@@ -36,6 +36,14 @@ pub struct ReplicationConfig {
     propose_semaphore_size: usize,
     /// Cap on `CatchupOp`s returned per `StrictCatchupResp` chunk.
     strict_max_catchup_ops: usize,
+    /// Encoded-byte budget for strict history and terminal-fence pages. Kept
+    /// below the default transport frame cap so a long-lived terminal journal
+    /// cannot make anti-entropy responses unsendable.
+    strict_max_catchup_bytes: usize,
+    /// Maximum aggregate bytes retained by v2 strict snapshot source pins and
+    /// receiver assemblies for one strict-topic runtime. This is independent
+    /// from the per-frame catchup budget.
+    strict_max_snapshot_transfer_bytes: usize,
     /// Minimum interval between bootstrap-catchup attempts. Triggered both
     /// by topic registration and by `Joined`/`Restarted` membership events;
     /// this throttle dedupes burst events so we don't fan out duplicate
@@ -50,7 +58,6 @@ pub struct ReplicationConfig {
     /// Recovery in-progress state is dropped after this many seconds
     /// without a quorum of acks.
     recovery_ttl: Duration,
-
     // ── Owner-scoped ──
     /// Suppress duplicate per-origin catchup requests within this window.
     owner_catchup_timeout: Duration,
@@ -103,11 +110,12 @@ impl Default for ReplicationConfig {
             propose_ttl: Duration::from_secs(10),
             propose_semaphore_size: 32,
             strict_max_catchup_ops: 256,
+            strict_max_catchup_bytes: 512 * 1024,
+            strict_max_snapshot_transfer_bytes: 64 * 1024 * 1024,
             strict_bootstrap_retry_interval: Duration::from_millis(500),
             strict_steady_state_catchup_interval: Duration::from_secs(5),
             pending_propose_ttl: Duration::from_secs(20),
             recovery_ttl: Duration::from_secs(10),
-
             owner_catchup_timeout: Duration::from_secs(5),
             owner_anti_entropy_interval: Duration::from_secs(30),
             owner_max_catchup_ops: 256,
@@ -150,6 +158,12 @@ impl ReplicationConfig {
     }
     pub fn strict_max_catchup_ops(&self) -> usize {
         self.strict_max_catchup_ops
+    }
+    pub fn strict_max_catchup_bytes(&self) -> usize {
+        self.strict_max_catchup_bytes
+    }
+    pub fn strict_max_snapshot_transfer_bytes(&self) -> usize {
+        self.strict_max_snapshot_transfer_bytes
     }
     pub fn strict_bootstrap_retry_interval(&self) -> Duration {
         self.strict_bootstrap_retry_interval
@@ -243,6 +257,14 @@ impl ReplicationConfig {
     }
     pub fn with_strict_max_catchup_ops(mut self, n: usize) -> Self {
         self.strict_max_catchup_ops = n;
+        self
+    }
+    pub fn with_strict_max_catchup_bytes(mut self, n: usize) -> Self {
+        self.strict_max_catchup_bytes = n.max(1);
+        self
+    }
+    pub fn with_strict_max_snapshot_transfer_bytes(mut self, n: usize) -> Self {
+        self.strict_max_snapshot_transfer_bytes = n.max(1);
         self
     }
     pub fn with_strict_bootstrap_retry_interval(mut self, d: Duration) -> Self {
@@ -412,6 +434,10 @@ pub struct ReplicationTuning {
     pub propose_semaphore_size: usize,
     #[serde(default = "default_strict_max_catchup_ops")]
     pub strict_max_catchup_ops: usize,
+    #[serde(default = "default_strict_max_catchup_bytes")]
+    pub strict_max_catchup_bytes: usize,
+    #[serde(default = "default_strict_max_snapshot_transfer_bytes")]
+    pub strict_max_snapshot_transfer_bytes: usize,
     #[serde(default = "default_strict_bootstrap_retry_interval_ms")]
     pub strict_bootstrap_retry_interval_ms: u64,
     #[serde(default = "default_strict_steady_state_catchup_interval_ms")]
@@ -462,6 +488,8 @@ impl Default for ReplicationTuning {
             propose_ttl_ms: default_propose_ttl_ms(),
             propose_semaphore_size: default_propose_semaphore_size(),
             strict_max_catchup_ops: default_strict_max_catchup_ops(),
+            strict_max_catchup_bytes: default_strict_max_catchup_bytes(),
+            strict_max_snapshot_transfer_bytes: default_strict_max_snapshot_transfer_bytes(),
             strict_bootstrap_retry_interval_ms: default_strict_bootstrap_retry_interval_ms(),
             strict_steady_state_catchup_interval_ms:
                 default_strict_steady_state_catchup_interval_ms(),
@@ -496,6 +524,8 @@ impl From<ReplicationTuning> for ReplicationConfig {
             .with_propose_ttl(Duration::from_millis(t.propose_ttl_ms))
             .with_propose_semaphore_size(t.propose_semaphore_size)
             .with_strict_max_catchup_ops(t.strict_max_catchup_ops)
+            .with_strict_max_catchup_bytes(t.strict_max_catchup_bytes)
+            .with_strict_max_snapshot_transfer_bytes(t.strict_max_snapshot_transfer_bytes)
             .with_strict_bootstrap_retry_interval(Duration::from_millis(
                 t.strict_bootstrap_retry_interval_ms,
             ))
@@ -544,6 +574,12 @@ fn default_propose_semaphore_size() -> usize {
 }
 fn default_strict_max_catchup_ops() -> usize {
     256
+}
+fn default_strict_max_catchup_bytes() -> usize {
+    512 * 1024
+}
+fn default_strict_max_snapshot_transfer_bytes() -> usize {
+    64 * 1024 * 1024
 }
 fn default_strict_bootstrap_retry_interval_ms() -> u64 {
     500

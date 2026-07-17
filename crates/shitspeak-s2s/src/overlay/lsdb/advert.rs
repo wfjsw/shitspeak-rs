@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Notify;
@@ -48,7 +48,8 @@ use super::super::proto::{OverlayBody, encode_message, wrap};
 use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
 use super::store::{
     AdmissionResult, ApplicationServices, DistributionCapabilities, LinkAdvertised, LinkStateDb,
-    LinkTransportAdvertised, LsaEntry, ReplicationServices, is_strictly_newer,
+    LinkTransportAdvertised, LsaEntry, ReplicationServices, STRICT_REPLICATION_PROTOCOL_VERSION,
+    is_strictly_newer,
 };
 
 const RTT_GATE_BUCKET_US: u64 = 25_000;
@@ -58,6 +59,30 @@ const VOICE_UDP_LOSS_GATE_BUCKET_PPM: u32 = 10_000;
 const VOICE_UDP_REPAIR_LOSS_START_PPM: u32 = 10_000;
 const VOICE_UDP_FULL_DUP_LOSS_PPM: u32 = 30_000;
 const VOICE_UDP_REPAIR_JITTER_START_US: u64 = 40_000;
+
+#[derive(Clone, Copy)]
+struct StrictReplicationProtocolState {
+    durable_state_ready: bool,
+    repository_registration_ready: bool,
+    /// A coordinated manager setup grants one promotion attempt. A
+    /// repository capability loss revokes it so a later lazy registration
+    /// cannot accidentally restore v2.
+    repository_registration_rearm_permitted: bool,
+    permanently_disabled: bool,
+}
+
+impl StrictReplicationProtocolState {
+    fn advertised_version(self) -> u32 {
+        if self.durable_state_ready
+            && self.repository_registration_ready
+            && !self.permanently_disabled
+        {
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        } else {
+            0
+        }
+    }
+}
 
 /// Local-LSA emitter state.
 pub struct LsaEmitter {
@@ -69,6 +94,8 @@ pub struct LsaEmitter {
     /// Whether this node asks peers not to use it as a transit router.
     transit_disabled: AtomicBool,
     strict_replication_enabled: AtomicBool,
+    strict_replication_protocol_version: AtomicU32,
+    strict_replication_protocol_state: parking_lot::Mutex<StrictReplicationProtocolState>,
     content_replication_enabled: AtomicBool,
     owner_replication_enabled: AtomicBool,
     voice_service_enabled: AtomicBool,
@@ -91,8 +118,18 @@ impl LsaEmitter {
         max_users: Arc<AtomicU64>,
         route_transit_messages: bool,
         replication_services: ReplicationServices,
+        strict_replication_durable_state_available: bool,
         application_services: ApplicationServices,
     ) -> Self {
+        let strict_replication_protocol_state = StrictReplicationProtocolState {
+            durable_state_ready: strict_replication_durable_state_available,
+            // The overlay cannot infer whether the server's Channel and Ban
+            // repositories are durable. ReplicationManager opens this gate
+            // before a coordinated expected-topic registration pass.
+            repository_registration_ready: false,
+            repository_registration_rearm_permitted: false,
+            permanently_disabled: false,
+        };
         Self {
             self_id,
             boot_epoch,
@@ -100,6 +137,12 @@ impl LsaEmitter {
             force_next_emit: AtomicBool::new(false),
             transit_disabled: AtomicBool::new(!route_transit_messages),
             strict_replication_enabled: AtomicBool::new(replication_services.strict()),
+            strict_replication_protocol_version: AtomicU32::new(
+                strict_replication_protocol_state.advertised_version(),
+            ),
+            strict_replication_protocol_state: parking_lot::Mutex::new(
+                strict_replication_protocol_state,
+            ),
             content_replication_enabled: AtomicBool::new(replication_services.content()),
             owner_replication_enabled: AtomicBool::new(replication_services.owner()),
             voice_service_enabled: AtomicBool::new(application_services.voice()),
@@ -146,6 +189,129 @@ impl LsaEmitter {
         )
     }
 
+    /// Cumulative strict-replication protocol version advertised in local
+    /// LSAs. Cluster use is gated by the minimum version visible in active
+    /// LSAs.
+    pub fn strict_replication_protocol_version(&self) -> u32 {
+        self.strict_replication_protocol_version
+            .load(Ordering::Relaxed)
+    }
+
+    /// Update shared S2S-state readiness. This is necessary but not sufficient
+    /// for the current cumulative protocol: repository registration must also
+    /// have completed successfully.
+    pub(crate) fn update_strict_replication_durable_state_ready(&self, ready: bool) {
+        let mut state = self.strict_replication_protocol_state.lock();
+        if state.durable_state_ready == ready {
+            return;
+        }
+        state.durable_state_ready = ready;
+        let advertised_version = state.advertised_version();
+        let changed = self
+            .strict_replication_protocol_version
+            .swap(advertised_version, Ordering::Relaxed)
+            != advertised_version;
+        drop(state);
+        if changed {
+            self.poke_force();
+        }
+    }
+
+    /// Begin a new manager-coordinated strict repository registration pass.
+    ///
+    /// This is the only operation that may clear a prior repository-loss
+    /// latch. The manager first drives readiness false, then promotes it only
+    /// after its complete expected topic registry has registered and passed
+    /// capability probing.
+    pub(crate) fn begin_strict_replication_repository_registration(&self) {
+        let mut state = self.strict_replication_protocol_state.lock();
+        state.repository_registration_ready = false;
+        state.repository_registration_rearm_permitted = true;
+        let advertised_version = state.advertised_version();
+        let changed = self
+            .strict_replication_protocol_version
+            .swap(advertised_version, Ordering::Relaxed)
+            != advertised_version;
+        drop(state);
+        if changed {
+            self.poke_force();
+        }
+    }
+
+    /// Update the manager-derived readiness of the current coordinated strict
+    /// repository registration pass.
+    ///
+    /// A `true` value is accepted only while the corresponding pass retains
+    /// its one-shot rearm permit. Once promoted, a repository capability loss
+    /// must be followed by another explicit coordinated setup; a later lazy
+    /// topic registration cannot silently re-enable the LSA.
+    pub(crate) fn update_strict_replication_repository_registration_ready(
+        &self,
+        ready: bool,
+    ) -> bool {
+        let mut state = self.strict_replication_protocol_state.lock();
+        if ready && !state.repository_registration_ready {
+            if !state.repository_registration_rearm_permitted {
+                return false;
+            }
+            state.repository_registration_rearm_permitted = false;
+        }
+        if state.repository_registration_ready == ready {
+            return ready;
+        }
+        state.repository_registration_ready = ready;
+        let advertised_version = state.advertised_version();
+        let changed = self
+            .strict_replication_protocol_version
+            .swap(advertised_version, Ordering::Relaxed)
+            != advertised_version;
+        drop(state);
+        if changed {
+            self.poke_force();
+        }
+        ready
+    }
+
+    /// Clamp the current protocol when an already registered repository loses
+    /// its v2 contract. The production manager must explicitly complete a new
+    /// coordinated registration before this can be advertised again.
+    pub(crate) fn report_strict_replication_repository_capability_loss(&self) {
+        let mut state = self.strict_replication_protocol_state.lock();
+        if !state.repository_registration_ready && !state.repository_registration_rearm_permitted {
+            return;
+        }
+        state.repository_registration_ready = false;
+        state.repository_registration_rearm_permitted = false;
+        let changed = self
+            .strict_replication_protocol_version
+            .swap(0, Ordering::Relaxed)
+            != 0;
+        drop(state);
+        if changed {
+            self.poke_force();
+        }
+    }
+
+    /// Stop advertising the current strict-replication protocol and force a
+    /// replacement LSA so peers promptly fail closed. This remains sticky for
+    /// the process lifetime because a later storage probe cannot repair a
+    /// terminal journal that failed to load or write.
+    pub(crate) fn disable_strict_replication_protocol(&self) {
+        let mut state = self.strict_replication_protocol_state.lock();
+        if state.permanently_disabled {
+            return;
+        }
+        state.permanently_disabled = true;
+        let changed = self
+            .strict_replication_protocol_version
+            .swap(0, Ordering::Relaxed)
+            != 0;
+        drop(state);
+        if changed {
+            self.poke_force();
+        }
+    }
+
     pub fn application_services(&self) -> ApplicationServices {
         ApplicationServices::with_distribution_capabilities(
             self.voice_service_enabled.load(Ordering::Relaxed),
@@ -181,6 +347,7 @@ struct LsaContent {
     transit_disabled: bool,
     replication_services: ReplicationServices,
     application_services: ApplicationServices,
+    strict_replication_protocol_version: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +423,11 @@ fn build_local_lsa_content(
         } else {
             emitter.application_services()
         },
+        strict_replication_protocol_version: if tombstone {
+            0
+        } else {
+            emitter.strict_replication_protocol_version()
+        },
     }
 }
 
@@ -272,6 +444,7 @@ fn stamp_local_lsa(emitter: &LsaEmitter, content: LsaContent) -> LsaEntry {
         transit_disabled: content.transit_disabled,
         replication_services: content.replication_services,
         application_services: content.application_services,
+        strict_replication_protocol_version: content.strict_replication_protocol_version,
     }
 }
 
@@ -486,6 +659,9 @@ fn content_gate_fingerprint(content: &LsaContent, cfg: &OverlayConfig) -> u64 {
     content.replication_services.strict().hash(&mut hasher);
     content.replication_services.content().hash(&mut hasher);
     content.replication_services.owner().hash(&mut hasher);
+    content
+        .strict_replication_protocol_version
+        .hash(&mut hasher);
     content.application_services.voice().hash(&mut hasher);
     content
         .application_services
@@ -515,6 +691,9 @@ fn content_identity_fingerprint(content: &LsaContent) -> u64 {
     content.replication_services.strict().hash(&mut hasher);
     content.replication_services.content().hash(&mut hasher);
     content.replication_services.owner().hash(&mut hasher);
+    content
+        .strict_replication_protocol_version
+        .hash(&mut hasher);
     content.application_services.voice().hash(&mut hasher);
     content
         .application_services
@@ -1330,15 +1509,19 @@ mod tests {
     }
 
     fn test_emitter() -> LsaEmitter {
-        LsaEmitter::new(
+        let emitter = LsaEmitter::new(
             1,
             100,
             vec![],
             Arc::new(AtomicU64::new(10)),
             true,
             ReplicationServices::ALL,
+            true,
             ApplicationServices::ALL,
-        )
+        );
+        emitter.begin_strict_replication_repository_registration();
+        assert!(emitter.update_strict_replication_repository_registration_ready(true));
+        emitter
     }
 
     #[test]
@@ -1354,6 +1537,195 @@ mod tests {
         assert_eq!(
             lsa.application_services.distribution().profile_ids(),
             &[3, 7]
+        );
+    }
+
+    #[test]
+    fn local_lsa_advertises_strict_replication_protocol_version_and_fingerprints_it() {
+        let emitter = test_emitter();
+        let lsa = build_local_lsa(&emitter, &[], false);
+        assert_eq!(
+            lsa.strict_replication_protocol_version(),
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            lsa.to_pb().strict_replication_protocol_version,
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        );
+
+        let cfg = OverlayConfig::new(vec![]);
+        let content = build_local_lsa_content(&emitter, &[], false);
+        let original = content_fingerprint(&content, &cfg);
+        let mut legacy = content.clone();
+        legacy.strict_replication_protocol_version = 0;
+        let changed = content_fingerprint(&legacy, &cfg);
+        assert_ne!(original.identity, changed.identity);
+        assert_ne!(original.gate, changed.gate);
+    }
+
+    #[test]
+    fn local_lsa_fails_closed_when_strict_durable_state_is_unavailable() {
+        let emitter = LsaEmitter::new(
+            1,
+            100,
+            vec![],
+            Arc::new(AtomicU64::new(10)),
+            true,
+            ReplicationServices::ALL,
+            false,
+            ApplicationServices::ALL,
+        );
+        emitter.begin_strict_replication_repository_registration();
+        assert!(emitter.update_strict_replication_repository_registration_ready(true));
+
+        assert_eq!(
+            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
+            0
+        );
+    }
+
+    #[test]
+    fn local_lsa_can_downgrade_strict_replication_protocol_version() {
+        let emitter = test_emitter();
+        emitter.disable_strict_replication_protocol();
+
+        assert!(emitter.force_next_emit.load(Ordering::Relaxed));
+        assert_eq!(
+            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
+            0
+        );
+    }
+
+    #[test]
+    fn local_lsa_re_advertises_when_durable_storage_recovers() {
+        let emitter = LsaEmitter::new(
+            1,
+            100,
+            vec![],
+            Arc::new(AtomicU64::new(10)),
+            true,
+            ReplicationServices::ALL,
+            false,
+            ApplicationServices::ALL,
+        );
+        let cfg = OverlayConfig::new(vec![]);
+        let unavailable = content_fingerprint(&build_local_lsa_content(&emitter, &[], false), &cfg);
+
+        emitter.begin_strict_replication_repository_registration();
+        assert!(emitter.update_strict_replication_repository_registration_ready(true));
+        emitter.update_strict_replication_durable_state_ready(true);
+        assert!(emitter.force_next_emit.load(Ordering::Relaxed));
+        let ready = content_fingerprint(&build_local_lsa_content(&emitter, &[], false), &cfg);
+        assert_ne!(unavailable.identity, ready.identity);
+        assert_ne!(unavailable.gate, ready.gate);
+        assert_eq!(
+            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        );
+
+        emitter.force_next_emit.store(false, Ordering::Relaxed);
+        emitter.update_strict_replication_durable_state_ready(false);
+        assert!(emitter.force_next_emit.load(Ordering::Relaxed));
+        assert_eq!(
+            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
+            0
+        );
+    }
+
+    #[test]
+    fn strict_journal_failure_keeps_current_protocol_disabled_after_storage_recovers() {
+        let emitter = test_emitter();
+        emitter.disable_strict_replication_protocol();
+        emitter.update_strict_replication_durable_state_ready(false);
+        emitter.update_strict_replication_durable_state_ready(true);
+
+        assert_eq!(
+            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
+            0
+        );
+    }
+
+    #[test]
+    fn shared_s2s_persistence_advertises_v2_only_after_verified_repository_registration() {
+        let emitter = LsaEmitter::new(
+            1,
+            100,
+            vec![],
+            Arc::new(AtomicU64::new(10)),
+            true,
+            ReplicationServices::ALL,
+            true,
+            ApplicationServices::ALL,
+        );
+
+        assert_eq!(
+            emitter.strict_replication_protocol_version(),
+            0,
+            "durable shared S2S state alone must not advertise v2"
+        );
+        assert_eq!(
+            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
+            0
+        );
+        emitter.begin_strict_replication_repository_registration();
+        assert!(!emitter.update_strict_replication_repository_registration_ready(false));
+        assert_eq!(emitter.strict_replication_protocol_version(), 0);
+        assert_eq!(
+            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
+            0,
+            "an incomplete coordinated repository registration must keep the LSA at v0"
+        );
+
+        assert!(emitter.update_strict_replication_repository_registration_ready(true));
+        assert_eq!(
+            emitter.strict_replication_protocol_version(),
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
+            STRICT_REPLICATION_PROTOCOL_VERSION,
+            "durable v2 repositories promote automatically after registration"
+        );
+
+        emitter.report_strict_replication_repository_capability_loss();
+        assert_eq!(emitter.strict_replication_protocol_version(), 0);
+
+        assert!(!emitter.update_strict_replication_repository_registration_ready(true));
+        emitter.begin_strict_replication_repository_registration();
+        assert!(emitter.update_strict_replication_repository_registration_ready(true));
+        assert_eq!(
+            emitter.strict_replication_protocol_version(),
+            STRICT_REPLICATION_PROTOCOL_VERSION,
+            "only an explicit coordinated re-registration can restore v2"
+        );
+    }
+
+    #[test]
+    fn repository_loss_before_initial_promotion_revokes_the_pending_rearm_permit() {
+        let emitter = LsaEmitter::new(
+            1,
+            100,
+            vec![],
+            Arc::new(AtomicU64::new(10)),
+            true,
+            ReplicationServices::ALL,
+            true,
+            ApplicationServices::ALL,
+        );
+
+        emitter.begin_strict_replication_repository_registration();
+        emitter.report_strict_replication_repository_capability_loss();
+        assert!(
+            !emitter.update_strict_replication_repository_registration_ready(true),
+            "a late registration must not re-enable a capability loss"
+        );
+        assert_eq!(emitter.strict_replication_protocol_version(), 0);
+
+        emitter.begin_strict_replication_repository_registration();
+        assert!(emitter.update_strict_replication_repository_registration_ready(true));
+        assert_eq!(
+            emitter.strict_replication_protocol_version(),
+            STRICT_REPLICATION_PROTOCOL_VERSION
         );
     }
 
@@ -1717,6 +2089,7 @@ mod tests {
                 transit_disabled: false,
                 replication_services: ReplicationServices::ALL,
                 application_services: ApplicationServices::ALL,
+                strict_replication_protocol_version: 0,
             }),
             AdmissionResult::Accepted
         );
@@ -1821,6 +2194,7 @@ mod tests {
             max_users.clone(),
             true,
             ReplicationServices::ALL,
+            true,
             ApplicationServices::ALL,
         );
         let cfg = OverlayConfig::new(vec![])

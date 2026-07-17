@@ -12,13 +12,17 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
+use tokio::time::{Instant as TokioInstant, sleep, sleep_until};
 use tracing::trace;
 
 use super::super::error::ReplicationError;
 use super::super::metrics::{self, ReplicationPipelineKind, ReplicationPipelineStage};
-use super::super::proto::{StrictBody, StrictPropose, StrictProposeAck};
+use super::super::proto::{StrictBody, StrictProposeAck, StrictProposeV1};
 use super::StrictReplicable;
-use super::runtime::{Proposal, STRICT_REPLICATION_SLOW_STAGE, StrictRuntime};
+use super::runtime::{
+    Proposal, STRICT_PROTOCOL_VERSION_V2, STRICT_REPLICATION_SLOW_STAGE, StrictProtocolSnapshot,
+    StrictRuntime, frozen_targets_from_epochs,
+};
 
 impl<R: StrictReplicable> StrictRuntime<R> {
     /// Begin a local proposal. Stores a waker in the proposal that the
@@ -38,21 +42,28 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         waker: oneshot::Sender<Result<u64, ReplicationError>>,
     ) -> Result<(), ReplicationError> {
         let fence_timeout = self.cfg.propose_ttl();
-        tokio::time::timeout(fence_timeout, async {
-            while self.state.lock().history_election_blocks_steady_state() {
-                tokio::select! {
-                    _ = self.shutdown.cancelled() => return Err(ReplicationError::Shutdown),
-                    _ = tokio::time::sleep(self.cfg.delivery_tick_interval()) => {}
-                }
+        let deadline = TokioInstant::now() + fence_timeout;
+        while self.state.lock().history_election_blocks_steady_state() {
+            if TokioInstant::now() >= deadline {
+                return Err(ReplicationError::ProposeTimeout(fence_timeout));
             }
-            Ok(())
-        })
-        .await
-        .map_err(|_| ReplicationError::ProposeTimeout(fence_timeout))??;
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return Err(ReplicationError::Shutdown),
+                _ = sleep_until(deadline) => return Err(ReplicationError::ProposeTimeout(fence_timeout)),
+                _ = sleep(self.cfg.delivery_tick_interval()) => {}
+            }
+        }
+
+        // Do not occupy scarce in-flight capacity while waiting for cluster
+        // capability convergence. The single proposal deadline covers this
+        // readiness phase and the subsequent permit acquisition.
+        self.wait_for_v2_protocol_snapshot(deadline, fence_timeout)
+            .await?;
 
         // Bound concurrent in-flight proposals per topic.
         let permit = tokio::select! {
             _ = self.shutdown.cancelled() => return Err(ReplicationError::Shutdown),
+            _ = sleep_until(deadline) => return Err(ReplicationError::ProposeTimeout(fence_timeout)),
             permit = self.propose_semaphore.clone().acquire_owned() => {
                 permit.map_err(|_| ReplicationError::Shutdown)?
             }
@@ -66,6 +77,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if self.state.lock().history_election_blocks_steady_state() {
             return Err(ReplicationError::ProposeTimeout(fence_timeout));
         }
+        if TokioInstant::now() >= deadline {
+            return Err(ReplicationError::ProposeTimeout(fence_timeout));
+        }
+
+        // A membership/LSA transition may have happened while capacity was
+        // unavailable. Freeze the descriptor only from a fresh v2-ready view
+        // immediately before registration and wire emission.
+        let network_snapshot = self
+            .wait_for_v2_protocol_snapshot(deadline, fence_timeout)
+            .await?;
 
         let encode_started_at = Instant::now();
         let encoded = rmp_serde::to_vec(&op);
@@ -77,8 +98,37 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let op_msgpack = Bytes::from(encoded?);
         let op_id = self.next_op_id();
         let op_bytes = op_msgpack.len();
-        let (target_set, fq) = self.snapshot_target_set();
-        let target_epochs = self.snapshot_target_epochs(&target_set);
+        // Capability and target membership were frozen from one v2-ready
+        // LSDB view. A legacy member joining before that view settles keeps
+        // this proposal in the readiness wait rather than causing v0 output.
+        let protocol_version = self.effective_protocol_version(network_snapshot.negotiated_version);
+        if protocol_version != STRICT_PROTOCOL_VERSION_V2 {
+            return Err(ReplicationError::ProposeTimeout(fence_timeout));
+        }
+        let mut target_set: std::collections::HashSet<_> = network_snapshot
+            .targets
+            .iter()
+            .map(|target| target.node)
+            .collect();
+        target_set.insert(self.self_id);
+        let mut target_epochs: HashMap<_, _> = network_snapshot
+            .targets
+            .iter()
+            .map(|target| (target.node, target.boot_epoch))
+            .collect();
+        target_epochs.insert(self.self_id, self.boot_epoch);
+        let frozen_targets = frozen_targets_from_epochs(&target_epochs);
+        // A v2 commit must always fit in one terminal catchup response. The
+        // bound includes the full replication protobuf envelope, descriptor,
+        // resolver identity, and worst-case scalar encoding rather than only
+        // the raw operation bytes.
+        if !self.v2_terminal_commit_fits_catchup_budget(op_id, &frozen_targets, op_msgpack.clone())
+        {
+            return Err(ReplicationError::Malformed(
+                "strict v2 proposal exceeds terminal catchup response budget",
+            ));
+        }
+        let fq = super::runtime::fast_quorum_size(target_set.len());
         let target_count = target_set.len();
 
         // Register the proposal and advance our local clock.
@@ -88,7 +138,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             // This check and proposal insertion must be one state-lock
             // transaction. Membership recovery may rearm the fence after
             // semaphore acquisition or encoding.
-            if s.history_election_blocks_steady_state() {
+            if self.shutdown.is_cancelled() {
+                return Err(ReplicationError::Shutdown);
+            }
+            if s.history_election_blocks_steady_state() || TokioInstant::now() >= deadline {
                 return Err(ReplicationError::ProposeTimeout(fence_timeout));
             }
             let ts_propose = s.tick_clock();
@@ -105,12 +158,57 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     accepted_waker,
                     waker: Some(waker),
                     committed: false,
+                    protocol_version,
+                    accept_acks: HashMap::new(),
+                    accept_started: false,
+                    phase_two_accept: None,
+                    #[cfg(any(test, feature = "test-support"))]
+                    phase_two_retry_attempts: 0,
+                    #[cfg(any(test, feature = "test-support"))]
+                    phase_two_floor_pauses: 0,
                     started_at,
                     _permit: permit,
                 },
             );
+            // Keep a local prepared record after the caller-visible proposal
+            // times out. Its v2 descriptor is the coordinator's durable
+            // evidence for automatic terminal resolution.
+            s.record_pending_propose_with_descriptor(
+                op_id,
+                self.self_id,
+                op_msgpack.clone(),
+                ts_propose,
+                started_at,
+                protocol_version,
+                Some(frozen_targets.clone()),
+                false,
+            );
             (ts_propose, s.clock)
         };
+        if !self.persist_v2_pending_descriptor(
+            op_id,
+            ts_propose,
+            op_msgpack.clone(),
+            &frozen_targets,
+        ) {
+            let waker = {
+                let mut state = self.state.lock();
+                state.pending_proposes.remove(&op_id);
+                state
+                    .proposals
+                    .remove(&op_id)
+                    .and_then(|proposal| proposal.waker)
+            };
+            if let Some(waker) = waker {
+                let _ = waker.send(Err(ReplicationError::Malformed(
+                    "strict v2 proposal descriptor persistence failed",
+                )));
+            }
+            return Err(ReplicationError::Malformed(
+                "strict v2 proposal descriptor persistence failed",
+            ));
+        }
+        self.spawn_proposal_deadline(op_id);
         tracing::debug!(
             topic = %self.topic,
             op_id_hi = op_id.0,
@@ -133,16 +231,22 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .filter(|n| **n != self.self_id)
             .copied()
             .collect();
-        let body = StrictBody::Propose(StrictPropose {
+        let body = StrictBody::ProposeV1(StrictProposeV1 {
             coord_node: self.self_id as u32,
             op_id_hi: op_id.0,
             op_id_lo: op_id.1,
             ts_propose,
             op_msgpack,
             src_clock,
+            protocol_version,
+            frozen_targets: super::runtime::frozen_targets_to_wire(&frozen_targets),
         });
         if !dsts.is_empty() {
-            if let Err(e) = self.net.send_multicast(&dsts, &self.topic, body).await {
+            if let Err(e) = self
+                .net
+                .send_redundant_multicast(&dsts, &self.topic, body)
+                .await
+            {
                 trace!(error=%e, "send propose multicast failed");
             }
         }
@@ -178,5 +282,28 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.spawn_propose_retries(op_id);
 
         Ok(())
+    }
+
+    async fn wait_for_v2_protocol_snapshot(
+        &self,
+        deadline: TokioInstant,
+        fence_timeout: std::time::Duration,
+    ) -> Result<StrictProtocolSnapshot, ReplicationError> {
+        loop {
+            if TokioInstant::now() >= deadline {
+                return Err(ReplicationError::ProposeTimeout(fence_timeout));
+            }
+            let snapshot = self.net.strict_protocol_snapshot();
+            if self.effective_protocol_version(snapshot.negotiated_version)
+                == STRICT_PROTOCOL_VERSION_V2
+            {
+                return Ok(snapshot);
+            }
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return Err(ReplicationError::Shutdown),
+                _ = sleep_until(deadline) => return Err(ReplicationError::ProposeTimeout(fence_timeout)),
+                _ = sleep(self.cfg.delivery_tick_interval()) => {}
+            }
+        }
     }
 }

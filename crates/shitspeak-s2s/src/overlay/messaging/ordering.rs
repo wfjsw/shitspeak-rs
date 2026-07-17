@@ -477,8 +477,14 @@ impl OverlayOrdering {
             dst: self_id,
             lane,
         };
-        let delivery =
-            OrderedDelivery::new(src, data.service_tag, level, class, data.payload.clone());
+        let delivery = OrderedDelivery::new(
+            src,
+            data.origin_boot_epoch,
+            data.service_tag,
+            level,
+            class,
+            data.payload.clone(),
+        );
         let mut inbound = self.inbound.lock().await;
         let state = inbound.entry(key).or_default();
 
@@ -625,6 +631,7 @@ pub(crate) struct AcceptOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct OrderedDelivery {
     src: NodeIdentifier,
+    origin_boot_epoch: u64,
     tag: u32,
     level: ServiceLevel,
     class: MessageClass,
@@ -634,6 +641,7 @@ pub(crate) struct OrderedDelivery {
 impl OrderedDelivery {
     pub(crate) fn new(
         src: NodeIdentifier,
+        origin_boot_epoch: u64,
         tag: u32,
         level: ServiceLevel,
         class: MessageClass,
@@ -641,6 +649,7 @@ impl OrderedDelivery {
     ) -> Self {
         Self {
             src,
+            origin_boot_epoch,
             tag,
             level,
             class,
@@ -650,6 +659,10 @@ impl OrderedDelivery {
 
     pub(crate) fn src(&self) -> NodeIdentifier {
         self.src
+    }
+
+    pub(crate) fn origin_boot_epoch(&self) -> u64 {
+        self.origin_boot_epoch
     }
 
     pub(crate) fn tag(&self) -> u32 {
@@ -730,7 +743,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffers_until_missing_sequence_arrives() {
+    async fn buffers_until_missing_sequence_arrives_and_preserves_origin_boot_epoch() {
         let ordering = OverlayOrdering::default();
 
         let second = ordering
@@ -758,6 +771,8 @@ mod tests {
         assert_eq!(first.ready.len(), 2);
         assert_eq!(&first.ready[0].body()[..], b"first");
         assert_eq!(&first.ready[1].body()[..], b"second");
+        assert_eq!(first.ready[0].origin_boot_epoch(), 99);
+        assert_eq!(first.ready[1].origin_boot_epoch(), 99);
         assert_eq!(first.ack_next_seq, 2);
     }
 

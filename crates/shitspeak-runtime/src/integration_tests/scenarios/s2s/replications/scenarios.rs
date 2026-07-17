@@ -13,11 +13,15 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
 use super::harness::ReplCluster;
-use shitspeak_s2s::overlay::{OverlayNetwork, SeedPeer};
+use crate::types::StrictReplicationMetadata;
+use shitspeak_s2s::overlay::{OverlayNetwork, STRICT_REPLICATION_PROTOCOL_VERSION, SeedPeer};
 use shitspeak_s2s::replications::proto::{
     self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG,
 };
-use shitspeak_s2s::replications::strict::{HistoryMetadata, LogSlice, StrictLogEntry};
+use shitspeak_s2s::replications::strict::{
+    HistoryMetadata, LogSlice, StrictCommitApplyOutcome, StrictLogEntry, StrictLogMetadata,
+    StrictSnapshotError,
+};
 use shitspeak_s2s::replications::test_support::{CountingOwnerRepo, CountingStrictRepo};
 use shitspeak_s2s::replications::{
     OwnerReplicable, ReplicationConfig, ReplicationError, ReplicationManager, StrictReplicable,
@@ -32,6 +36,7 @@ use shitspeak_s2s_transport::{
 use shitspeak_state::Channel;
 use shitspeak_state::{
     ChannelOp, ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
+    StrictOperationApplyOutcome, StrictOperationId,
 };
 
 #[derive(Clone)]
@@ -49,6 +54,7 @@ impl TestChannelReplicationAdapter {
 struct TestChannelSnapshot {
     channels: Vec<Channel>,
     freshness: i64,
+    strict_operation_ids: Vec<StrictOperationId>,
 }
 
 #[async_trait::async_trait]
@@ -68,35 +74,63 @@ impl StrictReplicable for TestChannelReplicationAdapter {
         }
     }
 
-    fn snapshot(&self) -> (u64, Bytes) {
-        let version = self.repo.current_version();
+    fn strict_replication_protocol_version(&self) -> u32 {
+        if self.repo.strict_operation_durability_enabled() {
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        } else {
+            0
+        }
+    }
+
+    fn snapshot(&self) -> Result<(u64, Bytes), StrictSnapshotError> {
         let repo = self.repo.clone();
-        let channels =
-            block_in_place_or_current(|handle| handle.block_on(repo.get_all())).unwrap_or_default();
-        let freshness = self
-            .repo
-            .latest_timestamp_in_server(crate::types::DEFAULT_SERVER_ID);
-        let bytes = Bytes::from(
-            rmp_serde::to_vec(&TestChannelSnapshot {
-                channels,
-                freshness,
-            })
-            .unwrap_or_default(),
-        );
-        (version, bytes)
+        let strict_snapshot = block_in_place_or_current(|handle| {
+            handle.block_on(repo.strict_snapshot_in_server(crate::types::DEFAULT_SERVER_ID))
+        })
+        .ok_or_else(|| StrictSnapshotError::new("channel snapshot capture requires a runtime"))?;
+        let (version, channels, freshness, strict_operation_ids) = strict_snapshot.into_parts();
+        let bytes = rmp_serde::to_vec(&TestChannelSnapshot {
+            channels,
+            freshness,
+            strict_operation_ids,
+        })
+        .map(Bytes::from)
+        .map_err(|error| {
+            StrictSnapshotError::new(format!("channel test snapshot encode failed: {error}"))
+        })?;
+        Ok((version, bytes))
     }
 
     fn log_since(&self, since: u64) -> LogSlice<StrictLogEntry<Self::Op>> {
         let repo = self.repo.clone();
-        let entries =
-            block_in_place_or_current(|handle| handle.block_on(repo.get_log_since(since)));
-        LogSlice::Available(
-            entries
-                .unwrap_or_default()
-                .into_iter()
-                .map(|op| (op.version, StrictLogEntry::new((*op).clone())))
-                .collect(),
-        )
+        let entries = block_in_place_or_current(|handle| {
+            handle.block_on(
+                repo.strict_log_entries_since_in_server(crate::types::DEFAULT_SERVER_ID, since),
+            )
+        });
+        match entries.flatten() {
+            Some(entries) => LogSlice::Available(
+                entries
+                    .into_iter()
+                    .map(|entry| {
+                        let op = entry.op();
+                        let log_entry = match entry.strict_metadata() {
+                            Some(metadata) => StrictLogEntry::with_metadata(
+                                (*op).clone(),
+                                StrictLogMetadata {
+                                    op_id_hi: metadata.op_id_hi(),
+                                    op_id_lo: metadata.op_id_lo(),
+                                    ts_final: metadata.ts_final(),
+                                },
+                            ),
+                            None => StrictLogEntry::new((*op).clone()),
+                        };
+                        (op.version, log_entry)
+                    })
+                    .collect(),
+            ),
+            None => LogSlice::TooOld,
+        }
     }
 
     async fn apply_committed(&self, version: u64, mut op: Self::Op) {
@@ -104,12 +138,69 @@ impl StrictReplicable for TestChannelReplicationAdapter {
         self.repo.apply_committed_operation(op).await.unwrap();
     }
 
-    async fn install_snapshot(&self, version: u64, snapshot: Bytes) {
-        let snapshot: TestChannelSnapshot = rmp_serde::from_slice(&snapshot).unwrap();
-        self.repo
-            .install_s2s_snapshot(version, snapshot.channels)
+    async fn apply_committed_with_metadata(
+        &self,
+        version: u64,
+        op: Self::Op,
+        metadata: Option<StrictLogMetadata>,
+    ) {
+        if let Some(metadata) = metadata {
+            let _ = self.apply_committed_once(version, op, metadata).await;
+        } else {
+            self.apply_committed(version, op).await;
+        }
+    }
+
+    async fn apply_committed_once(
+        &self,
+        version: u64,
+        mut op: Self::Op,
+        metadata: StrictLogMetadata,
+    ) -> StrictCommitApplyOutcome {
+        op.version = version;
+        match self
+            .repo
+            .apply_strict_operation_once(
+                op,
+                StrictReplicationMetadata::new(
+                    metadata.op_id_hi,
+                    metadata.op_id_lo,
+                    metadata.ts_final,
+                ),
+            )
             .await
-            .unwrap();
+        {
+            Ok(StrictOperationApplyOutcome::Applied) => StrictCommitApplyOutcome::Applied,
+            Ok(StrictOperationApplyOutcome::AlreadyApplied) => {
+                StrictCommitApplyOutcome::AlreadyApplied
+            }
+            Ok(StrictOperationApplyOutcome::VersionConflict) | Err(_) => {
+                StrictCommitApplyOutcome::Failed
+            }
+        }
+    }
+
+    async fn install_snapshot(
+        &self,
+        version: u64,
+        snapshot: Bytes,
+    ) -> Result<(), StrictSnapshotError> {
+        let snapshot: TestChannelSnapshot = rmp_serde::from_slice(&snapshot).map_err(|error| {
+            StrictSnapshotError::new(format!("channel test snapshot decode failed: {error}"))
+        })?;
+        self.repo
+            .install_s2s_snapshot_with_strict_operation_ids_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                version,
+                snapshot.channels,
+                snapshot.freshness,
+                snapshot.strict_operation_ids,
+            )
+            .await
+            .map_err(|error| {
+                StrictSnapshotError::new(format!("channel test snapshot install failed: {error}"))
+            })?;
+        Ok(())
     }
 }
 
@@ -122,28 +213,28 @@ fn channel_tuning() -> ChannelRepoTuning {
     }
 }
 
-async fn wait_for_elected_channel_history(
+async fn wait_for_converged_channel_history(
     repos: &[Arc<ChannelRepository>],
     deadline: Duration,
 ) -> bool {
     let start = Instant::now();
     while start.elapsed() < deadline {
-        if elected_channel_history_matches(repos).await {
+        if converged_channel_history_matches(repos).await {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    elected_channel_history_matches(repos).await
+    converged_channel_history_matches(repos).await
 }
 
-async fn elected_channel_history_matches(repos: &[Arc<ChannelRepository>]) -> bool {
+async fn converged_channel_history_matches(repos: &[Arc<ChannelRepository>]) -> bool {
     for repo in repos {
-        if repo.current_version() != 5 {
+        if repo.current_version() != 6 {
             return false;
         }
         let channels = repo.get_all().await;
         let has_channel = |id| channels.iter().any(|channel| channel.id == id);
-        if !has_channel(20) || !has_channel(21) || !has_channel(22) || has_channel(30) {
+        if !has_channel(20) || !has_channel(21) || !has_channel(22) || !has_channel(30) {
             return false;
         }
     }
@@ -228,6 +319,78 @@ async fn strict_three_node_convergence() {
     for r in &repos[1..] {
         assert_eq!(r.log(), log0, "replicas diverged on total order");
     }
+    cluster.shutdown().await;
+}
+
+/// Verifies that strict-v2 capability activation is derived from repository
+/// registration, rather than an application-maintained capability manifest.
+/// A later capable topic must preserve the already-advertised cumulative
+/// protocol floor and remain usable for strict replication.
+#[tokio::test]
+async fn strict_capability_activation_is_automatic_and_floor_stable() {
+    let cluster = ReplCluster::build_full_mesh(&[1, 2, 3]).await;
+    let channel_repos: Vec<Arc<CountingStrictRepo>> =
+        (0..3).map(|_| CountingStrictRepo::new()).collect();
+
+    for (idx, repo) in channel_repos.iter().enumerate() {
+        cluster
+            .register_strict(idx, "channels", repo.clone())
+            .unwrap();
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            cluster
+                .managers
+                .iter()
+                .all(|manager| manager.strict_capability_activation_ready())
+                && strict_protocol_floors(&cluster)
+                    .iter()
+                    .all(|(_, version)| *version == STRICT_REPLICATION_PROTOCOL_VERSION)
+        })
+        .await,
+        "automatic first-topic registration did not activate the cumulative strict protocol floor: floors={:?}",
+        strict_protocol_floors(&cluster),
+    );
+
+    let ban_repos: Vec<Arc<CountingStrictRepo>> =
+        (0..3).map(|_| CountingStrictRepo::new()).collect();
+    let mut ban_handles = Vec::new();
+    for (idx, repo) in ban_repos.iter().enumerate() {
+        ban_handles.push(cluster.register_strict(idx, "bans", repo.clone()).unwrap());
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            cluster
+                .managers
+                .iter()
+                .all(|manager| manager.strict_capability_activation_ready())
+                && strict_protocol_floors(&cluster)
+                    .iter()
+                    .all(|(_, version)| *version == STRICT_REPLICATION_PROTOCOL_VERSION)
+        })
+        .await,
+        "later capable topic lowered the cumulative strict protocol floor: floors={:?}",
+        strict_protocol_floors(&cluster),
+    );
+
+    let version = ban_handles[0].propose(42).await.unwrap();
+    assert_eq!(version, 1);
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            ban_repos
+                .iter()
+                .all(|repo| repo.current_version() == version)
+        })
+        .await,
+        "later strict topic did not replicate after automatic activation: versions={:?}",
+        ban_repos
+            .iter()
+            .map(|repo| repo.current_version())
+            .collect::<Vec<_>>(),
+    );
+
     cluster.shutdown().await;
 }
 
@@ -397,7 +560,7 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
     let cfg = ReplicationConfig::default()
         .with_propose_ttl(Duration::from_secs(20))
         .with_pending_propose_ttl(Duration::from_secs(30));
-    let cluster = ReplCluster::build_full_mesh_with_config(&[1, 2, 3], cfg.clone()).await;
+    let mut cluster = ReplCluster::build_full_mesh_with_config(&[1, 2, 3], cfg.clone()).await;
     let repos: Vec<Arc<CountingStrictRepo>> = (0..3).map(|_| CountingStrictRepo::new()).collect();
     let mut handles = Vec::new();
     for (idx, repo) in repos.iter().enumerate() {
@@ -409,33 +572,43 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let old_coordinator = cluster.cluster.node(1);
-    let held_ack = FaultSelector::new(2, TransportKind::Tcp, MessageType::StrictAck);
-    old_coordinator.chaos.drop_next(held_ack, 100);
-    old_coordinator.chaos.drop_next(
-        FaultSelector::new(3, TransportKind::Tcp, MessageType::StrictAck),
-        100,
-    );
-    let old_handle = handles[0].clone();
-    let old_proposal = tokio::spawn(async move { old_handle.propose(1111).await });
-    assert!(
-        wait_until(Duration::from_secs(3), || old_coordinator
-            .chaos
-            .remaining_drops(held_ack)
-            < 100)
-        .await,
-        "peer ACK never proved the old proposal reached pending state"
-    );
+    let (old_epoch, old_port) = {
+        let old_coordinator = cluster.cluster.node(1);
+        let held_ack = FaultSelector::new(2, TransportKind::Tcp, MessageType::StrictAck);
+        old_coordinator.chaos.drop_next(held_ack, 100);
+        old_coordinator.chaos.drop_next(
+            FaultSelector::new(3, TransportKind::Tcp, MessageType::StrictAck),
+            100,
+        );
+        let old_handle = handles[0].clone();
+        let old_proposal = tokio::spawn(async move { old_handle.propose(1111).await });
+        assert!(
+            wait_until(Duration::from_secs(3), || old_coordinator
+                .chaos
+                .remaining_drops(held_ack)
+                < 100)
+            .await,
+            "peer ACK never proved the old proposal reached pending state"
+        );
 
-    cluster.managers[0].shutdown().await;
-    old_coordinator.overlay.shutdown().await;
-    old_coordinator.transport.shutdown().await;
-    let _ = timeout(Duration::from_secs(3), old_proposal)
-        .await
-        .expect("old proposal did not terminate with its coordinator");
+        cluster.managers[0].shutdown().await;
+        old_coordinator.overlay.shutdown().await;
+        old_coordinator.transport.shutdown().await;
+        let _ = timeout(Duration::from_secs(3), old_proposal)
+            .await
+            .expect("old proposal did not terminate with its coordinator");
+        (
+            old_coordinator.overlay.local_boot_epoch(),
+            old_coordinator.port,
+        )
+    };
+    // A process restart drops every owner of the old terminal-journal lock.
+    // Removing both local test references makes the replacement exercise the
+    // same durable-journal handoff.
+    drop(handles.remove(0));
+    drop(cluster.managers.remove(0));
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let old_epoch = old_coordinator.overlay.local_boot_epoch();
     let seeds = [2u16, 3]
         .into_iter()
         .map(|peer| {
@@ -448,16 +621,17 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
             )
         })
         .collect();
-    let (new_transport, new_inbound) = ConnectionManager::start(transport_cfg(
-        &cluster.cluster.pki,
-        0,
-        loopback(old_coordinator.port),
-    ))
+    let (new_transport, new_inbound) =
+        ConnectionManager::start(transport_cfg(&cluster.cluster.pki, 0, loopback(old_port)))
+            .await
+            .unwrap();
+    let new_overlay = OverlayNetwork::start(
+        new_transport.clone(),
+        new_inbound,
+        overlay_cfg(seeds).with_persistence_dir(cluster.persistence_dir(0).to_path_buf()),
+    )
     .await
     .unwrap();
-    let new_overlay = OverlayNetwork::start(new_transport.clone(), new_inbound, overlay_cfg(seeds))
-        .await
-        .unwrap();
     assert!(
         new_overlay.local_boot_epoch() > old_epoch,
         "same-ID restart did not advance the incarnation"
@@ -470,20 +644,46 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
         .await,
         "restarted coordinator did not rejoin routing"
     );
-
     let new_manager = ReplicationManager::with_config(new_overlay.clone(), cfg);
     let new_repo = CountingStrictRepo::new();
     let new_handle = new_manager
         .register_strict("channels-restart", new_repo.clone())
         .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            new_overlay.minimum_strict_replication_protocol_version()
+                >= STRICT_REPLICATION_PROTOCOL_VERSION
+                && [2u16, 3].into_iter().all(|node| {
+                    cluster
+                        .cluster
+                        .node(node)
+                        .overlay
+                        .minimum_strict_replication_protocol_version()
+                        >= STRICT_REPLICATION_PROTOCOL_VERSION
+                })
+        })
+        .await,
+        "restarted strict protocol capability did not converge after repository registration: restarted={}, node2={}, node3={}",
+        new_overlay.minimum_strict_replication_protocol_version(),
+        cluster
+            .cluster
+            .node(2)
+            .overlay
+            .minimum_strict_replication_protocol_version(),
+        cluster
+            .cluster
+            .node(3)
+            .overlay
+            .minimum_strict_replication_protocol_version()
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let version = match timeout(Duration::from_secs(20), handles[1].propose(2222)).await {
+    let version = match timeout(Duration::from_secs(20), handles[0].propose(2222)).await {
         Ok(Ok(version)) => version,
         result => panic!(
             "old pending proposal wedged the restarted node ID: result={result:?}, node2={:?}, node3={:?}, restarted={:?}",
+            handles[0].debug_state(),
             handles[1].debug_state(),
-            handles[2].debug_state(),
             new_handle.debug_state(),
         ),
     };
@@ -718,26 +918,42 @@ async fn strict_quorum_lost_on_partition() {
     cluster.shutdown().await;
 }
 
-/// Checks channel repository history election across a real split-heal.
-/// Expected: after {1,2}|{3,4} diverge, healing elects the longest/freshest
-/// channel history and installs that snapshot on the losing side, removing
-/// channels that only existed in the shorter partition history.
+/// Checks durable v2 terminal-state convergence across a real split-heal.
+/// Expected: after {1,2}|{3,4} diverge, healing retains every terminally
+/// committed channel operation rather than allowing a history snapshot to
+/// roll back the shorter partition's completed operation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn strict_channel_repository_split_heal_elects_one_complete_history() {
+async fn strict_channel_repository_split_heal_preserves_all_terminal_commits() {
+    let node_ids = [1u16, 2, 3, 4];
+    // Keep these roots alive for the full test, including the reopen check
+    // after the overlay/runtime has released its repository handles.
+    let channel_storage_dirs = node_ids
+        .iter()
+        .map(|_| tempfile::tempdir().expect("strict channel repository storage dir"))
+        .collect::<Vec<_>>();
     let cfg = ReplicationConfig::default()
         .with_delivery_tick_interval(Duration::from_millis(25))
         .with_strict_bootstrap_retry_interval(Duration::from_millis(100));
-    let cluster = ReplCluster::build_full_mesh_fast_failure_with_config(&[1, 2, 3, 4], cfg).await;
-    let repos: Vec<Arc<ChannelRepository>> = [1u16, 2, 3, 4]
-        .into_iter()
-        .map(|node_id| {
-            ChannelRepository::new_in_memory(
+    let cluster = ReplCluster::build_full_mesh_fast_failure_with_config(&node_ids, cfg).await;
+    let mut repos = Vec::with_capacity(node_ids.len());
+    for (index, node_id) in node_ids.into_iter().enumerate() {
+        repos.push(
+            ChannelRepository::open(
                 node_id,
+                channel_storage_dirs[index].path(),
                 ChannelRootConfig::new("Root"),
                 channel_tuning(),
             )
-        })
-        .collect();
+            .await
+            .expect("open durable strict channel repository"),
+        );
+    }
+    assert!(
+        repos
+            .iter()
+            .all(|repo| repo.strict_operation_durability_enabled()),
+        "split-heal must exercise the durable v2 repository boundary"
+    );
     let mut handles = Vec::new();
     for (i, repo) in repos.iter().enumerate() {
         handles.push(
@@ -838,10 +1054,10 @@ async fn strict_channel_repository_split_heal_elects_one_complete_history() {
         "routing did not reconverge after partition heal"
     );
 
-    let healed = wait_for_elected_channel_history(&repos, Duration::from_secs(45)).await;
+    let healed = wait_for_converged_channel_history(&repos, Duration::from_secs(45)).await;
     if !healed {
         panic!(
-            "healed cluster did not converge on the elected channel history: {:?}",
+            "healed cluster did not converge on all terminal channel commits: {:?}",
             channel_history_status(&repos).await
         );
     }
@@ -863,8 +1079,52 @@ async fn strict_channel_repository_split_heal_elects_one_complete_history() {
     for names_for_repo in &names[1..] {
         assert_eq!(names_for_repo, &names[0]);
     }
+    assert_eq!(
+        names[0],
+        vec![
+            "Root".to_owned(),
+            "common-10".to_owned(),
+            "common-11".to_owned(),
+            "left-20".to_owned(),
+            "left-21".to_owned(),
+            "left-22".to_owned(),
+            "right-30".to_owned(),
+        ],
+        "all replicas must expose the same deterministic union of terminal commits"
+    );
+
+    let expected_operation_ids = repos[0].strict_operation_ids();
+    assert_eq!(
+        expected_operation_ids.len(),
+        6,
+        "the converged history must retain every committed strict operation id"
+    );
+    for repo in &repos[1..] {
+        assert_eq!(
+            repo.strict_operation_ids(),
+            expected_operation_ids,
+            "all replicas must retain the same sorted operation-id ledger"
+        );
+    }
 
     cluster.shutdown().await;
+    drop(handles);
+    drop(repos);
+    drop(cluster);
+
+    for (node_id, storage_dir) in [1u16, 2, 3, 4].into_iter().zip(&channel_storage_dirs) {
+        let reopened = ChannelRepository::open(
+            node_id,
+            storage_dir.path(),
+            ChannelRootConfig::new("Root"),
+            channel_tuning(),
+        )
+        .await
+        .expect("reopen durable strict channel repository");
+        assert!(reopened.strict_operation_durability_enabled());
+        assert_eq!(reopened.current_version(), 6);
+        assert_eq!(reopened.strict_operation_ids(), expected_operation_ids);
+    }
 }
 
 /// Checks strict-replication behavior when a quorum never forms but membership
@@ -980,6 +1240,21 @@ async fn strict_unreachable_node_during_replication_survives() {
     }
 }
 
+/// Current negotiated protocol floor as observed from each test node.
+fn strict_protocol_floors(cluster: &ReplCluster) -> Vec<(u16, u32)> {
+    cluster
+        .cluster
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.overlay.local_node_id(),
+                node.overlay.minimum_strict_replication_protocol_version(),
+            )
+        })
+        .collect()
+}
+
 /// Checks strict replication while direct cross-node links fail in a hostile,
 /// randomly shaped but deterministic network.
 /// Expected: each proposal routes around detected transient link cuts; no
@@ -1009,6 +1284,20 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
                 .unwrap(),
         );
     }
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            cluster
+                .managers
+                .iter()
+                .all(|manager| manager.strict_capability_activation_ready())
+                && strict_protocol_floors(&cluster)
+                    .iter()
+                    .all(|(_, version)| *version == STRICT_REPLICATION_PROTOCOL_VERSION)
+        })
+        .await,
+        "automatic strict capability activation did not converge before hostile-link injection: floors={:?}",
+        strict_protocol_floors(&cluster),
+    );
     for node in &cluster.cluster.nodes {
         node.chaos.set_jitter(Some(Duration::from_millis(40)));
     }
@@ -1073,22 +1362,66 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
         .await;
         assert!(
             strict_idle,
-            "strict history election did not quiesce while hostile links were failing: states={:?}",
+            "strict history election did not quiesce while hostile links were failing: protocol_floors={:?}, states={:?}",
+            strict_protocol_floors(&cluster),
             handles
                 .iter()
                 .map(|handle| handle.debug_state())
                 .collect::<Vec<_>>()
         );
 
+        assert!(
+            wait_until(Duration::from_secs(8), || {
+                cluster
+                    .managers
+                    .iter()
+                    .all(|manager| manager.strict_capability_activation_ready())
+                    && strict_protocol_floors(&cluster)
+                        .iter()
+                        .all(|(_, version)| *version == STRICT_REPLICATION_PROTOCOL_VERSION)
+            })
+            .await,
+            "strict capability floor did not remain v2 while hostile links were failing: round={round}, blocked_pairs={blocked_pairs:?}, floors={:?}",
+            strict_protocol_floors(&cluster),
+        );
+
         let proposer = rng.random_range(0..handles.len());
         let handle = handles[proposer].clone();
         let expected_version = round + 1;
-        let task = tokio::spawn(async move { handle.propose(9000 + round).await });
-        let version = timeout(Duration::from_secs(30), task)
-            .await
-            .unwrap_or_else(|_| panic!("proposal hung while cross-node links were failing: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}"))
+        let mut task = tokio::spawn(async move { handle.propose(9000 + round).await });
+        let deadline = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(deadline);
+        let mut last_phase_progress = None;
+        let mut last_phase_accept_acks = None;
+        let task_result = loop {
+            tokio::select! {
+                result = &mut task => break result,
+                _ = &mut deadline => {
+                    panic!(
+                        "proposal hung while cross-node links were failing: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}, protocol_floors={:?}, last_phase_progress={last_phase_progress:?}, states={:?}",
+                        strict_protocol_floors(&cluster),
+                        handles
+                            .iter()
+                            .map(|handle| handle.debug_state())
+                            .collect::<Vec<_>>()
+                    );
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    let state = handles[proposer].debug_state();
+                    if let Some(progress) = state.local_proposal_quorum() {
+                        last_phase_progress = Some(progress);
+                        last_phase_accept_acks = Some(
+                            state
+                                .local_proposal_accept_acks()
+                                .map(|acks| acks.to_vec()),
+                        );
+                    }
+                }
+            }
+        };
+        let version = task_result
             .unwrap_or_else(|e| panic!("proposal task panicked while cross-node links were failing: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}, join_error={e}"))
-            .unwrap_or_else(|e| panic!("strict replication should route around hostile link failures: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}, error={e:?}, states={:?}", handles.iter().map(|h| h.debug_state()).collect::<Vec<_>>()));
+            .unwrap_or_else(|e| panic!("strict replication should route around hostile link failures: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}, error={e:?}, protocol_floors={:?}, last_phase_progress={last_phase_progress:?}, last_phase_accept_acks={last_phase_accept_acks:?}, states={:?}", strict_protocol_floors(&cluster), handles.iter().map(|h| h.debug_state()).collect::<Vec<_>>()));
         assert_eq!(version, expected_version);
 
         let ok = wait_until(Duration::from_secs(15), || {
@@ -1099,10 +1432,15 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
         .await;
         assert!(
             ok,
-            "replicas did not converge after round {round}: versions = {:?}",
+            "replicas did not converge after round {round}: versions = {:?}, blocked_pairs = {blocked_pairs:?}, protocol_floors = {:?}, states = {:?}",
             repos
                 .iter()
                 .map(|r| r.current_version())
+                .collect::<Vec<_>>(),
+            strict_protocol_floors(&cluster),
+            handles
+                .iter()
+                .map(|handle| handle.debug_state())
                 .collect::<Vec<_>>()
         );
 

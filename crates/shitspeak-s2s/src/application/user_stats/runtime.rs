@@ -492,6 +492,7 @@ mod tests {
                 let target = target.expect("inbound not yet wired");
                 target.handle(OverlayInboundMessage {
                     from,
+                    origin_boot_epoch: 0,
                     level: USER_STATS_LEVEL,
                     class: USER_STATS_CLASS,
                     body,
@@ -563,6 +564,7 @@ mod tests {
         let bytes = proto::encode_user_stats(&env).unwrap();
         owner.inbound_handler().handle(OverlayInboundMessage {
             from: 5,
+            origin_boot_epoch: 0,
             level: USER_STATS_LEVEL,
             class: USER_STATS_CLASS,
             body: bytes,

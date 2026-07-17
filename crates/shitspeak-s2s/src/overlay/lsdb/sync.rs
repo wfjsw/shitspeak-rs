@@ -246,6 +246,7 @@ mod tests {
             transit_disabled: false,
             replication_services: super::super::store::ReplicationServices::ALL,
             application_services: super::super::store::ApplicationServices::ALL,
+            strict_replication_protocol_version: 0,
         }
     }
 

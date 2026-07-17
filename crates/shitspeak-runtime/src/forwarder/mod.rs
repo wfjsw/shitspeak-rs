@@ -375,7 +375,18 @@ fn start_forwarder_replications(
 ) -> Result<Arc<ReplicationManager>, Box<dyn Error>> {
     let manager = ReplicationManager::with_config(overlay, manager_config);
     if config.services.strict() {
-        register_strict_topics(&manager, &repositories, &config.strict_topics)?;
+        manager.set_expected_strict_topics(config.strict_topics.iter().cloned());
+        let install_channel_resolver =
+            register_strict_topics(&manager, &repositories, &config.strict_topics)?;
+        if !manager.strict_capability_activation_ready() {
+            warn!(
+                expected_topics = ?config.strict_topics,
+                "forwarder strict replication remains at v0 until every configured repository and its authenticated v2 frame prerequisites are ready"
+            );
+        }
+        if install_channel_resolver {
+            install_channel_replication_resolver(&manager, repositories.channels.clone());
+        }
     }
     if config.services.content() {
         register_content_topics(&manager, &repositories, &config.content_topics)?;
@@ -387,28 +398,21 @@ fn register_strict_topics(
     manager: &Arc<ReplicationManager>,
     repositories: &ForwarderRepositories,
     topics: &[String],
-) -> Result<(), Box<dyn Error>> {
-    if topics
+) -> Result<bool, Box<dyn Error>> {
+    let install_channel_resolver = topics
         .iter()
-        .any(|topic| server_id_from_channel_topic(topic).is_some())
-    {
-        install_channel_replication_resolver(manager, repositories.channels.clone());
-    }
+        .any(|topic| server_id_from_channel_topic(topic).is_some());
     for topic in topics {
         if topic == "bans" {
-            manager.register_strict(
-                topic.clone(),
-                Arc::new(BanReplicationAdapter::new(repositories.bans.clone())),
-            )?;
+            let repo = Arc::new(BanReplicationAdapter::new(repositories.bans.clone()));
+            manager.register_strict(topic.clone(), repo)?;
         } else if let Some(server_id) = server_id_from_channel_topic(topic) {
-            manager.register_strict(
-                topic.clone(),
-                Arc::new(ChannelReplicationAdapter::new(
-                    server_id,
-                    repositories.channels.clone(),
-                    None,
-                )),
-            )?;
+            let repo = Arc::new(ChannelReplicationAdapter::new(
+                server_id,
+                repositories.channels.clone(),
+                None,
+            ));
+            manager.register_strict(topic.clone(), repo)?;
         } else {
             return Err(format!(
                 "unsupported s2s-forwarder strict replication topic {topic:?}; supported topics are \"bans\", \"channels\", and \"channels:<server_id>\""
@@ -416,7 +420,7 @@ fn register_strict_topics(
             .into());
         }
     }
-    Ok(())
+    Ok(install_channel_resolver)
 }
 
 fn register_content_topics(

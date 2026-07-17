@@ -563,6 +563,15 @@ route_transit_messages = true
 propose_ttl_ms = 10000
 propose_semaphore_size = 32
 strict_max_catchup_ops = 256
+# Must accommodate every persisted terminal decision plus its authenticated
+# catchup envelope. If startup quarantines an old decision, raise the
+# effective frame budget or migrate/compact the terminal journal and restart.
+strict_max_catchup_bytes = 524288
+# Aggregate retained-image bound for all resumable v2 strict snapshot source
+# pins and receiver assemblies in one strict-topic runtime. This is not a
+# capability switch; size it for concurrent transfers and the durable
+# Channel/Ban state, not just one snapshot.
+strict_max_snapshot_transfer_bytes = 67108864
 strict_bootstrap_retry_interval_ms = 500
 strict_steady_state_catchup_interval_ms = 5000
 blob_chunk_size = 65536

@@ -419,6 +419,7 @@ mod tests {
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
             application_services: ApplicationServices::ALL,
+            strict_replication_protocol_version: 0,
         }
     }
 

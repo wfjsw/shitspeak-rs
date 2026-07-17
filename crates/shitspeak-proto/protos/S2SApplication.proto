@@ -154,6 +154,11 @@ message VoiceRepairRequest {
   uint64 last_seq       = 4;
   uint64 request_sent_unix_ms = 5;
   uint32 request_ttl_ms       = 6;
+  // When set, this is an acknowledgement that `last_seq` was emitted
+  // contiguously and was the terminator for the sender's utterance. The
+  // The existing repair service carries the acknowledgement. Older peers
+  // decode it as a harmless one-frame repair request.
+  bool tail_ack          = 7;
 }
 
 message VoiceIntent {

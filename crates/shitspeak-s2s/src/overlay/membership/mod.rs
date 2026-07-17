@@ -61,6 +61,7 @@ pub struct MemberSnapshot {
     max_users: u64,
     replication_services: ReplicationServices,
     application_services: ApplicationServices,
+    strict_replication_protocol_version: u32,
 }
 
 impl MemberSnapshot {
@@ -90,6 +91,12 @@ impl MemberSnapshot {
 
     pub fn application_services(&self) -> ApplicationServices {
         self.application_services.clone()
+    }
+
+    /// Cumulative strict-replication protocol version advertised by this
+    /// member. Zero means this member is a legacy peer.
+    pub fn strict_replication_protocol_version(&self) -> u32 {
+        self.strict_replication_protocol_version
     }
 
     /// Whether this alive member can relay the requested generic
@@ -188,6 +195,7 @@ impl MembershipTable {
                 max_users: e.max_users,
                 replication_services: e.replication_services,
                 application_services: e.application_services.clone(),
+                strict_replication_protocol_version: e.strict_replication_protocol_version(),
             })
             .collect();
         out.sort_by_key(|m| m.node_id);
@@ -207,6 +215,7 @@ impl MembershipTable {
             max_users: e.max_users,
             replication_services: e.replication_services,
             application_services: e.application_services.clone(),
+            strict_replication_protocol_version: e.strict_replication_protocol_version(),
         })
     }
 
@@ -335,6 +344,37 @@ impl MembershipTable {
     }
 }
 
+/// Minimum strict-replication protocol version among the provided active
+/// members after excluding quarantined identities. Returning zero for an
+/// empty input preserves the fail-closed rolling-upgrade gate.
+pub(crate) fn minimum_strict_replication_protocol_version(
+    members: impl IntoIterator<Item = MemberSnapshot>,
+    is_quarantined: impl Fn(NodeIdentifier) -> bool,
+) -> u32 {
+    members
+        .into_iter()
+        .filter(|member| member.status().is_reachable())
+        .filter(|member| !is_quarantined(member.node_id()))
+        .map(|member| member.strict_replication_protocol_version())
+        .min()
+        .unwrap_or_default()
+}
+
+/// Count active, non-quarantined members that cannot understand the requested
+/// cumulative strict-replication protocol version.
+pub(crate) fn unsupported_strict_replication_protocol_peers(
+    members: impl IntoIterator<Item = MemberSnapshot>,
+    required_version: u32,
+    is_quarantined: impl Fn(NodeIdentifier) -> bool,
+) -> usize {
+    members
+        .into_iter()
+        .filter(|member| member.status().is_reachable())
+        .filter(|member| !is_quarantined(member.node_id()))
+        .filter(|member| member.strict_replication_protocol_version() < required_version)
+        .count()
+}
+
 /// Construct an `Arc<MembershipTable>` together with its event broadcaster.
 pub fn new_table(
     self_id: NodeIdentifier,
@@ -368,6 +408,7 @@ mod tests {
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
             application_services: ApplicationServices::ALL,
+            strict_replication_protocol_version: 0,
         }
     }
 
@@ -433,6 +474,48 @@ mod tests {
                 .unwrap()
                 .application_services()
                 .voice()
+        );
+    }
+
+    #[test]
+    fn minimum_strict_replication_protocol_version_fails_closed() {
+        let floor = Arc::new(LsaFloor::new(0, None));
+        let lsdb = Arc::new(LinkStateDb::new(floor));
+        let (table, _) = new_table(1, lsdb.clone(), 8);
+
+        let mut v1 = entry(1, 1, false, 100);
+        v1.strict_replication_protocol_version = 1;
+        let mut legacy = entry(2, 1, false, 100);
+        legacy.strict_replication_protocol_version = 0;
+        let mut v2 = entry(3, 1, false, 100);
+        v2.strict_replication_protocol_version = 2;
+        let mut departed = entry(4, 1, true, 100);
+        departed.strict_replication_protocol_version = 0;
+
+        lsdb.admit(v1);
+        lsdb.admit(legacy);
+        lsdb.admit(v2);
+        lsdb.admit(departed);
+
+        assert_eq!(
+            minimum_strict_replication_protocol_version(table.snapshot(), |_| false),
+            0
+        );
+        assert_eq!(
+            minimum_strict_replication_protocol_version(table.snapshot(), |node| node == 2),
+            1
+        );
+        assert_eq!(
+            minimum_strict_replication_protocol_version(Vec::new(), |_| false),
+            0
+        );
+        assert_eq!(
+            unsupported_strict_replication_protocol_peers(table.snapshot(), 1, |_| false),
+            1
+        );
+        assert_eq!(
+            unsupported_strict_replication_protocol_peers(table.snapshot(), 1, |node| node == 2),
+            0
         );
     }
 }

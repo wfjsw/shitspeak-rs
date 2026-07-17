@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::status::PrometheusSample;
@@ -69,6 +69,32 @@ pub(crate) enum ReplicationPipelineStage {
     BlobStore,
 }
 
+/// Terminal outcome chosen for a stalled strict proposal.
+///
+/// The labels intentionally describe only the bounded protocol outcome; topic
+/// and operation identifiers would create unbounded Prometheus cardinality.
+#[derive(Clone, Copy)]
+pub(crate) enum StrictResolutionOutcome {
+    Commit,
+    Abort,
+}
+
+impl StrictResolutionOutcome {
+    fn index(self) -> usize {
+        match self {
+            Self::Commit => 0,
+            Self::Abort => 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Abort => "abort",
+        }
+    }
+}
+
 impl ReplicationPipelineStage {
     fn index(self) -> usize {
         match self {
@@ -108,6 +134,7 @@ impl ReplicationPipelineStage {
 const CATCHUP_MODE_COUNT: usize = 2;
 const REPLICATION_PIPELINE_KIND_COUNT: usize = 4;
 const REPLICATION_PIPELINE_STAGE_COUNT: usize = 12;
+const STRICT_RESOLUTION_OUTCOME_COUNT: usize = 2;
 const REPLICATION_PIPELINE_KINDS: [ReplicationPipelineKind; REPLICATION_PIPELINE_KIND_COUNT] = [
     ReplicationPipelineKind::Strict,
     ReplicationPipelineKind::Owner,
@@ -171,6 +198,16 @@ static CLIENT_REPLICATION_QUEUE_WAIT_TOTAL_US: AtomicU64 = AtomicU64::new(0);
 static CLIENT_REPLICATION_QUEUE_WAIT_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static CLIENT_REPLICATION_QUEUE_WAIT_BUCKETS: [AtomicU64; CLIENT_QUEUE_BUCKETS_US.len()] =
     [const { AtomicU64::new(0) }; CLIENT_QUEUE_BUCKETS_US.len()];
+
+// These values are refreshed from the negotiated, alive-member capability
+// snapshot. They are local observations of cluster state, rather than
+// per-topic state, so they deliberately carry no topic or peer labels.
+static STRICT_REPLICATION_CLUSTER_PROTOCOL_VERSION: AtomicU32 = AtomicU32::new(0);
+static STRICT_REPLICATION_TERMINAL_RESOLUTION_READY: AtomicBool = AtomicBool::new(false);
+static STRICT_REPLICATION_UNSUPPORTED_ACTIVE_PEERS: AtomicUsize = AtomicUsize::new(0);
+static STRICT_REPLICATION_TERMINAL_DECISIONS: [AtomicU64; STRICT_RESOLUTION_OUTCOME_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_RESOLUTION_OUTCOME_COUNT];
+static STRICT_REPLICATION_FENCE_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 
 fn increment(value: &AtomicU64, amount: u64) {
     value.fetch_add(amount, Ordering::Relaxed);
@@ -248,6 +285,31 @@ pub fn record_client_replication_queue_wait(wait: std::time::Duration) {
         &CLIENT_QUEUE_BUCKETS_US,
         wait_us,
     );
+}
+
+/// Publishes the strict-replication protocol negotiated across alive peers.
+///
+/// `cluster_version` is the minimum advertised incremental protocol version,
+/// `ready` reports whether terminal resolution may be emitted, and
+/// `unsupported_active_peers` exposes why a rollout has not become ready.
+pub(crate) fn set_strict_replication_protocol_status(
+    cluster_version: u32,
+    ready: bool,
+    unsupported_active_peers: usize,
+) {
+    STRICT_REPLICATION_CLUSTER_PROTOCOL_VERSION.store(cluster_version, Ordering::Relaxed);
+    STRICT_REPLICATION_TERMINAL_RESOLUTION_READY.store(ready, Ordering::Relaxed);
+    STRICT_REPLICATION_UNSUPPORTED_ACTIVE_PEERS.store(unsupported_active_peers, Ordering::Relaxed);
+}
+
+/// Records a terminal decision applied by the strict-resolution protocol.
+pub(crate) fn record_strict_resolution(outcome: StrictResolutionOutcome) {
+    increment(&STRICT_REPLICATION_TERMINAL_DECISIONS[outcome.index()], 1);
+}
+
+/// Records a late or conflicting strict frame rejected by a resolution fence.
+pub(crate) fn record_strict_fence_rejection() {
+    increment(&STRICT_REPLICATION_FENCE_REJECTIONS, 1);
 }
 
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
@@ -343,5 +405,92 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         ));
     }
 
+    samples.extend(strict_protocol_metric_samples(
+        STRICT_REPLICATION_CLUSTER_PROTOCOL_VERSION.load(Ordering::Relaxed),
+        STRICT_REPLICATION_TERMINAL_RESOLUTION_READY.load(Ordering::Relaxed),
+        STRICT_REPLICATION_UNSUPPORTED_ACTIVE_PEERS.load(Ordering::Relaxed),
+        [
+            STRICT_REPLICATION_TERMINAL_DECISIONS[StrictResolutionOutcome::Commit.index()]
+                .load(Ordering::Relaxed),
+            STRICT_REPLICATION_TERMINAL_DECISIONS[StrictResolutionOutcome::Abort.index()]
+                .load(Ordering::Relaxed),
+        ],
+        STRICT_REPLICATION_FENCE_REJECTIONS.load(Ordering::Relaxed),
+    ));
+
     samples
+}
+
+fn strict_protocol_metric_samples(
+    cluster_protocol_version: u32,
+    terminal_resolution_ready: bool,
+    unsupported_active_peers: usize,
+    terminal_decisions: [u64; STRICT_RESOLUTION_OUTCOME_COUNT],
+    fence_rejections: u64,
+) -> Vec<PrometheusSample> {
+    let mut samples = Vec::with_capacity(6);
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_cluster_protocol_version",
+        Vec::new(),
+        cluster_protocol_version as f64,
+    ));
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_terminal_resolution_ready",
+        Vec::new(),
+        terminal_resolution_ready as u8 as f64,
+    ));
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_unsupported_active_peers",
+        Vec::new(),
+        unsupported_active_peers as f64,
+    ));
+    for outcome in [
+        StrictResolutionOutcome::Commit,
+        StrictResolutionOutcome::Abort,
+    ] {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_terminal_decisions_total",
+            vec![("outcome".to_owned(), outcome.label().to_owned())],
+            terminal_decisions[outcome.index()] as f64,
+        ));
+    }
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_fence_rejections_total",
+        Vec::new(),
+        fence_rejections as f64,
+    ));
+    samples
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_protocol_metrics_expose_readiness_and_terminal_outcomes() {
+        let samples = strict_protocol_metric_samples(2, true, 2, [1, 1], 1);
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_cluster_protocol_version"
+                && sample.value() == 2.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_terminal_resolution_ready"
+                && sample.value() == 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_unsupported_active_peers"
+                && sample.value() == 2.0
+        }));
+        for outcome in ["commit", "abort"] {
+            assert!(samples.iter().any(|sample| {
+                sample.name() == "shitspeak_s2s_strict_replication_terminal_decisions_total"
+                    && sample.labels() == [("outcome".to_owned(), outcome.to_owned())]
+                    && sample.value() == 1.0
+            }));
+        }
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_fence_rejections_total"
+                && sample.value() == 1.0
+        }));
+    }
 }

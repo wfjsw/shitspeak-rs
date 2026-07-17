@@ -8,6 +8,7 @@
 pub mod catchup;
 pub mod propose;
 pub mod runtime;
+pub(crate) mod terminal_journal;
 
 use std::sync::Arc;
 
@@ -46,6 +47,65 @@ pub struct StrictLogEntry<Op> {
     pub metadata: Option<StrictLogMetadata>,
 }
 
+/// Failure while capturing or installing a strict-replication snapshot.
+///
+/// Snapshot failures are recoverable protocol events: catchup must retain
+/// its history election and retry rather than treating a partial or rejected
+/// snapshot as installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StrictSnapshotErrorKind {
+    Semantic,
+    Durability,
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("strict snapshot failed: {message}")]
+pub struct StrictSnapshotError {
+    message: String,
+    kind: StrictSnapshotErrorKind,
+}
+
+impl StrictSnapshotError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: StrictSnapshotErrorKind::Semantic,
+        }
+    }
+
+    /// Construct an error proving that this replica could not durably install
+    /// a snapshot. The strict runtime withdraws its advertised protocol
+    /// capability for this process when it observes this result.
+    pub fn durability_failure(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: StrictSnapshotErrorKind::Durability,
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn is_durability_failure(&self) -> bool {
+        self.kind == StrictSnapshotErrorKind::Durability
+    }
+}
+
+/// Result of passing a terminally committed operation through the
+/// repository's operation-id idempotency boundary.
+///
+/// A v1 strict implementation must retain the operation id together with
+/// the application state. After a crash, the terminal journal deliberately
+/// replays the committed value; `AlreadyApplied` is therefore a successful
+/// delivery result, not an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrictCommitApplyOutcome {
+    Applied,
+    AlreadyApplied,
+    Failed,
+}
+
 impl<Op> StrictLogEntry<Op> {
     pub fn new(op: Op) -> Self {
         Self { op, metadata: None }
@@ -81,6 +141,16 @@ impl<Op> StrictLogEntry<Op> {
 pub trait StrictReplicable: Send + Sync + 'static {
     type Op: Serialize + DeserializeOwned + Send + Sync + Clone + 'static;
 
+    /// Highest strict protocol version this repository can apply safely.
+    ///
+    /// Version 1 requires an atomic operation-id ledger that survives the
+    /// repository's normal snapshot/recovery path. The conservative default
+    /// keeps generic implementations on the legacy protocol until they opt
+    /// into that contract.
+    fn strict_replication_protocol_version(&self) -> u32 {
+        0
+    }
+
     /// Latest applied version.
     fn current_version(&self) -> u64;
 
@@ -94,9 +164,12 @@ pub trait StrictReplicable: Send + Sync + 'static {
         }
     }
 
-    /// Atomic snapshot. Returns `(version, msgpack_bytes)` where `version`
-    /// matches the applied state captured by `msgpack_bytes`.
-    fn snapshot(&self) -> (u64, Bytes);
+    /// Atomically capture a snapshot. The returned `version` matches the
+    /// applied state captured by `msgpack_bytes`.
+    ///
+    /// Capture errors must be reported rather than represented as an empty
+    /// snapshot: a responder will fail closed and let the requester retry.
+    fn snapshot(&self) -> Result<(u64, Bytes), StrictSnapshotError>;
 
     /// Ops with version in `(since, current_version]`. Returns
     /// `LogSlice::TooOld` when the structure can no longer satisfy from its
@@ -117,8 +190,39 @@ pub trait StrictReplicable: Send + Sync + 'static {
         self.apply_committed(version, op).await;
     }
 
+    /// Apply a strict operation once using its stable operation id.
+    ///
+    /// Implementations advertising protocol v1 must override this method
+    /// with an atomic, durable operation-id claim. The default preserves the
+    /// legacy trait contract for implementations which remain on v0.
+    async fn apply_committed_once(
+        &self,
+        version: u64,
+        op: Self::Op,
+        metadata: StrictLogMetadata,
+    ) -> StrictCommitApplyOutcome {
+        self.apply_committed_with_metadata(version, op, Some(metadata))
+            .await;
+        StrictCommitApplyOutcome::Applied
+    }
+
     /// Replace local state with the supplied snapshot.
-    async fn install_snapshot(&self, version: u64, snapshot: Bytes);
+    ///
+    /// The implementation must not report success until the snapshot is
+    /// durably installed. On failure, the runtime keeps the history election
+    /// pending and retries from a fresh source.
+    ///
+    /// A v2-capable implementation must reject a replacement snapshot whose
+    /// strict operation-id ledger omits any locally durable terminal operation
+    /// that the replacement could erase. It must not merge that local id into
+    /// the incoming ledger: doing so would turn a required replay into an
+    /// irreversible `AlreadyApplied` result while the operation's state is
+    /// absent.
+    async fn install_snapshot(
+        &self,
+        version: u64,
+        snapshot: Bytes,
+    ) -> Result<(), StrictSnapshotError>;
 }
 
 /// Caller-facing handle for a strict topic. Cloning is cheap (internally an
@@ -128,42 +232,94 @@ pub struct StrictHandle<R: StrictReplicable> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StrictDebugState {
     election_pending: bool,
     election_active: bool,
     can_start_election: bool,
+    history_probe_pending_peers: Option<usize>,
+    history_alive_peers: usize,
+    clock: u64,
+    earliest_pending: Option<((u64, u64), u64, shitspeak_core::NodeIdentifier)>,
+    earliest_pending_protocol_version: Option<u32>,
+    earliest_buffered: Option<((u64, u64), u64)>,
+    /// Oldest local proposal and its phase-one/phase-two quorum progress:
+    /// `(op_id, propose_acks, positive_accept_acks, targets, accept_started, committed)`.
+    local_proposal_quorum: Option<((u64, u64), usize, usize, usize, bool, bool)>,
+    local_proposal_accept_ack_count: Option<usize>,
+    local_proposal_accept_acks: Option<Vec<(shitspeak_core::NodeIdentifier, bool)>>,
+    local_proposal_phase_two_retry: Option<(usize, usize)>,
+    accepted_values: Vec<((u64, u64), u64)>,
     local_proposals: usize,
     pending_proposes: usize,
     buffered_commits: usize,
     unresolved_promises: usize,
+    unresolved_terminal_promises: usize,
     active_recoveries: usize,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl StrictDebugState {
-    pub fn election_pending(self) -> bool {
+    pub fn election_pending(&self) -> bool {
         self.election_pending
     }
-    pub fn election_active(self) -> bool {
+    pub fn election_active(&self) -> bool {
         self.election_active
     }
-    pub fn can_start_election(self) -> bool {
+    pub fn can_start_election(&self) -> bool {
         self.can_start_election
     }
-    pub fn local_proposals(self) -> usize {
+    pub fn history_probe_pending_peers(&self) -> Option<usize> {
+        self.history_probe_pending_peers
+    }
+    pub fn history_alive_peers(&self) -> usize {
+        self.history_alive_peers
+    }
+    pub fn clock(&self) -> u64 {
+        self.clock
+    }
+    pub fn earliest_pending(&self) -> Option<((u64, u64), u64, shitspeak_core::NodeIdentifier)> {
+        self.earliest_pending
+    }
+    pub fn earliest_pending_protocol_version(&self) -> Option<u32> {
+        self.earliest_pending_protocol_version
+    }
+    pub fn earliest_buffered(&self) -> Option<((u64, u64), u64)> {
+        self.earliest_buffered
+    }
+    /// Oldest local proposal's phase-one and phase-two quorum progress:
+    /// `(op_id, propose_acks, positive_accept_acks, targets, accept_started, committed)`.
+    pub fn local_proposal_quorum(&self) -> Option<((u64, u64), usize, usize, usize, bool, bool)> {
+        self.local_proposal_quorum
+    }
+    pub fn local_proposal_accept_ack_count(&self) -> Option<usize> {
+        self.local_proposal_accept_ack_count
+    }
+    pub fn local_proposal_accept_acks(&self) -> Option<&[(shitspeak_core::NodeIdentifier, bool)]> {
+        self.local_proposal_accept_acks.as_deref()
+    }
+    pub fn local_proposal_phase_two_retry(&self) -> Option<(usize, usize)> {
+        self.local_proposal_phase_two_retry
+    }
+    pub fn accepted_values(&self) -> &[((u64, u64), u64)] {
+        &self.accepted_values
+    }
+    pub fn local_proposals(&self) -> usize {
         self.local_proposals
     }
-    pub fn pending_proposes(self) -> usize {
+    pub fn pending_proposes(&self) -> usize {
         self.pending_proposes
     }
-    pub fn buffered_commits(self) -> usize {
+    pub fn buffered_commits(&self) -> usize {
         self.buffered_commits
     }
-    pub fn unresolved_promises(self) -> usize {
+    pub fn unresolved_promises(&self) -> usize {
         self.unresolved_promises
     }
-    pub fn active_recoveries(self) -> usize {
+    pub fn unresolved_terminal_promises(&self) -> usize {
+        self.unresolved_terminal_promises
+    }
+    pub fn active_recoveries(&self) -> usize {
         self.active_recoveries
     }
 }

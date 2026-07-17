@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use enumflags2::BitFlags;
@@ -51,6 +51,31 @@ use shitspeak_core::{DEFAULT_SERVER_ID, StrictReplicationMetadata, default_serve
 use shitspeak_messages::messages::{Message, encoder};
 
 const TEMPORARY_CHANNEL_ID_BIT: u32 = 0x8000_0000;
+
+#[cfg(windows)]
+const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
+#[cfg(windows)]
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+#[cfg(windows)]
+const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+unsafe extern "system" {
+    fn ReplaceFileW(
+        replaced_file_name: *const u16,
+        replacement_file_name: *const u16,
+        backup_file_name: *const u16,
+        replace_flags: u32,
+        exclude: *mut std::ffi::c_void,
+        reserved: *mut std::ffi::c_void,
+    ) -> i32;
+    fn MoveFileExW(
+        existing_file_name: *const u16,
+        new_file_name: *const u16,
+        move_flags: u32,
+    ) -> i32;
+}
 
 pub type ChannelStateSubscription = broadcast::Receiver<Arc<ChannelOperation>>;
 
@@ -86,6 +111,116 @@ impl ChannelRootConfig {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+/// Result of applying a strict-replication operation through the durable
+/// idempotency boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictOperationApplyOutcome {
+    /// This operation id was not previously recorded and the operation was applied.
+    Applied,
+    /// This operation id was already committed, so no state was changed.
+    AlreadyApplied,
+    /// The operation id is unknown, but its version is already covered by
+    /// different committed state. The caller must recover rather than treating
+    /// this as a successful duplicate.
+    VersionConflict,
+}
+
+impl StrictOperationApplyOutcome {
+    pub fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
+/// Stable identifier for a strict operation. `ts_final` deliberately is not
+/// part of the id: a retried operation is identified solely by its op id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StrictOperationId {
+    op_id_hi: u64,
+    op_id_lo: u64,
+}
+
+impl StrictOperationId {
+    pub fn new(op_id_hi: u64, op_id_lo: u64) -> Self {
+        Self { op_id_hi, op_id_lo }
+    }
+
+    pub fn op_id_hi(&self) -> u64 {
+        self.op_id_hi
+    }
+
+    pub fn op_id_lo(&self) -> u64 {
+        self.op_id_lo
+    }
+
+    fn from_metadata(metadata: StrictReplicationMetadata) -> Self {
+        Self::new(metadata.op_id_hi(), metadata.op_id_lo())
+    }
+}
+
+/// A single, internally consistent channel replication snapshot.
+///
+/// The fields remain private so callers cannot construct a bundle whose
+/// channel state, version, and idempotency ledger describe different points in
+/// time. Use [`Self::into_parts`] when serializing it for replication.
+#[derive(Debug, Clone)]
+pub struct ChannelStrictSnapshot {
+    version: u64,
+    channels: Vec<Channel>,
+    freshness: i64,
+    operation_ids: Vec<StrictOperationId>,
+}
+
+impl ChannelStrictSnapshot {
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn channels(&self) -> &[Channel] {
+        &self.channels
+    }
+
+    pub fn freshness(&self) -> i64 {
+        self.freshness
+    }
+
+    pub fn operation_ids(&self) -> &[StrictOperationId] {
+        &self.operation_ids
+    }
+
+    pub fn into_parts(self) -> (u64, Vec<Channel>, i64, Vec<StrictOperationId>) {
+        (
+            self.version,
+            self.channels,
+            self.freshness,
+            self.operation_ids,
+        )
+    }
+}
+
+/// Channel strict topics independently allocate operation ids, so the durable
+/// channel ledger also retains the server scope.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct StrictOperationKey {
+    server_id: String,
+    operation_id: StrictOperationId,
+}
+
+impl StrictOperationKey {
+    fn new(server_id: impl Into<String>, metadata: StrictReplicationMetadata) -> Self {
+        Self {
+            server_id: server_id.into(),
+            operation_id: StrictOperationId::from_metadata(metadata),
+        }
+    }
+
+    fn with_operation_id(server_id: impl Into<String>, operation_id: StrictOperationId) -> Self {
+        Self {
+            server_id: server_id.into(),
+            operation_id,
+        }
     }
 }
 
@@ -345,6 +480,10 @@ struct Snapshot {
     saved_at: i64,
     node_id: u16,
     channels: Vec<SnapshotChannel>,
+    /// Strict operation ids reflected in this snapshot. WAL compaction may
+    /// remove the associated records, so this ledger is part of durable state.
+    #[serde(default)]
+    strict_applied_ops: Vec<StrictOperationKey>,
 }
 
 // ─── ChannelRepository ────────────────────────────────────────────────────────
@@ -514,6 +653,12 @@ pub struct ChannelRepository {
     /// Derived transitive link groups, rebuilt from direct channel links.
     link_topologies: ParkingRwLock<HashMap<String, LinkTopology>>,
     versions: ParkingRwLock<HashMap<String, u64>>,
+    /// Strict operation ids committed through this repository.
+    strict_applied_ops: ParkingRwLock<HashSet<StrictOperationKey>>,
+    /// Serializes every state transition that can affect a replication
+    /// snapshot. In particular, it keeps a strict operation's durable WAL
+    /// record, in-memory state, and op-id ledger in one ordered transaction.
+    strict_apply_lock: AsyncMutex<()>,
     /// In-memory log for `get_log_since` and future S2S queries.
     log: ParkingRwLock<std::collections::VecDeque<ChannelLogEntry>>,
     log_max_entries: usize,
@@ -532,6 +677,14 @@ pub struct ChannelRepository {
     wal_file: Option<AsyncMutex<tokio::fs::File>>,
     /// Number of valid entries currently present in WAL.
     wal_entry_count: AtomicUsize,
+    /// A failed WAL sync has ambiguous durability: the record may already be
+    /// persistent even though the OS returned an error. Do not append further
+    /// records in this process; restart/recovery will reconcile the WAL.
+    wal_poisoned: AtomicBool,
+    #[cfg(test)]
+    force_next_wal_sync_failure: AtomicBool,
+    #[cfg(test)]
+    force_next_snapshot_write_failure: AtomicBool,
     snapshot_every_ops: u64,
     snapshot_every_secs: i64,
     wal_compaction_expire_count: usize,
@@ -568,6 +721,8 @@ impl ChannelRepository {
             channels: ParkingRwLock::new(channels),
             link_topologies: ParkingRwLock::new(HashMap::new()),
             versions: ParkingRwLock::new(versions),
+            strict_applied_ops: ParkingRwLock::new(HashSet::new()),
+            strict_apply_lock: AsyncMutex::new(()),
             log: ParkingRwLock::new(std::collections::VecDeque::new()),
             log_max_entries: tuning.log_max_entries,
             delete_visibility_hints: ParkingRwLock::new(HashMap::new()),
@@ -577,6 +732,11 @@ impl ChannelRepository {
             storage_dir: None,
             wal_file: None,
             wal_entry_count: AtomicUsize::new(0),
+            wal_poisoned: AtomicBool::new(false),
+            #[cfg(test)]
+            force_next_wal_sync_failure: AtomicBool::new(false),
+            #[cfg(test)]
+            force_next_snapshot_write_failure: AtomicBool::new(false),
             snapshot_every_ops: tuning.snapshot_every_ops,
             snapshot_every_secs: tuning.snapshot_every_secs,
             wal_compaction_expire_count: tuning.wal_compaction_expire_count,
@@ -606,7 +766,7 @@ impl ChannelRepository {
         let wal_path = storage_dir.join("channels.wal.jsonl");
 
         // ── 1. Load snapshot ─────────────────────────────────────────────
-        let (mut channels, mut versions, mut history_freshness) =
+        let (mut channels, mut versions, mut history_freshness, mut strict_applied_ops) =
             match tokio::fs::read(&snapshot_path).await {
                 Ok(data) => {
                     let snap: Snapshot = serde_json::from_slice(&data).map_err(|e| {
@@ -626,11 +786,19 @@ impl ChannelRepository {
                     if versions.is_empty() {
                         versions.insert(DEFAULT_SERVER_ID.to_owned(), snap.version);
                     }
-                    (map, versions, snap.history_freshness)
+                    (
+                        map,
+                        versions,
+                        snap.history_freshness,
+                        snap.strict_applied_ops.into_iter().collect(),
+                    )
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    (HashMap::new(), HashMap::new(), HashMap::new())
-                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashMap::new(),
+                    HashSet::new(),
+                ),
                 Err(e) => return Err(ChannelRepoError::WalIo(e)),
             };
 
@@ -661,6 +829,9 @@ impl ChannelRepository {
             };
             let op = record.op;
             let strict_metadata = record.strict_metadata;
+            if let Some(metadata) = strict_metadata {
+                strict_applied_ops.insert(StrictOperationKey::new(&op.server_id, metadata));
+            }
             wal_entry_count += 1;
             history_freshness
                 .entry(op.server_id.clone())
@@ -711,6 +882,8 @@ impl ChannelRepository {
             channels: ParkingRwLock::new(channels),
             link_topologies: ParkingRwLock::new(link_topologies),
             versions: ParkingRwLock::new(versions),
+            strict_applied_ops: ParkingRwLock::new(strict_applied_ops),
+            strict_apply_lock: AsyncMutex::new(()),
             log: ParkingRwLock::new(log_entries),
             log_max_entries: tuning.log_max_entries,
             delete_visibility_hints: ParkingRwLock::new(HashMap::new()),
@@ -720,6 +893,11 @@ impl ChannelRepository {
             storage_dir: Some(storage_dir.to_owned()),
             wal_file: Some(AsyncMutex::new(wal_file)),
             wal_entry_count: AtomicUsize::new(wal_entry_count),
+            wal_poisoned: AtomicBool::new(false),
+            #[cfg(test)]
+            force_next_wal_sync_failure: AtomicBool::new(false),
+            #[cfg(test)]
+            force_next_snapshot_write_failure: AtomicBool::new(false),
             snapshot_every_ops: tuning.snapshot_every_ops,
             snapshot_every_secs: tuning.snapshot_every_secs,
             wal_compaction_expire_count: tuning.wal_compaction_expire_count,
@@ -738,6 +916,133 @@ impl ChannelRepository {
 
     pub fn current_version_in_server(&self, server_id: &str) -> u64 {
         self.versions.read().get(server_id).copied().unwrap_or(0)
+    }
+
+    /// Whether strict operation ids are backed by restart-safe repository
+    /// storage. A poisoned WAL fails closed because its final sync outcome is
+    /// ambiguous until startup recovery reloads it.
+    pub fn strict_operation_durability_enabled(&self) -> bool {
+        self.storage_dir.is_some() && !self.wal_poisoned.load(Ordering::Acquire)
+    }
+
+    /// Return the durable strict operation ids for the default channel scope.
+    pub fn strict_operation_ids(&self) -> Vec<StrictOperationId> {
+        self.strict_operation_ids_in_server(DEFAULT_SERVER_ID)
+    }
+
+    /// Return the durable strict operation ids for one channel scope. These
+    /// ids are intended to accompany an S2S channel snapshot.
+    pub fn strict_operation_ids_in_server(&self, server_id: &str) -> Vec<StrictOperationId> {
+        let mut operation_ids: Vec<_> = self
+            .strict_applied_ops
+            .read()
+            .iter()
+            .filter(|key| key.server_id == server_id)
+            .map(|key| key.operation_id.clone())
+            .collect();
+        operation_ids.sort_unstable_by(|left, right| {
+            (left.op_id_hi, left.op_id_lo).cmp(&(right.op_id_hi, right.op_id_lo))
+        });
+        operation_ids
+    }
+
+    /// Capture channel state and its strict-replication idempotency ledger at
+    /// one write-transaction boundary. This is the only snapshot API that
+    /// v1 strict replication should use.
+    pub async fn strict_snapshot_in_server(&self, server_id: &str) -> ChannelStrictSnapshot {
+        let _write_transaction = self.strict_apply_lock.lock().await;
+        let root_config = self.root_config.read().clone();
+        let channels = self
+            .channels
+            .read()
+            .get(server_id)
+            .map(|channels| {
+                let mut channels: Vec<_> = channels.values().cloned().collect();
+                if !channels.iter().any(|channel| channel.id == 0) {
+                    channels.push(root_channel(&root_config));
+                }
+                channels
+            })
+            .unwrap_or_else(|| vec![root_channel(&root_config)]);
+        let version = self.versions.read().get(server_id).copied().unwrap_or(0);
+        let freshness = self
+            .history_freshness
+            .read()
+            .get(server_id)
+            .copied()
+            .unwrap_or(0);
+        let operation_ids = self.strict_operation_ids_in_server(server_id);
+
+        ChannelStrictSnapshot {
+            version,
+            channels,
+            freshness,
+            operation_ids,
+        }
+    }
+
+    /// Merge strict operation ids received with a snapshot for the default
+    /// channel scope and persist the expanded ledger.
+    pub async fn merge_strict_operation_ids(
+        self: &Arc<Self>,
+        operation_ids: Vec<StrictOperationId>,
+    ) -> Result<(), ChannelRepoError> {
+        self.merge_strict_operation_ids_in_server(DEFAULT_SERVER_ID, operation_ids)
+            .await
+    }
+
+    /// Merge strict operation ids received with a snapshot for one channel
+    /// scope and persist the expanded ledger.
+    pub async fn merge_strict_operation_ids_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        operation_ids: Vec<StrictOperationId>,
+    ) -> Result<(), ChannelRepoError> {
+        let _strict_apply_guard = self.strict_apply_lock.lock().await;
+        self.persist_strict_operation_ids_candidate(server_id, &operation_ids)
+            .await?;
+        self.merge_strict_operation_ids_in_server_unpersisted(server_id, operation_ids);
+        Ok(())
+    }
+
+    /// Make an op-id ledger expansion durable before exposing it in memory.
+    /// The write transaction is held by the caller.
+    async fn persist_strict_operation_ids_candidate(
+        &self,
+        server_id: &str,
+        operation_ids: &[StrictOperationId],
+    ) -> Result<(), ChannelRepoError> {
+        if self.storage_dir.is_none() {
+            return Ok(());
+        }
+
+        let mut applied_operations = self.strict_applied_ops.read().clone();
+        applied_operations.extend(
+            operation_ids
+                .iter()
+                .cloned()
+                .map(|operation_id| StrictOperationKey::with_operation_id(server_id, operation_id)),
+        );
+        let snapshot = self.snapshot_from_state(
+            self.versions.read().clone(),
+            self.history_freshness.read().clone(),
+            applied_operations,
+            self.channels.read().clone(),
+        );
+        self.write_strict_snapshot_candidate(&snapshot).await
+    }
+
+    fn merge_strict_operation_ids_in_server_unpersisted(
+        &self,
+        server_id: &str,
+        operation_ids: Vec<StrictOperationId>,
+    ) {
+        let mut applied_ops = self.strict_applied_ops.write();
+        applied_ops.extend(
+            operation_ids
+                .into_iter()
+                .map(|operation_id| StrictOperationKey::with_operation_id(server_id, operation_id)),
+        );
     }
 
     pub fn latest_timestamp_in_server(&self, server_id: &str) -> i64 {
@@ -804,6 +1109,7 @@ impl ChannelRepository {
     }
 
     pub async fn update_root_channel_config(&self, root_config: ChannelRootConfig) {
+        let _write_transaction = self.strict_apply_lock.lock().await;
         let mut changed_servers = Vec::new();
         {
             let mut current = self.root_config.write();
@@ -1304,6 +1610,7 @@ impl ChannelRepository {
         server_id: &str,
         mut channel: Channel,
     ) -> Result<Channel, ChannelRepoError> {
+        let _write_transaction = self.strict_apply_lock.lock().await;
         let op = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
@@ -1369,6 +1676,7 @@ impl ChannelRepository {
         id: u32,
         patch: ChannelPatch,
     ) -> Result<Channel, ChannelRepoError> {
+        let _write_transaction = self.strict_apply_lock.lock().await;
         let parent_changed = patch.parent_id.is_some();
         let patch = self.normalize_patch_for_channel(id, patch);
         let (op, updated) = {
@@ -1450,6 +1758,7 @@ impl ChannelRepository {
         links_add: Vec<u32>,
         links_remove: Vec<u32>,
     ) -> Result<Channel, ChannelRepoError> {
+        let _write_transaction = self.strict_apply_lock.lock().await;
         let parent_changed = patch.parent_id.is_some();
         let patch = self.normalize_patch_for_channel(id, patch);
         let links_changed = !links_add.is_empty() || !links_remove.is_empty();
@@ -1599,6 +1908,7 @@ impl ChannelRepository {
         nonce: u64,
         evict_clients: bool,
     ) -> Result<Vec<u32>, ChannelRepoError> {
+        let _write_transaction = self.strict_apply_lock.lock().await;
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
@@ -1652,6 +1962,7 @@ impl ChannelRepository {
         id: u32,
         nonce: u64,
     ) -> Result<bool, ChannelRepoError> {
+        let _write_transaction = self.strict_apply_lock.lock().await;
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
@@ -1707,6 +2018,7 @@ impl ChannelRepository {
         id: u32,
         nonce: u64,
     ) -> Result<(), ChannelRepoError> {
+        let _write_transaction = self.strict_apply_lock.lock().await;
         if id == 0 {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
@@ -1743,6 +2055,7 @@ impl ChannelRepository {
         a: u32,
         b: u32,
     ) -> Result<(), ChannelRepoError> {
+        let _write_transaction = self.strict_apply_lock.lock().await;
         if a == b {
             return Ok(()); // no-op; callers should reject same-channel links
         }
@@ -1784,6 +2097,7 @@ impl ChannelRepository {
         a: u32,
         b: u32,
     ) -> Result<(), ChannelRepoError> {
+        let _write_transaction = self.strict_apply_lock.lock().await;
         {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
@@ -1821,6 +2135,7 @@ impl ChannelRepository {
         inherit_acl: bool,
         acls: Vec<ACL>,
     ) -> Result<(), ChannelRepoError> {
+        let _write_transaction = self.strict_apply_lock.lock().await;
         {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
@@ -1996,25 +2311,36 @@ impl ChannelRepository {
     /// Write a snapshot to disk and lazily compact WAL by expiring the
     /// configured number of oldest entries per compaction pass.
     pub async fn save_snapshot(&self) -> Result<(), ChannelRepoError> {
-        let Some(ref dir) = self.storage_dir else {
-            return Ok(());
-        };
-        let snapshot_path = dir.join("channels.snapshot.json");
-        let snapshot_tmp = dir.join("channels.snapshot.json.tmp");
-        let wal_path = dir.join("channels.wal.jsonl");
-        let wal_tmp = dir.join("channels.wal.jsonl.tmp");
+        let _strict_apply_guard = self.strict_apply_lock.lock().await;
+        self.save_snapshot_inner().await
+    }
 
-        let versions = self.versions.read().clone();
-        let history_freshness = self.history_freshness.read().clone();
+    fn snapshot_from_state(
+        &self,
+        versions: HashMap<String, u64>,
+        history_freshness: HashMap<String, i64>,
+        strict_applied_ops: HashSet<StrictOperationKey>,
+        channels_by_server: HashMap<String, HashMap<u32, Channel>>,
+    ) -> Snapshot {
         let version = versions.get(DEFAULT_SERVER_ID).copied().unwrap_or_default();
-        let channels: Vec<SnapshotChannel> = self
-            .channels
-            .read()
-            .iter()
+        let mut strict_applied_ops: Vec<_> = strict_applied_ops.into_iter().collect();
+        strict_applied_ops.sort_unstable_by(|left, right| {
+            (
+                &left.server_id,
+                left.operation_id.op_id_hi,
+                left.operation_id.op_id_lo,
+            )
+                .cmp(&(
+                    &right.server_id,
+                    right.operation_id.op_id_hi,
+                    right.operation_id.op_id_lo,
+                ))
+        });
+        let channels = channels_by_server
+            .into_iter()
             .flat_map(|(server_id, channels)| {
                 channels
-                    .values()
-                    .cloned()
+                    .into_values()
                     .map(|channel| SnapshotChannel {
                         server_id: server_id.clone(),
                         channel: ChannelSnapshotState::from_channel(&channel),
@@ -2023,20 +2349,38 @@ impl ChannelRepository {
             })
             .collect();
 
-        let snap = Snapshot {
+        Snapshot {
             version,
             versions,
             history_freshness,
             saved_at: chrono::Utc::now().timestamp(),
             node_id: self.node_id,
             channels,
+            strict_applied_ops,
+        }
+    }
+
+    async fn write_snapshot_atomically(&self, snapshot: &Snapshot) -> Result<(), ChannelRepoError> {
+        let Some(dir) = self.storage_dir.as_ref() else {
+            return Ok(());
         };
-        let json = serde_json::to_vec(&snap).map_err(|e| ChannelRepoError::WalCorrupt {
+        #[cfg(test)]
+        if self
+            .force_next_snapshot_write_failure
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(ChannelRepoError::WalIo(io::Error::new(
+                io::ErrorKind::Other,
+                "forced channel snapshot write failure",
+            )));
+        }
+        let snapshot_path = dir.join("channels.snapshot.json");
+        let snapshot_tmp = dir.join("channels.snapshot.json.tmp");
+        let json = serde_json::to_vec(snapshot).map_err(|e| ChannelRepoError::WalCorrupt {
             line: 0,
             reason: format!("snapshot serialisation error: {e}"),
         })?;
 
-        // Write snapshot atomically
         {
             let mut file = tokio::fs::OpenOptions::new()
                 .write(true)
@@ -2046,8 +2390,39 @@ impl ChannelRepository {
                 .await?;
             file.write_all(&json).await?;
             file.sync_data().await?;
-        } // file closed here
+        }
+        #[cfg(windows)]
+        replace_file_atomically(&snapshot_tmp, &snapshot_path)?;
+        #[cfg(not(windows))]
         tokio::fs::rename(&snapshot_tmp, &snapshot_path).await?;
+        if let Some(parent) = snapshot_path.parent() {
+            sync_parent_directory(parent)?;
+        }
+        self.last_snapshot_at
+            .store(chrono::Utc::now().timestamp(), Ordering::Release);
+        Ok(())
+    }
+
+    /// Caller must hold `strict_apply_lock` when a strict operation may be
+    /// in flight, so a compacted snapshot cannot omit its durable op-id.
+    async fn save_snapshot_inner(&self) -> Result<(), ChannelRepoError> {
+        let Some(ref dir) = self.storage_dir else {
+            return Ok(());
+        };
+        let wal_path = dir.join("channels.wal.jsonl");
+        let wal_tmp = dir.join("channels.wal.jsonl.tmp");
+
+        let versions = self.versions.read().clone();
+        let history_freshness = self.history_freshness.read().clone();
+        let strict_applied_ops = self.strict_applied_ops.read().clone();
+        let channels_by_server = self.channels.read().clone();
+        let snapshot = self.snapshot_from_state(
+            versions,
+            history_freshness,
+            strict_applied_ops,
+            channels_by_server,
+        );
+        self.write_snapshot_atomically(&snapshot).await?;
 
         // Compact WAL only when it has grown past the replay window.
         let wal_count = self.wal_entry_count.load(Ordering::Acquire);
@@ -2098,6 +2473,9 @@ impl ChannelRepository {
                     tmp_file.sync_data().await?;
                 }
 
+                #[cfg(windows)]
+                replace_file_atomically(&wal_tmp, &wal_path)?;
+                #[cfg(not(windows))]
                 tokio::fs::rename(&wal_tmp, &wal_path).await?;
                 *wal = tokio::fs::OpenOptions::new()
                     .create(true)
@@ -2107,9 +2485,6 @@ impl ChannelRepository {
                 self.wal_entry_count.store(kept, Ordering::Release);
             }
         }
-
-        self.last_snapshot_at
-            .store(chrono::Utc::now().timestamp(), Ordering::Release);
 
         Ok(())
     }
@@ -2165,6 +2540,42 @@ impl ChannelRepository {
             .collect()
     }
 
+    /// Return a contiguous strict-replication history suffix, or `None` when
+    /// the requested version predates retained history. Strict catchup must
+    /// fail closed here and request a snapshot instead of treating a compacted
+    /// tail as a complete log.
+    pub async fn strict_log_entries_since_in_server(
+        &self,
+        server_id: &str,
+        since_version: u64,
+    ) -> Option<Vec<ChannelLogEntry>> {
+        let _write_transaction = self.strict_apply_lock.lock().await;
+        let current_version = self.current_version_in_server(server_id);
+        if since_version >= current_version {
+            return Some(Vec::new());
+        }
+
+        let entries: Vec<_> = self
+            .log
+            .read()
+            .iter()
+            .filter(|entry| entry.op.server_id == server_id && entry.op.version > since_version)
+            .cloned()
+            .collect();
+        let mut expected_version = since_version.checked_add(1)?;
+        for entry in &entries {
+            if entry.op.version != expected_version {
+                return None;
+            }
+            expected_version = expected_version.checked_add(1)?;
+        }
+        if expected_version.checked_sub(1) != Some(current_version) {
+            return None;
+        }
+
+        Some(entries)
+    }
+
     pub async fn acl_affected_channel_ids_for_op(
         &self,
         server_id: &str,
@@ -2185,6 +2596,7 @@ impl ChannelRepository {
         &self,
         op: Arc<ChannelOperation>,
     ) -> Result<(), ChannelRepoError> {
+        let _write_transaction = self.strict_apply_lock.lock().await;
         if op.version <= self.current_version_in_server(&op.server_id) {
             return Ok(());
         }
@@ -2259,13 +2671,90 @@ impl ChannelRepository {
         self: &Arc<Self>,
         op: ChannelOperation,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
-        self.apply_committed_operation_with_metadata(op, None).await
+        let _write_transaction = self.strict_apply_lock.lock().await;
+        self.apply_committed_operation_inner(op, None, None, false)
+            .await
     }
 
+    /// Compatibility entry point for committed operations that carry strict
+    /// metadata. Metadata-bearing operations use the durable op-id ledger;
+    /// callers that must suppress duplicate side effects should use
+    /// [`Self::apply_strict_operation_once`] directly.
     pub async fn apply_committed_operation_with_metadata(
+        self: &Arc<Self>,
+        op: ChannelOperation,
+        strict_metadata: Option<StrictReplicationMetadata>,
+    ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
+        match strict_metadata {
+            Some(metadata) => self
+                .apply_strict_operation_once_inner(op, metadata)
+                .await
+                .map(|(_, op)| op),
+            None => {
+                let _write_transaction = self.strict_apply_lock.lock().await;
+                self.apply_committed_operation_inner(op, None, None, false)
+                    .await
+            }
+        }
+    }
+
+    /// Atomically apply a strict operation at most once for this channel
+    /// scope. The operation id is retained in the snapshot ledger and is
+    /// rebuilt from WAL records during startup.
+    pub async fn apply_strict_operation_once(
+        self: &Arc<Self>,
+        mut op: ChannelOperation,
+        strict_metadata: StrictReplicationMetadata,
+    ) -> Result<StrictOperationApplyOutcome, ChannelRepoError> {
+        if op.server_id.is_empty() {
+            op.server_id = default_server_id();
+        }
+        self.apply_strict_operation_once_inner(op, strict_metadata)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    async fn apply_strict_operation_once_inner(
+        self: &Arc<Self>,
+        mut op: ChannelOperation,
+        strict_metadata: StrictReplicationMetadata,
+    ) -> Result<(StrictOperationApplyOutcome, Arc<ChannelOperation>), ChannelRepoError> {
+        if op.server_id.is_empty() {
+            op.server_id = default_server_id();
+        }
+        let strict_operation_id = StrictOperationKey::new(&op.server_id, strict_metadata);
+        let _strict_apply_guard = self.strict_apply_lock.lock().await;
+
+        if self
+            .strict_applied_ops
+            .read()
+            .contains(&strict_operation_id)
+        {
+            return Ok((StrictOperationApplyOutcome::AlreadyApplied, Arc::new(op)));
+        }
+        if op.version <= self.current_version_in_server(&op.server_id) {
+            return Ok((StrictOperationApplyOutcome::VersionConflict, Arc::new(op)));
+        }
+
+        let op = self.prepare_strict_operation_for_wal(op);
+        self.append_wal_record(&op, Some(strict_metadata)).await?;
+        let committed = self
+            .apply_committed_operation_inner(
+                op,
+                Some(strict_metadata),
+                Some(strict_operation_id),
+                true,
+            )
+            .await?;
+        Ok((StrictOperationApplyOutcome::Applied, committed))
+    }
+
+    async fn apply_committed_operation_inner(
         self: &Arc<Self>,
         mut op: ChannelOperation,
         strict_metadata: Option<StrictReplicationMetadata>,
+        strict_operation_id: Option<StrictOperationKey>,
+        wal_already_persisted: bool,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
         if op.server_id.is_empty() {
             op.server_id = default_server_id();
@@ -2339,7 +2828,13 @@ impl ChannelRepository {
             self.invalidate_acl_cache_for_op_scope(&server_id, affected_acl_channels);
         }
         let committed = self
-            .commit_assigned_operation(op, strict_metadata, deleted_channel_hint)
+            .commit_assigned_operation(
+                op,
+                strict_metadata,
+                deleted_channel_hint,
+                strict_operation_id,
+                wal_already_persisted,
+            )
             .await?;
 
         if let Some((id, nonce)) = evicting_pending_delete {
@@ -2364,11 +2859,24 @@ impl ChannelRepository {
         version: u64,
         channels_snapshot: Vec<Channel>,
     ) -> Result<(), ChannelRepoError> {
-        self.install_s2s_snapshot_in_server(
+        self.install_s2s_snapshot_with_strict_operation_ids(version, channels_snapshot, Vec::new())
+            .await
+    }
+
+    /// Install a default-scope S2S snapshot together with strict operation
+    /// ids already represented by the snapshot.
+    pub async fn install_s2s_snapshot_with_strict_operation_ids(
+        self: &Arc<Self>,
+        version: u64,
+        channels_snapshot: Vec<Channel>,
+        strict_operation_ids: Vec<StrictOperationId>,
+    ) -> Result<(), ChannelRepoError> {
+        self.install_s2s_snapshot_with_strict_operation_ids_in_server(
             DEFAULT_SERVER_ID,
             version,
             channels_snapshot,
             chrono::Utc::now().timestamp(),
+            strict_operation_ids,
         )
         .await
     }
@@ -2379,6 +2887,144 @@ impl ChannelRepository {
         version: u64,
         channels_snapshot: Vec<Channel>,
         freshness: i64,
+    ) -> Result<(), ChannelRepoError> {
+        self.install_s2s_snapshot_with_strict_operation_ids_in_server(
+            server_id,
+            version,
+            channels_snapshot,
+            freshness,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Install an S2S snapshot and atomically merge the strict operation ids
+    /// represented by it before the repository persists the snapshot.
+    ///
+    /// Any replacement snapshot must explicitly include every locally applied
+    /// strict operation id for this server. Merging a missing local id into a
+    /// snapshot that erased that operation's state would make a later replay
+    /// look like an irreversible duplicate.
+    pub async fn install_s2s_snapshot_with_strict_operation_ids_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        version: u64,
+        channels_snapshot: Vec<Channel>,
+        freshness: i64,
+        strict_operation_ids: Vec<StrictOperationId>,
+    ) -> Result<(), ChannelRepoError> {
+        let _strict_apply_guard = self.strict_apply_lock.lock().await;
+        let current_version = self.current_version_in_server(server_id);
+        if version < current_version {
+            tracing::debug!(
+                server_id,
+                current_version,
+                snapshot_version = version,
+                "ignoring stale s2s channel snapshot"
+            );
+            return Ok(());
+        }
+        let incoming_operation_ids: HashSet<_> = strict_operation_ids.iter().cloned().collect();
+        let missing_operation_ids = self
+            .strict_applied_ops
+            .read()
+            .iter()
+            .filter(|operation| {
+                operation.server_id == server_id
+                    && !incoming_operation_ids.contains(&operation.operation_id)
+            })
+            .count();
+        if missing_operation_ids != 0 {
+            return Err(ChannelRepoError::StrictSnapshotOperationIdsIncomplete {
+                missing: missing_operation_ids,
+            });
+        }
+        self.persist_s2s_snapshot_candidate(
+            server_id,
+            version,
+            &channels_snapshot,
+            freshness,
+            &strict_operation_ids,
+        )
+        .await?;
+        self.install_s2s_snapshot_in_server_inner(
+            server_id,
+            version,
+            channels_snapshot,
+            freshness,
+            strict_operation_ids,
+        )
+        .await
+    }
+
+    /// Persist the replacement state before publishing it in memory. A failed
+    /// snapshot write therefore leaves both the visible state and the strict
+    /// operation ledger untouched, allowing catchup to retry safely.
+    async fn persist_s2s_snapshot_candidate(
+        &self,
+        server_id: &str,
+        version: u64,
+        channels_snapshot: &[Channel],
+        freshness: i64,
+        strict_operation_ids: &[StrictOperationId],
+    ) -> Result<(), ChannelRepoError> {
+        if self.storage_dir.is_none() {
+            return Ok(());
+        }
+
+        let root_config = self.root_config.read().clone();
+        let mut channels_by_server = self.channels.read().clone();
+        let mut replacement = HashMap::new();
+        for mut channel in channels_snapshot.iter().cloned() {
+            if channel.id == 0 {
+                channel.name = root_config.name().to_owned();
+            }
+            replacement.insert(channel.id, channel);
+        }
+        ensure_root_channel(&mut replacement, &root_config);
+        channels_by_server.insert(server_id.to_owned(), replacement);
+
+        let mut versions = self.versions.read().clone();
+        versions.insert(server_id.to_owned(), version);
+        let mut history_freshness = self.history_freshness.read().clone();
+        history_freshness.insert(server_id.to_owned(), freshness);
+        let mut applied_operations = self.strict_applied_ops.read().clone();
+        applied_operations.extend(
+            strict_operation_ids
+                .iter()
+                .cloned()
+                .map(|operation_id| StrictOperationKey::with_operation_id(server_id, operation_id)),
+        );
+
+        let snapshot = self.snapshot_from_state(
+            versions,
+            history_freshness,
+            applied_operations,
+            channels_by_server,
+        );
+        self.write_strict_snapshot_candidate(&snapshot).await
+    }
+
+    /// Persist strict snapshot state before exposing it in memory. A failed
+    /// write makes the durable operation-id ledger ambiguous until restart.
+    async fn write_strict_snapshot_candidate(
+        &self,
+        snapshot: &Snapshot,
+    ) -> Result<(), ChannelRepoError> {
+        let result = self.write_snapshot_atomically(snapshot).await;
+        if result.is_err() {
+            self.wal_poisoned.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    async fn install_s2s_snapshot_in_server_inner(
+        self: &Arc<Self>,
+        server_id: &str,
+        version: u64,
+        channels_snapshot: Vec<Channel>,
+        freshness: i64,
+        strict_operation_ids: Vec<StrictOperationId>,
     ) -> Result<(), ChannelRepoError> {
         let (valid_channel_ids, notification_channels, removed_channel_ids) = {
             let mut ids = HashSet::new();
@@ -2414,6 +3060,7 @@ impl ChannelRepository {
             }
             (ids, notification_channels, removed_channel_ids)
         };
+        self.merge_strict_operation_ids_in_server_unpersisted(server_id, strict_operation_ids);
         self.history_freshness
             .write()
             .insert(server_id.to_owned(), freshness);
@@ -2449,12 +3096,6 @@ impl ChannelRepository {
                 repaired,
                 "repaired local clients after s2s channel snapshot install"
             );
-        }
-
-        if self.storage_dir.is_some() {
-            if let Err(e) = self.save_snapshot().await {
-                tracing::warn!("channel snapshot compaction failed after s2s install: {e}");
-            }
         }
 
         Ok(())
@@ -2605,11 +3246,104 @@ impl ChannelRepository {
         Ok(())
     }
 
+    /// The strict write transaction is held by the caller. This dry run
+    /// finalizes fields that depend on current state before the WAL record is
+    /// made durable, without making that state visible in memory.
+    fn prepare_strict_operation_for_wal(&self, mut op: ChannelOperation) -> ChannelOperation {
+        let root_config = self.root_config.read().clone();
+        op.op = normalize_op_for_root(&op.op, &root_config);
+
+        if let ChannelOp::DeleteChannel { id, nonce } = &op.op {
+            let mut channels = self
+                .channels
+                .read()
+                .get(&op.server_id)
+                .cloned()
+                .unwrap_or_default();
+            ensure_root_channel(&mut channels, &root_config);
+            op.emits_client_message =
+                apply_delete_channel_to_map(&mut channels, *id, *nonce).is_some();
+        }
+
+        op
+    }
+
+    /// Append and sync one WAL record before publishing a strict operation.
+    /// Once sync reports an error, durability is ambiguous, so fail closed
+    /// until restart rather than risking duplicate records in this process.
+    async fn append_wal_record(
+        &self,
+        op: &ChannelOperation,
+        strict_metadata: Option<StrictReplicationMetadata>,
+    ) -> Result<(), ChannelRepoError> {
+        let Some(wal_mutex) = self.wal_file.as_ref() else {
+            return Ok(());
+        };
+        if self.wal_poisoned.load(Ordering::Acquire) {
+            return Err(ChannelRepoError::WalIo(io::Error::new(
+                io::ErrorKind::Other,
+                "channel WAL is unavailable after a previous sync failure",
+            )));
+        }
+
+        let record = ChannelWalRecord::new(op, strict_metadata);
+        let mut line =
+            serde_json::to_string(&record).map_err(|e| ChannelRepoError::WalCorrupt {
+                line: 0,
+                reason: format!("WAL serialisation error: {e}"),
+            })?;
+        line.push('\n');
+
+        let mut wal = wal_mutex.lock().await;
+        let original_len = wal.metadata().await?.len();
+        if let Err(error) = wal.write_all(line.as_bytes()).await {
+            self.wal_poisoned.store(true, Ordering::Release);
+            if let Err(truncate_error) = wal.set_len(original_len).await {
+                tracing::warn!(error = ?truncate_error, "failed to truncate partial channel WAL record");
+            }
+            return Err(ChannelRepoError::WalIo(error));
+        }
+
+        #[cfg(test)]
+        if self
+            .force_next_wal_sync_failure
+            .swap(false, Ordering::AcqRel)
+        {
+            self.wal_poisoned.store(true, Ordering::Release);
+            return Err(ChannelRepoError::WalIo(io::Error::new(
+                io::ErrorKind::Other,
+                "forced channel WAL sync failure",
+            )));
+        }
+
+        if let Err(error) = wal.sync_data().await {
+            self.wal_poisoned.store(true, Ordering::Release);
+            return Err(ChannelRepoError::WalIo(error));
+        }
+
+        self.wal_entry_count.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn force_next_wal_sync_failure_for_test(&self) {
+        self.force_next_wal_sync_failure
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn force_next_snapshot_write_failure_for_test(&self) {
+        self.force_next_snapshot_write_failure
+            .store(true, Ordering::Release);
+    }
+
     async fn commit_assigned_operation(
         &self,
         mut op: ChannelOperation,
         strict_metadata: Option<StrictReplicationMetadata>,
         deleted_channel_ids: Option<Vec<u32>>,
+        strict_operation_id: Option<StrictOperationKey>,
+        wal_already_persisted: bool,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
         let root_config = self.root_config.read().clone();
         op.op = normalize_op_for_root(&op.op, &root_config);
@@ -2645,18 +3379,15 @@ impl ChannelRepository {
             .and_modify(|freshness| *freshness = (*freshness).max(op.timestamp))
             .or_insert(op.timestamp);
 
-        if let Some(ref wal_mutex) = self.wal_file {
-            let record = ChannelWalRecord::new(&op, strict_metadata);
-            let mut line =
-                serde_json::to_string(&record).map_err(|e| ChannelRepoError::WalCorrupt {
-                    line: 0,
-                    reason: format!("WAL serialisation error: {e}"),
-                })?;
-            line.push('\n');
-            let mut wal = wal_mutex.lock().await;
-            wal.write_all(line.as_bytes()).await?;
-            wal.sync_data().await?;
-            self.wal_entry_count.fetch_add(1, Ordering::AcqRel);
+        if !wal_already_persisted {
+            self.append_wal_record(&op, strict_metadata).await?;
+        }
+
+        // The WAL has been synced (or this repository is explicitly
+        // in-memory), so the id can now be retained before any automatic
+        // snapshot compaction runs.
+        if let Some(strict_operation_id) = strict_operation_id {
+            self.strict_applied_ops.write().insert(strict_operation_id);
         }
 
         let committed_version = op.version;
@@ -2675,7 +3406,10 @@ impl ChannelRepository {
         let ops_due = committed_version % self.snapshot_every_ops == 0;
         let time_due = now.saturating_sub(last_snapshot) >= self.snapshot_every_secs;
         if self.storage_dir.is_some() && (ops_due || time_due) {
-            if let Err(e) = self.save_snapshot().await {
+            // Every caller holds the write transaction, so taking it again
+            // through `save_snapshot` would deadlock.
+            let result = self.save_snapshot_inner().await;
+            if let Err(e) = result {
                 tracing::warn!("channel snapshot compaction failed: {e}");
             }
         }
@@ -2697,7 +3431,9 @@ impl ChannelRepository {
             "ChannelRepository version counter approaching u64::MAX — likely a bug"
         );
         op.version = version;
-        let _ = self.commit_assigned_operation(op, None, None).await?;
+        let _ = self
+            .commit_assigned_operation(op, None, None, None, false)
+            .await?;
         Ok(())
     }
 
@@ -2720,7 +3456,7 @@ impl ChannelRepository {
         );
         op.version = version;
         let _ = self
-            .commit_assigned_operation(op, None, deleted_channel_ids)
+            .commit_assigned_operation(op, None, deleted_channel_ids, None, false)
             .await?;
         Ok(())
     }
@@ -2739,6 +3475,70 @@ impl ChannelRepository {
 }
 
 // ─── free functions used both by open() replay and by mutation methods ────────
+
+#[cfg(windows)]
+fn replace_file_atomically(temporary_path: &Path, path: &Path) -> io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+
+    let temporary_wide = temporary_path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+
+    // `ReplaceFileW` preserves the existing snapshot until the replacement is
+    // committed. For the first write it reports NotFound, so use a same-volume
+    // write-through move instead.
+    let replaced = unsafe {
+        ReplaceFileW(
+            path_wide.as_ptr(),
+            temporary_wide.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if replaced != 0 {
+        return Ok(());
+    }
+
+    let replace_error = io::Error::last_os_error();
+    if replace_error.kind() != io::ErrorKind::NotFound {
+        return Err(replace_error);
+    }
+
+    let moved = unsafe {
+        MoveFileExW(
+            temporary_wide.as_ptr(),
+            path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
+    // Windows replacement uses write-through flags. Other platforms do not
+    // expose a portable directory sync primitive through the standard library.
+    Ok(())
+}
 
 fn next_available_channel_id(channels: &HashMap<u32, Channel>, temporary: bool) -> u32 {
     let max_non_temporary_id = channels
@@ -4072,5 +4872,666 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op().version, 1);
         assert_eq!(entries[0].strict_metadata(), Some(metadata));
+    }
+
+    #[tokio::test]
+    async fn strict_channel_operation_is_applied_once_by_op_id() {
+        let repo = repo();
+        let metadata = StrictReplicationMetadata::new(11, 22, 33);
+        let first = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(9, "first", 0, 0, Some(0)),
+            },
+        };
+
+        assert_eq!(
+            repo.apply_strict_operation_once(first, metadata)
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        let duplicate = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 2,
+            node_id: 1,
+            timestamp: 124,
+            emits_client_message: true,
+            op: ChannelOp::UpdateChannel {
+                id: 9,
+                patch: ChannelPatch {
+                    name: Some("duplicate".to_owned()),
+                    position: None,
+                    max_users: None,
+                    description_hash: None,
+                    parent_id: None,
+                },
+            },
+        };
+
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                duplicate,
+                StrictReplicationMetadata::new(11, 22, 999),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::AlreadyApplied
+        );
+        assert_eq!(repo.current_version(), 1);
+        assert_eq!(repo.get_channel(9).await.unwrap().name, "first");
+        assert_eq!(
+            repo.get_log_entries_since(DEFAULT_SERVER_ID, 0).await.len(),
+            1
+        );
+        assert_eq!(
+            repo.strict_operation_ids(),
+            vec![StrictOperationId::new(11, 22)]
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_strict_channel_operations_claim_one_op_id() {
+        let repo = repo();
+        let metadata = StrictReplicationMetadata::new(21, 22, 23);
+        let op = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(9, "once", 0, 0, Some(0)),
+            },
+        };
+
+        let (first, second) = tokio::join!(
+            repo.apply_strict_operation_once(op.clone(), metadata),
+            repo.apply_strict_operation_once(op, metadata),
+        );
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == StrictOperationApplyOutcome::Applied)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == StrictOperationApplyOutcome::AlreadyApplied)
+                .count(),
+            1
+        );
+        assert_eq!(repo.current_version(), 1);
+        assert_eq!(
+            repo.get_log_entries_since(DEFAULT_SERVER_ID, 0).await.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_channel_op_id_survives_snapshot_compaction_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut compacting_tuning = tuning();
+        compacting_tuning.log_max_entries = 1;
+        compacting_tuning.wal_compaction_expire_count = 10;
+        compacting_tuning.snapshot_every_ops = 100;
+        let metadata = StrictReplicationMetadata::new(44, 55, 66);
+
+        {
+            let repo = ChannelRepository::open(1, temp.path(), root_config(), compacting_tuning)
+                .await
+                .unwrap();
+            let first = ChannelOperation {
+                server_id: DEFAULT_SERVER_ID.to_owned(),
+                version: 1,
+                node_id: 1,
+                timestamp: 123,
+                emits_client_message: true,
+                op: ChannelOp::CreateChannel {
+                    channel: Channel::new(9, "first", 0, 0, Some(0)),
+                },
+            };
+            assert_eq!(
+                repo.apply_strict_operation_once(first, metadata)
+                    .await
+                    .unwrap(),
+                StrictOperationApplyOutcome::Applied
+            );
+            repo.apply_committed_operation(ChannelOperation {
+                server_id: DEFAULT_SERVER_ID.to_owned(),
+                version: 2,
+                node_id: 1,
+                timestamp: 124,
+                emits_client_message: true,
+                op: ChannelOp::UpdateChannel {
+                    id: 9,
+                    patch: ChannelPatch {
+                        name: Some("snapshot-state".to_owned()),
+                        position: None,
+                        max_users: None,
+                        description_hash: None,
+                        parent_id: None,
+                    },
+                },
+            })
+            .await
+            .unwrap();
+            repo.save_snapshot().await.unwrap();
+        }
+
+        let repo = ChannelRepository::open(1, temp.path(), root_config(), compacting_tuning)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.strict_operation_ids(),
+            vec![StrictOperationId::new(44, 55)]
+        );
+
+        let duplicate = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 3,
+            node_id: 1,
+            timestamp: 125,
+            emits_client_message: true,
+            op: ChannelOp::UpdateChannel {
+                id: 9,
+                patch: ChannelPatch {
+                    name: Some("replayed".to_owned()),
+                    position: None,
+                    max_users: None,
+                    description_hash: None,
+                    parent_id: None,
+                },
+            },
+        };
+        assert_eq!(
+            repo.apply_strict_operation_once(duplicate, metadata)
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::AlreadyApplied
+        );
+        assert_eq!(repo.current_version(), 2);
+        assert_eq!(repo.get_channel(9).await.unwrap().name, "snapshot-state");
+        assert!(
+            repo.strict_log_entries_since_in_server(DEFAULT_SERVER_ID, 0)
+                .await
+                .is_none(),
+            "a compacted tail must not masquerade as history from version zero"
+        );
+        assert_eq!(
+            repo.strict_log_entries_since_in_server(DEFAULT_SERVER_ID, 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_snapshot_merges_strict_operation_ids() {
+        let repo = repo();
+        let operation_id = StrictOperationId::new(71, 72);
+        repo.install_s2s_snapshot_with_strict_operation_ids(
+            1,
+            vec![Channel::new(9, "snapshot", 0, 0, Some(0))],
+            vec![operation_id.clone()],
+        )
+        .await
+        .unwrap();
+
+        let duplicate = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 2,
+            node_id: 1,
+            timestamp: 123,
+            emits_client_message: true,
+            op: ChannelOp::UpdateChannel {
+                id: 9,
+                patch: ChannelPatch {
+                    name: Some("replayed".to_owned()),
+                    position: None,
+                    max_users: None,
+                    description_hash: None,
+                    parent_id: None,
+                },
+            },
+        };
+        assert_eq!(
+            repo.apply_strict_operation_once(duplicate, StrictReplicationMetadata::new(71, 72, 1),)
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::AlreadyApplied
+        );
+        assert_eq!(repo.get_channel(9).await.unwrap().name, "snapshot");
+    }
+
+    #[tokio::test]
+    async fn strict_snapshot_rejects_an_equal_version_replacement_missing_a_local_operation_id() {
+        let repo = repo();
+        let local_operation_id = StrictOperationId::new(81, 82);
+        let local = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(9, "local", 0, 0, Some(0)),
+            },
+        };
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                local,
+                StrictReplicationMetadata::new(
+                    local_operation_id.op_id_hi(),
+                    local_operation_id.op_id_lo(),
+                    1,
+                ),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        assert!(matches!(
+            repo.install_s2s_snapshot_with_strict_operation_ids(
+                1,
+                vec![Channel::new(10, "replacement", 0, 0, Some(0))],
+                vec![StrictOperationId::new(83, 84)],
+            )
+            .await,
+            Err(ChannelRepoError::StrictSnapshotOperationIdsIncomplete { missing: 1 })
+        ));
+        assert_eq!(repo.current_version(), 1);
+        assert_eq!(repo.get_channel(9).await.unwrap().name, "local");
+        assert!(repo.get_channel(10).await.is_none());
+        assert_eq!(repo.strict_operation_ids(), vec![local_operation_id]);
+    }
+
+    #[tokio::test]
+    async fn strict_snapshot_rejects_a_newer_replacement_missing_a_local_operation_id() {
+        let repo = repo();
+        let local_operation_id = StrictOperationId::new(85, 86);
+        let local = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 125,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(9, "local", 0, 0, Some(0)),
+            },
+        };
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                local,
+                StrictReplicationMetadata::new(
+                    local_operation_id.op_id_hi(),
+                    local_operation_id.op_id_lo(),
+                    1,
+                ),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+        let before = repo.strict_snapshot_in_server(DEFAULT_SERVER_ID).await;
+
+        assert!(matches!(
+            repo.install_s2s_snapshot_with_strict_operation_ids(
+                2,
+                vec![Channel::new(10, "replacement", 0, 0, Some(0))],
+                vec![StrictOperationId::new(87, 88)],
+            )
+            .await,
+            Err(ChannelRepoError::StrictSnapshotOperationIdsIncomplete { missing: 1 })
+        ));
+
+        let after = repo.strict_snapshot_in_server(DEFAULT_SERVER_ID).await;
+        assert_eq!(after.version(), before.version());
+        assert_eq!(after.freshness(), before.freshness());
+        assert_eq!(after.operation_ids(), before.operation_ids());
+        assert_eq!(repo.get_channel(9).await.unwrap().name, "local");
+        assert!(repo.get_channel(10).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn strict_snapshot_accepts_a_newer_replacement_with_a_superset_ledger() {
+        let repo = repo();
+        let local_operation_id = StrictOperationId::new(91, 92);
+        let local = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 126,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(9, "local", 0, 0, Some(0)),
+            },
+        };
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                local,
+                StrictReplicationMetadata::new(
+                    local_operation_id.op_id_hi(),
+                    local_operation_id.op_id_lo(),
+                    1,
+                ),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        let incoming_operation_id = StrictOperationId::new(93, 94);
+        repo.install_s2s_snapshot_with_strict_operation_ids(
+            2,
+            vec![Channel::new(10, "replacement", 0, 0, Some(0))],
+            vec![local_operation_id.clone(), incoming_operation_id.clone()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(repo.current_version(), 2);
+        assert!(repo.get_channel(9).await.is_none());
+        assert_eq!(repo.get_channel(10).await.unwrap().name, "replacement");
+        assert_eq!(
+            repo.strict_operation_ids(),
+            vec![local_operation_id, incoming_operation_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_snapshot_ledger_guard_is_scoped_to_its_server() {
+        let repo = repo();
+        let other_server_operation = ChannelOperation {
+            server_id: "other-server".to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 127,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(9, "other", 0, 0, Some(0)),
+            },
+        };
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                other_server_operation,
+                StrictReplicationMetadata::new(95, 96, 1),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        repo.install_s2s_snapshot_with_strict_operation_ids(
+            1,
+            vec![Channel::new(10, "default", 0, 0, Some(0))],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(repo.get_channel(10).await.unwrap().name, "default");
+        assert_eq!(
+            repo.get_channel_in_server("other-server", 9)
+                .await
+                .unwrap()
+                .name,
+            "other"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_operation_with_unknown_id_at_covered_version_is_a_conflict() {
+        let repo = repo();
+        let first = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(9, "first", 0, 0, Some(0)),
+            },
+        };
+        assert_eq!(
+            repo.apply_strict_operation_once(first, StrictReplicationMetadata::new(1, 2, 3))
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        let conflicting = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 2,
+            timestamp: 124,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(10, "conflict", 0, 0, Some(0)),
+            },
+        };
+        assert_eq!(
+            repo.apply_strict_operation_once(conflicting, StrictReplicationMetadata::new(4, 5, 6),)
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::VersionConflict
+        );
+
+        assert_eq!(repo.current_version(), 1);
+        assert!(repo.get_channel(10).await.is_none());
+        assert_eq!(
+            repo.get_log_entries_since(DEFAULT_SERVER_ID, 0).await.len(),
+            1
+        );
+        assert_eq!(
+            repo.strict_operation_ids(),
+            vec![StrictOperationId::new(1, 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_snapshot_bundle_includes_matching_state_and_operation_ids() {
+        let repo = repo();
+        let metadata = StrictReplicationMetadata::new(31, 32, 33);
+        let op = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 456,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(9, "strict", 0, 0, Some(0)),
+            },
+        };
+        assert_eq!(
+            repo.apply_strict_operation_once(op, metadata)
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        let snapshot = repo.strict_snapshot_in_server(DEFAULT_SERVER_ID).await;
+        assert_eq!(snapshot.version(), 1);
+        assert_eq!(snapshot.freshness(), 456);
+        assert!(
+            snapshot
+                .channels()
+                .iter()
+                .any(|channel| channel.id == 9 && channel.name == "strict")
+        );
+        assert_eq!(snapshot.operation_ids(), &[StrictOperationId::new(31, 32)]);
+    }
+
+    #[tokio::test]
+    async fn failed_strict_wal_sync_does_not_publish_memory_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        assert!(repo.strict_operation_durability_enabled());
+        repo.force_next_wal_sync_failure_for_test();
+        let op = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(9, "unpublished", 0, 0, Some(0)),
+            },
+        };
+
+        assert!(matches!(
+            repo.apply_strict_operation_once(op, StrictReplicationMetadata::new(41, 42, 43))
+                .await,
+            Err(ChannelRepoError::WalIo(_))
+        ));
+        assert_eq!(repo.current_version(), 0);
+        assert!(repo.get_channel(9).await.is_none());
+        assert!(
+            repo.get_log_entries_since(DEFAULT_SERVER_ID, 0)
+                .await
+                .is_empty()
+        );
+        assert!(repo.strict_operation_ids().is_empty());
+        assert!(!repo.strict_operation_durability_enabled());
+    }
+
+    #[tokio::test]
+    async fn failed_s2s_snapshot_write_does_not_publish_replacement_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        assert!(repo.strict_operation_durability_enabled());
+        repo.create_channel(Channel::new(7, "existing", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.force_next_snapshot_write_failure_for_test();
+
+        assert!(matches!(
+            repo.install_s2s_snapshot_with_strict_operation_ids(
+                5,
+                vec![Channel::new(9, "replacement", 0, 0, Some(0))],
+                vec![StrictOperationId::new(51, 52)],
+            )
+            .await,
+            Err(ChannelRepoError::WalIo(_))
+        ));
+        assert_eq!(repo.current_version(), 1);
+        assert_eq!(repo.get_channel(7).await.unwrap().name, "existing");
+        assert!(repo.get_channel(9).await.is_none());
+        assert!(repo.strict_operation_ids().is_empty());
+        assert!(!repo.strict_operation_durability_enabled());
+    }
+
+    #[tokio::test]
+    async fn semantic_s2s_snapshot_rejection_does_not_poison_strict_durability() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        let op = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(7, "local", 0, 0, Some(0)),
+            },
+        };
+        repo.apply_strict_operation_once(op, StrictReplicationMetadata::new(61, 62, 63))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.install_s2s_snapshot_with_strict_operation_ids(
+                1,
+                vec![Channel::new(9, "replacement", 0, 0, Some(0))],
+                Vec::new(),
+            )
+            .await,
+            Err(ChannelRepoError::StrictSnapshotOperationIdsIncomplete { missing: 1 })
+        ));
+        assert!(repo.strict_operation_durability_enabled());
+    }
+
+    #[tokio::test]
+    async fn failed_operation_id_ledger_snapshot_does_not_publish_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        assert!(repo.strict_operation_durability_enabled());
+        repo.force_next_snapshot_write_failure_for_test();
+
+        assert!(matches!(
+            repo.merge_strict_operation_ids(vec![StrictOperationId::new(61, 62)])
+                .await,
+            Err(ChannelRepoError::WalIo(_))
+        ));
+        assert!(repo.strict_operation_ids().is_empty());
+        assert!(!repo.strict_operation_durability_enabled());
+    }
+
+    #[tokio::test]
+    async fn persisted_s2s_snapshots_can_replace_an_existing_snapshot_file() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+                .await
+                .unwrap();
+            repo.install_s2s_snapshot_with_strict_operation_ids(
+                1,
+                vec![Channel::new(7, "first", 0, 0, Some(0))],
+                vec![StrictOperationId::new(71, 72)],
+            )
+            .await
+            .unwrap();
+            repo.install_s2s_snapshot_with_strict_operation_ids(
+                2,
+                vec![Channel::new(9, "second", 0, 0, Some(0))],
+                vec![
+                    StrictOperationId::new(71, 72),
+                    StrictOperationId::new(73, 74),
+                ],
+            )
+            .await
+            .unwrap();
+            repo.install_s2s_snapshot_with_strict_operation_ids(
+                1,
+                vec![Channel::new(10, "stale", 0, 0, Some(0))],
+                vec![StrictOperationId::new(75, 76)],
+            )
+            .await
+            .unwrap();
+            assert_eq!(repo.current_version(), 2);
+            assert!(repo.get_channel(10).await.is_none());
+        }
+
+        let reopened = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        assert_eq!(reopened.current_version(), 2);
+        assert!(reopened.get_channel(7).await.is_none());
+        assert_eq!(reopened.get_channel(9).await.unwrap().name, "second");
+        assert_eq!(
+            reopened.strict_operation_ids(),
+            vec![
+                StrictOperationId::new(71, 72),
+                StrictOperationId::new(73, 74)
+            ]
+        );
     }
 }

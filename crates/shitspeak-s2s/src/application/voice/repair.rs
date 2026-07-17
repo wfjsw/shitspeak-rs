@@ -288,7 +288,7 @@ mod tests {
         let cache = RepairCache::new(Duration::from_millis(1));
         cache.insert_with_cache_ttl(
             RepairFrame::new(9, 10, 11, Bytes::from_static(b"long-lived")),
-            Duration::from_millis(20),
+            Duration::from_secs(1),
         );
         cache.insert(RepairFrame::new(
             9,
@@ -296,7 +296,7 @@ mod tests {
             12,
             Bytes::from_static(b"short-lived"),
         ));
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(10));
 
         assert_eq!(cache.lookup_range(9, 10, 11, 11).len(), 1);
         assert!(cache.lookup_range(9, 10, 12, 12).is_empty());

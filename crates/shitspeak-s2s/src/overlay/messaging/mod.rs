@@ -79,6 +79,10 @@ impl OverlayAttachment {
 #[derive(Debug, Clone)]
 pub struct OverlayInboundMessage {
     pub from: NodeIdentifier,
+    /// Boot epoch asserted by the logical origin in the overlay envelope.
+    /// A relay can carry this value but cannot authenticate it by itself;
+    /// security-sensitive services must require their own origin-bound proof.
+    pub(crate) origin_boot_epoch: u64,
     pub level: ServiceLevel,
     pub class: MessageClass,
     pub body: Bytes,
@@ -102,6 +106,7 @@ impl OverlayInboundMessage {
     ) -> Self {
         Self {
             from,
+            origin_boot_epoch: 0,
             level,
             class,
             body,
@@ -114,6 +119,12 @@ impl OverlayInboundMessage {
     pub fn with_distribution_repair(mut self, is_distribution_repair: bool) -> Self {
         self.is_distribution_repair = is_distribution_repair;
         self
+    }
+
+    /// Boot epoch asserted by the overlay envelope for the logical origin.
+    /// This is metadata, not an authenticated origin credential.
+    pub fn origin_boot_epoch(&self) -> u64 {
+        self.origin_boot_epoch
     }
 }
 

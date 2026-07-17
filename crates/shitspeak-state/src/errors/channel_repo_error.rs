@@ -30,4 +30,9 @@ pub enum ChannelRepoError {
 
     #[error("WAL corrupt at line {line}: {reason}")]
     WalCorrupt { line: usize, reason: String },
+
+    #[error(
+        "strict snapshot operation-id ledger is missing {missing} locally applied operation(s)"
+    )]
+    StrictSnapshotOperationIdsIncomplete { missing: usize },
 }

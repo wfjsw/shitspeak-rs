@@ -8,12 +8,16 @@
 
 #![cfg(any(test, feature = "test-support"))]
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 use super::error::ReplicationError;
 use super::owner::runtime::OwnerNet;
@@ -56,6 +60,13 @@ pub struct MockNet {
     pub self_id: NodeIdentifier,
     pub alive: Mutex<Vec<NodeIdentifier>>,
     pub epochs: Mutex<std::collections::HashMap<NodeIdentifier, u64>>,
+    strict_protocol_version: Mutex<u32>,
+    local_strict_protocol_version: Mutex<Option<u32>>,
+    strict_peer_protocol_versions: Mutex<std::collections::HashMap<NodeIdentifier, u32>>,
+    max_replication_payload_bytes: Mutex<usize>,
+    strict_protocol_disable_reports: Mutex<usize>,
+    strict_repository_capability_loss_reports: Mutex<usize>,
+    strict_protocol_state_dir: Mutex<Option<PathBuf>>,
     routes: Mutex<Option<std::collections::HashSet<(ServiceLevel, NodeIdentifier)>>>,
     live_routes: Mutex<Option<std::collections::HashSet<(ServiceLevel, NodeIdentifier)>>>,
     strict_unicast_failures: Mutex<std::collections::HashSet<NodeIdentifier>>,
@@ -69,6 +80,13 @@ impl MockNet {
             self_id,
             alive: Mutex::new(alive),
             epochs: Mutex::new(Default::default()),
+            strict_protocol_version: Mutex::new(0),
+            local_strict_protocol_version: Mutex::new(None),
+            strict_peer_protocol_versions: Mutex::new(Default::default()),
+            max_replication_payload_bytes: Mutex::new(usize::MAX),
+            strict_protocol_disable_reports: Mutex::new(0),
+            strict_repository_capability_loss_reports: Mutex::new(0),
+            strict_protocol_state_dir: Mutex::new(None),
             routes: Mutex::new(None),
             live_routes: Mutex::new(None),
             strict_unicast_failures: Mutex::new(Default::default()),
@@ -115,6 +133,39 @@ impl MockNet {
 
     pub fn set_epoch(&self, node: NodeIdentifier, epoch: u64) {
         self.epochs.lock().insert(node, epoch);
+    }
+
+    pub fn set_strict_replication_protocol_version(&self, version: u32) {
+        *self.strict_protocol_version.lock() = version;
+    }
+
+    /// Override this node's immediate local capability independently of the
+    /// negotiated cluster floor. Tests use this to model a transient remote
+    /// LSA downgrade without pretending the local durable repository changed.
+    pub fn set_local_strict_replication_protocol_version(&self, version: Option<u32>) {
+        *self.local_strict_protocol_version.lock() = version;
+    }
+
+    pub fn set_peer_strict_replication_protocol_version(&self, peer: NodeIdentifier, version: u32) {
+        self.strict_peer_protocol_versions
+            .lock()
+            .insert(peer, version);
+    }
+
+    pub fn set_max_replication_payload_bytes(&self, bytes: usize) {
+        *self.max_replication_payload_bytes.lock() = bytes;
+    }
+
+    pub fn strict_repository_capability_loss_reports(&self) -> usize {
+        *self.strict_repository_capability_loss_reports.lock()
+    }
+
+    pub fn strict_protocol_disable_reports(&self) -> usize {
+        *self.strict_protocol_disable_reports.lock()
+    }
+
+    pub fn set_strict_protocol_state_dir(&self, state_dir: Option<PathBuf>) {
+        *self.strict_protocol_state_dir.lock() = state_dir;
     }
 
     pub fn captures(&self) -> Vec<CapturedFrame> {
@@ -201,6 +252,44 @@ impl StrictNet for MockNet {
         self.epochs.lock().get(&node).copied()
     }
 
+    fn strict_replication_protocol_version(&self) -> u32 {
+        *self.strict_protocol_version.lock()
+    }
+
+    fn local_strict_replication_protocol_version(&self) -> u32 {
+        self.local_strict_protocol_version
+            .lock()
+            .unwrap_or_else(|| *self.strict_protocol_version.lock())
+    }
+
+    fn peer_strict_replication_protocol_version(&self, peer: NodeIdentifier) -> u32 {
+        self.strict_peer_protocol_versions
+            .lock()
+            .get(&peer)
+            .copied()
+            .unwrap_or_else(|| *self.strict_protocol_version.lock())
+    }
+
+    fn unsupported_active_protocol_peers(&self, required_version: u32) -> usize {
+        usize::from(*self.strict_protocol_version.lock() < required_version)
+    }
+
+    fn strict_protocol_state_dir(&self) -> Option<PathBuf> {
+        self.strict_protocol_state_dir.lock().clone()
+    }
+
+    fn max_replication_payload_bytes(&self) -> usize {
+        *self.max_replication_payload_bytes.lock()
+    }
+
+    fn disable_strict_replication_protocol(&self) {
+        *self.strict_protocol_disable_reports.lock() += 1;
+    }
+
+    fn report_strict_replication_repository_capability_loss(&self) {
+        *self.strict_repository_capability_loss_reports.lock() += 1;
+    }
+
     fn has_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {
         match self.routes.lock().as_ref() {
             Some(routes) => routes.contains(&(level, dst)),
@@ -260,18 +349,95 @@ impl OwnerNet for MockNet {
 // ---------- In-memory test repos ----------
 
 use super::owner::{LogSlice as OwnerLog, OwnerReplicable};
-use super::strict::{LogSlice as StrictLog, StrictLogEntry, StrictLogMetadata, StrictReplicable};
+use super::strict::{
+    LogSlice as StrictLog, StrictCommitApplyOutcome, StrictLogEntry, StrictLogMetadata,
+    StrictReplicable, StrictSnapshotError,
+};
 
 /// Mock strict-mode repo: holds a `(version, Vec<(version, op, metadata)>)` log.
 pub struct CountingStrictRepo {
     pub state: Mutex<(u64, Vec<(u64, u64, Option<StrictLogMetadata>)>)>,
+    strict_operation_ids: Mutex<HashSet<(u64, u64)>>,
+    strict_protocol_version: u32,
+    strict_repository_capable: AtomicBool,
+    snapshot_guard: Mutex<()>,
+    snapshot_capture_failure: Mutex<Option<String>>,
+    snapshot_capture_durability_failure: Mutex<Option<String>>,
+    snapshot_install_failure: Mutex<Option<String>>,
+    snapshot_install_durability_failure: Mutex<Option<String>>,
+    snapshot_install_durability_failure_without_capability_loss: Mutex<Option<String>>,
+    strict_apply_failure: Mutex<bool>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CountingStrictSnapshot {
+    entries: Vec<(u64, u64)>,
+    strict_operation_ids: Vec<(u64, u64)>,
 }
 
 impl CountingStrictRepo {
     pub fn new() -> Arc<Self> {
+        Self::with_strict_protocol_version(crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION)
+    }
+
+    pub fn new_v1() -> Arc<Self> {
+        Self::with_strict_protocol_version(1)
+    }
+
+    pub fn new_legacy() -> Arc<Self> {
+        Self::with_strict_protocol_version(0)
+    }
+
+    fn with_strict_protocol_version(strict_protocol_version: u32) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new((0, Vec::new())),
+            strict_operation_ids: Mutex::new(HashSet::new()),
+            strict_protocol_version,
+            strict_repository_capable: AtomicBool::new(true),
+            snapshot_guard: Mutex::new(()),
+            snapshot_capture_failure: Mutex::new(None),
+            snapshot_capture_durability_failure: Mutex::new(None),
+            snapshot_install_failure: Mutex::new(None),
+            snapshot_install_durability_failure: Mutex::new(None),
+            snapshot_install_durability_failure_without_capability_loss: Mutex::new(None),
+            strict_apply_failure: Mutex::new(false),
         })
+    }
+
+    pub fn fail_snapshot_captures(&self, message: impl Into<String>) {
+        *self.snapshot_capture_failure.lock() = Some(message.into());
+    }
+
+    /// Simulate a repository which proves the snapshot failure was durable,
+    /// but leaves protocol-capability withdrawal to its caller.
+    pub fn fail_snapshot_captures_durably_without_capability_loss(
+        &self,
+        message: impl Into<String>,
+    ) {
+        *self.snapshot_capture_durability_failure.lock() = Some(message.into());
+    }
+
+    pub fn fail_snapshot_installs(&self, message: impl Into<String>) {
+        *self.snapshot_install_failure.lock() = Some(message.into());
+    }
+
+    pub fn fail_snapshot_installs_durably(&self, message: impl Into<String>) {
+        *self.snapshot_install_durability_failure.lock() = Some(message.into());
+    }
+
+    /// Simulate a conforming repository that returns a typed durability error
+    /// while its advertised protocol version has not yet changed.
+    pub fn fail_snapshot_installs_durably_without_capability_loss(
+        &self,
+        message: impl Into<String>,
+    ) {
+        *self
+            .snapshot_install_durability_failure_without_capability_loss
+            .lock() = Some(message.into());
+    }
+
+    pub fn fail_strict_applies(&self) {
+        *self.strict_apply_failure.lock() = true;
     }
 
     pub fn log(&self) -> Vec<(u64, u64)> {
@@ -288,16 +454,41 @@ impl CountingStrictRepo {
 impl StrictReplicable for CountingStrictRepo {
     type Op = u64;
 
+    fn strict_replication_protocol_version(&self) -> u32 {
+        self.strict_repository_capable
+            .load(Ordering::Acquire)
+            .then_some(self.strict_protocol_version)
+            .unwrap_or_default()
+    }
+
     fn current_version(&self) -> u64 {
         self.state.lock().0
     }
 
-    fn snapshot(&self) -> (u64, Bytes) {
+    fn snapshot(&self) -> Result<(u64, Bytes), StrictSnapshotError> {
+        let _snapshot_guard = self.snapshot_guard.lock();
+        if let Some(message) = self.snapshot_capture_durability_failure.lock().clone() {
+            return Err(StrictSnapshotError::durability_failure(message));
+        }
+        if let Some(message) = self.snapshot_capture_failure.lock().clone() {
+            return Err(StrictSnapshotError::new(message));
+        }
         let s = self.state.lock();
         let v = s.0;
         let entries: Vec<(u64, u64)> = s.1.iter().map(|(version, op, _)| (*version, *op)).collect();
-        let bytes = Bytes::from(rmp_serde::to_vec(&entries).unwrap_or_default());
-        (v, bytes)
+        drop(s);
+        let mut strict_operation_ids: Vec<_> =
+            self.strict_operation_ids.lock().iter().copied().collect();
+        strict_operation_ids.sort_unstable();
+        let bytes = rmp_serde::to_vec(&CountingStrictSnapshot {
+            entries,
+            strict_operation_ids,
+        })
+        .map(Bytes::from)
+        .map_err(|error| {
+            StrictSnapshotError::new(format!("counting snapshot encode failed: {error}"))
+        })?;
+        Ok((v, bytes))
     }
 
     fn log_since(&self, since: u64) -> StrictLog<StrictLogEntry<Self::Op>> {
@@ -319,7 +510,10 @@ impl StrictReplicable for CountingStrictRepo {
     }
 
     async fn apply_committed(&self, version: u64, op: Self::Op) {
-        self.apply_committed_with_metadata(version, op, None).await;
+        let _snapshot_guard = self.snapshot_guard.lock();
+        let mut s = self.state.lock();
+        s.0 = version;
+        s.1.push((version, op, None));
     }
 
     async fn apply_committed_with_metadata(
@@ -328,19 +522,116 @@ impl StrictReplicable for CountingStrictRepo {
         op: Self::Op,
         metadata: Option<StrictLogMetadata>,
     ) {
+        let _snapshot_guard = self.snapshot_guard.lock();
         let mut s = self.state.lock();
         s.0 = version;
         s.1.push((version, op, metadata));
     }
 
-    async fn install_snapshot(&self, version: u64, snapshot: Bytes) {
-        let entries: Vec<(u64, u64)> = rmp_serde::from_slice(&snapshot).unwrap_or_default();
+    async fn apply_committed_once(
+        &self,
+        version: u64,
+        op: Self::Op,
+        metadata: StrictLogMetadata,
+    ) -> StrictCommitApplyOutcome {
+        if *self.strict_apply_failure.lock() {
+            return StrictCommitApplyOutcome::Failed;
+        }
+        let _snapshot_guard = self.snapshot_guard.lock();
+        let inserted = self
+            .strict_operation_ids
+            .lock()
+            .insert((metadata.op_id_hi, metadata.op_id_lo));
+        if !inserted {
+            return StrictCommitApplyOutcome::AlreadyApplied;
+        }
         let mut s = self.state.lock();
         s.0 = version;
-        s.1 = entries
+        s.1.push((version, op, Some(metadata)));
+        StrictCommitApplyOutcome::Applied
+    }
+
+    async fn install_snapshot(
+        &self,
+        version: u64,
+        snapshot: Bytes,
+    ) -> Result<(), StrictSnapshotError> {
+        let _snapshot_guard = self.snapshot_guard.lock();
+        if let Some(message) = self
+            .snapshot_install_durability_failure_without_capability_loss
+            .lock()
+            .clone()
+        {
+            return Err(StrictSnapshotError::durability_failure(message));
+        }
+        if let Some(message) = self.snapshot_install_durability_failure.lock().clone() {
+            self.strict_repository_capable
+                .store(false, Ordering::Release);
+            return Err(StrictSnapshotError::durability_failure(message));
+        }
+        if let Some(message) = self.snapshot_install_failure.lock().clone() {
+            return Err(StrictSnapshotError::new(message));
+        }
+        let decoded: CountingStrictSnapshot =
+            rmp_serde::from_slice(&snapshot).map_err(|error| {
+                StrictSnapshotError::new(format!("counting snapshot decode failed: {error}"))
+            })?;
+        let mut s = self.state.lock();
+        s.0 = version;
+        s.1 = decoded
+            .entries
             .into_iter()
             .map(|(version, op)| (version, op, None))
             .collect();
+        drop(s);
+        *self.strict_operation_ids.lock() = decoded.strict_operation_ids.into_iter().collect();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod strict_repo_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn strict_snapshot_preserves_operation_ids_for_duplicate_replay() {
+        let source = CountingStrictRepo::new();
+        let metadata = StrictLogMetadata {
+            op_id_hi: 11,
+            op_id_lo: 22,
+            ts_final: 33,
+        };
+        assert_eq!(
+            source.apply_committed_once(1, 101, metadata).await,
+            StrictCommitApplyOutcome::Applied
+        );
+        let (version, snapshot) = source.snapshot().expect("snapshot should encode");
+
+        let restored = CountingStrictRepo::new();
+        restored
+            .install_snapshot(version, snapshot)
+            .await
+            .expect("snapshot should install");
+        assert_eq!(
+            restored.apply_committed_once(2, 101, metadata).await,
+            StrictCommitApplyOutcome::AlreadyApplied
+        );
+        assert_eq!(restored.current_version(), 1);
+        assert_eq!(restored.log(), vec![(1, 101)]);
+    }
+
+    #[tokio::test]
+    async fn malformed_strict_snapshot_is_rejected_without_replacing_state() {
+        let repo = CountingStrictRepo::new();
+        repo.apply_committed(1, 101).await;
+
+        assert!(
+            repo.install_snapshot(2, Bytes::from_static(b"not-msgpack"))
+                .await
+                .is_err()
+        );
+        assert_eq!(repo.current_version(), 1);
+        assert_eq!(repo.log(), vec![(1, 101)]);
     }
 }
 
@@ -468,9 +759,9 @@ mod e2e_tests {
     use super::super::config::ReplicationConfig;
     use super::super::owner::runtime::OwnerRuntime;
     use super::super::proto::{
-        CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp, OwnerOp, StrictBody, StrictPropose,
+        CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp, OwnerOp, StrictBody,
     };
-    use super::super::strict::runtime::StrictRuntime;
+    use super::super::strict::runtime::{StrictRuntime, make_op_id};
     use super::*;
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -480,11 +771,26 @@ mod e2e_tests {
         Arc::new(ReplicationConfig::default())
     }
 
+    fn proposal_identity(body: &StrictBody) -> Option<(u64, u64, u64)> {
+        match body {
+            StrictBody::Propose(propose) => {
+                Some((propose.op_id_hi, propose.op_id_lo, propose.ts_propose))
+            }
+            StrictBody::ProposeV1(propose) => {
+                Some((propose.op_id_hi, propose.op_id_lo, propose.ts_propose))
+            }
+            _ => None,
+        }
+    }
+
     /// 1-node strict cluster: propose immediately self-acks, commits,
     /// delivers, applies. End-to-end.
     #[tokio::test]
     async fn strict_single_node_propose_end_to_end() {
         let net = MockNet::new(1, vec![1]);
+        net.set_strict_replication_protocol_version(
+            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+        );
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo.clone(),
@@ -511,6 +817,10 @@ mod e2e_tests {
     #[tokio::test]
     async fn strict_propose_accepts_at_quorum_decision() {
         let net = MockNet::new(1, vec![1, 2]);
+        net.set_strict_replication_protocol_version(
+            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+        );
+        net.set_epoch(2, 1);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo.clone(),
@@ -538,10 +848,7 @@ mod e2e_tests {
                 let CapturedFrame::StrictMulticast { body, .. } = capture else {
                     return None;
                 };
-                let StrictBody::Propose(propose) = body else {
-                    return None;
-                };
-                Some((propose.op_id_hi, propose.op_id_lo, propose.ts_propose))
+                proposal_identity(body)
             })
             .expect("initial propose multicast");
 
@@ -554,7 +861,7 @@ mod e2e_tests {
                 op_id_lo,
                 ts_local: ts_propose + 1,
                 src_clock: ts_propose + 1,
-                ack_boot_epoch: 0,
+                ack_boot_epoch: 1,
             },
         )
         .await;
@@ -565,6 +872,25 @@ mod e2e_tests {
                 src_clock: ts_propose + 2,
             },
         );
+        rt.recv_accept_ack(
+            2,
+            super::super::proto::StrictAcceptAck {
+                ack_node: 2,
+                coord_node: 1,
+                ballot: 0,
+                op_id_hi,
+                op_id_lo,
+                accepted: true,
+                src_clock: ts_propose + 3,
+                ack_boot_epoch: 1,
+            },
+        )
+        .await;
+        // The protocol needs the local clock to advance beyond the decided
+        // timestamp before delivery. Drive that deterministic condition here
+        // instead of coupling this quorum test to the background tick cadence.
+        rt.advance_clock_for_test(ts_propose + 3);
+        rt.wake_delivery_and_clock_tick();
 
         tokio::time::timeout(Duration::from_secs(1), accepted_rx)
             .await
@@ -585,6 +911,11 @@ mod e2e_tests {
     #[tokio::test]
     async fn strict_recv_propose_emits_ack() {
         let net = MockNet::new(2, vec![1, 2]);
+        net.set_strict_replication_protocol_version(
+            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+        );
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 100);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo,
@@ -597,15 +928,26 @@ mod e2e_tests {
         );
         // No start(): we want fully synchronous control.
 
-        rt.recv_propose(
+        rt.recv_propose_v1(
             1,
-            StrictPropose {
+            super::super::proto::StrictProposeV1 {
                 coord_node: 1,
-                op_id_hi: 1,
-                op_id_lo: 1,
+                op_id_hi: make_op_id(1, 1, 1).0,
+                op_id_lo: make_op_id(1, 1, 1).1,
                 ts_propose: 50,
                 op_msgpack: Bytes::from(rmp_serde::to_vec(&7u64).unwrap()),
                 src_clock: 50,
+                protocol_version: crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+                frozen_targets: vec![
+                    super::super::proto::StrictFrozenTarget {
+                        node: 1,
+                        boot_epoch: 1,
+                    },
+                    super::super::proto::StrictFrozenTarget {
+                        node: 2,
+                        boot_epoch: 100,
+                    },
+                ],
             },
         )
         .await;
@@ -635,6 +977,11 @@ mod e2e_tests {
                 .with_propose_ttl(Duration::from_secs(5)),
         );
         let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_strict_replication_protocol_version(
+            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+        );
+        net.set_epoch(2, 1);
+        net.set_epoch(3, 1);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo,
@@ -656,10 +1003,7 @@ mod e2e_tests {
                 let CapturedFrame::StrictMulticast { body, .. } = capture else {
                     return None;
                 };
-                let StrictBody::Propose(propose) = body else {
-                    return None;
-                };
-                Some((propose.op_id_hi, propose.op_id_lo, propose.ts_propose))
+                proposal_identity(body)
             })
             .expect("initial propose multicast");
         rt.recv_propose_ack(
@@ -671,7 +1015,7 @@ mod e2e_tests {
                 op_id_lo,
                 ts_local: ts_propose + 1,
                 src_clock: ts_propose + 1,
-                ack_boot_epoch: 0,
+                ack_boot_epoch: 1,
             },
         )
         .await;
@@ -684,7 +1028,7 @@ mod e2e_tests {
                         capture,
                         CapturedFrame::StrictMulticast {
                             dsts,
-                            body: StrictBody::Propose(_),
+                            body: StrictBody::Propose(_) | StrictBody::ProposeV1(_),
                             ..
                         } if dsts == &[3]
                     )
@@ -992,6 +1336,10 @@ mod e2e_tests {
                 strict_op_id_hi: 0,
                 strict_op_id_lo: 0,
                 strict_ts_final: 0,
+                strict_terminal_ballot: 0,
+                strict_terminal_resolver_node: 0,
+                strict_terminal_resolver_boot_epoch: 0,
+                strict_terminal_frozen_targets: Vec::new(),
             })
             .collect();
         let resp = OwnerCatchupResp {

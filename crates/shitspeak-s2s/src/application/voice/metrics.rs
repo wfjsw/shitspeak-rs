@@ -201,6 +201,9 @@ pub(crate) enum VoiceRepairResult {
     FrameSendFailed,
     FrameMissed,
     ProactiveCopySent,
+    TailAckSent,
+    TailAckReceived,
+    TailRetrySent,
 }
 
 impl VoiceRepairResult {
@@ -215,6 +218,9 @@ impl VoiceRepairResult {
             Self::FrameSendFailed => "frame_send_failed",
             Self::FrameMissed => "frame_missed",
             Self::ProactiveCopySent => "proactive_copy_sent",
+            Self::TailAckSent => "tail_ack_sent",
+            Self::TailAckReceived => "tail_ack_received",
+            Self::TailRetrySent => "tail_retry_sent",
         }
     }
 }

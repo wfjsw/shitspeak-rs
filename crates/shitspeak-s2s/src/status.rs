@@ -43,6 +43,7 @@ pub(crate) struct TopologyNode {
     transit_enabled: bool,
     lsa_seq: Option<u64>,
     lsa_age_ms: Option<u128>,
+    strict_replication_protocol_version: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -392,6 +393,8 @@ pub(crate) fn build_topology_snapshot(
                 lsa_seq: lsa.map(|entry| entry.seq),
                 lsa_age_ms: lsa
                     .map(|entry| now.duration_since(entry.ts_local_received).as_millis()),
+                strict_replication_protocol_version: lsa
+                    .map(|entry| entry.strict_replication_protocol_version()),
             }
         })
         .collect::<Vec<_>>();
@@ -1132,6 +1135,31 @@ impl<'a> PrometheusWriter<'a> {
         self.header(
             "shitspeak_s2s_client_replication_worker_queue_wait_us_bucket_total",
             "S2S client replication worker queue wait buckets.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_cluster_protocol_version",
+            "Minimum strict replication protocol version advertised by alive S2S peers.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_terminal_resolution_ready",
+            "Whether the negotiated strict protocol may emit terminal resolutions.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_unsupported_active_peers",
+            "Alive S2S peers below the strict terminal-resolution protocol version.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_terminal_decisions_total",
+            "Strict terminal decisions by bounded outcome.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_fence_rejections_total",
+            "Late or conflicting strict frames rejected by a terminal-resolution fence.",
             "counter",
         );
         self.header(
@@ -2283,6 +2311,7 @@ function renderGraph(data) {
       `Boot epoch: ${esc(n.boot_epoch)}`,
       `LSA seq: ${esc(n.lsa_seq ?? '-')}`,
       `LSA age: ${esc(n.lsa_age_ms ?? '-')} ms`,
+      `Strict replication protocol: v${esc(n.strict_replication_protocol_version ?? 0)}`,
       ...n.addresses.map(a => `${esc(a.transport)} ${esc(a.addr)}`)
     ]),
     color: nodeColor(n),
@@ -2322,7 +2351,7 @@ function renderGraph(data) {
   }
 }
 function renderTables(data) {
-  nodesTbody.innerHTML = data.nodes.map(n => `<tr><td>${n.node_id}</td><td><span class="pill ${n.status}">${n.status}</span></td><td>seq ${n.lsa_seq ?? '-'}<br>${n.lsa_age_ms ?? '-'} ms</td><td>${n.addresses.map(a => `<span class="transport">${esc(a.transport)}</span> ${esc(a.addr)}`).join('<br>')}</td></tr>`).join('');
+  nodesTbody.innerHTML = data.nodes.map(n => `<tr><td>${n.node_id}</td><td><span class="pill ${n.status}">${n.status}</span></td><td>seq ${n.lsa_seq ?? '-'}<br>${n.lsa_age_ms ?? '-'} ms<br>strict v${n.strict_replication_protocol_version ?? 0}</td><td>${n.addresses.map(a => `<span class="transport">${esc(a.transport)}</span> ${esc(a.addr)}`).join('<br>')}</td></tr>`).join('');
   const packetRows = data.debug_packet_io || [];
   packetIoTbody.innerHTML = packetRows.length
     ? packetRows.map(p => `<tr><td>${p.source} -> ${p.destination}</td><td>${esc(p.kind)}</td><td>${fmtBytes(p.total_bytes)}</td><td>${fmtBytes(p.sent_bytes)}<br><span class="transport">${p.sent_count}</span></td><td>${fmtBytes(p.recv_bytes)}<br><span class="transport">${p.recv_count}</span></td><td>${p.total_count}</td><td>${fmtBps(p.avg_total_bps)}</td></tr>`).join('')
@@ -2393,6 +2422,7 @@ mod tests {
                     transit_enabled: true,
                     lsa_seq: Some(9),
                     lsa_age_ms: Some(10),
+                    strict_replication_protocol_version: Some(2),
                 },
                 TopologyNode {
                     node_id: 2,
@@ -2411,6 +2441,7 @@ mod tests {
                     transit_enabled: true,
                     lsa_seq: Some(10),
                     lsa_age_ms: Some(20),
+                    strict_replication_protocol_version: Some(0),
                 },
             ],
             links: vec![
@@ -2540,6 +2571,16 @@ mod tests {
         let mut rendered = String::new();
         PrometheusWriter::new(&mut rendered).render(&snapshot);
 
+        let topology_json = serde_json::to_value(&snapshot).expect("topology JSON serializes");
+        assert_eq!(
+            topology_json["nodes"][0]["strict_replication_protocol_version"],
+            2
+        );
+        assert_eq!(
+            topology_json["nodes"][1]["strict_replication_protocol_version"],
+            0
+        );
+
         assert!(rendered.contains("# TYPE shitspeak_s2s_node_info gauge\n"));
         assert!(rendered.contains(
             "shitspeak_s2s_node_geo_latitude{node=\"1\",city=\"Dallas \\\"North\\\"\\nWest\\\\\",region=\"TX\",country=\"US\",source=\"manual\"} 32.7767"
@@ -2608,6 +2649,19 @@ mod tests {
             rendered.contains("# TYPE shitspeak_s2s_voice_ingress_queue_capacity_bytes gauge\n")
         );
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_reorder_speaker_states gauge\n"));
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_strict_replication_cluster_protocol_version gauge\n"
+            )
+        );
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_strict_replication_terminal_resolution_ready gauge\n"
+            )
+        );
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_terminal_decisions_total counter\n"
+        ));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_deadline_wakes_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_proactive_events_total counter\n"));
     }

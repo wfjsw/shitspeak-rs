@@ -39,6 +39,13 @@ use super::super::proto::{address_from_pb, address_to_pb, kind_to_u32, u32_to_ki
 use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_proto::s2s_overlay_proto::link_state_advert_capabilities as lsa_caps;
 
+/// Latest strict-replication protocol understood by this binary.
+///
+/// Values are cumulative: a node advertising this version supports every
+/// earlier strict-replication protocol version too. Zero is reserved for
+/// legacy peers that omit the capability from their LSA.
+pub const STRICT_REPLICATION_PROTOCOL_VERSION: u32 = 2;
+
 /// Replication service kinds advertised by one overlay member.
 ///
 /// Missing fields on the wire default to enabled to keep rolling upgrades
@@ -252,6 +259,7 @@ pub struct LsaEntry {
     pub transit_disabled: bool,
     pub replication_services: ReplicationServices,
     pub application_services: ApplicationServices,
+    pub(crate) strict_replication_protocol_version: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -363,6 +371,12 @@ fn describe_lsa_entry_delta(previous: Option<&LsaEntry>, current: &LsaEntry) -> 
         "owner_replication",
         previous.replication_services.owner(),
         current.replication_services.owner(),
+    );
+    push_scalar_change(
+        &mut changes,
+        "strict_replication_protocol_version",
+        previous.strict_replication_protocol_version,
+        current.strict_replication_protocol_version,
     );
     push_scalar_change(
         &mut changes,
@@ -594,6 +608,12 @@ fn describe_single_link_delta(
 }
 
 impl LsaEntry {
+    /// Cumulative strict-replication protocol version advertised by this
+    /// member. A missing field from an older LSA is represented as zero.
+    pub fn strict_replication_protocol_version(&self) -> u32 {
+        self.strict_replication_protocol_version
+    }
+
     /// Build from a wire LSA. Returns `None` if `origin` is not a valid
     /// `NodeIdentifier` (overflows u16).
     pub fn from_pb(pb: &pb::LinkStateAdvert) -> Option<Self> {
@@ -671,6 +691,7 @@ impl LsaEntry {
                     pb.distribution_profile_ids.iter().copied(),
                 ),
             ),
+            strict_replication_protocol_version: pb.strict_replication_protocol_version,
         })
     }
 
@@ -745,6 +766,7 @@ impl LsaEntry {
                 .distribution()
                 .profile_ids()
                 .to_vec(),
+            strict_replication_protocol_version: self.strict_replication_protocol_version,
         }
     }
 }
@@ -1330,6 +1352,7 @@ mod tests {
             transit_disabled: false,
             replication_services: ReplicationServices::ALL,
             application_services: ApplicationServices::ALL,
+            strict_replication_protocol_version: 0,
         }
     }
 
@@ -1660,6 +1683,37 @@ mod tests {
         assert_eq!(db.admit(roundtrip), AdmissionResult::Accepted);
         assert!(db.supports_distribution_profile(1, 2, 3));
         assert!(!db.supports_distribution_profile(1, 2, 8));
+    }
+
+    #[test]
+    fn strict_replication_protocol_version_roundtrips_and_defaults_to_zero() {
+        let mut lsa = entry(1, 100, 1, false);
+        lsa.strict_replication_protocol_version = STRICT_REPLICATION_PROTOCOL_VERSION;
+
+        let pb = lsa.to_pb();
+        assert_eq!(
+            pb.strict_replication_protocol_version,
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            LsaEntry::from_pb(&pb)
+                .unwrap()
+                .strict_replication_protocol_version(),
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        );
+
+        let legacy = pb::LinkStateAdvert {
+            origin: 2,
+            boot_epoch: 100,
+            seq: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            LsaEntry::from_pb(&legacy)
+                .unwrap()
+                .strict_replication_protocol_version(),
+            0
+        );
     }
 
     #[test]

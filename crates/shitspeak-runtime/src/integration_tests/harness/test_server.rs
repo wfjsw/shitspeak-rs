@@ -86,6 +86,7 @@ pub struct TestServer {
     pub authenticator: Arc<TestAuthenticator>,
     run_handle: Option<JoinHandle<()>>,
     _s2s_persistence_dir: Option<TempDir>,
+    _blob_storage_dir: Option<TempDir>,
 }
 
 impl TestServer {
@@ -129,7 +130,16 @@ pub async fn spawn_test_server(opts: TestServerOpts) -> TestServer {
     install_provider_once();
 
     let pki = Arc::new(mint_pki(&[1]));
-    spawn_test_server_with_pki(opts, Arc::clone(&pki), 1, 0, S2sConfig::default(), None).await
+    spawn_test_server_with_pki(
+        opts,
+        Arc::clone(&pki),
+        1,
+        0,
+        S2sConfig::default(),
+        None,
+        None,
+    )
+    .await
 }
 
 pub async fn spawn_s2s_test_server(
@@ -140,6 +150,7 @@ pub async fn spawn_s2s_test_server(
     install_provider_once();
 
     let persistence_dir = TempDir::new().expect("s2s persistence dir");
+    let blob_storage_dir = TempDir::new().expect("s2s blob storage dir");
     let (cert_path, key_path) = pki.nodes[s2s_opts.cert_index].clone();
     let s2s = S2sConfig {
         enabled: true,
@@ -159,6 +170,7 @@ pub async fn spawn_s2s_test_server(
         s2s_opts.cert_index,
         s2s,
         Some(persistence_dir),
+        Some(blob_storage_dir),
     )
     .await
 }
@@ -173,6 +185,7 @@ pub async fn spawn_s2s_test_server_with_config(
     install_provider_once();
 
     let persistence_dir = TempDir::new().expect("s2s persistence dir");
+    let blob_storage_dir = TempDir::new().expect("s2s blob storage dir");
     let (cert_path, key_path) = pki.nodes[cert_index].clone();
     s2s.enabled = true;
     s2s.ca_path = Some(pki.ca_path.clone());
@@ -180,7 +193,16 @@ pub async fn spawn_s2s_test_server_with_config(
     s2s.key_path = Some(key_path);
     s2s.persistence_dir = Some(persistence_dir.path().to_path_buf());
 
-    spawn_test_server_with_pki(opts, pki, node_id, cert_index, s2s, Some(persistence_dir)).await
+    spawn_test_server_with_pki(
+        opts,
+        pki,
+        node_id,
+        cert_index,
+        s2s,
+        Some(persistence_dir),
+        Some(blob_storage_dir),
+    )
+    .await
 }
 
 async fn spawn_test_server_with_pki(
@@ -190,6 +212,7 @@ async fn spawn_test_server_with_pki(
     cert_index: usize,
     s2s: S2sConfig,
     s2s_persistence_dir: Option<TempDir>,
+    blob_storage_dir: Option<TempDir>,
 ) -> TestServer {
     let (cert_path, key_path) = pki.nodes[cert_index].clone();
 
@@ -221,7 +244,9 @@ async fn spawn_test_server_with_pki(
         root_channel_name: "Root".into(),
         default_channel: opts.default_channel,
         cert_required: opts.cert_required,
-        blob_storage_dir: None,
+        blob_storage_dir: blob_storage_dir
+            .as_ref()
+            .map(|directory| directory.path().to_path_buf()),
         channel_log_max_entries: opts.channel_log_max_entries,
         client_log_max_entries: 10_000,
         channel_snapshot_every_ops: 10,
@@ -281,5 +306,6 @@ async fn spawn_test_server_with_pki(
         authenticator,
         run_handle: Some(run_handle),
         _s2s_persistence_dir: s2s_persistence_dir,
+        _blob_storage_dir: blob_storage_dir,
     }
 }

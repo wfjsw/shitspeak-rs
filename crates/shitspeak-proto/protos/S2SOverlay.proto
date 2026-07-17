@@ -73,6 +73,9 @@ message LinkStateAdvert {
   // Stable distribution profile IDs supported by this node's generic tree
   // transport. Empty means no distribution profile is active here.
   repeated uint32 distribution_profile_ids = 15;
+  // Cumulative strict-replication protocol version. Zero, including an
+  // absent field from an older peer, means terminal resolution is unsupported.
+  uint32 strict_replication_protocol_version = 16;
 }
 
 // One advertised edge from `origin` to `neighbor`.

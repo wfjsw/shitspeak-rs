@@ -9,13 +9,107 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
+use aws_lc_rs::signature;
 use rustls::RootCertStore;
+use rustls::SignatureScheme;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use thiserror::Error;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::types::NodeIdentifier;
 
 use super::error::ConfigError;
+use super::tls;
+
+const ORIGIN_SIGNATURE_SCHEMES: &[SignatureScheme] = &[
+    SignatureScheme::ECDSA_NISTP256_SHA256,
+    SignatureScheme::ECDSA_NISTP384_SHA384,
+    SignatureScheme::ECDSA_NISTP521_SHA512,
+    SignatureScheme::ED25519,
+    SignatureScheme::RSA_PSS_SHA256,
+    SignatureScheme::RSA_PKCS1_SHA256,
+];
+
+/// Detached proof made with the node certificate key.
+///
+/// The certificate chain is intentionally included because a routed overlay
+/// frame can arrive through a relay that has no direct TLS session with the
+/// logical origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OriginSignature {
+    signature_scheme: u16,
+    certificate_chain: Vec<Vec<u8>>,
+    signature: Vec<u8>,
+}
+
+impl OriginSignature {
+    pub fn signature_scheme(&self) -> u16 {
+        self.signature_scheme
+    }
+
+    pub fn certificate_chain(&self) -> &[Vec<u8>] {
+        &self.certificate_chain
+    }
+
+    pub fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+
+    /// Largest detached-signature length this transport supports for the
+    /// selected scheme. This is used to reserve wire space before a message
+    /// is signed; ECDSA DER encodings vary by a few bytes between signatures.
+    pub fn maximum_signature_len(&self) -> usize {
+        match self.signature_scheme {
+            // ASN.1 DER sequence maxima for P-256, P-384, and P-521.
+            0x0403 => 72,
+            0x0503 => 104,
+            0x0603 => 141,
+            0x0807 => 64,
+            // RSA signatures have fixed modulus length. Keep the observed
+            // length for the two RSA schemes we advertise.
+            0x0401 | 0x0804 => self.signature.len(),
+            _ => self.signature.len(),
+        }
+        .max(self.signature.len())
+    }
+
+    pub fn from_parts(
+        signature_scheme: u16,
+        certificate_chain: Vec<Vec<u8>>,
+        signature: Vec<u8>,
+    ) -> Self {
+        Self {
+            signature_scheme,
+            certificate_chain,
+            signature,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum OriginAuthenticationError {
+    #[error("transport identity is unavailable")]
+    IdentityUnavailable,
+    #[error("origin certificate chain is empty")]
+    CertificateChainEmpty,
+    #[error("origin certificate chain validation failed: {0}")]
+    CertificateChain(String),
+    #[error("origin certificate identity validation failed: {0}")]
+    CertificateIdentity(String),
+    #[error("origin certificate node {actual} does not match claimed node {expected}")]
+    NodeMismatch {
+        expected: NodeIdentifier,
+        actual: NodeIdentifier,
+    },
+    #[error("origin certificate parse failed: {0}")]
+    CertificateParse(String),
+    #[error("origin signature scheme is unsupported")]
+    UnsupportedSignatureScheme,
+    #[error("origin signature is invalid")]
+    InvalidSignature,
+    #[error("origin signature operation failed: {0}")]
+    Signing(String),
+}
 
 /// Loaded once at manager start; cloned cheaply through the rest of the system.
 #[derive(Clone)]
@@ -64,6 +158,96 @@ impl NodeIdentity {
 
     pub fn key(&self) -> &PrivateKeyDer<'static> {
         &self.key
+    }
+
+    pub(crate) fn sign_origin_payload(
+        &self,
+        payload: &[u8],
+    ) -> Result<OriginSignature, OriginAuthenticationError> {
+        let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(self.key())
+            .map_err(|error| OriginAuthenticationError::Signing(error.to_string()))?;
+        let signer = signing_key
+            .choose_scheme(ORIGIN_SIGNATURE_SCHEMES)
+            .ok_or(OriginAuthenticationError::UnsupportedSignatureScheme)?;
+        let signature_scheme = signature_scheme_code(signer.scheme())?;
+        let signature = signer
+            .sign(payload)
+            .map_err(|error| OriginAuthenticationError::Signing(error.to_string()))?;
+        Ok(OriginSignature::from_parts(
+            signature_scheme,
+            self.chain
+                .iter()
+                .map(|cert| cert.as_ref().to_vec())
+                .collect(),
+            signature,
+        ))
+    }
+
+    pub(crate) fn verify_origin_payload(
+        &self,
+        expected_node: NodeIdentifier,
+        proof: &OriginSignature,
+        payload: &[u8],
+    ) -> Result<(), OriginAuthenticationError> {
+        if proof.certificate_chain.is_empty() {
+            return Err(OriginAuthenticationError::CertificateChainEmpty);
+        }
+        let chain: Vec<CertificateDer<'static>> = proof
+            .certificate_chain
+            .iter()
+            .cloned()
+            .map(CertificateDer::from)
+            .collect();
+        tls::verify_peer_cert_chain(self.roots.clone(), &chain)
+            .map_err(|error| OriginAuthenticationError::CertificateChain(error.to_string()))?;
+        let actual_node = parse_peer_cn(&chain)
+            .map_err(|error| OriginAuthenticationError::CertificateIdentity(error.to_string()))?;
+        if actual_node != expected_node {
+            return Err(OriginAuthenticationError::NodeMismatch {
+                expected: expected_node,
+                actual: actual_node,
+            });
+        }
+        let leaf = chain
+            .first()
+            .ok_or(OriginAuthenticationError::CertificateChainEmpty)?;
+        let (_, certificate) = X509Certificate::from_der(leaf.as_ref())
+            .map_err(|error| OriginAuthenticationError::CertificateParse(error.to_string()))?;
+        let algorithm = signature_verification_algorithm(proof.signature_scheme)?;
+        let public_key = &certificate
+            .tbs_certificate
+            .subject_pki
+            .subject_public_key
+            .data;
+        signature::UnparsedPublicKey::new(algorithm, public_key)
+            .verify(payload, &proof.signature)
+            .map_err(|_| OriginAuthenticationError::InvalidSignature)
+    }
+}
+
+fn signature_scheme_code(scheme: SignatureScheme) -> Result<u16, OriginAuthenticationError> {
+    match scheme {
+        SignatureScheme::RSA_PKCS1_SHA256 => Ok(0x0401),
+        SignatureScheme::ECDSA_NISTP256_SHA256 => Ok(0x0403),
+        SignatureScheme::ECDSA_NISTP384_SHA384 => Ok(0x0503),
+        SignatureScheme::ECDSA_NISTP521_SHA512 => Ok(0x0603),
+        SignatureScheme::RSA_PSS_SHA256 => Ok(0x0804),
+        SignatureScheme::ED25519 => Ok(0x0807),
+        _ => Err(OriginAuthenticationError::UnsupportedSignatureScheme),
+    }
+}
+
+fn signature_verification_algorithm(
+    scheme: u16,
+) -> Result<&'static dyn signature::VerificationAlgorithm, OriginAuthenticationError> {
+    match scheme {
+        0x0401 => Ok(&signature::RSA_PKCS1_2048_8192_SHA256),
+        0x0403 => Ok(&signature::ECDSA_P256_SHA256_ASN1),
+        0x0503 => Ok(&signature::ECDSA_P384_SHA384_ASN1),
+        0x0603 => Ok(&signature::ECDSA_P521_SHA512_ASN1),
+        0x0804 => Ok(&signature::RSA_PSS_2048_8192_SHA256),
+        0x0807 => Ok(&signature::ED25519),
+        _ => Err(OriginAuthenticationError::UnsupportedSignatureScheme),
     }
 }
 
@@ -234,5 +418,24 @@ mod tests {
             ConfigError::CnNotNumeric { cn } => assert_eq!(cn, "alpha"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn detached_origin_proof_binds_node_and_payload() {
+        let dir = TempDir::new().unwrap();
+        let (ca, cert, key) = mint_identity(&dir, "42");
+        let identity = NodeIdentity::load(&ca, &cert, &key).unwrap();
+        let payload = b"strict-origin-proof";
+        let proof = identity.sign_origin_payload(payload).unwrap();
+
+        identity.verify_origin_payload(42, &proof, payload).unwrap();
+        assert!(matches!(
+            identity.verify_origin_payload(7, &proof, payload),
+            Err(OriginAuthenticationError::NodeMismatch { .. })
+        ));
+        assert!(matches!(
+            identity.verify_origin_payload(42, &proof, b"modified"),
+            Err(OriginAuthenticationError::InvalidSignature)
+        ));
     }
 }

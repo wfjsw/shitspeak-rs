@@ -42,27 +42,127 @@ mod runtime;
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::future::join_all;
+use prost::Message as _;
+use shitspeak_proto::s2s_overlay_proto as overlay_pb;
 use tokio::sync::broadcast;
 use tokio::time::{Instant, timeout};
 
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{
     AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage, MessageClass,
-    ServiceLevel, TransportKind,
+    OriginAuthenticationError, OriginSignature, ServiceLevel, TransportKind,
+    encoded_data_frame_len,
 };
 
 const DISTRIBUTION_HOP_TTL: Duration = Duration::from_millis(80);
+// A compressed data frame can carry the encoding, original length, and a
+// dictionary id in addition to the identity-frame fields used for sizing.
+const MAX_COMPRESSION_FRAME_METADATA_BYTES: usize = 24;
+
+fn protobuf_varint_len(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
+fn length_delimited_field_len(payload_len: usize) -> usize {
+    if payload_len == 0 {
+        0
+    } else {
+        1usize
+            .saturating_add(protobuf_varint_len(payload_len))
+            .saturating_add(payload_len)
+    }
+}
+
+fn strict_unicast_overlay_data_base_len() -> usize {
+    static BASE_LEN: OnceLock<usize> = OnceLock::new();
+    *BASE_LEN.get_or_init(|| {
+        overlay_pb::OverlayData {
+            src: u32::MAX,
+            dsts: vec![u32::MAX],
+            path_trace: vec![u32::MAX; messaging::forward::MAX_PATH_TRACE_NODES],
+            service_tag: u32::MAX,
+            service_level: u32::MAX,
+            message_class: u32::MAX,
+            payload: Bytes::new(),
+            process_on_transit: true,
+            route_metric: u32::MAX,
+            ordered_delivery: true,
+            ordering_seq: u64::MAX,
+            ordering_dst: u32::MAX,
+            lane_id: Some(u32::MAX),
+            origin_boot_epoch: u64::MAX,
+            origin_message_id: u64::MAX,
+            allow_l1_compression: true,
+            distribution_profile: Some(u32::MAX),
+            distribution_tree_version: Some(u64::MAX),
+            distribution_group: Some(u64::MAX),
+            distribution_group_version: Some(u64::MAX),
+            distribution_topology_epoch: Some(u64::MAX),
+            distribution_deadline_unix_ms: Some(u64::MAX),
+            distribution_repair: true,
+            distribution_repair_target: Some(u32::MAX),
+            distribution_deadline_issuer: Some(u32::MAX),
+            distribution_deadline_unix_us: Some(u64::MAX),
+            inline_attachments: Vec::new(),
+        }
+        .encoded_len()
+    })
+}
+
+fn strict_unicast_replication_frame_len(replication_payload_len: usize) -> usize {
+    let overlay_data_len = strict_unicast_overlay_data_base_len()
+        .saturating_add(length_delimited_field_len(replication_payload_len));
+    // `OverlayMessage` contains exactly one length-delimited `data` field.
+    let overlay_message_len = length_delimited_field_len(overlay_data_len);
+    encoded_data_frame_len(
+        u16::MAX,
+        u16::MAX,
+        ServiceLevel::Reliable,
+        MessageClass::Regular,
+        u64::MAX,
+        overlay_message_len,
+    )
+    .saturating_add(MAX_COMPRESSION_FRAME_METADATA_BYTES)
+}
+
+fn max_replication_payload_bytes_for_frame(
+    max_frame_bytes: usize,
+    additional_replication_overhead: usize,
+) -> usize {
+    if additional_replication_overhead > max_frame_bytes {
+        return 0;
+    }
+    let mut low = 0usize;
+    let mut high = max_frame_bytes - additional_replication_overhead;
+    while low < high {
+        let candidate = low + (high - low).div_ceil(2);
+        let encoded_len =
+            strict_unicast_replication_frame_len(candidate + additional_replication_overhead);
+        if encoded_len <= max_frame_bytes {
+            low = candidate;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    low
+}
 
 pub use config::{OverlayConfig, OverlayTuning, SeedPeer, TransportMask};
 pub use duplicate::{DuplicateDetector, DuplicateEvidenceKind, DuplicateNodeSnapshot};
 pub use error::OverlayError;
 pub use lane::LaneId;
-pub use lsdb::{ApplicationServices, ReplicationServices};
+pub use lsdb::{ApplicationServices, ReplicationServices, STRICT_REPLICATION_PROTOCOL_VERSION};
 pub use membership::{MemberIncarnation, MemberSnapshot, MemberStatus, MembershipEvent};
 pub use messaging::{
     OVERLAY_ATTACHMENT_SERVICE_TAG, OverlayAttachment, OverlayInboundMessage, OverlaySendOptions,
@@ -313,6 +413,102 @@ impl OverlayNetwork {
         self.inner.boot_epoch
     }
 
+    /// Sign an end-to-end payload as this overlay's logical origin.
+    pub(crate) fn sign_origin_payload(
+        &self,
+        payload: &[u8],
+    ) -> Result<OriginSignature, OriginAuthenticationError> {
+        self.inner.transport.sign_origin_payload(payload)
+    }
+
+    /// Verify a routed logical-origin proof against the configured S2S CA.
+    pub(crate) fn verify_origin_payload(
+        &self,
+        claimed_node: NodeIdentifier,
+        proof: &OriginSignature,
+        payload: &[u8],
+    ) -> Result<(), OriginAuthenticationError> {
+        self.inner
+            .transport
+            .verify_origin_payload(claimed_node, proof, payload)
+    }
+
+    /// Locally advertised strict-replication protocol version. Unlike the
+    /// cluster floor, this reflects this node's synchronous durable-state and
+    /// coordinated-repository registration gates.
+    pub(crate) fn local_strict_replication_protocol_version(&self) -> u32 {
+        self.inner.emitter.strict_replication_protocol_version()
+    }
+
+    /// Conservative budget for a complete strict routed-unicast replication
+    /// payload inside one transport frame.
+    pub(crate) fn max_replication_payload_bytes(&self) -> usize {
+        self.max_replication_payload_bytes_with_additional_replication_overhead(0)
+    }
+
+    /// Conservative budget for an unsigned strict routed-unicast payload when
+    /// a later encoding adds `additional_replication_overhead` bytes. Callers
+    /// must derive that value with
+    /// `authenticated_encoded_len.checked_sub(unsigned_encoded_len)` from the
+    /// exact origin-auth representation that will be sent.
+    pub(crate) fn max_replication_payload_bytes_with_additional_replication_overhead(
+        &self,
+        additional_replication_overhead: usize,
+    ) -> usize {
+        max_replication_payload_bytes_for_frame(
+            self.inner.transport.max_frame_bytes(),
+            additional_replication_overhead,
+        )
+    }
+
+    /// Shared persistence root used by overlay-backed protocol state. The
+    /// replication layer derives its per-topic terminal journal beneath this
+    /// directory rather than introducing a second operator path.
+    pub(crate) fn persistence_dir(&self) -> Option<std::path::PathBuf> {
+        self.inner.cfg.persistence_dir().cloned()
+    }
+
+    /// Begin a manager-owned coordinated strict repository registration pass.
+    ///
+    /// Only `ReplicationManager` uses this lifecycle hook. It deliberately
+    /// does not accept repository versions from callers: the manager probes
+    /// its registered runtimes directly before it can promote the local LSA.
+    pub(crate) fn begin_strict_replication_repository_registration(&self) {
+        self.inner
+            .emitter
+            .begin_strict_replication_repository_registration();
+    }
+
+    /// Apply manager-derived readiness for the currently coordinated strict
+    /// repository registration pass. A capability loss revokes the pass's
+    /// rearm permit, so `true` is accepted only after an explicit new setup.
+    pub(crate) fn update_strict_replication_repository_registration_ready(
+        &self,
+        ready: bool,
+    ) -> bool {
+        self.inner
+            .emitter
+            .update_strict_replication_repository_registration_ready(ready)
+    }
+
+    /// Immediately clamp the local LSA when an already registered strict
+    /// repository loses its current protocol capability. Only a coordinated
+    /// re-registration can clear this latch.
+    pub(crate) fn report_strict_replication_repository_capability_loss(&self) {
+        self.inner
+            .emitter
+            .report_strict_replication_repository_capability_loss();
+    }
+
+    /// Stop advertising the current strict-replication protocol in the local
+    /// LSA.
+    ///
+    /// The strict runtime calls this when it cannot restore its durable
+    /// terminal journal.
+    pub(crate) fn disable_strict_replication_protocol(&self) {
+        self.inner.emitter.disable_strict_replication_protocol();
+    }
+
     #[cfg(feature = "pre-release-workload")]
     pub fn pre_release_distribution_epoch(&self) -> u64 {
         self.inner.lsdb.distribution_epoch()
@@ -386,6 +582,60 @@ impl OverlayNetwork {
             .into_iter()
             .filter(|node| !self.is_node_quarantined(*node))
             .collect()
+    }
+
+    /// Minimum cumulative strict-replication protocol version across every
+    /// active, non-quarantined overlay member. Legacy LSAs and an empty view
+    /// both yield zero, so callers can safely gate new strict frames with a
+    /// simple minimum-version comparison.
+    pub fn minimum_strict_replication_protocol_version(&self) -> u32 {
+        let member_floor = membership::minimum_strict_replication_protocol_version(
+            self.inner.table.snapshot(),
+            |node| self.inner.duplicate_detector.is_quarantined(node),
+        );
+        member_floor.min(self.inner.emitter.strict_replication_protocol_version())
+    }
+
+    /// Freeze the strict-replication targets and cumulative protocol floor
+    /// from one membership snapshot. The floor deliberately covers every
+    /// reachable member, including relays; targets include only members that
+    /// advertise the strict replication service.
+    pub(crate) fn strict_replication_target_snapshot(&self) -> (u32, Vec<(NodeIdentifier, u64)>) {
+        let members = self.inner.table.snapshot();
+        let local_protocol_version = self.inner.emitter.strict_replication_protocol_version();
+        let mut floor: Option<u32> = None;
+        let mut targets = Vec::new();
+        for member in members {
+            if !member.status().is_reachable()
+                || self
+                    .inner
+                    .duplicate_detector
+                    .is_quarantined(member.node_id())
+            {
+                continue;
+            }
+            floor = Some(match floor {
+                Some(current) => current.min(member.strict_replication_protocol_version()),
+                None => member.strict_replication_protocol_version(),
+            });
+            if member.replication_services().strict() {
+                targets.push((member.node_id(), member.boot_epoch()));
+            }
+        }
+        (
+            floor.unwrap_or_default().min(local_protocol_version),
+            targets,
+        )
+    }
+
+    /// Number of active, non-quarantined overlay members below the requested
+    /// cumulative strict-replication protocol version.
+    pub fn unsupported_strict_replication_protocol_peers(&self, required_version: u32) -> usize {
+        membership::unsupported_strict_replication_protocol_peers(
+            self.inner.table.snapshot(),
+            required_version,
+            |node| self.inner.duplicate_detector.is_quarantined(node),
+        )
     }
 
     /// IDs of active members that advertise application voice service.
@@ -1923,5 +2173,37 @@ impl OverlayNetwork {
     /// neighbor, then cancel internal tasks.
     pub async fn shutdown(&self) {
         self.inner.shutdown_graceful().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_MAX_FRAME_BYTES: usize = 64 * 1024;
+
+    #[test]
+    fn strict_unicast_frame_budget_fits_with_the_maximum_path_trace() {
+        let budget = max_replication_payload_bytes_for_frame(TEST_MAX_FRAME_BYTES, 0);
+
+        assert!(strict_unicast_replication_frame_len(budget) <= TEST_MAX_FRAME_BYTES);
+        assert!(strict_unicast_replication_frame_len(budget + 1) > TEST_MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn strict_unicast_frame_budget_accounts_for_auth_overhead() {
+        const AUTH_OVERHEAD_BYTES: usize = 768;
+
+        let budget =
+            max_replication_payload_bytes_for_frame(TEST_MAX_FRAME_BYTES, AUTH_OVERHEAD_BYTES);
+
+        assert!(
+            strict_unicast_replication_frame_len(budget + AUTH_OVERHEAD_BYTES)
+                <= TEST_MAX_FRAME_BYTES
+        );
+        assert!(
+            strict_unicast_replication_frame_len(budget + AUTH_OVERHEAD_BYTES + 1)
+                > TEST_MAX_FRAME_BYTES
+        );
     }
 }

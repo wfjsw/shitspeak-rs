@@ -5,10 +5,10 @@
 //! hands emitted frames to the installed audio sink. The speaker-side API
 //! wraps already-encoded audio payloads with unresolved routing intent.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -50,6 +50,10 @@ const REPAIR_RESPONSE_MIN_CONCURRENCY: usize = 2;
 const REPAIR_RESPONSE_MAX_CONCURRENCY: usize = 16;
 const DISTANT_REPAIR_PATH_LATENCY_US: u64 = 150_000;
 const PROACTIVE_WORKER_CONCURRENCY: usize = 4;
+const TAIL_REPAIR_SUFFIX_FRAMES: u64 = 8;
+const TAIL_REPAIR_MAX_ATTEMPTS: u8 = 12;
+const TAIL_REPAIR_INITIAL_DELAY: Duration = Duration::from_millis(50);
+const TAIL_REPAIR_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Decoded inbound voice frame along with the immediate sender (next-hop
 /// peer that delivered the overlay frame, not necessarily the originator).
@@ -67,6 +71,23 @@ struct RepairRequestKey {
     sender_epoch: u64,
     first_seq: u64,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TailRepairKey {
+    destination: NodeIdentifier,
+    sender_session: u32,
+    sender_epoch: u64,
+    terminal_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TailRepairEntry {
+    attempts: u8,
+    next_retry: Instant,
+    expires_at: Instant,
+}
+
+type TailRepairState = Arc<parking_lot::Mutex<HashMap<TailRepairKey, TailRepairEntry>>>;
 
 impl RepairRequestKey {
     fn new(gap: GapReport) -> Self {
@@ -170,6 +191,7 @@ pub struct VoiceService {
     proactive_inbox_tx: mpsc::UnboundedSender<InboundVoiceWork>,
     proactive_send_tx: mpsc::UnboundedSender<ProactiveSendWork>,
     repair_response_tx: mpsc::Sender<RepairResponseRequest>,
+    tail_repairs: TailRepairState,
 
     /// Live byte and speaker admission limits derived from runtime capacity.
     voice_budget: AdaptiveVoiceBudget,
@@ -268,6 +290,7 @@ impl VoiceService {
         };
         let (repair_response_tx, repair_response_rx) =
             mpsc::channel(REPAIR_RESPONSE_QUEUE_CAPACITY);
+        let tail_repairs: TailRepairState = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let audio_sink: AudioSinkSlot = Arc::new(RwLock::new(None));
         let reorderer = Reorderer::new_with_capacity_source(cfg.clone(), max_users);
         let repair_cache = Arc::new(RepairCache::new(Duration::from_millis(cfg.repair_cache_ms)));
@@ -304,6 +327,13 @@ impl VoiceService {
             voice_budget.clone(),
             shutdown.clone(),
         );
+        spawn_tail_repair_worker(
+            tail_repairs.clone(),
+            transport.clone(),
+            repair_cache.clone(),
+            cfg.clone(),
+            shutdown.clone(),
+        );
         reorder::spawn_deadline_task(reorderer.clone(), shutdown.clone(), move || {
             let _ = deadline_tx.try_send(());
         });
@@ -316,6 +346,7 @@ impl VoiceService {
             proactive_inbox_tx,
             proactive_send_tx,
             repair_response_tx,
+            tail_repairs,
             voice_budget,
             sender_epoch,
             seq_counters: Arc::new(SccMap::new()),
@@ -369,6 +400,7 @@ impl VoiceService {
             transport: self.transport.clone(),
             repair_enabled: self.cfg.repair_enabled,
             response_tx: self.repair_response_tx.clone(),
+            tail_repairs: self.tail_repairs.clone(),
         })
     }
 
@@ -430,6 +462,7 @@ impl VoiceService {
         )?;
         let bytes = envelope.original_body();
         self.cache_original(sender_session, seq, bytes.clone());
+        self.register_terminal_repairs(sender_session, seq, bytes.clone(), is_terminator, &dsts);
         let result = if self.cfg.tree_delivery_enabled {
             self.transport
                 .send_tree_multicast(
@@ -455,8 +488,14 @@ impl VoiceService {
                 VoiceSendResult::Failed
             },
         );
+        if result.is_err() {
+            self.cancel_terminal_repairs(sender_session, seq, &dsts);
+        }
         result?;
         self.refresh_cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, &dsts);
+        if is_terminator {
+            self.extend_terminal_cache(sender_session, seq, bytes);
+        }
         Ok(())
     }
 
@@ -517,6 +556,7 @@ impl VoiceService {
         )?;
         let bytes = envelope.original_body();
         self.cache_original(sender_session, seq, bytes.clone());
+        self.register_terminal_repairs(sender_session, seq, bytes.clone(), is_terminator, dsts);
         let result = if self.cfg.tree_delivery_enabled {
             self.transport
                 .send_tree_multicast(dsts, group, bytes.clone(), self.cfg.transport_ttl())
@@ -537,8 +577,14 @@ impl VoiceService {
                 VoiceSendResult::Failed
             },
         );
+        if result.is_err() {
+            self.cancel_terminal_repairs(sender_session, seq, dsts);
+        }
         result?;
         self.refresh_cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, dsts);
+        if is_terminator {
+            self.extend_terminal_cache(sender_session, seq, bytes);
+        }
         Ok(())
     }
 
@@ -838,6 +884,7 @@ impl VoiceService {
         )?;
         let bytes = envelope.original_body();
         self.cache_original(sender_session, seq, bytes.clone());
+        self.register_terminal_repairs(sender_session, seq, bytes.clone(), is_terminator, &[dst]);
         let result = self
             .transport
             .send_unicast(dst, bytes.clone(), self.cfg.transport_ttl())
@@ -853,8 +900,14 @@ impl VoiceService {
                 VoiceSendResult::Failed
             },
         );
+        if result.is_err() {
+            self.cancel_terminal_repairs(sender_session, seq, &[dst]);
+        }
         result?;
         self.refresh_cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, &[dst]);
+        if is_terminator {
+            self.extend_terminal_cache(sender_session, seq, bytes);
+        }
         Ok(())
     }
 
@@ -900,6 +953,71 @@ impl VoiceService {
             s2s_seq,
             body,
         ));
+    }
+
+    fn register_terminal_repairs(
+        &self,
+        sender_session: u32,
+        terminal_seq: u64,
+        terminal_body: Bytes,
+        is_terminator: bool,
+        dsts: &[NodeIdentifier],
+    ) {
+        if !self.cfg.repair_enabled || !is_terminator {
+            return;
+        }
+        let now = Instant::now();
+        let expires_at = now + tail_repair_lifetime(&self.cfg);
+        self.extend_terminal_cache(sender_session, terminal_seq, terminal_body);
+        let mut repairs = self.tail_repairs.lock();
+        for &destination in dsts {
+            if destination == self.transport.local_node_id() {
+                continue;
+            }
+            repairs.insert(
+                TailRepairKey {
+                    destination,
+                    sender_session,
+                    sender_epoch: self.sender_epoch,
+                    terminal_seq,
+                },
+                TailRepairEntry {
+                    attempts: 0,
+                    next_retry: now + TAIL_REPAIR_INITIAL_DELAY,
+                    expires_at,
+                },
+            );
+        }
+    }
+
+    fn cancel_terminal_repairs(
+        &self,
+        sender_session: u32,
+        terminal_seq: u64,
+        dsts: &[NodeIdentifier],
+    ) {
+        if !self.cfg.repair_enabled {
+            return;
+        }
+        let mut repairs = self.tail_repairs.lock();
+        for &destination in dsts {
+            repairs.remove(&TailRepairKey {
+                destination,
+                sender_session,
+                sender_epoch: self.sender_epoch,
+                terminal_seq,
+            });
+        }
+    }
+
+    fn extend_terminal_cache(&self, sender_session: u32, terminal_seq: u64, body: Bytes) {
+        if !self.cfg.repair_enabled {
+            return;
+        }
+        self.repair_cache.insert_with_cache_ttl(
+            RepairFrame::new(sender_session, self.sender_epoch, terminal_seq, body),
+            tail_repair_lifetime(&self.cfg),
+        );
     }
 
     fn refresh_cache_and_queue_proactive_repairs(
@@ -1173,6 +1291,7 @@ struct VoiceRepairInbound {
     transport: Arc<dyn VoiceTransport>,
     repair_enabled: bool,
     response_tx: mpsc::Sender<RepairResponseRequest>,
+    tail_repairs: TailRepairState,
 }
 
 impl ServiceInbound for VoiceRepairInbound {
@@ -1188,6 +1307,18 @@ impl ServiceInbound for VoiceRepairInbound {
                 return;
             }
         };
+        if request.tail_ack {
+            let key = TailRepairKey {
+                destination: msg.from,
+                sender_session: request.sender_session,
+                sender_epoch: request.sender_epoch,
+                terminal_seq: request.last_seq,
+            };
+            if self.tail_repairs.lock().remove(&key).is_some() {
+                metrics::record_repair(source, msg.from, VoiceRepairResult::TailAckReceived, 1);
+            }
+            return;
+        }
         let work = RepairResponseRequest {
             from: msg.from,
             request,
@@ -1343,7 +1474,21 @@ fn spawn_dispatch_task(
                 Some(sink) => {
                     for emission in emits {
                         let (from, frame, is_repair) = emission.into_parts();
+                        let tail_ack = cfg.repair_enabled && frame.is_terminator;
+                        let ack_sender_session = frame.sender_session;
+                        let ack_sender_epoch = frame.sender_epoch;
+                        let ack_terminal_seq = frame.s2s_seq;
                         sink.deliver(from, frame, is_repair).await;
+                        if tail_ack {
+                            spawn_tail_ack(
+                                transport.clone(),
+                                shutdown.clone(),
+                                ack_sender_session,
+                                ack_sender_epoch,
+                                ack_terminal_seq,
+                                cfg.repair_request_ttl_ms,
+                            );
+                        }
                     }
                 }
                 None => {
@@ -1480,6 +1625,151 @@ fn spawn_proactive_worker(
     });
 }
 
+/// Keep the end of every originated utterance alive until the receiver has
+/// emitted its terminator contiguously. A terminator has no later packet that
+/// could open a reorder gap, so ordinary NACK repair cannot discover a loss at
+/// the tail. These bounded, proactively-marked suffix copies are accepted by
+/// a healthy reorder stream and stop immediately on the receiver's ACK.
+fn spawn_tail_repair_worker(
+    repairs: TailRepairState,
+    transport: Arc<dyn VoiceTransport>,
+    repair_cache: Arc<RepairCache>,
+    cfg: VoiceConfig,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(TAIL_REPAIR_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
+
+            let now = Instant::now();
+            let due: Vec<(TailRepairKey, u8)> = {
+                let mut state = repairs.lock();
+                state.retain(|_, entry| entry.expires_at > now);
+                let mut due = Vec::new();
+                for (key, entry) in state.iter_mut() {
+                    if entry.next_retry > now {
+                        continue;
+                    }
+                    if entry.attempts >= TAIL_REPAIR_MAX_ATTEMPTS {
+                        continue;
+                    }
+                    entry.attempts = entry.attempts.saturating_add(1);
+                    entry.next_retry = now + TAIL_REPAIR_INTERVAL;
+                    due.push((*key, entry.attempts));
+                }
+                state.retain(|_, entry| entry.attempts < TAIL_REPAIR_MAX_ATTEMPTS);
+                due
+            };
+
+            for (key, attempt) in due {
+                let first_seq = key
+                    .terminal_seq
+                    .saturating_sub(TAIL_REPAIR_SUFFIX_FRAMES.saturating_sub(1));
+                let frames = repair_cache.lookup_range(
+                    key.sender_session,
+                    key.sender_epoch,
+                    first_seq,
+                    key.terminal_seq,
+                );
+                if frames.is_empty() {
+                    continue;
+                }
+                let avoid_first_hop = transport
+                    .voice_route_quality(key.destination)
+                    .map(|quality| quality.next_hop());
+                let ttl = adaptive_repair_transport_ttl(
+                    &cfg,
+                    transport.voice_route_quality(key.destination),
+                );
+                for frame in frames {
+                    let body = match send::mark_proactive_copy(frame.body()) {
+                        Ok(body) => body,
+                        Err(error) => {
+                            trace!(%error, "voice tail repair: mark envelope failed");
+                            continue;
+                        }
+                    };
+                    let still_outstanding = repairs.lock().contains_key(&key);
+                    if !still_outstanding {
+                        break;
+                    }
+                    match transport
+                        .send_proactive_repair_frame(key.destination, body, avoid_first_hop, ttl)
+                        .await
+                    {
+                        Ok(()) => metrics::record_repair(
+                            transport.local_node_id(),
+                            key.destination,
+                            VoiceRepairResult::TailRetrySent,
+                            1,
+                        ),
+                        Err(error) => {
+                            trace!(%error, "voice tail repair send failed");
+                        }
+                    }
+                }
+                trace!(
+                    destination = %key.destination,
+                    sender_session = key.sender_session,
+                    terminal_seq = key.terminal_seq,
+                    attempt,
+                    "voice tail repair suffix sent"
+                );
+            }
+        }
+    });
+}
+
+fn spawn_tail_ack(
+    transport: Arc<dyn VoiceTransport>,
+    shutdown: CancellationToken,
+    sender_session: u32,
+    sender_epoch: u64,
+    terminal_seq: u64,
+    request_ttl_ms: u64,
+) {
+    tokio::spawn(async move {
+        let destination = repair_destination(sender_session);
+        let request = VoiceRepairRequest {
+            sender_session,
+            sender_epoch,
+            first_seq: terminal_seq,
+            last_seq: terminal_seq,
+            request_sent_unix_ms: 0,
+            request_ttl_ms: request_ttl_ms.min(u64::from(u32::MAX)) as u32,
+            tail_ack: true,
+        };
+        let Ok(body) = proto::encode_voice_repair_request(&request) else {
+            return;
+        };
+        let result = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            result = transport.send_repair_request(
+                destination,
+                body,
+                Duration::from_millis(request_ttl_ms),
+            ) => result,
+        };
+        if result.is_ok() {
+            metrics::record_repair(
+                transport.local_node_id(),
+                destination,
+                VoiceRepairResult::TailAckSent,
+                1,
+            );
+        }
+    });
+}
+
+fn tail_repair_lifetime(cfg: &VoiceConfig) -> Duration {
+    Duration::from_millis(cfg.repair_cache_ms.max(250))
+}
+
 fn spawn_repair_request_worker(
     mut rx: mpsc::Receiver<GapReport>,
     outstanding: Arc<parking_lot::Mutex<HashSet<RepairRequestKey>>>,
@@ -1507,6 +1797,7 @@ fn spawn_repair_request_worker(
                     last_seq: gap.last_seq,
                     request_sent_unix_ms: 0,
                     request_ttl_ms: request_ttl_ms.min(u64::from(u32::MAX)) as u32,
+                    tail_ack: false,
                 };
                 match proto::encode_voice_repair_request(&request) {
                     Ok(body) => {
@@ -2205,6 +2496,119 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn contiguous_terminator_sends_tail_ack_after_sink_delivery() {
+        let transport = FakeVoiceTransport::new(7, vec![2]);
+        let svc = make_legacy_service(transport.clone());
+        let sink = RecordingSink::new();
+        svc.set_audio_sink(sink.clone());
+        let sender_session = shitspeak_core::ClientSessionIdentifier::new(7, 0xABC)
+            .unwrap()
+            .to_u32();
+        let body = send::build_envelope(
+            sender_session,
+            shitspeak_core::default_server_id(),
+            42,
+            17,
+            0,
+            true,
+            Bytes::from_static(b"tail"),
+            normal_intent(5),
+        )
+        .unwrap();
+
+        svc.inbound_handler().handle(OverlayInboundMessage {
+            from: 2,
+            origin_boot_epoch: 0,
+            level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
+            class: shitspeak_s2s_transport::MessageClass::HighPriority,
+            body,
+            remote_playout_delay_ms: None,
+            is_distribution_repair: false,
+        });
+
+        for _ in 0..100 {
+            if sink.len() == 1 && transport.calls().len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sink.len(), 1);
+        let calls = wait_for_call_count(&transport, 1).await;
+        match &calls[0] {
+            FakeCall::RepairRequest { dst, body, .. } => {
+                assert_eq!(*dst, 7);
+                let ack = proto::decode_voice_repair_request(body).unwrap();
+                assert!(ack.tail_ack);
+                assert_eq!(ack.sender_session, sender_session);
+                assert_eq!(ack.sender_epoch, 42);
+                assert_eq!(ack.first_seq, 17);
+                assert_eq!(ack.last_seq, 17);
+            }
+            other => panic!("expected tail acknowledgement, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tail_retry_stops_when_destination_acknowledges() {
+        let transport = FakeVoiceTransport::new(7, vec![2]);
+        let mut cfg = VoiceConfig::default();
+        cfg.repair_cache_ms = 1;
+        let svc =
+            VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
+        svc.send_unicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            0,
+            true,
+            Bytes::from_static(b"tail"),
+            normal_intent(5),
+            2,
+        )
+        .await
+        .unwrap();
+        let mut calls = transport.calls();
+        for _ in 0..60 {
+            if calls.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            calls = transport.calls();
+        }
+        assert!(matches!(
+            calls.get(1),
+            Some(FakeCall::RepairFrame {
+                dst: 2,
+                is_repair: false,
+                body,
+                ..
+            }) if proto::decode_voice(body).unwrap().proactive_copy
+        ));
+
+        let ack = VoiceRepairRequest {
+            sender_session: 0xABC,
+            sender_epoch: 42,
+            first_seq: 0,
+            last_seq: 0,
+            request_sent_unix_ms: 0,
+            request_ttl_ms: 0,
+            tail_ack: true,
+        };
+        svc.repair_inbound_handler().handle(OverlayInboundMessage {
+            from: 2,
+            origin_boot_epoch: 0,
+            level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
+            class: shitspeak_s2s_transport::MessageClass::HighPriority,
+            body: proto::encode_voice_repair_request(&ack).unwrap(),
+            remote_playout_delay_ms: None,
+            is_distribution_repair: false,
+        });
+        assert!(svc.tail_repairs.lock().is_empty());
+
+        tokio::time::sleep(TAIL_REPAIR_INTERVAL + Duration::from_millis(30)).await;
+        assert_eq!(transport.calls().len(), 2);
+    }
+
     fn make_service_with_strategy(
         transport: Arc<FakeVoiceTransport>,
         strategy: &str,
@@ -2318,9 +2722,11 @@ mod tests {
             last_seq: 0,
             request_sent_unix_ms: 0,
             request_ttl_ms: 0,
+            tail_ack: false,
         };
         svc.repair_inbound_handler().handle(OverlayInboundMessage {
             from: 3,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: proto::encode_voice_repair_request(&request).unwrap(),
@@ -2371,6 +2777,7 @@ mod tests {
             .unwrap();
             inbound.handle(OverlayInboundMessage {
                 from: 11,
+                origin_boot_epoch: 0,
                 level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
                 class: shitspeak_s2s_transport::MessageClass::HighPriority,
                 body,
@@ -2381,6 +2788,7 @@ mod tests {
         let primary_session = 0xABCD;
         inbound.handle(OverlayInboundMessage {
             from: 11,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: send::build_envelope(
@@ -2546,6 +2954,7 @@ mod tests {
         };
         inbound.handle(OverlayInboundMessage {
             from: 11,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: make_body(1),
@@ -2558,6 +2967,7 @@ mod tests {
         max_users.store(100, Ordering::Relaxed);
         inbound.handle(OverlayInboundMessage {
             from: 11,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: make_body(2),
@@ -3067,6 +3477,7 @@ mod tests {
         .unwrap();
         svc.inbound_handler().handle(OverlayInboundMessage {
             from: 11,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: envelope,
@@ -3129,6 +3540,7 @@ mod tests {
             .unwrap();
             inbound.handle(OverlayInboundMessage {
                 from: 11,
+                origin_boot_epoch: 0,
                 level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
                 class: shitspeak_s2s_transport::MessageClass::HighPriority,
                 body,
@@ -3189,6 +3601,7 @@ mod tests {
         for body in [original, late_proactive] {
             inbound.handle(OverlayInboundMessage {
                 from: 11,
+                origin_boot_epoch: 0,
                 level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
                 class: shitspeak_s2s_transport::MessageClass::HighPriority,
                 body,
@@ -3229,6 +3642,7 @@ mod tests {
 
         svc.inbound_handler().handle(OverlayInboundMessage {
             from: 11,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: original,
@@ -3248,6 +3662,7 @@ mod tests {
         .unwrap();
         svc.inbound_handler().handle(OverlayInboundMessage {
             from: 11,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: buffered_original,
@@ -3267,6 +3682,7 @@ mod tests {
         .unwrap();
         svc.inbound_handler().handle(OverlayInboundMessage {
             from: 11,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: repair,
@@ -3300,6 +3716,7 @@ mod tests {
         .unwrap();
         svc.inbound_handler().handle(OverlayInboundMessage {
             from: 1,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: envelope,
@@ -3338,6 +3755,7 @@ mod tests {
             .unwrap();
             inbound.handle(OverlayInboundMessage {
                 from: 11,
+                origin_boot_epoch: 0,
                 level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
                 class: shitspeak_s2s_transport::MessageClass::HighPriority,
                 body: envelope,
@@ -3397,6 +3815,7 @@ mod tests {
             .unwrap();
             inbound.handle(OverlayInboundMessage {
                 from: 11,
+                origin_boot_epoch: 0,
                 level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
                 class: shitspeak_s2s_transport::MessageClass::HighPriority,
                 body: envelope,
@@ -3441,10 +3860,12 @@ mod tests {
             last_seq: 0,
             request_sent_unix_ms: 0,
             request_ttl_ms: 0,
+            tail_ack: false,
         };
         let request_body = proto::encode_voice_repair_request(&request).unwrap();
         svc.repair_inbound_handler().handle(OverlayInboundMessage {
             from: 2,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::ReliableLowLatency,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: request_body,
@@ -3506,6 +3927,7 @@ mod tests {
                     last_seq,
                     request_sent_unix_ms: 0,
                     request_ttl_ms: 0,
+                    tail_ack: false,
                 },
             })
             .await
@@ -3594,9 +4016,11 @@ mod tests {
             last_seq: 0,
             request_sent_unix_ms: 0,
             request_ttl_ms: 0,
+            tail_ack: false,
         };
         svc.repair_inbound_handler().handle(OverlayInboundMessage {
             from: 3,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: proto::encode_voice_repair_request(&request).unwrap(),
@@ -3677,10 +4101,12 @@ mod tests {
             last_seq: 0,
             request_sent_unix_ms: 1,
             request_ttl_ms: 1,
+            tail_ack: false,
         };
         let request_body = proto::encode_voice_repair_request(&request).unwrap();
         svc.repair_inbound_handler().handle(OverlayInboundMessage {
             from: 2,
+            origin_boot_epoch: 0,
             level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
             class: shitspeak_s2s_transport::MessageClass::HighPriority,
             body: request_body,

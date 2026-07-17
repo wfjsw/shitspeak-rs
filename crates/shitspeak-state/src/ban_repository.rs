@@ -8,11 +8,12 @@
 //!
 //! The public interface is unchanged from the previous in-memory implementation.
 
+use std::collections::HashSet;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
@@ -20,6 +21,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::broadcast;
 
 use shitspeak_core::StrictReplicationMetadata;
+
+use crate::channel_repository::{StrictOperationApplyOutcome, StrictOperationId};
 
 // ─── Ban entry ───────────────────────────────────────────────────────────────
 
@@ -30,6 +33,10 @@ fn sql_i64_from_u64(value: u64) -> rusqlite::Result<i64> {
 fn sql_i64_from_u64_io(value: u64) -> Result<i64, io::Error> {
     sql_i64_from_u64(value)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+}
+
+fn sqlite_io_error(error: rusqlite::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, error.to_string())
 }
 
 fn sql_u64_from_i64(value: i64) -> u64 {
@@ -132,6 +139,31 @@ impl BanLogEntry {
     }
 }
 
+/// An atomically captured strict-replication snapshot of the ban repository.
+///
+/// The state, version, freshness, and idempotency ledger are read from one
+/// SQLite transaction. Consumers must serialize this bundle together rather
+/// than independently querying its fields.
+#[derive(Debug, Clone)]
+pub struct BanStrictSnapshot {
+    version: u64,
+    entries: Vec<BanEntry>,
+    freshness: i64,
+    operation_ids: Vec<StrictOperationId>,
+}
+
+impl BanStrictSnapshot {
+    /// Consume the snapshot into the values needed by an S2S snapshot frame.
+    pub fn into_parts(self) -> (u64, Vec<BanEntry>, i64, Vec<StrictOperationId>) {
+        (
+            self.version,
+            self.entries,
+            self.freshness,
+            self.operation_ids,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum BanOp {
@@ -154,6 +186,10 @@ pub struct BanRepository {
     /// Optional storage directory (for logging / future use).
     #[allow(dead_code)]
     storage_dir: Option<PathBuf>,
+    /// A failed strict SQLite transaction leaves its durable terminal state
+    /// uncertain. Keep v2 disabled until a fresh process reopens and verifies
+    /// the repository rather than treating the configured path as healthy.
+    strict_durability_poisoned: AtomicBool,
     /// Broadcast channel for S2S subscribers.
     tx: broadcast::Sender<Arc<BanOperation>>,
 }
@@ -211,6 +247,19 @@ impl BanRepository {
                 strict_ts_final TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS ban_strict_op_ids (
+                op_id_hi TEXT NOT NULL,
+                op_id_lo TEXT NOT NULL,
+                ts_final TEXT NOT NULL,
+                PRIMARY KEY (op_id_hi, op_id_lo)
+            );
+
+            CREATE TABLE IF NOT EXISTS ban_snapshot_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version TEXT NOT NULL,
+                freshness INTEGER NOT NULL
+            );
+
             -- Index for efficient IP lookups
             CREATE INDEX IF NOT EXISTS idx_bans_address ON bans(address);",
         )
@@ -222,6 +271,16 @@ impl BanRepository {
         ] {
             let _ = conn.execute(migration, []);
         }
+        conn.execute(
+            "INSERT OR IGNORE INTO ban_strict_op_ids (op_id_hi, op_id_lo, ts_final)
+             SELECT strict_op_id_hi, strict_op_id_lo, strict_ts_final
+             FROM ban_operations
+             WHERE strict_op_id_hi IS NOT NULL
+               AND strict_op_id_lo IS NOT NULL
+               AND strict_ts_final IS NOT NULL",
+            [],
+        )
+        .expect("strict operation id backfill should succeed");
 
         // Determine current version from the operations table
         let max_version = conn
@@ -232,15 +291,32 @@ impl BanRepository {
             )
             .map(sql_u64_from_i64)
             .unwrap_or(0);
+        let snapshot_version = conn
+            .query_row(
+                "SELECT version FROM ban_snapshot_state WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|version| sql_u64_from_text(Some(version)))
+            .unwrap_or(0);
+        let snapshot_freshness = conn
+            .query_row(
+                "SELECT freshness FROM ban_snapshot_state WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
 
         let (tx, _) = broadcast::channel(256);
 
         Self {
             node_id,
             conn: Mutex::new(conn),
-            version: AtomicU64::new(max_version),
-            history_freshness: AtomicI64::new(0),
+            version: AtomicU64::new(max_version.max(snapshot_version)),
+            history_freshness: AtomicI64::new(snapshot_freshness),
             storage_dir,
+            strict_durability_poisoned: AtomicBool::new(false),
             tx,
         }
     }
@@ -264,6 +340,95 @@ impl BanRepository {
 
     pub fn local_node_id(&self) -> u16 {
         self.node_id
+    }
+
+    /// Whether the strict-operation ledger is backed by a persistent SQLite
+    /// database and therefore survives a repository restart.
+    pub fn durable_storage_enabled(&self) -> bool {
+        self.storage_dir.is_some() && !self.strict_durability_poisoned.load(Ordering::Acquire)
+    }
+
+    /// Whether this repository instance has observed a local strict-storage
+    /// failure. Callers use this to distinguish a failed durable snapshot
+    /// install from a semantically rejected peer snapshot.
+    pub fn strict_durability_failure_observed(&self) -> bool {
+        self.strict_durability_poisoned.load(Ordering::Acquire)
+    }
+
+    fn mark_strict_durability_failed(&self) {
+        if self.storage_dir.is_some() {
+            self.strict_durability_poisoned
+                .store(true, Ordering::Release);
+        }
+    }
+
+    /// Return strict operation ids retained by the durable idempotency ledger.
+    /// These ids are intended to accompany an S2S ban snapshot.
+    pub fn strict_operation_ids(&self) -> Result<Vec<StrictOperationId>, io::Error> {
+        let conn = self.conn.lock();
+        let result = strict_operation_ids_from_connection(&conn);
+        if result.is_err() {
+            self.mark_strict_durability_failed();
+        }
+        result
+    }
+
+    /// Atomically capture the data required for a strict-replication snapshot.
+    ///
+    /// This is deliberately a single repository operation: independently
+    /// reading the version, ban entries, freshness, and operation-id ledger can
+    /// expose state from different commits and make a later strict delivery look
+    /// like a duplicate before its mutation is represented by the snapshot.
+    pub fn strict_snapshot(&self) -> Result<BanStrictSnapshot, io::Error> {
+        let result = (|| {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(sqlite_io_error)?;
+            let version = durable_version_from_connection(&tx)?;
+            let freshness = durable_freshness_from_connection(&tx)?;
+            let entries = active_bans_from_connection(&tx, chrono::Utc::now().timestamp())?;
+            let operation_ids = strict_operation_ids_from_connection(&tx)?;
+            tx.commit().map_err(sqlite_io_error)?;
+
+            Ok(BanStrictSnapshot {
+                version,
+                entries,
+                freshness,
+                operation_ids,
+            })
+        })();
+        if result.is_err() {
+            self.mark_strict_durability_failed();
+        }
+        result
+    }
+
+    /// Merge strict operation ids received with an S2S ban snapshot. The
+    /// transaction commits the ledger before this method returns.
+    pub fn merge_strict_operation_ids(
+        &self,
+        operation_ids: &[StrictOperationId],
+    ) -> Result<(), io::Error> {
+        let result = (|| {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(sqlite_io_error)?;
+            for operation_id in operation_ids {
+                tx.execute(
+                    "INSERT OR IGNORE INTO ban_strict_op_ids (op_id_hi, op_id_lo, ts_final)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        sql_text_from_u64(operation_id.op_id_hi()),
+                        sql_text_from_u64(operation_id.op_id_lo()),
+                        "0",
+                    ],
+                )
+                .map_err(sqlite_io_error)?;
+            }
+            tx.commit().map_err(sqlite_io_error)
+        })();
+        if result.is_err() {
+            self.mark_strict_durability_failed();
+        }
+        result
     }
 
     // ── Read API ──────────────────────────────────────────────────────────
@@ -338,77 +503,18 @@ impl BanRepository {
 
     /// Replace the entire ban list.
     pub async fn set_bans(self: &Arc<Self>, entries: Vec<BanEntry>) -> Result<(), io::Error> {
-        let op = {
-            let conn = self.conn.lock();
-            conn.execute("DELETE FROM bans", [])
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-            let op = {
-                let mut stmt = conn
-                    .prepare(
-                        "INSERT INTO bans (address, mask, name, hash, reason, start, duration)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    )
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-                for entry in &entries {
-                    stmt.execute(params![
-                        entry.address.to_string(),
-                        entry.mask,
-                        entry.name,
-                        entry.hash,
-                        entry.reason,
-                        entry.start,
-                        sql_i64_from_u64_io(entry.duration)?,
-                    ])
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                }
-                self.make_op(BanOp::SetBans { entries })
-            };
-            op
-        };
-        // Lock released — safe to await
-        self.commit(op).await?;
-        Ok(())
+        self.commit(self.make_op(BanOp::SetBans { entries })).await
     }
 
     /// Add a single ban entry.
     pub async fn add_ban(self: &Arc<Self>, entry: BanEntry) -> Result<(), io::Error> {
-        let op = {
-            let conn = self.conn.lock();
-            conn.execute(
-                "INSERT OR REPLACE INTO bans (address, mask, name, hash, reason, start, duration)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    entry.address.to_string(),
-                    entry.mask,
-                    entry.name,
-                    entry.hash,
-                    entry.reason,
-                    entry.start,
-                    sql_i64_from_u64_io(entry.duration)?,
-                ],
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            self.make_op(BanOp::AddBan { entry })
-        };
-        self.commit(op).await?;
-        Ok(())
+        self.commit(self.make_op(BanOp::AddBan { entry })).await
     }
 
     /// Remove a ban entry by address and mask.
     pub async fn remove_ban(self: &Arc<Self>, address: IpAddr, mask: u8) -> Result<(), io::Error> {
-        let op = {
-            let conn = self.conn.lock();
-            conn.execute(
-                "DELETE FROM bans WHERE address = ?1 AND mask = ?2",
-                params![address.to_string(), mask],
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            self.make_op(BanOp::RemoveBan { address, mask })
-        };
-        self.commit(op).await?;
-        Ok(())
+        self.commit(self.make_op(BanOp::RemoveBan { address, mask }))
+            .await
     }
 
     // ── S2S / replication ─────────────────────────────────────────────────
@@ -502,6 +608,35 @@ impl BanRepository {
             .collect()
     }
 
+    /// Return strict-replication log entries after `since_version` when this
+    /// repository still has a complete history for that cursor.
+    ///
+    /// `None` means an installed snapshot established a newer history floor,
+    /// or durable log data cannot be read safely. Strict callers must request a
+    /// snapshot in that case instead of treating a partial operation list as a
+    /// complete history.
+    pub async fn strict_log_entries_since(&self, since_version: u64) -> Option<Vec<BanLogEntry>> {
+        let sql_since_version = i64::try_from(since_version).ok()?;
+        let conn = self.conn.lock();
+        let history_floor = match snapshot_version_from_connection(&conn) {
+            Ok(version) => version,
+            Err(_) => {
+                self.mark_strict_durability_failed();
+                return None;
+            }
+        };
+        if since_version < history_floor {
+            return None;
+        }
+        match strict_log_entries_since_from_connection(&conn, sql_since_version) {
+            Ok(entries) => Some(entries),
+            Err(_) => {
+                self.mark_strict_durability_failed();
+                None
+            }
+        }
+    }
+
     /// Apply an operation that arrived from a remote node.
     pub async fn apply_remote_operation(&self, op: Arc<BanOperation>) {
         self.apply_remote_operation_with_metadata(op, None).await
@@ -512,26 +647,40 @@ impl BanRepository {
         op: Arc<BanOperation>,
         strict_metadata: Option<StrictReplicationMetadata>,
     ) {
-        if op.version <= self.version.load(Ordering::Acquire) {
+        if let Some(strict_metadata) = strict_metadata {
+            if let Err(error) = self.apply_strict_operation_once(op, strict_metadata).await {
+                tracing::warn!(error = %error, "strict ban operation apply failed");
+            }
             return;
         }
+
         let Ok(sql_version) = sql_i64_from_u64(op.version) else {
             return;
         };
-        let conn = self.conn.lock();
-        apply_op_to_db(&conn, &op.op).ok();
-        // Record the operation in the log
         let op_data = serde_json::to_string(&op.op).expect("BanOp should be serializable");
-        let (strict_op_id_hi, strict_op_id_lo, strict_ts_final) = strict_metadata
-            .map(|metadata| {
-                (
-                    Some(sql_text_from_u64(metadata.op_id_hi())),
-                    Some(sql_text_from_u64(metadata.op_id_lo())),
-                    Some(sql_text_from_u64(metadata.ts_final())),
-                )
-            })
-            .unwrap_or((None, None, None));
-        conn.execute(
+        let mut conn = self.conn.lock();
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to begin remote ban operation transaction");
+                return;
+            }
+        };
+        let current_version = match durable_version_from_connection(&tx) {
+            Ok(version) => version,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to read remote ban operation version");
+                return;
+            }
+        };
+        if op.version <= current_version {
+            return;
+        }
+        if let Err(error) = apply_op_to_db(&tx, &op.op) {
+            tracing::warn!(error = %error, "failed to apply remote ban operation");
+            return;
+        }
+        if let Err(error) = tx.execute(
             "INSERT OR IGNORE INTO ban_operations
                 (version, node_id, timestamp, op_type, op_data,
                  strict_op_id_hi, strict_op_id_lo, strict_ts_final)
@@ -542,27 +691,202 @@ impl BanRepository {
                 op.timestamp,
                 op_type_str(&op.op),
                 op_data,
-                strict_op_id_hi,
-                strict_op_id_lo,
-                strict_ts_final,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<String>::None,
             ],
-        )
-        .ok();
+        ) {
+            tracing::warn!(error = %error, "failed to record remote ban operation");
+            return;
+        }
+        if let Err(error) = tx.commit() {
+            tracing::warn!(error = %error, "failed to commit remote ban operation");
+            return;
+        }
         self.version.fetch_max(op.version, Ordering::AcqRel);
         self.history_freshness
             .fetch_max(op.timestamp, Ordering::AcqRel);
     }
 
+    /// Atomically apply a strict ban operation at most once. The op-id claim,
+    /// ban mutation, and operation-log append commit in one SQLite
+    /// transaction, so the result survives a repository restart.
+    pub async fn apply_strict_operation_once(
+        &self,
+        op: Arc<BanOperation>,
+        strict_metadata: StrictReplicationMetadata,
+    ) -> Result<StrictOperationApplyOutcome, io::Error> {
+        let result = self
+            .apply_strict_operation_once_inner(op, strict_metadata)
+            .await;
+        if result.is_err() {
+            self.mark_strict_durability_failed();
+        }
+        result
+    }
+
+    async fn apply_strict_operation_once_inner(
+        &self,
+        op: Arc<BanOperation>,
+        strict_metadata: StrictReplicationMetadata,
+    ) -> Result<StrictOperationApplyOutcome, io::Error> {
+        let sql_version = sql_i64_from_u64_io(op.version)?;
+        let op_data = serde_json::to_string(&op.op).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("op serialisation error: {error}"),
+            )
+        })?;
+        let strict_op_id_hi = sql_text_from_u64(strict_metadata.op_id_hi());
+        let strict_op_id_lo = sql_text_from_u64(strict_metadata.op_id_lo());
+        let strict_ts_final = sql_text_from_u64(strict_metadata.ts_final());
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(sqlite_io_error)?;
+        let claimed = tx
+            .execute(
+                "INSERT OR IGNORE INTO ban_strict_op_ids (op_id_hi, op_id_lo, ts_final)
+                 VALUES (?1, ?2, ?3)",
+                params![strict_op_id_hi, strict_op_id_lo, strict_ts_final],
+            )
+            .map_err(sqlite_io_error)?;
+        if claimed == 0 {
+            tx.commit().map_err(sqlite_io_error)?;
+            return Ok(StrictOperationApplyOutcome::AlreadyApplied);
+        }
+
+        let current_version = durable_version_from_connection(&tx)?;
+        if op.version <= current_version {
+            tx.rollback().map_err(sqlite_io_error)?;
+            return Ok(StrictOperationApplyOutcome::VersionConflict);
+        }
+
+        apply_op_to_db(&tx, &op.op).map_err(sqlite_io_error)?;
+        tx.execute(
+            "INSERT INTO ban_operations
+                (version, node_id, timestamp, op_type, op_data,
+                 strict_op_id_hi, strict_op_id_lo, strict_ts_final)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                sql_version,
+                op.node_id,
+                op.timestamp,
+                op_type_str(&op.op),
+                op_data,
+                sql_text_from_u64(strict_metadata.op_id_hi()),
+                sql_text_from_u64(strict_metadata.op_id_lo()),
+                sql_text_from_u64(strict_metadata.ts_final()),
+            ],
+        )
+        .map_err(sqlite_io_error)?;
+        tx.commit().map_err(sqlite_io_error)?;
+
+        self.version.fetch_max(op.version, Ordering::AcqRel);
+        self.history_freshness
+            .fetch_max(op.timestamp, Ordering::AcqRel);
+        Ok(StrictOperationApplyOutcome::Applied)
+    }
+
     pub async fn install_s2s_snapshot(&self, version: u64, entries: Vec<BanEntry>, freshness: i64) {
-        let conn = self.conn.lock();
-        if let Err(e) = apply_op_to_db(&conn, &BanOp::SetBans { entries }) {
-            tracing::warn!("ban snapshot install failed: {e}");
-            return;
+        if let Err(error) = self
+            .install_s2s_snapshot_with_strict_operation_ids(version, entries, freshness, Vec::new())
+            .await
+        {
+            tracing::warn!(error = %error, "ban snapshot install failed");
         }
+    }
+
+    /// Install an S2S ban snapshot and atomically merge strict operation ids
+    /// represented by it into the durable SQLite ledger.
+    ///
+    /// A replacement must retain every local strict operation id. Otherwise a
+    /// merged ledger could suppress replay of an operation whose ban state was
+    /// erased by the replacement snapshot.
+    pub async fn install_s2s_snapshot_with_strict_operation_ids(
+        &self,
+        version: u64,
+        entries: Vec<BanEntry>,
+        freshness: i64,
+        strict_operation_ids: Vec<StrictOperationId>,
+    ) -> Result<(), io::Error> {
+        let mut conn = self.conn.lock();
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(error) => {
+                self.mark_strict_durability_failed();
+                return Err(sqlite_io_error(error));
+            }
+        };
+        let durable_version = match durable_version_from_connection(&tx) {
+            Ok(version) => version,
+            Err(error) => {
+                self.mark_strict_durability_failed();
+                return Err(error);
+            }
+        };
+        if version < durable_version {
+            // The caller is behind this repository. Treat the stale snapshot
+            // as an idempotent no-op so catchup can complete without replacing
+            // newer durable state.
+            return Ok(());
+        }
+        let incoming_operation_ids: HashSet<_> = strict_operation_ids.iter().cloned().collect();
+        let local_operation_ids = match strict_operation_ids_from_connection(&tx) {
+            Ok(operation_ids) => operation_ids,
+            Err(error) => {
+                self.mark_strict_durability_failed();
+                return Err(error);
+            }
+        };
+        let missing_operation_ids = local_operation_ids
+            .into_iter()
+            .filter(|operation_id| !incoming_operation_ids.contains(operation_id))
+            .count();
+        if missing_operation_ids != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "strict snapshot operation-id ledger is missing {missing_operation_ids} locally applied operation(s)"
+                ),
+            ));
+        }
+        if let Err(error) = apply_op_to_db(&tx, &BanOp::SetBans { entries }) {
+            self.mark_strict_durability_failed();
+            return Err(sqlite_io_error(error));
+        }
+        for operation_id in strict_operation_ids {
+            if let Err(error) = tx.execute(
+                "INSERT OR IGNORE INTO ban_strict_op_ids (op_id_hi, op_id_lo, ts_final)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    sql_text_from_u64(operation_id.op_id_hi()),
+                    sql_text_from_u64(operation_id.op_id_lo()),
+                    "0",
+                ],
+            ) {
+                self.mark_strict_durability_failed();
+                return Err(sqlite_io_error(error));
+            }
+        }
+        if let Err(error) = tx.execute(
+            "INSERT INTO ban_snapshot_state (id, version, freshness)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET
+                version = excluded.version,
+                freshness = excluded.freshness",
+            params![sql_text_from_u64(version), freshness],
+        ) {
+            self.mark_strict_durability_failed();
+            return Err(sqlite_io_error(error));
+        }
+        if let Err(error) = tx.commit() {
+            self.mark_strict_durability_failed();
+            return Err(sqlite_io_error(error));
+        }
+
         self.version.store(version, Ordering::Release);
-        if freshness > 0 {
-            self.history_freshness.store(freshness, Ordering::Release);
-        }
+        self.history_freshness.store(freshness, Ordering::Release);
+        Ok(())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -579,18 +903,26 @@ impl BanRepository {
     /// Commit an operation: assign version, insert into ban_operations, broadcast.
     /// Acquires the connection lock internally.
     async fn commit(&self, op: BanOperation) -> Result<(), io::Error> {
-        let op = {
-            let conn = self.conn.lock();
-            self.commit_locked(&conn, op)?
+        let result = {
+            let mut conn = self.conn.lock();
+            self.commit_locked(&mut conn, op)
         };
-        let _ = self.tx.send(op);
-        Ok(())
+        match result {
+            Ok(op) => {
+                let _ = self.tx.send(op);
+                Ok(())
+            }
+            Err(error) => {
+                self.mark_strict_durability_failed();
+                Err(error)
+            }
+        }
     }
 
     /// Commit an operation synchronously. The caller must hold `conn` lock.
     fn commit_locked(
         &self,
-        conn: &Connection,
+        conn: &mut Connection,
         op: BanOperation,
     ) -> Result<Arc<BanOperation>, io::Error> {
         self.commit_locked_with_metadata(conn, op, None)
@@ -598,11 +930,14 @@ impl BanRepository {
 
     fn commit_locked_with_metadata(
         &self,
-        conn: &Connection,
+        conn: &mut Connection,
         mut op: BanOperation,
         strict_metadata: Option<StrictReplicationMetadata>,
     ) -> Result<Arc<BanOperation>, io::Error> {
-        let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
+        let tx = conn.transaction().map_err(sqlite_io_error)?;
+        let version = durable_version_from_connection(&tx)?
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ban version overflow"))?;
         op.version = version;
         let sql_version = sql_i64_from_u64_io(version)?;
 
@@ -622,7 +957,8 @@ impl BanRepository {
             })
             .unwrap_or((None, None, None));
 
-        conn.execute(
+        apply_op_to_db(&tx, &op.op).map_err(sqlite_io_error)?;
+        tx.execute(
             "INSERT INTO ban_operations
                 (version, node_id, timestamp, op_type, op_data,
                  strict_op_id_hi, strict_op_id_lo, strict_ts_final)
@@ -638,9 +974,11 @@ impl BanRepository {
                 strict_ts_final,
             ],
         )
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(sqlite_io_error)?;
+        tx.commit().map_err(sqlite_io_error)?;
 
         let op = Arc::new(op);
+        self.version.store(version, Ordering::Release);
         self.history_freshness
             .fetch_max(op.timestamp, Ordering::AcqRel);
         Ok(op)
@@ -648,6 +986,259 @@ impl BanRepository {
 }
 
 // ─── Free functions ──────────────────────────────────────────────────────────
+
+fn snapshot_version_from_connection(conn: &Connection) -> Result<u64, io::Error> {
+    match conn.query_row(
+        "SELECT version FROM ban_snapshot_state WHERE id = 1",
+        [],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(version) => version.parse::<u64>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid ban snapshot version: {error}"),
+            )
+        }),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        Err(error) => Err(sqlite_io_error(error)),
+    }
+}
+
+fn snapshot_freshness_from_connection(conn: &Connection) -> Result<i64, io::Error> {
+    match conn.query_row(
+        "SELECT freshness FROM ban_snapshot_state WHERE id = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(freshness) => Ok(freshness),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        Err(error) => Err(sqlite_io_error(error)),
+    }
+}
+
+fn durable_version_from_connection(conn: &Connection) -> Result<u64, io::Error> {
+    let operation_version = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM ban_operations",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(sql_u64_from_i64)
+        .map_err(sqlite_io_error)?;
+    Ok(operation_version.max(snapshot_version_from_connection(conn)?))
+}
+
+fn durable_freshness_from_connection(conn: &Connection) -> Result<i64, io::Error> {
+    let operation_freshness = conn
+        .query_row(
+            "SELECT COALESCE(MAX(timestamp), 0) FROM ban_operations",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(sqlite_io_error)?;
+    Ok(operation_freshness.max(snapshot_freshness_from_connection(conn)?))
+}
+
+fn strict_operation_ids_from_connection(
+    conn: &Connection,
+) -> Result<Vec<StrictOperationId>, io::Error> {
+    let raw_operation_ids = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT op_id_hi, op_id_lo
+                 FROM ban_strict_op_ids
+                 ORDER BY op_id_hi ASC, op_id_lo ASC",
+            )
+            .map_err(sqlite_io_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_io_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_io_error)?
+    };
+
+    raw_operation_ids
+        .into_iter()
+        .map(|(op_id_hi, op_id_lo)| {
+            let op_id_hi = op_id_hi.parse::<u64>().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid strict operation high id: {error}"),
+                )
+            })?;
+            let op_id_lo = op_id_lo.parse::<u64>().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid strict operation low id: {error}"),
+                )
+            })?;
+            Ok(StrictOperationId::new(op_id_hi, op_id_lo))
+        })
+        .collect()
+}
+
+fn active_bans_from_connection(conn: &Connection, now: i64) -> Result<Vec<BanEntry>, io::Error> {
+    let raw_entries = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT address, mask, name, hash, reason, start, duration
+                 FROM bans
+                 WHERE duration = 0 OR (start + duration) > ?1",
+            )
+            .map_err(sqlite_io_error)?;
+        let rows = stmt
+            .query_map(params![now], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(sqlite_io_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_io_error)?
+    };
+
+    raw_entries
+        .into_iter()
+        .map(|(address, mask, name, hash, reason, start, duration)| {
+            let address = address.parse().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid ban address in strict snapshot: {error}"),
+                )
+            })?;
+            let mask = u8::try_from(mask).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid ban mask in strict snapshot: {error}"),
+                )
+            })?;
+            let duration = u64::try_from(duration).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid ban duration in strict snapshot: {error}"),
+                )
+            })?;
+            Ok(BanEntry {
+                address,
+                mask,
+                name,
+                hash,
+                reason,
+                start,
+                duration,
+            })
+        })
+        .collect()
+}
+
+fn strict_log_entries_since_from_connection(
+    conn: &Connection,
+    since_version: i64,
+) -> Result<Vec<BanLogEntry>, io::Error> {
+    let raw_entries = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT version, node_id, timestamp, op_data,
+                        CAST(strict_op_id_hi AS TEXT),
+                        CAST(strict_op_id_lo AS TEXT),
+                        CAST(strict_ts_final AS TEXT)
+                 FROM ban_operations
+                 WHERE version > ?1
+                 ORDER BY version ASC",
+            )
+            .map_err(sqlite_io_error)?;
+        let rows = stmt
+            .query_map(params![since_version], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u16>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(sqlite_io_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_io_error)?
+    };
+
+    raw_entries
+        .into_iter()
+        .map(
+            |(
+                version,
+                node_id,
+                timestamp,
+                op_data,
+                strict_op_id_hi,
+                strict_op_id_lo,
+                strict_ts_final,
+            )| {
+                let version = u64::try_from(version).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid strict ban operation version: {error}"),
+                    )
+                })?;
+                let op = serde_json::from_str(&op_data).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid strict ban operation payload: {error}"),
+                    )
+                })?;
+                let strict_metadata = match (strict_op_id_hi, strict_op_id_lo, strict_ts_final) {
+                    (None, None, None) => None,
+                    (Some(op_id_hi), Some(op_id_lo), Some(ts_final)) => {
+                        let op_id_hi = op_id_hi.parse::<u64>().map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid strict operation high id: {error}"),
+                            )
+                        })?;
+                        let op_id_lo = op_id_lo.parse::<u64>().map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid strict operation low id: {error}"),
+                            )
+                        })?;
+                        let ts_final = ts_final.parse::<u64>().map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid strict operation final timestamp: {error}"),
+                            )
+                        })?;
+                        Some(StrictReplicationMetadata::new(op_id_hi, op_id_lo, ts_final))
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "incomplete strict ban operation metadata",
+                        ));
+                    }
+                };
+                Ok(BanLogEntry::new(
+                    Arc::new(BanOperation {
+                        version,
+                        node_id,
+                        timestamp,
+                        op,
+                    }),
+                    strict_metadata,
+                ))
+            },
+        )
+        .collect()
+}
 
 /// Apply a `BanOp` to the database.
 fn apply_op_to_db(conn: &Connection, op: &BanOp) -> Result<(), rusqlite::Error> {
@@ -793,5 +1384,602 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op().version, 1);
         assert_eq!(entries[0].strict_metadata(), Some(metadata));
+    }
+
+    fn test_ban(address: &str, reason: &str) -> BanEntry {
+        BanEntry {
+            address: address.parse().unwrap(),
+            mask: 32,
+            name: Some("strict-ban".into()),
+            hash: None,
+            reason: Some(reason.into()),
+            start: 123,
+            duration: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_storage_capability_tracks_repository_backing() {
+        assert!(!BanRepository::new_in_memory(1).durable_storage_enabled());
+
+        let temp = tempfile::tempdir().unwrap();
+        let persisted = BanRepository::open(1, temp.path()).await.unwrap();
+        assert!(persisted.durable_storage_enabled());
+    }
+
+    #[tokio::test]
+    async fn strict_sqlite_transaction_failure_latches_durable_capability_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = BanRepository::open(1, temp.path()).await.unwrap();
+        assert!(repo.durable_storage_enabled());
+        repo.conn
+            .lock()
+            .execute_batch("PRAGMA query_only = ON;")
+            .unwrap();
+
+        let result = repo
+            .apply_strict_operation_once(
+                Arc::new(BanOperation {
+                    version: 1,
+                    node_id: 1,
+                    timestamp: 123,
+                    op: BanOp::AddBan {
+                        entry: test_ban("203.0.113.30", "read-only transaction"),
+                    },
+                }),
+                StrictReplicationMetadata::new(91, 92, 93),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            !repo.durable_storage_enabled(),
+            "a failed strict SQLite transaction must clamp v2 until restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_sqlite_snapshot_failure_latches_durable_capability_off() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = BanRepository::open(1, temp.path()).await.unwrap();
+        assert!(repo.durable_storage_enabled());
+        repo.conn
+            .lock()
+            .execute_batch("PRAGMA query_only = ON;")
+            .unwrap();
+
+        let result = repo
+            .install_s2s_snapshot_with_strict_operation_ids(
+                1,
+                vec![test_ban("203.0.113.80", "snapshot")],
+                123,
+                Vec::new(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(repo.strict_durability_failure_observed());
+        assert!(
+            !repo.durable_storage_enabled(),
+            "a failed strict SQLite snapshot transaction must clamp v2 until restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_ban_op_id_survives_restart_and_prevents_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let metadata = StrictReplicationMetadata::new(101, 202, 303);
+
+        {
+            let repo = BanRepository::open(1, temp.path()).await.unwrap();
+            let first = Arc::new(BanOperation {
+                version: 1,
+                node_id: 1,
+                timestamp: 123,
+                op: BanOp::AddBan {
+                    entry: test_ban("203.0.113.31", "first"),
+                },
+            });
+            assert_eq!(
+                repo.apply_strict_operation_once(first, metadata)
+                    .await
+                    .unwrap(),
+                StrictOperationApplyOutcome::Applied
+            );
+        }
+
+        let repo = BanRepository::open(1, temp.path()).await.unwrap();
+        assert_eq!(
+            repo.strict_operation_ids().unwrap(),
+            vec![StrictOperationId::new(101, 202)]
+        );
+        let duplicate = Arc::new(BanOperation {
+            version: 2,
+            node_id: 1,
+            timestamp: 124,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.32", "replayed"),
+            },
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                duplicate,
+                StrictReplicationMetadata::new(101, 202, 999),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::AlreadyApplied
+        );
+        assert_eq!(repo.current_version(), 1);
+        assert_eq!(repo.get_log_entries_since(0).await.len(), 1);
+        let active_bans = repo.get_active_bans().await;
+        assert_eq!(active_bans.len(), 1);
+        assert_eq!(
+            active_bans[0].address,
+            "203.0.113.31".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_strict_ban_operations_claim_one_op_id() {
+        let repo = BanRepository::new_in_memory(1);
+        let metadata = StrictReplicationMetadata::new(301, 302, 303);
+        let op = Arc::new(BanOperation {
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.35", "once"),
+            },
+        });
+
+        let (first, second) = tokio::join!(
+            repo.apply_strict_operation_once(Arc::clone(&op), metadata),
+            repo.apply_strict_operation_once(op, metadata),
+        );
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == StrictOperationApplyOutcome::Applied)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == StrictOperationApplyOutcome::AlreadyApplied)
+                .count(),
+            1
+        );
+        assert_eq!(repo.current_version(), 1);
+        assert_eq!(repo.get_log_entries_since(0).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_ban_version_conflict_does_not_claim_the_operation_id() {
+        let repo = BanRepository::new_in_memory(1);
+        let first = Arc::new(BanOperation {
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.36", "first"),
+            },
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(first, StrictReplicationMetadata::new(401, 402, 1))
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        let conflict = Arc::new(BanOperation {
+            version: 1,
+            node_id: 1,
+            timestamp: 124,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.37", "conflict"),
+            },
+        });
+        let conflicting_id = StrictReplicationMetadata::new(403, 404, 2);
+        assert_eq!(
+            repo.apply_strict_operation_once(Arc::clone(&conflict), conflicting_id)
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::VersionConflict
+        );
+        assert_eq!(
+            repo.strict_operation_ids().unwrap(),
+            vec![StrictOperationId::new(401, 402)]
+        );
+
+        let retry = Arc::new(BanOperation {
+            version: 2,
+            ..(*conflict).clone()
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(retry, conflicting_id)
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+        assert_eq!(repo.current_version(), 2);
+        assert_eq!(repo.get_active_bans().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn strict_snapshot_captures_state_version_freshness_and_ledger_together() {
+        let repo = BanRepository::new_in_memory(1);
+        let first_metadata = StrictReplicationMetadata::new(601, 602, 1);
+        let first = Arc::new(BanOperation {
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.51", "first"),
+            },
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(first, first_metadata)
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        let (version, entries, freshness, operation_ids) =
+            repo.strict_snapshot().unwrap().into_parts();
+        assert_eq!(version, 1);
+        assert_eq!(freshness, 123);
+        assert_eq!(entries, vec![test_ban("203.0.113.51", "first")]);
+        assert_eq!(operation_ids, vec![StrictOperationId::new(601, 602)]);
+
+        let second = Arc::new(BanOperation {
+            version: 2,
+            node_id: 1,
+            timestamp: 124,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.52", "second"),
+            },
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(second, StrictReplicationMetadata::new(603, 604, 2))
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        let (version, entries, freshness, operation_ids) =
+            repo.strict_snapshot().unwrap().into_parts();
+        assert_eq!(version, 2);
+        assert_eq!(freshness, 124);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            operation_ids,
+            vec![
+                StrictOperationId::new(601, 602),
+                StrictOperationId::new(603, 604),
+            ]
+        );
+    }
+
+    #[test]
+    fn strict_snapshot_rejects_a_malformed_operation_id_ledger() {
+        let repo = BanRepository::new_in_memory(1);
+        {
+            let conn = repo.conn.lock();
+            conn.execute(
+                "INSERT INTO ban_strict_op_ids (op_id_hi, op_id_lo, ts_final)
+                 VALUES (?1, ?2, ?3)",
+                params!["not-a-number", "2", "0"],
+            )
+            .unwrap();
+        }
+
+        let error = repo.strict_snapshot().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn ban_snapshot_merges_strict_operation_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let operation_id = StrictOperationId::new(501, 502);
+        {
+            let repo = BanRepository::open(1, temp.path()).await.unwrap();
+            repo.install_s2s_snapshot_with_strict_operation_ids(
+                7,
+                vec![test_ban("203.0.113.41", "snapshot")],
+                123,
+                vec![operation_id.clone()],
+            )
+            .await
+            .unwrap();
+        }
+
+        let repo = BanRepository::open(1, temp.path()).await.unwrap();
+        assert_eq!(repo.current_version(), 7);
+        assert_eq!(
+            repo.strict_operation_ids().unwrap(),
+            vec![operation_id.clone()]
+        );
+        let (snapshot_version, snapshot_entries, snapshot_freshness, snapshot_operation_ids) =
+            repo.strict_snapshot().unwrap().into_parts();
+        assert_eq!(snapshot_version, 7);
+        assert_eq!(snapshot_entries, vec![test_ban("203.0.113.41", "snapshot")]);
+        assert_eq!(snapshot_freshness, 123);
+        assert_eq!(
+            snapshot_operation_ids,
+            vec![StrictOperationId::new(501, 502)]
+        );
+
+        let unknown_id_at_snapshot_version = Arc::new(BanOperation {
+            version: 7,
+            node_id: 1,
+            timestamp: 124,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.43", "conflict"),
+            },
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                unknown_id_at_snapshot_version,
+                StrictReplicationMetadata::new(503, 504, 1),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::VersionConflict
+        );
+        assert_eq!(
+            repo.strict_operation_ids().unwrap(),
+            vec![operation_id.clone()]
+        );
+
+        let duplicate = Arc::new(BanOperation {
+            version: 8,
+            node_id: 1,
+            timestamp: 124,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.42", "replayed"),
+            },
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                duplicate,
+                StrictReplicationMetadata::new(501, 502, 1),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::AlreadyApplied
+        );
+        let active_bans = repo.get_active_bans().await;
+        assert_eq!(active_bans.len(), 1);
+        assert_eq!(
+            active_bans[0].address,
+            "203.0.113.41".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_snapshot_rejects_an_equal_version_replacement_missing_a_local_operation_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = BanRepository::open(1, temp.path()).await.unwrap();
+        assert!(repo.durable_storage_enabled());
+        let local_operation_id = StrictOperationId::new(801, 802);
+        let local = Arc::new(BanOperation {
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.81", "local"),
+            },
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                local,
+                StrictReplicationMetadata::new(
+                    local_operation_id.op_id_hi(),
+                    local_operation_id.op_id_lo(),
+                    1,
+                ),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        let error = repo
+            .install_s2s_snapshot_with_strict_operation_ids(
+                1,
+                vec![test_ban("203.0.113.82", "replacement")],
+                124,
+                vec![StrictOperationId::new(803, 804)],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(repo.current_version(), 1);
+        assert_eq!(
+            repo.get_active_bans().await,
+            vec![test_ban("203.0.113.81", "local")]
+        );
+        assert_eq!(
+            repo.strict_operation_ids().unwrap(),
+            vec![local_operation_id]
+        );
+        assert!(repo.durable_storage_enabled());
+        assert!(!repo.strict_durability_failure_observed());
+    }
+
+    #[tokio::test]
+    async fn strict_snapshot_rejects_a_newer_replacement_missing_a_local_operation_id() {
+        let repo = BanRepository::new_in_memory(1);
+        let local_operation_id = StrictOperationId::new(805, 806);
+        let local = Arc::new(BanOperation {
+            version: 1,
+            node_id: 1,
+            timestamp: 125,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.85", "local"),
+            },
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                local,
+                StrictReplicationMetadata::new(
+                    local_operation_id.op_id_hi(),
+                    local_operation_id.op_id_lo(),
+                    1,
+                ),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+        let before = repo.strict_snapshot().unwrap();
+
+        let error = repo
+            .install_s2s_snapshot_with_strict_operation_ids(
+                2,
+                vec![test_ban("203.0.113.86", "replacement")],
+                126,
+                vec![StrictOperationId::new(807, 808)],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let after = repo.strict_snapshot().unwrap();
+        assert_eq!(after.into_parts(), before.into_parts());
+        assert_eq!(
+            repo.get_active_bans().await,
+            vec![test_ban("203.0.113.85", "local")]
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_snapshot_accepts_a_newer_replacement_with_a_superset_ledger() {
+        let repo = BanRepository::new_in_memory(1);
+        let local_operation_id = StrictOperationId::new(811, 812);
+        let local = Arc::new(BanOperation {
+            version: 1,
+            node_id: 1,
+            timestamp: 127,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.87", "local"),
+            },
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                local,
+                StrictReplicationMetadata::new(
+                    local_operation_id.op_id_hi(),
+                    local_operation_id.op_id_lo(),
+                    1,
+                ),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        let incoming_operation_id = StrictOperationId::new(813, 814);
+        repo.install_s2s_snapshot_with_strict_operation_ids(
+            2,
+            vec![test_ban("203.0.113.88", "replacement")],
+            128,
+            vec![local_operation_id.clone(), incoming_operation_id.clone()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(repo.current_version(), 2);
+        assert_eq!(
+            repo.get_active_bans().await,
+            vec![test_ban("203.0.113.88", "replacement")]
+        );
+        assert_eq!(
+            repo.strict_operation_ids().unwrap(),
+            vec![local_operation_id, incoming_operation_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_log_requires_a_snapshot_below_the_installed_history_floor() {
+        let repo = BanRepository::new_in_memory(1);
+        repo.install_s2s_snapshot_with_strict_operation_ids(
+            7,
+            vec![test_ban("203.0.113.61", "snapshot")],
+            123,
+            vec![StrictOperationId::new(701, 702)],
+        )
+        .await
+        .unwrap();
+
+        assert!(repo.strict_log_entries_since(0).await.is_none());
+        assert!(repo.strict_log_entries_since(6).await.is_none());
+        assert!(repo.strict_log_entries_since(7).await.unwrap().is_empty());
+
+        let increment = Arc::new(BanOperation {
+            version: 8,
+            node_id: 1,
+            timestamp: 124,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.62", "increment"),
+            },
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                increment,
+                StrictReplicationMetadata::new(703, 704, 2)
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        assert!(repo.strict_log_entries_since(0).await.is_none());
+        let entries = repo.strict_log_entries_since(7).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].op().version, 8);
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_install_is_a_noop_against_newer_durable_state() {
+        let repo = BanRepository::new_in_memory(1);
+        let committed = Arc::new(BanOperation {
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            op: BanOp::AddBan {
+                entry: test_ban("203.0.113.71", "committed"),
+            },
+        });
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                committed,
+                StrictReplicationMetadata::new(801, 802, 1)
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        repo.install_s2s_snapshot_with_strict_operation_ids(
+            0,
+            vec![test_ban("203.0.113.72", "stale")],
+            1,
+            vec![StrictOperationId::new(803, 804)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(repo.current_version(), 1);
+        assert_eq!(
+            repo.get_active_bans().await,
+            vec![test_ban("203.0.113.71", "committed")]
+        );
+        assert_eq!(
+            repo.strict_operation_ids().unwrap(),
+            vec![StrictOperationId::new(801, 802)]
+        );
     }
 }

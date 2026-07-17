@@ -25,7 +25,30 @@ message StrictMessage {
     StrictRecoveryReq    recovery_req    = 7;
     StrictRecoveryAck    recovery_ack    = 8;
     StrictRecoveryCommit recovery_commit = 9;
+    StrictAccept         accept          = 10;
+    StrictAcceptAck      accept_ack      = 11;
+    StrictResolutionHint resolution_hint = 12;
+    StrictResolutionPrepare resolution_prepare = 13;
+    StrictResolutionAck  resolution_ack  = 14;
+    StrictDecision       decision        = 15;
+    // Deliberately separate from the legacy `propose` tag. Older binaries
+    // ignore this cumulative-protocol body instead of treating it as a
+    // recoverable legacy proposal after dropping unknown fields.
+    StrictProposeV1     propose_v1      = 16;
   }
+  // End-to-end origin proof for routed strict traffic. The signature binds
+  // the topic, oneof body, logical source node, and source boot epoch; it is
+  // intentionally separate from hop-authenticated transport framing so
+  // relays can preserve it unchanged.
+  StrictOriginAuth origin_auth = 17;
+}
+
+message StrictOriginAuth {
+  uint32 origin_node = 1;
+  uint64 origin_boot_epoch = 2;
+  uint32 signature_scheme = 3;
+  repeated bytes certificate_chain = 4;
+  bytes signature = 5;
 }
 
 message StrictPropose {
@@ -35,6 +58,29 @@ message StrictPropose {
   uint64 ts_propose = 4;
   bytes  op_msgpack = 5;
   uint64 src_clock  = 6;   // sender's clock at send time (piggyback)
+}
+
+// Cumulative strict protocol proposals. New protocol versions continue to
+// use this separate body and raise `protocol_version`; a legacy decoder
+// silently ignores the unknown oneof tag.
+//
+// Protocol v2 freezes the target membership with each proposal and later
+// resolution message. An empty list is accepted only as descriptor-less
+// legacy compatibility data.
+message StrictFrozenTarget {
+  uint32 node       = 1;
+  uint64 boot_epoch = 2;
+}
+
+message StrictProposeV1 {
+  uint32 coord_node = 1;
+  uint64 op_id_hi   = 2;
+  uint64 op_id_lo   = 3;
+  uint64 ts_propose = 4;
+  bytes  op_msgpack = 5;
+  uint64 src_clock  = 6;
+  uint32 protocol_version = 7;
+  repeated StrictFrozenTarget frozen_targets = 8;
 }
 
 message StrictProposeAck {
@@ -67,6 +113,17 @@ message StrictCatchupReq {
   uint64 chunk_token   = 3;   // 0 = first chunk; >0 = continuation
   bool   force_snapshot = 4;  // true for startup history election
   bool   history_probe_only = 5; // true = return only history rank metadata
+  // Cursor into the stable, op-id-sorted terminal-fence journal.
+  uint64 terminal_state_cursor = 6;
+  // v2 only: terminal-decision generation from the last complete terminal
+  // fence sync with this source. A responder re-pages fences when it differs.
+  uint64 terminal_decision_generation = 7;
+  // v2 only: a nonzero value resumes one immutable snapshot image selected
+  // by this responder. Zero starts (or safely restarts) a transfer.
+  uint64 snapshot_transfer_id = 8;
+  // Byte offset of the requested snapshot chunk. This is meaningful only
+  // with a nonzero `snapshot_transfer_id`.
+  uint64 snapshot_chunk_cursor = 9;
 }
 
 message StrictCatchupResp {
@@ -80,6 +137,30 @@ message StrictCatchupResp {
   int64  history_freshness      = 8;  // unix seconds of newest known op/snapshot
   uint64 runtime_started_at     = 9;  // overlay boot_epoch; lower = longer running
   uint32 history_node           = 10;
+  repeated StrictTerminalState terminal_states = 11;
+  uint64 next_terminal_state_cursor = 12;
+  bool   terminal_states_has_more = 13;
+  // A terminal-only page preserves the history request that must resume once
+  // fence pagination reaches the end.
+  bool   terminal_sync_only = 14;
+  bool   request_force_snapshot = 15;
+  bool   request_history_probe_only = 16;
+  // Generation of the stable terminal-fence cut represented by this response.
+  // A v2 receiver echoes it only after all terminal pages have been applied.
+  uint64 terminal_decision_generation = 17;
+  // v2-only immutable snapshot-transfer identity and chunk framing. The
+  // legacy `snapshot_msgpack` field carries exactly one bounded chunk when
+  // `snapshot_transfer_id` is nonzero.
+  uint64 snapshot_transfer_id = 18;
+  uint64 snapshot_chunk_cursor = 19;
+  uint64 snapshot_next_cursor = 20;
+  uint64 snapshot_total_bytes = 21;
+  bytes  snapshot_sha256 = 22;
+  bool   snapshot_has_more = 23;
+  // The source could not safely retain or serve the requested aggregate
+  // image under its resource limit. A v2 receiver restarts history election
+  // rather than treating this as an empty snapshot.
+  bool   snapshot_transfer_rejected = 24;
 }
 
 message CatchupOp {
@@ -88,6 +169,14 @@ message CatchupOp {
   uint64 strict_op_id_hi  = 3; // strict-mode repair metadata; 0 when absent
   uint64 strict_op_id_lo  = 4;
   uint64 strict_ts_final  = 5;
+  // A strict v2 history entry carries its terminal commit proof. This closes
+  // the race where a terminal-page snapshot predates a concurrently delivered
+  // commit: the sink persists this descriptor-bearing fence before buffering
+  // the ordinary history operation.
+  uint64 strict_terminal_ballot = 6;
+  uint32 strict_terminal_resolver_node = 7;
+  uint64 strict_terminal_resolver_boot_epoch = 8;
+  repeated StrictFrozenTarget strict_terminal_frozen_targets = 9;
 }
 
 // Tempo slow-path: coordinator-failure recovery (two-phase Paxos per op_id).
@@ -133,6 +222,143 @@ message StrictRecoveryCommit {
   uint64 ts_final      = 6;
   bytes  op_msgpack    = 7;
   uint64 src_clock     = 8;
+}
+
+// ------- Strict terminal resolution (current v2, legacy-compatible decoding) -------
+//
+// Current binaries originate these messages only once every active S2S member
+// has advertised the current cumulative strict-replication version. The
+// descriptor-less legacy forms remain decodable for compatibility; tags 1..9
+// above retain the legacy wire path for older nodes during a rollout.
+
+// Phase 2 of a coordinator commit. The coordinator must collect an accept
+// quorum before broadcasting the terminal `StrictDecision`.
+message StrictAccept {
+  uint32 coord_node = 1;
+  uint64 ballot     = 2;
+  uint64 op_id_hi   = 3;
+  uint64 op_id_lo   = 4;
+  uint64 ts_final   = 5;
+  bytes  op_msgpack = 6;
+  uint64 src_clock  = 7;
+}
+
+message StrictAcceptAck {
+  uint32 ack_node       = 1;
+  uint32 coord_node     = 2;
+  uint64 ballot         = 3;
+  uint64 op_id_hi       = 4;
+  uint64 op_id_lo       = 5;
+  bool   accepted        = 6;
+  uint64 src_clock       = 7;
+  uint64 ack_boot_epoch  = 8;
+}
+
+// An advisory report from a replica that has retained an unresolved proposal.
+// The deterministic resolver uses it to start a quorum-backed resolution.
+message StrictResolutionHint {
+  uint32 reporter_node       = 1;
+  uint32 coord_node          = 2;
+  uint64 op_id_hi            = 3;
+  uint64 op_id_lo            = 4;
+  uint64 ts_local            = 5;
+  bytes  op_msgpack          = 6;
+  uint64 src_clock           = 7;
+  uint64 reporter_boot_epoch = 8;
+  uint32 protocol_version    = 9;
+  repeated StrictFrozenTarget frozen_targets = 10;
+}
+
+// Resolution phase 1. A higher ballot promises that ordinary commit and
+// lower-ballot resolution messages cannot subsequently win for this op id.
+message StrictResolutionPrepare {
+  uint32 resolver_node = 1;
+  uint64 ballot        = 2;
+  uint32 coord_node    = 3;
+  uint64 op_id_hi      = 4;
+  uint64 op_id_lo      = 5;
+  uint64 src_clock     = 6;
+  repeated StrictFrozenTarget frozen_targets = 7;
+}
+
+// A value accepted by the descriptor-less legacy accept path. A resolver that
+// observes multiple accepted values must select the one at the highest ballot.
+message StrictAcceptedValue {
+  uint64 ballot     = 1;
+  uint64 ts_final   = 2;
+  bytes  op_msgpack = 3;
+}
+
+// A prepared proposal that has not been accepted. This lets a resolver
+// recover the original value when its configured policy permits that outcome.
+message StrictPendingValue {
+  uint64 ts_local   = 1;
+  bytes  op_msgpack = 2;
+  uint32 protocol_version = 3;
+}
+
+// Resolution phase 1 reply. `observed` is intentionally a oneof: a terminal
+// decision dominates an accepted value, which dominates a merely pending
+// proposal. Absence means the replica knows no value for the op id.
+message StrictResolutionAck {
+  uint32 ack_node          = 1;
+  uint64 ballot            = 2;
+  uint32 coord_node        = 3;
+  uint64 op_id_hi          = 4;
+  uint64 op_id_lo          = 5;
+  bool   promised          = 6;
+  oneof observed {
+    StrictTerminalState terminal = 7;
+    StrictAcceptedValue accepted = 8;
+    StrictPendingValue  pending  = 9;
+  }
+  uint64 src_clock         = 10;
+  uint64 ack_boot_epoch    = 11;
+}
+
+// A terminal outcome is a durable fence. Commit carries the operation that
+// must be delivered; abort has no payload and rejects every later commit.
+message StrictDecisionCommit {
+  uint64 ts_final   = 1;
+  bytes  op_msgpack = 2;
+}
+
+message StrictDecisionAbort {}
+
+message StrictDecision {
+  uint32 resolver_node = 1;
+  uint64 ballot        = 2;
+  uint32 coord_node    = 3;
+  uint64 op_id_hi      = 4;
+  uint64 op_id_lo      = 5;
+  oneof outcome {
+    StrictDecisionCommit commit = 6;
+    StrictDecisionAbort  abort  = 7;
+  }
+  uint64 src_clock     = 8;
+  // v2 decision identity. A cold receiver verifies that the decision sender
+  // is the exact resolver incarnation from the immutable target descriptor.
+  // Default/empty fields are accepted only as descriptor-less legacy data.
+  uint64 resolver_boot_epoch = 9;
+  repeated StrictFrozenTarget frozen_targets = 10;
+}
+
+// Catchup representation of a terminal decision. Legacy terminal states leave
+// the v2 identity fields empty. A v2 state carries the exact resolver
+// incarnation and frozen target descriptor so a joining replica never turns a
+// v2 fence into descriptor-less legacy state.
+message StrictTerminalState {
+  uint32 coord_node = 1;
+  uint64 op_id_hi   = 2;
+  uint64 op_id_lo   = 3;
+  uint64 ballot     = 4;
+  oneof outcome {
+    StrictDecisionCommit commit = 5;
+    StrictDecisionAbort  abort  = 6;
+  }
+  uint32 resolver_node       = 7;
+  uint64 resolver_boot_epoch = 8;
+  repeated StrictFrozenTarget frozen_targets = 9;
 }
 
 // ------- Owner-scoped -------

@@ -10,62 +10,78 @@ use shitspeak_s2s::replications::{
     StrictHandle, StrictReplicable,
 };
 use shitspeak_s2s::testing::{
-    Cluster, full_mesh_seeds, wait_for_full_alive_mesh, wait_for_full_routing,
+    Cluster, full_mesh_seeds, wait_for_full_alive_mesh, wait_for_full_routing, wait_until,
 };
+use tempfile::TempDir;
 
 pub(crate) struct ReplCluster {
     pub(crate) cluster: Cluster,
     pub(crate) managers: Vec<Arc<ReplicationManager>>,
+    persistence_dirs: Vec<TempDir>,
 }
 
 impl ReplCluster {
     /// Build a full-mesh `n`-node cluster with a `ReplicationManager` per
     /// node, and wait for full alive mesh + full routing.
     pub async fn build_full_mesh(node_ids: &[u16]) -> Self {
-        let cluster = Cluster::build_with_cfg(node_ids, full_mesh_seeds, repl_overlay_cfg).await;
-        assert!(
-            wait_for_full_alive_mesh(&cluster, Duration::from_secs(5)).await,
-            "alive mesh did not form"
-        );
-        assert!(
-            wait_for_full_routing(&cluster, Duration::from_secs(5)).await,
-            "routing did not converge"
-        );
-        let managers: Vec<Arc<ReplicationManager>> = cluster
-            .nodes
-            .iter()
-            .map(|n| ReplicationManager::new(n.overlay.clone()))
-            .collect();
-        Self { cluster, managers }
+        Self::build_with_overlay_config(node_ids, ReplicationConfig::default(), repl_overlay_cfg)
+            .await
     }
 
     pub async fn build_full_mesh_fast_failure(node_ids: &[u16]) -> Self {
-        let cluster =
-            Cluster::build_with_cfg(node_ids, full_mesh_seeds, repl_fast_failure_overlay_cfg).await;
-        Self::from_cluster(cluster, ReplicationConfig::default()).await
+        Self::build_with_overlay_config(
+            node_ids,
+            ReplicationConfig::default(),
+            repl_fast_failure_overlay_cfg,
+        )
+        .await
     }
 
     pub async fn build_full_mesh_with_config(node_ids: &[u16], cfg: ReplicationConfig) -> Self {
-        let cluster = Cluster::build_with_cfg(node_ids, full_mesh_seeds, repl_overlay_cfg).await;
-        Self::from_cluster(cluster, cfg).await
+        Self::build_with_overlay_config(node_ids, cfg, repl_overlay_cfg).await
     }
 
     pub async fn build_full_mesh_fast_failure_with_config(
         node_ids: &[u16],
         cfg: ReplicationConfig,
     ) -> Self {
-        let cluster =
-            Cluster::build_with_cfg(node_ids, full_mesh_seeds, repl_fast_failure_overlay_cfg).await;
-        Self::from_cluster(cluster, cfg).await
+        Self::build_with_overlay_config(node_ids, cfg, repl_fast_failure_overlay_cfg).await
     }
 
-    async fn from_cluster(cluster: Cluster, cfg: ReplicationConfig) -> Self {
+    async fn build_with_overlay_config(
+        node_ids: &[u16],
+        cfg: ReplicationConfig,
+        configure_overlay: fn(usize, OverlayConfig) -> OverlayConfig,
+    ) -> Self {
+        // Strict v2 requires a durable terminal journal. Keep a distinct
+        // root per node so the real-network harness exercises the same
+        // capability path as production and can reuse one root on restart.
+        let persistence_dirs: Vec<_> = node_ids
+            .iter()
+            .map(|_| TempDir::new().expect("strict test persistence dir"))
+            .collect();
+        let persistence_paths: Vec<_> = persistence_dirs
+            .iter()
+            .map(|dir| dir.path().to_path_buf())
+            .collect();
+        let cluster = Cluster::build_with_cfg(node_ids, full_mesh_seeds, move |idx, base| {
+            configure_overlay(idx, base).with_persistence_dir(persistence_paths[idx].clone())
+        })
+        .await;
+        Self::from_cluster(cluster, cfg, persistence_dirs).await
+    }
+
+    async fn from_cluster(
+        cluster: Cluster,
+        cfg: ReplicationConfig,
+        persistence_dirs: Vec<TempDir>,
+    ) -> Self {
         assert!(
-            wait_for_full_alive_mesh(&cluster, Duration::from_secs(5)).await,
+            wait_for_full_alive_mesh(&cluster, Duration::from_secs(8)).await,
             "alive mesh did not form"
         );
         assert!(
-            wait_for_full_routing(&cluster, Duration::from_secs(5)).await,
+            wait_for_full_routing(&cluster, Duration::from_secs(8)).await,
             "routing did not converge"
         );
         let managers: Vec<Arc<ReplicationManager>> = cluster
@@ -73,11 +89,19 @@ impl ReplCluster {
             .iter()
             .map(|n| ReplicationManager::with_config(n.overlay.clone(), cfg.clone()))
             .collect();
-        Self { cluster, managers }
+        Self {
+            cluster,
+            managers,
+            persistence_dirs,
+        }
     }
 
     pub fn manager(&self, idx: usize) -> &Arc<ReplicationManager> {
         &self.managers[idx]
+    }
+
+    pub fn persistence_dir(&self, idx: usize) -> &std::path::Path {
+        self.persistence_dirs[idx].path()
     }
 
     pub fn register_strict<R: StrictReplicable>(

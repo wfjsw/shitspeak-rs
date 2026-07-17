@@ -60,6 +60,7 @@ fn link_ads(count: u32, links_per_ad: u32) -> Vec<overlay_pb::LinkStateAdvert> {
                     | overlay_pb::link_state_advert_capabilities::SERVICE_VOICE,
             distribution_protocol_version: 0,
             distribution_profile_ids: Vec::new(),
+            strict_replication_protocol_version: 0,
         })
         .collect()
 }
@@ -119,6 +120,10 @@ fn strict_catchup_resp_payload() -> Bytes {
                 strict_op_id_hi: 0,
                 strict_op_id_lo: 0,
                 strict_ts_final: 0,
+                strict_terminal_ballot: 0,
+                strict_terminal_resolver_node: 0,
+                strict_terminal_resolver_boot_epoch: 0,
+                strict_terminal_frozen_targets: Vec::new(),
             })
             .collect(),
         has_more: true,
@@ -128,12 +133,27 @@ fn strict_catchup_resp_payload() -> Bytes {
         history_freshness: 1_700_000_000,
         runtime_started_at: 1,
         history_node: 1,
+        terminal_states: Vec::new(),
+        next_terminal_state_cursor: 0,
+        terminal_states_has_more: false,
+        terminal_sync_only: false,
+        request_force_snapshot: false,
+        request_history_probe_only: false,
+        terminal_decision_generation: 0,
+        snapshot_transfer_id: 0,
+        snapshot_chunk_cursor: 0,
+        snapshot_next_cursor: 0,
+        snapshot_total_bytes: 0,
+        snapshot_sha256: Bytes::new(),
+        snapshot_has_more: false,
+        snapshot_transfer_rejected: false,
     };
     let msg = repl_pb::ReplicationMessage {
         topic: "channels".to_string(),
         body: Some(repl_pb::replication_message::Body::Strict(
             repl_pb::StrictMessage {
                 body: Some(repl_pb::strict_message::Body::CatchupResp(resp)),
+                origin_auth: None,
             },
         )),
     };
@@ -153,6 +173,10 @@ fn owner_catchup_resp_payload() -> Bytes {
                 strict_op_id_hi: 0,
                 strict_op_id_lo: 0,
                 strict_ts_final: 0,
+                strict_terminal_ballot: 0,
+                strict_terminal_resolver_node: 0,
+                strict_terminal_resolver_boot_epoch: 0,
+                strict_terminal_frozen_targets: Vec::new(),
             })
             .collect(),
         has_more: true,

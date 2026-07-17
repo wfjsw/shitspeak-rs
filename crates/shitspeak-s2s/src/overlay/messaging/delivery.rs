@@ -23,7 +23,31 @@ pub fn deliver(
     class: MessageClass,
     body: Bytes,
 ) {
-    deliver_with_remote_playout(services, tag, from, level, class, body, None, false);
+    deliver_with_origin_boot_epoch(services, tag, from, 0, level, class, body);
+}
+
+/// Deliver a local service frame with origin-incarnation metadata asserted by
+/// the overlay envelope.
+pub(crate) fn deliver_with_origin_boot_epoch(
+    services: &ServiceRegistry,
+    tag: u32,
+    from: NodeIdentifier,
+    origin_boot_epoch: u64,
+    level: ServiceLevel,
+    class: MessageClass,
+    body: Bytes,
+) {
+    deliver_with_origin_boot_epoch_and_remote_playout(
+        services,
+        tag,
+        from,
+        origin_boot_epoch,
+        level,
+        class,
+        body,
+        None,
+        false,
+    );
 }
 
 /// Deliver a local service frame with compatibility distribution metadata.
@@ -41,9 +65,37 @@ pub fn deliver_with_remote_playout(
     remote_playout_delay_ms: Option<u64>,
     is_distribution_repair: bool,
 ) {
+    deliver_with_origin_boot_epoch_and_remote_playout(
+        services,
+        tag,
+        from,
+        0,
+        level,
+        class,
+        body,
+        remote_playout_delay_ms,
+        is_distribution_repair,
+    );
+}
+
+/// Deliver a local service frame with compatibility distribution metadata and
+/// origin-incarnation metadata asserted by the overlay envelope.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_with_origin_boot_epoch_and_remote_playout(
+    services: &ServiceRegistry,
+    tag: u32,
+    from: NodeIdentifier,
+    origin_boot_epoch: u64,
+    level: ServiceLevel,
+    class: MessageClass,
+    body: Bytes,
+    remote_playout_delay_ms: Option<u64>,
+    is_distribution_repair: bool,
+) {
     if let Some(h) = services.get(tag) {
         h.handle(OverlayInboundMessage {
             from,
+            origin_boot_epoch,
             level,
             class,
             body,

@@ -163,6 +163,21 @@ mod tests {
     }
 
     #[test]
+    fn voice_tail_ack_roundtrip() {
+        let request = VoiceRepairRequest {
+            sender_session: 0xABC,
+            sender_epoch: 42,
+            first_seq: 17,
+            last_seq: 17,
+            request_sent_unix_ms: 0,
+            request_ttl_ms: 750,
+            tail_ack: true,
+        };
+        let bytes = encode_voice_repair_request(&request).unwrap();
+        assert_eq!(decode_voice_repair_request(&bytes).unwrap(), request);
+    }
+
+    #[test]
     fn plugin_data_envelope_roundtrip() {
         let env = PluginDataEnvelope {
             sender_session: 0xABC_12345,

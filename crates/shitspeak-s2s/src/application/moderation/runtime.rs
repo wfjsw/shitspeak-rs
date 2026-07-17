@@ -397,6 +397,7 @@ mod tests {
         let bytes = proto::encode_moderation(&env).unwrap();
         svc.inbound_handler().handle(OverlayInboundMessage {
             from: 99,
+            origin_boot_epoch: 0,
             level: MODERATION_LEVEL,
             class: MODERATION_CLASS,
             body: bytes,

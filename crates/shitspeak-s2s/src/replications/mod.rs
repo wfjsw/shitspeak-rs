@@ -39,11 +39,11 @@ mod topic;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use scc::HashMap as SccMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -53,13 +53,14 @@ use crate::overlay::{
     MemberIncarnation, MembershipEvent, OverlayInboundMessage, OverlayNetwork, ServiceInbound,
 };
 use shitspeak_core::NodeIdentifier;
+use shitspeak_s2s_transport::OriginSignature;
 
 pub use blob::{BlobHandle, BlobReplicable};
 pub use config::{ReplicationConfig, ReplicationTuning};
 pub use error::ReplicationError;
 pub use owner::{OwnerHandle, OwnerReplicable};
 pub use proto::REPLICATION_SERVICE_TAG;
-pub use strict::{StrictHandle, StrictReplicable};
+pub use strict::{StrictHandle, StrictReplicable, StrictSnapshotError};
 
 use self::blob::{BlobNet, BlobRuntime, OverlayBlobNet};
 use self::metrics::{ReplicationPipelineKind, ReplicationPipelineStage};
@@ -140,6 +141,7 @@ struct ManagerInner {
     self_id: NodeIdentifier,
     self_epoch: u64,
     strict_topics: Arc<SccMap<String, Arc<dyn ErasedStrictRuntime>>>,
+    strict_capability_registry: Mutex<StrictCapabilityRegistry>,
     owner_topics: Arc<SccMap<String, Arc<dyn ErasedOwnerRuntime>>>,
     blob_topics: Arc<SccMap<String, Arc<dyn ErasedBlobRuntime>>>,
     _inbox_tx: mpsc::UnboundedSender<InboundFrame>,
@@ -150,6 +152,103 @@ struct ManagerInner {
     strict_topic_resolver: RwLock<Option<StrictTopicResolver>>,
     blob_topic_resolver: RwLock<Option<BlobTopicResolver>>,
     cfg: Arc<ReplicationConfig>,
+}
+
+/// Manager-owned lifecycle state for local strict-v2 advertisement.
+///
+/// `expected_topics` is the exact coordinated startup set when a caller has
+/// declared one. Direct manager users instead begin an implicit pass from
+/// their first successfully installed topic. `vetted_topics` contains every
+/// successfully installed runtime topic, including valid lazy channel scopes.
+/// Every installed topic remains part of future readiness probes so a dynamic
+/// repository can withdraw capability but cannot silently re-enable a prior
+/// loss.
+#[derive(Default)]
+struct StrictCapabilityRegistry {
+    expected_topics: BTreeSet<String>,
+    vetted_topics: BTreeSet<String>,
+    reserved_topics: BTreeSet<String>,
+    /// An explicit empty manifest is intentional: do not infer a capability
+    /// activation pass from a later lazy registration.
+    explicit_manifest_declared: bool,
+    /// Direct registration is allowed to open exactly one inferred pass. A
+    /// capability loss must still require an explicit coordinated rearm.
+    implicit_registration_pass_started: bool,
+    activation_pending: bool,
+    activation_completed: bool,
+}
+
+enum StrictCapabilityReadiness {
+    AwaitingRegistration,
+    Incapable,
+    Ready,
+}
+
+impl StrictCapabilityRegistry {
+    /// Start the optional direct-registration lifecycle after a runtime has
+    /// actually been installed. Starting only after finalization means a
+    /// failed registration cannot leave an absent topic blocking activation.
+    ///
+    /// This is intentionally one-shot. Once an inferred pass has observed a
+    /// repository capability loss, a later lazy registration cannot rearm the
+    /// local LSA; callers must use the explicit coordinated manifest path.
+    fn start_implicit_registration_pass(&mut self, topic: &str) -> bool {
+        if self.explicit_manifest_declared || self.implicit_registration_pass_started {
+            return false;
+        }
+        self.expected_topics.insert(topic.to_owned());
+        self.implicit_registration_pass_started = true;
+        self.activation_pending = true;
+        self.activation_completed = false;
+        true
+    }
+}
+
+#[cfg(test)]
+mod strict_capability_registry_tests {
+    use super::StrictCapabilityRegistry;
+
+    #[test]
+    fn direct_registration_starts_one_implicit_pass() {
+        let mut registry = StrictCapabilityRegistry::default();
+
+        assert!(registry.start_implicit_registration_pass("channels"));
+        assert!(registry.expected_topics.contains("channels"));
+        assert_eq!(registry.expected_topics.len(), 1);
+        assert!(registry.activation_pending);
+        assert!(!registry.activation_completed);
+
+        assert!(!registry.start_implicit_registration_pass("bans"));
+        assert!(!registry.expected_topics.contains("bans"));
+    }
+
+    #[test]
+    fn explicit_empty_manifest_disables_implicit_activation() {
+        let mut registry = StrictCapabilityRegistry::default();
+        registry.explicit_manifest_declared = true;
+        registry.activation_pending = true;
+
+        assert!(!registry.start_implicit_registration_pass("channels"));
+        assert!(registry.expected_topics.is_empty());
+        assert!(registry.activation_pending);
+    }
+
+    #[test]
+    fn implicit_mode_cannot_rearm_after_a_capability_loss() {
+        let mut registry = StrictCapabilityRegistry::default();
+        assert!(registry.start_implicit_registration_pass("channels"));
+
+        // Mirrors the `Incapable` transition after a registered runtime fails
+        // its v2 probe.
+        registry.activation_pending = false;
+        registry.activation_completed = false;
+
+        assert!(!registry.start_implicit_registration_pass("bans"));
+        assert!(registry.expected_topics.contains("channels"));
+        assert!(!registry.expected_topics.contains("bans"));
+        assert!(!registry.activation_pending);
+        assert!(!registry.activation_completed);
+    }
 }
 
 impl ReplicationManager {
@@ -190,6 +289,7 @@ impl ReplicationManager {
             self_id,
             self_epoch,
             strict_topics: strict_topics.clone(),
+            strict_capability_registry: Mutex::new(StrictCapabilityRegistry::default()),
             owner_topics: owner_topics.clone(),
             blob_topics: blob_topics.clone(),
             _inbox_tx: inbox_tx.clone(),
@@ -204,7 +304,10 @@ impl ReplicationManager {
 
         // Register the L3 service handler. The overlay calls `handle`
         // synchronously per the trait contract; we just decode and push.
-        let handler = Arc::new(InboundHandler { inbox_tx });
+        let handler = Arc::new(InboundHandler {
+            inbox_tx,
+            overlay: overlay.clone(),
+        });
         overlay.register_service(REPLICATION_SERVICE_TAG, handler);
 
         // Spawn the central dispatch task.
@@ -253,18 +356,19 @@ impl ReplicationManager {
 
     /// Register a strict (Tempo) topic. Returns the caller-facing handle
     /// used to propose ops.
+    ///
+    /// When no explicit expected-topic manifest was declared, the first
+    /// successfully installed topic automatically opens an inferred strict-v2
+    /// capability pass. Call [`Self::set_expected_strict_topics`] when the
+    /// application knows a complete startup set and requires that whole set to
+    /// be verified before the local LSA can advertise v2.
     pub fn register_strict<R: StrictReplicable>(
         &self,
         topic: impl Into<String>,
         repo: Arc<R>,
     ) -> Result<StrictHandle<R>, ReplicationError> {
         let topic = topic.into();
-        if self.inner.strict_topics.contains_sync(&topic)
-            || self.inner.owner_topics.contains_sync(&topic)
-            || self.inner.blob_topics.contains_sync(&topic)
-        {
-            return Err(ReplicationError::TopicAlreadyRegistered(topic));
-        }
+        self.inner.reserve_strict_topic(&topic)?;
         let runtime = StrictRuntime::new(
             repo,
             self.inner.self_id,
@@ -278,7 +382,14 @@ impl ReplicationManager {
             .seed_membership_snapshot(current_membership_view(&self.inner.overlay).into_values());
         runtime.start();
         let erased: Arc<dyn ErasedStrictRuntime> = runtime.clone();
-        let _ = self.inner.strict_topics.insert_sync(topic, erased);
+        if let Err(error) = self
+            .inner
+            .finalize_reserved_strict_runtime(topic.clone(), erased)
+        {
+            runtime.shutdown();
+            self.inner.release_strict_topic_reservation(&topic);
+            return Err(error);
+        }
         Ok(StrictHandle { runtime })
     }
 
@@ -292,19 +403,43 @@ impl ReplicationManager {
         }
     }
 
+    /// Declare the complete coordinated strict-topic set before its
+    /// repositories begin registration.
+    ///
+    /// The manager derives the advertised protocol capability from the
+    /// concrete runtimes; callers never supply a parallel version vector.
+    /// Replacing this set is the explicit coordinated lifecycle action that
+    /// may rearm a prior repository-capability loss.
+    pub fn set_expected_strict_topics<I, T>(&self, topics: I) -> bool
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.inner.set_expected_strict_topics(topics)
+    }
+
+    /// Re-evaluate the manager-owned strict capability registry.
+    ///
+    /// Normal registration paths invoke this automatically. Once a
+    /// repository loss has withdrawn v2, this method remains fail-closed;
+    /// only [`Self::set_expected_strict_topics`] opens a new coordinated
+    /// re-registration pass.
+    pub fn refresh_strict_capability_activation(&self) -> bool {
+        self.inner.refresh_strict_capability_activation()
+    }
+
+    /// Whether the local manager currently has an activated strict-v2
+    /// registry and the overlay is advertising the current protocol.
+    pub fn strict_capability_activation_ready(&self) -> bool {
+        self.inner.strict_capability_activation_ready()
+    }
+
     pub fn install_strict_runtime(
         &self,
         topic: String,
         runtime: Arc<dyn ErasedStrictRuntime>,
     ) -> Result<(), ReplicationError> {
-        if self.inner.strict_topics.contains_sync(&topic)
-            || self.inner.owner_topics.contains_sync(&topic)
-            || self.inner.blob_topics.contains_sync(&topic)
-        {
-            return Err(ReplicationError::TopicAlreadyRegistered(topic));
-        }
-        let _ = self.inner.strict_topics.insert_sync(topic, runtime);
-        Ok(())
+        self.inner.install_strict_runtime(topic, runtime)
     }
 
     pub fn set_strict_topic_resolver(&self, resolver: Option<StrictTopicResolver>) {
@@ -412,6 +547,181 @@ impl ReplicationManager {
         self.inner
             .overlay
             .unregister_service(REPLICATION_SERVICE_TAG);
+    }
+}
+
+impl ManagerInner {
+    fn set_expected_strict_topics<I, T>(&self, topics: I) -> bool
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let expected_topics = topics
+            .into_iter()
+            .map(Into::into)
+            .filter(|topic: &String| !topic.is_empty())
+            .collect();
+        let mut registry = self.strict_capability_registry.lock();
+        registry.explicit_manifest_declared = true;
+        registry.expected_topics = expected_topics;
+        // Include any runtime installed before a coordinator declared its
+        // manifest. This keeps an existing lazy topic from being forgotten
+        // by a later explicit re-registration pass.
+        self.strict_topics.iter_sync(|topic, _| {
+            registry.vetted_topics.insert(topic.clone());
+            true
+        });
+        registry.activation_pending = true;
+        registry.activation_completed = false;
+        self.overlay
+            .begin_strict_replication_repository_registration();
+        self.refresh_strict_capability_activation_locked(&mut registry)
+    }
+
+    fn reserve_strict_topic(&self, topic: &str) -> Result<(), ReplicationError> {
+        let mut registry = self.strict_capability_registry.lock();
+        if self.strict_topics.contains_sync(topic)
+            || self.owner_topics.contains_sync(topic)
+            || self.blob_topics.contains_sync(topic)
+            || registry.reserved_topics.contains(topic)
+        {
+            return Err(ReplicationError::TopicAlreadyRegistered(topic.to_owned()));
+        }
+        registry.reserved_topics.insert(topic.to_owned());
+        Ok(())
+    }
+
+    fn release_strict_topic_reservation(&self, topic: &str) {
+        self.strict_capability_registry
+            .lock()
+            .reserved_topics
+            .remove(topic);
+    }
+
+    fn finalize_reserved_strict_runtime(
+        &self,
+        topic: String,
+        runtime: Arc<dyn ErasedStrictRuntime>,
+    ) -> Result<(), ReplicationError> {
+        let mut registry = self.strict_capability_registry.lock();
+        if !registry.reserved_topics.remove(&topic)
+            || self.strict_topics.contains_sync(&topic)
+            || self.owner_topics.contains_sync(&topic)
+            || self.blob_topics.contains_sync(&topic)
+        {
+            return Err(ReplicationError::TopicAlreadyRegistered(topic));
+        }
+        if self
+            .strict_topics
+            .insert_sync(topic.clone(), runtime)
+            .is_err()
+        {
+            return Err(ReplicationError::TopicAlreadyRegistered(topic));
+        }
+        registry.vetted_topics.insert(topic.clone());
+        if registry.start_implicit_registration_pass(&topic) {
+            self.overlay
+                .begin_strict_replication_repository_registration();
+        }
+        let _ = self.refresh_strict_capability_activation_locked(&mut registry);
+        Ok(())
+    }
+
+    fn install_strict_runtime(
+        &self,
+        topic: String,
+        runtime: Arc<dyn ErasedStrictRuntime>,
+    ) -> Result<(), ReplicationError> {
+        self.reserve_strict_topic(&topic)?;
+        if let Err(error) = self.finalize_reserved_strict_runtime(topic.clone(), runtime) {
+            self.release_strict_topic_reservation(&topic);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn refresh_strict_capability_activation(&self) -> bool {
+        let mut registry = self.strict_capability_registry.lock();
+        self.refresh_strict_capability_activation_locked(&mut registry)
+    }
+
+    fn strict_capability_activation_ready(&self) -> bool {
+        let registry = self.strict_capability_registry.lock();
+        self.strict_capability_activation_ready_locked(&registry)
+    }
+
+    fn strict_capability_activation_ready_locked(
+        &self,
+        registry: &StrictCapabilityRegistry,
+    ) -> bool {
+        registry.activation_completed
+            && self.overlay.local_strict_replication_protocol_version()
+                >= crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION
+    }
+
+    fn refresh_strict_capability_activation_locked(
+        &self,
+        registry: &mut StrictCapabilityRegistry,
+    ) -> bool {
+        match self.strict_capability_readiness(registry) {
+            StrictCapabilityReadiness::AwaitingRegistration => {
+                if registry.activation_pending {
+                    self.overlay
+                        .update_strict_replication_repository_registration_ready(false);
+                }
+                false
+            }
+            StrictCapabilityReadiness::Incapable => {
+                // A registered runtime or its authenticated frame path cannot
+                // uphold v2. This revokes the current activation pass; only a
+                // later `set_expected_strict_topics` lifecycle setup may
+                // rearm it.
+                registry.activation_pending = false;
+                registry.activation_completed = false;
+                self.overlay
+                    .report_strict_replication_repository_capability_loss();
+                false
+            }
+            StrictCapabilityReadiness::Ready if registry.activation_pending => {
+                let accepted = self
+                    .overlay
+                    .update_strict_replication_repository_registration_ready(true);
+                registry.activation_pending = false;
+                registry.activation_completed = accepted;
+                self.strict_capability_activation_ready_locked(registry)
+            }
+            StrictCapabilityReadiness::Ready => {
+                self.strict_capability_activation_ready_locked(registry)
+            }
+        }
+    }
+
+    fn strict_capability_readiness(
+        &self,
+        registry: &StrictCapabilityRegistry,
+    ) -> StrictCapabilityReadiness {
+        if registry.expected_topics.is_empty() {
+            return StrictCapabilityReadiness::AwaitingRegistration;
+        }
+        let mut topics = registry.expected_topics.clone();
+        topics.extend(registry.vetted_topics.iter().cloned());
+        let strict_max_catchup_bytes = self.cfg.strict_max_catchup_bytes();
+        for topic in topics {
+            let Some(runtime) = self
+                .strict_topics
+                .read_sync(&topic, |_, runtime| runtime.clone())
+            else {
+                return StrictCapabilityReadiness::AwaitingRegistration;
+            };
+            if !runtime.strict_v2_advertisement_prerequisites_ready()
+                || !self
+                    .strict_net
+                    .current_protocol_prerequisites_ready(&topic, strict_max_catchup_bytes)
+            {
+                return StrictCapabilityReadiness::Incapable;
+            }
+        }
+        StrictCapabilityReadiness::Ready
     }
 }
 
@@ -580,6 +890,9 @@ mod membership_reconciliation_tests {
     #[tokio::test]
     async fn lagged_manager_subscriber_reconciles_restart_into_strict_runtime() {
         let net = MockNet::new(1, vec![1, 2]);
+        net.set_strict_replication_protocol_version(
+            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+        );
         net.set_epoch(2, 8);
         let runtime = StrictRuntime::new(
             CountingStrictRepo::new(),
@@ -653,10 +966,18 @@ mod membership_reconciliation_tests {
 
 /// Decode an overlay payload into the per-topic `InboundFrame` shape,
 /// returning `None` if the bytes don't parse as a `ReplicationMessage`
-/// or carry no body. Shared by the production handler and the test-only
-/// filtered handler.
-fn decode_to_frame(msg: OverlayInboundMessage) -> Option<InboundFrame> {
+/// or carry no body. Strict frames additionally require a verified detached
+/// origin proof before entering the manager inbox. Shared by the production
+/// handler and the test-only filtered handler.
+fn decode_to_frame(
+    msg: OverlayInboundMessage,
+    overlay: Option<&OverlayNetwork>,
+) -> Option<InboundFrame> {
     let decode_started_at = Instant::now();
+    if !proto::strict_origin_auth_wire_within_bounds(&msg.body) {
+        trace!("strict origin proof wire representation exceeds its bound");
+        return None;
+    }
     let decoded = match proto::decode(&msg.body) {
         Ok(d) => d,
         Err(e) => {
@@ -670,10 +991,92 @@ fn decode_to_frame(msg: OverlayInboundMessage) -> Option<InboundFrame> {
         }
     };
     let topic = decoded.topic;
-    let body = match decoded.body? {
-        ReplBody::Strict(strict) => InboundBody::Strict(strict.body?),
-        ReplBody::Owner(owner) => InboundBody::Owner(owner.body?),
-        ReplBody::Blob(blob) => InboundBody::Blob(blob.body?),
+    let (body, origin_authenticated) = match decoded.body? {
+        ReplBody::Strict(strict) => {
+            let body = strict.body?;
+            let origin_authenticated = match strict.origin_auth {
+                Some(auth) => {
+                    if !proto::strict_origin_auth_within_bounds(&auth) {
+                        trace!("strict origin proof exceeds the v2 wire bound");
+                        return None;
+                    }
+                    let origin_node = match NodeIdentifier::try_from(auth.origin_node) {
+                        Ok(node) => node,
+                        Err(_) => {
+                            trace!(
+                                origin_node = auth.origin_node,
+                                "strict origin proof has invalid node"
+                            );
+                            return None;
+                        }
+                    };
+                    if origin_node != msg.from || auth.origin_boot_epoch != msg.origin_boot_epoch {
+                        trace!(
+                            claimed_node = origin_node,
+                            envelope_node = msg.from,
+                            claimed_epoch = auth.origin_boot_epoch,
+                            envelope_epoch = msg.origin_boot_epoch,
+                            "strict origin proof does not match overlay envelope"
+                        );
+                        return None;
+                    }
+                    let signature_scheme = match u16::try_from(auth.signature_scheme) {
+                        Ok(scheme) => scheme,
+                        Err(_) => {
+                            trace!(
+                                signature_scheme = auth.signature_scheme,
+                                "strict origin proof has invalid signature scheme"
+                            );
+                            return None;
+                        }
+                    };
+                    let signing_payload = match proto::strict_origin_signing_payload(
+                        &topic,
+                        &body,
+                        auth.origin_node,
+                        auth.origin_boot_epoch,
+                    ) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            trace!(%error, "strict origin proof payload encode failed");
+                            return None;
+                        }
+                    };
+                    let proof = OriginSignature::from_parts(
+                        signature_scheme,
+                        auth.certificate_chain
+                            .into_iter()
+                            .map(|certificate| certificate.to_vec())
+                            .collect(),
+                        auth.signature.to_vec(),
+                    );
+                    let Some(overlay) = overlay else {
+                        trace!(
+                            "strict origin proof cannot be verified without an overlay identity"
+                        );
+                        return None;
+                    };
+                    if let Err(error) =
+                        overlay.verify_origin_payload(origin_node, &proof, &signing_payload)
+                    {
+                        trace!(%error, from = msg.from, "strict origin proof verification failed");
+                        return None;
+                    }
+                    true
+                }
+                None => {
+                    // Keep legacy wire data decodable at the protobuf layer,
+                    // but do not enqueue an unauthenticated strict operation.
+                    // The inbox is unbounded and strict handlers can mutate
+                    // durable state, so admission must fail closed here.
+                    trace!("strict frame is missing an origin proof");
+                    return None;
+                }
+            };
+            (InboundBody::Strict(body), origin_authenticated)
+        }
+        ReplBody::Owner(owner) => (InboundBody::Owner(owner.body?), false),
+        ReplBody::Blob(blob) => (InboundBody::Blob(blob.body?), false),
     };
     metrics::record_pipeline_stage(
         inbound_pipeline_kind(&body),
@@ -682,6 +1085,8 @@ fn decode_to_frame(msg: OverlayInboundMessage) -> Option<InboundFrame> {
     );
     Some(InboundFrame {
         from: msg.from,
+        origin_boot_epoch: msg.origin_boot_epoch,
+        origin_authenticated,
         topic,
         body,
     })
@@ -700,11 +1105,12 @@ fn inbound_pipeline_kind(body: &InboundBody) -> ReplicationPipelineKind {
 /// `handle` returns immediately without awaiting.
 struct InboundHandler {
     inbox_tx: mpsc::UnboundedSender<InboundFrame>,
+    overlay: OverlayNetwork,
 }
 
 impl ServiceInbound for InboundHandler {
     fn handle(&self, msg: OverlayInboundMessage) {
-        if let Some(frame) = decode_to_frame(msg) {
+        if let Some(frame) = decode_to_frame(msg, Some(&self.overlay)) {
             let _ = self.inbox_tx.send(frame);
         }
     }
@@ -716,13 +1122,14 @@ impl ServiceInbound for InboundHandler {
 #[cfg(any(test, feature = "test-support"))]
 struct FilteredInboundHandler {
     inbox_tx: mpsc::UnboundedSender<InboundFrame>,
+    overlay: OverlayNetwork,
     predicate: Arc<dyn Fn(&InboundFrame) -> bool + Send + Sync>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl ServiceInbound for FilteredInboundHandler {
     fn handle(&self, msg: OverlayInboundMessage) {
-        let Some(frame) = decode_to_frame(msg) else {
+        let Some(frame) = decode_to_frame(msg, Some(&self.overlay)) else {
             return;
         };
         if (self.predicate)(&frame) {
@@ -745,6 +1152,7 @@ impl ReplicationManager {
         let inbox_tx = self.inner._inbox_tx.clone();
         let handler = Arc::new(FilteredInboundHandler {
             inbox_tx,
+            overlay: self.inner.overlay.clone(),
             predicate: Arc::new(predicate),
         });
         self.inner
@@ -780,21 +1188,54 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
                                 .read_sync(&frame.topic, |_, v| v.clone());
                             if rt.is_none() {
                                 if let Some(resolver) = inner.strict_topic_resolver.read().clone() {
-                                    let parts = StrictTopicRuntimeParts {
-                                        self_id: inner.self_id,
-                                        self_epoch: inner.self_epoch,
-                                        net: inner.strict_net.clone(),
-                                        shutdown: inner.shutdown.clone(),
-                                        cfg: inner.cfg.clone(),
-                                    };
-                                    rt = resolver(&frame.topic, parts);
-                                    if let Some(rt) = rt.as_ref() {
-                                        let _ = inner.strict_topics.insert_sync(frame.topic.clone(), rt.clone());
+                                    if inner.reserve_strict_topic(&frame.topic).is_ok() {
+                                        let parts = StrictTopicRuntimeParts {
+                                            self_id: inner.self_id,
+                                            self_epoch: inner.self_epoch,
+                                            net: inner.strict_net.clone(),
+                                            shutdown: inner.shutdown.clone(),
+                                            cfg: inner.cfg.clone(),
+                                        };
+                                        rt = resolver(&frame.topic, parts);
+                                        if let Some(resolved) = rt.as_ref() {
+                                            if inner
+                                                .finalize_reserved_strict_runtime(
+                                                    frame.topic.clone(),
+                                                    resolved.clone(),
+                                                )
+                                                .is_err()
+                                            {
+                                                resolved.shutdown();
+                                                inner.release_strict_topic_reservation(&frame.topic);
+                                                rt = inner
+                                                    .strict_topics
+                                                    .read_sync(&frame.topic, |_, runtime| runtime.clone());
+                                            }
+                                        } else {
+                                            inner.release_strict_topic_reservation(&frame.topic);
+                                        }
+                                    } else {
+                                        // A concurrent explicit registration
+                                        // already owns the topic reservation.
+                                        // Use its runtime if it has completed
+                                        // admission instead of constructing a
+                                        // second side-effecting runtime.
+                                        if rt.is_none() {
+                                            rt = inner
+                                                .strict_topics
+                                                .read_sync(&frame.topic, |_, runtime| runtime.clone());
+                                        }
                                     }
                                 }
                             }
                             if let Some(rt) = rt {
-                                rt.dispatch(frame.from, b).await;
+                                rt.dispatch(
+                                    frame.from,
+                                    frame.origin_boot_epoch,
+                                    frame.origin_authenticated,
+                                    b,
+                                )
+                                .await;
                             } else {
                                 trace!(topic=%frame.topic, "strict frame for unknown topic");
                             }
@@ -841,4 +1282,68 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
             }
         }
     });
+}
+
+#[cfg(test)]
+mod inbound_frame_tests {
+    use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
+
+    use super::*;
+    use crate::replications::proto::{self, StrictBody};
+
+    #[test]
+    fn decode_rejects_a_proofless_strict_frame_before_the_inbox() {
+        let body = proto::encode(&proto::wrap_strict(
+            "strict-topic",
+            StrictBody::ClockTick(Default::default()),
+        ))
+        .expect("strict frame should encode");
+        assert!(
+            decode_to_frame(
+                OverlayInboundMessage {
+                    from: 7,
+                    origin_boot_epoch: 41,
+                    level: ServiceLevel::Reliable,
+                    class: MessageClass::Regular,
+                    body,
+                    remote_playout_delay_ms: None,
+                    is_distribution_repair: false,
+                },
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn decode_rejects_a_strict_proof_that_disagrees_with_the_envelope() {
+        let body = proto::encode(&proto::wrap_strict_with_origin_auth(
+            "strict-topic",
+            StrictBody::ClockTick(Default::default()),
+            proto::StrictOriginAuth {
+                origin_node: 8,
+                origin_boot_epoch: 41,
+                signature_scheme: 0x0807,
+                certificate_chain: vec![bytes::Bytes::from_static(&[1])],
+                signature: bytes::Bytes::from_static(&[2]),
+            },
+        ))
+        .expect("strict frame should encode");
+
+        assert!(
+            decode_to_frame(
+                OverlayInboundMessage {
+                    from: 7,
+                    origin_boot_epoch: 41,
+                    level: ServiceLevel::Reliable,
+                    class: MessageClass::Regular,
+                    body,
+                    remote_playout_delay_ms: None,
+                    is_distribution_repair: false,
+                },
+                None,
+            )
+            .is_none()
+        );
+    }
 }

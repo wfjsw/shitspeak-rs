@@ -1186,6 +1186,7 @@ mod tests {
                         | overlay_pb::link_state_advert_capabilities::SERVICE_VOICE,
                     distribution_protocol_version: 0,
                     distribution_profile_ids: Vec::new(),
+                    strict_replication_protocol_version: 0,
                 })
                 .collect(),
         };

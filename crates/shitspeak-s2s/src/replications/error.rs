@@ -13,6 +13,8 @@ pub enum ReplicationError {
     Encode(#[from] prost::EncodeError),
     #[error("decode error: {0}")]
     Decode(#[from] prost::DecodeError),
+    #[error("strict origin authentication failed: {0}")]
+    OriginAuthentication(String),
     #[error("msgpack encode error: {0}")]
     MsgpackEncode(#[from] rmp_serde::encode::Error),
     #[error("msgpack decode error: {0}")]

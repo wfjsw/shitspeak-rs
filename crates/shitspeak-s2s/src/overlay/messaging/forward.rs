@@ -48,6 +48,9 @@ const DISTRIBUTION_PROCESSING_GUARD: Duration = Duration::from_millis(20);
 const MAX_ATTACHMENT_BYTES: usize = 256 * 1024;
 const MAX_ATTACHMENT_CHUNKS: usize = 512;
 const MAX_ATTACHMENT_CHUNK_BYTES: usize = 512;
+/// A routed overlay frame records every distinct forwarding hop. Keeping this
+/// finite bounds the outer envelope independently of its service payload.
+pub(crate) const MAX_PATH_TRACE_NODES: usize = 256;
 
 fn unix_time_ms() -> u64 {
     SystemTime::now()
@@ -771,10 +774,11 @@ async fn process_distribution_frame(
         // `remote_playout_delay_ms` remains part of the inbound message for
         // wire/API compatibility, but the server no longer paces remote voice.
         // S2S reordering is the only remote buffering policy.
-        delivery::deliver_with_remote_playout(
+        delivery::deliver_with_origin_boot_epoch_and_remote_playout(
             services,
             data.service_tag,
             source,
+            data.origin_boot_epoch,
             level,
             class,
             data.payload.clone(),
@@ -860,10 +864,11 @@ pub(crate) async fn handle_inbound(
                             .await;
                     }
                     for msg in outcome.ready {
-                        delivery::deliver(
+                        delivery::deliver_with_origin_boot_epoch(
                             services,
                             msg.tag(),
                             msg.src(),
+                            msg.origin_boot_epoch(),
                             msg.level(),
                             msg.class(),
                             msg.body(),
@@ -880,10 +885,11 @@ pub(crate) async fn handle_inbound(
             )
             .await
         {
-            delivery::deliver_with_remote_playout(
+            delivery::deliver_with_origin_boot_epoch_and_remote_playout(
                 services,
                 data.service_tag,
                 src,
+                data.origin_boot_epoch,
                 level,
                 class,
                 data.payload.clone(),
@@ -912,10 +918,11 @@ pub(crate) async fn handle_inbound(
                 .await
         };
         if should_deliver {
-            delivery::deliver(
+            delivery::deliver_with_origin_boot_epoch(
                 services,
                 data.service_tag,
                 src,
+                data.origin_boot_epoch,
                 level,
                 class,
                 data.payload.clone(),
@@ -1195,6 +1202,16 @@ async fn send_control_to(
     if target == self_id {
         return Ok(());
     }
+    if control.path_trace.len() > MAX_PATH_TRACE_NODES {
+        debug!(
+            self_id = %self_id,
+            target = %target,
+            path_trace_len = control.path_trace.len(),
+            max_path_trace_nodes = MAX_PATH_TRACE_NODES,
+            "dropping overlay control because path trace exceeds hop limit"
+        );
+        return Ok(());
+    }
     let tables = routing.load();
     let path_trace_set = path_trace_set(&control.path_trace);
     let next_hop = match select_forward_next_hop(
@@ -1248,7 +1265,16 @@ async fn send_control_to(
             return Ok(());
         }
     };
-    append_path_trace(&mut control.path_trace, self_id);
+    if !append_path_trace(&mut control.path_trace, self_id) {
+        debug!(
+            self_id = %self_id,
+            target = %target,
+            path_trace_len = control.path_trace.len(),
+            max_path_trace_nodes = MAX_PATH_TRACE_NODES,
+            "dropping overlay control because path trace reached hop limit"
+        );
+        return Ok(());
+    }
     let body = OverlayBody::Control(control);
     let packet_kind = crate::debug_io::classify_overlay_body(&body);
     let payload = encode_message(&wrap(body))?;
@@ -1298,11 +1324,18 @@ fn path_trace_set(path_trace: &[u32]) -> HashSet<NodeIdentifier> {
         .collect()
 }
 
-fn append_path_trace(path_trace: &mut Vec<u32>, self_id: NodeIdentifier) {
+fn append_path_trace(path_trace: &mut Vec<u32>, self_id: NodeIdentifier) -> bool {
+    if path_trace.len() > MAX_PATH_TRACE_NODES {
+        return false;
+    }
     let self_wire = node_to_wire(self_id);
     if !path_trace.contains(&self_wire) {
+        if path_trace.len() == MAX_PATH_TRACE_NODES {
+            return false;
+        }
         path_trace.push(self_wire);
     }
+    true
 }
 
 fn encode_overlay_data(data: &pb::OverlayData) -> Result<Bytes, prost::EncodeError> {
@@ -1683,6 +1716,16 @@ async fn forward_pb_as(
     transport_ttl: Option<std::time::Duration>,
     avoid_first_hop: Option<NodeIdentifier>,
 ) -> Result<(), OverlayError> {
+    if data.path_trace.len() > MAX_PATH_TRACE_NODES {
+        debug!(
+            self_id = %self_id,
+            src = %NodeIdentifier::try_from(data.src).unwrap_or(0),
+            path_trace_len = data.path_trace.len(),
+            max_path_trace_nodes = MAX_PATH_TRACE_NODES,
+            "dropping overlay data because path trace exceeds hop limit"
+        );
+        return Ok(());
+    }
     let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
     let routing_metric = route_metric_from_wire(data.route_metric, level)
         .unwrap_or_else(|| RoutingMetric::default_for_level(level));
@@ -1769,7 +1812,16 @@ async fn forward_pb_as(
     }
 
     let mut new_trace = data.path_trace.clone();
-    append_path_trace(&mut new_trace, self_id);
+    if !append_path_trace(&mut new_trace, self_id) {
+        debug!(
+            self_id = %self_id,
+            src = %NodeIdentifier::try_from(data.src).unwrap_or(0),
+            path_trace_len = data.path_trace.len(),
+            max_path_trace_nodes = MAX_PATH_TRACE_NODES,
+            "dropping overlay data because path trace reached hop limit"
+        );
+        return Ok(());
+    }
     let mut sends: Vec<
         Pin<Box<dyn Future<Output = (NodeIdentifier, Result<(), SendError>)> + Send>>,
     > = Vec::with_capacity(buckets.len());
@@ -1934,6 +1986,9 @@ async fn send_direct_tree_edge_with_routing(
     transport_class: MessageClass,
     hop_ttl: Duration,
 ) -> TreeEdgeSendOutcome {
+    if path_trace.len() > MAX_PATH_TRACE_NODES {
+        return TreeEdgeSendOutcome::Loop;
+    }
     if path_trace_set(&path_trace).contains(&child) {
         return TreeEdgeSendOutcome::Loop;
     }
@@ -2069,11 +2124,28 @@ async fn forward_tree_data_v3(
     transport_class: MessageClass,
     hop_ttl: Duration,
 ) -> Result<(), OverlayError> {
+    if data.path_trace.len() > MAX_PATH_TRACE_NODES {
+        debug!(
+            self_id = %self_id,
+            path_trace_len = data.path_trace.len(),
+            max_path_trace_nodes = MAX_PATH_TRACE_NODES,
+            "dropping distribution tree frame because path trace exceeds hop limit"
+        );
+        return Ok(());
+    }
     let profile = data.distribution_profile.unwrap_or_default();
     let is_repair = data.distribution_repair;
     let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
     let mut path_trace = data.path_trace.clone();
-    append_path_trace(&mut path_trace, self_id);
+    if !append_path_trace(&mut path_trace, self_id) {
+        debug!(
+            self_id = %self_id,
+            path_trace_len = data.path_trace.len(),
+            max_path_trace_nodes = MAX_PATH_TRACE_NODES,
+            "dropping distribution tree frame because path trace reached hop limit"
+        );
+        return Ok(());
+    }
     let mut sends = Vec::new();
     for child in tree.children(self_id).iter().copied() {
         let edge_path_trace = path_trace.clone();
@@ -2190,6 +2262,15 @@ async fn forward_tree_data(
         )
         .await;
     }
+    if data.path_trace.len() > MAX_PATH_TRACE_NODES {
+        debug!(
+            self_id = %self_id,
+            path_trace_len = data.path_trace.len(),
+            max_path_trace_nodes = MAX_PATH_TRACE_NODES,
+            "dropping distribution tree frame because path trace exceeds hop limit"
+        );
+        return Ok(());
+    }
     let profile = data.distribution_profile.unwrap_or_default();
     let is_repair = data.distribution_repair;
     let metric_context = distribution_metric_context(
@@ -2202,7 +2283,15 @@ async fn forward_tree_data(
     let requires_clock_offset =
         data.distribution_deadline_unix_us.is_some() || data.distribution_deadline_issuer.is_some();
     let mut path_trace = data.path_trace.clone();
-    append_path_trace(&mut path_trace, self_id);
+    if !append_path_trace(&mut path_trace, self_id) {
+        debug!(
+            self_id = %self_id,
+            path_trace_len = data.path_trace.len(),
+            max_path_trace_nodes = MAX_PATH_TRACE_NODES,
+            "dropping distribution tree frame because path trace reached hop limit"
+        );
+        return Ok(());
+    }
     let visited = path_trace_set(&path_trace);
     let mut sends: Vec<
         Pin<Box<dyn Future<Output = (NodeIdentifier, Result<(), OverlayError>)> + Send + '_>>,
@@ -2596,6 +2685,19 @@ mod tests {
             primary: cost,
             latency_us: cost,
         }
+    }
+
+    #[test]
+    fn path_trace_cap_rejects_a_new_distinct_hop_without_growth() {
+        let mut path_trace: Vec<u32> = (1..=MAX_PATH_TRACE_NODES as u32).collect();
+        let original = path_trace.clone();
+
+        assert!(!append_path_trace(
+            &mut path_trace,
+            (MAX_PATH_TRACE_NODES + 1) as NodeIdentifier,
+        ));
+        assert_eq!(path_trace, original);
+        assert_eq!(path_trace.len(), MAX_PATH_TRACE_NODES);
     }
 
     fn test_overlay_data(allow_l1_compression: bool) -> pb::OverlayData {
@@ -3898,7 +4000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unordered_final_and_transit_duplicate_delivers_and_forwards_once() {
+    async fn unordered_delivery_preserves_origin_boot_epoch() {
         let (transport, mut receivers) =
             ConnectionManager::test_with_live_streams(2, 4, &[TransportKind::Tcp]);
         let mut forwarded_to_four = receivers.pop().unwrap();
@@ -3928,6 +4030,7 @@ mod tests {
             .expect("local service should receive final delivery")
             .expect("capture receiver should stay open");
         assert_eq!(msg.from, 1);
+        assert_eq!(msg.origin_boot_epoch(), 77);
         assert_eq!(msg.body, Bytes::from_static(b"payload"));
 
         let forwarded = timeout(Duration::from_millis(50), forwarded_to_four.recv())

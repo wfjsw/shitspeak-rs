@@ -42,7 +42,7 @@ use super::endpoint::{
 };
 use super::error::{ConfigError, SendError, TransportError};
 use super::frame::encoded_data_frame_len;
-use super::identity::NodeIdentity;
+use super::identity::{NodeIdentity, OriginAuthenticationError, OriginSignature};
 use super::metrics::{
     ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot,
     MetricsTuning, QueueWatermark, QueueWatermarkReport, TransportHealthExclusionReason,
@@ -383,6 +383,7 @@ impl InboundDispatch {
 /// individual endpoints reachable through `endpoints`.
 pub(crate) struct ManagerInner {
     self_id: NodeIdentifier,
+    identity: Option<Arc<NodeIdentity>>,
     peers: Arc<SccMap<NodeIdentifier, Arc<PeerState>>>,
     seed_backoff: Arc<SccMap<SeedAddress, Arc<parking_lot::Mutex<BackoffState>>>>,
     successful_seeds: Arc<SccMap<SeedAddress, PeerAddress>>,
@@ -458,6 +459,7 @@ impl ManagerInner {
     fn clone_for_dispatcher(&self) -> ManagerInner {
         ManagerInner {
             self_id: self.self_id,
+            identity: self.identity.clone(),
             peers: self.peers.clone(),
             seed_backoff: self.seed_backoff.clone(),
             successful_seeds: self.successful_seeds.clone(),
@@ -571,6 +573,11 @@ pub struct ConnectionManager {
 }
 
 impl ConnectionManager {
+    /// Maximum encoded transport frame size accepted by this manager.
+    pub fn max_frame_bytes(&self) -> usize {
+        self.inner.cfg().max_frame_bytes()
+    }
+
     /// Check whether an identity-encoded data payload fits as one frame on a
     /// selected transport. Stream transports have no datagram ceiling.
     pub fn payload_fits_transport(
@@ -680,6 +687,7 @@ impl ConnectionManager {
 
         let inner = Arc::new(ManagerInner {
             self_id: identity.node_id(),
+            identity: Some(identity),
             peers: Arc::new(SccMap::new()),
             seed_backoff: Arc::new(SccMap::new()),
             successful_seeds: Arc::new(SccMap::new()),
@@ -728,6 +736,7 @@ impl ConnectionManager {
         let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into());
         let inner = Arc::new(ManagerInner {
             self_id,
+            identity: None,
             peers: Arc::new(SccMap::new()),
             seed_backoff: Arc::new(SccMap::new()),
             successful_seeds: Arc::new(SccMap::new()),
@@ -775,6 +784,35 @@ impl ConnectionManager {
 
     pub fn local_node_id(&self) -> NodeIdentifier {
         self.inner.self_id
+    }
+
+    /// Sign an end-to-end origin-bound payload with this node's configured
+    /// certificate key. Callers receive only a detached proof, never key
+    /// material.
+    pub fn sign_origin_payload(
+        &self,
+        payload: &[u8],
+    ) -> Result<OriginSignature, OriginAuthenticationError> {
+        self.inner
+            .identity
+            .as_ref()
+            .ok_or(OriginAuthenticationError::IdentityUnavailable)?
+            .sign_origin_payload(payload)
+    }
+
+    /// Verify a detached origin proof against this node's configured S2S CA
+    /// and the claimed logical node identifier.
+    pub fn verify_origin_payload(
+        &self,
+        claimed_node: NodeIdentifier,
+        proof: &OriginSignature,
+        payload: &[u8],
+    ) -> Result<(), OriginAuthenticationError> {
+        self.inner
+            .identity
+            .as_ref()
+            .ok_or(OriginAuthenticationError::IdentityUnavailable)?
+            .verify_origin_payload(claimed_node, proof, payload)
     }
 
     pub fn listen_addresses(&self) -> Vec<PeerAddress> {

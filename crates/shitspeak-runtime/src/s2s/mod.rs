@@ -26,7 +26,10 @@ use crate::voice::metrics::{
     S2SVoiceGatewayDropDirection, S2SVoiceGatewayDropReason, record_s2s_gateway_drop,
 };
 use shitspeak_state::{BanEntry, BanOp, BanOperation, BanRepository};
-use shitspeak_state::{ChannelOp, ChannelOperation, ChannelRepository};
+use shitspeak_state::{
+    ChannelOp, ChannelOperation, ChannelRepoError, ChannelRepository, StrictOperationApplyOutcome,
+    StrictOperationId,
+};
 
 use shitspeak_s2s::application as s2s_application;
 use shitspeak_s2s::application::error::ApplicationError;
@@ -69,6 +72,7 @@ const S2S_GATEWAY_CONTROL_MIN_BYTES: usize = 1024 * 1024;
 const S2S_GATEWAY_LANE_MIN_BYTES: usize = 512 * 1024;
 const S2S_VOICE_GATEWAY_MIN_SHARDS: usize = 2;
 const S2S_VOICE_GATEWAY_MAX_SHARDS: usize = 16;
+const MAX_DYNAMIC_CHANNEL_SERVER_ID_BYTES: usize = 256;
 
 fn strict_proposal_gateway_response_timeout(cfg: &s2s_replications::ReplicationConfig) -> Duration {
     let slack = cfg
@@ -1888,6 +1892,107 @@ impl S2SManager {
         );
         let recipient_index = RecipientIndex::new();
         let server_handle = server.upgrade();
+
+        #[cfg(feature = "pre-release-workload")]
+        let pre_release_workload_enabled = pre_release_workload::enabled();
+        let mut expected_strict_topics = BTreeSet::new();
+        if server_handle.is_some() {
+            expected_strict_topics.insert(channel_topic(DEFAULT_SERVER_ID));
+            expected_strict_topics.insert("bans".to_owned());
+        }
+        #[cfg(feature = "pre-release-workload")]
+        if pre_release_workload_enabled {
+            expected_strict_topics.insert(pre_release_workload::strict_topic().to_owned());
+        }
+        replications.set_expected_strict_topics(expected_strict_topics.iter().cloned());
+
+        application.user_stats().set_responder(
+            crate::client::handlers::ServerUserStatsResponder::new(server.clone()),
+        );
+        let S2SGateways {
+            native_tx,
+            s2s_tx,
+            s2s_rx,
+            native_runtime,
+        } = gateways;
+        let native_sink = Arc::new(S2SNativeGatewaySink::new(native_tx));
+        application.moderation().set_applier(native_sink.clone());
+        application.voice().set_audio_sink(native_sink.clone());
+        application
+            .voice()
+            .set_recipient_index(recipient_index.clone());
+        application.plugin_data().set_sink(native_sink.clone());
+        application.text_message().set_sink(native_sink);
+
+        let (
+            channel_replications,
+            ban_replication,
+            client_replication,
+            channel_blob_replications,
+            bridge_tasks,
+        ) = match server_handle.as_ref() {
+            Some(server) => {
+                self.register_repositories(
+                    Arc::clone(&self),
+                    &replications,
+                    application.clone(),
+                    server,
+                    recipient_index.clone(),
+                    &native_runtime,
+                    s2s_tx.clone(),
+                    s2s_rx,
+                    shutdown.clone(),
+                )
+                .await
+            }
+            None => {
+                warn!("s2s repository replication skipped: server handle dropped");
+                (HashMap::new(), None, None, HashMap::new(), Vec::new())
+            }
+        };
+
+        #[cfg(feature = "pre-release-workload")]
+        let started_pre_release_workload = if pre_release_workload_enabled {
+            let chaos = self.state.read().inbound_chaos.clone();
+            pre_release_workload::start(
+                overlay.clone(),
+                replications.clone(),
+                chaos,
+                shutdown.clone(),
+            )
+        } else {
+            None
+        };
+
+        if !expected_strict_topics.is_empty() && !replications.strict_capability_activation_ready()
+        {
+            warn!(
+                required_version = s2s_overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+                expected_topics = ?expected_strict_topics,
+                "strict replication remains at v0 until every expected repository and its authenticated v2 frame prerequisites are ready"
+            );
+        }
+
+        {
+            let mut state = self.state.write();
+            state.transport = Some(transport.clone());
+            state.overlay = Some(overlay.clone());
+            state.local_geo = local_geo.clone();
+            state.replications = Some(replications.clone());
+            state.application = Some(application.clone());
+            state.recipient_index = Some(recipient_index);
+            state.server = Some(server.clone());
+            state.channel_replications = channel_replications;
+            state.ban_replication = ban_replication;
+            state.client_replication = client_replication;
+            state.channel_blob_replications = channel_blob_replications;
+            state.bridge_tasks = bridge_tasks;
+            #[cfg(feature = "pre-release-workload")]
+            if let Some(workload) = started_pre_release_workload {
+                state.bridge_tasks.push(workload.into_task());
+            }
+        }
+
         if let Some(server) = server_handle.as_ref() {
             let channels = server.get_channels().clone();
             let manager = Arc::clone(&self);
@@ -1932,84 +2037,6 @@ impl S2SManager {
                     .or_insert(handle);
                 Some(runtime)
             })));
-        }
-
-        application.user_stats().set_responder(
-            crate::client::handlers::ServerUserStatsResponder::new(server.clone()),
-        );
-        let S2SGateways {
-            native_tx,
-            s2s_tx,
-            s2s_rx,
-            native_runtime,
-        } = gateways;
-        let native_sink = Arc::new(S2SNativeGatewaySink::new(native_tx));
-        application.moderation().set_applier(native_sink.clone());
-        application.voice().set_audio_sink(native_sink.clone());
-        application
-            .voice()
-            .set_recipient_index(recipient_index.clone());
-        application.plugin_data().set_sink(native_sink.clone());
-        application.text_message().set_sink(native_sink);
-
-        #[cfg(feature = "pre-release-workload")]
-        let pre_release_task = if pre_release_workload::enabled() {
-            let chaos = self.state.read().inbound_chaos.clone();
-            pre_release_workload::start(
-                overlay.clone(),
-                replications.clone(),
-                chaos,
-                shutdown.clone(),
-            )
-        } else {
-            None
-        };
-
-        let (
-            channel_replications,
-            ban_replication,
-            client_replication,
-            channel_blob_replications,
-            bridge_tasks,
-        ) = match server_handle.as_ref() {
-            Some(server) => {
-                self.register_repositories(
-                    Arc::clone(&self),
-                    &replications,
-                    application.clone(),
-                    server,
-                    recipient_index.clone(),
-                    &native_runtime,
-                    s2s_tx.clone(),
-                    s2s_rx,
-                    shutdown.clone(),
-                )
-                .await
-            }
-            None => {
-                warn!("s2s repository replication skipped: server handle dropped");
-                (HashMap::new(), None, None, HashMap::new(), Vec::new())
-            }
-        };
-
-        {
-            let mut state = self.state.write();
-            state.transport = Some(transport.clone());
-            state.overlay = Some(overlay.clone());
-            state.local_geo = local_geo.clone();
-            state.replications = Some(replications.clone());
-            state.application = Some(application.clone());
-            state.recipient_index = Some(recipient_index);
-            state.server = Some(server.clone());
-            state.channel_replications = channel_replications;
-            state.ban_replication = ban_replication;
-            state.client_replication = client_replication;
-            state.channel_blob_replications = channel_blob_replications;
-            state.bridge_tasks = bridge_tasks;
-            #[cfg(feature = "pre-release-workload")]
-            if let Some(task) = pre_release_task {
-                state.bridge_tasks.push(task);
-            }
         }
 
         let status_task = self.status_http_listen.and_then(|listen| {
@@ -2207,12 +2234,7 @@ impl S2SManager {
                     server.get_channels().clone(),
                     Some(Arc::downgrade(server)),
                 ));
-                let runtime = replications
-                    .strict_topic_parts()
-                    .build_runtime(topic.clone(), repo);
-                runtime.start();
-                replications.install_strict_runtime(topic, runtime.clone())?;
-                let handle = s2s_replications::StrictHandle::with_runtime(runtime);
+                let handle = replications.register_strict(topic, repo)?;
                 entry.insert(handle.clone());
                 Ok(handle)
             }
@@ -3385,10 +3407,8 @@ pub fn server_id_from_channel_topic(topic: &str) -> Option<String> {
     if topic == "channels" {
         Some(DEFAULT_SERVER_ID.to_owned())
     } else {
-        topic
-            .strip_prefix("channels:")
-            .filter(|server_id| !server_id.is_empty())
-            .map(str::to_owned)
+        let server_id = validated_dynamic_channel_server_id(topic.strip_prefix("channels:")?)?;
+        (channel_topic(server_id) == topic).then(|| server_id.to_owned())
     }
 }
 
@@ -3396,11 +3416,16 @@ pub fn server_id_from_channel_blob_topic(topic: &str) -> Option<String> {
     if topic == "channel_blobs" {
         Some(DEFAULT_SERVER_ID.to_owned())
     } else {
-        topic
-            .strip_prefix("channel_blobs:")
-            .filter(|server_id| !server_id.is_empty())
-            .map(str::to_owned)
+        let server_id = validated_dynamic_channel_server_id(topic.strip_prefix("channel_blobs:")?)?;
+        (channel_blob_topic(server_id) == topic).then(|| server_id.to_owned())
     }
+}
+
+fn validated_dynamic_channel_server_id(server_id: &str) -> Option<&str> {
+    (!server_id.is_empty()
+        && server_id.len() <= MAX_DYNAMIC_CHANNEL_SERVER_ID_BYTES
+        && !server_id.chars().any(char::is_control))
+    .then_some(server_id)
 }
 
 pub fn channel_topic(server_id: &str) -> String {
@@ -3477,13 +3502,108 @@ impl ChannelReplicationAdapter {
             server,
         }
     }
+
+    fn bind_operation_to_topic(&self, op: &mut ChannelOperation) -> bool {
+        if op.server_id.is_empty() || op.server_id == DEFAULT_SERVER_ID {
+            op.server_id.clone_from(&self.server_id);
+        }
+        op.server_id == self.server_id
+    }
+
+    async fn apply_strict_committed_once(
+        &self,
+        version: u64,
+        mut op: ChannelOperation,
+        metadata: s2s_replications::strict::StrictLogMetadata,
+    ) -> s2s_replications::strict::StrictCommitApplyOutcome {
+        op.version = version;
+        if !self.bind_operation_to_topic(&mut op) {
+            warn!(
+                topic_server_id = %self.server_id,
+                operation_server_id = %op.server_id,
+                "s2s strict channel operation does not match its topic scope"
+            );
+            return s2s_replications::strict::StrictCommitApplyOutcome::Failed;
+        }
+        let evict_pending_delete = match &op.op {
+            ChannelOp::MarkPendingDelete {
+                id,
+                nonce,
+                evict_clients,
+            } if *evict_clients => {
+                let fallback = self
+                    .repo
+                    .get_channel_in_server(&op.server_id, *id)
+                    .await
+                    .and_then(|channel| channel.parent_id)
+                    .unwrap_or(0);
+                Some((*id, *nonce, fallback))
+            }
+            _ => None,
+        };
+        let op_server_id = op.server_id.clone();
+        let applied_op = op.op.clone();
+        let outcome = match self
+            .repo
+            .apply_strict_operation_once(op, strict_log_metadata_to_repo(metadata))
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                warn!(error = ?error, "s2s strict channel operation apply failed");
+                return s2s_replications::strict::StrictCommitApplyOutcome::Failed;
+            }
+        };
+        match outcome {
+            StrictOperationApplyOutcome::Applied => {}
+            StrictOperationApplyOutcome::AlreadyApplied => {
+                return s2s_replications::strict::StrictCommitApplyOutcome::AlreadyApplied;
+            }
+            StrictOperationApplyOutcome::VersionConflict => {
+                warn!(
+                    version,
+                    "s2s strict channel operation version conflicts with repository state"
+                );
+                return s2s_replications::strict::StrictCommitApplyOutcome::Failed;
+            }
+        }
+        if let Some(server) = self.server.as_ref().and_then(Weak::upgrade) {
+            server
+                .reevaluate_speak_after_acl_change(&op_server_id, &applied_op, version)
+                .await;
+        }
+        if let (Some(server), Some((id, nonce, fallback))) = (
+            self.server.as_ref().and_then(Weak::upgrade),
+            evict_pending_delete,
+        ) {
+            let moved = crate::user_channel_cache::move_local_clients_out_of_pending_delete(
+                &server,
+                &op_server_id,
+                id,
+                nonce,
+                fallback,
+                version,
+            )
+            .await;
+            if moved > 0 {
+                trace!(
+                    server_id = %op_server_id,
+                    channel_id = id,
+                    nonce,
+                    moved,
+                    "moved local clients out of replicated pending-delete subtree"
+                );
+            }
+        }
+        s2s_replications::strict::StrictCommitApplyOutcome::Applied
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChannelSnapshot {
     channels: Vec<shitspeak_state::Channel>,
-    #[serde(default)]
     freshness: i64,
+    strict_operation_ids: Vec<StrictOperationId>,
 }
 
 fn strict_log_metadata_from_repo(
@@ -3517,22 +3637,38 @@ impl StrictReplicable for ChannelReplicationAdapter {
         }
     }
 
-    fn snapshot(&self) -> (u64, Bytes) {
-        let version = self.repo.current_version_in_server(&self.server_id);
+    fn strict_replication_protocol_version(&self) -> u32 {
+        if self.repo.strict_operation_durability_enabled() {
+            s2s_overlay::STRICT_REPLICATION_PROTOCOL_VERSION
+        } else {
+            0
+        }
+    }
+
+    fn snapshot(&self) -> Result<(u64, Bytes), s2s_replications::strict::StrictSnapshotError> {
         let repo = self.repo.clone();
         let server_id = self.server_id.clone();
-        let channels =
-            block_in_place_or_current(|handle| handle.block_on(repo.get_all_in_server(&server_id)))
-                .unwrap_or_default();
-        let freshness = self.repo.latest_timestamp_in_server(&self.server_id);
-        let bytes = Bytes::from(
-            rmp_serde::to_vec(&ChannelSnapshot {
-                channels,
-                freshness,
-            })
-            .unwrap_or_default(),
-        );
-        (version, bytes)
+        let strict_snapshot = block_in_place_or_current(|handle| {
+            handle.block_on(repo.strict_snapshot_in_server(&server_id))
+        })
+        .ok_or_else(|| {
+            s2s_replications::strict::StrictSnapshotError::new(
+                "s2s channel snapshot requires a multi-thread Tokio runtime",
+            )
+        })?;
+        let (version, channels, freshness, strict_operation_ids) = strict_snapshot.into_parts();
+        let bytes = rmp_serde::to_vec(&ChannelSnapshot {
+            channels,
+            freshness,
+            strict_operation_ids,
+        })
+        .map(Bytes::from)
+        .map_err(|error| {
+            s2s_replications::strict::StrictSnapshotError::new(format!(
+                "s2s channel snapshot serialization failed: {error}"
+            ))
+        })?;
+        Ok((version, bytes))
     }
 
     fn log_since(
@@ -3543,9 +3679,9 @@ impl StrictReplicable for ChannelReplicationAdapter {
         let repo = self.repo.clone();
         let server_id = self.server_id.clone();
         let entries = block_in_place_or_current(|handle| {
-            handle.block_on(repo.get_log_entries_since_in_server(&server_id, since))
+            handle.block_on(repo.strict_log_entries_since_in_server(&server_id, since))
         });
-        match entries {
+        match entries.flatten() {
             Some(entries) => s2s_replications::strict::LogSlice::Available(
                 entries
                     .into_iter()
@@ -3571,8 +3707,13 @@ impl StrictReplicable for ChannelReplicationAdapter {
 
     async fn apply_committed(&self, version: u64, mut op: Self::Op) {
         op.version = version;
-        if op.server_id.is_empty() || op.server_id == DEFAULT_SERVER_ID {
-            op.server_id = self.server_id.clone();
+        if !self.bind_operation_to_topic(&mut op) {
+            warn!(
+                topic_server_id = %self.server_id,
+                operation_server_id = %op.server_id,
+                "s2s channel operation does not match its topic scope"
+            );
+            return;
         }
         let evict_pending_delete = match &op.op {
             ChannelOp::MarkPendingDelete {
@@ -3632,88 +3773,53 @@ impl StrictReplicable for ChannelReplicationAdapter {
         op: Self::Op,
         metadata: Option<s2s_replications::strict::StrictLogMetadata>,
     ) {
-        let mut op = op;
-        op.version = version;
-        if op.server_id.is_empty() || op.server_id == DEFAULT_SERVER_ID {
-            op.server_id = self.server_id.clone();
-        }
-        let evict_pending_delete = match &op.op {
-            ChannelOp::MarkPendingDelete {
-                id,
-                nonce,
-                evict_clients,
-            } if *evict_clients => {
-                let fallback = self
-                    .repo
-                    .get_channel_in_server(&op.server_id, *id)
-                    .await
-                    .and_then(|channel| channel.parent_id)
-                    .unwrap_or(0);
-                Some((*id, *nonce, fallback))
-            }
-            _ => None,
-        };
-        let op_server_id = op.server_id.clone();
-        let applied_op = op.op.clone();
-        let metadata = metadata.map(strict_log_metadata_to_repo);
-        if let Err(e) = self
-            .repo
-            .apply_committed_operation_with_metadata(op, metadata)
-            .await
-        {
-            warn!(error = ?e, "s2s channel operation apply failed");
-            return;
-        }
-        if let Some(server) = self.server.as_ref().and_then(Weak::upgrade) {
-            server
-                .reevaluate_speak_after_acl_change(&op_server_id, &applied_op, version)
+        if let Some(metadata) = metadata {
+            let _ = self
+                .apply_strict_committed_once(version, op, metadata)
                 .await;
-        }
-        if let (Some(server), Some((id, nonce, fallback))) = (
-            self.server.as_ref().and_then(Weak::upgrade),
-            evict_pending_delete,
-        ) {
-            let moved = crate::user_channel_cache::move_local_clients_out_of_pending_delete(
-                &server,
-                &op_server_id,
-                id,
-                nonce,
-                fallback,
-                version,
-            )
-            .await;
-            if moved > 0 {
-                trace!(
-                    server_id = %op_server_id,
-                    channel_id = id,
-                    nonce,
-                    moved,
-                    "moved local clients out of replicated pending-delete subtree"
-                );
-            }
+        } else {
+            self.apply_committed(version, op).await;
         }
     }
 
-    async fn install_snapshot(&self, version: u64, snapshot: Bytes) {
-        let decoded: ChannelSnapshot = match rmp_serde::from_slice(&snapshot) {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                warn!(error = %e, "s2s channel snapshot decode failed");
-                return;
-            }
-        };
-        if let Err(e) = self
-            .repo
-            .install_s2s_snapshot_in_server(
+    async fn apply_committed_once(
+        &self,
+        version: u64,
+        op: Self::Op,
+        metadata: s2s_replications::strict::StrictLogMetadata,
+    ) -> s2s_replications::strict::StrictCommitApplyOutcome {
+        self.apply_strict_committed_once(version, op, metadata)
+            .await
+    }
+
+    async fn install_snapshot(
+        &self,
+        version: u64,
+        snapshot: Bytes,
+    ) -> Result<(), s2s_replications::strict::StrictSnapshotError> {
+        let decoded: ChannelSnapshot = rmp_serde::from_slice(&snapshot).map_err(|error| {
+            s2s_replications::strict::StrictSnapshotError::new(format!(
+                "s2s channel snapshot decode failed: {error}"
+            ))
+        })?;
+        self.repo
+            .install_s2s_snapshot_with_strict_operation_ids_in_server(
                 &self.server_id,
                 version,
                 decoded.channels,
                 decoded.freshness,
+                decoded.strict_operation_ids,
             )
             .await
-        {
-            warn!(error = ?e, "s2s channel snapshot install failed");
-        }
+            .map_err(|error| {
+                let message = format!("s2s channel snapshot install failed: {error:?}");
+                match error {
+                    ChannelRepoError::WalIo(_) => {
+                        s2s_replications::strict::StrictSnapshotError::durability_failure(message)
+                    }
+                    _ => s2s_replications::strict::StrictSnapshotError::new(message),
+                }
+            })
     }
 }
 
@@ -3796,8 +3902,8 @@ impl BanReplicationAdapter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BanSnapshot {
     entries: Vec<BanEntry>,
-    #[serde(default)]
     freshness: i64,
+    strict_operation_ids: Vec<StrictOperationId>,
 }
 
 #[async_trait]
@@ -3815,15 +3921,36 @@ impl StrictReplicable for BanReplicationAdapter {
         }
     }
 
-    fn snapshot(&self) -> (u64, Bytes) {
-        let version = self.repo.current_version();
-        let repo = self.repo.clone();
-        let entries = block_in_place_or_current(|handle| handle.block_on(repo.get_active_bans()))
-            .unwrap_or_default();
-        let freshness = self.repo.latest_timestamp();
-        let bytes =
-            Bytes::from(rmp_serde::to_vec(&BanSnapshot { entries, freshness }).unwrap_or_default());
-        (version, bytes)
+    fn strict_replication_protocol_version(&self) -> u32 {
+        if self.repo.durable_storage_enabled() {
+            s2s_overlay::STRICT_REPLICATION_PROTOCOL_VERSION
+        } else {
+            0
+        }
+    }
+
+    fn snapshot(&self) -> Result<(u64, Bytes), s2s_replications::strict::StrictSnapshotError> {
+        let strict_snapshot = self.repo.strict_snapshot().map_err(|error| {
+            let message = format!("s2s ban snapshot capture failed: {error}");
+            if self.repo.strict_durability_failure_observed() {
+                s2s_replications::strict::StrictSnapshotError::durability_failure(message)
+            } else {
+                s2s_replications::strict::StrictSnapshotError::new(message)
+            }
+        })?;
+        let (version, entries, freshness, strict_operation_ids) = strict_snapshot.into_parts();
+        let bytes = rmp_serde::to_vec(&BanSnapshot {
+            entries,
+            freshness,
+            strict_operation_ids,
+        })
+        .map(Bytes::from)
+        .map_err(|error| {
+            s2s_replications::strict::StrictSnapshotError::new(format!(
+                "s2s ban snapshot serialization failed: {error}"
+            ))
+        })?;
+        Ok((version, bytes))
     }
 
     fn log_since(
@@ -3832,9 +3959,10 @@ impl StrictReplicable for BanReplicationAdapter {
     ) -> s2s_replications::strict::LogSlice<s2s_replications::strict::StrictLogEntry<Self::Op>>
     {
         let repo = self.repo.clone();
-        let entries =
-            block_in_place_or_current(|handle| handle.block_on(repo.get_log_entries_since(since)));
-        match entries {
+        let entries = block_in_place_or_current(|handle| {
+            handle.block_on(repo.strict_log_entries_since(since))
+        });
+        match entries.flatten() {
             Some(entries) => s2s_replications::strict::LogSlice::Available(
                 entries
                     .into_iter()
@@ -3866,29 +3994,74 @@ impl StrictReplicable for BanReplicationAdapter {
     async fn apply_committed_with_metadata(
         &self,
         version: u64,
-        mut op: Self::Op,
+        op: Self::Op,
         metadata: Option<s2s_replications::strict::StrictLogMetadata>,
     ) {
-        op.version = version;
-        self.repo
-            .apply_remote_operation_with_metadata(
-                Arc::new(op),
-                metadata.map(strict_log_metadata_to_repo),
-            )
-            .await;
+        if let Some(metadata) = metadata {
+            let _ = self.apply_committed_once(version, op, metadata).await;
+        } else {
+            self.apply_committed(version, op).await;
+        }
     }
 
-    async fn install_snapshot(&self, version: u64, snapshot: Bytes) {
-        let decoded: BanSnapshot = match rmp_serde::from_slice(&snapshot) {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                warn!(error = %e, "s2s ban snapshot decode failed");
-                return;
+    async fn apply_committed_once(
+        &self,
+        version: u64,
+        mut op: Self::Op,
+        metadata: s2s_replications::strict::StrictLogMetadata,
+    ) -> s2s_replications::strict::StrictCommitApplyOutcome {
+        op.version = version;
+        match self
+            .repo
+            .apply_strict_operation_once(Arc::new(op), strict_log_metadata_to_repo(metadata))
+            .await
+        {
+            Ok(StrictOperationApplyOutcome::Applied) => {
+                s2s_replications::strict::StrictCommitApplyOutcome::Applied
             }
-        };
+            Ok(StrictOperationApplyOutcome::AlreadyApplied) => {
+                s2s_replications::strict::StrictCommitApplyOutcome::AlreadyApplied
+            }
+            Ok(StrictOperationApplyOutcome::VersionConflict) => {
+                warn!(
+                    version,
+                    "s2s strict ban operation version conflicts with repository state"
+                );
+                s2s_replications::strict::StrictCommitApplyOutcome::Failed
+            }
+            Err(error) => {
+                warn!(error = %error, "s2s strict ban operation apply failed");
+                s2s_replications::strict::StrictCommitApplyOutcome::Failed
+            }
+        }
+    }
+
+    async fn install_snapshot(
+        &self,
+        version: u64,
+        snapshot: Bytes,
+    ) -> Result<(), s2s_replications::strict::StrictSnapshotError> {
+        let decoded: BanSnapshot = rmp_serde::from_slice(&snapshot).map_err(|error| {
+            s2s_replications::strict::StrictSnapshotError::new(format!(
+                "s2s ban snapshot decode failed: {error}"
+            ))
+        })?;
         self.repo
-            .install_s2s_snapshot(version, decoded.entries, decoded.freshness)
-            .await;
+            .install_s2s_snapshot_with_strict_operation_ids(
+                version,
+                decoded.entries,
+                decoded.freshness,
+                decoded.strict_operation_ids,
+            )
+            .await
+            .map_err(|error| {
+                let message = format!("s2s ban snapshot install failed: {error}");
+                if self.repo.strict_durability_failure_observed() {
+                    s2s_replications::strict::StrictSnapshotError::durability_failure(message)
+                } else {
+                    s2s_replications::strict::StrictSnapshotError::new(message)
+                }
+            })
     }
 }
 
@@ -4122,6 +4295,10 @@ impl OwnerReplicable for ClientReplicationAdapter {
 
 fn block_in_place_or_current<T>(f: impl FnOnce(&tokio::runtime::Handle) -> T) -> Option<T> {
     let handle = tokio::runtime::Handle::try_current().ok()?;
+    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+        // A synchronous trait callback cannot safely re-enter this runtime.
+        return None;
+    }
     Some(tokio::task::block_in_place(|| f(&handle)))
 }
 
@@ -4153,6 +4330,32 @@ mod tests {
         assert_eq!(
             strict_proposal_gateway_response_timeout(&cfg),
             S2S_GATEWAY_RESPONSE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn dynamic_channel_topics_are_canonical_bounded_and_control_free() {
+        assert_eq!(
+            server_id_from_channel_topic("channels"),
+            Some(DEFAULT_SERVER_ID.to_owned())
+        );
+        assert_eq!(
+            server_id_from_channel_topic("channels:tenant-a"),
+            Some("tenant-a".to_owned())
+        );
+        assert_eq!(
+            server_id_from_channel_blob_topic("channel_blobs:tenant-a"),
+            Some("tenant-a".to_owned())
+        );
+        assert!(server_id_from_channel_topic("channels:default").is_none());
+        assert!(server_id_from_channel_topic("channels:").is_none());
+        assert!(server_id_from_channel_topic("channels:tenant\nnext").is_none());
+        assert!(
+            server_id_from_channel_topic(&format!(
+                "channels:{}",
+                "x".repeat(MAX_DYNAMIC_CHANNEL_SERVER_ID_BYTES + 1)
+            ))
+            .is_none()
         );
     }
 
@@ -4436,6 +4639,555 @@ mod tests {
                 wal_compaction_expire_count: 100,
             },
         )
+    }
+
+    fn persisted_channel_tuning() -> ChannelRepoTuning {
+        ChannelRepoTuning {
+            log_max_entries: 128,
+            snapshot_every_ops: 100,
+            snapshot_every_secs: 60,
+            wal_compaction_expire_count: 100,
+        }
+    }
+
+    fn strict_log_metadata(
+        op_id_hi: u64,
+        op_id_lo: u64,
+        ts_final: u64,
+    ) -> s2s_replications::strict::StrictLogMetadata {
+        s2s_replications::strict::StrictLogMetadata {
+            op_id_hi,
+            op_id_lo,
+            ts_final,
+        }
+    }
+
+    fn strict_channel_create_op(channel_id: u32) -> ChannelOperation {
+        ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 0,
+            node_id: 1,
+            timestamp: 123,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: shitspeak_state::Channel::new(
+                    channel_id,
+                    "strict-snapshot",
+                    0,
+                    0,
+                    Some(0),
+                ),
+            },
+        }
+    }
+
+    fn strict_ban_add_op(address: &str) -> BanOperation {
+        BanOperation {
+            version: 0,
+            node_id: 1,
+            timestamp: 123,
+            op: BanOp::AddBan {
+                entry: BanEntry {
+                    address: address.parse().expect("test address"),
+                    mask: 32,
+                    name: Some("strict-snapshot".to_owned()),
+                    hash: None,
+                    reason: Some("snapshot replay test".to_owned()),
+                    start: 123,
+                    duration: 0,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn strict_production_adapters_require_durable_repositories_for_v2() {
+        let channels = test_channel_repo(1);
+        let channel_adapter =
+            ChannelReplicationAdapter::new(DEFAULT_SERVER_ID.to_owned(), channels, None);
+        assert_eq!(channel_adapter.strict_replication_protocol_version(), 0);
+
+        let bans = BanRepository::new_in_memory(1);
+        let ban_adapter = BanReplicationAdapter::new(bans);
+        assert_eq!(ban_adapter.strict_replication_protocol_version(), 0);
+    }
+
+    #[tokio::test]
+    async fn strict_production_adapters_report_malformed_snapshot_payloads() {
+        let channel_adapter = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            test_channel_repo(1),
+            None,
+        );
+        assert!(
+            channel_adapter
+                .install_snapshot(1, Bytes::from_static(b"not-msgpack"))
+                .await
+                .is_err()
+        );
+
+        let ban_adapter = BanReplicationAdapter::new(BanRepository::new_in_memory(1));
+        assert!(
+            ban_adapter
+                .install_snapshot(1, Bytes::from_static(b"not-msgpack"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_production_adapters_reject_snapshots_without_operation_ids() {
+        #[derive(Serialize)]
+        struct ChannelSnapshotWithoutOperationIds {
+            channels: Vec<shitspeak_state::Channel>,
+            freshness: i64,
+        }
+
+        #[derive(Serialize)]
+        struct BanSnapshotWithoutOperationIds {
+            entries: Vec<BanEntry>,
+            freshness: i64,
+        }
+
+        let channel_adapter = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            test_channel_repo(1),
+            None,
+        );
+        let channel_snapshot = rmp_serde::to_vec_named(&ChannelSnapshotWithoutOperationIds {
+            channels: Vec::new(),
+            freshness: 0,
+        })
+        .expect("encode incomplete channel snapshot");
+        assert!(
+            channel_adapter
+                .install_snapshot(1, Bytes::from(channel_snapshot))
+                .await
+                .is_err()
+        );
+
+        let ban_adapter = BanReplicationAdapter::new(BanRepository::new_in_memory(1));
+        let ban_snapshot = rmp_serde::to_vec_named(&BanSnapshotWithoutOperationIds {
+            entries: Vec::new(),
+            freshness: 0,
+        })
+        .expect("encode incomplete ban snapshot");
+        assert!(
+            ban_adapter
+                .install_snapshot(1, Bytes::from(ban_snapshot))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_production_adapters_reject_equal_version_snapshots_missing_local_operation_ids()
+    {
+        let channels = test_channel_repo(1);
+        let channel_adapter = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            Arc::clone(&channels),
+            None,
+        );
+        let mut local_channel_op = strict_channel_create_op(70);
+        local_channel_op.version = 1;
+        assert_eq!(
+            channels
+                .apply_strict_operation_once(
+                    local_channel_op,
+                    StrictReplicationMetadata::new(901, 902, 1),
+                )
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+        let channel_snapshot = rmp_serde::to_vec(&ChannelSnapshot {
+            channels: vec![shitspeak_state::Channel::new(
+                71,
+                "replacement",
+                0,
+                0,
+                Some(0),
+            )],
+            freshness: 124,
+            strict_operation_ids: vec![StrictOperationId::new(903, 904)],
+        })
+        .expect("encode channel snapshot");
+        assert!(
+            channel_adapter
+                .install_snapshot(1, Bytes::from(channel_snapshot))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            channels.get_channel(70).await.unwrap().name,
+            "strict-snapshot"
+        );
+        assert!(channels.get_channel(71).await.is_none());
+        assert_eq!(
+            channels.strict_operation_ids(),
+            vec![StrictOperationId::new(901, 902)]
+        );
+
+        let bans = BanRepository::new_in_memory(1);
+        let ban_adapter = BanReplicationAdapter::new(Arc::clone(&bans));
+        let mut local_ban_op = strict_ban_add_op("203.0.113.90");
+        local_ban_op.version = 1;
+        assert_eq!(
+            bans.apply_strict_operation_once(
+                Arc::new(local_ban_op),
+                StrictReplicationMetadata::new(905, 906, 1),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+        let ban_snapshot = rmp_serde::to_vec(&BanSnapshot {
+            entries: vec![BanEntry {
+                address: "203.0.113.91".parse().unwrap(),
+                mask: 32,
+                name: Some("replacement".to_owned()),
+                hash: None,
+                reason: None,
+                start: 124,
+                duration: 0,
+            }],
+            freshness: 124,
+            strict_operation_ids: vec![StrictOperationId::new(907, 908)],
+        })
+        .expect("encode ban snapshot");
+        assert!(
+            ban_adapter
+                .install_snapshot(1, Bytes::from(ban_snapshot))
+                .await
+                .is_err()
+        );
+        let active_bans = bans.get_active_bans().await;
+        assert_eq!(active_bans.len(), 1);
+        assert_eq!(
+            active_bans[0].address,
+            "203.0.113.90".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            bans.strict_operation_ids().unwrap(),
+            vec![StrictOperationId::new(905, 906)]
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_strict_snapshot_classifies_only_persistence_failures_as_durability_failures() {
+        let storage_failure_dir = tempfile::tempdir().expect("storage failure tempdir");
+        let storage_failure_repo = ChannelRepository::open(
+            1,
+            storage_failure_dir.path(),
+            ChannelRootConfig::new("Root"),
+            persisted_channel_tuning(),
+        )
+        .await
+        .expect("open persisted channel repo");
+        let storage_failure_adapter = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            Arc::clone(&storage_failure_repo),
+            None,
+        );
+        std::fs::create_dir(
+            storage_failure_dir
+                .path()
+                .join("channels.snapshot.json.tmp"),
+        )
+        .expect("block the replacement snapshot temp file");
+        let snapshot = rmp_serde::to_vec(&ChannelSnapshot {
+            channels: vec![shitspeak_state::Channel::new(
+                7,
+                "replacement",
+                0,
+                0,
+                Some(0),
+            )],
+            freshness: 0,
+            strict_operation_ids: Vec::new(),
+        })
+        .expect("encode replacement snapshot");
+
+        let error = storage_failure_adapter
+            .install_snapshot(1, Bytes::from(snapshot))
+            .await
+            .expect_err("snapshot persistence must fail");
+        assert!(error.is_durability_failure());
+        assert!(!storage_failure_repo.strict_operation_durability_enabled());
+
+        let semantic_failure_dir = tempfile::tempdir().expect("semantic failure tempdir");
+        let semantic_failure_repo = ChannelRepository::open(
+            1,
+            semantic_failure_dir.path(),
+            ChannelRootConfig::new("Root"),
+            persisted_channel_tuning(),
+        )
+        .await
+        .expect("open persisted channel repo");
+        let mut local_op = strict_channel_create_op(8);
+        local_op.version = 1;
+        assert_eq!(
+            semantic_failure_repo
+                .apply_strict_operation_once(
+                    local_op,
+                    StrictReplicationMetadata::new(901, 902, 903),
+                )
+                .await
+                .expect("apply local strict operation"),
+            StrictOperationApplyOutcome::Applied
+        );
+        let semantic_failure_adapter = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            Arc::clone(&semantic_failure_repo),
+            None,
+        );
+        let semantic_snapshot = rmp_serde::to_vec(&ChannelSnapshot {
+            channels: vec![shitspeak_state::Channel::new(
+                9,
+                "semantic-replacement",
+                0,
+                0,
+                Some(0),
+            )],
+            freshness: 0,
+            strict_operation_ids: Vec::new(),
+        })
+        .expect("encode semantic replacement snapshot");
+
+        let error = semantic_failure_adapter
+            .install_snapshot(1, Bytes::from(semantic_snapshot))
+            .await
+            .expect_err("snapshot without a local operation id must be rejected");
+        assert!(!error.is_durability_failure());
+        assert!(semantic_failure_repo.strict_operation_durability_enabled());
+    }
+
+    #[tokio::test]
+    async fn channel_strict_adapter_fails_closed_on_current_thread_runtime() {
+        let adapter = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            test_channel_repo(1),
+            None,
+        );
+
+        assert!(adapter.snapshot().is_err());
+        assert!(matches!(
+            adapter.log_since(0),
+            s2s_replications::strict::LogSlice::TooOld
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_production_adapters_fail_delivery_on_version_conflict() {
+        let channels = test_channel_repo(1);
+        channels
+            .create_channel(shitspeak_state::Channel::new(70, "existing", 0, 0, Some(0)))
+            .await
+            .expect("create existing channel");
+        let channel_adapter = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            Arc::clone(&channels),
+            None,
+        );
+        assert_eq!(
+            channel_adapter
+                .apply_committed_once(
+                    1,
+                    strict_channel_create_op(71),
+                    strict_log_metadata(1, 2, 3)
+                )
+                .await,
+            s2s_replications::strict::StrictCommitApplyOutcome::Failed
+        );
+
+        let bans = BanRepository::new_in_memory(1);
+        let mut existing_ban = strict_ban_add_op("203.0.113.70");
+        existing_ban.version = 1;
+        bans.apply_remote_operation(Arc::new(existing_ban)).await;
+        let ban_adapter = BanReplicationAdapter::new(bans);
+        assert_eq!(
+            ban_adapter
+                .apply_committed_once(
+                    1,
+                    strict_ban_add_op("203.0.113.71"),
+                    strict_log_metadata(4, 5, 6)
+                )
+                .await,
+            s2s_replications::strict::StrictCommitApplyOutcome::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_replication_adapter_rejects_cross_scope_operations() {
+        let channels = test_channel_repo(1);
+        let adapter =
+            ChannelReplicationAdapter::new("tenant-a".to_owned(), Arc::clone(&channels), None);
+        let mut mismatched_op = strict_channel_create_op(72);
+        mismatched_op.server_id = "tenant-b".to_owned();
+
+        adapter.apply_committed(1, mismatched_op.clone()).await;
+        assert_eq!(channels.current_version_in_server("tenant-a"), 0);
+        assert_eq!(channels.current_version_in_server("tenant-b"), 0);
+        assert!(
+            channels
+                .get_channel_in_server("tenant-b", 72)
+                .await
+                .is_none()
+        );
+
+        assert_eq!(
+            adapter
+                .apply_committed_once(1, mismatched_op, strict_log_metadata(7, 8, 9))
+                .await,
+            s2s_replications::strict::StrictCommitApplyOutcome::Failed
+        );
+        assert_eq!(channels.current_version_in_server("tenant-a"), 0);
+        assert_eq!(channels.current_version_in_server("tenant-b"), 0);
+        assert!(
+            channels
+                .get_channel_in_server("tenant-b", 72)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_strict_snapshot_transfer_survives_restart_and_suppresses_replay() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_repo = ChannelRepository::open(
+            1,
+            source_dir.path(),
+            ChannelRootConfig::new("Root"),
+            persisted_channel_tuning(),
+        )
+        .await
+        .expect("open source channel repo");
+        let source = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            Arc::clone(&source_repo),
+            None,
+        );
+        assert_eq!(
+            source.strict_replication_protocol_version(),
+            s2s_overlay::STRICT_REPLICATION_PROTOCOL_VERSION
+        );
+        let op = strict_channel_create_op(71);
+
+        assert_eq!(
+            source
+                .apply_committed_once(1, op.clone(), strict_log_metadata(71, 72, 73))
+                .await,
+            s2s_replications::strict::StrictCommitApplyOutcome::Applied
+        );
+        let (version, bytes) = source.snapshot().expect("channel snapshot captures ledger");
+        assert_eq!(version, 1);
+
+        let sink_dir = tempfile::tempdir().expect("sink tempdir");
+        {
+            let sink_repo = ChannelRepository::open(
+                2,
+                sink_dir.path(),
+                ChannelRootConfig::new("Root"),
+                persisted_channel_tuning(),
+            )
+            .await
+            .expect("open sink channel repo");
+            let sink = ChannelReplicationAdapter::new(
+                DEFAULT_SERVER_ID.to_owned(),
+                Arc::clone(&sink_repo),
+                None,
+            );
+            sink.install_snapshot(version, bytes)
+                .await
+                .expect("install channel snapshot");
+            assert!(sink_repo.get_channel(71).await.is_some());
+            assert!(matches!(
+                sink.log_since(0),
+                s2s_replications::strict::LogSlice::TooOld
+            ));
+        }
+
+        let recovered_repo = ChannelRepository::open(
+            2,
+            sink_dir.path(),
+            ChannelRootConfig::new("Root"),
+            persisted_channel_tuning(),
+        )
+        .await
+        .expect("reopen sink channel repo");
+        let recovered = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            Arc::clone(&recovered_repo),
+            None,
+        );
+        assert_eq!(
+            recovered
+                .apply_committed_once(2, op, strict_log_metadata(71, 72, 73))
+                .await,
+            s2s_replications::strict::StrictCommitApplyOutcome::AlreadyApplied
+        );
+        assert_eq!(recovered_repo.current_version(), version);
+        assert_eq!(
+            recovered_repo
+                .get_channel(71)
+                .await
+                .expect("snapshot channel exists")
+                .name,
+            "strict-snapshot"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ban_strict_snapshot_transfer_survives_restart_and_suppresses_replay() {
+        let source_dir = tempfile::tempdir().expect("source tempdir");
+        let source_repo = BanRepository::open(1, source_dir.path())
+            .await
+            .expect("open source ban repo");
+        let source = BanReplicationAdapter::new(Arc::clone(&source_repo));
+        assert_eq!(
+            source.strict_replication_protocol_version(),
+            s2s_overlay::STRICT_REPLICATION_PROTOCOL_VERSION
+        );
+        let op = strict_ban_add_op("203.0.113.71");
+
+        assert_eq!(
+            source
+                .apply_committed_once(1, op.clone(), strict_log_metadata(81, 82, 83))
+                .await,
+            s2s_replications::strict::StrictCommitApplyOutcome::Applied
+        );
+        let (version, bytes) = source.snapshot().expect("ban snapshot captures ledger");
+        assert_eq!(version, 1);
+
+        let sink_dir = tempfile::tempdir().expect("sink tempdir");
+        {
+            let sink_repo = BanRepository::open(2, sink_dir.path())
+                .await
+                .expect("open sink ban repo");
+            let sink = BanReplicationAdapter::new(Arc::clone(&sink_repo));
+            sink.install_snapshot(version, bytes)
+                .await
+                .expect("install ban snapshot");
+            assert_eq!(sink_repo.get_active_bans().await.len(), 1);
+            assert!(matches!(
+                sink.log_since(0),
+                s2s_replications::strict::LogSlice::TooOld
+            ));
+        }
+
+        let recovered_repo = BanRepository::open(2, sink_dir.path())
+            .await
+            .expect("reopen sink ban repo");
+        let recovered = BanReplicationAdapter::new(Arc::clone(&recovered_repo));
+        assert_eq!(
+            recovered
+                .apply_committed_once(2, op, strict_log_metadata(81, 82, 83))
+                .await,
+            s2s_replications::strict::StrictCommitApplyOutcome::AlreadyApplied
+        );
+        assert_eq!(recovered_repo.current_version(), version);
+        assert_eq!(recovered_repo.get_active_bans().await.len(), 1);
     }
 
     async fn make_published_web_client(

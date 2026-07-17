@@ -95,7 +95,8 @@ impl MessageType {
                             repl.body
                         {
                             return match strict.body? {
-                                crate::replications::proto::StrictBody::Propose(_) => {
+                                crate::replications::proto::StrictBody::Propose(_)
+                                | crate::replications::proto::StrictBody::ProposeV1(_) => {
                                     Some(MessageType::StrictPropose)
                                 }
                                 crate::replications::proto::StrictBody::ProposeAck(_) => {

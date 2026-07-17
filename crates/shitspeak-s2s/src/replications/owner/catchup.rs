@@ -101,6 +101,10 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
                 strict_op_id_hi: 0,
                 strict_op_id_lo: 0,
                 strict_ts_final: 0,
+                strict_terminal_ballot: 0,
+                strict_terminal_resolver_node: 0,
+                strict_terminal_resolver_boot_epoch: 0,
+                strict_terminal_frozen_targets: Vec::new(),
             }),
             Err(e) => warn!(error=%e, "owner catchup op encode failed; skipping"),
         }
