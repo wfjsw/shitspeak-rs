@@ -76,6 +76,12 @@ mod service_level;
 mod stream_io;
 mod tls;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
+
+#[cfg(test)]
+mod integration_tests;
+
 pub use adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
 pub use compression::SendOptions;
 pub use config::{KcpTuning, TransportConfig, TransportRoutingPolicy, TransportTuning};

@@ -1,18 +1,18 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::client::client_session_identifier::ClientSessionIdentifier;
-use shitspeak_s2s::application::ApplicationLayer;
-use shitspeak_s2s::application::config::ApplicationConfig;
-use shitspeak_s2s::application::moderation::runtime::testing::RecordingApplier;
-use shitspeak_s2s::application::proto::{
+use shitspeak_core::{ClientSessionIdentifier, default_server_id};
+
+use crate::application::ApplicationLayer;
+use crate::application::config::ApplicationConfig;
+use crate::application::moderation::runtime::testing::RecordingApplier;
+use crate::application::proto::{
     ModerationCommand, UserStatePatch, VoiceIntent, VoiceIntentKind, VoiceIntentNormal,
 };
-use shitspeak_s2s::application::voice::sink::testing::RecordingSink;
-use shitspeak_s2s::overlay::{RoutingMetric, SeedPeer};
-use shitspeak_s2s::testing::{
+use crate::application::voice::sink::testing::RecordingSink;
+use crate::overlay::{RoutingMetric, SeedPeer};
+use crate::testing::{
     Cluster, full_mesh_seeds, line_seeds, wait_for_full_alive_mesh, wait_for_full_routing,
     wait_until,
 };
@@ -32,7 +32,7 @@ fn seed_pair(idx: usize, _ids: &[u16], ports: &[u16]) -> Vec<SeedPeer> {
     vec![SeedPeer::new(
         if other == 0 { 1 } else { 2 },
         vec![PeerAddress::new(
-            shitspeak_s2s::testing::loopback(ports[other]),
+            crate::testing::loopback(ports[other]),
             TransportKind::Tcp,
         )],
     )]
@@ -73,7 +73,7 @@ async fn two_node_voice_passthrough_in_order() {
             .voice()
             .send_broadcast(
                 sender_session,
-                crate::types::default_server_id(),
+                default_server_id(),
                 0,
                 is_terminator,
                 payload,
@@ -162,7 +162,7 @@ async fn three_node_voice_unicast_learns_direct_connection() {
         .voice()
         .send_unicast(
             0xABC_12345,
-            crate::types::default_server_id(),
+            default_server_id(),
             0,
             false,
             Bytes::from_static(b"line-frame"),
@@ -252,7 +252,7 @@ async fn three_node_voice_unicast_forwards_without_transit_delivery_when_direct_
         .voice()
         .send_unicast(
             0xABC_12345,
-            crate::types::default_server_id(),
+            default_server_id(),
             0,
             false,
             Bytes::from_static(b"line-frame"),
@@ -405,7 +405,7 @@ async fn two_node_voice_drops_when_sink_missing() {
             .voice()
             .send_broadcast(
                 0xABC,
-                crate::types::default_server_id(),
+                default_server_id(),
                 0,
                 false,
                 Bytes::from(format!("frame-{i}").into_bytes()),

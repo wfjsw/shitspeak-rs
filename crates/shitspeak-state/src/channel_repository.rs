@@ -4756,6 +4756,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn simultaneous_temporary_channels_get_distinct_ids() {
+        let repo = repo();
+
+        let alice_temp = repo.next_channel_id(true).await;
+        repo.create_channel(Channel::new(alice_temp, "AliceTemp", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        let bob_temp = repo.next_channel_id(true).await;
+        repo.create_channel(Channel::new(bob_temp, "BobTemp", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            alice_temp, bob_temp,
+            "active temporary channels must not reuse the same id"
+        );
+        assert_eq!(
+            repo.get_channel(alice_temp).await.unwrap().name,
+            "AliceTemp"
+        );
+        assert_eq!(repo.get_channel(bob_temp).await.unwrap().name, "BobTemp");
+    }
+
+    #[tokio::test]
+    async fn removed_temporary_channel_id_is_reused() {
+        let repo = repo();
+
+        let first_temp = repo.next_channel_id(true).await;
+        repo.create_channel(Channel::new(first_temp, "ReusableTemp", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.delete_channel(first_temp).await.unwrap();
+        assert!(
+            repo.get_channel(first_temp).await.is_none(),
+            "precondition: temporary channel should be removed before reuse"
+        );
+
+        let second_temp = repo.next_channel_id(true).await;
+        repo.create_channel(Channel::new(second_temp, "ReusedTemp", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second_temp, first_temp,
+            "temporary channel ids should be recycled once the old channel has been removed"
+        );
+        assert_eq!(
+            repo.get_channel(second_temp).await.unwrap().name,
+            "ReusedTemp"
+        );
+    }
+
+    #[tokio::test]
     async fn subscribed_snapshot_receives_followup_channel_operations() {
         let repo = repo();
         let (channels, version, mut rx) =

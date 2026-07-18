@@ -1,10 +1,10 @@
 //! Integration test scenarios.
 //!
-//! Each test brings up a [`Cluster`](shitspeak_s2s::testing::Cluster) of two
+//! Each test brings up a [`Cluster`](crate::testing::Cluster) of two
 //! or more `OverlayNetwork` instances on real `ConnectionManager`s, applies
-//! optional [`LinkChaos`](shitspeak_s2s::testing::LinkChaos), and asserts a
+//! optional [`LinkChaos`](crate::testing::LinkChaos), and asserts a
 //! single end-to-end behavior. Common helpers (PKI, ports, wait predicates)
-//! live in [`shitspeak_s2s::testing`].
+//! live in [`crate::testing`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,17 +13,17 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use shitspeak_s2s::testing::{
+use crate::testing::{
     Capture, Cluster, MessageType, full_mesh_seeds, install_provider_once, line_seeds, loopback,
     mint_pki, overlay_cfg, pick_free_port, s2s_network_test_guard, transport_cfg,
     wait_for_full_alive_mesh, wait_for_full_routing, wait_until,
 };
-use shitspeak_s2s::{application::VOICE_SERVICE_TAG, status::prometheus_samples};
+use crate::{application::VOICE_SERVICE_TAG, status::prometheus_samples};
 use shitspeak_s2s_transport::{
     ConnectionManager, MessageClass, PeerAddress, ServiceLevel, TransportKind,
 };
 
-use shitspeak_s2s::overlay::{
+use crate::overlay::{
     MembershipEvent, OverlayNetwork, OverlaySendOptions, RoutingMetric, SeedPeer,
 };
 
@@ -356,7 +356,6 @@ async fn link_down_reroutes() {
     let cluster = Cluster::build(&[1, 2, 3], full_mesh_seeds).await;
 
     let a = cluster.node(1);
-    let b = cluster.node(2);
     let c = cluster.node(3);
 
     let (tx_c, mut rx_c) = mpsc::channel(8);
@@ -498,7 +497,7 @@ async fn transit_routing_disabled_nodes_are_not_route_intermediates() {
                 .unwrap_err();
             assert!(matches!(
                 err,
-                shitspeak_s2s::overlay::OverlayError::NoRoute { dst: 3, .. }
+                crate::overlay::OverlayError::NoRoute { dst: 3, .. }
             ));
             assert!(
                 timeout(Duration::from_millis(500), rx_c.recv())
@@ -549,7 +548,7 @@ async fn restart_detection_via_hello() {
             ConnectionManager::start(transport_cfg(&pki, 1, loopback(port_b)))
                 .await
                 .unwrap();
-        let overlay_b1 = OverlayNetwork::start(
+        let _overlay_b1 = OverlayNetwork::start(
             transport_b1.clone(),
             inbound_b1,
             overlay_cfg(vec![seed_a.clone()]),

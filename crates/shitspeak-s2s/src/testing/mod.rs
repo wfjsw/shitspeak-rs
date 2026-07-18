@@ -7,8 +7,6 @@
 //! belong with the layer they exercise.
 //!
 //! Layout:
-//!   * [`pki`] — CA + per-node certificate minting, rustls provider init.
-//!   * [`ports`] — loopback `SocketAddr` + free-port pickers.
 //!   * [`chaos`] — per-node inbound chaos middleware (overlay-aware).
 //!   * [`cluster`] — multi-node cluster builder atop transport + overlay.
 //!   * [`wait`] — predicate-driven sleep loops.
@@ -17,8 +15,6 @@
 
 pub mod chaos;
 pub mod cluster;
-pub mod pki;
-pub mod ports;
 pub mod wait;
 
 // Convenient re-exports for the most common items so callers can write
@@ -26,9 +22,10 @@ pub mod wait;
 // attention to file layout.
 pub use chaos::{FaultSelector, LinkChaos, MessageType};
 pub use cluster::{
-    Capture, Cluster, Node, full_mesh_seeds, line_seeds, overlay_cfg, s2s_network_test_guard,
-    transport_cfg,
+    Capture, Cluster, Node, full_mesh_seeds, line_seeds, overlay_cfg, transport_cfg,
 };
-pub use pki::{Pki, install_provider_once, mint_pki};
-pub use ports::{loopback, pick_free_port, pick_free_udp_port};
+pub use shitspeak_s2s_transport::testing::{
+    Pki, install_provider_once, loopback, mint_pki, pick_free_port, pick_free_udp_port,
+    s2s_network_test_guard,
+};
 pub use wait::{wait_for_full_alive_mesh, wait_for_full_routing, wait_until, wait_until_with};

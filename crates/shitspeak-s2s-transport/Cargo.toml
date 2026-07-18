@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = []
-test-support = []
+test-support = ["dep:tempfile"]
 
 [dependencies]
 arc-swap = { workspace = true }
@@ -32,6 +32,7 @@ shitspeak-core = { workspace = true }
 shitspeak-proto = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
+tempfile = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }

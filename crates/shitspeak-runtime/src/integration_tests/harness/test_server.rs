@@ -21,7 +21,7 @@ use shitspeak_runtime_config::{
     UdpPingUserCountScope, WebConfig,
 };
 use shitspeak_s2s::testing::LinkChaos;
-use shitspeak_s2s::testing::pki::{Pki, install_provider_once, mint_pki};
+use shitspeak_s2s::testing::{Pki, install_provider_once, mint_pki};
 
 #[derive(Debug, Clone)]
 pub struct TestServerOpts {

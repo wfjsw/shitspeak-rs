@@ -11,11 +11,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::time::timeout;
 
-use shitspeak_s2s::testing::{
+use crate::testing::{
     Pki, install_provider_once, loopback, mint_pki, pick_free_port, pick_free_udp_port,
     s2s_network_test_guard,
 };
-use shitspeak_s2s_transport::{
+use crate::{
     ConnectionManager, Inbound, LinkMetrics, MessageClass, PeerAddress, SendOptions, ServiceLevel,
     TransportConfig, TransportKind,
 };
@@ -195,7 +195,7 @@ async fn idle_link_reports_zero_passive_throughput() {
     let cfg_b = config_for(&pki, 1, loopback(port_b));
 
     let (mgr_a, _ina) = ConnectionManager::start(cfg_a).await.unwrap();
-    let (mgr_b, _inb) = ConnectionManager::start(cfg_b).await.unwrap();
+    let (_mgr_b, _inb) = ConnectionManager::start(cfg_b).await.unwrap();
 
     mgr_a
         .add_address(200, PeerAddress::new(loopback(port_b), TransportKind::Tcp))

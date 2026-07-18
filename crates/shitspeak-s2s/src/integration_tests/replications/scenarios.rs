@@ -1,4 +1,4 @@
-//! End-to-end replication scenarios over a real overlay.
+//! End-to-end replication scenarios over a real S2S overlay.
 
 use std::sync::{
     Arc,
@@ -12,24 +12,19 @@ use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
-use super::harness::ReplCluster;
-use crate::types::StrictReplicationMetadata;
-use shitspeak_s2s::overlay::{OverlayNetwork, STRICT_REPLICATION_PROTOCOL_VERSION, SeedPeer};
-use shitspeak_s2s::replications::proto::{
-    self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG,
-};
-use shitspeak_s2s::replications::strict::{
+use crate::overlay::{OverlayNetwork, STRICT_REPLICATION_PROTOCOL_VERSION, SeedPeer};
+use crate::replications::proto::{self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG};
+use crate::replications::strict::{
     HistoryMetadata, LogSlice, StrictCommitApplyOutcome, StrictLogEntry, StrictLogMetadata,
     StrictSnapshotError,
 };
-use shitspeak_s2s::replications::test_support::{CountingOwnerRepo, CountingStrictRepo};
-use shitspeak_s2s::replications::{
+use crate::replications::test_support::{CountingOwnerRepo, CountingStrictRepo};
+use crate::replications::{
     OwnerReplicable, ReplicationConfig, ReplicationError, ReplicationManager, StrictReplicable,
 };
-use shitspeak_s2s::testing::chaos::{FaultSelector, MessageType};
-use shitspeak_s2s::testing::{
-    loopback, overlay_cfg, transport_cfg, wait_for_full_routing, wait_until,
-};
+use crate::testing::chaos::{FaultSelector, MessageType};
+use crate::testing::{loopback, overlay_cfg, transport_cfg, wait_for_full_routing, wait_until};
+use shitspeak_core::{DEFAULT_SERVER_ID, StrictReplicationMetadata};
 use shitspeak_s2s_transport::{
     ConnectionManager, MessageClass, PeerAddress, ServiceLevel, TransportKind,
 };
@@ -38,6 +33,8 @@ use shitspeak_state::{
     ChannelOp, ChannelOperation, ChannelRepoTuning, ChannelRepository, ChannelRootConfig,
     StrictOperationApplyOutcome, StrictOperationId,
 };
+
+use super::harness::ReplCluster;
 
 #[derive(Clone)]
 struct TestChannelReplicationAdapter {
@@ -68,9 +65,7 @@ impl StrictReplicable for TestChannelReplicationAdapter {
     fn history_metadata(&self) -> HistoryMetadata {
         HistoryMetadata {
             version: self.repo.current_version(),
-            freshness: self
-                .repo
-                .latest_timestamp_in_server(crate::types::DEFAULT_SERVER_ID),
+            freshness: self.repo.latest_timestamp_in_server(DEFAULT_SERVER_ID),
         }
     }
 
@@ -85,7 +80,7 @@ impl StrictReplicable for TestChannelReplicationAdapter {
     fn snapshot(&self) -> Result<(u64, Bytes), StrictSnapshotError> {
         let repo = self.repo.clone();
         let strict_snapshot = block_in_place_or_current(|handle| {
-            handle.block_on(repo.strict_snapshot_in_server(crate::types::DEFAULT_SERVER_ID))
+            handle.block_on(repo.strict_snapshot_in_server(DEFAULT_SERVER_ID))
         })
         .ok_or_else(|| StrictSnapshotError::new("channel snapshot capture requires a runtime"))?;
         let (version, channels, freshness, strict_operation_ids) = strict_snapshot.into_parts();
@@ -104,9 +99,7 @@ impl StrictReplicable for TestChannelReplicationAdapter {
     fn log_since(&self, since: u64) -> LogSlice<StrictLogEntry<Self::Op>> {
         let repo = self.repo.clone();
         let entries = block_in_place_or_current(|handle| {
-            handle.block_on(
-                repo.strict_log_entries_since_in_server(crate::types::DEFAULT_SERVER_ID, since),
-            )
+            handle.block_on(repo.strict_log_entries_since_in_server(DEFAULT_SERVER_ID, since))
         });
         match entries.flatten() {
             Some(entries) => LogSlice::Available(
@@ -190,7 +183,7 @@ impl StrictReplicable for TestChannelReplicationAdapter {
         })?;
         self.repo
             .install_s2s_snapshot_with_strict_operation_ids_in_server(
-                crate::types::DEFAULT_SERVER_ID,
+                DEFAULT_SERVER_ID,
                 version,
                 snapshot.channels,
                 snapshot.freshness,
@@ -266,7 +259,7 @@ fn block_in_place_or_current<T>(f: impl FnOnce(&tokio::runtime::Handle) -> T) ->
 
 fn channel_create_op(node_id: u16, channel: Channel) -> ChannelOperation {
     ChannelOperation {
-        server_id: crate::types::DEFAULT_SERVER_ID.to_owned(),
+        server_id: DEFAULT_SERVER_ID.to_owned(),
         version: 0,
         node_id,
         timestamp: chrono::Utc::now().timestamp(),

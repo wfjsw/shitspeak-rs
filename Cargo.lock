@@ -4500,6 +4500,7 @@ dependencies = [
  "shitspeak-core",
  "shitspeak-proto",
  "shitspeak-s2s-transport",
+ "shitspeak-state",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

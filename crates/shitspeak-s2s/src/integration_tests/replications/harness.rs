@@ -1,22 +1,20 @@
 //! `ReplCluster` — one `ReplicationManager` per node atop the shared
-//! [`Cluster`](shitspeak_s2s::testing::Cluster) test harness.
+//! [`Cluster`](crate::testing::Cluster) test harness.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use shitspeak_s2s::overlay::OverlayConfig;
-use shitspeak_s2s::replications::{
+use crate::overlay::OverlayConfig;
+use crate::replications::{
     OwnerHandle, OwnerReplicable, ReplicationConfig, ReplicationError, ReplicationManager,
     StrictHandle, StrictReplicable,
 };
-use shitspeak_s2s::testing::{
-    Cluster, full_mesh_seeds, wait_for_full_alive_mesh, wait_for_full_routing, wait_until,
-};
+use crate::testing::{Cluster, full_mesh_seeds, wait_for_full_alive_mesh, wait_for_full_routing};
 use tempfile::TempDir;
 
-pub(crate) struct ReplCluster {
-    pub(crate) cluster: Cluster,
-    pub(crate) managers: Vec<Arc<ReplicationManager>>,
+pub(super) struct ReplCluster {
+    pub(super) cluster: Cluster,
+    pub(super) managers: Vec<Arc<ReplicationManager>>,
     persistence_dirs: Vec<TempDir>,
 }
 

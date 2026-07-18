@@ -3,17 +3,17 @@
 //! path.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, OwnedMutexGuard, mpsc};
+use tokio::sync::{OwnedMutexGuard, mpsc};
 
 use super::chaos::LinkChaos;
-use super::pki::{Pki, install_provider_once, mint_pki};
-use super::ports::{loopback, pick_free_port};
 use crate::overlay::OverlayNetwork;
 use crate::overlay::config::{OverlayConfig, SeedPeer};
 use crate::overlay::messaging::{OverlayInboundMessage, ServiceInbound};
+use shitspeak_s2s_transport::testing::{
+    Pki, install_provider_once, loopback, mint_pki, pick_free_port, s2s_network_test_guard,
+};
 use shitspeak_s2s_transport::{
     AdaptiveInboundReceiver, ConnectionManager, PeerAddress, TransportConfig, TransportKind,
 };
@@ -44,23 +44,6 @@ pub fn overlay_cfg(seeds: Vec<SeedPeer>) -> OverlayConfig {
         .with_anti_entropy_interval(Duration::from_millis(500))
         .with_routing_recompute_debounce(Duration::from_millis(20))
         .with_peer_persistence_interval(Duration::from_secs(1))
-}
-
-static S2S_NETWORK_TEST_LOCK: std::sync::OnceLock<Arc<Mutex<()>>> = std::sync::OnceLock::new();
-
-fn s2s_network_test_lock() -> Arc<Mutex<()>> {
-    S2S_NETWORK_TEST_LOCK
-        .get_or_init(|| Arc::new(Mutex::new(())))
-        .clone()
-}
-
-/// Serialize integration tests that bring up real S2S transports.
-///
-/// The harness reserves known ports before listeners are started, so running
-/// multiple real S2S clusters in parallel can create cross-test socket races
-/// and enough scheduler pressure to trip short convergence deadlines.
-pub async fn s2s_network_test_guard() -> OwnedMutexGuard<()> {
-    s2s_network_test_lock().lock_owned().await
 }
 
 /// One node in an integration-test cluster.
