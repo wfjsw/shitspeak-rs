@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 
 use crate::status::PrometheusSample;
@@ -208,6 +209,69 @@ static STRICT_REPLICATION_UNSUPPORTED_ACTIVE_PEERS: AtomicUsize = AtomicUsize::n
 static STRICT_REPLICATION_TERMINAL_DECISIONS: [AtomicU64; STRICT_RESOLUTION_OUTCOME_COUNT] =
     [const { AtomicU64::new(0) }; STRICT_RESOLUTION_OUTCOME_COUNT];
 static STRICT_REPLICATION_FENCE_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+static STRICT_ADMISSION_METRIC_SOURCES: LazyLock<Mutex<Vec<Weak<StrictAdmissionMetrics>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Per-runtime admission gauges aggregated at scrape time.
+///
+/// A process can host multiple strict topics. Weak sources let the exported
+/// metrics combine every live runtime without a topic label or stale values
+/// after a runtime is dropped.
+#[derive(Default)]
+pub(crate) struct StrictAdmissionMetrics {
+    admitted: AtomicUsize,
+    awaiting_local_cut: AtomicUsize,
+    awaiting_peer: AtomicUsize,
+    highest_barrier: AtomicU64,
+}
+
+impl StrictAdmissionMetrics {
+    pub(crate) fn update(
+        &self,
+        admitted: usize,
+        awaiting_local_cut: usize,
+        awaiting_peer: usize,
+        highest_barrier: u64,
+    ) {
+        self.admitted.store(admitted, Ordering::Relaxed);
+        self.awaiting_local_cut
+            .store(awaiting_local_cut, Ordering::Relaxed);
+        self.awaiting_peer.store(awaiting_peer, Ordering::Relaxed);
+        self.highest_barrier
+            .store(highest_barrier, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> StrictAdmissionMetricSnapshot {
+        StrictAdmissionMetricSnapshot {
+            admitted: self.admitted.load(Ordering::Relaxed),
+            awaiting_local_cut: self.awaiting_local_cut.load(Ordering::Relaxed),
+            awaiting_peer: self.awaiting_peer.load(Ordering::Relaxed),
+            highest_barrier: self.highest_barrier.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StrictAdmissionMetricSnapshot {
+    admitted: usize,
+    awaiting_local_cut: usize,
+    awaiting_peer: usize,
+    highest_barrier: u64,
+}
+
+pub(crate) fn register_strict_admission_metrics() -> Arc<StrictAdmissionMetrics> {
+    let source = Arc::new(StrictAdmissionMetrics {
+        admitted: AtomicUsize::new(0),
+        awaiting_local_cut: AtomicUsize::new(0),
+        awaiting_peer: AtomicUsize::new(0),
+        highest_barrier: AtomicU64::new(0),
+    });
+    STRICT_ADMISSION_METRIC_SOURCES
+        .lock()
+        .unwrap()
+        .push(Arc::downgrade(&source));
+    source
+}
 
 fn increment(value: &AtomicU64, amount: u64) {
     value.fetch_add(amount, Ordering::Relaxed);
@@ -310,6 +374,56 @@ pub(crate) fn record_strict_resolution(outcome: StrictResolutionOutcome) {
 /// Records a late or conflicting strict frame rejected by a resolution fence.
 pub(crate) fn record_strict_fence_rejection() {
     increment(&STRICT_REPLICATION_FENCE_REJECTIONS, 1);
+}
+
+fn aggregate_strict_admission_metrics() -> StrictAdmissionMetricSnapshot {
+    let mut sources = STRICT_ADMISSION_METRIC_SOURCES.lock().unwrap();
+    aggregate_strict_admission_sources(&mut sources)
+}
+
+fn aggregate_strict_admission_sources(
+    sources: &mut Vec<Weak<StrictAdmissionMetrics>>,
+) -> StrictAdmissionMetricSnapshot {
+    let mut aggregate = StrictAdmissionMetricSnapshot::default();
+    sources.retain(|source| {
+        let Some(source) = source.upgrade() else {
+            return false;
+        };
+        let snapshot = source.snapshot();
+        aggregate.admitted = aggregate.admitted.saturating_add(snapshot.admitted);
+        aggregate.awaiting_local_cut = aggregate
+            .awaiting_local_cut
+            .saturating_add(snapshot.awaiting_local_cut);
+        aggregate.awaiting_peer = aggregate
+            .awaiting_peer
+            .saturating_add(snapshot.awaiting_peer);
+        aggregate.highest_barrier = aggregate.highest_barrier.max(snapshot.highest_barrier);
+        true
+    });
+    aggregate
+}
+
+fn strict_admission_metric_samples(
+    snapshot: StrictAdmissionMetricSnapshot,
+) -> Vec<PrometheusSample> {
+    let mut samples = Vec::with_capacity(4);
+    for (state, value) in [
+        ("admitted", snapshot.admitted),
+        ("awaiting_local_cut", snapshot.awaiting_local_cut),
+        ("awaiting_peer", snapshot.awaiting_peer),
+    ] {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_admission_peer_states",
+            vec![("state".to_owned(), state.to_owned())],
+            value as f64,
+        ));
+    }
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_admission_highest_barrier",
+        Vec::new(),
+        snapshot.highest_barrier as f64,
+    ));
+    samples
 }
 
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
@@ -417,6 +531,9 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         ],
         STRICT_REPLICATION_FENCE_REJECTIONS.load(Ordering::Relaxed),
     ));
+    samples.extend(strict_admission_metric_samples(
+        aggregate_strict_admission_metrics(),
+    ));
 
     samples
 }
@@ -492,5 +609,61 @@ mod tests {
             sample.name() == "shitspeak_s2s_strict_replication_fence_rejections_total"
                 && sample.value() == 1.0
         }));
+    }
+
+    #[test]
+    fn strict_admission_metrics_expose_bounded_phase_counts_and_barrier() {
+        let samples = strict_admission_metric_samples(StrictAdmissionMetricSnapshot {
+            admitted: 3,
+            awaiting_local_cut: 2,
+            awaiting_peer: 1,
+            highest_barrier: 101,
+        });
+        for (state, value) in [
+            ("admitted", 3.0),
+            ("awaiting_local_cut", 2.0),
+            ("awaiting_peer", 1.0),
+        ] {
+            assert!(samples.iter().any(|sample| {
+                sample.name() == "shitspeak_s2s_strict_replication_admission_peer_states"
+                    && sample.labels() == [("state".to_owned(), state.to_owned())]
+                    && sample.value() == value
+            }));
+        }
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_admission_highest_barrier"
+                && sample.value() == 101.0
+        }));
+    }
+
+    #[test]
+    fn strict_admission_metrics_aggregate_only_live_runtime_sources() {
+        let first = Arc::new(StrictAdmissionMetrics::default());
+        first.update(2, 1, 0, 40);
+        let second = Arc::new(StrictAdmissionMetrics::default());
+        second.update(3, 0, 2, 90);
+        let mut sources = vec![Arc::downgrade(&first), Arc::downgrade(&second)];
+
+        assert_eq!(
+            aggregate_strict_admission_sources(&mut sources),
+            StrictAdmissionMetricSnapshot {
+                admitted: 5,
+                awaiting_local_cut: 1,
+                awaiting_peer: 2,
+                highest_barrier: 90,
+            }
+        );
+
+        drop(second);
+        assert_eq!(
+            aggregate_strict_admission_sources(&mut sources),
+            StrictAdmissionMetricSnapshot {
+                admitted: 2,
+                awaiting_local_cut: 1,
+                awaiting_peer: 0,
+                highest_barrier: 40,
+            }
+        );
+        assert_eq!(sources.len(), 1);
     }
 }

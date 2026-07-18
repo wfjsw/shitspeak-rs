@@ -275,6 +275,117 @@ fn channel_create_op(node_id: u16, channel: Channel) -> ChannelOperation {
     }
 }
 
+/// A strict repository whose delivery path can be held after the runtime has
+/// removed a terminal commit from its buffer. Catch-up capture/install remain
+/// live so a healed peer exercises the admission protocol rather than an
+/// artificial transport stall.
+struct GatedCountingStrictRepo {
+    inner: Arc<CountingStrictRepo>,
+    delivery_gate: AtomicBool,
+    delivery_blocked: AtomicBool,
+    delivery_release: tokio::sync::Notify,
+}
+
+impl GatedCountingStrictRepo {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: CountingStrictRepo::new(),
+            delivery_gate: AtomicBool::new(false),
+            delivery_blocked: AtomicBool::new(false),
+            delivery_release: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn block_delivery(&self) {
+        self.delivery_gate.store(true, Ordering::Release);
+        self.delivery_blocked.store(false, Ordering::Release);
+    }
+
+    fn delivery_is_blocked(&self) -> bool {
+        self.delivery_blocked.load(Ordering::Acquire)
+    }
+
+    fn release_delivery(&self) {
+        self.delivery_gate.store(false, Ordering::Release);
+        self.delivery_release.notify_waiters();
+    }
+
+    fn log(&self) -> Vec<(u64, u64)> {
+        self.inner.log()
+    }
+
+    async fn wait_for_delivery_release(&self) {
+        while self.delivery_gate.load(Ordering::Acquire) {
+            let released = self.delivery_release.notified();
+            if !self.delivery_gate.load(Ordering::Acquire) {
+                break;
+            }
+            self.delivery_blocked.store(true, Ordering::Release);
+            released.await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StrictReplicable for GatedCountingStrictRepo {
+    type Op = u64;
+
+    fn strict_replication_protocol_version(&self) -> u32 {
+        self.inner.strict_replication_protocol_version()
+    }
+
+    fn current_version(&self) -> u64 {
+        self.inner.current_version()
+    }
+
+    fn history_metadata(&self) -> HistoryMetadata {
+        self.inner.history_metadata()
+    }
+
+    fn snapshot(&self) -> Result<(u64, Bytes), StrictSnapshotError> {
+        self.inner.snapshot()
+    }
+
+    fn log_since(&self, since: u64) -> LogSlice<StrictLogEntry<Self::Op>> {
+        self.inner.log_since(since)
+    }
+
+    async fn apply_committed(&self, version: u64, op: Self::Op) {
+        self.wait_for_delivery_release().await;
+        self.inner.apply_committed(version, op).await;
+    }
+
+    async fn apply_committed_with_metadata(
+        &self,
+        version: u64,
+        op: Self::Op,
+        metadata: Option<StrictLogMetadata>,
+    ) {
+        self.wait_for_delivery_release().await;
+        self.inner
+            .apply_committed_with_metadata(version, op, metadata)
+            .await;
+    }
+
+    async fn apply_committed_once(
+        &self,
+        version: u64,
+        op: Self::Op,
+        metadata: StrictLogMetadata,
+    ) -> StrictCommitApplyOutcome {
+        self.wait_for_delivery_release().await;
+        self.inner.apply_committed_once(version, op, metadata).await
+    }
+
+    async fn install_snapshot(
+        &self,
+        version: u64,
+        snapshot: Bytes,
+    ) -> Result<(), StrictSnapshotError> {
+        self.inner.install_snapshot(version, snapshot).await
+    }
+}
+
 /// Checks strict replication convergence with sequential proposers.
 /// Expected: three replicas converge to the same total-ordered 15-operation
 /// log. The replicated channel/state operations carry Mumble/shitspeak
@@ -301,10 +412,17 @@ async fn strict_three_node_convergence() {
     for (i, h) in handles.iter().enumerate() {
         let base = (i as u64) * 100;
         for k in 0..5 {
-            timeout(Duration::from_secs(20), h.propose(base + k))
-                .await
-                .expect("propose timeout")
-                .expect("propose result");
+            let result = timeout(Duration::from_secs(20), h.propose(base + k)).await;
+            if !matches!(result, Ok(Ok(_))) {
+                panic!(
+                    "propose failed: proposer={i}, op={}, result={result:?}, states={:?}",
+                    base + k,
+                    handles
+                        .iter()
+                        .map(|handle| handle.debug_state())
+                        .collect::<Vec<_>>()
+                );
+            }
         }
     }
 
@@ -546,6 +664,167 @@ async fn strict_route_change_between_propose_ack_and_commit_converges() {
     let log0 = repos[0].log();
     for repo in &repos[1..] {
         assert_eq!(repo.log(), log0, "replicas diverged after route change");
+    }
+
+    cluster.shutdown().await;
+}
+
+/// A peer that regains a route while an already-committed operation is inside
+/// repository apply must remain outside the delivery watermark until its
+/// history and clock pass the epoch-scoped admission barrier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_rejoining_peer_does_not_pin_buffered_delivery() {
+    use std::collections::HashSet;
+
+    let cfg = ReplicationConfig::default()
+        .with_delivery_tick_interval(Duration::from_millis(25))
+        .with_strict_bootstrap_retry_interval(Duration::from_millis(100))
+        .with_propose_ttl(Duration::from_secs(20))
+        .with_pending_propose_ttl(Duration::from_secs(30));
+    let cluster = ReplCluster::build_full_mesh_fast_failure_with_config(&[1, 2, 3, 4], cfg).await;
+    let repos: Vec<_> = (0..4).map(|_| GatedCountingStrictRepo::new()).collect();
+    let mut handles = Vec::new();
+    for (idx, repo) in repos.iter().enumerate() {
+        handles.push(
+            cluster
+                .register_strict(idx, "channels-rejoin-admission", repo.clone())
+                .unwrap(),
+        );
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            cluster
+                .managers
+                .iter()
+                .all(|manager| manager.strict_capability_activation_ready())
+                && strict_protocol_floors(&cluster)
+                    .iter()
+                    .all(|(_, version)| *version == STRICT_REPLICATION_PROTOCOL_VERSION)
+        })
+        .await,
+        "strict v2 capability did not converge before the rejoin scenario: floors={:?}",
+        strict_protocol_floors(&cluster)
+    );
+
+    let warmup_version = handles[0].propose(100).await.unwrap();
+    assert_eq!(warmup_version, 1);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            repos
+                .iter()
+                .all(|repo| repo.current_version() == warmup_version)
+        })
+        .await,
+        "warm-up operation did not converge: versions={:?}",
+        repos
+            .iter()
+            .map(|repo| repo.current_version())
+            .collect::<Vec<_>>()
+    );
+
+    cluster.cluster.partition(&[1, 2, 3], &[4]);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            [1u16, 2, 3].into_iter().all(|node_id| {
+                let alive: HashSet<_> = cluster
+                    .cluster
+                    .node(node_id)
+                    .overlay
+                    .alive_members()
+                    .into_iter()
+                    .collect();
+                !alive.contains(&4)
+                    && cluster
+                        .cluster
+                        .node(node_id)
+                        .overlay
+                        .route_to(4, ServiceLevel::Reliable)
+                        .is_none()
+            })
+        })
+        .await,
+        "partitioned node 4 was not removed from the surviving membership"
+    );
+
+    for repo in &repos[..3] {
+        repo.block_delivery();
+    }
+    let coordinator = handles[0].clone();
+    let proposal = tokio::spawn(async move { coordinator.propose(200).await });
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            repos[..3].iter().all(|repo| repo.delivery_is_blocked())
+                && matches!(
+                    handles[0].debug_state().local_proposal_quorum(),
+                    Some((_, _, _, 3, _, true))
+                )
+        })
+        .await,
+        "the surviving frozen configuration did not commit into gated apply: states={:?}",
+        handles
+            .iter()
+            .map(|handle| handle.debug_state())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        repos[3].current_version(),
+        warmup_version,
+        "partitioned node unexpectedly received the committed operation"
+    );
+
+    cluster.cluster.heal_partition(&[1, 2, 3], &[4]);
+    assert!(
+        wait_for_full_routing(&cluster.cluster, Duration::from_secs(10)).await,
+        "routing did not reconverge while repository delivery was gated"
+    );
+    // Let the bootstrap worker observe the new exact incarnation and create
+    // its admission barrier before repository apply is allowed to complete.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    for repo in &repos[..3] {
+        repo.release_delivery();
+    }
+    let committed_version = timeout(Duration::from_secs(8), proposal)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "rejoined stale peer pinned committed delivery: states={:?}",
+                handles
+                    .iter()
+                    .map(|handle| handle.debug_state())
+                    .collect::<Vec<_>>()
+            )
+        })
+        .expect("proposal task panicked")
+        .expect("committed proposal returned an error after peer rejoin");
+    assert_eq!(committed_version, 2);
+
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            repos
+                .iter()
+                .all(|repo| repo.current_version() == committed_version)
+        })
+        .await,
+        "automatic admission catch-up did not converge: versions={:?}, states={:?}",
+        repos
+            .iter()
+            .map(|repo| repo.current_version())
+            .collect::<Vec<_>>(),
+        handles
+            .iter()
+            .map(|handle| handle.debug_state())
+            .collect::<Vec<_>>()
+    );
+    let expected_log = repos[0].log();
+    for repo in &repos[1..] {
+        assert_eq!(
+            repo.log(),
+            expected_log,
+            "strict logs diverged after rejoin"
+        );
     }
 
     cluster.shutdown().await;
@@ -879,20 +1158,60 @@ async fn strict_quorum_lost_on_partition() {
                 .unwrap(),
         );
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            handles.iter().all(|handle| {
+                let state = handle.debug_state();
+                state.admitted_peers() == 3
+                    && !state.election_pending()
+                    && !state.election_active()
+            })
+        })
+        .await,
+        "four-node strict admission did not converge: states={:?}",
+        handles
+            .iter()
+            .map(|handle| handle.debug_state())
+            .collect::<Vec<_>>()
+    );
 
-    // Block all inbound from 3,4 on node 1 (and symmetrically on node 2)
-    // BEFORE proposing. Acks from 3,4 will be dropped at node 1; Hellos
-    // also stop, so dead-detect will fire `Failed(3)` and `Failed(4)`
-    // within ~hello_dead_interval seconds.
-    cluster.cluster.partition(&[1, 2], &[3, 4]);
+    // Keep the proposal in phase one until its immutable four-node target
+    // descriptor is observable. Partitioning before descriptor registration
+    // legitimately lets admission freeze the surviving {1,2} view instead.
+    let coordinator = cluster.cluster.node(1);
+    let held_acks: Vec<_> = [2, 3, 4]
+        .into_iter()
+        .map(|peer| FaultSelector::new(peer, TransportKind::Tcp, MessageType::StrictAck))
+        .collect();
+    for selector in held_acks.iter().copied() {
+        coordinator.chaos.hold(selector);
+    }
 
-    // Propose immediately — alive_members on node 1 is still {1,2,3,4}.
     let h0 = handles[0].clone();
     let task = tokio::spawn(async move { h0.propose(7777u64).await });
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            matches!(
+                handles[0].debug_state().local_proposal_quorum(),
+                Some((_, _, _, 4, false, false))
+            )
+        })
+        .await,
+        "proposal did not freeze the four-node target set: state={:?}",
+        handles[0].debug_state()
+    );
 
-    let res = timeout(Duration::from_secs(20), task)
-        .await
+    // Block all inbound from 3,4 on node 1 (and symmetrically on node 2).
+    // Hellos stop, so dead-detect fires `Failed(3)` and `Failed(4)` within
+    // ~hello_dead_interval seconds. The already-frozen descriptor cannot be
+    // shrunk to the surviving side.
+    cluster.cluster.partition(&[1, 2], &[3, 4]);
+
+    let result = timeout(Duration::from_secs(20), task).await;
+    for selector in held_acks {
+        coordinator.chaos.release(selector);
+    }
+    let res = result
         .expect("propose task hung")
         .expect("propose task panicked");
     assert!(
@@ -1247,7 +1566,7 @@ fn strict_protocol_floors(cluster: &ReplCluster) -> Vec<(u16, u32)> {
 /// Expected: each proposal routes around detected transient link cuts; no
 /// proposal task panics or hangs, and every replica has the same total-ordered
 /// log after each hostile-network round.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn strict_replication_survives_random_cross_node_link_failures() {
     let node_ids: Vec<u16> = (1..=7).collect();
     // Keep the retry cadence bounded while the test deliberately churns
@@ -1379,13 +1698,15 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
         let deadline = tokio::time::sleep(Duration::from_secs(30));
         tokio::pin!(deadline);
         let mut last_phase_progress = None;
+        let mut last_phase_propose_acks = None;
+        let mut last_phase_invalid_targets = None;
         let mut last_phase_accept_acks = None;
         let task_result = loop {
             tokio::select! {
                 result = &mut task => break result,
                 _ = &mut deadline => {
                     panic!(
-                        "proposal hung while cross-node links were failing: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}, protocol_floors={:?}, last_phase_progress={last_phase_progress:?}, states={:?}",
+                        "proposal hung while cross-node links were failing: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}, protocol_floors={:?}, last_phase_progress={last_phase_progress:?}, last_phase_propose_acks={last_phase_propose_acks:?}, last_phase_invalid_targets={last_phase_invalid_targets:?}, states={:?}",
                         strict_protocol_floors(&cluster),
                         handles
                             .iter()
@@ -1397,6 +1718,10 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
                     let state = handles[proposer].debug_state();
                     if let Some(progress) = state.local_proposal_quorum() {
                         last_phase_progress = Some(progress);
+                        last_phase_propose_acks = state.local_proposal_acks().map(<[_]>::to_vec);
+                        last_phase_invalid_targets = state
+                            .local_proposal_invalid_targets()
+                            .map(<[_]>::to_vec);
                         last_phase_accept_acks = Some(
                             state
                                 .local_proposal_accept_acks()
@@ -1408,7 +1733,7 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
         };
         let version = task_result
             .unwrap_or_else(|e| panic!("proposal task panicked while cross-node links were failing: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}, join_error={e}"))
-            .unwrap_or_else(|e| panic!("strict replication should route around hostile link failures: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}, error={e:?}, protocol_floors={:?}, last_phase_progress={last_phase_progress:?}, last_phase_accept_acks={last_phase_accept_acks:?}, states={:?}", strict_protocol_floors(&cluster), handles.iter().map(|h| h.debug_state()).collect::<Vec<_>>()));
+            .unwrap_or_else(|e| panic!("strict replication should route around hostile link failures: round={round}, proposer={proposer}, blocked_pairs={blocked_pairs:?}, error={e:?}, protocol_floors={:?}, last_phase_progress={last_phase_progress:?}, last_phase_propose_acks={last_phase_propose_acks:?}, last_phase_invalid_targets={last_phase_invalid_targets:?}, last_phase_accept_acks={last_phase_accept_acks:?}, states={:?}", strict_protocol_floors(&cluster), handles.iter().map(|h| h.debug_state()).collect::<Vec<_>>()));
         assert_eq!(version, expected_version);
 
         let ok = wait_until(Duration::from_secs(15), || {

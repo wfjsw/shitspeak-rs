@@ -1537,12 +1537,15 @@ async fn send_s2s_shout_voice_segment(
     sent_at
 }
 
-async fn wait_for_s2s_root_shout_tree_delivery(
+async fn wait_for_s2s_root_shout_delivery(
     speaker: &TestClient,
     listeners: &[&TestClient],
     slot: u32,
 ) {
-    const MARKER_ATTEMPTS: u64 = 10;
+    const REQUIRED_CONSECUTIVE_MARKERS: usize = 3;
+    const MARKER_ATTEMPTS: u64 = 20;
+
+    let mut consecutive_markers = 0;
 
     for attempt in 0..MARKER_ATTEMPTS {
         for listener in listeners {
@@ -1566,13 +1569,18 @@ async fn wait_for_s2s_root_shout_tree_delivery(
         };
         let (_sent_at, deliveries) = tokio::join!(send_task, receive_task);
         if deliveries.iter().all(Option::is_some) {
-            return;
+            consecutive_markers += 1;
+            if consecutive_markers >= REQUIRED_CONSECUTIVE_MARKERS {
+                return;
+            }
+        } else {
+            consecutive_markers = 0;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     panic!(
-        "tree delivery did not complete a marker talkspurt for every root-shout listener after {MARKER_ATTEMPTS} attempts"
+        "root-shout delivery did not complete {REQUIRED_CONSECUTIVE_MARKERS} consecutive marker talkspurts for every listener after {MARKER_ATTEMPTS} attempts"
     );
 }
 
@@ -3893,19 +3901,21 @@ async fn run_s2s_root_children_shout_traffic(tree_delivery_enabled: bool) {
 
     if tree_delivery_enabled {
         // Tree installation is ACK-gated. Prime the exact broadcast group
-        // and then require both listener paths to receive a complete marker
-        // talkspurt before taking traffic snapshots.
+        // before proving end-to-end delivery below.
         wait_for_s2s_tree_voice_forwarding(speaker_server, &alice, S2S_SHOUT_TARGET_SLOT).await;
         alice.drain_now().await;
         first_listener.drain_now().await;
         second_listener.drain_now().await;
-        wait_for_s2s_root_shout_tree_delivery(
-            &alice,
-            &[&first_listener, &second_listener],
-            S2S_SHOUT_TARGET_SLOT,
-        )
-        .await;
     }
+    // Transport send-readiness does not prove that the complete application
+    // path and receiver reorder state are warm. Require the same end-to-end
+    // marker fence for legacy and tree delivery before measuring traffic.
+    wait_for_s2s_root_shout_delivery(
+        &alice,
+        &[&first_listener, &second_listener],
+        S2S_SHOUT_TARGET_SLOT,
+    )
+    .await;
 
     let frames = s2s_shout_voice_segment(52_000);
     assert!(

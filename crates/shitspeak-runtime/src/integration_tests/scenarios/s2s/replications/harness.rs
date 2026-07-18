@@ -87,7 +87,18 @@ impl ReplCluster {
         let managers: Vec<Arc<ReplicationManager>> = cluster
             .nodes
             .iter()
-            .map(|n| ReplicationManager::with_config(n.overlay.clone(), cfg.clone()))
+            .map(|n| {
+                // Each harness node represents a separate production
+                // process. ReplicationConfig clones intentionally share the
+                // manager-local catch-up limiter, so rebuild it here instead
+                // of accidentally imposing one cluster-wide limiter on all
+                // simulated processes.
+                let node_cfg = cfg
+                    .clone()
+                    .with_catchup_max_in_flight_total(cfg.catchup_max_in_flight_total())
+                    .with_catchup_max_in_flight_per_peer(cfg.catchup_max_in_flight_per_peer());
+                ReplicationManager::with_config(n.overlay.clone(), node_cfg)
+            })
             .collect();
         Self {
             cluster,

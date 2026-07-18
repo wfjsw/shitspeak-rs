@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use aws_lc_rs::digest::{SHA256, digest};
 use bytes::Bytes;
 use prost::Message as _;
-use tracing::warn;
+use tracing::{trace, warn};
 
 use super::super::error::ReplicationError;
 use super::super::metrics::{self, CatchupMode, ReplicationPipelineKind, ReplicationPipelineStage};
@@ -26,7 +26,7 @@ use super::runtime::{
     HistorySnapshotResponseOutcome, STRICT_PROTOCOL_VERSION_V2, SnapshotReceiveTransfer,
     SnapshotTransfer, StrictRuntime, TerminalCommitProof, terminal_identity_from_wire,
 };
-use super::{LogSlice, StrictLogMetadata, StrictReplicable, StrictSnapshotError};
+use super::{HistoryMetadata, LogSlice, StrictLogMetadata, StrictReplicable, StrictSnapshotError};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::ServiceLevel;
 
@@ -133,10 +133,11 @@ async fn send_response<R: StrictReplicable>(
     if !response_fits_budget(rt, from, &response, false) {
         return;
     }
-    let history_probe = response.request_history_probe_only
-        && response.terminal_states.is_empty()
-        && response.ops.is_empty()
-        && !response.terminal_sync_only;
+    // Admission probes may first carry terminal-fence pages before their
+    // final metadata response. Keep every page of that control exchange on
+    // the redundant path; losing the terminal page prevents an excluded
+    // participant from ever reaching the metadata cut it must prove.
+    let history_probe = response.request_history_probe_only;
     let result = if history_probe {
         rt.net
             .send_redundant_unicast(from, &rt.topic, StrictBody::CatchupResp(response))
@@ -164,10 +165,10 @@ async fn send_v2_response<R: StrictReplicable>(
     if !response_fits_budget(rt, from, &response, true) {
         return;
     }
-    let history_probe = response.request_history_probe_only
-        && response.terminal_states.is_empty()
-        && response.ops.is_empty()
-        && !response.terminal_sync_only;
+    // See send_response: terminal pagination is part of the authenticated
+    // admission probe and needs the same redundant delivery semantics as its
+    // final metadata page.
+    let history_probe = response.request_history_probe_only;
     let result = if history_probe {
         rt.net
             .send_redundant_unicast(from, &rt.topic, StrictBody::CatchupResp(response))
@@ -516,8 +517,11 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     from: NodeIdentifier,
     req: StrictCatchupReq,
 ) {
-    let terminal_probe =
-        req.history_probe_only && req.terminal_state_cursor != TERMINAL_STATE_CURSOR_SKIP;
+    // Every admission/history probe needs a fresh directed clock proof. A
+    // requester that already remembers the responder's terminal generation
+    // legitimately starts at SKIP and must not lose the clock half of the
+    // admission handshake merely because no terminal pagination is needed.
+    let terminal_probe = req.history_probe_only;
     let Some(_permit) = rt
         .cfg
         .try_begin_catchup(CatchupMode::Strict, &rt.topic, from)
@@ -530,6 +534,39 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
             "strict catchup declined because terminal storage is unavailable"
         );
         return;
+    }
+    if req.history_probe_only && req.since_version > rt.repo.current_version() {
+        let local_version = rt.repo.current_version();
+        // Admission probes carry the requester's durable version. This peer
+        // may not know it was excluded from a frozen configuration, so use a
+        // strictly newer authenticated requester cut to trigger normal
+        // history election without waiting for steady-state anti-entropy.
+        {
+            let mut state = rt.state.lock();
+            if !state.history_election_blocks_steady_state() {
+                state.request_history_election();
+            }
+        }
+        rt.wake_clock_tick_loop();
+        let reciprocal = StrictCatchupReq {
+            src_node: rt.self_id as u32,
+            since_version: local_version,
+            chunk_token: local_version,
+            force_snapshot: false,
+            history_probe_only: false,
+            terminal_state_cursor: 0,
+            terminal_decision_generation: 0,
+            snapshot_transfer_id: 0,
+            snapshot_chunk_cursor: 0,
+        };
+        metrics::record_catchup_request(CatchupMode::Strict);
+        if let Err(error) = rt
+            .net
+            .send_redundant_unicast(from, &rt.topic, StrictBody::CatchupReq(reciprocal))
+            .await
+        {
+            trace!(%error, from, "strict reciprocal admission catchup request failed");
+        }
     }
     // This is a reply path for an authenticated request that has already
     // crossed the overlay. Do not discard its terminal fence merely because a
@@ -1547,12 +1584,13 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
 
 /// Apply an inbound `StrictCatchupResp`. Installs the snapshot if
 /// requested, then applies each op in order via `apply_committed`. If
-/// `has_more`, continues pagination with the same validated peer.
+/// `has_more`, continues pagination with the same validated peer. Returns
+/// history metadata only when a metadata-only response is fully accepted.
 pub(crate) async fn apply_response<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     from: NodeIdentifier,
     resp: StrictCatchupResp,
-) {
+) -> Option<HistoryMetadata> {
     let apply_started_at = std::time::Instant::now();
     let Some(remote_node) = super::runtime::node_from_u32(resp.history_node) else {
         warn!(
@@ -1564,7 +1602,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             ReplicationPipelineStage::CatchupApply,
             apply_started_at.elapsed(),
         );
-        return;
+        return None;
     };
     if remote_node != from {
         warn!(
@@ -1572,7 +1610,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             claimed = remote_node,
             "strict catchup response origin mismatch"
         );
-        return;
+        return None;
     }
     // Install terminal fences only after authenticating the response origin,
     // but before considering ordinary history. A joining replica must not
@@ -1585,7 +1623,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                 ReplicationPipelineStage::CatchupApply,
                 apply_started_at.elapsed(),
             );
-            return;
+            return None;
         }
     }
     // A v2 source supplies a persisted generation for its stable terminal
@@ -1623,7 +1661,12 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             metrics::record_catchup_request(CatchupMode::Strict);
             let _ = rt
                 .net
-                .send_unicast(from, &rt.topic, StrictBody::CatchupReq(req))
+                // Terminal pagination is a control-plane prerequisite for
+                // both admission metadata and ordinary history. A lost final
+                // continuation otherwise leaves clock evidence present but
+                // history evidence permanently absent until another full
+                // generation replay.
+                .send_redundant_unicast(from, &rt.topic, StrictBody::CatchupReq(req))
                 .await;
         }
         metrics::record_pipeline_stage(
@@ -1631,7 +1674,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             ReplicationPipelineStage::CatchupApply,
             apply_started_at.elapsed(),
         );
-        return;
+        return None;
     }
     let remote_rank = HistoryRank {
         version: resp.history_version,
@@ -1641,7 +1684,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     };
     if resp.snapshot_transfer_rejected || resp.snapshot_transfer_id != 0 {
         apply_snapshot_transfer_response(rt, from, &resp, remote_rank, apply_started_at).await;
-        return;
+        return None;
     }
     if resp.snapshot_chunk_cursor != 0
         || resp.snapshot_next_cursor != 0
@@ -1654,7 +1697,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             "strict catchup response has descriptor-less v2 snapshot-transfer fields"
         );
         rearm_history_election(rt);
-        return;
+        return None;
     }
     let local_rank = HistoryRank::local(rt);
     let can_bootstrap = rt.state.lock().can_bootstrap_catchup();
@@ -1662,10 +1705,40 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     let metadata_only_response =
         !resp.too_old_use_snapshot && resp.snapshot_msgpack.is_empty() && resp.ops.is_empty();
     if metadata_only_response {
+        // Admission evidence is narrower than a generally processable empty
+        // catch-up page. Require the canonical final history-probe shape so
+        // contradictory pagination, terminal, or snapshot flags cannot be
+        // interpreted as a convergence proof.
+        let admission_metadata = (resp.snapshot_version == 0
+            && !resp.has_more
+            && resp.next_chunk_token == 0
+            && resp.terminal_states.is_empty()
+            && resp.next_terminal_state_cursor == TERMINAL_STATE_CURSOR_SKIP
+            && !resp.terminal_states_has_more
+            && !resp.terminal_sync_only
+            && !resp.request_force_snapshot
+            && resp.request_history_probe_only)
+            .then_some(HistoryMetadata {
+                version: remote_rank.version,
+                freshness: remote_rank.freshness,
+            });
         let local_metadata = rt.repo.history_metadata();
+        let remote_history_ahead = remote_rank.version > local_metadata.version;
         let equal_version_metadata_diverged = !can_bootstrap
             && remote_rank.version == local_metadata.version
             && remote_rank.freshness != local_metadata.freshness;
+        if remote_history_ahead {
+            // Admission probes run at the bootstrap retry cadence. When a
+            // temporarily excluded replica discovers that an admitted peer
+            // is ahead, immediately enter the normal history election rather
+            // than waiting for the 30-second steady-state anti-entropy loop.
+            let mut state = rt.state.lock();
+            if !state.history_election_blocks_steady_state() {
+                state.request_history_election();
+            }
+            drop(state);
+            rt.wake_clock_tick_loop();
+        }
         if equal_version_metadata_diverged {
             warn!(
                 from,
@@ -1676,7 +1749,15 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             );
             rt.state.lock().request_history_election();
             rt.wake_clock_tick_loop();
-            return;
+            // The envelope is valid even though it disproves freshness.
+            // Return the metadata so the admission state can clear any
+            // previously observed history proof for this incarnation.
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Strict,
+                ReplicationPipelineStage::CatchupApply,
+                apply_started_at.elapsed(),
+            );
+            return admission_metadata;
         }
         let outcome =
             rt.state
@@ -1693,13 +1774,13 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                     rt.state.lock().request_history_election();
                 }
             }
-            metrics::record_pipeline_stage(
-                ReplicationPipelineKind::Strict,
-                ReplicationPipelineStage::CatchupApply,
-                apply_started_at.elapsed(),
-            );
-            return;
         }
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::CatchupApply,
+            apply_started_at.elapsed(),
+        );
+        return admission_metadata;
     }
 
     if resp.too_old_use_snapshot {
@@ -1710,7 +1791,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                 history_version = remote_rank.version,
                 "strict catchup snapshot rank/version mismatch"
             );
-            return;
+            return None;
         }
         install_snapshot_candidate(
             rt,
@@ -1721,7 +1802,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             apply_started_at,
         )
         .await;
-        return;
+        return None;
     }
 
     if can_bootstrap && rt.repo.current_version() > 0 {
@@ -1730,7 +1811,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             ReplicationPipelineStage::CatchupApply,
             apply_started_at.elapsed(),
         );
-        return;
+        return None;
     }
 
     if resp.ops.is_empty() {
@@ -1739,7 +1820,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             ReplicationPipelineStage::CatchupApply,
             apply_started_at.elapsed(),
         );
-        return;
+        return None;
     }
 
     for cop in resp.ops {
@@ -1766,7 +1847,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                     ReplicationPipelineStage::CatchupApply,
                     apply_started_at.elapsed(),
                 );
-                return;
+                return None;
             }
         };
         metrics::record_pipeline_stage(
@@ -1783,7 +1864,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                     ReplicationPipelineStage::CatchupApply,
                     apply_started_at.elapsed(),
                 );
-                return;
+                return None;
             }
         } {
             let encode_started_at = std::time::Instant::now();
@@ -1801,7 +1882,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                         ReplicationPipelineStage::CatchupApply,
                         apply_started_at.elapsed(),
                     );
-                    return;
+                    return None;
                 }
             };
             metrics::record_pipeline_stage(
@@ -1823,7 +1904,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                         ReplicationPipelineStage::CatchupApply,
                         apply_started_at.elapsed(),
                     );
-                    return;
+                    return None;
                 }
                 continue;
             }
@@ -1837,7 +1918,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                     ReplicationPipelineStage::CatchupApply,
                     apply_started_at.elapsed(),
                 );
-                return;
+                return None;
             }
             {
                 let mut state = rt.state.lock();
@@ -1881,7 +1962,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                 ReplicationPipelineStage::CatchupApply,
                 apply_started_at.elapsed(),
             );
-            return;
+            return None;
         }
         let req = StrictCatchupReq {
             src_node: rt.self_id as u32,
@@ -1905,6 +1986,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         ReplicationPipelineStage::CatchupApply,
         apply_started_at.elapsed(),
     );
+    None
 }
 
 struct CatchupStrictMetadata {

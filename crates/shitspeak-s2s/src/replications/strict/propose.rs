@@ -209,6 +209,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             ));
         }
         self.spawn_proposal_deadline(op_id);
+        // Start repair before awaiting the initial route-diverse multicast.
+        // On a hostile topology that send can spend meaningful time walking
+        // alternate first hops; the proposal TTL must retain concurrent
+        // opportunities to reach and hear from the frozen targets.
+        self.spawn_propose_retries(op_id);
         tracing::debug!(
             topic = %self.topic,
             op_id_hi = op_id.0,
@@ -279,7 +284,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         .await;
 
         self.wake_delivery_and_clock_tick();
-        self.spawn_propose_retries(op_id);
 
         Ok(())
     }
@@ -297,7 +301,14 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             if self.effective_protocol_version(snapshot.negotiated_version)
                 == STRICT_PROTOCOL_VERSION_V2
             {
-                return Ok(snapshot);
+                let snapshot = self.filter_admitted_protocol_snapshot(snapshot);
+                // A local incarnation must first establish its own admission
+                // against the current routed view. Once established, later
+                // pending peers remain excluded from this snapshot rather
+                // than stopping healthy incumbent coordinators.
+                if self.local_coordination_ready() {
+                    return Ok(snapshot);
+                }
             }
             tokio::select! {
                 _ = self.shutdown.cancelled() => return Err(ReplicationError::Shutdown),

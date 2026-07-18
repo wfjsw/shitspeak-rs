@@ -566,11 +566,14 @@ impl StrictNet for OverlayStrictNet {
             StrictBody::ProposeAck(_)
             | StrictBody::AcceptAck(_)
             | StrictBody::ResolutionAck(_)
-            | StrictBody::Decision(_) => MessageClass::HighPriority,
-            // A metadata-only response is the liveness escape hatch for a
-            // durable terminal fence or delivery watermark. Keep responses
-            // in the same control lane as ACKs while leaving requests and
-            // bulk history regular.
+            | StrictBody::ClockTick(_) => MessageClass::HighPriority,
+            // Admission probes and their responses are the liveness escape
+            // hatch for pending coordinators, terminal fences, and delivery
+            // watermarks. Keep the bounded metadata/control exchange in the
+            // same lane as ACKs; ordinary history remains regular/bulk.
+            StrictBody::CatchupReq(request) if request.history_probe_only => {
+                MessageClass::HighPriority
+            }
             StrictBody::CatchupResp(response) if response.request_history_probe_only => {
                 MessageClass::HighPriority
             }
@@ -636,7 +639,6 @@ impl StrictNet for OverlayStrictNet {
                 | StrictBody::AcceptAck(_)
                 | StrictBody::ResolutionPrepare(_)
                 | StrictBody::ResolutionAck(_)
-                | StrictBody::Decision(_)
                 | StrictBody::ClockTick(_)
         ) {
             MessageClass::HighPriority
@@ -754,6 +756,20 @@ impl StrictNet for OverlayStrictNet {
         if dsts.is_empty() {
             return Ok(());
         }
+        let message_class = if matches!(
+            &body,
+            StrictBody::ProposeV1(_)
+                | StrictBody::ProposeAck(_)
+                | StrictBody::Accept(_)
+                | StrictBody::AcceptAck(_)
+                | StrictBody::ResolutionPrepare(_)
+                | StrictBody::ResolutionAck(_)
+                | StrictBody::ClockTick(_)
+        ) {
+            MessageClass::HighPriority
+        } else {
+            MessageClass::Regular
+        };
         let encode_started_at = Instant::now();
         let encoded = self.encode_strict_payload(topic, body);
         metrics::record_pipeline_stage(
@@ -768,7 +784,7 @@ impl StrictNet for OverlayStrictNet {
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 RoutingMetric::ReliableCost,
-                MessageClass::Regular,
+                message_class,
                 bytes,
             )
             .await?;
@@ -1190,6 +1206,15 @@ struct PendingAcceptRetry {
     fast_quorum: usize,
 }
 
+#[derive(Clone)]
+struct AcceptAckRetryFence {
+    coordinator: NodeIdentifier,
+    coordinator_boot_epoch: u64,
+    frozen_targets: Vec<FrozenTarget>,
+    pending_seen_at: Instant,
+    deadline: Instant,
+}
+
 struct AcceptedProposal {
     body: StrictBody,
     dsts: Vec<NodeIdentifier>,
@@ -1264,6 +1289,9 @@ struct DeliveryBlockDiagnostics {
     commit_buffer_len: usize,
     pending_local_proposals: usize,
     pending_remote_proposes: usize,
+    admitted_peers: usize,
+    pending_admissions: usize,
+    highest_admission_barrier: u64,
 }
 
 #[derive(Default)]
@@ -1322,6 +1350,47 @@ pub(crate) struct StrictState {
     /// tombstone after removal. Keeping tombstones prevents reordered events
     /// from resurrecting an older process incarnation.
     member_incarnations: HashMap<NodeIdentifier, AppliedMemberIncarnation>,
+    /// Epoch-scoped admission fence between overlay reachability and strict
+    /// participation. Self is implicitly admitted and is never stored here.
+    peer_admissions: HashMap<NodeIdentifier, PeerAdmission>,
+    /// Unit-test and alternate-runtime construction does not always seed an
+    /// overlay membership snapshot. Keep those direct state-machine users on
+    /// their historical behavior until membership has actually been wired.
+    admission_tracking_started: bool,
+    /// Latched once this local incarnation has reciprocally converged with a
+    /// remote participant (or has legitimately coordinated as a singleton).
+    /// A restarted node with known peers may not coordinate a self-only v2
+    /// round before this gate opens.
+    local_coordination_admitted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PeerAdmission {
+    boot_epoch: u64,
+    phase: PeerAdmissionPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerAdmissionPhase {
+    AwaitingLocalCut {
+        barrier_ts: u64,
+    },
+    AwaitingPeer {
+        required_history: HistoryMetadata,
+        clock_gt: u64,
+        history_ready: bool,
+        clock_ready: bool,
+    },
+    Admitted,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AdmissionDiagnostics {
+    admitted: usize,
+    pending: usize,
+    awaiting_local_cut: usize,
+    awaiting_peer: usize,
+    highest_barrier: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1359,7 +1428,336 @@ impl StrictState {
             history_election_phase: HistoryElectionPhase::Idle,
             history_alive_peers: HashSet::new(),
             member_incarnations: HashMap::new(),
+            peer_admissions: HashMap::new(),
+            admission_tracking_started: false,
+            local_coordination_admitted: false,
         }
+    }
+
+    fn admission_barrier_ts(&self) -> u64 {
+        self.commit_buffer
+            .keys()
+            .map(|key| key.0)
+            .chain(
+                self.delivering_commits
+                    .iter()
+                    .filter_map(|op_id| self.committed_ts_final.get(op_id).copied()),
+            )
+            .fold(self.delivered_high_water, u64::max)
+    }
+
+    fn begin_peer_admission(&mut self, node: NodeIdentifier, boot_epoch: u64) {
+        let barrier_ts = self.admission_barrier_ts();
+        match self.peer_admissions.get(&node) {
+            Some(current) if current.boot_epoch > boot_epoch => return,
+            Some(current) if current.boot_epoch == boot_epoch => return,
+            _ => {}
+        }
+        self.peer_clocks.remove(&node);
+        self.peer_admissions.insert(
+            node,
+            PeerAdmission {
+                boot_epoch,
+                phase: PeerAdmissionPhase::AwaitingLocalCut { barrier_ts },
+            },
+        );
+    }
+
+    /// Reconcile the admission table against exact-incarnation, reliably
+    /// routed peers. Route loss revokes admission; observing the same epoch
+    /// again preserves any newer evidence already collected.
+    fn reconcile_peer_admissions(
+        &mut self,
+        self_id: NodeIdentifier,
+        routed: &[(NodeIdentifier, u64)],
+    ) {
+        if !self.admission_tracking_started {
+            return;
+        }
+        let mut routed_current = HashMap::new();
+        for (node, boot_epoch) in routed.iter().copied() {
+            if node == self_id {
+                continue;
+            }
+            match self.member_incarnations.get(&node).copied() {
+                Some(known) if boot_epoch < known.boot_epoch => {
+                    // A stale LSDB route must not resurrect or downgrade a
+                    // replacement incarnation.
+                    continue;
+                }
+                Some(known) if boot_epoch == known.boot_epoch && !known.alive => {
+                    // A live routed LSDB observation can be the first signal
+                    // that a failed/aged-out same incarnation returned. It
+                    // re-enters as pending and must prove a fresh barrier;
+                    // it is never restored directly to Admitted.
+                    self.member_incarnations.insert(
+                        node,
+                        AppliedMemberIncarnation {
+                            boot_epoch,
+                            alive: true,
+                        },
+                    );
+                }
+                Some(known) if boot_epoch > known.boot_epoch => {
+                    self.member_incarnations.insert(
+                        node,
+                        AppliedMemberIncarnation {
+                            boot_epoch,
+                            alive: true,
+                        },
+                    );
+                }
+                None => {
+                    self.member_incarnations.insert(
+                        node,
+                        AppliedMemberIncarnation {
+                            boot_epoch,
+                            alive: true,
+                        },
+                    );
+                }
+                _ => {}
+            }
+            routed_current.insert(node, boot_epoch);
+        }
+        let revoked: Vec<_> = self
+            .peer_admissions
+            .iter()
+            .filter_map(|(node, admission)| {
+                (routed_current.get(node).copied() != Some(admission.boot_epoch)).then_some(*node)
+            })
+            .collect();
+        for node in revoked {
+            self.peer_admissions.remove(&node);
+            self.peer_clocks.remove(&node);
+        }
+        for (node, boot_epoch) in routed_current {
+            self.begin_peer_admission(node, boot_epoch);
+        }
+    }
+
+    /// Once every commit present at join observation has reached the local
+    /// repository, freeze that repository cut as the history requirement the
+    /// joining incarnation must prove.
+    fn freeze_ready_admission_cuts(&mut self, metadata: HistoryMetadata) {
+        if self.history_election_blocks_steady_state() {
+            return;
+        }
+        let delivered_high_water = self.delivered_high_water;
+        let buffered_timestamps: Vec<_> = self.commit_buffer.keys().map(|key| key.0).collect();
+        let delivering_timestamps: Vec<_> = self
+            .delivering_commits
+            .iter()
+            .filter_map(|op_id| self.committed_ts_final.get(op_id).copied())
+            .collect();
+        for admission in self.peer_admissions.values_mut() {
+            let PeerAdmissionPhase::AwaitingLocalCut { barrier_ts } = admission.phase else {
+                continue;
+            };
+            // A timestamp high-water alone is insufficient because multiple
+            // commits can share one final timestamp. Freeze only after the
+            // complete known prefix through the barrier has left both the
+            // buffer and the in-flight repository apply set.
+            let prefix_still_pending = buffered_timestamps
+                .iter()
+                .chain(delivering_timestamps.iter())
+                .any(|ts| *ts <= barrier_ts);
+            if delivered_high_water >= barrier_ts && !prefix_still_pending {
+                admission.phase = PeerAdmissionPhase::AwaitingPeer {
+                    required_history: metadata,
+                    clock_gt: barrier_ts,
+                    history_ready: false,
+                    clock_ready: false,
+                };
+            }
+        }
+    }
+
+    /// Returns true when equal-version freshness disagreement requires a
+    /// history election. Higher remote versions are sufficient evidence that
+    /// the peer is not behind the frozen local cut.
+    fn observe_admission_history(
+        &mut self,
+        node: NodeIdentifier,
+        boot_epoch: u64,
+        remote: HistoryMetadata,
+    ) -> bool {
+        if self.history_election_blocks_steady_state() {
+            return false;
+        }
+        let Some(admission) = self.peer_admissions.get_mut(&node) else {
+            return false;
+        };
+        if admission.boot_epoch != boot_epoch {
+            return false;
+        }
+        let PeerAdmissionPhase::AwaitingPeer {
+            required_history,
+            clock_gt,
+            history_ready: _,
+            clock_ready,
+        } = admission.phase
+        else {
+            return false;
+        };
+        let freshness_diverged = remote.version == required_history.version
+            && remote.freshness != required_history.freshness;
+        let history_ready = remote.version > required_history.version
+            || (remote.version == required_history.version
+                && remote.freshness == required_history.freshness);
+        admission.phase = if history_ready && clock_ready {
+            PeerAdmissionPhase::Admitted
+        } else {
+            PeerAdmissionPhase::AwaitingPeer {
+                required_history,
+                clock_gt,
+                history_ready,
+                clock_ready,
+            }
+        };
+        freshness_diverged
+    }
+
+    fn observe_admission_clock(&mut self, node: NodeIdentifier, boot_epoch: u64, src_clock: u64) {
+        if self.history_election_blocks_steady_state() {
+            return;
+        }
+        let Some(admission) = self.peer_admissions.get_mut(&node) else {
+            return;
+        };
+        if admission.boot_epoch != boot_epoch {
+            return;
+        }
+        let PeerAdmissionPhase::AwaitingPeer {
+            required_history,
+            clock_gt,
+            history_ready,
+            clock_ready,
+        } = admission.phase
+        else {
+            return;
+        };
+        let clock_ready = clock_ready || src_clock > clock_gt;
+        admission.phase = if history_ready && clock_ready {
+            PeerAdmissionPhase::Admitted
+        } else {
+            PeerAdmissionPhase::AwaitingPeer {
+                required_history,
+                clock_gt,
+                history_ready,
+                clock_ready,
+            }
+        };
+    }
+
+    fn peer_incarnation_is_admitted(
+        &self,
+        self_id: NodeIdentifier,
+        node: NodeIdentifier,
+        boot_epoch: u64,
+    ) -> bool {
+        node == self_id
+            || !self.admission_tracking_started
+            || self.peer_admissions.get(&node).is_some_and(|admission| {
+                admission.boot_epoch == boot_epoch
+                    && matches!(admission.phase, PeerAdmissionPhase::Admitted)
+            })
+    }
+
+    fn admitted_members(
+        &self,
+        self_id: NodeIdentifier,
+        routed: &[(NodeIdentifier, u64)],
+    ) -> Vec<NodeIdentifier> {
+        if !self.admission_tracking_started {
+            return routed.iter().map(|(node, _)| *node).collect();
+        }
+        routed
+            .iter()
+            .filter_map(|(node, boot_epoch)| {
+                self.peer_incarnation_is_admitted(self_id, *node, *boot_epoch)
+                    .then_some(*node)
+            })
+            .collect()
+    }
+
+    fn quarantine_excluded_members(&mut self, self_id: NodeIdentifier, targets: &[FrozenTarget]) {
+        if !self.admission_tracking_started {
+            return;
+        }
+        let target_epochs: HashMap<_, _> = targets
+            .iter()
+            .map(|target| (target.node(), target.boot_epoch()))
+            .collect();
+        let barrier_ts = self.admission_barrier_ts();
+        let excluded: Vec<_> = self
+            .peer_admissions
+            .iter()
+            .filter_map(|(node, admission)| {
+                (*node != self_id && target_epochs.get(node).copied() != Some(admission.boot_epoch))
+                    .then_some((*node, admission.boot_epoch))
+            })
+            .collect();
+        for (node, boot_epoch) in excluded {
+            self.peer_clocks.remove(&node);
+            self.peer_admissions.insert(
+                node,
+                PeerAdmission {
+                    boot_epoch,
+                    phase: PeerAdmissionPhase::AwaitingLocalCut { barrier_ts },
+                },
+            );
+        }
+    }
+
+    fn admission_diagnostics(&self) -> AdmissionDiagnostics {
+        let mut diagnostics = AdmissionDiagnostics::default();
+        for admission in self.peer_admissions.values() {
+            match admission.phase {
+                PeerAdmissionPhase::Admitted => diagnostics.admitted += 1,
+                PeerAdmissionPhase::AwaitingLocalCut { barrier_ts } => {
+                    diagnostics.pending += 1;
+                    diagnostics.awaiting_local_cut += 1;
+                    diagnostics.highest_barrier = diagnostics.highest_barrier.max(barrier_ts);
+                }
+                PeerAdmissionPhase::AwaitingPeer { clock_gt, .. } => {
+                    diagnostics.pending += 1;
+                    diagnostics.awaiting_peer += 1;
+                    diagnostics.highest_barrier = diagnostics.highest_barrier.max(clock_gt);
+                }
+            }
+        }
+        diagnostics
+    }
+
+    fn local_coordination_ready(&mut self, self_id: NodeIdentifier) -> bool {
+        if self.local_coordination_admitted {
+            return true;
+        }
+        // A local incarnation that joined an existing routed view must prove
+        // convergence against the complete current view before it can
+        // coordinate. Once established, keep the result latched: a later
+        // joining/restarted peer is fenced from new descriptors and must not
+        // stop healthy incumbent coordinators from making progress.
+        if !self.peer_admissions.is_empty()
+            && self
+                .peer_admissions
+                .values()
+                .all(|admission| matches!(admission.phase, PeerAdmissionPhase::Admitted))
+        {
+            self.local_coordination_admitted = true;
+            return true;
+        }
+        let has_known_remote = self
+            .member_incarnations
+            .iter()
+            .any(|(node, incarnation)| *node != self_id && incarnation.alive);
+        if !has_known_remote {
+            // Latch a genuine singleton so a later joining peer does not
+            // retroactively fence an already-established local incarnation.
+            self.local_coordination_admitted = true;
+        }
+        self.local_coordination_admitted
     }
 
     fn apply_membership_event(&mut self, event: &MembershipEvent) -> MembershipTransition {
@@ -1614,6 +2012,17 @@ impl StrictState {
         }
         self.history_election_requested = true;
         self.history_election_phase = HistoryElectionPhase::Idle;
+        // The repository cut is unstable until this election completes.
+        // Immediately revoke all peer proof state so a divergence-triggered
+        // election cannot deadlock behind an already-admitted stale clock.
+        let barrier_ts = self.admission_barrier_ts();
+        let peers: Vec<_> = self.peer_admissions.keys().copied().collect();
+        for node in peers {
+            self.peer_clocks.remove(&node);
+            if let Some(admission) = self.peer_admissions.get_mut(&node) {
+                admission.phase = PeerAdmissionPhase::AwaitingLocalCut { barrier_ts };
+            }
+        }
     }
 
     pub fn begin_history_election(&mut self, peers: impl IntoIterator<Item = NodeIdentifier>) {
@@ -1856,6 +2265,17 @@ impl StrictState {
     pub fn finish_history_election(&mut self) {
         self.history_election_requested = false;
         self.history_election_phase = HistoryElectionPhase::Idle;
+        // A completed election may have replaced the repository without a
+        // strict commit timestamp. Invalidate prior peer proofs so the next
+        // reconciliation freezes the post-election repository cut.
+        let barrier_ts = self.admission_barrier_ts();
+        let peers: Vec<_> = self.peer_admissions.keys().copied().collect();
+        for node in peers {
+            self.peer_clocks.remove(&node);
+            if let Some(admission) = self.peer_admissions.get_mut(&node) {
+                admission.phase = PeerAdmissionPhase::AwaitingLocalCut { barrier_ts };
+            }
+        }
     }
 
     /// Record a Propose we just ack'd so a takeover can recover it.
@@ -2098,6 +2518,9 @@ impl StrictState {
         let mut expired = Vec::new();
         let mut to_remove = Vec::new();
         for (op_id, p) in self.proposals.iter_mut() {
+            if p.committed {
+                continue;
+            }
             if now.duration_since(p.started_at) >= propose_ttl {
                 expired.push(ExpiredProposal {
                     op_id: *op_id,
@@ -2158,6 +2581,14 @@ pub(crate) fn make_ballot(takeover_node: NodeIdentifier, attempt: u64) -> u64 {
     ((takeover_node as u64) << 32) | (attempt & 0xFFFF_FFFF)
 }
 
+fn phase_two_completion_grace(cfg: &ReplicationConfig) -> Duration {
+    cfg.propose_ttl()
+        .checked_div(4)
+        .unwrap_or_else(|| cfg.delivery_tick_interval())
+        .max(cfg.delivery_tick_interval())
+        .max(Duration::from_millis(500))
+}
+
 // ---------- Generic runtime ----------
 
 pub struct StrictRuntime<R: StrictReplicable> {
@@ -2167,6 +2598,7 @@ pub struct StrictRuntime<R: StrictReplicable> {
     pub(super) topic: String,
     pub(super) net: Arc<dyn StrictNet>,
     pub(super) state: Mutex<StrictState>,
+    admission_metrics: Arc<metrics::StrictAdmissionMetrics>,
     pub(super) deliver_signal: Notify,
     pub(super) clock_tick_signal: Notify,
     pub(super) propose_semaphore: Arc<Semaphore>,
@@ -2195,6 +2627,10 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// route from making the coordinator permanently depend on another
     /// Accept retransmission.
     accept_ack_retries: Mutex<HashSet<OpId>>,
+    /// Limit the broadcast fallback to the first phase-one ACK for one
+    /// operation. Duplicate Propose frames continue to receive targeted
+    /// redundant ACKs without repeatedly flooding the overlay.
+    propose_ack_broadcasts: Mutex<HashSet<OpId>>,
     /// Limit the broadcast fallback to the first positive ACK for one
     /// operation. Later Accept retransmissions use targeted route diversity.
     accept_ack_broadcasts: Mutex<HashSet<OpId>>,
@@ -2210,6 +2646,11 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// heal, so the initial attempt may fail with NoRoute and we rely on
     /// later membership events to drive a retry).
     pub(super) last_bootstrap_attempt: Mutex<Option<Instant>>,
+    /// Per-peer admission request throttle shared by periodic retries and
+    /// pending-coordinator rejection acceleration. Proposal retransmission
+    /// runs much faster than admission and must not amplify into a control
+    /// packet flood.
+    last_admission_probe_at: Mutex<HashMap<NodeIdentifier, Instant>>,
     delivery_blocked_log: Mutex<DeliveryBlockedLogState>,
     pub(super) shutdown: CancellationToken,
     pub(super) cfg: Arc<ReplicationConfig>,
@@ -2288,6 +2729,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             topic,
             net,
             state: Mutex::new(StrictState::new()),
+            admission_metrics: metrics::register_strict_admission_metrics(),
             deliver_signal: Notify::new(),
             clock_tick_signal: Notify::new(),
             propose_semaphore,
@@ -2300,10 +2742,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             resolutions: Mutex::new(HashMap::new()),
             deferred_v2_resolution_hints: Mutex::new(HashSet::new()),
             accept_ack_retries: Mutex::new(HashSet::new()),
+            propose_ack_broadcasts: Mutex::new(HashSet::new()),
             accept_ack_broadcasts: Mutex::new(HashSet::new()),
             resolution_ack_broadcasts: Mutex::new(HashSet::new()),
             weak_self: Mutex::new(None),
             last_bootstrap_attempt: Mutex::new(None),
+            last_admission_probe_at: Mutex::new(HashMap::new()),
             delivery_blocked_log: Mutex::new(DeliveryBlockedLogState::default()),
             shutdown,
             cfg,
@@ -2352,9 +2796,114 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         members: impl IntoIterator<Item = crate::overlay::MemberIncarnation>,
     ) {
         let mut state = self.state.lock();
+        state.admission_tracking_started = true;
         for member in members {
             let _ = state.apply_membership_event(&MembershipEvent::Joined(member));
         }
+        drop(state);
+        let _ = self.reconcile_peer_admissions();
+    }
+
+    /// Reconcile exact-incarnation route visibility with the private
+    /// admission table, freeze any locally applied cuts, and return only
+    /// members that are safe to include in a strict delivery watermark.
+    fn reconcile_peer_admissions(&self) -> Vec<NodeIdentifier> {
+        let routed = delivery_member_incarnations(self.net.as_ref(), self.self_id, self.boot_epoch);
+        let mut state = self.state.lock();
+        // Read repository metadata while holding the strict-state lock. A
+        // delivery applies to the repository before raising its state
+        // high-water; this ordering prevents pairing a post-apply high-water
+        // with metadata captured before that apply.
+        let metadata = self.repo.history_metadata();
+        state.reconcile_peer_admissions(self.self_id, &routed);
+        state.freeze_ready_admission_cuts(metadata);
+        let admitted = state.admitted_members(self.self_id, &routed);
+        let diagnostics = state.admission_diagnostics();
+        drop(state);
+        self.admission_metrics.update(
+            diagnostics.admitted,
+            diagnostics.awaiting_local_cut,
+            diagnostics.awaiting_peer,
+            diagnostics.highest_barrier,
+        );
+        admitted
+    }
+
+    /// Filter one atomic LSDB protocol snapshot through the epoch-scoped
+    /// admission table before a new proposal freezes its descriptor.
+    pub(super) fn filter_admitted_protocol_snapshot(
+        &self,
+        mut snapshot: StrictProtocolSnapshot,
+    ) -> StrictProtocolSnapshot {
+        let _ = self.reconcile_peer_admissions();
+        let state = self.state.lock();
+        snapshot.targets.retain(|target| {
+            state.peer_incarnation_is_admitted(self.self_id, target.node, target.boot_epoch)
+        });
+        snapshot
+    }
+
+    pub(crate) fn peer_incarnation_is_admitted(
+        &self,
+        node: NodeIdentifier,
+        boot_epoch: u64,
+    ) -> bool {
+        let _ = self.reconcile_peer_admissions();
+        self.state
+            .lock()
+            .peer_incarnation_is_admitted(self.self_id, node, boot_epoch)
+    }
+
+    pub(super) fn local_coordination_ready(&self) -> bool {
+        let _ = self.reconcile_peer_admissions();
+        self.state.lock().local_coordination_ready(self.self_id)
+    }
+
+    fn quarantine_members_excluded_from_frozen_targets(&self, targets: &[FrozenTarget]) {
+        let _ = self.reconcile_peer_admissions();
+        let diagnostics = {
+            let mut state = self.state.lock();
+            state.quarantine_excluded_members(self.self_id, targets);
+            state.admission_diagnostics()
+        };
+        self.admission_metrics.update(
+            diagnostics.admitted,
+            diagnostics.awaiting_local_cut,
+            diagnostics.awaiting_peer,
+            diagnostics.highest_barrier,
+        );
+    }
+
+    fn pending_admission_probe_peers(&self) -> Vec<NodeIdentifier> {
+        let _ = self.reconcile_peer_admissions();
+        self.state
+            .lock()
+            .peer_admissions
+            .iter()
+            .filter_map(|(node, admission)| {
+                // Retry metadata probes even while the local cut is waiting
+                // for an active history election. Those responses are also
+                // the election's authenticated rank evidence; restricting
+                // retries to AwaitingPeer lets one lost startup response pin
+                // the election until its timeout and leaves no admission
+                // worker available to repair it.
+                (!matches!(admission.phase, PeerAdmissionPhase::Admitted)).then_some(*node)
+            })
+            .collect()
+    }
+
+    fn admission_probe_due(&self, peer: NodeIdentifier) -> bool {
+        let now = Instant::now();
+        let interval = self.cfg.strict_bootstrap_retry_interval();
+        let mut last = self.last_admission_probe_at.lock();
+        if last
+            .get(&peer)
+            .is_some_and(|previous| now.duration_since(*previous) < interval)
+        {
+            return false;
+        }
+        last.insert(peer, now);
+        true
     }
 
     pub(crate) fn wake_clock_tick_loop(&self) {
@@ -2469,8 +3018,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
 
     /// Compute `(target_set, fast_quorum)` from the current alive view.
     pub fn snapshot_target_set(&self) -> (HashSet<NodeIdentifier>, usize) {
-        let alive = self.net.alive_members();
-        let mut tgt: HashSet<NodeIdentifier> = alive.into_iter().collect();
+        let mut tgt: HashSet<NodeIdentifier> =
+            self.reconcile_peer_admissions().into_iter().collect();
         tgt.insert(self.self_id);
         let fq = fast_quorum_size(tgt.len());
         (tgt, fq)
@@ -2628,18 +3177,21 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         origin_boot_epoch: u64,
         expected_boot_epoch: u64,
     ) -> bool {
-        let observed_boot_epoch = if from == self.self_id {
-            Some(self.boot_epoch)
-        } else {
-            self.net.member_boot_epoch(from).or_else(|| {
-                self.state
-                    .lock()
-                    .member_incarnations
-                    .get(&from)
-                    .map(|incarnation| incarnation.boot_epoch)
+        if from == self.self_id {
+            return origin_boot_epoch == expected_boot_epoch
+                && origin_boot_epoch == self.boot_epoch;
+        }
+        let network_epoch = self.net.member_boot_epoch(from);
+        let network_current_and_live = network_epoch == Some(origin_boot_epoch)
+            && self.net.has_live_route(from, ServiceLevel::Reliable);
+        let known = self.state.lock().member_incarnations.get(&from).copied();
+        origin_boot_epoch == expected_boot_epoch
+            && network_epoch.is_none_or(|epoch| epoch == origin_boot_epoch)
+            && known.is_none_or(|incarnation| {
+                incarnation.boot_epoch == origin_boot_epoch
+                    && (incarnation.alive || network_current_and_live)
             })
-        };
-        origin_boot_epoch == expected_boot_epoch && observed_boot_epoch == Some(origin_boot_epoch)
+            && (network_epoch.is_some() || known.is_some())
     }
 
     fn observed_origin_matches_epoch_in_state(
@@ -2649,18 +3201,43 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         origin_boot_epoch: u64,
         expected_boot_epoch: u64,
     ) -> bool {
-        let observed_boot_epoch = if from == self.self_id {
-            Some(self.boot_epoch)
-        } else {
-            self.net.member_boot_epoch(from).or_else(|| {
-                state
-                    .member_incarnations
-                    .get(&from)
-                    .map(|incarnation| incarnation.boot_epoch)
-            })
-        };
+        if from == self.self_id {
+            return origin_boot_epoch == expected_boot_epoch
+                && origin_boot_epoch == self.boot_epoch;
+        }
+        let network_epoch = self.net.member_boot_epoch(from);
+        let network_current_and_live = network_epoch == Some(origin_boot_epoch)
+            && self.net.has_live_route(from, ServiceLevel::Reliable);
+        let known = state.member_incarnations.get(&from).copied();
         origin_boot_epoch == expected_boot_epoch
-            && observed_boot_epoch.map_or(true, |observed| observed == origin_boot_epoch)
+            && network_epoch.is_none_or(|epoch| epoch == origin_boot_epoch)
+            && known.is_none_or(|incarnation| {
+                incarnation.boot_epoch == origin_boot_epoch
+                    && (incarnation.alive || network_current_and_live)
+            })
+            && (network_epoch.is_some() || known.is_some())
+    }
+
+    fn frozen_origin_epoch_matches_in_state(
+        &self,
+        state: &StrictState,
+        from: NodeIdentifier,
+        origin_boot_epoch: u64,
+        expected_boot_epoch: u64,
+    ) -> bool {
+        if origin_boot_epoch != expected_boot_epoch {
+            return false;
+        }
+        if from == self.self_id {
+            return origin_boot_epoch == self.boot_epoch;
+        }
+        let network_epoch = self.net.member_boot_epoch(from);
+        let known_epoch = state
+            .member_incarnations
+            .get(&from)
+            .map(|incarnation| incarnation.boot_epoch);
+        network_epoch.is_none_or(|epoch| epoch == origin_boot_epoch)
+            && known_epoch.is_none_or(|epoch| epoch == origin_boot_epoch)
     }
 
     /// Accept a frozen-incarnation frame after the membership view has
@@ -2673,21 +3250,21 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         origin_boot_epoch: u64,
         expected_boot_epoch: u64,
     ) -> bool {
-        origin_boot_epoch == expected_boot_epoch
-            && if from == self.self_id {
-                origin_boot_epoch == self.boot_epoch
-            } else {
-                self.net
-                    .member_boot_epoch(from)
-                    .or_else(|| {
-                        self.state
-                            .lock()
-                            .member_incarnations
-                            .get(&from)
-                            .map(|incarnation| incarnation.boot_epoch)
-                    })
-                    .map_or(true, |observed| observed == origin_boot_epoch)
-            }
+        if origin_boot_epoch != expected_boot_epoch {
+            return false;
+        }
+        if from == self.self_id {
+            return origin_boot_epoch == self.boot_epoch;
+        }
+        let network_epoch = self.net.member_boot_epoch(from);
+        let known_epoch = self
+            .state
+            .lock()
+            .member_incarnations
+            .get(&from)
+            .map(|incarnation| incarnation.boot_epoch);
+        network_epoch.is_none_or(|epoch| epoch == origin_boot_epoch)
+            && known_epoch.is_none_or(|epoch| epoch == origin_boot_epoch)
     }
 
     fn origin_matches_frozen_target(
@@ -3189,6 +3766,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             return state_changed;
         }
         let mut state_changed = false;
+        let mut admission_diagnostics = None;
         {
             let mut state = self.state.lock();
             let decision = TerminalDecision::Commit(AcceptedValue {
@@ -3216,14 +3794,88 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             state.peer_clocks.insert(self.self_id, clock);
             if state.mark_committed(op_id, ts_final) {
                 state.buffer_commit(op_id, ts_final, op_msgpack);
+                if let Some(identity) = identity {
+                    // Re-fence every excluded incarnation only when this
+                    // descriptor-bearing terminal commit first enters the
+                    // buffer. The barrier now includes ts_final; duplicate
+                    // terminal replay therefore cannot erase newer progress.
+                    state.quarantine_excluded_members(self.self_id, &identity.frozen_targets);
+                }
+                if state.history_election_active() {
+                    // A terminal-fenced commit learned during probing must
+                    // drain before a snapshot election can safely continue.
+                    // Return the election to requested/idle; the delivery
+                    // loop explicitly permits that prerequisite drain.
+                    state.request_history_election();
+                }
+                if identity.is_some() {
+                    admission_diagnostics = Some(state.admission_diagnostics());
+                }
                 state_changed = true;
             }
+        }
+        if let Some(diagnostics) = admission_diagnostics {
+            self.admission_metrics.update(
+                diagnostics.admitted,
+                diagnostics.awaiting_local_cut,
+                diagnostics.awaiting_peer,
+                diagnostics.highest_barrier,
+            );
         }
         if journal_changed || state_changed {
             metrics::record_strict_resolution(metrics::StrictResolutionOutcome::Commit);
         }
         if state_changed {
             self.wake_delivery_and_clock_tick();
+            if let Some(identity) = identity {
+                let frozen_nodes: HashSet<_> = identity
+                    .frozen_targets
+                    .iter()
+                    .map(FrozenTarget::node)
+                    .collect();
+                let excluded: Vec<_> = self
+                    .net
+                    .alive_members()
+                    .into_iter()
+                    .filter(|node| {
+                        *node != self.self_id
+                            && !frozen_nodes.contains(node)
+                            && self.net.has_route(*node, ServiceLevel::Reliable)
+                    })
+                    .collect();
+                if !excluded.is_empty()
+                    && let Some(weak) = self.weak_self.lock().clone()
+                    && let Ok(handle) = tokio::runtime::Handle::try_current()
+                {
+                    handle.spawn(async move {
+                        let Some(runtime) = weak.upgrade() else {
+                            return;
+                        };
+                        for dst in excluded {
+                            // A non-target may not know it was excluded and
+                            // therefore may never start an admission probe.
+                            // Push the terminal-fenced admission stream for
+                            // the newly accepted configuration transition.
+                            super::catchup::respond_to_request(
+                                runtime.as_ref(),
+                                dst,
+                                StrictCatchupReq {
+                                    src_node: dst as u32,
+                                    since_version: 0,
+                                    chunk_token: 0,
+                                    force_snapshot: false,
+                                    history_probe_only: true,
+                                    terminal_state_cursor: 0,
+                                    terminal_decision_generation: 0,
+                                    snapshot_transfer_id: 0,
+                                    snapshot_chunk_cursor: 0,
+                                },
+                            )
+                            .await;
+                        }
+                    });
+                }
+            }
         }
         state_changed
     }
@@ -3754,6 +4406,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             earliest_pending_protocol_version,
             earliest_buffered,
             local_proposal_quorum,
+            local_proposal_acks,
+            local_proposal_invalid_targets,
             local_proposal_accept_ack_count,
             local_proposal_accept_acks,
             local_proposal_phase_two_retry,
@@ -3763,6 +4417,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             buffered_commits,
             unresolved_promises,
             unresolved_terminal_promises,
+            admission_diagnostics,
+            pending_admission_proofs,
         ) = {
             let state = self.state.lock();
             let unresolved_promises = state
@@ -3802,6 +4458,28 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 .iter()
                 .min_by_key(|(_, proposal)| proposal.started_at)
                 .map(|(_, proposal)| proposal.accept_acks.len());
+            let local_proposal_acks = state
+                .proposals
+                .iter()
+                .min_by_key(|(_, proposal)| proposal.started_at)
+                .map(|(_, proposal)| {
+                    let mut acks = proposal
+                        .acks
+                        .iter()
+                        .map(|(node, ts)| (*node, *ts))
+                        .collect::<Vec<_>>();
+                    acks.sort_unstable_by_key(|(node, _)| *node);
+                    acks
+                });
+            let local_proposal_invalid_targets = state
+                .proposals
+                .iter()
+                .min_by_key(|(_, proposal)| proposal.started_at)
+                .map(|(_, proposal)| {
+                    let mut targets = proposal.invalid_targets.iter().copied().collect::<Vec<_>>();
+                    targets.sort_unstable();
+                    targets
+                });
             let local_proposal_accept_acks = state
                 .proposals
                 .iter()
@@ -3831,6 +4509,21 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 .map(|(op_id, value)| (*op_id, value.ballot))
                 .collect::<Vec<_>>();
             accepted_values.sort_unstable_by_key(|(op_id, ballot)| (*op_id, *ballot));
+            let mut pending_admission_proofs = state
+                .peer_admissions
+                .iter()
+                .filter_map(|(node, admission)| match admission.phase {
+                    PeerAdmissionPhase::AwaitingPeer {
+                        history_ready,
+                        clock_ready,
+                        ..
+                    } => Some((*node, history_ready, clock_ready)),
+                    PeerAdmissionPhase::AwaitingLocalCut { .. } | PeerAdmissionPhase::Admitted => {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            pending_admission_proofs.sort_unstable_by_key(|(node, _, _)| *node);
             (
                 state.history_election_requested,
                 state.history_election_active(),
@@ -3854,6 +4547,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     .next()
                     .map(|(_, buffered)| (buffered.op_id, buffered.ts_final)),
                 local_proposal_quorum,
+                local_proposal_acks,
+                local_proposal_invalid_targets,
                 local_proposal_accept_ack_count,
                 local_proposal_accept_acks,
                 local_proposal_phase_two_retry,
@@ -3863,8 +4558,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 state.commit_buffer.len(),
                 unresolved_promises,
                 unresolved_terminal_promises,
+                state.admission_diagnostics(),
+                pending_admission_proofs,
             )
         };
+        let earliest_pending_promise_ballot = earliest_pending.and_then(|(op_id, _, _)| {
+            self.terminal_journal
+                .lock()
+                .get(op_id)
+                .map(TerminalJournalRecord::promise_ballot)
+        });
         let active_recoveries = self.recoveries.lock().len();
         super::StrictDebugState {
             election_pending,
@@ -3874,9 +4577,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             history_alive_peers,
             clock,
             earliest_pending,
+            earliest_pending_promise_ballot,
             earliest_pending_protocol_version,
             earliest_buffered,
             local_proposal_quorum,
+            local_proposal_acks,
+            local_proposal_invalid_targets,
             local_proposal_accept_ack_count,
             local_proposal_accept_acks,
             local_proposal_phase_two_retry,
@@ -3886,6 +4592,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             buffered_commits,
             unresolved_promises,
             unresolved_terminal_promises,
+            admitted_peers: admission_diagnostics.admitted,
+            awaiting_local_cut_peers: admission_diagnostics.awaiting_local_cut,
+            awaiting_peer_proof_peers: admission_diagnostics.awaiting_peer,
+            pending_admission_proofs,
+            highest_admission_barrier: admission_diagnostics.highest_barrier,
             active_recoveries,
         }
     }
@@ -4045,29 +4756,21 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     {
                         return;
                     }
-                    if phase_two_grace_used && proposal.committed {
-                        // A phase-two quorum completed during the grace
-                        // window. Leave the proposal for the delivery loop so
-                        // its caller can receive the successful version.
+                    if proposal.committed {
+                        // A durable phase-two quorum is no longer a proposal
+                        // that can time out. Leave it and its caller waker for
+                        // ordered delivery while terminal catch-up and clock
+                        // repair converge any lagging admitted member.
                         return;
                     }
                     !phase_two_grace_used
                         && proposal.protocol_version == STRICT_PROTOCOL_VERSION_V2
                         && proposal.accept_started
                         && !proposal.committed
-                        && proposal
-                            .accept_acks
-                            .values()
-                            .filter(|accepted| **accepted)
-                            .count()
-                            >= fast_quorum_size(proposal.target_set.len())
                 };
                 if phase_two_grace {
                     phase_two_grace_used = true;
-                    let grace = rt
-                        .cfg
-                        .delivery_tick_interval()
-                        .max(Duration::from_millis(500));
+                    let grace = phase_two_completion_grace(&rt.cfg);
                     tokio::select! {
                         _ = rt.shutdown.cancelled() => return,
                         _ = tokio::time::sleep(grace) => {},
@@ -4194,14 +4897,13 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 if let Some(proposal) = rt.state.lock().proposals.get_mut(&op_id) {
                     proposal.phase_two_retry_attempts += 1;
                 }
-                if let Err(error) = rt
-                    .net
-                    .send_redundant_multicast(
-                        &remote_dsts,
-                        &rt.topic,
-                        StrictBody::Accept(retry.body.clone()),
-                    )
-                    .await
+                if let Err(error) = send_terminal_fanout(
+                    rt.net.as_ref(),
+                    &remote_dsts,
+                    &rt.topic,
+                    StrictBody::Accept(retry.body.clone()),
+                )
+                .await
                 {
                     trace!(%error, "send strict v2 accept retry multicast failed");
                 }
@@ -4417,6 +5119,61 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     );
                     return;
                 }
+                let exact_durable_retry = self
+                    .state
+                    .lock()
+                    .pending_proposes
+                    .get(&op_id)
+                    .is_some_and(|pending| {
+                        pending.coord_node == from
+                            && pending.protocol_version == STRICT_PROTOCOL_VERSION_V2
+                            && pending.v2_descriptor_durable
+                            && pending.frozen_targets.as_deref() == Some(targets.as_slice())
+                            && pending.op_msgpack == p.op_msgpack
+                    });
+                if !self.peer_incarnation_is_admitted(from, origin_boot_epoch)
+                    && !exact_durable_retry
+                {
+                    metrics::record_strict_fence_rejection();
+                    debug!(
+                        from,
+                        origin_boot_epoch,
+                        op_id_hi = op_id.0,
+                        op_id_lo = op_id.1,
+                        "strict v2 propose rejected: coordinator incarnation is awaiting admission"
+                    );
+                    // A new proposal remains fully rejected and cannot mutate
+                    // its clock or pending state. An exact retransmission of a
+                    // descriptor already durably accepted above is allowed to
+                    // reuse its original ACK: route churn must not strand old
+                    // frozen work merely because it also revoked admission
+                    // for new work. Use the validated exact-incarnation origin
+                    // here only to accelerate the admission traffic needed by
+                    // a genuinely new proposal.
+                    let req = StrictCatchupReq {
+                        src_node: self.self_id as u32,
+                        since_version: self.repo.current_version(),
+                        chunk_token: 0,
+                        force_snapshot: false,
+                        history_probe_only: true,
+                        terminal_state_cursor: super::catchup::TERMINAL_STATE_CURSOR_SKIP,
+                        terminal_decision_generation: self
+                            .remembered_terminal_decision_generation(from),
+                        snapshot_transfer_id: 0,
+                        snapshot_chunk_cursor: 0,
+                    };
+                    if self.admission_probe_due(from) {
+                        metrics::record_catchup_request(CatchupMode::Strict);
+                        if let Err(error) = self
+                            .net
+                            .send_redundant_unicast(from, &self.topic, StrictBody::CatchupReq(req))
+                            .await
+                        {
+                            trace!(%error, from, "strict pending-coordinator admission probe failed");
+                        }
+                    }
+                    return;
+                }
                 Some(targets)
             }
             _ => unreachable!("protocol version was validated above"),
@@ -4478,6 +5235,19 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if protocol_version < STRICT_PROTOCOL_VERSION_V2 && self.has_v2_terminal_descriptor(op_id) {
             metrics::record_strict_fence_rejection();
             return;
+        }
+        if protocol_version == STRICT_PROTOCOL_VERSION_V2
+            && self.v2_frozen_targets_for_op(op_id).is_none()
+        {
+            // All immutable coordinator, descriptor, participation, and
+            // catch-up-budget checks have passed. Apply the proposal-stage
+            // configuration fence only on this first valid observation;
+            // reliable retransmissions preserve newer admission progress.
+            self.quarantine_members_excluded_from_frozen_targets(
+                frozen_targets
+                    .as_deref()
+                    .expect("v2 descriptor was validated above"),
+            );
         }
         // A retransmitted Propose must reuse the original ACK timestamp.
         // Advancing the local clock again would move this replica's pending
@@ -4584,7 +5354,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 return;
             }
         }
-        let ack = StrictBody::ProposeAck(StrictProposeAck {
+        let ack = StrictProposeAck {
             ack_node: self.self_id as u32,
             coord_node: coord as u32,
             op_id_hi: op_id.0,
@@ -4592,15 +5362,131 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             ts_local,
             src_clock: local_clock_after,
             ack_boot_epoch: self.boot_epoch,
-        });
-        if let Err(e) = self
-            .net
-            .send_redundant_unicast(coord, &self.topic, ack)
-            .await
-        {
-            trace!(error=%e, "send propose-ack failed");
+        };
+        let start_retry_worker = protocol_version == STRICT_PROTOCOL_VERSION_V2
+            && self.propose_ack_broadcasts.lock().insert(op_id);
+        if start_retry_worker {
+            self.spawn_propose_ack_retries(op_id, ack);
+        } else {
+            self.spawn_single_propose_ack_send(coord, ack);
         }
         self.wake_delivery_and_clock_tick();
+    }
+
+    fn spawn_single_propose_ack_send(&self, coord: NodeIdentifier, ack: StrictProposeAck) {
+        let Some(weak) = self.weak_self.lock().clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(runtime) = weak.upgrade() else {
+                return;
+            };
+            let send = runtime.net.send_redundant_unicast(
+                coord,
+                &runtime.topic,
+                StrictBody::ProposeAck(ack),
+            );
+            tokio::select! {
+                _ = runtime.shutdown.cancelled() => {}
+                result = send => {
+                    if let Err(error) = result {
+                        trace!(%error, "send propose-ack failed");
+                    }
+                }
+            }
+        });
+    }
+
+    fn spawn_propose_ack_retries(&self, op_id: OpId, ack: StrictProposeAck) {
+        let Some(weak) = self.weak_self.lock().clone() else {
+            self.propose_ack_broadcasts.lock().remove(&op_id);
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(runtime) = weak.upgrade() else {
+                return;
+            };
+            let started_at = Instant::now();
+            let retry_ttl = runtime.cfg.propose_ttl();
+            let retry_interval = runtime.cfg.delivery_tick_interval();
+            let broadcast_interval = retry_interval.max(Duration::from_millis(500));
+            let mut last_broadcast_at = started_at;
+            let mut initial_send = true;
+            loop {
+                let retry_is_still_valid = {
+                    let state = runtime.state.lock();
+                    state.pending_proposes.get(&op_id).is_some_and(|pending| {
+                        pending.coord_node == ack.coord_node as NodeIdentifier
+                            && pending.protocol_version == STRICT_PROTOCOL_VERSION_V2
+                            && pending.v2_descriptor_durable
+                            && pending.ts_local == ack.ts_local
+                    }) && !state.accepted_values.contains_key(&op_id)
+                        && !state.terminal_decisions.contains_key(&op_id)
+                        && state.resolution_promise(op_id) == NORMAL_ACCEPT_BALLOT
+                };
+                if !retry_is_still_valid || started_at.elapsed() >= retry_ttl {
+                    break;
+                }
+
+                if !initial_send {
+                    let remaining = retry_ttl.saturating_sub(started_at.elapsed());
+                    tokio::select! {
+                        _ = runtime.shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(retry_interval.min(remaining)) => {}
+                    }
+                    if started_at.elapsed() >= retry_ttl {
+                        break;
+                    }
+                    let retry_is_still_valid = {
+                        let state = runtime.state.lock();
+                        state.pending_proposes.get(&op_id).is_some_and(|pending| {
+                            pending.coord_node == ack.coord_node as NodeIdentifier
+                                && pending.protocol_version == STRICT_PROTOCOL_VERSION_V2
+                                && pending.v2_descriptor_durable
+                                && pending.ts_local == ack.ts_local
+                        }) && !state.accepted_values.contains_key(&op_id)
+                            && !state.terminal_decisions.contains_key(&op_id)
+                            && state.resolution_promise(op_id) == NORMAL_ACCEPT_BALLOT
+                    };
+                    if !retry_is_still_valid {
+                        break;
+                    }
+                }
+
+                let now = Instant::now();
+                let use_broadcast =
+                    initial_send || now.duration_since(last_broadcast_at) >= broadcast_interval;
+                if use_broadcast {
+                    last_broadcast_at = now;
+                }
+                initial_send = false;
+                let body = StrictBody::ProposeAck(ack.clone());
+                let result = if use_broadcast {
+                    tokio::select! {
+                        _ = runtime.shutdown.cancelled() => break,
+                        result = send_accept_ack_fanout(
+                            runtime.net.as_ref(),
+                            ack.coord_node as NodeIdentifier,
+                            &runtime.topic,
+                            body,
+                        ) => result,
+                    }
+                } else {
+                    tokio::select! {
+                        _ = runtime.shutdown.cancelled() => break,
+                        result = runtime.net.send_redundant_unicast(
+                            ack.coord_node as NodeIdentifier,
+                            &runtime.topic,
+                            body,
+                        ) => result,
+                    }
+                };
+                if let Err(error) = result {
+                    trace!(%error, "retry strict propose-ack failed");
+                }
+            }
+            runtime.propose_ack_broadcasts.lock().remove(&op_id);
+        });
     }
 
     pub async fn recv_propose_ack(&self, from: NodeIdentifier, ack: StrictProposeAck) {
@@ -4671,7 +5557,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 || (p.protocol_version == STRICT_PROTOCOL_VERSION_V2
                     && !self.local_v2_participation_ready())
                 || (p.protocol_version == STRICT_PROTOCOL_VERSION_V2
-                    && !self.observed_origin_matches_epoch_in_state(
+                    && !self.frozen_origin_epoch_matches_in_state(
                         &s,
                         ack_node,
                         origin_boot_epoch,
@@ -4896,19 +5782,35 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     async fn send_normal_accept_phase(&self, op_id: OpId, accept: V1AcceptProposal) {
-        if let Err(e) = self
-            .net
-            .send_redundant_multicast(
-                &accept.dsts,
-                &self.topic,
-                StrictBody::Accept(accept.body.clone()),
-            )
-            .await
-        {
-            trace!(error=%e, "send strict v1 accept multicast failed");
-        }
-        self.recv_accept(self.self_id, accept.body).await;
+        // Establish the local durable accept and start the bounded repair
+        // worker before the initial multi-destination network send. Route
+        // diversity walks alternate first hops sequentially and can be slow
+        // under backpressure. Keep that fanout off the manager's serialized
+        // inbound dispatch task so phase-two acknowledgements can be handled
+        // while the first send is still in progress.
+        self.recv_accept(self.self_id, accept.body.clone()).await;
         self.spawn_accept_retries(op_id);
+        let Some(weak) = self.weak_self.lock().clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(rt) = weak.upgrade() else {
+                return;
+            };
+            let send = rt.net.send_redundant_multicast(
+                &accept.dsts,
+                &rt.topic,
+                StrictBody::Accept(accept.body),
+            );
+            tokio::select! {
+                _ = rt.shutdown.cancelled() => {}
+                result = send => {
+                    if let Err(error) = result {
+                        trace!(%error, "send strict v1 accept multicast failed");
+                    }
+                }
+            }
+        });
     }
 
     /// Record the v1 phase-2 accept and reply to its coordinator. A prepared
@@ -5118,17 +6020,94 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .await;
     }
 
-    fn spawn_accept_ack_retries(&self, op_id: OpId, ack: StrictAcceptAck) {
-        let is_v2_pending = self
-            .state
-            .lock()
-            .pending_proposes
-            .get(&op_id)
-            .is_some_and(|pending| pending.protocol_version == STRICT_PROTOCOL_VERSION_V2);
-        if !is_v2_pending {
-            return;
+    fn accept_ack_retry_fence(
+        &self,
+        op_id: OpId,
+        ack: &StrictAcceptAck,
+    ) -> Option<AcceptAckRetryFence> {
+        let coordinator = node_from_u32(ack.coord_node)?;
+        if node_from_u32(ack.ack_node) != Some(self.self_id)
+            || ack.ack_boot_epoch != self.boot_epoch
+            || ack.ballot != NORMAL_ACCEPT_BALLOT
+        {
+            return None;
         }
+        let state = self.state.lock();
+        let pending = state.pending_proposes.get(&op_id)?;
+        if pending.coord_node != coordinator
+            || pending.protocol_version != STRICT_PROTOCOL_VERSION_V2
+            || !pending.v2_descriptor_durable
+        {
+            return None;
+        }
+        let frozen_targets = pending.frozen_targets.clone()?;
+        let coordinator_boot_epoch = FrozenTarget::find_in_canonical(
+            &frozen_targets,
+            coordinator,
+        )?
+        .boot_epoch();
+        if FrozenTarget::find_in_canonical(&frozen_targets, self.self_id)
+            .is_none_or(|target| target.boot_epoch() != self.boot_epoch)
+        {
+            return None;
+        }
+        let deadline = pending.seen_at.checked_add(self.cfg.propose_ttl())?;
+        (Instant::now() < deadline).then_some(AcceptAckRetryFence {
+            coordinator,
+            coordinator_boot_epoch,
+            frozen_targets,
+            pending_seen_at: pending.seen_at,
+            deadline,
+        })
+    }
+
+    fn accept_ack_retry_is_valid(
+        &self,
+        op_id: OpId,
+        ack: &StrictAcceptAck,
+        fence: &AcceptAckRetryFence,
+    ) -> bool {
+        if Instant::now() >= fence.deadline
+            || node_from_u32(ack.coord_node) != Some(fence.coordinator)
+            || node_from_u32(ack.ack_node) != Some(self.self_id)
+            || ack.ack_boot_epoch != self.boot_epoch
+            || ack.ballot != NORMAL_ACCEPT_BALLOT
+            || self
+                .net
+                .member_boot_epoch(fence.coordinator)
+                .is_some_and(|epoch| epoch != fence.coordinator_boot_epoch)
+        {
+            return false;
+        }
+        let state = self.state.lock();
+        let known_coordinator_epoch_matches = fence.coordinator == self.self_id
+            || state
+                .member_incarnations
+                .get(&fence.coordinator)
+                .is_none_or(|known| known.boot_epoch == fence.coordinator_boot_epoch);
+        known_coordinator_epoch_matches
+            && state.pending_proposes.get(&op_id).is_some_and(|pending| {
+                pending.coord_node == fence.coordinator
+                    && pending.protocol_version == STRICT_PROTOCOL_VERSION_V2
+                    && pending.v2_descriptor_durable
+                    && pending.seen_at == fence.pending_seen_at
+                    && pending.frozen_targets.as_deref() == Some(fence.frozen_targets.as_slice())
+            })
+            && state
+                .accepted_values
+                .get(&op_id)
+                .is_some_and(|accepted| accepted.ballot == ack.ballot)
+            && !state.terminal_decisions.contains_key(&op_id)
+            && state.resolution_promise(op_id) == NORMAL_ACCEPT_BALLOT
+    }
+
+    fn spawn_accept_ack_retries(&self, op_id: OpId, ack: StrictAcceptAck) {
+        let Some(fence) = self.accept_ack_retry_fence(op_id, &ack) else {
+            self.accept_ack_broadcasts.lock().remove(&op_id);
+            return;
+        };
         let Some(weak) = self.weak_self.lock().clone() else {
+            self.accept_ack_broadcasts.lock().remove(&op_id);
             return;
         };
         if !self.accept_ack_retries.lock().insert(op_id) {
@@ -5138,40 +6117,30 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let Some(rt) = weak.upgrade() else {
                 return;
             };
-            let started_at = Instant::now();
             let broadcast_interval = rt
                 .cfg
-                .delivery_tick_interval()
-                .max(Duration::from_millis(500));
-            let mut last_broadcast_at = started_at;
+                .propose_ttl()
+                .checked_div(4)
+                .unwrap_or_else(|| rt.cfg.delivery_tick_interval())
+                .clamp(Duration::from_millis(500), Duration::from_secs(2));
+            let mut last_broadcast_at = fence.pending_seen_at;
             loop {
-                let elapsed = started_at.elapsed();
-                let proposal_ttl = rt.cfg.propose_ttl();
-                if elapsed >= proposal_ttl {
+                if !rt.accept_ack_retry_is_valid(op_id, &ack, &fence) {
                     break;
                 }
-                let delay = rt
-                    .cfg
-                    .delivery_tick_interval()
-                    .min(proposal_ttl.saturating_sub(elapsed));
+                let delay = rt.cfg.delivery_tick_interval().min(
+                    fence
+                        .deadline
+                        .saturating_duration_since(Instant::now()),
+                );
                 tokio::select! {
                     _ = rt.shutdown.cancelled() => break,
                     _ = sleep(delay) => {},
                 }
-                let retry_is_still_valid = {
-                    let state = rt.state.lock();
-                    state.pending_proposes.get(&op_id).is_some_and(|pending| {
-                        pending.protocol_version == STRICT_PROTOCOL_VERSION_V2
-                    }) && state
-                        .accepted_values
-                        .get(&op_id)
-                        .is_some_and(|accepted| accepted.ballot == ack.ballot)
-                        && state.terminal_decisions.get(&op_id).is_none()
-                };
-                if !retry_is_still_valid {
+                if !rt.accept_ack_retry_is_valid(op_id, &ack, &fence) {
                     break;
                 }
-                let coord = ack.coord_node as NodeIdentifier;
+                let coord = fence.coordinator;
                 if coord == rt.self_id {
                     rt.recv_accept_ack(rt.self_id, ack.clone()).await;
                 } else {
@@ -5238,27 +6207,40 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 // fresh immediate fanout.
                 return;
             }
-            let use_broadcast = accepted;
-            let result = if use_broadcast {
-                send_accept_ack_fanout(
-                    self.net.as_ref(),
+            if accepted {
+                // The accepted value is already durable. Start its bounded
+                // repair loop before the first network attempt so queue
+                // pressure cannot leave the only ACK attempt without an
+                // independent retry path.
+                self.spawn_accept_ack_retries(op_id, ack.clone());
+            }
+            // Keep the immediate attempt targeted. The retry worker adds a
+            // sparse broadcast fallback over the immutable proposal lifetime.
+            self.spawn_single_accept_ack_send(coord, ack);
+        }
+    }
+
+    fn spawn_single_accept_ack_send(&self, coord: NodeIdentifier, ack: StrictAcceptAck) {
+        let Some(weak) = self.weak_self.lock().clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(runtime) = weak.upgrade() else {
+                return;
+            };
+            let body = StrictBody::AcceptAck(ack);
+            let result = tokio::select! {
+                _ = runtime.shutdown.cancelled() => return,
+                result = runtime.net.send_redundant_unicast(
                     coord,
-                    &self.topic,
-                    StrictBody::AcceptAck(ack.clone()),
-                )
-                .await
-            } else {
-                self.net
-                    .send_redundant_unicast(coord, &self.topic, StrictBody::AcceptAck(ack.clone()))
-                    .await
+                    &runtime.topic,
+                    body,
+                ) => result,
             };
             if let Err(error) = result {
                 trace!(%error, "send strict accept ack failed");
             }
-            if accepted {
-                self.spawn_accept_ack_retries(op_id, ack);
-            }
-        }
+        });
     }
 
     pub async fn recv_accept_ack(&self, from: NodeIdentifier, ack: StrictAcceptAck) {
@@ -5330,7 +6312,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 || (proposal.protocol_version == STRICT_PROTOCOL_VERSION_V2
                     && !self.local_v2_participation_ready())
                 || (proposal.protocol_version == STRICT_PROTOCOL_VERSION_V2
-                    && !self.observed_origin_matches_epoch_in_state(
+                    && !self.frozen_origin_epoch_matches_in_state(
                         &state,
                         ack_node,
                         origin_boot_epoch,
@@ -5357,17 +6339,34 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 if accepted_count < fast_quorum {
                     return;
                 }
+                let (ts_final, op_msgpack) =
+                    if proposal.protocol_version == STRICT_PROTOCOL_VERSION_V2 {
+                        let phase_two = proposal
+                            .phase_two_accept
+                            .as_ref()
+                            .expect("started v2 accept phase must retain its frozen value");
+                        (phase_two.ts_final, phase_two.op_msgpack.clone())
+                    } else {
+                        (
+                            proposal
+                                .acks
+                                .values()
+                                .copied()
+                                .max()
+                                .unwrap_or(proposal.ts_propose),
+                            proposal.op_msgpack.clone(),
+                        )
+                    };
                 proposal.committed = true;
                 (
                     accepted_count,
                     fast_quorum,
-                    proposal
-                        .acks
-                        .values()
-                        .copied()
-                        .max()
-                        .unwrap_or(proposal.ts_propose),
-                    proposal.op_msgpack.clone(),
+                    // Phase-one ACK retries can arrive after phase two has
+                    // started. They must not rebuild the chosen timestamp:
+                    // every acceptor and the durable journal already hold
+                    // this exact immutable ballot-zero value.
+                    ts_final,
+                    op_msgpack,
                     proposal
                         .target_set
                         .iter()
@@ -6806,10 +7805,47 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     pub fn recv_clock_tick(&self, from: NodeIdentifier, t: StrictClockTick) {
-        {
+        self.recv_clock_tick_with_origin_epoch(
+            from,
+            self.direct_inbound_origin_boot_epoch(from),
+            t,
+        );
+    }
+
+    fn recv_clock_tick_with_origin_epoch(
+        &self,
+        from: NodeIdentifier,
+        origin_boot_epoch: u64,
+        t: StrictClockTick,
+    ) {
+        if node_from_u32(t.src_node) != Some(from) {
+            metrics::record_strict_fence_rejection();
+            return;
+        }
+        let _ = self.reconcile_peer_admissions();
+        let diagnostics = {
             let mut s = self.state.lock();
             s.observe_peer(from, t.src_clock);
-        }
+            // Directed admission ticks also synchronize a restarted peer's
+            // volatile Tempo clock. Without this monotonic raise, a
+            // snapshot-only recovery would advance by one per retry and
+            // could take an unbounded practical time to cross a far-ahead
+            // barrier. The next locally generated tick still supplies the
+            // strict `> barrier` proof.
+            if t.src_clock > s.clock {
+                s.clock = t.src_clock;
+                let clock = s.clock;
+                s.peer_clocks.insert(self.self_id, clock);
+            }
+            s.observe_admission_clock(from, origin_boot_epoch, t.src_clock);
+            s.admission_diagnostics()
+        };
+        self.admission_metrics.update(
+            diagnostics.admitted,
+            diagnostics.awaiting_local_cut,
+            diagnostics.awaiting_peer,
+            diagnostics.highest_barrier,
+        );
         // Tick may unblock delivery.
         self.deliver_signal.notify_one();
     }
@@ -6847,7 +7883,74 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     pub async fn recv_catchup_resp(&self, from: NodeIdentifier, resp: StrictCatchupResp) {
-        super::catchup::apply_response(self, from, resp).await
+        self.recv_catchup_resp_with_origin_epoch(
+            from,
+            self.direct_inbound_origin_boot_epoch(from),
+            resp,
+        )
+        .await
+    }
+
+    async fn recv_catchup_resp_with_origin_epoch(
+        &self,
+        from: NodeIdentifier,
+        origin_boot_epoch: u64,
+        resp: StrictCatchupResp,
+    ) {
+        // Admission accepts history evidence only after catchup has fully
+        // validated and accepted a plain metadata response. This keeps
+        // malformed terminal, snapshot, and log payloads from becoming
+        // admission proofs.
+        let admission_metadata = super::catchup::apply_response(self, from, resp).await;
+        if let Some(metadata) = admission_metadata {
+            let local_version = self.repo.current_version();
+            if metadata.version < local_version {
+                // The authenticated admission response proves this exact
+                // incarnation is behind. Serve it the ordinary terminal-
+                // fenced suffix/snapshot immediately instead of relying on
+                // the stale peer to randomly select an up-to-date source in
+                // the slower steady-state anti-entropy loop.
+                super::catchup::respond_to_request(
+                    self,
+                    from,
+                    StrictCatchupReq {
+                        src_node: from as u32,
+                        since_version: metadata.version,
+                        chunk_token: metadata.version,
+                        force_snapshot: false,
+                        // The terminal-fence pages themselves carry every
+                        // committed operation needed to repair an excluded
+                        // participant. Retain probe intent so those control
+                        // pages use redundant delivery; the final metadata
+                        // response will prove whether another retry is needed.
+                        history_probe_only: true,
+                        terminal_state_cursor: 0,
+                        terminal_decision_generation: 0,
+                        snapshot_transfer_id: 0,
+                        snapshot_chunk_cursor: 0,
+                    },
+                )
+                .await;
+            }
+            let _ = self.reconcile_peer_admissions();
+            let (freshness_diverged, diagnostics) = {
+                let mut state = self.state.lock();
+                let freshness_diverged =
+                    state.observe_admission_history(from, origin_boot_epoch, metadata);
+                (freshness_diverged, state.admission_diagnostics())
+            };
+            self.admission_metrics.update(
+                diagnostics.admitted,
+                diagnostics.awaiting_local_cut,
+                diagnostics.awaiting_peer,
+                diagnostics.highest_barrier,
+            );
+            if freshness_diverged {
+                self.state.lock().request_history_election();
+                self.wake_clock_tick_loop();
+            }
+            self.wake_delivery_and_clock_tick();
+        }
     }
 
     // ------ Slow-path recovery handlers ------
@@ -7355,7 +8458,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// longer reach fast-quorum, and initiates slow-path recovery for any
     /// pending Propose whose coord just died.
     pub fn on_membership_change(&self, ev: &MembershipEvent) {
-        let transition = self.state.lock().apply_membership_event(ev);
+        let transition = {
+            let mut state = self.state.lock();
+            state.admission_tracking_started = true;
+            state.apply_membership_event(ev)
+        };
         if transition == MembershipTransition::Ignored {
             trace!(event = ?ev, "ignored stale or duplicate strict membership event");
             return;
@@ -7377,6 +8484,20 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             transition,
             MembershipTransition::Removed | MembershipTransition::Restarted
         );
+        {
+            let mut state = self.state.lock();
+            if peer_removed {
+                state.peer_admissions.remove(&member.node_id());
+                state.peer_clocks.remove(&member.node_id());
+            }
+            if matches!(
+                transition,
+                MembershipTransition::Joined | MembershipTransition::Restarted
+            ) && member.node_id() != self.self_id
+            {
+                state.begin_peer_admission(member.node_id(), member.incarnation());
+            }
+        }
         let mut history_snapshot_request = None;
         if peer_removed {
             let node = member.node_id();
@@ -7408,11 +8529,18 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 let mut s = self.state.lock();
                 s.peer_clocks.remove(&node);
                 for proposal in s.proposals.values_mut() {
-                    proposal.acks.remove(&node);
-                    if transition == MembershipTransition::Restarted
-                        && proposal.target_set.contains(&node)
-                    {
-                        proposal.invalid_targets.insert(node);
+                    if transition == MembershipTransition::Restarted {
+                        proposal.acks.remove(&node);
+                        if proposal.target_set.contains(&node) {
+                            proposal.invalid_targets.insert(node);
+                        }
+                    } else if proposal.protocol_version < STRICT_PROTOCOL_VERSION_V2 {
+                        // Legacy proposals have no frozen incarnation proof,
+                        // so their old reachability-scoped ACK cannot survive
+                        // removal. A v2 ACK is authenticated against the
+                        // immutable target epoch and remains valid until an
+                        // actual replacement incarnation is observed.
+                        proposal.acks.remove(&node);
                     }
                 }
                 s.fail_quorum_lost(&alive_set)
@@ -7433,10 +8561,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     // promise remains in the journal and a fresh ballot will
                     // be re-driven below against the original descriptor.
                     resolutions.retain(|_, resolution| !resolution.target_set.contains(&node));
-                } else {
-                    for resolution in resolutions.values_mut() {
-                        resolution.prepare_acks.remove(&node);
-                    }
                 }
             }
             for (op_id, w) in wakers {
@@ -7535,6 +8659,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
         }
 
+        let _ = self.reconcile_peer_admissions();
         self.deliver_signal.notify_one();
     }
 }
@@ -7655,7 +8780,9 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                     .await
             }
             StrictBody::Commit(c) => self.recv_commit(from, c).await,
-            StrictBody::ClockTick(t) => self.recv_clock_tick(from, t),
+            StrictBody::ClockTick(t) => {
+                self.recv_clock_tick_with_origin_epoch(from, origin_boot_epoch, t)
+            }
             StrictBody::CatchupReq(r) => {
                 if self.net.peer_strict_replication_protocol_version(from)
                     >= STRICT_PROTOCOL_VERSION_V2
@@ -7664,7 +8791,25 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                     self.reject_untrusted_v2_origin();
                     return;
                 }
-                self.recv_catchup_req(from, r).await
+                if r.history_probe_only {
+                    // Admission and terminal-repair probes are read-side
+                    // control traffic, but producing their authenticated
+                    // response can await several route-diverse sends. Keep
+                    // those sends off the manager's serialized inbound loop
+                    // so an active repair cadence cannot starve proposal and
+                    // phase-two acknowledgements. Ordinary history/snapshot
+                    // requests remain serialized below.
+                    let Some(weak) = self.weak_self.lock().clone() else {
+                        return;
+                    };
+                    tokio::spawn(async move {
+                        if let Some(runtime) = weak.upgrade() {
+                            runtime.recv_catchup_req(from, r).await;
+                        }
+                    });
+                } else {
+                    self.recv_catchup_req(from, r).await
+                }
             }
             StrictBody::CatchupResp(r) => {
                 if self.net.peer_strict_replication_protocol_version(from)
@@ -7674,7 +8819,8 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                     self.reject_untrusted_v2_origin();
                     return;
                 }
-                self.recv_catchup_resp(from, r).await
+                self.recv_catchup_resp_with_origin_epoch(from, origin_boot_epoch, r)
+                    .await
             }
             StrictBody::RecoveryReq(_)
             | StrictBody::RecoveryAck(_)
@@ -7861,9 +9007,11 @@ fn spawn_commit_fanout_retries(
         // long-lived repair worker below the delivery tick so several prior
         // rounds cannot monopolize the reliable control queues and starve a
         // new proposal's phase-two acknowledgements.
-        let retry_interval = interval.max(Duration::from_millis(500));
-        let broadcast_interval = retry_interval;
-        let mut last_broadcast_at = started_at;
+        let retry_floor = retry_ttl
+            .checked_div(2)
+            .unwrap_or(retry_ttl)
+            .min(Duration::from_secs(2));
+        let retry_interval = interval.max(retry_floor);
         loop {
             let elapsed = started_at.elapsed();
             if elapsed >= retry_ttl {
@@ -7877,17 +9025,7 @@ fn spawn_commit_fanout_retries(
             if started_at.elapsed() >= retry_ttl {
                 return;
             }
-            let now = Instant::now();
-            let use_broadcast = now.duration_since(last_broadcast_at) >= broadcast_interval;
-            if use_broadcast {
-                last_broadcast_at = now;
-            }
-            let result = if use_broadcast {
-                send_terminal_fanout_with_broadcast(net.as_ref(), &dsts, &topic, body.clone()).await
-            } else {
-                send_terminal_fanout(net.as_ref(), &dsts, &topic, body.clone()).await
-            };
-            if let Err(e) = result {
+            if let Err(e) = net.send_multicast(&dsts, &topic, body.clone()).await {
                 trace!(error=%e, "commit fanout retry failed");
             }
         }
@@ -7976,7 +9114,7 @@ fn spawn_delivery_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
 }
 
 async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
-    let alive = delivery_members(rt.net.as_ref(), rt.self_id);
+    let alive = rt.reconcile_peer_admissions();
     let now = Instant::now();
     let mut blocked: Option<DeliveryBlockDiagnostics> = None;
     let to_apply: Vec<BufferedOp> = {
@@ -8016,6 +9154,9 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
                             .filter(|p| !p.committed)
                             .count(),
                         pending_remote_proposes: s.pending_proposes.len(),
+                        admitted_peers: s.admission_diagnostics().admitted,
+                        pending_admissions: s.admission_diagnostics().pending,
+                        highest_admission_barrier: s.admission_diagnostics().highest_barrier,
                     });
                 }
             }
@@ -8137,6 +9278,7 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
             let waker = proposal.and_then(|p| p.waker);
             (waker, elapsed)
         };
+        let _ = rt.reconcile_peer_admissions();
         log_delivery_applied(
             &rt.topic,
             &buf,
@@ -8197,6 +9339,28 @@ fn delivery_members(net: &dyn StrictNet, self_id: NodeIdentifier) -> Vec<NodeIde
         }
         if node == self_id || net.has_live_route(node, ServiceLevel::Reliable) {
             members.push(node);
+        }
+    }
+    members
+}
+
+fn delivery_member_incarnations(
+    net: &dyn StrictNet,
+    self_id: NodeIdentifier,
+    self_boot_epoch: u64,
+) -> Vec<(NodeIdentifier, u64)> {
+    let mut seen = HashSet::new();
+    let mut members = Vec::new();
+    for node in net.alive_members().into_iter().chain([self_id]) {
+        if !seen.insert(node) {
+            continue;
+        }
+        if node == self_id {
+            members.push((node, self_boot_epoch));
+        } else if net.has_live_route(node, ServiceLevel::Reliable)
+            && let Some(boot_epoch) = net.member_boot_epoch(node)
+        {
+            members.push((node, boot_epoch));
         }
     }
     members
@@ -8327,6 +9491,9 @@ fn log_delivery_blocked<R: StrictReplicable>(
         commit_buffer_len = diagnostics.commit_buffer_len,
         pending_local_proposals = diagnostics.pending_local_proposals,
         pending_remote_proposes = diagnostics.pending_remote_proposes,
+        admitted_peers = diagnostics.admitted_peers,
+        pending_admissions = diagnostics.pending_admissions,
+        highest_admission_barrier = diagnostics.highest_admission_barrier,
         "strict delivery blocked"
     );
 }
@@ -8500,7 +9667,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     fn clock_tick_needed(&self) -> bool {
-        let alive = delivery_members(self.net.as_ref(), self.self_id);
+        let alive = self.reconcile_peer_admissions();
         let state = self.state.lock();
         clock_tick_needed_for_state(&state, self.self_id, &alive)
     }
@@ -8668,12 +9835,57 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
             if should_probe {
                 rt.try_bootstrap_catchup().await;
             }
+            request_admission_probes(&rt).await;
             tokio::select! {
                 _ = rt.shutdown.cancelled() => return,
                 _ = tokio::time::sleep(interval) => {}
             }
         }
     });
+}
+
+/// Retry metadata and directed-clock evidence for every routed incarnation
+/// awaiting admission. This cadence is independent of the coarser ordinary
+/// anti-entropy loop so a healed route cannot pin liveness until 30 seconds.
+async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
+    if !rt.can_originate_v2() {
+        return;
+    }
+    let peers = rt.pending_admission_probe_peers();
+    let local_version = rt.repo.current_version();
+    for dst in peers {
+        if rt.net.peer_strict_replication_protocol_version(dst) < STRICT_PROTOCOL_VERSION_V2
+            || !rt.net.has_live_route(dst, ServiceLevel::Reliable)
+            || !rt.admission_probe_due(dst)
+        {
+            continue;
+        }
+        let req = StrictCatchupReq {
+            src_node: rt.self_id as u32,
+            // Besides asking for the peer's metadata, advertise the local
+            // durable cut. A peer that did not observe its own exclusion can
+            // use this authenticated hint to rearm catch-up immediately.
+            since_version: local_version,
+            chunk_token: 0,
+            force_snapshot: false,
+            history_probe_only: true,
+            // Reuse a completed terminal cut. The responder restarts at
+            // cursor zero if its generation changed, while an unchanged peer
+            // can return metadata and a fresh directed clock immediately.
+            terminal_state_cursor: super::catchup::TERMINAL_STATE_CURSOR_SKIP,
+            terminal_decision_generation: rt.remembered_terminal_decision_generation(dst),
+            snapshot_transfer_id: 0,
+            snapshot_chunk_cursor: 0,
+        };
+        metrics::record_catchup_request(CatchupMode::Strict);
+        if let Err(error) = rt
+            .net
+            .send_redundant_unicast(dst, &rt.topic, StrictBody::CatchupReq(req))
+            .await
+        {
+            trace!(%error, dst, "strict admission probe send failed");
+        }
+    }
 }
 
 fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
@@ -8722,16 +9934,20 @@ async fn request_terminal_repair_probe<R: StrictReplicable>(rt: &Arc<StrictRunti
     if !rt.can_originate_v2() {
         return false;
     }
-    let alive = delivery_members(rt.net.as_ref(), rt.self_id);
+    let alive = rt.reconcile_peer_admissions();
     // A pending fence may belong to the preceding round: waiting for its
     // full caller TTL can race the next proposal's own deadline. Give the
     // deterministic resolver the second half of that TTL to complete while
     // retaining a grace period for an in-flight normal phase-two exchange.
-    let stale_after = rt
+    let unavailable_coord_stale_after = rt
         .cfg
         .propose_ttl()
         .checked_div(2)
         .unwrap_or_else(|| rt.cfg.propose_ttl());
+    let live_coord_stale_after = rt
+        .cfg
+        .propose_ttl()
+        .saturating_add(phase_two_completion_grace(&rt.cfg));
     let (candidates, preferred_peer, stale_pending): (
         Vec<(NodeIdentifier, Option<u64>)>,
         Option<NodeIdentifier>,
@@ -8764,6 +9980,33 @@ async fn request_terminal_repair_probe<R: StrictReplicable>(rt: &Arc<StrictRunti
             .pending_proposes
             .iter()
             .filter(|(op_id, pending)| {
+                let coordinator_epoch = pending.frozen_targets.as_deref().and_then(|targets| {
+                    FrozenTarget::find_in_canonical(targets, pending.coord_node)
+                        .map(FrozenTarget::boot_epoch)
+                });
+                // A transient first-hop/route transition is not evidence that
+                // the frozen coordinator incarnation is gone. Treat the
+                // incarnation as live while it remains in the authenticated
+                // membership view; otherwise one replica on a hostile link
+                // can start a higher repair ballot at half TTL and fence an
+                // otherwise healthy coordinator's normal phase two at every
+                // acceptor.
+                let coordinator_live = pending.coord_node == rt.self_id
+                    || (rt.net.alive_members().contains(&pending.coord_node)
+                        && coordinator_epoch.is_some_and(|epoch| {
+                            rt.net.member_boot_epoch(pending.coord_node) == Some(epoch)
+                        }));
+                let stale_after = if coordinator_live {
+                    // Do not let a half-TTL repair ballot preempt a slow but
+                    // live coordinator's normal phase two. The caller grants
+                    // a final bounded grace window when it already has an
+                    // accept quorum at its deadline, so remote resolution
+                    // must begin strictly after that same window rather than
+                    // racing the coordinator's ballot-zero journal write.
+                    live_coord_stale_after
+                } else {
+                    unavailable_coord_stale_after
+                };
                 pending.protocol_version == STRICT_PROTOCOL_VERSION_V2
                     && pending.v2_descriptor_durable
                     && pending.frozen_targets.is_some()
@@ -9003,7 +10246,9 @@ fn hydrate_terminal_journal_record(
             );
         }
     }
-    if let Some(accepted) = record.accepted_commit() {
+    if !state.committed_ids.contains(&op_id)
+        && let Some(accepted) = record.accepted_commit()
+    {
         if accepted.ts_final() > state.clock {
             state.clock = accepted.ts_final();
         }
@@ -9673,6 +10918,23 @@ mod tests {
     }
 
     #[test]
+    fn terminal_replay_does_not_resurrect_an_accepted_value_after_commit() {
+        let op_id = make_op_id(10, 1, 99);
+        let mut journal = TerminalJournal::in_memory("channels");
+        journal
+            .upsert_commit_decision(op_id, NORMAL_ACCEPT_BALLOT, 8, vec![1, 2, 3])
+            .unwrap();
+        let record = journal.get(op_id).unwrap().clone();
+        let mut state = StrictState::new();
+        assert!(state.mark_committed(op_id, 8));
+
+        hydrate_terminal_journal_record(&mut state, op_id, &record, true);
+
+        assert!(!state.accepted_values.contains_key(&op_id));
+        assert!(state.terminal_decisions.contains_key(&op_id));
+    }
+
+    #[test]
     fn clock_tick_not_needed_when_idle_and_alive_peers_observed() {
         let mut s = StrictState::new();
         s.finish_history_election();
@@ -9831,6 +11093,521 @@ mod tests {
         let hw = s.delivery_high_water(10, &alive);
 
         assert_eq!(hw, 5);
+    }
+
+    #[test]
+    fn pending_rejoin_clock_cannot_pin_buffered_delivery() {
+        let mut state = StrictState::new();
+        state.admission_tracking_started = true;
+        state.clock = 110;
+        state.peer_clocks.insert(1, 110);
+        state.buffer_commit((1, 1), 101, Bytes::new());
+
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 7)]);
+        state.observe_peer(2, 96);
+
+        assert_eq!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingLocalCut { barrier_ts: 101 }
+        );
+        let admitted = state.admitted_members(1, &[(1, 1), (2, 7)]);
+        assert_eq!(admitted, vec![1]);
+        assert_eq!(state.delivery_high_water(1, &admitted), 110);
+        assert_eq!(state.drain_deliverable(110).len(), 1);
+    }
+
+    #[test]
+    fn admission_cut_freezes_only_after_repository_applies_through_barrier() {
+        let mut state = StrictState::new();
+        state.finish_history_election();
+        state.admission_tracking_started = true;
+        state.delivered_high_water = 100;
+        state.buffer_commit((1, 1), 101, Bytes::new());
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 3)]);
+
+        state.freeze_ready_admission_cuts(HistoryMetadata {
+            version: 40,
+            freshness: 4,
+        });
+        assert_eq!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingLocalCut { barrier_ts: 101 }
+        );
+
+        state.commit_buffer.clear();
+        state.delivered_high_water = 101;
+        state.freeze_ready_admission_cuts(HistoryMetadata {
+            version: 41,
+            freshness: 5,
+        });
+        assert_eq!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingPeer {
+                required_history: HistoryMetadata {
+                    version: 41,
+                    freshness: 5,
+                },
+                clock_gt: 101,
+                history_ready: false,
+                clock_ready: false,
+            }
+        );
+    }
+
+    #[test]
+    fn admission_cut_waits_for_every_equal_timestamp_delivery() {
+        let mut state = StrictState::new();
+        state.finish_history_election();
+        state.admission_tracking_started = true;
+        let first = (1, 1);
+        let second = (1, 2);
+        assert!(state.mark_committed(first, 101));
+        assert!(state.mark_committed(second, 101));
+        state.buffer_commit(first, 101, Bytes::new());
+        state.buffer_commit(second, 101, Bytes::new());
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 3)]);
+        let drained = state.drain_deliverable(101);
+        state.mark_delivering_commits(&drained);
+
+        state.finish_delivering_commit(first);
+        state.delivered_high_water = 101;
+        state.freeze_ready_admission_cuts(HistoryMetadata {
+            version: 1,
+            freshness: 1,
+        });
+        assert_eq!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingLocalCut { barrier_ts: 101 }
+        );
+
+        state.finish_delivering_commit(second);
+        state.freeze_ready_admission_cuts(HistoryMetadata {
+            version: 2,
+            freshness: 2,
+        });
+        assert!(matches!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingPeer {
+                required_history: HistoryMetadata { version: 2, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn admission_requires_history_and_clock_strictly_above_barrier() {
+        let required_history = HistoryMetadata {
+            version: 8,
+            freshness: 13,
+        };
+        let mut state = StrictState::new();
+        state.finish_history_election();
+        state.admission_tracking_started = true;
+        state.delivered_high_water = 101;
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 9), (3, 4)]);
+        state.freeze_ready_admission_cuts(required_history);
+
+        assert!(!state.observe_admission_history(2, 9, required_history));
+        state.observe_admission_clock(3, 4, 102);
+        assert_eq!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingPeer {
+                required_history,
+                clock_gt: 101,
+                history_ready: true,
+                clock_ready: false,
+            }
+        );
+        assert_eq!(
+            state.peer_admissions[&3].phase,
+            PeerAdmissionPhase::AwaitingPeer {
+                required_history,
+                clock_gt: 101,
+                history_ready: false,
+                clock_ready: true,
+            }
+        );
+
+        state.observe_admission_clock(2, 9, 101);
+        assert!(!matches!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::Admitted
+        ));
+        state.observe_admission_clock(2, 9, 102);
+        assert_eq!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::Admitted
+        );
+    }
+
+    #[test]
+    fn admission_proofs_are_epoch_scoped() {
+        let required_history = HistoryMetadata {
+            version: 3,
+            freshness: 7,
+        };
+        let mut state = StrictState::new();
+        state.finish_history_election();
+        state.admission_tracking_started = true;
+        state.delivered_high_water = 50;
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 2)]);
+        state.freeze_ready_admission_cuts(required_history);
+
+        assert!(!state.observe_admission_history(2, 1, required_history));
+        state.observe_admission_clock(2, 1, 51);
+        assert_eq!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingPeer {
+                required_history,
+                clock_gt: 50,
+                history_ready: false,
+                clock_ready: false,
+            }
+        );
+
+        assert!(!state.observe_admission_history(2, 2, required_history));
+        state.observe_admission_clock(2, 1, u64::MAX);
+        assert!(!matches!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::Admitted
+        ));
+        state.observe_admission_clock(2, 2, 51);
+        assert_eq!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::Admitted
+        );
+    }
+
+    #[test]
+    fn duplicate_same_epoch_join_preserves_admission_progress() {
+        let required_history = HistoryMetadata {
+            version: 12,
+            freshness: 21,
+        };
+        let mut state = StrictState::new();
+        state.finish_history_election();
+        state.admission_tracking_started = true;
+        state.delivered_high_water = 10;
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 6)]);
+        state.freeze_ready_admission_cuts(required_history);
+        assert!(!state.observe_admission_history(2, 6, required_history));
+        let progressed = state.peer_admissions[&2];
+
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 6)]);
+
+        assert_eq!(state.peer_admissions[&2], progressed);
+    }
+
+    #[test]
+    fn route_loss_revokes_admission_and_reappearance_takes_a_new_barrier() {
+        let mut state = StrictState::new();
+        state.finish_history_election();
+        state.admission_tracking_started = true;
+        state.delivered_high_water = 10;
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 5)]);
+        state.freeze_ready_admission_cuts(HistoryMetadata {
+            version: 1,
+            freshness: 1,
+        });
+        state.observe_peer(2, 20);
+
+        state.reconcile_peer_admissions(1, &[(1, 1)]);
+        assert!(!state.peer_admissions.contains_key(&2));
+        assert!(!state.peer_clocks.contains_key(&2));
+
+        state.buffer_commit((9, 9), 25, Bytes::new());
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 5)]);
+        assert_eq!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingLocalCut { barrier_ts: 25 }
+        );
+    }
+
+    #[test]
+    fn stale_route_cannot_downgrade_or_resurrect_an_incarnation() {
+        use crate::overlay::MemberIncarnation;
+
+        let mut state = StrictState::new();
+        state.finish_history_election();
+        state.admission_tracking_started = true;
+        assert_eq!(
+            state.apply_membership_event(&MembershipEvent::Joined(MemberIncarnation::new(2, 2))),
+            MembershipTransition::Joined
+        );
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 2)]);
+        assert_eq!(state.peer_admissions[&2].boot_epoch, 2);
+
+        assert_eq!(
+            state.apply_membership_event(&MembershipEvent::Restarted(MemberIncarnation::new(2, 3))),
+            MembershipTransition::Restarted
+        );
+        state.begin_peer_admission(2, 3);
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 2)]);
+        assert!(!state.peer_admissions.contains_key(&2));
+        assert_eq!(state.member_incarnations[&2].boot_epoch, 3);
+
+        assert_eq!(
+            state.apply_membership_event(&MembershipEvent::Left(MemberIncarnation::new(2, 3))),
+            MembershipTransition::Removed
+        );
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 2)]);
+        assert!(!state.peer_admissions.contains_key(&2));
+        assert!(!state.member_incarnations[&2].alive);
+    }
+
+    #[test]
+    fn equal_version_freshness_disagreement_rearms_history_proof() {
+        let required_history = HistoryMetadata {
+            version: 14,
+            freshness: 40,
+        };
+        let mut state = StrictState::new();
+        state.finish_history_election();
+        state.admission_tracking_started = true;
+        state.delivered_high_water = 20;
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 8)]);
+        state.freeze_ready_admission_cuts(required_history);
+        state.observe_admission_clock(2, 8, 21);
+
+        assert!(state.observe_admission_history(
+            2,
+            8,
+            HistoryMetadata {
+                version: 14,
+                freshness: 41,
+            }
+        ));
+        assert_eq!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingPeer {
+                required_history,
+                clock_gt: 20,
+                history_ready: false,
+                clock_ready: true,
+            }
+        );
+    }
+
+    #[test]
+    fn new_terminal_descriptor_refences_excluded_peer_at_commit_barrier_once() {
+        let (rt, _net, _repo) = v1_runtime(ReplicationConfig::default());
+        {
+            let mut state = rt.state.lock();
+            state.admission_tracking_started = true;
+            state.begin_peer_admission(2, 1);
+            state.peer_admissions.get_mut(&2).unwrap().phase = PeerAdmissionPhase::Admitted;
+        }
+        let op_id = make_op_id(1, 1, 777);
+        let op_msgpack = Bytes::from(rmp_serde::to_vec(&777u64).unwrap());
+        let identity = TerminalDecisionIdentity {
+            resolver: TerminalResolver::new(1, 1),
+            frozen_targets: vec![FrozenTarget::new(1, 1)],
+        };
+
+        assert!(rt.apply_terminal_commit_with_descriptor(
+            op_id,
+            NORMAL_ACCEPT_BALLOT,
+            101,
+            op_msgpack.clone(),
+            Some(&identity),
+        ));
+        assert_eq!(
+            rt.state.lock().peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingLocalCut { barrier_ts: 101 }
+        );
+
+        let progressed = PeerAdmissionPhase::AwaitingPeer {
+            required_history: HistoryMetadata {
+                version: 1,
+                freshness: 1,
+            },
+            clock_gt: 101,
+            history_ready: true,
+            clock_ready: false,
+        };
+        rt.state.lock().peer_admissions.get_mut(&2).unwrap().phase = progressed;
+        assert!(!rt.apply_terminal_commit_with_descriptor(
+            op_id,
+            NORMAL_ACCEPT_BALLOT,
+            101,
+            op_msgpack,
+            Some(&identity),
+        ));
+        assert_eq!(rt.state.lock().peer_admissions[&2].phase, progressed);
+    }
+
+    #[test]
+    fn pending_peer_is_filtered_from_new_protocol_snapshot() {
+        use crate::overlay::MemberIncarnation;
+
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        for node in [1, 2, 3] {
+            net.set_epoch(node, 1);
+        }
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.seed_membership_snapshot([
+            MemberIncarnation::new(1, 1),
+            MemberIncarnation::new(2, 1),
+            MemberIncarnation::new(3, 1),
+        ]);
+        rt.state.lock().peer_admissions.get_mut(&2).unwrap().phase = PeerAdmissionPhase::Admitted;
+
+        let filtered = rt.filter_admitted_protocol_snapshot(StrictProtocolSnapshot {
+            negotiated_version: STRICT_PROTOCOL_VERSION_V2,
+            targets: vec![
+                StrictProtocolTarget {
+                    node: 1,
+                    boot_epoch: 1,
+                },
+                StrictProtocolTarget {
+                    node: 2,
+                    boot_epoch: 1,
+                },
+                StrictProtocolTarget {
+                    node: 3,
+                    boot_epoch: 1,
+                },
+            ],
+        });
+
+        assert_eq!(
+            filtered.targets,
+            vec![
+                StrictProtocolTarget {
+                    node: 1,
+                    boot_epoch: 1,
+                },
+                StrictProtocolTarget {
+                    node: 2,
+                    boot_epoch: 1,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_coordinator_v2_proposal_is_rejected_without_state_mutation() {
+        use crate::overlay::MemberIncarnation;
+
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+        let op_id = make_op_id(2, 1, 500);
+        let before_clock = rt.state.lock().clock;
+
+        rt.recv_propose_v1_with_origin_epoch(
+            2,
+            1,
+            StrictProposeV1 {
+                coord_node: 2,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                ts_propose: 30,
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&500u64).unwrap()),
+                src_clock: 30,
+                protocol_version: STRICT_PROTOCOL_VERSION_V2,
+                frozen_targets: v2_frozen_targets_wire(),
+            },
+        )
+        .await;
+
+        let state = rt.state.lock();
+        assert_eq!(state.clock, before_clock);
+        assert!(!state.peer_clocks.contains_key(&2));
+        assert!(!state.pending_proposes.contains_key(&op_id));
+        assert!(!state.accepted_values.contains_key(&op_id));
+        drop(state);
+        assert!(!net.drain_captures().iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::ProposeAck(StrictProposeAck {
+                    op_id_hi,
+                    op_id_lo,
+                    ..
+                }),
+                ..
+            } if (*op_id_hi, *op_id_lo) == op_id
+        )));
+    }
+
+    #[test]
+    fn local_coordination_waits_for_reciprocal_remote_admission() {
+        use crate::overlay::MemberIncarnation;
+
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+        rt.finish_history_election_for_test();
+
+        assert!(!rt.local_coordination_ready());
+        rt.state.lock().peer_admissions.get_mut(&2).unwrap().phase = PeerAdmissionPhase::Admitted;
+        assert!(rt.local_coordination_ready());
+    }
+
+    #[tokio::test]
+    async fn authenticated_clock_tick_raises_restarted_local_clock_in_one_step() {
+        use crate::overlay::MemberIncarnation;
+
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+        rt.finish_history_election_for_test();
+
+        rt.dispatch(
+            2,
+            1,
+            true,
+            StrictBody::ClockTick(StrictClockTick {
+                src_node: 2,
+                src_clock: 80_000,
+            }),
+        )
+        .await;
+
+        let state = rt.state.lock();
+        assert_eq!(state.clock, 80_000);
+        assert_eq!(state.peer_clocks.get(&1), Some(&80_000));
     }
 
     #[test]
@@ -12129,6 +13906,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_late_phase_one_ack_cannot_change_the_frozen_accept_value() {
+        let net = MockNet::new(1, vec![1, 2, 3, 4]);
+        for node in 1..=4 {
+            net.set_epoch(node, 1);
+        }
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.finish_history_election_for_test();
+
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (delivered_tx, _delivered_rx) = oneshot::channel();
+        rt.clone()
+            .begin_propose_with_accepted(141u64, Some(accepted_tx), delivered_tx)
+            .await
+            .unwrap();
+        let op_id = *rt.state.lock().proposals.keys().next().unwrap();
+
+        for (node, ts_local) in [(2, 10), (3, 20)] {
+            rt.recv_propose_ack(
+                node,
+                StrictProposeAck {
+                    ack_node: node as u32,
+                    coord_node: 1,
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                    ts_local,
+                    src_clock: ts_local,
+                    ack_boot_epoch: 1,
+                },
+            )
+            .await;
+        }
+        let frozen_ts = rt.state.lock().proposals[&op_id]
+            .phase_two_accept
+            .as_ref()
+            .expect("fast quorum must freeze phase two")
+            .ts_final;
+
+        rt.recv_propose_ack(
+            4,
+            StrictProposeAck {
+                ack_node: 4,
+                coord_node: 1,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                ts_local: frozen_ts + 100,
+                src_clock: frozen_ts + 100,
+                ack_boot_epoch: 1,
+            },
+        )
+        .await;
+
+        for node in [2, 3] {
+            rt.recv_accept_ack(
+                node,
+                StrictAcceptAck {
+                    ack_node: node as u32,
+                    coord_node: 1,
+                    ballot: NORMAL_ACCEPT_BALLOT,
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                    accepted: true,
+                    src_clock: frozen_ts + 101,
+                    ack_boot_epoch: 1,
+                },
+            )
+            .await;
+        }
+
+        accepted_rx
+            .await
+            .expect("the frozen phase-two value must commit");
+        assert!(matches!(
+            rt.state.lock().terminal_decisions.get(&op_id),
+            Some(TerminalDecision::Commit(value)) if value.ts_final == frozen_ts
+        ));
+    }
+
+    fn accepted_v2_ack_retry_fixture(
+        rt: &StrictRuntime<CountingStrictRepo>,
+        seen_at: Instant,
+    ) -> (OpId, StrictAcceptAck) {
+        let op_id = make_op_id(2, 1, 142);
+        let op_msgpack = Bytes::from(rmp_serde::to_vec(&142u64).unwrap());
+        let mut state = rt.state.lock();
+        state.record_pending_propose_with_descriptor(
+            op_id,
+            2,
+            op_msgpack.clone(),
+            10,
+            seen_at,
+            STRICT_PROTOCOL_VERSION_V2,
+            Some(v2_frozen_targets()),
+            true,
+        );
+        state.accepted_values.insert(
+            op_id,
+            AcceptedValue {
+                ballot: NORMAL_ACCEPT_BALLOT,
+                ts_final: 10,
+                op_msgpack,
+            },
+        );
+        drop(state);
+        (
+            op_id,
+            StrictAcceptAck {
+                ack_node: 1,
+                coord_node: 2,
+                ballot: NORMAL_ACCEPT_BALLOT,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                accepted: true,
+                src_clock: 10,
+                ack_boot_epoch: 1,
+            },
+        )
+    }
+
+    #[test]
+    fn v2_accept_ack_retry_deadline_is_scoped_to_the_original_pending_value() {
+        let cfg = ReplicationConfig::default().with_propose_ttl(Duration::from_millis(10));
+        let (rt, _net, _repo) = v1_runtime(cfg);
+        let (op_id, ack) = accepted_v2_ack_retry_fixture(
+            &rt,
+            Instant::now() - Duration::from_millis(20),
+        );
+
+        assert!(
+            rt.accept_ack_retry_fence(op_id, &ack).is_none(),
+            "a late phase-two accept must not restart the original proposal TTL"
+        );
+    }
+
+    #[test]
+    fn v2_accept_ack_retry_preserves_route_flaps_but_fences_state_changes() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        let (op_id, ack) = accepted_v2_ack_retry_fixture(&rt, Instant::now());
+        let fence = rt
+            .accept_ack_retry_fence(op_id, &ack)
+            .expect("fresh accepted value must retain its ACK");
+
+        net.set_alive(vec![1]);
+        assert!(
+            rt.accept_ack_retry_is_valid(op_id, &ack, &fence),
+            "same-epoch route loss must not erase a frozen ACK"
+        );
+
+        rt.state
+            .lock()
+            .pending_proposes
+            .get_mut(&op_id)
+            .unwrap()
+            .frozen_targets = Some(vec![FrozenTarget::new(1, 1)]);
+        assert!(
+            !rt.accept_ack_retry_is_valid(op_id, &ack, &fence),
+            "a changed descriptor must stop the ACK retry"
+        );
+        rt.state
+            .lock()
+            .pending_proposes
+            .get_mut(&op_id)
+            .unwrap()
+            .frozen_targets = Some(v2_frozen_targets());
+
+        net.set_epoch(2, 2);
+        assert!(
+            !rt.accept_ack_retry_is_valid(op_id, &ack, &fence),
+            "a replacement coordinator epoch must stop the old ACK retry"
+        );
+        net.set_epoch(2, 1);
+        rt.state.lock().try_resolution_promise(op_id, 1);
+        assert!(
+            !rt.accept_ack_retry_is_valid(op_id, &ack, &fence),
+            "a superseding terminal promise must stop ballot-zero ACK repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_accept_ack_uses_targeted_delivery_before_sparse_broadcast_fallback() {
+        let cfg = ReplicationConfig::default()
+            .with_delivery_tick_interval(Duration::from_millis(100))
+            .with_propose_ttl(Duration::from_secs(1));
+        let (rt, net, _repo) = v1_runtime(cfg);
+        let (op_id, ack) = accepted_v2_ack_retry_fixture(&rt, Instant::now());
+        net.drain_captures();
+
+        rt.send_accept_ack(2, op_id, NORMAL_ACCEPT_BALLOT, true)
+            .await;
+        tokio::task::yield_now().await;
+        let captures = net.drain_captures();
+        assert!(captures.iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::AcceptAck(candidate),
+                ..
+            } if (candidate.op_id_hi, candidate.op_id_lo) == op_id
+        )));
+        assert!(!captures.iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictMulticast {
+                body: StrictBody::AcceptAck(candidate),
+                ..
+            } if (candidate.op_id_hi, candidate.op_id_lo) == op_id
+        )));
+        rt.shutdown.cancel();
+    }
+
+    #[tokio::test]
     async fn v2_accept_retries_peers_without_a_positive_ack_and_commits() {
         let cfg = ReplicationConfig::default()
             .with_delivery_tick_interval(Duration::from_millis(1))
@@ -12177,6 +14172,7 @@ mod tests {
             },
         )
         .await;
+        tokio::task::yield_now().await;
         let initial_accept = net
             .drain_captures()
             .into_iter()
@@ -12547,6 +14543,7 @@ mod tests {
 
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
         rt.resume_v2_accept_from_phase_one_quorum(op_id).await;
+        tokio::task::yield_now().await;
 
         let mut accept_dsts = net
             .drain_captures()
@@ -12668,14 +14665,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_v2_pending_fence_starts_resolution_before_the_full_proposal_ttl() {
+    async fn live_v2_pending_fence_starts_resolution_after_phase_two_grace() {
         let cfg = ReplicationConfig::default();
         let (rt, net, _repo) = v1_runtime(cfg.clone());
+        net.set_live_reliable_routes([1]);
         let op_id = make_op_id(2, 1, 140);
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&140u64).unwrap());
         let frozen_targets = v2_frozen_targets();
-        let stale_at =
-            Instant::now() - cfg.propose_ttl().checked_div(2).unwrap() - Duration::from_millis(1);
+        let stale_at = Instant::now()
+            - cfg.propose_ttl()
+            - phase_two_completion_grace(&cfg)
+            - Duration::from_millis(1);
         rt.state.lock().record_pending_propose_with_descriptor(
             op_id,
             2,
@@ -12690,6 +14690,7 @@ mod tests {
         net.drain_captures();
 
         assert!(request_terminal_repair_probe(&rt).await);
+        tokio::task::yield_now().await;
         let captures = net.drain_captures();
         assert!(captures.iter().any(|frame| {
             matches!(
@@ -12860,7 +14861,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proposal_deadline_releases_a_committed_but_undelivered_proposal() {
+    async fn proposal_deadline_preserves_a_committed_but_undelivered_proposal() {
         let propose_ttl = Duration::from_millis(10);
         let cfg = ReplicationConfig::default().with_propose_ttl(propose_ttl);
         let net = MockNet::new(1, vec![1]);
@@ -12877,7 +14878,7 @@ mod tests {
         );
         rt.finish_history_election_for_test();
 
-        let (delivered_tx, delivered_rx) = oneshot::channel();
+        let (delivered_tx, mut delivered_rx) = oneshot::channel();
         rt.clone()
             .begin_propose(134u64, delivered_tx)
             .await
@@ -12895,12 +14896,23 @@ mod tests {
             Some(TerminalDecision::Commit(_))
         ));
 
+        tokio::time::sleep(propose_ttl.saturating_mul(2)).await;
+        run_gc_pass(&rt);
         assert!(matches!(
-            delivered_rx.await,
-            Ok(Err(ReplicationError::ProposeTimeout(timeout))) if timeout == propose_ttl
+            delivered_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
-        assert!(!rt.state.lock().proposals.contains_key(&op_id));
+        assert!(rt.state.lock().proposals.contains_key(&op_id));
         assert!(rt.state.lock().terminal_decisions.contains_key(&op_id));
+
+        {
+            let mut state = rt.state.lock();
+            state.clock = state.clock.saturating_add(1);
+            let clock = state.clock;
+            state.peer_clocks.insert(1, clock);
+        }
+        run_delivery_pass(&rt).await;
+        assert!(matches!(delivered_rx.await, Ok(Ok(1))));
     }
 
     #[tokio::test]
@@ -13548,6 +15560,7 @@ mod tests {
             },
         )
         .await;
+        tokio::task::yield_now().await;
 
         assert!(rt.state.lock().pending_proposes[&op_id].v2_descriptor_durable);
         let record = rt
@@ -13759,6 +15772,7 @@ mod tests {
             },
         )
         .await;
+        tokio::task::yield_now().await;
 
         assert!(!rt.state.lock().accepted_values.contains_key(&op_id));
         assert!(net.drain_captures().iter().any(|frame| {

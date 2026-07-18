@@ -1163,6 +1163,16 @@ impl<'a> PrometheusWriter<'a> {
             "counter",
         );
         self.header(
+            "shitspeak_s2s_strict_replication_admission_peer_states",
+            "Strict topic-peer admission records by bounded convergence state; self is implicit and excluded.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_admission_highest_barrier",
+            "Highest logical strict timestamp currently fencing a pending peer admission across active strict topics.",
+            "gauge",
+        );
+        self.header(
             "shitspeak_s2s_distribution_events_total",
             "Distribution-tree control, forwarding, deadline, and fallback events.",
             "counter",
@@ -2662,6 +2672,15 @@ mod tests {
         assert!(rendered.contains(
             "# TYPE shitspeak_s2s_strict_replication_terminal_decisions_total counter\n"
         ));
+        assert!(
+            rendered
+                .contains("# TYPE shitspeak_s2s_strict_replication_admission_peer_states gauge\n")
+        );
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_strict_replication_admission_highest_barrier gauge\n"
+            )
+        );
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_deadline_wakes_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_proactive_events_total counter\n"));
     }

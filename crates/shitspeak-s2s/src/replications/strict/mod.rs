@@ -241,11 +241,14 @@ pub struct StrictDebugState {
     history_alive_peers: usize,
     clock: u64,
     earliest_pending: Option<((u64, u64), u64, shitspeak_core::NodeIdentifier)>,
+    earliest_pending_promise_ballot: Option<u64>,
     earliest_pending_protocol_version: Option<u32>,
     earliest_buffered: Option<((u64, u64), u64)>,
     /// Oldest local proposal and its phase-one/phase-two quorum progress:
     /// `(op_id, propose_acks, positive_accept_acks, targets, accept_started, committed)`.
     local_proposal_quorum: Option<((u64, u64), usize, usize, usize, bool, bool)>,
+    local_proposal_acks: Option<Vec<(shitspeak_core::NodeIdentifier, u64)>>,
+    local_proposal_invalid_targets: Option<Vec<shitspeak_core::NodeIdentifier>>,
     local_proposal_accept_ack_count: Option<usize>,
     local_proposal_accept_acks: Option<Vec<(shitspeak_core::NodeIdentifier, bool)>>,
     local_proposal_phase_two_retry: Option<(usize, usize)>,
@@ -255,6 +258,11 @@ pub struct StrictDebugState {
     buffered_commits: usize,
     unresolved_promises: usize,
     unresolved_terminal_promises: usize,
+    admitted_peers: usize,
+    awaiting_local_cut_peers: usize,
+    awaiting_peer_proof_peers: usize,
+    pending_admission_proofs: Vec<(shitspeak_core::NodeIdentifier, bool, bool)>,
+    highest_admission_barrier: u64,
     active_recoveries: usize,
 }
 
@@ -281,6 +289,9 @@ impl StrictDebugState {
     pub fn earliest_pending(&self) -> Option<((u64, u64), u64, shitspeak_core::NodeIdentifier)> {
         self.earliest_pending
     }
+    pub fn earliest_pending_promise_ballot(&self) -> Option<u64> {
+        self.earliest_pending_promise_ballot
+    }
     pub fn earliest_pending_protocol_version(&self) -> Option<u32> {
         self.earliest_pending_protocol_version
     }
@@ -291,6 +302,12 @@ impl StrictDebugState {
     /// `(op_id, propose_acks, positive_accept_acks, targets, accept_started, committed)`.
     pub fn local_proposal_quorum(&self) -> Option<((u64, u64), usize, usize, usize, bool, bool)> {
         self.local_proposal_quorum
+    }
+    pub fn local_proposal_acks(&self) -> Option<&[(shitspeak_core::NodeIdentifier, u64)]> {
+        self.local_proposal_acks.as_deref()
+    }
+    pub fn local_proposal_invalid_targets(&self) -> Option<&[shitspeak_core::NodeIdentifier]> {
+        self.local_proposal_invalid_targets.as_deref()
     }
     pub fn local_proposal_accept_ack_count(&self) -> Option<usize> {
         self.local_proposal_accept_ack_count
@@ -318,6 +335,21 @@ impl StrictDebugState {
     }
     pub fn unresolved_terminal_promises(&self) -> usize {
         self.unresolved_terminal_promises
+    }
+    pub fn admitted_peers(&self) -> usize {
+        self.admitted_peers
+    }
+    pub fn awaiting_local_cut_peers(&self) -> usize {
+        self.awaiting_local_cut_peers
+    }
+    pub fn awaiting_peer_proof_peers(&self) -> usize {
+        self.awaiting_peer_proof_peers
+    }
+    pub fn pending_admission_proofs(&self) -> &[(shitspeak_core::NodeIdentifier, bool, bool)] {
+        &self.pending_admission_proofs
+    }
+    pub fn highest_admission_barrier(&self) -> u64 {
+        self.highest_admission_barrier
     }
     pub fn active_recoveries(&self) -> usize {
         self.active_recoveries

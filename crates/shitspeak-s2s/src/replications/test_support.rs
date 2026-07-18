@@ -1033,7 +1033,7 @@ mod e2e_tests {
             CancellationToken::new(),
             default_cfg(),
         );
-        // No start(): we want fully synchronous control.
+        // No start(): only the detached ACK effect needs one scheduler turn.
 
         rt.recv_propose_v1(
             1,
@@ -1058,10 +1058,23 @@ mod e2e_tests {
             },
         )
         .await;
+        tokio::task::yield_now().await;
 
         let caps = net.captures();
-        assert_eq!(caps.len(), 1);
-        match &caps[0] {
+        let targeted_ack = caps
+            .iter()
+            .find(|frame| {
+                matches!(
+                    frame,
+                    CapturedFrame::StrictUnicast {
+                        dst: 1,
+                        body: StrictBody::ProposeAck(_),
+                        ..
+                    }
+                )
+            })
+            .expect("targeted propose ack must be emitted");
+        match targeted_ack {
             CapturedFrame::StrictUnicast { dst, body, .. } => {
                 assert_eq!(*dst, 1);
                 match body {
