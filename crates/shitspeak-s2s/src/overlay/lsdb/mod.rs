@@ -12,7 +12,8 @@ pub use advert::{
 pub use store::{
     AdmissionResult, ApplicationServices, DistributionCapabilities, LinkAdvertised, LinkStateDb,
     LinkTransportAdvertised, LsaEntry, LsaFloor, OriginVersion, ReplicationServices,
-    STRICT_REPLICATION_PROTOCOL_VERSION, spawn_floor_persister,
+    STRICT_REPLICATION_PROTOCOL_VERSION, STRICT_REPLICATION_TRANSIT_PROTOCOL_VERSION,
+    spawn_floor_persister,
 };
 pub use sync::{
     full_pull, handle_request as handle_sync_request, handle_response as handle_sync_response,

@@ -440,6 +440,20 @@ impl OverlayNetwork {
         self.inner.emitter.strict_replication_protocol_version()
     }
 
+    /// Whether this node is configured as a strict-replication participant.
+    /// A disabled participant can still advertise opaque transit support.
+    pub(crate) fn local_strict_replication_enabled(&self) -> bool {
+        self.inner.emitter.replication_services().strict()
+    }
+
+    /// Locally advertised opaque strict-frame transit capability. This is
+    /// independent of local strict-replication participation/readiness.
+    pub(crate) fn local_strict_replication_transit_protocol_version(&self) -> u32 {
+        self.inner
+            .emitter
+            .strict_replication_transit_protocol_version()
+    }
+
     /// Conservative budget for a complete strict routed-unicast replication
     /// payload inside one transport frame.
     pub(crate) fn max_replication_payload_bytes(&self) -> usize {
@@ -584,58 +598,45 @@ impl OverlayNetwork {
             .collect()
     }
 
-    /// Minimum cumulative strict-replication protocol version across every
-    /// active, non-quarantined overlay member. Legacy LSAs and an empty view
-    /// both yield zero, so callers can safely gate new strict frames with a
-    /// simple minimum-version comparison.
+    /// Compatibility view of the participant protocol floor across active,
+    /// non-quarantined strict-replication members. Legacy participants and an
+    /// empty view both yield zero.
+    ///
+    /// Deprecated: protocol negotiation belongs to the replication layer.
+    /// New callers should derive participant and transit floors from a
+    /// replication protocol snapshot rather than asking the overlay to make
+    /// a replication policy decision.
+    #[deprecated(note = "derive replication protocol floors in the replication layer")]
     pub fn minimum_strict_replication_protocol_version(&self) -> u32 {
-        let member_floor = membership::minimum_strict_replication_protocol_version(
-            self.inner.table.snapshot(),
-            |node| self.inner.duplicate_detector.is_quarantined(node),
-        );
-        member_floor.min(self.inner.emitter.strict_replication_protocol_version())
+        self.members()
+            .into_iter()
+            .filter(|member| member.status().is_reachable())
+            .filter(|member| member.replication_services().strict())
+            .map(|member| member.strict_replication_protocol_version())
+            .chain(
+                self.inner
+                    .emitter
+                    .replication_services()
+                    .strict()
+                    .then_some(self.inner.emitter.strict_replication_protocol_version()),
+            )
+            .min()
+            .unwrap_or_default()
     }
 
-    /// Freeze the strict-replication targets and cumulative protocol floor
-    /// from one membership snapshot. The floor deliberately covers every
-    /// reachable member, including relays; targets include only members that
-    /// advertise the strict replication service.
-    pub(crate) fn strict_replication_target_snapshot(&self) -> (u32, Vec<(NodeIdentifier, u64)>) {
-        let members = self.inner.table.snapshot();
-        let local_protocol_version = self.inner.emitter.strict_replication_protocol_version();
-        let mut floor: Option<u32> = None;
-        let mut targets = Vec::new();
-        for member in members {
-            if !member.status().is_reachable()
-                || self
-                    .inner
-                    .duplicate_detector
-                    .is_quarantined(member.node_id())
-            {
-                continue;
-            }
-            floor = Some(match floor {
-                Some(current) => current.min(member.strict_replication_protocol_version()),
-                None => member.strict_replication_protocol_version(),
-            });
-            if member.replication_services().strict() {
-                targets.push((member.node_id(), member.boot_epoch()));
-            }
-        }
-        (
-            floor.unwrap_or_default().min(local_protocol_version),
-            targets,
-        )
-    }
-
-    /// Number of active, non-quarantined overlay members below the requested
-    /// cumulative strict-replication protocol version.
+    /// Number of active, non-quarantined strict participants below the
+    /// requested cumulative protocol version.
+    ///
+    /// Deprecated: unsupported-peer diagnostics are replication policy and
+    /// should be calculated by the replication layer from a frozen snapshot.
+    #[deprecated(note = "calculate unsupported replication peers in the replication layer")]
     pub fn unsupported_strict_replication_protocol_peers(&self, required_version: u32) -> usize {
-        membership::unsupported_strict_replication_protocol_peers(
-            self.inner.table.snapshot(),
-            required_version,
-            |node| self.inner.duplicate_detector.is_quarantined(node),
-        )
+        self.members()
+            .into_iter()
+            .filter(|member| member.status().is_reachable())
+            .filter(|member| member.replication_services().strict())
+            .filter(|member| member.strict_replication_protocol_version() < required_version)
+            .count()
     }
 
     /// IDs of active members that advertise application voice service.

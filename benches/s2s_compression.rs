@@ -61,6 +61,7 @@ fn link_ads(count: u32, links_per_ad: u32) -> Vec<overlay_pb::LinkStateAdvert> {
             distribution_protocol_version: 0,
             distribution_profile_ids: Vec::new(),
             strict_replication_protocol_version: 0,
+            strict_replication_transit_protocol_version: 0,
         })
         .collect()
 }

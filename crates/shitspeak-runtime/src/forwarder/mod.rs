@@ -53,6 +53,10 @@ impl ForwarderConfig {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 struct ForwarderReplicationConfig {
+    /// Enables local replication participants and repositories. This setting
+    /// does not control opaque strict-frame transit: the overlay advertises
+    /// its transport capability independently, so a replication-disabled
+    /// forwarder can still relay v2 frames safely.
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
@@ -651,5 +655,27 @@ mod tests {
                 .map(String::as_str),
             Some("forwarder")
         );
+    }
+
+    #[test]
+    fn replication_disabled_forwarder_needs_no_storage_or_manager() {
+        let config = parse_forwarder_config(
+            r#"
+            [s2s]
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "0.0.0.0:64739"
+            "#,
+        );
+
+        let resolved = config
+            .replication
+            .resolve(None)
+            .expect("disabled replication does not require persistence");
+        assert!(!resolved.runs_manager());
+        assert!(!resolved.services.strict());
+        assert!(!resolved.services.content());
     }
 }

@@ -76,6 +76,10 @@ message LinkStateAdvert {
   // Cumulative strict-replication protocol version. Zero, including an
   // absent field from an older peer, means terminal resolution is unsupported.
   uint32 strict_replication_protocol_version = 16;
+  // Cumulative protocol version this node can forward opaquely through the
+  // overlay. This is independent of local replication repositories and lets
+  // transport-only nodes relay newer replication frames safely.
+  uint32 strict_replication_transit_protocol_version = 17;
 }
 
 // One advertised edge from `origin` to `neighbor`.

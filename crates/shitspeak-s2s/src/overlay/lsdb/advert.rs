@@ -49,7 +49,7 @@ use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
 use super::store::{
     AdmissionResult, ApplicationServices, DistributionCapabilities, LinkAdvertised, LinkStateDb,
     LinkTransportAdvertised, LsaEntry, ReplicationServices, STRICT_REPLICATION_PROTOCOL_VERSION,
-    is_strictly_newer,
+    STRICT_REPLICATION_TRANSIT_PROTOCOL_VERSION, is_strictly_newer,
 };
 
 const RTT_GATE_BUCKET_US: u64 = 25_000;
@@ -95,6 +95,7 @@ pub struct LsaEmitter {
     transit_disabled: AtomicBool,
     strict_replication_enabled: AtomicBool,
     strict_replication_protocol_version: AtomicU32,
+    strict_replication_transit_protocol_version: AtomicU32,
     strict_replication_protocol_state: parking_lot::Mutex<StrictReplicationProtocolState>,
     content_replication_enabled: AtomicBool,
     owner_replication_enabled: AtomicBool,
@@ -139,6 +140,12 @@ impl LsaEmitter {
             strict_replication_enabled: AtomicBool::new(replication_services.strict()),
             strict_replication_protocol_version: AtomicU32::new(
                 strict_replication_protocol_state.advertised_version(),
+            ),
+            // Transit support is a property of the overlay wire implementation,
+            // not of local replication repositories. Modern binaries can relay
+            // opaque strict-replication frames even when participation is off.
+            strict_replication_transit_protocol_version: AtomicU32::new(
+                STRICT_REPLICATION_TRANSIT_PROTOCOL_VERSION,
             ),
             strict_replication_protocol_state: parking_lot::Mutex::new(
                 strict_replication_protocol_state,
@@ -194,6 +201,13 @@ impl LsaEmitter {
     /// LSAs.
     pub fn strict_replication_protocol_version(&self) -> u32 {
         self.strict_replication_protocol_version
+            .load(Ordering::Relaxed)
+    }
+
+    /// Cumulative strict-replication protocol version this overlay can relay
+    /// opaquely, independent of local replication participation/readiness.
+    pub fn strict_replication_transit_protocol_version(&self) -> u32 {
+        self.strict_replication_transit_protocol_version
             .load(Ordering::Relaxed)
     }
 
@@ -348,6 +362,7 @@ struct LsaContent {
     replication_services: ReplicationServices,
     application_services: ApplicationServices,
     strict_replication_protocol_version: u32,
+    strict_replication_transit_protocol_version: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -428,6 +443,11 @@ fn build_local_lsa_content(
         } else {
             emitter.strict_replication_protocol_version()
         },
+        strict_replication_transit_protocol_version: if tombstone {
+            0
+        } else {
+            emitter.strict_replication_transit_protocol_version()
+        },
     }
 }
 
@@ -445,6 +465,8 @@ fn stamp_local_lsa(emitter: &LsaEmitter, content: LsaContent) -> LsaEntry {
         replication_services: content.replication_services,
         application_services: content.application_services,
         strict_replication_protocol_version: content.strict_replication_protocol_version,
+        strict_replication_transit_protocol_version: content
+            .strict_replication_transit_protocol_version,
     }
 }
 
@@ -662,6 +684,9 @@ fn content_gate_fingerprint(content: &LsaContent, cfg: &OverlayConfig) -> u64 {
     content
         .strict_replication_protocol_version
         .hash(&mut hasher);
+    content
+        .strict_replication_transit_protocol_version
+        .hash(&mut hasher);
     content.application_services.voice().hash(&mut hasher);
     content
         .application_services
@@ -693,6 +718,9 @@ fn content_identity_fingerprint(content: &LsaContent) -> u64 {
     content.replication_services.owner().hash(&mut hasher);
     content
         .strict_replication_protocol_version
+        .hash(&mut hasher);
+    content
+        .strict_replication_transit_protocol_version
         .hash(&mut hasher);
     content.application_services.voice().hash(&mut hasher);
     content
@@ -1552,6 +1580,14 @@ mod tests {
             lsa.to_pb().strict_replication_protocol_version,
             STRICT_REPLICATION_PROTOCOL_VERSION
         );
+        assert_eq!(
+            lsa.strict_replication_transit_protocol_version(),
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            lsa.to_pb().strict_replication_transit_protocol_version,
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        );
 
         let cfg = OverlayConfig::new(vec![]);
         let content = build_local_lsa_content(&emitter, &[], false);
@@ -1561,6 +1597,32 @@ mod tests {
         let changed = content_fingerprint(&legacy, &cfg);
         assert_ne!(original.identity, changed.identity);
         assert_ne!(original.gate, changed.gate);
+
+        let mut transit_legacy = content.clone();
+        transit_legacy.strict_replication_transit_protocol_version = 0;
+        let transit_changed = content_fingerprint(&transit_legacy, &cfg);
+        assert_ne!(original.identity, transit_changed.identity);
+        assert_ne!(original.gate, transit_changed.gate);
+    }
+
+    #[test]
+    fn transport_only_emitter_advertises_transit_without_participating() {
+        let emitter = LsaEmitter::new(
+            1,
+            100,
+            vec![],
+            Arc::new(AtomicU64::new(10)),
+            true,
+            ReplicationServices::NONE,
+            false,
+            ApplicationServices::NONE,
+        );
+        let lsa = build_local_lsa(&emitter, &[], false);
+        assert_eq!(lsa.strict_replication_protocol_version(), 0);
+        assert_eq!(
+            lsa.strict_replication_transit_protocol_version(),
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        );
     }
 
     #[test]
@@ -2090,6 +2152,7 @@ mod tests {
                 replication_services: ReplicationServices::ALL,
                 application_services: ApplicationServices::ALL,
                 strict_replication_protocol_version: 0,
+                strict_replication_transit_protocol_version: 0,
             }),
             AdmissionResult::Accepted
         );

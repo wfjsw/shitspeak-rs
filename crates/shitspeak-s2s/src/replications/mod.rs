@@ -33,6 +33,7 @@ pub mod error;
 pub mod metrics;
 pub mod owner;
 pub mod proto;
+pub(crate) mod protocol;
 pub mod strict;
 mod topic;
 

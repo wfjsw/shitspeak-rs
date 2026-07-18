@@ -88,7 +88,11 @@ struct CapturedBootEpoch {
     durability: BootEpochDurability,
 }
 
-fn strict_replication_journal_ready(
+/// Probe the durable state required by a local strict-replication participant.
+///
+/// This deliberately does not describe transit support: a transport-only
+/// forwarder can relay opaque strict frames without opening a local journal.
+fn strict_replication_participant_journal_ready(
     persistence_dir: Option<&Path>,
     self_id: NodeIdentifier,
 ) -> io::Result<bool> {
@@ -226,7 +230,10 @@ fn create_directory_with_durable_entries(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn spawn_strict_replication_durability_monitor(
+/// Track local participant durability and update only the participant
+/// capability advertised by `LsaEmitter`. Transit capability is initialized
+/// independently by the emitter and is never changed by this task.
+fn spawn_strict_replication_participant_durability_monitor(
     persistence_dir: Option<PathBuf>,
     self_id: NodeIdentifier,
     boot_epoch: u64,
@@ -615,6 +622,9 @@ pub(crate) struct OverlayInner {
     pub hello: Arc<HelloContext>,
     pub shutdown: CancellationToken,
     pub cfg: OverlayConfig,
+    /// Whether this overlay owns local strict-replication state. Transport-
+    /// only forwarders leave this disabled while still advertising transit.
+    strict_replication_participation_enabled: bool,
     strict_replication_boot_epoch_durability: BootEpochDurability,
     strict_replication_journal_ready_at_start: bool,
 }
@@ -629,21 +639,27 @@ impl OverlayInner {
         self_addresses: Vec<PeerAddress>,
     ) -> Self {
         let self_id = transport.local_node_id();
+        let strict_replication_participation_enabled = replication_services.strict();
         let captured_boot_epoch = capture_monotonic_boot_epoch(self_id, cfg.persistence_dir());
         let boot_epoch = captured_boot_epoch.value;
-        let strict_replication_journal_ready_at_start = match strict_replication_journal_ready(
-            cfg.persistence_dir().map(|dir| dir.as_path()),
-            self_id,
-        ) {
-            Ok(ready) => ready,
-            Err(error) => {
-                warn!(
-                    persistence_dir = ?cfg.persistence_dir(),
-                    %error,
-                    "strict replication durable storage is not ready; advertising v0"
-                );
-                false
+        let strict_replication_journal_ready_at_start = if strict_replication_participation_enabled
+        {
+            match strict_replication_participant_journal_ready(
+                cfg.persistence_dir().map(|dir| dir.as_path()),
+                self_id,
+            ) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    warn!(
+                        persistence_dir = ?cfg.persistence_dir(),
+                        %error,
+                        "strict replication durable storage is not ready; advertising v0"
+                    );
+                    false
+                }
             }
+        } else {
+            false
         };
         let strict_replication_durable_state_ready_at_start =
             captured_boot_epoch.durability.readiness.is_ready()
@@ -726,6 +742,7 @@ impl OverlayInner {
             hello,
             shutdown,
             cfg,
+            strict_replication_participation_enabled,
             strict_replication_boot_epoch_durability: captured_boot_epoch.durability,
             strict_replication_journal_ready_at_start,
         }
@@ -777,16 +794,18 @@ impl OverlayInner {
 
         spawn_hello_task(self.hello.clone());
         spawn_link_up_watcher(self.hello.clone(), self.neighbor.subscribe_link_up());
-        spawn_strict_replication_durability_monitor(
-            self.cfg.persistence_dir().cloned(),
-            self.self_id,
-            self.boot_epoch,
-            self.strict_replication_boot_epoch_durability,
-            self.emitter.clone(),
-            self.cfg.peer_persistence_interval(),
-            self.shutdown.clone(),
-            self.strict_replication_journal_ready_at_start,
-        );
+        if self.strict_replication_participation_enabled {
+            spawn_strict_replication_participant_durability_monitor(
+                self.cfg.persistence_dir().cloned(),
+                self.self_id,
+                self.boot_epoch,
+                self.strict_replication_boot_epoch_durability,
+                self.emitter.clone(),
+                self.cfg.peer_persistence_interval(),
+                self.shutdown.clone(),
+                self.strict_replication_journal_ready_at_start,
+            );
+        }
         self.flood_pacer
             .clone()
             .spawn(self.cfg.clone(), self.shutdown.clone());
@@ -1070,19 +1089,19 @@ mod tests {
     }
 
     #[test]
-    fn strict_replication_protocol_v2_requires_active_durable_storage() {
-        assert!(!strict_replication_journal_ready(None, 7).unwrap());
-        assert!(!strict_replication_journal_ready(Some(Path::new("")), 7).unwrap());
+    fn strict_replication_participant_v2_requires_active_durable_storage() {
+        assert!(!strict_replication_participant_journal_ready(None, 7).unwrap());
+        assert!(!strict_replication_participant_journal_ready(Some(Path::new("")), 7).unwrap());
 
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("persistence");
-        assert!(strict_replication_journal_ready(Some(&root), 7).unwrap());
+        assert!(strict_replication_participant_journal_ready(Some(&root), 7).unwrap());
         let journal_dir = root.join(STRICT_REPLICATION_JOURNAL_DIRECTORY);
         assert!(journal_dir.is_dir());
         assert!(std::fs::read_dir(&journal_dir).unwrap().next().is_none());
 
         let regular_file = dir.path().join("not-a-directory");
         std::fs::write(&regular_file, b"not a directory").unwrap();
-        assert!(strict_replication_journal_ready(Some(&regular_file), 7).is_err());
+        assert!(strict_replication_participant_journal_ready(Some(&regular_file), 7).is_err());
     }
 }

@@ -33,6 +33,7 @@ use super::super::proto::{
     StrictResolutionAck, StrictResolutionHint, StrictResolutionObserved, StrictResolutionPrepare,
     StrictTerminalOutcome, StrictTerminalState,
 };
+use super::super::protocol::{self as replication_protocol, ProtocolMember};
 use super::super::topic::ErasedStrictRuntime;
 use super::terminal_journal::{
     FrozenTarget, TerminalDecision as JournalTerminalDecision, TerminalJournal,
@@ -99,17 +100,7 @@ pub(crate) fn fast_quorum_size(n: usize) -> usize {
 
 /// A single LSDB/membership view used to freeze a proposal's target
 /// incarnations together with the cumulative strict-protocol floor.
-#[derive(Clone, Debug)]
-pub(crate) struct StrictProtocolSnapshot {
-    pub(crate) negotiated_version: u32,
-    pub(crate) targets: Vec<StrictProtocolTarget>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct StrictProtocolTarget {
-    pub(crate) node: NodeIdentifier,
-    pub(crate) boot_epoch: u64,
-}
+pub(crate) use replication_protocol::{StrictProtocolSnapshot, StrictProtocolTarget};
 
 pub(crate) struct TerminalStatePage {
     pub(crate) states: Vec<StrictTerminalState>,
@@ -234,10 +225,9 @@ pub(crate) trait StrictNet: Send + Sync + 'static {
     fn has_live_route(&self, dst: NodeIdentifier, level: ServiceLevel) -> bool {
         self.has_route(dst, level)
     }
-    /// Lowest cumulative strict protocol version advertised by every active
-    /// S2S member. Relay-only members are intentionally included by the
-    /// production implementation because an older relay strips unknown v1
-    /// bodies and LSA fields.
+    /// Effective strict protocol floor for this replication view. The
+    /// participant floor covers strict endpoints; the transit floor covers
+    /// relay-capable members so an old relay cannot strip opaque frames.
     fn strict_replication_protocol_version(&self) -> u32 {
         0
     }
@@ -254,9 +244,10 @@ pub(crate) trait StrictNet: Send + Sync + 'static {
     fn peer_strict_replication_protocol_version(&self, _peer: NodeIdentifier) -> u32 {
         self.strict_replication_protocol_version()
     }
-    /// Freeze the capability floor and strict-replication target set from one
-    /// membership view. Production avoids sampling these independently while
-    /// LSDB updates are in flight; the default keeps test transports simple.
+    /// Freeze the participant/transit capability floor and strict target set
+    /// from one membership view. Production avoids sampling these
+    /// independently while LSDB updates are in flight; the default keeps
+    /// test transports simple.
     fn strict_protocol_snapshot(&self) -> StrictProtocolSnapshot {
         StrictProtocolSnapshot {
             negotiated_version: self.strict_replication_protocol_version(),
@@ -323,6 +314,35 @@ pub(crate) struct OverlayStrictNet {
 }
 
 impl OverlayStrictNet {
+    fn protocol_members(&self) -> Vec<ProtocolMember> {
+        self.overlay
+            .members()
+            .into_iter()
+            .map(|member| {
+                ProtocolMember::new(
+                    member.node_id(),
+                    member.boot_epoch(),
+                    member.status().is_reachable(),
+                    member.replication_services().strict(),
+                    member.strict_replication_protocol_version(),
+                    !member.transit_disabled(),
+                    member.strict_replication_transit_protocol_version(),
+                )
+            })
+            .collect()
+    }
+
+    fn protocol_snapshot(&self) -> StrictProtocolSnapshot {
+        replication_protocol::strict_protocol_snapshot(
+            self.protocol_members(),
+            self.overlay
+                .local_strict_replication_enabled()
+                .then(|| self.overlay.local_strict_replication_protocol_version()),
+            self.overlay
+                .local_strict_replication_transit_protocol_version(),
+        )
+    }
+
     fn strict_origin_auth(
         &self,
         topic: &str,
@@ -752,11 +772,23 @@ impl StrictNet for OverlayStrictNet {
     }
 
     fn alive_members(&self) -> Vec<NodeIdentifier> {
-        self.overlay.strict_replication_members()
+        self.protocol_snapshot()
+            .targets
+            .into_iter()
+            .map(|target| target.node)
+            .collect()
     }
 
     fn strict_replication_protocol_version(&self) -> u32 {
-        self.overlay.minimum_strict_replication_protocol_version()
+        replication_protocol::strict_protocol_floors(
+            self.protocol_members(),
+            self.overlay
+                .local_strict_replication_enabled()
+                .then(|| self.overlay.local_strict_replication_protocol_version()),
+            self.overlay
+                .local_strict_replication_transit_protocol_version(),
+        )
+        .2
     }
 
     fn local_strict_replication_protocol_version(&self) -> u32 {
@@ -771,19 +803,12 @@ impl StrictNet for OverlayStrictNet {
     }
 
     fn strict_protocol_snapshot(&self) -> StrictProtocolSnapshot {
-        let (negotiated_version, targets) = self.overlay.strict_replication_target_snapshot();
-        StrictProtocolSnapshot {
-            negotiated_version,
-            targets: targets
-                .into_iter()
-                .map(|(node, boot_epoch)| StrictProtocolTarget { node, boot_epoch })
-                .collect(),
-        }
+        self.protocol_snapshot()
     }
 
     fn unsupported_active_protocol_peers(&self, required_version: u32) -> usize {
-        self.overlay
-            .unsupported_strict_replication_protocol_peers(required_version)
+        replication_protocol::unsupported_protocol_peers(self.protocol_members(), required_version)
+            .total()
     }
 
     fn strict_protocol_state_dir(&self) -> Option<PathBuf> {

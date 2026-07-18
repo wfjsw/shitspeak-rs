@@ -46,6 +46,11 @@ use shitspeak_proto::s2s_overlay_proto::link_state_advert_capabilities as lsa_ca
 /// legacy peers that omit the capability from their LSA.
 pub const STRICT_REPLICATION_PROTOCOL_VERSION: u32 = 2;
 
+/// Latest strict-replication protocol this binary can forward opaquely
+/// through the overlay. Kept separate from the local participant capability
+/// so transport-only nodes can advertise relay support without repositories.
+pub const STRICT_REPLICATION_TRANSIT_PROTOCOL_VERSION: u32 = 2;
+
 /// Replication service kinds advertised by one overlay member.
 ///
 /// Missing fields on the wire default to enabled to keep rolling upgrades
@@ -260,6 +265,7 @@ pub struct LsaEntry {
     pub replication_services: ReplicationServices,
     pub application_services: ApplicationServices,
     pub(crate) strict_replication_protocol_version: u32,
+    pub(crate) strict_replication_transit_protocol_version: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -377,6 +383,12 @@ fn describe_lsa_entry_delta(previous: Option<&LsaEntry>, current: &LsaEntry) -> 
         "strict_replication_protocol_version",
         previous.strict_replication_protocol_version,
         current.strict_replication_protocol_version,
+    );
+    push_scalar_change(
+        &mut changes,
+        "strict_replication_transit_protocol_version",
+        previous.strict_replication_transit_protocol_version,
+        current.strict_replication_transit_protocol_version,
     );
     push_scalar_change(
         &mut changes,
@@ -614,6 +626,13 @@ impl LsaEntry {
         self.strict_replication_protocol_version
     }
 
+    /// Cumulative strict-replication protocol version this member can forward
+    /// opaquely through the overlay. This is independent of local
+    /// replication repositories and may be non-zero for transport-only nodes.
+    pub fn strict_replication_transit_protocol_version(&self) -> u32 {
+        self.strict_replication_transit_protocol_version
+    }
+
     /// Build from a wire LSA. Returns `None` if `origin` is not a valid
     /// `NodeIdentifier` (overflows u16).
     pub fn from_pb(pb: &pb::LinkStateAdvert) -> Option<Self> {
@@ -692,6 +711,8 @@ impl LsaEntry {
                 ),
             ),
             strict_replication_protocol_version: pb.strict_replication_protocol_version,
+            strict_replication_transit_protocol_version: pb
+                .strict_replication_transit_protocol_version,
         })
     }
 
@@ -767,6 +788,8 @@ impl LsaEntry {
                 .profile_ids()
                 .to_vec(),
             strict_replication_protocol_version: self.strict_replication_protocol_version,
+            strict_replication_transit_protocol_version: self
+                .strict_replication_transit_protocol_version,
         }
     }
 }
@@ -1353,6 +1376,7 @@ mod tests {
             replication_services: ReplicationServices::ALL,
             application_services: ApplicationServices::ALL,
             strict_replication_protocol_version: 0,
+            strict_replication_transit_protocol_version: 0,
         }
     }
 
@@ -1689,6 +1713,7 @@ mod tests {
     fn strict_replication_protocol_version_roundtrips_and_defaults_to_zero() {
         let mut lsa = entry(1, 100, 1, false);
         lsa.strict_replication_protocol_version = STRICT_REPLICATION_PROTOCOL_VERSION;
+        lsa.strict_replication_transit_protocol_version = STRICT_REPLICATION_PROTOCOL_VERSION;
 
         let pb = lsa.to_pb();
         assert_eq!(
@@ -1699,6 +1724,12 @@ mod tests {
             LsaEntry::from_pb(&pb)
                 .unwrap()
                 .strict_replication_protocol_version(),
+            STRICT_REPLICATION_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            LsaEntry::from_pb(&pb)
+                .unwrap()
+                .strict_replication_transit_protocol_version(),
             STRICT_REPLICATION_PROTOCOL_VERSION
         );
 
@@ -1712,6 +1743,12 @@ mod tests {
             LsaEntry::from_pb(&legacy)
                 .unwrap()
                 .strict_replication_protocol_version(),
+            0
+        );
+        assert_eq!(
+            LsaEntry::from_pb(&legacy)
+                .unwrap()
+                .strict_replication_transit_protocol_version(),
             0
         );
     }
