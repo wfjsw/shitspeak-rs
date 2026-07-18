@@ -38,9 +38,9 @@ impl From<ProtocolVersion> for u32 {
 impl From<u64> for ProtocolVersion {
     fn from(version: u64) -> Self {
         Self {
-            major: ((version >> 48) & 0xFFFF) as u64,
-            minor: ((version >> 32) & 0xFFFF) as u64,
-            patch: ((version >> 16) & 0xFFFF) as u64,
+            major: (version >> 48) & 0xFFFF,
+            minor: (version >> 32) & 0xFFFF,
+            patch: (version >> 16) & 0xFFFF,
         }
     }
 }
@@ -51,8 +51,8 @@ impl From<ProtocolVersion> for u64 {
     }
 }
 
-impl ToString for ProtocolVersion {
-    fn to_string(&self) -> String {
-        format!("{}.{}.{}", self.major, self.minor, self.patch)
+impl std::fmt::Display for ProtocolVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
     }
 }

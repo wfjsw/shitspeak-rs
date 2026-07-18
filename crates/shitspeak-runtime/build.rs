@@ -125,17 +125,17 @@ fn emit_git_metadata_rerun_hints() {
         git_dir.join("objects").join("pack").display()
     );
 
-    if let Ok(commit_hash) = git_head_from_filesystem() {
-        if commit_hash.len() == 40 {
-            println!(
-                "cargo:rerun-if-changed={}",
-                git_dir
-                    .join("objects")
-                    .join(&commit_hash[..2])
-                    .join(&commit_hash[2..])
-                    .display()
-            );
-        }
+    if let Ok(commit_hash) = git_head_from_filesystem()
+        && commit_hash.len() == 40
+    {
+        println!(
+            "cargo:rerun-if-changed={}",
+            git_dir
+                .join("objects")
+                .join(&commit_hash[..2])
+                .join(&commit_hash[2..])
+                .display()
+        );
     }
 }
 

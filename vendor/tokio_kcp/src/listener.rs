@@ -183,8 +183,7 @@ impl KcpListener {
     pub async fn accept(&mut self) -> KcpResult<(KcpStream, SocketAddr)> {
         match self.accept_rx.recv().await {
             Some(s) => Ok(s),
-            None => Err(KcpError::IoError(io::Error::new(
-                ErrorKind::Other,
+            None => Err(KcpError::IoError(io::Error::other(
                 "accept channel closed unexpectedly",
             ))),
         }
@@ -193,7 +192,7 @@ impl KcpListener {
     pub fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<KcpResult<(KcpStream, SocketAddr)>> {
         self.accept_rx.poll_recv(cx).map(|op_res| {
             op_res.ok_or_else(|| {
-                KcpError::IoError(io::Error::new(ErrorKind::Other, "accept channel closed unexpectedly"))
+                KcpError::IoError(io::Error::other("accept channel closed unexpectedly"))
             })
         })
     }
@@ -221,7 +220,7 @@ mod test {
         const KCP_CMD_PUSH: u8 = 81;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
-        let mut packet = vec![0u8; kcp::KCP_OVERHEAD as usize];
+        let mut packet = vec![0u8; kcp::KCP_OVERHEAD];
         kcp::set_conv(&mut packet, conv);
         packet[4] = KCP_CMD_PUSH;
         socket.send_to(&packet, server_addr).await?;

@@ -280,7 +280,7 @@ impl AsyncRead for KcpStream {
                 Ok(()).into()
             }
             Err(KcpError::IoError(err)) => Err(err).into(),
-            Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
+            Err(err) => Err(io::Error::other(err)).into(),
         }
     }
 }
@@ -290,7 +290,7 @@ impl AsyncWrite for KcpStream {
         match ready!(self.poll_send(cx, buf)) {
             Ok(n) => Ok(n).into(),
             Err(KcpError::IoError(err)) => Err(err).into(),
-            Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
+            Err(err) => Err(io::Error::other(err)).into(),
         }
     }
 
@@ -341,7 +341,7 @@ impl AsyncWrite for KcpStream {
                 self.session.refresh_runtime_state(&kcp);
                 drop(kcp);
                 self.session.wake_socket_waiters();
-                Err(io::Error::new(ErrorKind::Other, err)).into()
+                Err(io::Error::other(err)).into()
             }
         }
     }
@@ -364,7 +364,7 @@ mod test {
         let config = KcpConfig::default();
         let server_addr = "127.0.0.1:5555".parse::<SocketAddr>().unwrap();
 
-        let mut listener = KcpListener::bind(config.clone(), server_addr).await.unwrap();
+        let mut listener = KcpListener::bind(config, server_addr).await.unwrap();
         let listener_hdl = tokio::spawn(async move {
             loop {
                 let (mut stream, peer_addr) = listener.accept().await.unwrap();

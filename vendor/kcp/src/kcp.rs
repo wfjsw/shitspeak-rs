@@ -44,19 +44,19 @@ const KCP_FASTACK_LIMIT: u32 = 5; // max times to trigger fastack
 
 /// Read `conv` from raw buffer
 pub fn get_conv(mut buf: &[u8]) -> u32 {
-    assert!(buf.len() >= KCP_OVERHEAD as usize);
+    assert!(buf.len() >= KCP_OVERHEAD);
     buf.get_u32_le()
 }
 
 /// Set `conv` to raw buffer
 pub fn set_conv(mut buf: &mut [u8], conv: u32) {
-    assert!(buf.len() >= KCP_OVERHEAD as usize);
+    assert!(buf.len() >= KCP_OVERHEAD);
     buf.put_u32_le(conv)
 }
 
 /// Get `sn` from raw buffer
 pub fn get_sn(buf: &[u8]) -> u32 {
-    assert!(buf.len() >= KCP_OVERHEAD as usize);
+    assert!(buf.len() >= KCP_OVERHEAD);
     (&buf[12..]).get_u32_le()
 }
 
@@ -126,7 +126,7 @@ impl KcpSegment {
     }
 
     fn encoded_len(&self) -> usize {
-        KCP_OVERHEAD as usize + self.data.len()
+        KCP_OVERHEAD + self.data.len()
     }
 }
 
@@ -400,7 +400,7 @@ impl<Output: Write> Kcp<Output> {
             mss: KCP_MTU_DEF - KCP_OVERHEAD,
             stream,
 
-            buf: BytesMut::with_capacity((KCP_MTU_DEF + KCP_OVERHEAD) as usize * 3),
+            buf: BytesMut::with_capacity((KCP_MTU_DEF + KCP_OVERHEAD) * 3),
 
             snd_queue: VecDeque::new(),
             rcv_queue: VecDeque::new(),
@@ -531,8 +531,8 @@ impl<Output: Write> Kcp<Output> {
         if self.stream {
             if let Some(old) = self.snd_queue.back_mut() {
                 let l = old.data.len();
-                if l < self.mss as usize {
-                    let capacity = self.mss as usize - l;
+                if l < self.mss {
+                    let capacity = self.mss - l;
                     let extend = cmp::min(buf.len(), capacity);
 
                     trace!(
@@ -556,10 +556,10 @@ impl<Output: Write> Kcp<Output> {
             }
         }
 
-        let count = if buf.len() <= self.mss as usize {
+        let count = if buf.len() <= self.mss {
             1
         } else {
-            (buf.len() + self.mss as usize - 1) / self.mss as usize
+            buf.len().div_ceil(self.mss)
         };
 
         if count >= KCP_WND_RCV as usize {
@@ -570,7 +570,7 @@ impl<Output: Write> Kcp<Output> {
         let count = cmp::max(1, count);
 
         for i in 0..count {
-            let size = cmp::min(self.mss as usize, buf.len());
+            let size = cmp::min(self.mss, buf.len());
 
             let (lf, rt) = buf.split_at(size);
 
@@ -595,11 +595,7 @@ impl<Output: Write> Kcp<Output> {
             self.rx_srtt = rtt;
             self.rx_rttval = rtt / 2;
         } else {
-            let delta = if rtt > self.rx_srtt {
-                rtt - self.rx_srtt
-            } else {
-                self.rx_srtt - rtt
-            };
+            let delta = rtt.abs_diff(self.rx_srtt);
             self.rx_rttval = (3 * self.rx_rttval + delta) / 4;
             self.rx_srtt = (7 * self.rx_srtt + rtt) / 8;
             if self.rx_srtt < 1 {
@@ -624,7 +620,7 @@ impl<Output: Write> Kcp<Output> {
             return;
         }
 
-        let mut i = 0 as usize;
+        let mut i = 0_usize;
         while i < self.snd_buf.len() {
             match sn.cmp(&self.snd_buf[i].sn) {
                 Ordering::Equal => {
@@ -632,7 +628,7 @@ impl<Output: Write> Kcp<Output> {
                     break;
                 }
                 Ordering::Less => break,
-                _ => i = i + 1,
+                _ => i += 1,
             }
         }
     }
@@ -755,7 +751,7 @@ impl<Output: Write> Kcp<Output> {
 
         trace!("[RI] {} bytes", buf.len());
 
-        if buf.len() < KCP_OVERHEAD as usize {
+        if buf.len() < KCP_OVERHEAD {
             debug!(
                 "input bufsize={} too small, at least {}",
                 buf.len(),
@@ -770,7 +766,7 @@ impl<Output: Write> Kcp<Output> {
         let mut latest_ts = 0;
 
         let mut buf = Cursor::new(buf);
-        while buf.remaining() >= KCP_OVERHEAD as usize {
+        while buf.remaining() >= KCP_OVERHEAD {
             let conv = buf.get_u32_le();
             if conv != self.conv {
                 // This allows getting conv from this call, which allows us to allocate
@@ -793,7 +789,7 @@ impl<Output: Write> Kcp<Output> {
             let una = buf.get_u32_le();
             let len = buf.get_u32_le() as usize;
 
-            if buf.remaining() < len as usize {
+            if buf.remaining() < len {
                 debug!(
                     "input bufsize={} payload length={} remaining={} not match",
                     input_size,
@@ -863,9 +859,9 @@ impl<Output: Write> Kcp<Output> {
                     if timediff(sn, self.rcv_nxt + self.rcv_wnd as u32) < 0 {
                         self.ack_push(sn, ts);
                         if timediff(sn, self.rcv_nxt) >= 0 {
-                            let mut sbuf = BytesMut::with_capacity(len as usize);
+                            let mut sbuf = BytesMut::with_capacity(len);
                             unsafe {
-                                sbuf.set_len(len as usize);
+                                sbuf.set_len(len);
                             }
                             buf.read_exact(&mut sbuf).unwrap();
                             has_read_data = true;
@@ -945,7 +941,7 @@ impl<Output: Write> Kcp<Output> {
         // while let Some((sn, ts)) = self.acklist.pop_front() {
         for i in 0..self.acklist.len() {
             let (sn, ts) = self.acklist[i];
-            if self.buf.len() + KCP_OVERHEAD as usize > self.mtu as usize {
+            if self.buf.len() + KCP_OVERHEAD > self.mtu {
                 self.flush_output_buffer()?;
             }
             segment.sn = sn;
@@ -996,7 +992,7 @@ impl<Output: Write> Kcp<Output> {
 
     fn _flush_probe_commands(&mut self, cmd: u8, segment: &mut KcpSegment) -> KcpResult<()> {
         segment.cmd = cmd;
-        if self.buf.len() + KCP_OVERHEAD as usize > self.mtu as usize {
+        if self.buf.len() + KCP_OVERHEAD > self.mtu {
             self.flush_output_buffer()?;
         }
         segment.encode(&mut self.buf);
@@ -1090,7 +1086,7 @@ impl<Output: Write> Kcp<Output> {
         let resent = if self.fastresend > 0 {
             self.fastresend
         } else {
-            u32::max_value()
+            u32::MAX
         };
 
         let rtomin = if !self.nodelay { self.rx_rto >> 3 } else { 0 };
@@ -1106,7 +1102,7 @@ impl<Output: Write> Kcp<Output> {
                 } else if timediff(self.current, snd_segment.resendts) >= 0 {
                     Some(FlushSendReason::Timeout)
                 } else if snd_segment.fastack >= resent
-                    && (snd_segment.xmit <= self.fastlimit || self.fastlimit <= 0)
+                    && (snd_segment.xmit <= self.fastlimit || self.fastlimit == 0)
                 {
                     Some(FlushSendReason::FastAck)
                 } else {
@@ -1118,8 +1114,8 @@ impl<Output: Write> Kcp<Output> {
                 continue;
             };
 
-            let need = KCP_OVERHEAD as usize + self.snd_buf[i].data.len();
-            if self.buf.len() + need > self.mtu as usize {
+            let need = KCP_OVERHEAD + self.snd_buf[i].data.len();
+            if self.buf.len() + need > self.mtu {
                 self.flush_output_buffer()?;
             }
 
@@ -1207,7 +1203,7 @@ impl<Output: Write> Kcp<Output> {
 
         let mut slap = timediff(self.current, self.ts_flush);
 
-        if slap >= 10000 || slap < -10000 {
+        if !(-10000..10000).contains(&slap) {
             self.ts_flush = self.current;
             slap = 0;
         }
@@ -1232,7 +1228,7 @@ impl<Output: Write> Kcp<Output> {
         }
 
         let mut ts_flush = self.ts_flush;
-        let mut tm_packet = u32::max_value();
+        let mut tm_packet = u32::MAX;
 
         if timediff(current, ts_flush) >= 10000 || timediff(current, ts_flush) < -10000 {
             ts_flush = current;
@@ -1273,7 +1269,7 @@ impl<Output: Write> Kcp<Output> {
         self.mtu = mtu;
         self.mss = self.mtu - KCP_OVERHEAD;
 
-        let target_size = ((mtu + KCP_OVERHEAD) * 3) as usize;
+        let target_size = (mtu + KCP_OVERHEAD) * 3;
         if target_size > self.buf.capacity() {
             self.buf.reserve(target_size - self.buf.capacity());
         }
@@ -1289,11 +1285,7 @@ impl<Output: Write> Kcp<Output> {
 
     /// Set check interval
     pub fn set_interval(&mut self, mut interval: u32) {
-        if interval > 5000 {
-            interval = 5000;
-        } else if interval < 10 {
-            interval = 10;
-        }
+        interval = interval.clamp(10, 5000);
         self.interval = interval;
     }
 
@@ -1331,7 +1323,7 @@ impl<Output: Write> Kcp<Output> {
     /// set maximum window size: `sndwnd=32`, `rcvwnd=32` by default
     pub fn set_wndsize(&mut self, sndwnd: u16, rcvwnd: u16) {
         if sndwnd > 0 {
-            self.snd_wnd = sndwnd as u16;
+            self.snd_wnd = sndwnd;
         }
 
         if rcvwnd > 0 {
@@ -1378,7 +1370,7 @@ impl<Output: Write> Kcp<Output> {
     /// KCP header size
     #[inline]
     pub fn header_len() -> usize {
-        KCP_OVERHEAD as usize
+        KCP_OVERHEAD
     }
 
     /// Enabled stream or not

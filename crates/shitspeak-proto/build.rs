@@ -27,6 +27,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         ".s2s_application.UserStatsReply.payload",
         ".s2s_replication",
     ]);
+    config.enum_attribute(
+        ".s2s_overlay.OverlayMessage.body",
+        "#[allow(clippy::large_enum_variant)]",
+    );
 
     for proto in &proto_files {
         println!("cargo:rerun-if-changed={}", proto.display());
