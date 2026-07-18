@@ -3194,30 +3194,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             && (network_epoch.is_some() || known.is_some())
     }
 
-    fn observed_origin_matches_epoch_in_state(
-        &self,
-        state: &StrictState,
-        from: NodeIdentifier,
-        origin_boot_epoch: u64,
-        expected_boot_epoch: u64,
-    ) -> bool {
-        if from == self.self_id {
-            return origin_boot_epoch == expected_boot_epoch
-                && origin_boot_epoch == self.boot_epoch;
-        }
-        let network_epoch = self.net.member_boot_epoch(from);
-        let network_current_and_live = network_epoch == Some(origin_boot_epoch)
-            && self.net.has_live_route(from, ServiceLevel::Reliable);
-        let known = state.member_incarnations.get(&from).copied();
-        origin_boot_epoch == expected_boot_epoch
-            && network_epoch.is_none_or(|epoch| epoch == origin_boot_epoch)
-            && known.is_none_or(|incarnation| {
-                incarnation.boot_epoch == origin_boot_epoch
-                    && (incarnation.alive || network_current_and_live)
-            })
-            && (network_epoch.is_some() || known.is_some())
-    }
-
     fn frozen_origin_epoch_matches_in_state(
         &self,
         state: &StrictState,
@@ -9326,6 +9302,7 @@ fn delivery_watermark(
     }
 }
 
+#[cfg(test)]
 fn delivery_members(net: &dyn StrictNet, self_id: NodeIdentifier) -> Vec<NodeIdentifier> {
     let mut seen = HashSet::new();
     let mut members = Vec::new();
