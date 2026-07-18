@@ -4,7 +4,7 @@ use bytes::Bytes;
 /// Encoder for `ChannelState` protobuf messages.
 ///
 /// Mirrors the protobuf fields with native Rust types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChannelState {
     pub channel_id: Option<u32>,
     pub parent: Option<u32>,
@@ -57,48 +57,28 @@ impl From<crate::mumble_proto::ChannelState> for ChannelState {
     }
 }
 
-impl Default for ChannelState {
-    fn default() -> Self {
-        Self {
-            channel_id: None,
-            parent: None,
-            name: None,
-            links: Vec::new(),
-            description: None,
-            links_add: Vec::new(),
-            links_remove: Vec::new(),
-            temporary: None,
-            position: None,
-            description_hash: None,
-            max_users: None,
-            is_enter_restricted: None,
-            can_enter: None,
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::ChannelState> for ChannelState {
-    fn into(self) -> crate::mumble_proto::ChannelState {
+impl From<ChannelState> for crate::mumble_proto::ChannelState {
+    fn from(value: ChannelState) -> Self {
         crate::mumble_proto::ChannelState {
-            channel_id: self.channel_id,
-            parent: self.parent,
-            name: self.name,
-            links: self.links,
-            description: self.description,
-            links_add: self.links_add,
-            links_remove: self.links_remove,
-            temporary: self.temporary,
-            position: self.position,
-            description_hash: self.description_hash.map(|b| b.to_vec()),
-            max_users: self.max_users,
-            is_enter_restricted: self.is_enter_restricted,
-            can_enter: self.can_enter,
+            channel_id: value.channel_id,
+            parent: value.parent,
+            name: value.name,
+            links: value.links,
+            description: value.description,
+            links_add: value.links_add,
+            links_remove: value.links_remove,
+            temporary: value.temporary,
+            position: value.position,
+            description_hash: value.description_hash.map(|bytes| bytes.as_ref().to_vec()),
+            max_users: value.max_users,
+            is_enter_restricted: value.is_enter_restricted,
+            can_enter: value.can_enter,
         }
     }
 }
 
-impl Into<Message> for ChannelState {
-    fn into(self) -> Message {
-        Message::ChannelState(self.into())
+impl From<ChannelState> for Message {
+    fn from(value: ChannelState) -> Self {
+        Self::ChannelState(value.into())
     }
 }

@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TextMessage {
     pub actor: Option<u32>,
     pub session: Vec<u32>,
@@ -21,32 +21,20 @@ impl From<crate::mumble_proto::TextMessage> for TextMessage {
     }
 }
 
-impl Default for TextMessage {
-    fn default() -> Self {
-        Self {
-            actor: None,
-            session: Vec::new(),
-            channel_id: Vec::new(),
-            tree_id: Vec::new(),
-            message: String::new(),
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::TextMessage> for TextMessage {
-    fn into(self) -> crate::mumble_proto::TextMessage {
+impl From<TextMessage> for crate::mumble_proto::TextMessage {
+    fn from(message: TextMessage) -> Self {
         crate::mumble_proto::TextMessage {
-            actor: self.actor,
-            session: self.session,
-            channel_id: self.channel_id,
-            tree_id: self.tree_id,
-            message: self.message,
+            actor: message.actor,
+            session: message.session,
+            channel_id: message.channel_id,
+            tree_id: message.tree_id,
+            message: message.message,
         }
     }
 }
 
-impl Into<Message> for TextMessage {
-    fn into(self) -> Message {
-        Message::TextMessage(self.into())
+impl From<TextMessage> for Message {
+    fn from(message: TextMessage) -> Self {
+        Message::TextMessage(message.into())
     }
 }

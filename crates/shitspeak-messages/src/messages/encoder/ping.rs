@@ -1,6 +1,6 @@
 use crate::messages::{Message, errors::PingProtocolError};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Ping {
     pub timestamp: u64,
     pub good: u32,
@@ -58,44 +58,26 @@ impl Ping {
     }
 }
 
-impl Default for Ping {
-    fn default() -> Self {
-        Self {
-            timestamp: 0,
-            good: 0,
-            late: 0,
-            lost: 0,
-            resync: 0,
-            udp_packets: None,
-            tcp_packets: None,
-            udp_ping_avg: None,
-            udp_ping_var: None,
-            tcp_ping_avg: None,
-            tcp_ping_var: None,
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::Ping> for Ping {
-    fn into(self) -> crate::mumble_proto::Ping {
+impl From<Ping> for crate::mumble_proto::Ping {
+    fn from(value: Ping) -> Self {
         crate::mumble_proto::Ping {
-            timestamp: Some(self.timestamp),
-            good: Some(self.good),
-            late: Some(self.late),
-            lost: Some(self.lost),
-            resync: Some(self.resync),
-            udp_packets: self.udp_packets,
-            tcp_packets: self.tcp_packets,
-            udp_ping_avg: self.udp_ping_avg,
-            udp_ping_var: self.udp_ping_var,
-            tcp_ping_avg: self.tcp_ping_avg,
-            tcp_ping_var: self.tcp_ping_var,
+            timestamp: Some(value.timestamp),
+            good: Some(value.good),
+            late: Some(value.late),
+            lost: Some(value.lost),
+            resync: Some(value.resync),
+            udp_packets: value.udp_packets,
+            tcp_packets: value.tcp_packets,
+            udp_ping_avg: value.udp_ping_avg,
+            udp_ping_var: value.udp_ping_var,
+            tcp_ping_avg: value.tcp_ping_avg,
+            tcp_ping_var: value.tcp_ping_var,
         }
     }
 }
 
-impl Into<Message> for Ping {
-    fn into(self) -> Message {
-        Message::Ping(self.into())
+impl From<Ping> for Message {
+    fn from(value: Ping) -> Self {
+        Message::Ping(value.into())
     }
 }

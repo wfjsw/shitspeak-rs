@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SuggestConfig {
     pub version: Option<u32>,
     pub positional: Option<bool>,
@@ -17,29 +17,19 @@ impl From<crate::mumble_proto::SuggestConfig> for SuggestConfig {
     }
 }
 
-impl Default for SuggestConfig {
-    fn default() -> Self {
-        Self {
-            version: None,
-            positional: None,
-            push_to_talk: None,
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::SuggestConfig> for SuggestConfig {
-    fn into(self) -> crate::mumble_proto::SuggestConfig {
+impl From<SuggestConfig> for crate::mumble_proto::SuggestConfig {
+    fn from(config: SuggestConfig) -> Self {
         crate::mumble_proto::SuggestConfig {
-            version_v1: self.version,
-            version_v2: self.version.map(|v| v as u64),
-            positional: self.positional,
-            push_to_talk: self.push_to_talk,
+            version_v1: config.version,
+            version_v2: config.version.map(u64::from),
+            positional: config.positional,
+            push_to_talk: config.push_to_talk,
         }
     }
 }
 
-impl Into<Message> for SuggestConfig {
-    fn into(self) -> Message {
-        Message::SuggestConfig(self.into())
+impl From<SuggestConfig> for Message {
+    fn from(config: SuggestConfig) -> Self {
+        Message::SuggestConfig(config.into())
     }
 }

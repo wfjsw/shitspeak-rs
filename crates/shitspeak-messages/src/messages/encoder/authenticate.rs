@@ -6,9 +6,9 @@ pub enum ClientType {
     Bot = 1,
 }
 
-impl Into<i32> for ClientType {
-    fn into(self) -> i32 {
-        match self {
+impl From<ClientType> for i32 {
+    fn from(client_type: ClientType) -> Self {
+        match client_type {
             ClientType::Regular => 0,
             ClientType::Bot => 1,
         }
@@ -44,7 +44,7 @@ impl From<crate::mumble_proto::Authenticate> for Authenticate {
             opus: proto.opus,
             client_type: proto
                 .client_type
-                .map_or(ClientType::Regular, |ct| ClientType::from(ct)),
+                .map_or(ClientType::Regular, ClientType::from),
         }
     }
 }
@@ -64,21 +64,21 @@ impl Default for Authenticate {
     }
 }
 
-impl Into<crate::mumble_proto::Authenticate> for Authenticate {
-    fn into(self) -> crate::mumble_proto::Authenticate {
+impl From<Authenticate> for crate::mumble_proto::Authenticate {
+    fn from(authenticate: Authenticate) -> Self {
         crate::mumble_proto::Authenticate {
-            username: self.username,
-            password: self.password,
-            tokens: self.tokens,
-            celt_versions: self.celt_versions,
-            opus: self.opus,
-            client_type: Some(self.client_type.into()),
+            username: authenticate.username,
+            password: authenticate.password,
+            tokens: authenticate.tokens,
+            celt_versions: authenticate.celt_versions,
+            opus: authenticate.opus,
+            client_type: Some(authenticate.client_type.into()),
         }
     }
 }
 
-impl Into<Message> for Authenticate {
-    fn into(self) -> Message {
-        Message::Authenticate(self.into())
+impl From<Authenticate> for Message {
+    fn from(authenticate: Authenticate) -> Self {
+        Message::Authenticate(authenticate.into())
     }
 }

@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QueryUsers {
     pub ids: Vec<u32>,
     pub names: Vec<String>,
@@ -15,26 +15,17 @@ impl From<crate::mumble_proto::QueryUsers> for QueryUsers {
     }
 }
 
-impl Default for QueryUsers {
-    fn default() -> Self {
-        Self {
-            ids: Vec::new(),
-            names: Vec::new(),
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::QueryUsers> for QueryUsers {
-    fn into(self) -> crate::mumble_proto::QueryUsers {
+impl From<QueryUsers> for crate::mumble_proto::QueryUsers {
+    fn from(value: QueryUsers) -> Self {
         crate::mumble_proto::QueryUsers {
-            ids: self.ids,
-            names: self.names,
+            ids: value.ids,
+            names: value.names,
         }
     }
 }
 
-impl Into<Message> for QueryUsers {
-    fn into(self) -> Message {
-        Message::QueryUsers(self.into())
+impl From<QueryUsers> for Message {
+    fn from(value: QueryUsers) -> Self {
+        Message::QueryUsers(value.into())
     }
 }

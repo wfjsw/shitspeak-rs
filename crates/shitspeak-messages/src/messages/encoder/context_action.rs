@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ContextAction {
     pub session: Option<u32>,
     pub channel_id: Option<u32>,
@@ -17,28 +17,18 @@ impl From<crate::mumble_proto::ContextAction> for ContextAction {
     }
 }
 
-impl Default for ContextAction {
-    fn default() -> Self {
-        Self {
-            session: None,
-            channel_id: None,
-            action: String::new(),
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::ContextAction> for ContextAction {
-    fn into(self) -> crate::mumble_proto::ContextAction {
+impl From<ContextAction> for crate::mumble_proto::ContextAction {
+    fn from(context_action: ContextAction) -> Self {
         crate::mumble_proto::ContextAction {
-            session: self.session,
-            channel_id: self.channel_id,
-            action: self.action,
+            session: context_action.session,
+            channel_id: context_action.channel_id,
+            action: context_action.action,
         }
     }
 }
 
-impl Into<Message> for ContextAction {
-    fn into(self) -> Message {
-        Message::ContextAction(self.into())
+impl From<ContextAction> for Message {
+    fn from(context_action: ContextAction) -> Self {
+        Self::ContextAction(context_action.into())
     }
 }

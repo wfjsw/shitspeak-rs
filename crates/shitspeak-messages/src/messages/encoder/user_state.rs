@@ -3,10 +3,10 @@ use core::option::Option;
 
 use crate::{
     client::client_session_identifier::ClientSessionIdentifier,
-    messages::{Message, errors::UserStateProtocolError},
+    messages::{errors::UserStateProtocolError, Message},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct VolumeAdjustment {
     pub listening_channel: u32,
     pub volume_adjustment: f32,
@@ -59,8 +59,8 @@ pub struct UserState {
 impl TryFrom<crate::mumble_proto::UserState> for UserState {
     fn try_from(proto: crate::mumble_proto::UserState) -> Result<Self, Self::Error> {
         Ok(Self {
-            session: proto.session.map(|a| a.into()),
-            actor: proto.actor.map(|a| a.into()),
+            session: proto.session.map(ClientSessionIdentifier::from),
+            actor: proto.actor.map(ClientSessionIdentifier::from),
             name: proto.name,
             user_id: proto.user_id,
             channel_id: proto.channel_id,
@@ -84,7 +84,7 @@ impl TryFrom<crate::mumble_proto::UserState> for UserState {
             listening_volume_adjustment: proto
                 .listening_volume_adjustment
                 .into_iter()
-                .map(|va| va.try_into())
+                .map(VolumeAdjustment::try_from)
                 .collect::<Result<_, _>>()?,
         })
     }
@@ -92,64 +92,32 @@ impl TryFrom<crate::mumble_proto::UserState> for UserState {
     type Error = UserStateProtocolError;
 }
 
-impl UserState {}
-
-impl Default for UserState {
-    fn default() -> Self {
-        Self {
-            session: None,
-            actor: None,
-            name: None,
-            user_id: None,
-            channel_id: None,
-            mute: None,
-            deaf: None,
-            suppress: None,
-            self_mute: None,
-            self_deaf: None,
-            texture: None,
-            plugin_context: None,
-            plugin_identity: None,
-            comment: None,
-            hash: None,
-            comment_hash: None,
-            texture_hash: None,
-            priority_speaker: None,
-            recording: None,
-            temporary_access_tokens: Vec::new(),
-            listening_channel_add: Vec::new(),
-            listening_channel_remove: Vec::new(),
-            listening_volume_adjustment: Vec::new(),
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::UserState> for UserState {
-    fn into(self) -> crate::mumble_proto::UserState {
+impl From<UserState> for crate::mumble_proto::UserState {
+    fn from(user_state: UserState) -> Self {
         crate::mumble_proto::UserState {
-            session: self.session.map(|s| u32::from(s)),
-            actor: self.actor.map(|a| u32::from(a)),
-            name: self.name,
-            user_id: self.user_id,
-            channel_id: self.channel_id,
-            mute: self.mute,
-            deaf: self.deaf,
-            suppress: self.suppress,
-            self_mute: self.self_mute,
-            self_deaf: self.self_deaf,
-            texture: self.texture.map(|b| b.to_vec()),
-            plugin_context: self.plugin_context.map(|b| b.to_vec()),
-            plugin_identity: self.plugin_identity,
-            comment: self.comment,
-            hash: self.hash,
-            comment_hash: self.comment_hash.map(|b| b.to_vec()),
-            texture_hash: self.texture_hash.map(|b| b.to_vec()),
-            priority_speaker: self.priority_speaker,
-            recording: self.recording,
-            temporary_access_tokens: self.temporary_access_tokens,
-            listening_channel_add: self.listening_channel_add,
-            listening_channel_remove: self.listening_channel_remove,
-            listening_volume_adjustment: self
+            session: user_state.session.map(u32::from),
+            actor: user_state.actor.map(u32::from),
+            name: user_state.name,
+            user_id: user_state.user_id,
+            channel_id: user_state.channel_id,
+            mute: user_state.mute,
+            deaf: user_state.deaf,
+            suppress: user_state.suppress,
+            self_mute: user_state.self_mute,
+            self_deaf: user_state.self_deaf,
+            texture: user_state.texture.map(|b| b.to_vec()),
+            plugin_context: user_state.plugin_context.map(|b| b.to_vec()),
+            plugin_identity: user_state.plugin_identity,
+            comment: user_state.comment,
+            hash: user_state.hash,
+            comment_hash: user_state.comment_hash.map(|b| b.to_vec()),
+            texture_hash: user_state.texture_hash.map(|b| b.to_vec()),
+            priority_speaker: user_state.priority_speaker,
+            recording: user_state.recording,
+            temporary_access_tokens: user_state.temporary_access_tokens,
+            listening_channel_add: user_state.listening_channel_add,
+            listening_channel_remove: user_state.listening_channel_remove,
+            listening_volume_adjustment: user_state
                 .listening_volume_adjustment
                 .into_iter()
                 .map(|va| crate::mumble_proto::user_state::VolumeAdjustment {
@@ -161,8 +129,8 @@ impl Into<crate::mumble_proto::UserState> for UserState {
     }
 }
 
-impl Into<Message> for UserState {
-    fn into(self) -> Message {
-        Message::UserState(self.into())
+impl From<UserState> for Message {
+    fn from(user_state: UserState) -> Self {
+        Message::UserState(user_state.into())
     }
 }

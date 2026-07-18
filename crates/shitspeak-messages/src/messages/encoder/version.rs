@@ -94,21 +94,21 @@ impl Version {
     }
 }
 
-impl Into<crate::mumble_proto::Version> for Version {
-    fn into(self) -> crate::mumble_proto::Version {
+impl From<Version> for crate::mumble_proto::Version {
+    fn from(version: Version) -> Self {
         crate::mumble_proto::Version {
-            version_v1: self.version.map(|v| v.into()),
-            version_v2: self.version.map(|v| v.into()),
-            release: self.release,
-            os: self.os,
-            os_version: self.os_version,
+            version_v1: version.version.map(u32::from),
+            version_v2: version.version.map(u64::from),
+            release: version.release,
+            os: version.os,
+            os_version: version.os_version,
         }
     }
 }
 
-impl Into<Message> for Version {
-    fn into(self) -> Message {
-        Message::Version(self.into())
+impl From<Version> for Message {
+    fn from(version: Version) -> Self {
+        Message::Version(version.into())
     }
 }
 

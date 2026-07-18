@@ -23,6 +23,8 @@ pub trait WriteMessageExt {
 }
 
 impl<T: tokio::io::AsyncWriteExt + Unpin + Send> WriteMessageExt for T {
+    // The explicit future type preserves the trait's public `Send` guarantee.
+    #[allow(clippy::manual_async_fn)]
     fn write_proto_message<'a>(
         &'a mut self,
         message: &'a Message,
@@ -40,6 +42,8 @@ impl<T: tokio::io::AsyncWriteExt + Unpin + Send> WriteMessageExt for T {
         }
     }
 
+    // The explicit future type preserves the trait's public `Send` guarantee.
+    #[allow(clippy::manual_async_fn)]
     fn write_proto_message_batch<'a>(
         &'a mut self,
         messages: &'a [Message],

@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BanList {
     pub bans: Vec<crate::mumble_proto::ban_list::BanEntry>,
     pub query: Option<bool>,
@@ -15,26 +15,17 @@ impl From<crate::mumble_proto::BanList> for BanList {
     }
 }
 
-impl Default for BanList {
-    fn default() -> Self {
-        Self {
-            bans: Vec::new(),
-            query: None,
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::BanList> for BanList {
-    fn into(self) -> crate::mumble_proto::BanList {
+impl From<BanList> for crate::mumble_proto::BanList {
+    fn from(value: BanList) -> Self {
         crate::mumble_proto::BanList {
-            bans: self.bans,
-            query: self.query,
+            bans: value.bans,
+            query: value.query,
         }
     }
 }
 
-impl Into<Message> for BanList {
-    fn into(self) -> Message {
-        Message::BanList(self.into())
+impl From<BanList> for Message {
+    fn from(value: BanList) -> Self {
+        Self::BanList(value.into())
     }
 }

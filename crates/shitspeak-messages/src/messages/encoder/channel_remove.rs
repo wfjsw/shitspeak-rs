@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChannelRemove {
     pub channel_id: u32,
 }
@@ -13,22 +13,16 @@ impl From<crate::mumble_proto::ChannelRemove> for ChannelRemove {
     }
 }
 
-impl Default for ChannelRemove {
-    fn default() -> Self {
-        Self { channel_id: 0 }
-    }
-}
-
-impl Into<crate::mumble_proto::ChannelRemove> for ChannelRemove {
-    fn into(self) -> crate::mumble_proto::ChannelRemove {
+impl From<ChannelRemove> for crate::mumble_proto::ChannelRemove {
+    fn from(value: ChannelRemove) -> Self {
         crate::mumble_proto::ChannelRemove {
-            channel_id: self.channel_id,
+            channel_id: value.channel_id,
         }
     }
 }
 
-impl Into<Message> for ChannelRemove {
-    fn into(self) -> Message {
-        Message::ChannelRemove(self.into())
+impl From<ChannelRemove> for Message {
+    fn from(value: ChannelRemove) -> Self {
+        Self::ChannelRemove(value.into())
     }
 }

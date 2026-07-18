@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ContextActionModify {
     pub action: String,
     pub text: Option<String>,
@@ -19,30 +19,19 @@ impl From<crate::mumble_proto::ContextActionModify> for ContextActionModify {
     }
 }
 
-impl Default for ContextActionModify {
-    fn default() -> Self {
-        Self {
-            action: String::new(),
-            text: None,
-            context: None,
-            operation: None,
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::ContextActionModify> for ContextActionModify {
-    fn into(self) -> crate::mumble_proto::ContextActionModify {
+impl From<ContextActionModify> for crate::mumble_proto::ContextActionModify {
+    fn from(context_action_modify: ContextActionModify) -> Self {
         crate::mumble_proto::ContextActionModify {
-            action: self.action,
-            text: self.text,
-            context: self.context,
-            operation: self.operation,
+            action: context_action_modify.action,
+            text: context_action_modify.text,
+            context: context_action_modify.context,
+            operation: context_action_modify.operation,
         }
     }
 }
 
-impl Into<Message> for ContextActionModify {
-    fn into(self) -> Message {
-        Message::ContextActionModify(self.into())
+impl From<ContextActionModify> for Message {
+    fn from(context_action_modify: ContextActionModify) -> Self {
+        Self::ContextActionModify(context_action_modify.into())
     }
 }

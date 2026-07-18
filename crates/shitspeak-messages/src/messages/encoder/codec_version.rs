@@ -30,19 +30,19 @@ impl Default for CodecVersion {
     }
 }
 
-impl Into<crate::mumble_proto::CodecVersion> for CodecVersion {
-    fn into(self) -> crate::mumble_proto::CodecVersion {
+impl From<CodecVersion> for crate::mumble_proto::CodecVersion {
+    fn from(codec_version: CodecVersion) -> Self {
         crate::mumble_proto::CodecVersion {
-            alpha: self.alpha,
-            beta: self.beta,
-            prefer_alpha: self.prefer_alpha,
-            opus: self.opus,
+            alpha: codec_version.alpha,
+            beta: codec_version.beta,
+            prefer_alpha: codec_version.prefer_alpha,
+            opus: codec_version.opus,
         }
     }
 }
 
-impl Into<Message> for CodecVersion {
-    fn into(self) -> Message {
-        Message::CodecVersion(self.into())
+impl From<CodecVersion> for Message {
+    fn from(codec_version: CodecVersion) -> Self {
+        Self::CodecVersion(codec_version.into())
     }
 }

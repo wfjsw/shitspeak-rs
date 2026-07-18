@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ServerSync {
     pub session: Option<u32>,
     pub max_bandwidth: Option<u32>,
@@ -21,32 +21,21 @@ impl From<crate::mumble_proto::ServerSync> for ServerSync {
     }
 }
 
-impl Default for ServerSync {
-    fn default() -> Self {
-        Self {
-            session: None,
-            max_bandwidth: None,
-            welcome_text: None,
-            permissions: None,
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::ServerSync> for ServerSync {
-    fn into(self) -> crate::mumble_proto::ServerSync {
+impl From<ServerSync> for crate::mumble_proto::ServerSync {
+    fn from(value: ServerSync) -> Self {
         crate::mumble_proto::ServerSync {
-            session: self.session,
-            max_bandwidth: self.max_bandwidth,
-            welcome_text: self.welcome_text,
-            permissions: self
+            session: value.session,
+            max_bandwidth: value.max_bandwidth,
+            welcome_text: value.welcome_text,
+            permissions: value
                 .permissions
                 .map(|permissions| u64::from(permissions.bits())),
         }
     }
 }
 
-impl Into<Message> for ServerSync {
-    fn into(self) -> Message {
-        Message::ServerSync(self.into())
+impl From<ServerSync> for Message {
+    fn from(value: ServerSync) -> Self {
+        Message::ServerSync(value.into())
     }
 }

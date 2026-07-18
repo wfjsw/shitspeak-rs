@@ -123,21 +123,21 @@ impl Default for PermissionDenied {
     }
 }
 
-impl Into<crate::mumble_proto::PermissionDenied> for PermissionDenied {
-    fn into(self) -> crate::mumble_proto::PermissionDenied {
+impl From<PermissionDenied> for crate::mumble_proto::PermissionDenied {
+    fn from(value: PermissionDenied) -> Self {
         crate::mumble_proto::PermissionDenied {
-            r#type: Some(self.r#type as i32),
-            session: Some(self.session),
-            channel_id: self.channel_id,
-            reason: self.reason.map(Cow::into_owned),
-            name: self.name.map(Cow::into_owned),
-            permission: self.permission,
+            r#type: Some(value.r#type as i32),
+            session: Some(value.session),
+            channel_id: value.channel_id,
+            reason: value.reason.map(Cow::into_owned),
+            name: value.name.map(Cow::into_owned),
+            permission: value.permission,
         }
     }
 }
 
-impl Into<Message> for PermissionDenied {
-    fn into(self) -> Message {
-        Message::PermissionDenied(self.into())
+impl From<PermissionDenied> for Message {
+    fn from(value: PermissionDenied) -> Self {
+        Message::PermissionDenied(value.into())
     }
 }

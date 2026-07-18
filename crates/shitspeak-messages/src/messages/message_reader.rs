@@ -12,6 +12,8 @@ pub trait ReadMessageExt {
 }
 
 impl<T: tokio::io::AsyncReadExt + Unpin + Send> ReadMessageExt for T {
+    // The explicit future type preserves the trait's public `Send` guarantee.
+    #[allow(clippy::manual_async_fn)]
     fn read_proto_message(
         &mut self,
     ) -> impl Future<Output = Result<Message, ReadProtoMessageError>> + Send + '_ {

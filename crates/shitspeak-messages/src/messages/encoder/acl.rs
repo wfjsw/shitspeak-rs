@@ -26,16 +26,16 @@ impl From<crate::mumble_proto::acl::ChanAcl> for ChanAcl {
     }
 }
 
-impl Into<crate::mumble_proto::acl::ChanAcl> for ChanAcl {
-    fn into(self) -> crate::mumble_proto::acl::ChanAcl {
+impl From<ChanAcl> for crate::mumble_proto::acl::ChanAcl {
+    fn from(acl: ChanAcl) -> Self {
         crate::mumble_proto::acl::ChanAcl {
-            apply_here: Some(self.apply_here),
-            apply_subs: Some(self.apply_subs),
-            inherited: Some(self.inherited),
-            user_id: self.user_id,
-            group: self.group,
-            grant: Some(self.grant),
-            deny: Some(self.deny),
+            apply_here: Some(acl.apply_here),
+            apply_subs: Some(acl.apply_subs),
+            inherited: Some(acl.inherited),
+            user_id: acl.user_id,
+            group: acl.group,
+            grant: Some(acl.grant),
+            deny: Some(acl.deny),
         }
     }
 }
@@ -56,7 +56,7 @@ impl From<crate::mumble_proto::Acl> for Acl {
             channel_id: proto.channel_id,
             inherit_acls: Some(proto.inherit_acls.unwrap_or(true)),
             groups: proto.groups,
-            acls: proto.acls.into_iter().map(|a| a.into()).collect(),
+            acls: proto.acls.into_iter().map(ChanAcl::from).collect(),
             query: proto.query,
         }
     }
@@ -74,20 +74,24 @@ impl Default for Acl {
     }
 }
 
-impl Into<crate::mumble_proto::Acl> for Acl {
-    fn into(self) -> crate::mumble_proto::Acl {
+impl From<Acl> for crate::mumble_proto::Acl {
+    fn from(acl: Acl) -> Self {
         crate::mumble_proto::Acl {
-            channel_id: self.channel_id,
-            inherit_acls: self.inherit_acls,
-            groups: self.groups,
-            acls: self.acls.into_iter().map(|a| a.into()).collect(),
-            query: self.query,
+            channel_id: acl.channel_id,
+            inherit_acls: acl.inherit_acls,
+            groups: acl.groups,
+            acls: acl
+                .acls
+                .into_iter()
+                .map(crate::mumble_proto::acl::ChanAcl::from)
+                .collect(),
+            query: acl.query,
         }
     }
 }
 
-impl Into<Message> for Acl {
-    fn into(self) -> Message {
-        Message::ACL(self.into())
+impl From<Acl> for Message {
+    fn from(acl: Acl) -> Self {
+        Message::ACL(acl.into())
     }
 }

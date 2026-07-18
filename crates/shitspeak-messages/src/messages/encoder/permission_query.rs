@@ -7,7 +7,7 @@ use crate::messages::Message;
 /// unknown permission cache entry.
 pub const CLIENT_PERMISSION_CACHE_BIT: u32 = 0x0800_0000;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PermissionQuery {
     pub channel_id: Option<u32>,
     pub permissions: Option<u32>,
@@ -54,28 +54,18 @@ impl From<crate::mumble_proto::PermissionQuery> for PermissionQuery {
     }
 }
 
-impl Default for PermissionQuery {
-    fn default() -> Self {
-        Self {
-            channel_id: None,
-            permissions: None,
-            flush: None,
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::PermissionQuery> for PermissionQuery {
-    fn into(self) -> crate::mumble_proto::PermissionQuery {
+impl From<PermissionQuery> for crate::mumble_proto::PermissionQuery {
+    fn from(value: PermissionQuery) -> Self {
         crate::mumble_proto::PermissionQuery {
-            channel_id: self.channel_id,
-            permissions: self.permissions,
-            flush: self.flush,
+            channel_id: value.channel_id,
+            permissions: value.permissions,
+            flush: value.flush,
         }
     }
 }
 
-impl Into<Message> for PermissionQuery {
-    fn into(self) -> Message {
-        Message::PermissionQuery(self.into())
+impl From<PermissionQuery> for Message {
+    fn from(value: PermissionQuery) -> Self {
+        Message::PermissionQuery(value.into())
     }
 }

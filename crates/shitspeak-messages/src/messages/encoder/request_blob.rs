@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RequestBlob {
     pub session_texture: Vec<u32>,
     pub session_comment: Vec<u32>,
@@ -17,28 +17,18 @@ impl From<crate::mumble_proto::RequestBlob> for RequestBlob {
     }
 }
 
-impl Default for RequestBlob {
-    fn default() -> Self {
-        Self {
-            session_texture: Vec::new(),
-            session_comment: Vec::new(),
-            channel_description: Vec::new(),
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::RequestBlob> for RequestBlob {
-    fn into(self) -> crate::mumble_proto::RequestBlob {
+impl From<RequestBlob> for crate::mumble_proto::RequestBlob {
+    fn from(value: RequestBlob) -> Self {
         crate::mumble_proto::RequestBlob {
-            session_texture: self.session_texture,
-            session_comment: self.session_comment,
-            channel_description: self.channel_description,
+            session_texture: value.session_texture,
+            session_comment: value.session_comment,
+            channel_description: value.channel_description,
         }
     }
 }
 
-impl Into<Message> for RequestBlob {
-    fn into(self) -> Message {
-        Message::RequestBlob(self.into())
+impl From<RequestBlob> for Message {
+    fn from(value: RequestBlob) -> Self {
+        Message::RequestBlob(value.into())
     }
 }

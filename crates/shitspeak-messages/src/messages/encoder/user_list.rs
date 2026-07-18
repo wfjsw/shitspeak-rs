@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UserList {
     pub users: Vec<crate::mumble_proto::user_list::User>,
 }
@@ -11,20 +11,16 @@ impl From<crate::mumble_proto::UserList> for UserList {
     }
 }
 
-impl Default for UserList {
-    fn default() -> Self {
-        Self { users: Vec::new() }
+impl From<UserList> for crate::mumble_proto::UserList {
+    fn from(user_list: UserList) -> Self {
+        Self {
+            users: user_list.users,
+        }
     }
 }
 
-impl Into<crate::mumble_proto::UserList> for UserList {
-    fn into(self) -> crate::mumble_proto::UserList {
-        crate::mumble_proto::UserList { users: self.users }
-    }
-}
-
-impl Into<Message> for UserList {
-    fn into(self) -> Message {
-        Message::UserList(self.into())
+impl From<UserList> for Message {
+    fn from(user_list: UserList) -> Self {
+        Message::UserList(user_list.into())
     }
 }

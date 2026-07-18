@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct VoiceTarget {
     pub id: Option<u32>,
     pub targets: Vec<crate::mumble_proto::voice_target::Target>,
@@ -15,26 +15,17 @@ impl From<crate::mumble_proto::VoiceTarget> for VoiceTarget {
     }
 }
 
-impl Default for VoiceTarget {
-    fn default() -> Self {
-        Self {
-            id: None,
-            targets: Vec::new(),
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::VoiceTarget> for VoiceTarget {
-    fn into(self) -> crate::mumble_proto::VoiceTarget {
+impl From<VoiceTarget> for crate::mumble_proto::VoiceTarget {
+    fn from(voice_target: VoiceTarget) -> Self {
         crate::mumble_proto::VoiceTarget {
-            id: self.id,
-            targets: self.targets,
+            id: voice_target.id,
+            targets: voice_target.targets,
         }
     }
 }
 
-impl Into<Message> for VoiceTarget {
-    fn into(self) -> Message {
-        Message::VoiceTarget(self.into())
+impl From<VoiceTarget> for Message {
+    fn from(voice_target: VoiceTarget) -> Self {
+        Message::VoiceTarget(voice_target.into())
     }
 }

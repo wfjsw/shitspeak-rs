@@ -1,7 +1,7 @@
 use crate::messages::Message;
 use bytes::Bytes;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CryptSetup {
     key: Option<Bytes>,
     client_nonce: Option<Bytes>,
@@ -40,28 +40,18 @@ impl CryptSetup {
     }
 }
 
-impl Default for CryptSetup {
-    fn default() -> Self {
-        Self {
-            key: None,
-            client_nonce: None,
-            server_nonce: None,
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::CryptSetup> for CryptSetup {
-    fn into(self) -> crate::mumble_proto::CryptSetup {
+impl From<CryptSetup> for crate::mumble_proto::CryptSetup {
+    fn from(crypt_setup: CryptSetup) -> Self {
         crate::mumble_proto::CryptSetup {
-            key: self.key.map(|b| b.to_vec()),
-            client_nonce: self.client_nonce.map(|b| b.to_vec()),
-            server_nonce: self.server_nonce.map(|b| b.to_vec()),
+            key: crypt_setup.key.map(Vec::from),
+            client_nonce: crypt_setup.client_nonce.map(Vec::from),
+            server_nonce: crypt_setup.server_nonce.map(Vec::from),
         }
     }
 }
 
-impl Into<Message> for CryptSetup {
-    fn into(self) -> Message {
-        Message::CryptSetup(self.into())
+impl From<CryptSetup> for Message {
+    fn from(crypt_setup: CryptSetup) -> Self {
+        Self::CryptSetup(crypt_setup.into())
     }
 }

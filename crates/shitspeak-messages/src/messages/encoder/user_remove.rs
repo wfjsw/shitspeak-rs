@@ -1,6 +1,6 @@
 use crate::messages::Message;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UserRemove {
     pub session: u32,
     pub actor: Option<u32>,
@@ -19,30 +19,19 @@ impl From<crate::mumble_proto::UserRemove> for UserRemove {
     }
 }
 
-impl Default for UserRemove {
-    fn default() -> Self {
-        Self {
-            session: 0,
-            actor: None,
-            reason: None,
-            ban: None,
-        }
-    }
-}
-
-impl Into<crate::mumble_proto::UserRemove> for UserRemove {
-    fn into(self) -> crate::mumble_proto::UserRemove {
+impl From<UserRemove> for crate::mumble_proto::UserRemove {
+    fn from(user_remove: UserRemove) -> Self {
         crate::mumble_proto::UserRemove {
-            session: self.session,
-            actor: self.actor,
-            reason: self.reason,
-            ban: self.ban,
+            session: user_remove.session,
+            actor: user_remove.actor,
+            reason: user_remove.reason,
+            ban: user_remove.ban,
         }
     }
 }
 
-impl Into<Message> for UserRemove {
-    fn into(self) -> Message {
-        Message::UserRemove(self.into())
+impl From<UserRemove> for Message {
+    fn from(user_remove: UserRemove) -> Self {
+        Message::UserRemove(user_remove.into())
     }
 }
