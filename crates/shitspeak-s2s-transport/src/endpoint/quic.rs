@@ -2,7 +2,6 @@
 //! stream transports. The bound `quinn::Endpoint` is built once at endpoint
 //! construction time and shared between accept and dial.
 
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -145,137 +144,124 @@ fn quic_transport_config() -> Arc<QuinnTransportConfig> {
 }
 
 impl Endpoint for QuicEndpoint {
-    fn start(
-        self: Arc<Self>,
-        inner: Arc<ManagerInner>,
-    ) -> impl Future<Output = io::Result<()>> + Send {
-        async move {
-            let mut handles = Vec::with_capacity(self.listen_addrs.len());
-            for addr in self.listen_addrs.iter().copied() {
-                let mux_handle = self
-                    .mux
-                    .take_handle(addr, TransportKind::Quic, inner.shutdown().child_token())
-                    .await?;
-                let mut server_cfg = self.server_cfg.clone();
-                server_cfg.transport = quic_transport_config();
-                let handle = bind_mux_server_endpoint(server_cfg, mux_handle)
-                    .map_err(|e| io::Error::new(e.kind(), format!("quic mux bind {addr}: {e}")))?;
-                handles.push(AcceptEndpoint { handle });
-            }
-            *self.accept_handles.lock() = handles;
-            for accept in self.accept_handles.lock().iter() {
-                let handle = accept.handle.clone();
-                debug!(addr=?handle.local_addr().ok(), "quic listener up");
-                tokio::spawn(accept_loop(handle, inner.clone()));
-            }
-            Ok(())
+    async fn start(self: Arc<Self>, inner: Arc<ManagerInner>) -> io::Result<()> {
+        let mut handles = Vec::with_capacity(self.listen_addrs.len());
+        for addr in self.listen_addrs.iter().copied() {
+            let mux_handle = self
+                .mux
+                .take_handle(addr, TransportKind::Quic, inner.shutdown().child_token())
+                .await?;
+            let mut server_cfg = self.server_cfg.clone();
+            server_cfg.transport = quic_transport_config();
+            let handle = bind_mux_server_endpoint(server_cfg, mux_handle)
+                .map_err(|e| io::Error::new(e.kind(), format!("quic mux bind {addr}: {e}")))?;
+            handles.push(AcceptEndpoint { handle });
         }
+        *self.accept_handles.lock() = handles;
+        for accept in self.accept_handles.lock().iter() {
+            let handle = accept.handle.clone();
+            debug!(addr=?handle.local_addr().ok(), "quic listener up");
+            tokio::spawn(accept_loop(handle, inner.clone()));
+        }
+        Ok(())
     }
 
-    fn dial(
+    async fn dial(
         self: Arc<Self>,
         inner: Arc<ManagerInner>,
         peer: Arc<PeerState>,
         addr: SocketAddr,
-    ) -> impl Future<Output = io::Result<()>> + Send {
-        async move {
-            let connecting = self
-                .client_handle(addr)
-                .await?
-                .connect_with(
-                    self.client_config_for_path(),
-                    addr,
-                    &format!("node-{}", peer.node_id()),
-                )
-                .map_err(|e| io::Error::other(format!("quic connect_with: {e}")))?;
-            let conn = connecting
-                .await
-                .map_err(|e| io::Error::other(format!("quic connecting: {e}")))?;
-            let chain = conn
-                .peer_identity()
-                .and_then(|d| {
-                    d.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
-                        .ok()
-                })
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "no quic peer identity")
-                })?;
-            let peer_node = parse_peer_cn(&chain)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
-            if peer_node != peer.node_id() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "peer certificate node id {peer_node} != expected {}",
-                        peer.node_id()
-                    ),
-                ));
-            }
-            let native_sampler = Some(native_stats::quic_sampler(conn.clone()));
-            let (send, recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| io::Error::other(format!("quic open_bi: {e}")))?;
-            install_stream_session(
-                &inner,
-                peer_node,
-                TransportKind::Quic,
-                Some(addr),
-                true,
-                BiStream { send, recv },
-                native_sampler,
-            );
-            Ok(())
+    ) -> io::Result<()> {
+        let connecting = self
+            .client_handle(addr)
+            .await?
+            .connect_with(
+                self.client_config_for_path(),
+                addr,
+                &format!("node-{}", peer.node_id()),
+            )
+            .map_err(|e| io::Error::other(format!("quic connect_with: {e}")))?;
+        let conn = connecting
+            .await
+            .map_err(|e| io::Error::other(format!("quic connecting: {e}")))?;
+        let chain = conn
+            .peer_identity()
+            .and_then(|d| {
+                d.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+                    .ok()
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no quic peer identity"))?;
+        let peer_node = parse_peer_cn(&chain)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        if peer_node != peer.node_id() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "peer certificate node id {peer_node} != expected {}",
+                    peer.node_id()
+                ),
+            ));
         }
+        let native_sampler = Some(native_stats::quic_sampler(conn.clone()));
+        let (send, recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| io::Error::other(format!("quic open_bi: {e}")))?;
+        install_stream_session(
+            &inner,
+            peer_node,
+            TransportKind::Quic,
+            Some(addr),
+            true,
+            BiStream { send, recv },
+            native_sampler,
+        );
+        Ok(())
     }
 
-    fn dial_unidentified(
+    async fn dial_unidentified(
         self: Arc<Self>,
         inner: Arc<ManagerInner>,
         addr: SocketAddr,
-    ) -> impl Future<Output = io::Result<crate::types::NodeIdentifier>> + Send {
-        async move {
-            let connecting = self
-                .client_handle(addr)
-                .await?
-                .connect_with(self.client_config_for_path(), addr, "s2s-seed.local")
-                .map_err(|e| io::Error::other(format!("quic connect_with: {e}")))?;
-            let conn = connecting
-                .await
-                .map_err(|e| io::Error::other(format!("quic connecting: {e}")))?;
-            let chain = conn
-                .peer_identity()
-                .and_then(|d| {
-                    d.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
-                        .ok()
-                })
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "no quic peer identity")
-                })?;
-            let peer_node = parse_peer_cn(&chain)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
-            if peer_node == inner.self_id() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "self-loop rejected",
-                ));
-            }
-            let native_sampler = Some(native_stats::quic_sampler(conn.clone()));
-            let (send, recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| io::Error::other(format!("quic open_bi: {e}")))?;
-            install_stream_session(
-                &inner,
-                peer_node,
-                TransportKind::Quic,
-                Some(addr),
-                true,
-                BiStream { send, recv },
-                native_sampler,
-            );
-            Ok(peer_node)
+    ) -> io::Result<crate::types::NodeIdentifier> {
+        let connecting = self
+            .client_handle(addr)
+            .await?
+            .connect_with(self.client_config_for_path(), addr, "s2s-seed.local")
+            .map_err(|e| io::Error::other(format!("quic connect_with: {e}")))?;
+        let conn = connecting
+            .await
+            .map_err(|e| io::Error::other(format!("quic connecting: {e}")))?;
+        let chain = conn
+            .peer_identity()
+            .and_then(|d| {
+                d.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+                    .ok()
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no quic peer identity"))?;
+        let peer_node = parse_peer_cn(&chain)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        if peer_node == inner.self_id() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "self-loop rejected",
+            ));
         }
+        let native_sampler = Some(native_stats::quic_sampler(conn.clone()));
+        let (send, recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| io::Error::other(format!("quic open_bi: {e}")))?;
+        install_stream_session(
+            &inner,
+            peer_node,
+            TransportKind::Quic,
+            Some(addr),
+            true,
+            BiStream { send, recv },
+            native_sampler,
+        );
+        Ok(peer_node)
     }
 }
 

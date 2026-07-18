@@ -2,7 +2,6 @@
 //! layer rustls on top of `KcpStream` (which implements AsyncRead+AsyncWrite)
 //! exactly like we do for TCP.
 
-use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -55,114 +54,105 @@ impl KcpEndpoint {
 }
 
 impl Endpoint for KcpEndpoint {
-    fn start(
-        self: Arc<Self>,
-        inner: Arc<ManagerInner>,
-    ) -> impl Future<Output = io::Result<()>> + Send {
-        async move {
-            let acceptor = TlsAcceptor::from(self.server_tls.clone());
-            for addr in self.listen_addrs.iter().copied() {
-                let handle = self
-                    .mux
-                    .take_handle(addr, TransportKind::Kcp, inner.shutdown().child_token())
-                    .await?;
-                let cfg = kcp_config(self.kcp_tuning);
-                let listener = KcpListener::from_io(cfg, Arc::new(handle))
-                    .await
-                    .map_err(|e| io::Error::other(format!("kcp mux bind {addr}: {e}")))?;
-                debug!(%addr, "kcp listener up");
-                tokio::spawn(accept_loop(
-                    listener,
-                    acceptor.clone(),
-                    inner.clone(),
-                    Arc::new(Semaphore::new(KCP_MAX_INBOUND_HANDSHAKES)),
-                ));
-            }
-            Ok(())
+    async fn start(self: Arc<Self>, inner: Arc<ManagerInner>) -> io::Result<()> {
+        let acceptor = TlsAcceptor::from(self.server_tls.clone());
+        for addr in self.listen_addrs.iter().copied() {
+            let handle = self
+                .mux
+                .take_handle(addr, TransportKind::Kcp, inner.shutdown().child_token())
+                .await?;
+            let cfg = kcp_config(self.kcp_tuning);
+            let listener = KcpListener::from_io(cfg, Arc::new(handle))
+                .await
+                .map_err(|e| io::Error::other(format!("kcp mux bind {addr}: {e}")))?;
+            debug!(%addr, "kcp listener up");
+            tokio::spawn(accept_loop(
+                listener,
+                acceptor.clone(),
+                inner.clone(),
+                Arc::new(Semaphore::new(KCP_MAX_INBOUND_HANDSHAKES)),
+            ));
         }
+        Ok(())
     }
 
-    fn dial(
+    async fn dial(
         self: Arc<Self>,
         inner: Arc<ManagerInner>,
         peer: Arc<PeerState>,
         addr: SocketAddr,
-    ) -> impl Future<Output = io::Result<()>> + Send {
-        async move {
-            let cfg = kcp_config(self.kcp_tuning);
-            let sock = connect_kcp_stream(&cfg, addr)
-                .await
-                .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
-            let native_sampler = native_stats::kcp_sampler(&sock);
-            let connector = TlsConnector::from(self.client_tls.clone());
-            let server_name = ServerName::try_from(format!("node-{}", peer.node_id()))
-                .expect("static name parses");
-            let tls = connector.connect(server_name, sock).await?;
-            let (_, client) = tls.get_ref();
-            let chain = client
-                .peer_certificates()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no peer cert chain"))?;
-            let peer_node = parse_peer_cn(chain)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
-            if peer_node != peer.node_id() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "peer certificate node id {peer_node} != expected {}",
-                        peer.node_id()
-                    ),
-                ));
-            }
-            install_stream_session(
-                &inner,
-                peer_node,
-                TransportKind::Kcp,
-                Some(addr),
-                true,
-                tls,
-                native_sampler,
-            );
-            Ok(())
+    ) -> io::Result<()> {
+        let cfg = kcp_config(self.kcp_tuning);
+        let sock = connect_kcp_stream(&cfg, addr)
+            .await
+            .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
+        let native_sampler = native_stats::kcp_sampler(&sock);
+        let connector = TlsConnector::from(self.client_tls.clone());
+        let server_name =
+            ServerName::try_from(format!("node-{}", peer.node_id())).expect("static name parses");
+        let tls = connector.connect(server_name, sock).await?;
+        let (_, client) = tls.get_ref();
+        let chain = client
+            .peer_certificates()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no peer cert chain"))?;
+        let peer_node = parse_peer_cn(chain)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        if peer_node != peer.node_id() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "peer certificate node id {peer_node} != expected {}",
+                    peer.node_id()
+                ),
+            ));
         }
+        install_stream_session(
+            &inner,
+            peer_node,
+            TransportKind::Kcp,
+            Some(addr),
+            true,
+            tls,
+            native_sampler,
+        );
+        Ok(())
     }
 
-    fn dial_unidentified(
+    async fn dial_unidentified(
         self: Arc<Self>,
         inner: Arc<ManagerInner>,
         addr: SocketAddr,
-    ) -> impl Future<Output = io::Result<crate::types::NodeIdentifier>> + Send {
-        async move {
-            let cfg = kcp_config(self.kcp_tuning);
-            let sock = connect_kcp_stream(&cfg, addr)
-                .await
-                .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
-            let native_sampler = native_stats::kcp_sampler(&sock);
-            let connector = TlsConnector::from(self.client_tls.clone());
-            let server_name = ServerName::try_from("s2s-seed.local").expect("static name parses");
-            let tls = connector.connect(server_name, sock).await?;
-            let (_, client) = tls.get_ref();
-            let chain = client
-                .peer_certificates()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no peer cert chain"))?;
-            let peer_node = parse_peer_cn(chain)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
-            if peer_node == inner.self_id() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "self-loop rejected",
-                ));
-            }
-            install_stream_session(
-                &inner,
-                peer_node,
-                TransportKind::Kcp,
-                Some(addr),
-                true,
-                tls,
-                native_sampler,
-            );
-            Ok(peer_node)
+    ) -> io::Result<crate::types::NodeIdentifier> {
+        let cfg = kcp_config(self.kcp_tuning);
+        let sock = connect_kcp_stream(&cfg, addr)
+            .await
+            .map_err(|e| io::Error::other(format!("kcp connect: {e}")))?;
+        let native_sampler = native_stats::kcp_sampler(&sock);
+        let connector = TlsConnector::from(self.client_tls.clone());
+        let server_name = ServerName::try_from("s2s-seed.local").expect("static name parses");
+        let tls = connector.connect(server_name, sock).await?;
+        let (_, client) = tls.get_ref();
+        let chain = client
+            .peer_certificates()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no peer cert chain"))?;
+        let peer_node = parse_peer_cn(chain)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+        if peer_node == inner.self_id() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "self-loop rejected",
+            ));
         }
+        install_stream_session(
+            &inner,
+            peer_node,
+            TransportKind::Kcp,
+            Some(addr),
+            true,
+            tls,
+            native_sampler,
+        );
+        Ok(peer_node)
     }
 }
 

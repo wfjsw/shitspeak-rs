@@ -37,7 +37,7 @@ static ADAPTIVE_DICTIONARY_CACHE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Per-send transport options. Defaults are intentionally raw so only
 /// non-latency-sensitive callers opt in to L1 compression.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SendOptions {
     allow_l1_compression: bool,
     expires_at: Option<Instant>,
@@ -68,15 +68,6 @@ impl SendOptions {
 
     pub fn is_expired_at(&self, now: Instant) -> bool {
         self.expires_at.is_some_and(|deadline| now >= deadline)
-    }
-}
-
-impl Default for SendOptions {
-    fn default() -> Self {
-        Self {
-            allow_l1_compression: false,
-            expires_at: None,
-        }
     }
 }
 

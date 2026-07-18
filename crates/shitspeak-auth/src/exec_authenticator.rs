@@ -102,11 +102,11 @@ impl ExecAuthenticator {
         let request_mode = config.long_running_request_mode();
         Ok(Self {
             inner: Arc::new(ExecAuthenticatorInner::new(
-                ExecAuthenticatorMode::LongRunning {
+                ExecAuthenticatorMode::LongRunning(Box::new(LongRunningExecAuthenticatorMode {
                     process: Mutex::new(LongRunningProcessState::default()),
                     request_mode,
                     next_request_id: AtomicU64::new(1),
-                },
+                })),
                 config,
             )?),
         })
@@ -228,13 +228,14 @@ impl ExecAuthenticatorInner {
                 let request_json = line_json(&request)?;
                 self.invoke_ephemeral(request_json).await?
             }
-            ExecAuthenticatorMode::LongRunning {
-                process,
-                request_mode,
-                next_request_id,
-            } => {
-                self.invoke_long_running(process, *request_mode, next_request_id, request)
-                    .await?
+            ExecAuthenticatorMode::LongRunning(mode) => {
+                self.invoke_long_running(
+                    &mode.process,
+                    mode.request_mode,
+                    &mode.next_request_id,
+                    request,
+                )
+                .await?
             }
         };
         serde_json::from_slice(&response_json).map_err(|source| ExecAuthenticatorError::Json {
@@ -676,11 +677,13 @@ impl ExecAuthenticatorInner {
 
 enum ExecAuthenticatorMode {
     Ephemeral,
-    LongRunning {
-        process: Mutex<LongRunningProcessState>,
-        request_mode: ExecLongRunningRequestMode,
-        next_request_id: AtomicU64,
-    },
+    LongRunning(Box<LongRunningExecAuthenticatorMode>),
+}
+
+struct LongRunningExecAuthenticatorMode {
+    process: Mutex<LongRunningProcessState>,
+    request_mode: ExecLongRunningRequestMode,
+    next_request_id: AtomicU64,
 }
 
 #[derive(Default)]

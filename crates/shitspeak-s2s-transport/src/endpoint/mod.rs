@@ -8,10 +8,10 @@
 //! `start` and `dial` calls through that.
 //!
 //! Adding a fifth transport is mechanical:
-//!   1. Add a variant to `TransportKind`.
-//!   2. Define `XxxEndpoint` and `impl Endpoint for XxxEndpoint`.
-//!   3. Add an `Option<Arc<XxxEndpoint>>` field to `EndpointRegistry`.
-//!   4. Add one match arm each to [`start_all`] and [`dispatch_dial`].
+//! 1. Add a variant to `TransportKind`.
+//! 2. Define `XxxEndpoint` and `impl Endpoint for XxxEndpoint`.
+//! 3. Add an `Option<Arc<XxxEndpoint>>` field to `EndpointRegistry`.
+//! 4. Add one match arm each to [`start_all`] and [`dispatch_dial`].
 //! The compiler flags every site that needs updating.
 
 use std::collections::HashSet;
@@ -95,10 +95,10 @@ pub(crate) async fn bind_udp_socket_with_ipv6_only(
 }
 
 fn set_socket_ipv6_only(socket: &socket2::Socket, addr: SocketAddr, ipv6_only: bool) {
-    if addr.is_ipv6() {
-        if let Err(e) = socket.set_only_v6(ipv6_only) {
-            debug!(%addr, %ipv6_only, error=%e, "unable to set IPv6-only socket mode");
-        }
+    if addr.is_ipv6()
+        && let Err(e) = socket.set_only_v6(ipv6_only)
+    {
+        debug!(%addr, %ipv6_only, error=%e, "unable to set IPv6-only socket mode");
     }
 }
 
@@ -338,33 +338,31 @@ pub(crate) async fn run_supervisor(inner: Arc<ManagerInner>) {
                 inner.cfg().unselected_link_probe_interval(),
                 now,
             )
-        {
-            if let Some((node, peer)) = select_unselected_probe_candidate(
+            && let Some((node, peer)) = select_unselected_probe_candidate(
                 &candidates,
                 &mandatory_targets,
                 inner.cfg(),
                 local_ip_capability,
-            ) {
-                if peer.try_begin_connect() {
-                    last_unselected_probe = Some(now);
-                    let inner_c = inner.clone();
-                    let peer_c = peer.clone();
-                    let probe_hold = exploratory_probe_hold_time(inner.cfg());
-                    tokio::spawn(async move {
-                        debug!(
-                            peer = %node,
-                            max_outgoing_connections = inner_c.cfg().max_outgoing_connections(),
-                            "probing unselected S2S link beyond outgoing cap"
-                        );
-                        let _ = try_dial_peer(&inner_c, &peer_c, true).await;
-                        peer_c.end_connect();
-                        tokio::select! {
-                            _ = sleep(probe_hold) => prune_outgoing_to_soft_cap(&inner_c),
-                            _ = inner_c.shutdown().cancelled() => {}
-                        }
-                    });
+            )
+            && peer.try_begin_connect()
+        {
+            last_unselected_probe = Some(now);
+            let inner_c = inner.clone();
+            let peer_c = peer.clone();
+            let probe_hold = exploratory_probe_hold_time(inner.cfg());
+            tokio::spawn(async move {
+                debug!(
+                    peer = %node,
+                    max_outgoing_connections = inner_c.cfg().max_outgoing_connections(),
+                    "probing unselected S2S link beyond outgoing cap"
+                );
+                let _ = try_dial_peer(&inner_c, &peer_c, true).await;
+                peer_c.end_connect();
+                tokio::select! {
+                    _ = sleep(probe_hold) => prune_outgoing_to_soft_cap(&inner_c),
+                    _ = inner_c.shutdown().cancelled() => {}
                 }
-            }
+            });
         }
 
         let mut registered_addresses = None;

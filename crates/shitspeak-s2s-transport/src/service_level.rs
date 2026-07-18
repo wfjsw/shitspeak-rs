@@ -30,8 +30,9 @@ impl ServiceLevel {
 /// Each default service-level policy has its own metric identity. Upper layers
 /// can request a different metric when the payload has different quality needs,
 /// for example conversational voice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum RoutingMetric {
+    #[default]
     ReliableCost,
     ReliableLowLatencyCost,
     BestEffortCost,
@@ -61,12 +62,6 @@ impl RoutingMetric {
             Self::BestEffortCost => "best_effort",
             Self::ConversationalQuality => "conversational",
         }
-    }
-}
-
-impl Default for RoutingMetric {
-    fn default() -> Self {
-        Self::ReliableCost
     }
 }
 

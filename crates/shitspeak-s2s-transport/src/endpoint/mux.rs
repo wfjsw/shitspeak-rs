@@ -822,7 +822,7 @@ fn prefixed_datagram(protocol: MuxProtocol, payload: &[u8]) -> Vec<u8> {
     datagram
 }
 
-fn decode_prefixed<'a>(expected: MuxProtocol, datagram: &'a [u8]) -> io::Result<Option<&'a [u8]>> {
+fn decode_prefixed(expected: MuxProtocol, datagram: &[u8]) -> io::Result<Option<&[u8]>> {
     let Some((&discriminator, payload)) = datagram.split_first() else {
         return Ok(None);
     };
