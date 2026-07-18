@@ -14069,7 +14069,7 @@ mod tests {
             .with_delivery_tick_interval(Duration::from_millis(100))
             .with_propose_ttl(Duration::from_secs(1));
         let (rt, net, _repo) = v1_runtime(cfg);
-        let (op_id, ack) = accepted_v2_ack_retry_fixture(&rt, Instant::now());
+        let (op_id, _ack) = accepted_v2_ack_retry_fixture(&rt, Instant::now());
         net.drain_captures();
 
         rt.send_accept_ack(2, op_id, NORMAL_ACCEPT_BALLOT, true)
