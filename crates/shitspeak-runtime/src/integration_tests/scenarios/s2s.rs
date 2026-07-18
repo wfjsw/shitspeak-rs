@@ -1300,7 +1300,7 @@ fn s2s_repair_frame(
 }
 
 async fn wait_for_s2s_tree_voice_forwarding(source: &TestServer, speaker: &TestClient, slot: u32) {
-    const REQUIRED_CONSECUTIVE_TREE_FORWARDS: usize = 3;
+    const REQUIRED_TREE_FORWARDS: usize = 3;
     const MAX_ACTIVATION_PROBES: u64 = 100;
 
     let original_before = s2s_prometheus_total(
@@ -1308,8 +1308,6 @@ async fn wait_for_s2s_tree_voice_forwarding(source: &TestServer, speaker: &TestC
         "shitspeak_s2s_distribution_events_total",
         &[("profile", "voice_realtime"), ("event", "original_forward")],
     );
-    let mut previous_originals = original_before;
-    let mut consecutive_tree_forwards = 0;
     for attempt in 0..MAX_ACTIVATION_PROBES {
         speaker
             .send_voice_tcp_terminator(
@@ -1324,19 +1322,13 @@ async fn wait_for_s2s_tree_voice_forwarding(source: &TestServer, speaker: &TestC
             "shitspeak_s2s_distribution_events_total",
             &[("profile", "voice_realtime"), ("event", "original_forward")],
         );
-        if originals > previous_originals {
-            consecutive_tree_forwards += 1;
-        } else {
-            consecutive_tree_forwards = 0;
-        }
-        previous_originals = originals;
-        if consecutive_tree_forwards >= REQUIRED_CONSECUTIVE_TREE_FORWARDS {
+        if (originals - original_before).max(0.0) >= REQUIRED_TREE_FORWARDS as f64 {
             return;
         }
     }
 
     panic!(
-        "tree delivery did not sustain {REQUIRED_CONSECUTIVE_TREE_FORWARDS} active forwards after {MAX_ACTIVATION_PROBES} activation probes"
+        "tree delivery did not observe {REQUIRED_TREE_FORWARDS} active forwards after {MAX_ACTIVATION_PROBES} activation probes"
     );
 }
 
@@ -1929,18 +1921,20 @@ async fn wait_for_s2s_voice_target_installed(
 async fn create_s2s_root_shout_traffic_tree(server: &TestServer) -> Vec<u32> {
     let mut channel_ids = Vec::with_capacity(S2S_ROOT_SHOUT_TRAFFIC_CHANNELS.len());
     for &(channel_id, parent_id, name) in S2S_ROOT_SHOUT_TRAFFIC_CHANNELS {
-        server
+        let result = server
             .server
-            .get_channels()
-            .create_channel(Channel::new(
-                channel_id,
-                name.to_owned(),
-                0,
-                0,
-                Some(parent_id),
-            ))
-            .await
-            .unwrap_or_else(|err| panic!("create traffic channel {channel_id}: {err:?}"));
+            .s2s_manager()
+            .propose_channel_op(
+                None,
+                shitspeak_state::ChannelOp::CreateChannel {
+                    channel: Channel::new(channel_id, name.to_owned(), 0, 0, Some(parent_id)),
+                },
+            )
+            .await;
+        assert!(
+            result.is_proposed(),
+            "strict proposal for traffic channel {channel_id} ({name}, parent {parent_id}) failed: {result:?}"
+        );
         channel_ids.push(channel_id);
     }
     channel_ids

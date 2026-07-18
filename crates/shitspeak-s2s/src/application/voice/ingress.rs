@@ -5,7 +5,7 @@
 //! hands emitted frames to the installed audio sink. The speaker-side API
 //! wraps already-encoded audio payloads with unresolved routing intent.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -30,7 +30,7 @@ use crate::application::voice::metrics::{
 use crate::application::voice::reorder::{
     self, GapReport, Reorderer, VoiceCopyKind, VoiceRouteHint,
 };
-use crate::application::voice::repair::{RepairCache, RepairFrame};
+use crate::application::voice::repair::{REPAIR_RESPONSE_PAGE_SEQUENCES, RepairCache, RepairFrame};
 use crate::application::voice::send::{
     self, DistributionGroup, OverlayVoiceTransport, VoiceTransport,
 };
@@ -45,7 +45,13 @@ type AudioSinkSlot = Arc<RwLock<Option<Arc<dyn AudioSink>>>>;
 type RecipientIndexSlot = Arc<RwLock<Option<Arc<RecipientIndex>>>>;
 
 const REPAIR_REQUEST_QUEUE_CAPACITY: usize = 256;
+const REPAIR_REQUEST_MAX_STREAMS: usize = 256;
+const REPAIR_REQUEST_MAX_CONCURRENCY: usize = 16;
+const REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE: u8 = 3;
+const REPAIR_REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const REPAIR_REQUEST_MAX_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const REPAIR_RESPONSE_QUEUE_CAPACITY: usize = 256;
+const REPAIR_RESPONSE_MAX_STREAMS: usize = 256;
 const REPAIR_RESPONSE_MIN_CONCURRENCY: usize = 2;
 const REPAIR_RESPONSE_MAX_CONCURRENCY: usize = 16;
 const DISTANT_REPAIR_PATH_LATENCY_US: u64 = 150_000;
@@ -69,7 +75,18 @@ struct RepairRequestKey {
     destination: NodeIdentifier,
     sender_session: u32,
     sender_epoch: u64,
-    first_seq: u64,
+}
+
+#[derive(Debug)]
+struct RepairRequestState {
+    from: NodeIdentifier,
+    tracked_first_seq: u64,
+    attempts: u8,
+    requested_page_last: Option<u64>,
+    retry_interval: Duration,
+    next_attempt: Instant,
+    send_cancel: CancellationToken,
+    in_flight_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -95,7 +112,6 @@ impl RepairRequestKey {
             destination: repair_destination(gap.sender_session),
             sender_session: gap.sender_session,
             sender_epoch: gap.sender_epoch,
-            first_seq: gap.first_seq,
         }
     }
 }
@@ -103,7 +119,6 @@ impl RepairRequestKey {
 #[derive(Clone)]
 struct RepairRequestScheduler {
     tx: mpsc::Sender<GapReport>,
-    outstanding: Arc<parking_lot::Mutex<HashSet<RepairRequestKey>>>,
 }
 
 impl RepairRequestScheduler {
@@ -113,23 +128,14 @@ impl RepairRequestScheduler {
             metrics::record_repair(source, destination, VoiceRepairResult::RequestSuppressed, 1);
             return;
         }
-        let key = RepairRequestKey::new(gap);
-        if !self.outstanding.lock().insert(key) {
-            metrics::record_repair(source, destination, VoiceRepairResult::RequestSuppressed, 1);
-            return;
-        }
         match self.tx.try_send(gap) {
-            Ok(()) => metrics::record_repair(
-                source,
-                key.destination,
-                VoiceRepairResult::RequestScheduled,
-                1,
-            ),
+            Ok(()) => {
+                metrics::record_repair(source, destination, VoiceRepairResult::RequestScheduled, 1)
+            }
             Err(_) => {
-                self.outstanding.lock().remove(&key);
                 metrics::record_repair(
                     source,
-                    key.destination,
+                    destination,
                     VoiceRepairResult::RequestSuppressed,
                     1,
                 );
@@ -146,6 +152,32 @@ fn repair_destination(sender_session: u32) -> NodeIdentifier {
 struct RepairResponseRequest {
     from: NodeIdentifier,
     request: VoiceRepairRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RepairResponseKey {
+    destination: NodeIdentifier,
+    sender_session: u32,
+    sender_epoch: u64,
+}
+
+#[derive(Debug)]
+struct RepairResponseState {
+    cursor_floor: u64,
+    pending: Option<RepairResponseRequest>,
+    queued: bool,
+    in_flight: bool,
+    in_flight_last_seq: Option<u64>,
+}
+
+impl RepairResponseKey {
+    fn new(work: &RepairResponseRequest) -> Self {
+        Self {
+            destination: work.from,
+            sender_session: work.request.sender_session,
+            sender_epoch: work.request.sender_epoch,
+        }
+    }
 }
 
 /// Work whose byte reservation remains live until serialized dispatch has
@@ -286,7 +318,6 @@ impl VoiceService {
         let (repair_request_tx, repair_request_rx) = mpsc::channel(REPAIR_REQUEST_QUEUE_CAPACITY);
         let repair_request_scheduler = RepairRequestScheduler {
             tx: repair_request_tx,
-            outstanding: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         };
         let (repair_response_tx, repair_response_rx) =
             mpsc::channel(REPAIR_RESPONSE_QUEUE_CAPACITY);
@@ -294,12 +325,13 @@ impl VoiceService {
         let audio_sink: AudioSinkSlot = Arc::new(RwLock::new(None));
         let reorderer = Reorderer::new_with_capacity_source(cfg.clone(), max_users);
         let repair_cache = Arc::new(RepairCache::new(Duration::from_millis(cfg.repair_cache_ms)));
+        let repair_request_ttl_ms =
+            repair_deadline_transport_ttl_ms(&cfg, cfg.repair_request_ttl_ms);
         spawn_repair_request_worker(
             repair_request_rx,
-            repair_request_scheduler.outstanding.clone(),
             reorderer.clone(),
             transport.clone(),
-            cfg.repair_request_ttl_ms,
+            repair_request_ttl_ms,
             shutdown.clone(),
         );
         spawn_repair_response_worker(
@@ -1772,80 +1804,233 @@ fn tail_repair_lifetime(cfg: &VoiceConfig) -> Duration {
 
 fn spawn_repair_request_worker(
     mut rx: mpsc::Receiver<GapReport>,
-    outstanding: Arc<parking_lot::Mutex<HashSet<RepairRequestKey>>>,
     reorderer: Arc<Reorderer>,
     transport: Arc<dyn VoiceTransport>,
     request_ttl_ms: u64,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
+        let source = transport.local_node_id();
+        let mut active = HashMap::<RepairRequestKey, RepairRequestState>::new();
+        let mut jobs = tokio::task::JoinSet::<(RepairRequestKey, u64, u64, bool)>::new();
+        let mut next_generation = 0_u64;
+        let mut ticker = tokio::time::interval(REPAIR_REQUEST_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let gap = tokio::select! {
+            tokio::select! {
                 _ = shutdown.cancelled() => return,
-                gap = rx.recv() => match gap {
-                    Some(gap) => gap,
-                    None => return,
-                },
-            };
-            let source = transport.local_node_id();
-            let destination = repair_destination(gap.sender_session);
-            if reorderer.gap_still_missing(gap) {
-                let request = VoiceRepairRequest {
-                    sender_session: gap.sender_session,
-                    sender_epoch: gap.sender_epoch,
-                    first_seq: gap.first_seq,
-                    last_seq: gap.last_seq,
-                    request_sent_unix_ms: 0,
-                    request_ttl_ms: request_ttl_ms.min(u64::from(u32::MAX)) as u32,
-                    tail_ack: false,
-                };
-                match proto::encode_voice_repair_request(&request) {
-                    Ok(body) => {
-                        if transport
-                            .send_repair_request(
-                                destination,
-                                body,
-                                Duration::from_millis(request_ttl_ms),
-                            )
-                            .await
-                            .is_ok()
-                        {
-                            metrics::record_repair(
-                                source,
-                                destination,
-                                VoiceRepairResult::RequestSent,
-                                1,
-                            );
-                        } else {
-                            metrics::record_repair(
-                                source,
-                                destination,
-                                VoiceRepairResult::RequestFailed,
-                                1,
-                            );
+                gap = rx.recv() => {
+                    let Some(gap) = gap else { return; };
+                    let key = RepairRequestKey::new(gap);
+                    let stale = active
+                        .iter()
+                        .filter_map(|(key, state)| {
+                            reorderer
+                                .current_actionable_gap(
+                                    state.from,
+                                    key.sender_session,
+                                    key.sender_epoch,
+                                )
+                                .is_none()
+                                .then_some(*key)
+                        })
+                        .collect::<Vec<_>>();
+                    for stale_key in stale {
+                        if let Some(state) = active.remove(&stale_key) {
+                            state.send_cancel.cancel();
                         }
                     }
-                    Err(error) => {
+                    if let Some(state) = active.get_mut(&key) {
+                        state.from = gap.from;
+                    } else if active.len() >= REPAIR_REQUEST_MAX_STREAMS {
                         metrics::record_repair(
                             source,
-                            destination,
+                            key.destination,
                             VoiceRepairResult::RequestSuppressed,
                             1,
                         );
-                        trace!(%error, "voice repair: encode request failed");
+                    } else if let Some(actionable) = reorderer.current_actionable_gap(
+                        gap.from,
+                        gap.sender_session,
+                        gap.sender_epoch,
+                    ) {
+                        let now = Instant::now();
+                        let current = actionable.gap();
+                        let remaining = actionable.deadline().saturating_duration_since(now);
+                        active.insert(
+                            key,
+                            RepairRequestState {
+                                from: gap.from,
+                                tracked_first_seq: current.first_seq,
+                                attempts: 0,
+                                requested_page_last: None,
+                                retry_interval: repair_request_retry_interval(remaining),
+                                next_attempt: now,
+                                send_cancel: CancellationToken::new(),
+                                in_flight_generation: None,
+                            },
+                        );
+                    } else {
+                        metrics::record_repair(
+                            source,
+                            key.destination,
+                            VoiceRepairResult::RequestSuppressed,
+                            1,
+                        );
                     }
                 }
-            } else {
-                metrics::record_repair(
-                    source,
-                    destination,
-                    VoiceRepairResult::RequestSuppressed,
-                    1,
-                );
+                result = jobs.join_next(), if !jobs.is_empty() => {
+                    match result {
+                        Some(Ok((key, generation, first_seq, sent))) => {
+                            if let Some(state) = active.get_mut(&key)
+                                && state.in_flight_generation == Some(generation)
+                            {
+                                state.in_flight_generation = None;
+                                if sent && state.tracked_first_seq == first_seq {
+                                    state.attempts = state.attempts.saturating_add(1);
+                                }
+                            }
+                        }
+                        Some(Err(error)) => {
+                            trace!(%error, "voice repair: request job failed");
+                        }
+                        None => {}
+                    }
+                }
+                _ = ticker.tick() => {}
             }
-            outstanding.lock().remove(&RepairRequestKey::new(gap));
+
+            let now = Instant::now();
+            let mut remove = Vec::new();
+            let mut due = Vec::new();
+            let mut slots = REPAIR_REQUEST_MAX_CONCURRENCY.saturating_sub(jobs.len());
+            let keys = active.keys().copied().collect::<Vec<_>>();
+            for key in keys {
+                let Some(state) = active.get_mut(&key) else {
+                    continue;
+                };
+                let Some(actionable) = reorderer.current_actionable_gap(
+                    state.from,
+                    key.sender_session,
+                    key.sender_epoch,
+                ) else {
+                    remove.push(key);
+                    continue;
+                };
+                let gap = actionable.gap();
+                let deadline = actionable.deadline();
+                if gap.first_seq != state.tracked_first_seq {
+                    state.tracked_first_seq = gap.first_seq;
+                    state.attempts = 0;
+                    let remaining = deadline.saturating_duration_since(now);
+                    state.retry_interval = repair_request_retry_interval(remaining);
+                    if state
+                        .requested_page_last
+                        .is_some_and(|last| gap.first_seq > last)
+                    {
+                        state.requested_page_last = None;
+                    }
+                    state.next_attempt = now + REPAIR_REQUEST_POLL_INTERVAL.min(remaining);
+                }
+                if slots == 0
+                    || state.in_flight_generation.is_some()
+                    || state.attempts >= REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE
+                    || state.next_attempt > now
+                {
+                    continue;
+                }
+                let page_last = state.requested_page_last.unwrap_or_else(|| {
+                    gap.last_seq.min(
+                        gap.first_seq
+                            .saturating_add(REPAIR_RESPONSE_PAGE_SEQUENCES.saturating_sub(1)),
+                    )
+                });
+                state.requested_page_last = Some(page_last);
+                state.next_attempt = now + state.retry_interval;
+                let generation = next_generation;
+                next_generation = next_generation.wrapping_add(1);
+                state.in_flight_generation = Some(generation);
+                due.push((
+                    key,
+                    key.destination,
+                    GapReport {
+                        last_seq: gap.last_seq.min(page_last),
+                        ..gap
+                    },
+                    state.send_cancel.clone(),
+                    generation,
+                ));
+                slots -= 1;
+            }
+            for key in remove {
+                if let Some(state) = active.remove(&key) {
+                    state.send_cancel.cancel();
+                }
+            }
+            for (key, destination, gap, send_cancel, generation) in due {
+                let transport = transport.clone();
+                jobs.spawn(async move {
+                    let sent = tokio::select! {
+                        _ = send_cancel.cancelled() => false,
+                        sent = send_repair_request_attempt(
+                            source,
+                            destination,
+                            gap,
+                            transport,
+                            request_ttl_ms,
+                        ) => sent,
+                    };
+                    (key, generation, gap.first_seq, sent)
+                });
+            }
         }
     });
+}
+
+fn repair_request_retry_interval(remaining: Duration) -> Duration {
+    (remaining / 3).clamp(
+        REPAIR_REQUEST_POLL_INTERVAL,
+        REPAIR_REQUEST_MAX_RETRY_INTERVAL,
+    )
+}
+
+fn repair_deadline_transport_ttl_ms(cfg: &VoiceConfig, configured_ttl_ms: u64) -> u64 {
+    configured_ttl_ms
+        .max(cfg.reorder_max_delay_ms)
+        .max(cfg.adaptive_jitter_max_delay_ms)
+}
+
+async fn send_repair_request_attempt(
+    source: NodeIdentifier,
+    destination: NodeIdentifier,
+    gap: GapReport,
+    transport: Arc<dyn VoiceTransport>,
+    request_ttl_ms: u64,
+) -> bool {
+    let request = VoiceRepairRequest {
+        sender_session: gap.sender_session,
+        sender_epoch: gap.sender_epoch,
+        first_seq: gap.first_seq,
+        last_seq: gap.last_seq,
+        request_sent_unix_ms: 0,
+        request_ttl_ms: request_ttl_ms.min(u64::from(u32::MAX)) as u32,
+        tail_ack: false,
+    };
+    let Ok(body) = proto::encode_voice_repair_request(&request) else {
+        metrics::record_repair(source, destination, VoiceRepairResult::RequestSuppressed, 1);
+        return false;
+    };
+    if transport
+        .send_repair_request(destination, body, Duration::from_millis(request_ttl_ms))
+        .await
+        .is_ok()
+    {
+        metrics::record_repair(source, destination, VoiceRepairResult::RequestSent, 1);
+        true
+    } else {
+        metrics::record_repair(source, destination, VoiceRepairResult::RequestFailed, 1);
+        false
+    }
 }
 
 fn spawn_repair_response_worker(
@@ -1882,40 +2067,142 @@ fn spawn_repair_response_worker_with_concurrency(
 ) {
     let concurrency = concurrency.max(1);
     tokio::spawn(async move {
+        let source = transport.local_node_id();
+        let mut states = HashMap::<RepairResponseKey, RepairResponseState>::new();
+        let mut ready = VecDeque::<RepairResponseKey>::new();
         let mut jobs = tokio::task::JoinSet::new();
+        let mut task_keys = HashMap::new();
         let mut rx_open = true;
         loop {
-            if !rx_open && jobs.is_empty() {
-                return;
+            while jobs.len() < concurrency {
+                let Some(key) = ready.pop_front() else {
+                    break;
+                };
+                let Some(state) = states.get_mut(&key) else {
+                    continue;
+                };
+                state.queued = false;
+                let Some(work) = state.pending.take() else {
+                    continue;
+                };
+                state.in_flight = true;
+                state.in_flight_last_seq = Some(work.request.last_seq);
+                let transport = transport.clone();
+                let repair_cache = repair_cache.clone();
+                let ttl = Duration::from_millis(repair_deadline_transport_ttl_ms(
+                    &cfg,
+                    cfg.repair_transport_ttl_ms,
+                ));
+                let handle = jobs.spawn(async move {
+                    let admitted = send_repair_response(work, transport, repair_cache, ttl).await;
+                    (key, admitted)
+                });
+                task_keys.insert(handle.id(), key);
             }
 
-            if !rx_open || jobs.len() >= concurrency {
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    result = jobs.join_next() => {
-                        if let Some(Err(error)) = result {
-                            trace!(%error, "voice repair: response job failed");
-                        }
-                    }
-                }
-                continue;
+            if !rx_open && jobs.is_empty() && ready.is_empty() {
+                return;
             }
 
             tokio::select! {
                 _ = shutdown.cancelled() => return,
-                result = jobs.join_next(), if !jobs.is_empty() => {
-                    if let Some(Err(error)) = result {
-                        trace!(%error, "voice repair: response job failed");
+                result = jobs.join_next_with_id(), if !jobs.is_empty() => {
+                    let completed = match result {
+                        Some(Ok((task_id, completed))) => {
+                            task_keys.remove(&task_id);
+                            Some(completed)
+                        }
+                        Some(Err(error)) => {
+                            let completed = task_keys.remove(&error.id()).map(|key| (key, false));
+                            trace!(%error, "voice repair: response job failed");
+                            completed
+                        }
+                        None => None,
+                    };
+                    if let Some((key, admitted)) = completed
+                        && let Some(state) = states.get_mut(&key)
+                    {
+                        state.in_flight = false;
+                        let completed_last_seq = state.in_flight_last_seq.take();
+                        if admitted
+                            && state.pending.as_ref().is_some_and(|pending| {
+                                completed_last_seq.is_some_and(|last_seq| {
+                                    pending.request.first_seq <= last_seq
+                                })
+                            })
+                        {
+                            state.pending = None;
+                        }
+                        if state.pending.is_some() {
+                            if !state.queued {
+                                state.queued = true;
+                                ready.push_back(key);
+                            }
+                        } else {
+                            states.remove(&key);
+                        }
                     }
                 }
-                work = rx.recv() => match work {
+                work = rx.recv(), if rx_open => match work {
                     Some(work) => {
-                        let transport = transport.clone();
-                        let repair_cache = repair_cache.clone();
-                        let ttl = Duration::from_millis(cfg.repair_transport_ttl_ms);
-                        jobs.spawn(async move {
-                            send_repair_response(work, transport, repair_cache, ttl).await;
-                        });
+                        let key = RepairResponseKey::new(&work);
+                        if let Some(state) = states.get_mut(&key) {
+                            let first_seq = work.request.first_seq;
+                            if state
+                                .in_flight_last_seq
+                                .is_some_and(|last_seq| first_seq <= last_seq)
+                            {
+                                metrics::record_repair(
+                                    source,
+                                    key.destination,
+                                    VoiceRepairResult::RequestSuppressed,
+                                    1,
+                                );
+                            }
+                            if first_seq < state.cursor_floor {
+                                metrics::record_repair(
+                                    source,
+                                    key.destination,
+                                    VoiceRepairResult::RequestSuppressed,
+                                    1,
+                                );
+                                continue;
+                            }
+                            if first_seq > state.cursor_floor {
+                                state.cursor_floor = first_seq;
+                                state.pending = Some(work);
+                            } else if let Some(pending) = state.pending.as_mut() {
+                                pending.request.last_seq = pending
+                                    .request
+                                    .last_seq
+                                    .max(work.request.last_seq);
+                            } else {
+                                state.pending = Some(work);
+                            }
+                            if !state.in_flight && !state.queued {
+                                state.queued = true;
+                                ready.push_back(key);
+                            }
+                        } else if states.len() >= REPAIR_RESPONSE_MAX_STREAMS {
+                            metrics::record_repair(
+                                source,
+                                key.destination,
+                                VoiceRepairResult::RequestSuppressed,
+                                1,
+                            );
+                        } else {
+                            states.insert(
+                                key,
+                                RepairResponseState {
+                                    cursor_floor: work.request.first_seq,
+                                    pending: Some(work),
+                                    queued: true,
+                                    in_flight: false,
+                                    in_flight_last_seq: None,
+                                },
+                            );
+                            ready.push_back(key);
+                        }
                     }
                     None => rx_open = false,
                 },
@@ -1929,7 +2216,7 @@ async fn send_repair_response(
     transport: Arc<dyn VoiceTransport>,
     repair_cache: Arc<RepairCache>,
     ttl: Duration,
-) {
+) -> bool {
     let source = transport.local_node_id();
     let frames = repair_cache.lookup_range(
         work.request.sender_session,
@@ -1939,22 +2226,39 @@ async fn send_repair_response(
     );
     if frames.is_empty() {
         metrics::record_repair(source, work.from, VoiceRepairResult::FrameMissed, 1);
-        return;
+        return false;
     }
+    let destination = work.from;
     let avoid_first_hop = transport
-        .voice_route_quality(work.from)
+        .voice_route_quality(destination)
+        .filter(|quality| quality.transport() == TransportKind::Udp)
         .map(|quality| quality.next_hop());
+    let mut admitted = true;
     for frame in frames {
-        if transport
-            .send_repair_frame(work.from, frame.body().clone(), avoid_first_hop, ttl)
-            .await
-            .is_err()
-        {
-            metrics::record_repair(source, work.from, VoiceRepairResult::FrameSendFailed, 1);
-        } else {
-            metrics::record_repair(source, work.from, VoiceRepairResult::FrameServed, 1);
+        let body = frame.body().clone();
+        let mut result = transport
+            .send_repair_frame(destination, body.clone(), avoid_first_hop, ttl)
+            .await;
+        if result.is_err() && avoid_first_hop.is_some() {
+            result = transport
+                .send_repair_frame(destination, body.clone(), None, ttl)
+                .await;
         }
+        if result.is_err() {
+            tokio::task::yield_now().await;
+            result = transport
+                .send_repair_frame(destination, body, None, ttl)
+                .await;
+        }
+        if result.is_err() {
+            admitted = false;
+            metrics::record_repair(source, destination, VoiceRepairResult::FrameSendFailed, 1);
+        } else {
+            metrics::record_repair(source, destination, VoiceRepairResult::FrameServed, 1);
+        }
+        tokio::task::yield_now().await;
     }
+    admitted
 }
 
 #[cfg(test)]
@@ -2096,16 +2400,22 @@ mod tests {
         repair_release: Semaphore,
         active_repairs: AtomicU64,
         max_active_repairs: AtomicU64,
+        failures_remaining: AtomicU64,
     }
 
     impl ControlledRepairTransport {
         fn new() -> Arc<Self> {
+            Self::with_failures(0)
+        }
+
+        fn with_failures(failures: u64) -> Arc<Self> {
             Arc::new(Self {
                 inner: FakeVoiceTransport::new(7, vec![2, 3, 4]),
                 repair_entered: Semaphore::new(0),
                 repair_release: Semaphore::new(0),
                 active_repairs: AtomicU64::new(0),
                 max_active_repairs: AtomicU64::new(0),
+                failures_remaining: AtomicU64::new(failures),
             })
         }
     }
@@ -2163,7 +2473,230 @@ mod tests {
                 .expect("test release semaphore remains open")
                 .forget();
             self.active_repairs.fetch_sub(1, Ordering::SeqCst);
-            result
+            let fail = self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+            if fail {
+                Err(ApplicationError::Unavailable)
+            } else {
+                result
+            }
+        }
+
+        async fn send_proactive_repair_frame(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            avoid_first_hop: Option<NodeIdentifier>,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .send_proactive_repair_frame(dst, body, avoid_first_hop, ttl)
+                .await
+        }
+
+        fn alive_members(&self) -> Vec<NodeIdentifier> {
+            self.inner.alive_members()
+        }
+
+        fn local_node_id(&self) -> NodeIdentifier {
+            self.inner.local_node_id()
+        }
+
+        fn voice_route_quality(
+            &self,
+            dst: NodeIdentifier,
+        ) -> Option<crate::overlay::VoiceRouteQuality> {
+            self.inner.voice_route_quality(dst)
+        }
+    }
+
+    struct ControlledRepairRequestTransport {
+        inner: Arc<FakeVoiceTransport>,
+        request_entered: Semaphore,
+        request_release: Semaphore,
+        active_requests: AtomicU64,
+        request_attempts: AtomicU64,
+        failures_remaining: AtomicU64,
+        block_requests: bool,
+    }
+
+    struct ActiveRequestGuard<'a>(&'a AtomicU64);
+
+    impl Drop for ActiveRequestGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ControlledRepairRequestTransport {
+        fn new() -> Arc<Self> {
+            Self::new_inner(0, true)
+        }
+
+        fn with_failures(failures: u64) -> Arc<Self> {
+            Self::new_inner(failures, false)
+        }
+
+        fn new_inner(failures: u64, block_requests: bool) -> Arc<Self> {
+            Arc::new(Self {
+                inner: FakeVoiceTransport::new(7, vec![12]),
+                request_entered: Semaphore::new(0),
+                request_release: Semaphore::new(0),
+                active_requests: AtomicU64::new(0),
+                request_attempts: AtomicU64::new(0),
+                failures_remaining: AtomicU64::new(failures),
+                block_requests,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceTransport for ControlledRepairRequestTransport {
+        async fn send_unicast(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner.send_unicast(dst, body, ttl).await
+        }
+
+        async fn send_multicast(
+            &self,
+            dsts: &[NodeIdentifier],
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner.send_multicast(dsts, body, ttl).await
+        }
+
+        async fn send_broadcast(&self, body: Bytes, ttl: Duration) -> Result<(), ApplicationError> {
+            self.inner.send_broadcast(body, ttl).await
+        }
+
+        async fn send_repair_request(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.request_attempts.fetch_add(1, Ordering::SeqCst);
+            self.active_requests.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveRequestGuard(&self.active_requests);
+            self.request_entered.add_permits(1);
+            if self.block_requests {
+                self.request_release
+                    .acquire()
+                    .await
+                    .expect("test release semaphore remains open")
+                    .forget();
+            }
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(ApplicationError::Unavailable);
+            }
+            self.inner.send_repair_request(dst, body, ttl).await
+        }
+
+        async fn send_repair_frame(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            avoid_first_hop: Option<NodeIdentifier>,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .send_repair_frame(dst, body, avoid_first_hop, ttl)
+                .await
+        }
+
+        async fn send_proactive_repair_frame(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            avoid_first_hop: Option<NodeIdentifier>,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner
+                .send_proactive_repair_frame(dst, body, avoid_first_hop, ttl)
+                .await
+        }
+
+        fn alive_members(&self) -> Vec<NodeIdentifier> {
+            self.inner.alive_members()
+        }
+
+        fn local_node_id(&self) -> NodeIdentifier {
+            self.inner.local_node_id()
+        }
+
+        fn voice_route_quality(
+            &self,
+            dst: NodeIdentifier,
+        ) -> Option<crate::overlay::VoiceRouteQuality> {
+            self.inner.voice_route_quality(dst)
+        }
+    }
+
+    struct AlternateFailRepairTransport {
+        inner: Arc<FakeVoiceTransport>,
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceTransport for AlternateFailRepairTransport {
+        async fn send_unicast(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner.send_unicast(dst, body, ttl).await
+        }
+
+        async fn send_multicast(
+            &self,
+            dsts: &[NodeIdentifier],
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner.send_multicast(dsts, body, ttl).await
+        }
+
+        async fn send_broadcast(&self, body: Bytes, ttl: Duration) -> Result<(), ApplicationError> {
+            self.inner.send_broadcast(body, ttl).await
+        }
+
+        async fn send_repair_request(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            self.inner.send_repair_request(dst, body, ttl).await
+        }
+
+        async fn send_repair_frame(
+            &self,
+            dst: NodeIdentifier,
+            body: Bytes,
+            avoid_first_hop: Option<NodeIdentifier>,
+            ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            if avoid_first_hop.is_some() {
+                return Err(ApplicationError::Unavailable);
+            }
+            self.inner
+                .send_repair_frame(dst, body, avoid_first_hop, ttl)
+                .await
         }
 
         async fn send_proactive_repair_frame(
@@ -2638,6 +3171,24 @@ mod tests {
         transport.calls()
     }
 
+    fn repair_test_frame(sender_session: u32, sender_epoch: u64, s2s_seq: u64) -> VoiceFrame {
+        VoiceFrame {
+            sender_session,
+            server_id: shitspeak_core::default_server_id(),
+            sender_epoch,
+            s2s_seq,
+            target_kind: 0,
+            is_terminator: false,
+            payload: Bytes::from(format!("repair-{s2s_seq}").into_bytes()),
+            intent: Some(VoiceIntent {
+                kind: Some(VoiceIntentKind::Normal(VoiceIntentNormal {
+                    source_channel: 0,
+                })),
+            }),
+            proactive_copy: false,
+        }
+    }
+
     #[test]
     fn proactive_repair_defaults_remain_enabled() {
         let cfg = VoiceConfig::default();
@@ -2648,7 +3199,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_request_dedup_key_distinguishes_sender_epochs() {
+    fn repair_request_stream_key_coalesces_ranges_and_distinguishes_epochs() {
         let gap = GapReport {
             from: 11,
             sender_session: shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
@@ -2658,16 +3209,371 @@ mod tests {
             first_seq: 7,
             last_seq: 9,
         };
+        let mut advanced = gap;
+        advanced.first_seq = 10;
+        advanced.last_seq = 12;
         let mut restarted = gap;
         restarted.sender_epoch = 43;
 
         let first = RepairRequestKey::new(gap);
+        let same_stream = RepairRequestKey::new(advanced);
         let second = RepairRequestKey::new(restarted);
+        assert_eq!(first, same_stream);
         assert_ne!(first, second);
-        let mut outstanding = HashSet::new();
-        assert!(outstanding.insert(first));
-        assert!(outstanding.insert(second));
-        assert!(!outstanding.insert(first));
+    }
+
+    #[tokio::test]
+    async fn repair_request_coordinator_coalesces_and_bounds_retries() {
+        let transport = FakeVoiceTransport::new(7, vec![12]);
+        let mut cfg = VoiceConfig::default();
+        cfg.adaptive_jitter_enabled = false;
+        cfg.reorder_max_delay_ms = 90;
+        let reorderer = Reorderer::new(cfg.clone());
+        let sender_session = shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
+            .unwrap()
+            .to_u32();
+        reorderer.push(11, repair_test_frame(sender_session, 42, 0));
+        let opened = reorderer.push_with_route_hint_report(
+            11,
+            repair_test_frame(sender_session, 42, 2),
+            None,
+        );
+        let gap = opened.opened_gap().expect("gap should open");
+
+        let (tx, rx) = mpsc::channel(REPAIR_REQUEST_QUEUE_CAPACITY);
+        let shutdown = CancellationToken::new();
+        spawn_repair_request_worker(
+            rx,
+            reorderer,
+            transport.clone(),
+            cfg.repair_request_ttl_ms,
+            shutdown.clone(),
+        );
+        for _ in 0..100 {
+            tx.try_send(gap).expect("duplicate report should fit");
+        }
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let requests = transport
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, FakeCall::RepairRequest { .. }))
+            .count();
+        assert!(
+            (2..=REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE as usize).contains(&requests),
+            "the stable gap should retry without exceeding its page budget; requests={requests}"
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn repair_request_coordinator_stops_after_gap_closes() {
+        let transport = FakeVoiceTransport::new(7, vec![12]);
+        let mut cfg = VoiceConfig::default();
+        cfg.adaptive_jitter_enabled = false;
+        cfg.reorder_max_delay_ms = 120;
+        let reorderer = Reorderer::new(cfg.clone());
+        let sender_session = shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
+            .unwrap()
+            .to_u32();
+        reorderer.push(11, repair_test_frame(sender_session, 42, 0));
+        let opened = reorderer.push_with_route_hint_report(
+            11,
+            repair_test_frame(sender_session, 42, 2),
+            None,
+        );
+        let gap = opened.opened_gap().expect("gap should open");
+
+        let (tx, rx) = mpsc::channel(REPAIR_REQUEST_QUEUE_CAPACITY);
+        let shutdown = CancellationToken::new();
+        spawn_repair_request_worker(
+            rx,
+            reorderer.clone(),
+            transport.clone(),
+            cfg.repair_request_ttl_ms,
+            shutdown.clone(),
+        );
+        tx.send(gap).await.unwrap();
+        let calls = wait_for_call_count(&transport, 1).await;
+        assert!(matches!(calls[0], FakeCall::RepairRequest { .. }));
+
+        reorderer.push_with_route_hint_report_with_repair(
+            11,
+            repair_test_frame(sender_session, 42, 1),
+            None,
+            true,
+        );
+        tokio::time::sleep(Duration::from_millis(140)).await;
+        let requests = transport
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, FakeCall::RepairRequest { .. }))
+            .count();
+        assert_eq!(requests, 1);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn repair_request_coordinator_cancels_an_in_flight_send_after_convergence() {
+        let transport = ControlledRepairRequestTransport::new();
+        let mut cfg = VoiceConfig::default();
+        cfg.adaptive_jitter_enabled = false;
+        cfg.reorder_max_delay_ms = 120;
+        let reorderer = Reorderer::new(cfg.clone());
+        let sender_session = shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
+            .unwrap()
+            .to_u32();
+        reorderer.push(11, repair_test_frame(sender_session, 42, 0));
+        let opened = reorderer.push_with_route_hint_report(
+            11,
+            repair_test_frame(sender_session, 42, 2),
+            None,
+        );
+        let gap = opened.opened_gap().expect("gap should open");
+
+        let (tx, rx) = mpsc::channel(REPAIR_REQUEST_QUEUE_CAPACITY);
+        let shutdown = CancellationToken::new();
+        spawn_repair_request_worker(
+            rx,
+            reorderer.clone(),
+            transport.clone(),
+            cfg.repair_request_ttl_ms,
+            shutdown.clone(),
+        );
+        tx.send(gap).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.request_entered.acquire(),
+        )
+        .await
+        .expect("the initial request should enter the transport")
+        .unwrap()
+        .forget();
+
+        reorderer.push_with_route_hint_report_with_repair(
+            11,
+            repair_test_frame(sender_session, 42, 1),
+            None,
+            true,
+        );
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while transport.active_requests.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the converged stream should cancel its blocked request future");
+
+        assert!(
+            transport.inner.calls().is_empty(),
+            "a converged stream must cancel its blocked repair send"
+        );
+        assert_eq!(transport.request_entered.available_permits(), 0);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn repair_request_rejection_does_not_consume_the_three_send_budget() {
+        let transport = ControlledRepairRequestTransport::with_failures(3);
+        let mut cfg = VoiceConfig::default();
+        cfg.adaptive_jitter_enabled = false;
+        cfg.reorder_max_delay_ms = 1_000;
+        cfg.adaptive_jitter_min_delay_ms = 1_000;
+        cfg.adaptive_jitter_max_delay_ms = 1_000;
+        let reorderer = Reorderer::new(cfg.clone());
+        let sender_session = shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
+            .unwrap()
+            .to_u32();
+        reorderer.push(11, repair_test_frame(sender_session, 42, 0));
+        let opened = reorderer.push_with_route_hint_report(
+            11,
+            repair_test_frame(sender_session, 42, 2),
+            None,
+        );
+
+        let (tx, rx) = mpsc::channel(REPAIR_REQUEST_QUEUE_CAPACITY);
+        let shutdown = CancellationToken::new();
+        spawn_repair_request_worker(
+            rx,
+            reorderer,
+            transport.clone(),
+            cfg.repair_request_ttl_ms,
+            shutdown.clone(),
+        );
+        tx.send(opened.opened_gap().expect("gap should open"))
+            .await
+            .unwrap();
+
+        let completed = tokio::time::timeout(Duration::from_millis(700), async {
+            while transport.inner.calls().len() < REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE as usize {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "three accepted sends should follow transient admission failures; attempts={} accepted={}",
+            transport.request_attempts.load(Ordering::SeqCst),
+            transport.inner.calls().len()
+        );
+
+        assert_eq!(
+            transport.request_attempts.load(Ordering::SeqCst),
+            3 + u64::from(REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE)
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn repair_request_coordinator_retries_residual_after_cursor_progress() {
+        let transport = FakeVoiceTransport::new(7, vec![12]);
+        let mut cfg = VoiceConfig::default();
+        cfg.adaptive_jitter_enabled = false;
+        cfg.reorder_max_delay_ms = 500;
+        cfg.adaptive_jitter_min_delay_ms = 500;
+        cfg.adaptive_jitter_max_delay_ms = 500;
+        let reorderer = Reorderer::new(cfg.clone());
+        let sender_session = shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
+            .unwrap()
+            .to_u32();
+        reorderer.push(11, repair_test_frame(sender_session, 42, 0));
+        let opened = reorderer.push_with_route_hint_report(
+            11,
+            repair_test_frame(sender_session, 42, 6),
+            None,
+        );
+        let gap = opened.opened_gap().expect("gap should open");
+
+        let (tx, rx) = mpsc::channel(REPAIR_REQUEST_QUEUE_CAPACITY);
+        let shutdown = CancellationToken::new();
+        spawn_repair_request_worker(
+            rx,
+            reorderer.clone(),
+            transport.clone(),
+            cfg.repair_request_ttl_ms,
+            shutdown.clone(),
+        );
+        tx.send(gap).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert_eq!(
+            transport
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, FakeCall::RepairRequest { .. }))
+                .count(),
+            REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE as usize
+        );
+
+        reorderer.push_with_route_hint_report_with_repair(
+            11,
+            repair_test_frame(sender_session, 42, 1),
+            None,
+            true,
+        );
+        tokio::time::timeout(Duration::from_millis(40), async {
+            loop {
+                let saw_residual = transport.calls().iter().any(|call| {
+                    let FakeCall::RepairRequest { body, .. } = call else {
+                        return false;
+                    };
+                    proto::decode_voice_repair_request(body)
+                        .is_ok_and(|request| request.first_seq == 2 && request.last_seq == 5)
+                });
+                if saw_residual {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cursor progress must schedule the residual page after the 5 ms settling delay");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn repair_request_coordinator_continues_after_a_32_sequence_page() {
+        let transport = FakeVoiceTransport::new(7, vec![12]);
+        let mut cfg = VoiceConfig::default();
+        cfg.adaptive_jitter_enabled = false;
+        cfg.reorder_max_delay_ms = 2_000;
+        cfg.adaptive_jitter_min_delay_ms = 2_000;
+        cfg.adaptive_jitter_max_delay_ms = 2_000;
+        let reorderer = Reorderer::new(cfg.clone());
+        let sender_session = shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
+            .unwrap()
+            .to_u32();
+        reorderer.push(11, repair_test_frame(sender_session, 42, 0));
+        let opened = reorderer.push_with_route_hint_report(
+            11,
+            repair_test_frame(sender_session, 42, 34),
+            None,
+        );
+        let gap = opened.opened_gap().expect("gap should open");
+
+        let (tx, rx) = mpsc::channel(REPAIR_REQUEST_QUEUE_CAPACITY);
+        let shutdown = CancellationToken::new();
+        spawn_repair_request_worker(
+            rx,
+            reorderer.clone(),
+            transport.clone(),
+            cfg.repair_request_ttl_ms,
+            shutdown.clone(),
+        );
+        tx.send(gap).await.unwrap();
+        let first = wait_for_call_count(&transport, 1).await;
+        let FakeCall::RepairRequest { body, .. } = &first[0] else {
+            panic!("expected initial repair request");
+        };
+        let first_request = proto::decode_voice_repair_request(body).unwrap();
+        assert_eq!((first_request.first_seq, first_request.last_seq), (1, 32));
+
+        for seq in 1..=31 {
+            reorderer.push_with_route_hint_report_with_repair(
+                11,
+                repair_test_frame(sender_session, 42, seq),
+                None,
+                true,
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            assert_eq!(
+                transport
+                    .calls()
+                    .into_iter()
+                    .filter(|call| matches!(call, FakeCall::RepairRequest { .. }))
+                    .count(),
+                1,
+                "progress inside one response page must not create overlapping requests"
+            );
+        }
+        reorderer.push_with_route_hint_report_with_repair(
+            11,
+            repair_test_frame(sender_session, 42, 32),
+            None,
+            true,
+        );
+        let current = reorderer
+            .current_actionable_gap(11, sender_session, 42)
+            .expect("the next page should remain actionable");
+        assert_eq!((current.gap().first_seq, current.gap().last_seq), (33, 33));
+
+        let calls = wait_for_call_count(&transport, 2).await;
+        let continuation = calls.iter().find_map(|call| {
+            let FakeCall::RepairRequest { body, .. } = call else {
+                return None;
+            };
+            let request = proto::decode_voice_repair_request(body).ok()?;
+            (request.first_seq == 33).then_some(request)
+        });
+        let continuation = continuation.expect("coordinator should request the next page");
+        assert_eq!((continuation.first_seq, continuation.last_seq), (33, 33));
+
+        reorderer.push_with_route_hint_report_with_repair(
+            11,
+            repair_test_frame(sender_session, 42, 33),
+            None,
+            true,
+        );
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -3895,6 +4801,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repair_response_falls_back_when_alternate_first_hop_fails() {
+        let inner = FakeVoiceTransport::new(7, vec![2]);
+        inner.set_voice_route_quality(
+            2,
+            crate::overlay::VoiceRouteQuality::new(2, TransportKind::Udp, 0, 0, 0),
+        );
+        let transport: Arc<dyn VoiceTransport> = Arc::new(AlternateFailRepairTransport {
+            inner: inner.clone(),
+        });
+        let cache = Arc::new(RepairCache::new(Duration::from_secs(1)));
+        let sender_session = 0xABC;
+        let body = send::build_envelope(
+            sender_session,
+            shitspeak_core::default_server_id(),
+            42,
+            7,
+            0,
+            false,
+            Bytes::from_static(b"fallback-repair"),
+            normal_intent(5),
+        )
+        .unwrap();
+        cache.insert(RepairFrame::new(sender_session, 42, 7, body.clone()));
+
+        send_repair_response(
+            RepairResponseRequest {
+                from: 2,
+                request: VoiceRepairRequest {
+                    sender_session,
+                    sender_epoch: 42,
+                    first_seq: 7,
+                    last_seq: 7,
+                    request_sent_unix_ms: 0,
+                    request_ttl_ms: 0,
+                    tail_ack: false,
+                },
+            },
+            transport,
+            cache,
+            Duration::from_millis(100),
+        )
+        .await;
+
+        let calls = inner.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(
+            &calls[0],
+            FakeCall::RepairFrame {
+                dst: 2,
+                body: sent,
+                avoid_first_hop: None,
+                is_repair: true,
+                ..
+            } if sent == &body
+        ));
+    }
+
+    #[tokio::test]
     async fn repair_responses_overlap_across_requests_with_bounded_concurrency() {
         let transport = ControlledRepairTransport::new();
         let repair_cache = Arc::new(RepairCache::new(Duration::from_secs(1)));
@@ -3977,6 +4941,81 @@ mod tests {
             vec![Bytes::from_static(b"a0"), Bytes::from_static(b"a1")],
             "frames within one request must retain cache sequence order"
         );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn repair_response_coalesces_overlap_and_replays_once_after_send_failure() {
+        let transport = ControlledRepairTransport::with_failures(2);
+        let repair_cache = Arc::new(RepairCache::new(Duration::from_secs(1)));
+        repair_cache.insert(RepairFrame::new(100, 42, 0, Bytes::from_static(b"retry-0")));
+
+        let (tx, rx) = mpsc::channel(16);
+        let shutdown = CancellationToken::new();
+        spawn_repair_response_worker_with_concurrency(
+            rx,
+            transport.clone(),
+            repair_cache,
+            VoiceConfig::default(),
+            shutdown.clone(),
+            2,
+        );
+        let work = RepairResponseRequest {
+            from: 2,
+            request: VoiceRepairRequest {
+                sender_session: 100,
+                sender_epoch: 42,
+                first_seq: 0,
+                last_seq: 0,
+                request_sent_unix_ms: 0,
+                request_ttl_ms: 0,
+                tail_ack: false,
+            },
+        };
+        tx.send(work.clone()).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.repair_entered.acquire(),
+        )
+        .await
+        .expect("the first response should start")
+        .unwrap()
+        .forget();
+
+        for _ in 0..10 {
+            tx.send(work.clone()).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(transport.active_repairs.load(Ordering::SeqCst), 1);
+        transport.repair_release.add_permits(1);
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.repair_entered.acquire(),
+        )
+        .await
+        .expect("the bounded admission retry should follow the first rejection")
+        .unwrap()
+        .forget();
+        transport.repair_release.add_permits(1);
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            transport.repair_entered.acquire(),
+        )
+        .await
+        .expect("one coalesced response should replay after both submissions fail")
+        .unwrap()
+        .forget();
+        transport.repair_release.add_permits(1);
+        for _ in 0..50 {
+            if transport.active_repairs.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(transport.inner.calls().len(), 3);
+        assert_eq!(transport.max_active_repairs.load(Ordering::SeqCst), 1);
         shutdown.cancel();
     }
 

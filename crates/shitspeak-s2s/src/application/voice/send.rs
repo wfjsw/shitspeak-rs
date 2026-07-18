@@ -21,7 +21,7 @@ pub const VOICE_LEVEL: ServiceLevel = ServiceLevel::BestEffort;
 pub const VOICE_CLASS: MessageClass = MessageClass::HighPriority;
 pub const VOICE_ROUTING_METRIC: RoutingMetric = RoutingMetric::ConversationalQuality;
 pub const VOICE_REPAIR_LEVEL: ServiceLevel = ServiceLevel::BestEffort;
-pub const VOICE_REPAIR_CLASS: MessageClass = MessageClass::HighPriority;
+pub const VOICE_REPAIR_CLASS: MessageClass = MessageClass::Control;
 pub const VOICE_REPAIR_ROUTING_METRIC: RoutingMetric = RoutingMetric::ConversationalQuality;
 
 /// Stable identity of a recipient group passed to the generic distribution
@@ -339,7 +339,7 @@ impl VoiceTransport for OverlayVoiceTransport {
                 VOICE_SERVICE_TAG,
                 VOICE_LEVEL,
                 VOICE_ROUTING_METRIC,
-                VOICE_CLASS,
+                VOICE_REPAIR_CLASS,
                 body,
                 options,
             )

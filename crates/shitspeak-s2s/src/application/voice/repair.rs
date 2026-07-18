@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use super::metrics;
 
 const REPAIR_CACHE_MAX_ENTRIES: usize = 8_192;
+pub(crate) const REPAIR_RESPONSE_PAGE_SEQUENCES: u64 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct RepairKey {
@@ -144,7 +145,10 @@ impl RepairCache {
         let mut inner = self.state.inner.lock();
         prune_expired_locked(&mut inner, now);
         let mut out = Vec::new();
-        for s2s_seq in first_seq..=last_seq.min(first_seq.saturating_add(31)) {
+        for s2s_seq in first_seq
+            ..=last_seq
+                .min(first_seq.saturating_add(REPAIR_RESPONSE_PAGE_SEQUENCES.saturating_sub(1)))
+        {
             let key = RepairKey {
                 sender_session,
                 sender_epoch,

@@ -176,6 +176,27 @@ pub struct GapReport {
     pub last_seq: u64,
 }
 
+/// The currently actionable missing range for an already-open gap.
+///
+/// Unlike [`GapReport`], which records the range that originally opened the
+/// gap, this range follows repair progress while retaining the original
+/// playout deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ActionableGap {
+    gap: GapReport,
+    deadline: Instant,
+}
+
+impl ActionableGap {
+    pub(crate) fn gap(self) -> GapReport {
+        self.gap
+    }
+
+    pub(crate) fn deadline(self) -> Instant {
+        self.deadline
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoiceRouteHint {
     path_latency_us: u64,
@@ -897,6 +918,46 @@ impl Reorderer {
         entry.sender_epoch == gap.sender_epoch
             && entry.next_seq <= gap.last_seq
             && !entry.pending.is_empty()
+            && matches!(entry.deadline, Some(deadline) if deadline > Instant::now())
+    }
+
+    /// Return the live missing range for an existing repair coordinator.
+    ///
+    /// The caller supplies the immediate peer captured when the gap opened;
+    /// sender state deliberately contains no routing information. The query
+    /// is fenced by epoch and by the original reorder deadline, and never
+    /// rearms or extends that deadline.
+    pub(crate) fn current_actionable_gap(
+        &self,
+        from: NodeIdentifier,
+        sender_session: u32,
+        sender_epoch: u64,
+    ) -> Option<ActionableGap> {
+        if self.cfg.reorder_disabled {
+            return None;
+        }
+
+        let state = self.state.lock();
+        let entry = state.per_sender.get(&sender_session)?;
+        let deadline = entry.deadline?;
+        if entry.sender_epoch != sender_epoch || deadline <= Instant::now() {
+            return None;
+        }
+        let first_pending = entry.pending.keys().next().copied()?;
+        if entry.next_seq >= first_pending {
+            return None;
+        }
+
+        Some(ActionableGap {
+            gap: GapReport {
+                from,
+                sender_session,
+                sender_epoch,
+                first_seq: entry.next_seq,
+                last_seq: first_pending.saturating_sub(1),
+            },
+            deadline,
+        })
     }
     #[cfg(test)]
     pub fn pending_total(&self) -> usize {
@@ -1248,6 +1309,78 @@ mod tests {
             .collect();
         assert_eq!(seqs, vec![2, 3]);
         assert!(!r.gap_still_missing(gap));
+    }
+
+    #[test]
+    fn current_actionable_gap_tracks_successive_holes_without_extending_deadline() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 500;
+        c.adaptive_jitter_min_delay_ms = 500;
+        c.adaptive_jitter_max_delay_ms = 500;
+        let r = Reorderer::new(c);
+        let session = 0xABC;
+
+        r.push(11, frame(session, 7, 0, false));
+        r.push(11, frame(session, 7, 3, false));
+        r.push(11, frame(session, 7, 5, false));
+
+        let initial = r
+            .current_actionable_gap(11, session, 7)
+            .expect("the first hole is actionable");
+        assert_eq!((initial.gap().first_seq, initial.gap().last_seq), (1, 2));
+        let original_deadline = initial.deadline();
+
+        assert_eq!(r.push(11, frame(session, 7, 1, false)).len(), 1);
+        let partial = r
+            .current_actionable_gap(11, session, 7)
+            .expect("the remainder of the first hole is actionable");
+        assert_eq!((partial.gap().first_seq, partial.gap().last_seq), (2, 2));
+        assert_eq!(partial.deadline(), original_deadline);
+
+        assert_eq!(
+            r.push(11, frame(session, 7, 2, false))
+                .iter()
+                .map(|(_, frame)| frame.s2s_seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        let later = r
+            .current_actionable_gap(11, session, 7)
+            .expect("the later hole under the same deadline is actionable");
+        assert_eq!((later.gap().first_seq, later.gap().last_seq), (4, 4));
+        assert_eq!(later.deadline(), original_deadline);
+    }
+
+    #[test]
+    fn current_actionable_gap_rejects_closed_expired_and_old_epoch_state() {
+        let session = 0xABC;
+
+        let r = Reorderer::new(cfg());
+        r.push(11, frame(session, 1, 0, false));
+        r.push(11, frame(session, 1, 2, false));
+        assert!(r.current_actionable_gap(11, session, 1).is_some());
+        r.push(11, frame(session, 1, 1, false));
+        assert!(r.current_actionable_gap(11, session, 1).is_none());
+
+        r.push(11, frame(session, 1, 4, false));
+        assert!(r.current_actionable_gap(11, session, 1).is_some());
+        r.push(11, frame(session, 2, 0, false));
+        assert!(r.current_actionable_gap(11, session, 1).is_none());
+
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_min_delay_ms = 5;
+        c.adaptive_jitter_max_delay_ms = 5;
+        let expired = Reorderer::new(c);
+        expired.push(11, frame(session, 3, 0, false));
+        let out_of_order = frame(session, 3, 2, false);
+        expired.push(11, out_of_order.clone());
+        let opened = expired
+            .gap_for_frame(11, &out_of_order)
+            .expect("gap exists before its deadline");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(expired.current_actionable_gap(11, session, 3).is_none());
+        assert!(!expired.gap_still_missing(opened));
     }
 
     #[test]
