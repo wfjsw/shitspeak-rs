@@ -33,6 +33,7 @@ use shitspeak_s2s::testing::{
 };
 use shitspeak_s2s::{
     application::proto::{self, VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal},
+    application::voice::AudioSink,
     overlay::{OverlayInboundMessage, ServiceInbound},
 };
 use shitspeak_s2s_transport::{
@@ -71,7 +72,7 @@ const S2S_LONG_HAUL_JITTER: Duration = Duration::from_millis(4);
 const S2S_LONG_HAUL_FRAME_COUNT: usize = 48;
 const S2S_LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET: Duration = Duration::from_millis(400);
 const S2S_LONG_HAUL_REPAIR_FRAME_OFFSET: usize = 4;
-const S2S_LOW_RTT_GAP_OBSERVE_BUDGET: Duration = Duration::from_millis(30);
+const S2S_LOW_RTT_GAP_OBSERVE_BUDGET: Duration = Duration::from_millis(300);
 const S2S_LOW_RTT_REPAIR_RELEASE_BUDGET: Duration = Duration::from_millis(40);
 const S2S_LOW_RTT_SUFFIX_BURST_BUDGET: Duration = Duration::from_millis(20);
 const S2S_ROOT_SHOUT_TRAFFIC_CHANNELS: &[(u32, u32, &str)] = &[
@@ -290,10 +291,9 @@ async fn spawn_s2s_low_rtt_pair() -> (TestServer, TestServer) {
     // The scenario observes a deliberately opened gap before injecting its
     // own marked repair. Keep that test setup comfortably inside the reorder
     // deadline so scheduler jitter cannot flush the suffix first.
-    node_3_config.application.voice.reorder_max_delay_ms = 200;
-    node_3_config.application.voice.adaptive_jitter_min_delay_ms = 200;
-    node_3_config.application.voice.adaptive_jitter_max_delay_ms = 200;
-    node_3_config.application.voice.repair_enabled = false;
+    node_3_config.application.voice.reorder_max_delay_ms = 500;
+    node_3_config.application.voice.adaptive_jitter_min_delay_ms = 500;
+    node_3_config.application.voice.adaptive_jitter_max_delay_ms = 500;
 
     let node_8 = spawn_s2s_test_server_with_config(
         TestServerOpts {
@@ -1296,6 +1296,32 @@ fn s2s_repair_frame(
             })),
         }),
         proactive_copy: false,
+    }
+}
+
+struct TimedVoiceDelivery {
+    frame: VoiceFrame,
+    is_repair: bool,
+    delivered_at: Instant,
+}
+
+struct TimedVoiceSink {
+    tx: tokio::sync::mpsc::UnboundedSender<TimedVoiceDelivery>,
+}
+
+#[async_trait::async_trait]
+impl AudioSink for TimedVoiceSink {
+    async fn deliver(
+        &self,
+        _from_immediate: shitspeak_core::NodeIdentifier,
+        frame: VoiceFrame,
+        is_repair: bool,
+    ) {
+        let _ = self.tx.send(TimedVoiceDelivery {
+            frame,
+            is_repair,
+            delivered_at: Instant::now(),
+        });
     }
 }
 
@@ -3297,7 +3323,7 @@ async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_med
         .await;
     wait_for_s2s_voice_target_installed(&node_8, &speaker, S2S_SHOUT_TARGET_SLOT).await;
     listener.drain_now().await;
-    wait_for_s2s_tree_voice_forwarding(&node_8, &speaker, S2S_SHOUT_TARGET_SLOT).await;
+    wait_for_s2s_tree_voice_forwarding_between(&speaker, S2S_SHOUT_TARGET_SLOT, 8, 3).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     listener.drain_now().await;
 
@@ -3311,6 +3337,25 @@ async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_med
         (410_117, Bytes::from_static(&[0x00, 0xE0])),
     ];
     let sender_session = u32::from(speaker.server_session);
+    let expected_deliveries = frames
+        .iter()
+        .enumerate()
+        .map(|(offset, (frame_number, opus))| {
+            let is_terminator = offset + 1 == frames.len();
+            (
+                s2s_native_voice_payload(*frame_number, opus.clone(), is_terminator),
+                is_terminator,
+            )
+        })
+        .collect::<Vec<_>>();
+    let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    node_3
+        .server
+        .s2s_manager()
+        .application()
+        .expect("node 3 application")
+        .voice()
+        .set_audio_sink(Arc::new(TimedVoiceSink { tx: sink_tx }));
     let sender_epoch = node_8
         .server
         .s2s_manager()
@@ -3352,7 +3397,39 @@ async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_med
         ],
     );
 
-    let receive_task = receive_s2s_shout_stream(&listener, &speaker, 0, &frames);
+    let receive_task = async move {
+        tokio::time::timeout(S2S_SHOUT_FRAME_LATENCY_BUDGET, async {
+            let mut deliveries = Vec::with_capacity(expected_deliveries.len());
+            while deliveries.len() < expected_deliveries.len() {
+                let delivery = sink_rx
+                    .recv()
+                    .await
+                    .expect("timed voice sink should remain installed");
+                if delivery.frame.sender_session != sender_session {
+                    continue;
+                }
+                let expected_index = deliveries.len();
+                let (expected_payload, expected_terminator) =
+                    &expected_deliveries[expected_index];
+                if delivery.frame.payload != *expected_payload {
+                    if expected_deliveries
+                        .iter()
+                        .any(|(payload, _)| delivery.frame.payload == *payload)
+                    {
+                        panic!(
+                            "low-RTT reorder sink delivered measured frame {expected_index} out of order"
+                        );
+                    }
+                    continue;
+                }
+                assert_eq!(delivery.frame.is_terminator, *expected_terminator);
+                deliveries.push(delivery);
+            }
+            deliveries
+        })
+        .await
+        .expect("low-RTT reorder sink did not receive the measured stream in time")
+    };
     let send_task = async {
         let first_sent_at = Instant::now();
         source_voice
@@ -3384,12 +3461,13 @@ async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_med
                 .expect("send low-RTT later voice frame");
         }
 
+        let expected_buffered_suffix = frames.len() - 2;
         assert!(
             wait_until_with(
                 S2S_LOW_RTT_GAP_OBSERVE_BUDGET,
                 Duration::from_millis(1),
                 || {
-                    s2s_prometheus_total(
+                    let measured_gap_buffered = s2s_prometheus_total(
                         &node_3,
                         "shitspeak_s2s_voice_receive_events_total",
                         &[
@@ -3398,11 +3476,18 @@ async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_med
                             ("from_immediate", "8"),
                             ("result", "gap_buffered"),
                         ],
-                    ) > gap_buffered_before
+                    ) - gap_buffered_before;
+                    let pending = s2s_prometheus_total(
+                        &node_3,
+                        "shitspeak_s2s_voice_reorder_pending",
+                        &[("source", "3")],
+                    );
+                    measured_gap_buffered >= expected_buffered_suffix as f64
+                        && pending >= expected_buffered_suffix as f64
                 },
             )
             .await,
-            "node 3 did not observe the intended S2S sequence gap before its 40 ms repair window"
+            "node 3 did not buffer the complete measured suffix before its 500 ms reorder deadline"
         );
 
         let repair_injected_at = Instant::now();
@@ -3425,7 +3510,7 @@ async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_med
         );
         (first_sent_at, repair_injected_at)
     };
-    let ((first_sent_at, repair_injected_at), delivery) = tokio::join!(send_task, receive_task);
+    let ((first_sent_at, repair_injected_at), deliveries) = tokio::join!(send_task, receive_task);
 
     let gap_buffered_delta = s2s_prometheus_total(
         &node_3,
@@ -3447,15 +3532,22 @@ async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_med
             ("result", "gap_filled"),
         ],
     ) - gap_filled_before;
-    let repair_release = delivery.received_at[1]
-        .1
+    let expected_buffered_suffix = (frames.len() - 2) as f64;
+    let repair_release = deliveries[1]
+        .delivered_at
         .saturating_duration_since(repair_injected_at);
-    let suffix_burst = delivery.received_at[1..]
+    let suffix_burst = deliveries[1..]
         .windows(2)
-        .map(|window| window[1].1.saturating_duration_since(window[0].1))
+        .map(|window| {
+            window[1]
+                .delivered_at
+                .saturating_duration_since(window[0].delivered_at)
+        })
         .max()
         .unwrap_or_default();
-    let first_release = delivery.first_at.saturating_duration_since(first_sent_at);
+    let first_release = deliveries[0]
+        .delivered_at
+        .saturating_duration_since(first_sent_at);
     eprintln!(
         "s2s_low_rtt_tree_reorder_metrics source=8 destination=3 frames={} gap_buffered={:.0} gap_filled={:.0} first_release_ms={} repair_release_ms={} suffix_burst_ms={}",
         frames.len(),
@@ -3467,12 +3559,16 @@ async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_med
     );
 
     assert!(
-        gap_buffered_delta >= 1.0,
-        "node 3 did not buffer the suffix after the missing S2S sequence"
+        gap_buffered_delta >= expected_buffered_suffix,
+        "node 3 did not buffer the complete suffix after the missing S2S sequence"
     );
     assert!(
-        gap_filled_delta >= 1.0,
-        "the repair did not drain a buffered suffix"
+        gap_filled_delta >= expected_buffered_suffix,
+        "the repair did not drain the complete buffered suffix"
+    );
+    assert!(
+        deliveries[1].is_repair,
+        "the injected frame was not marked as a repair"
     );
     assert!(
         repair_release <= S2S_LOW_RTT_REPAIR_RELEASE_BUDGET,
