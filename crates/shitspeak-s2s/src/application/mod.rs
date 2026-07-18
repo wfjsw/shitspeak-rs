@@ -27,6 +27,7 @@
 
 pub mod config;
 pub mod error;
+pub mod gateway;
 pub mod moderation;
 pub mod plugin_data;
 pub mod proto;

@@ -2,4 +2,4 @@
 rustflags = ["-C", "linker=rust-lld"]
 
 [alias]
-test-runtime = "test -p shitspeak-runtime -p shitspeak-client-crypto -p shitspeak-runtime-config -p shitspeak-state"
+test-runtime = "test -p shitspeak-runtime -p shitspeak-client-crypto -p shitspeak-runtime-config -p shitspeak-state -p shitspeak-s2s -p shitspeak-s2s-transport"

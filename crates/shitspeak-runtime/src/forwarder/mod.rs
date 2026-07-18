@@ -8,15 +8,18 @@ use crate::logging;
 use crate::observability::{self, S2sMetricsSource, S2sTopologyMetricsSource};
 use crate::s2s::{
     BanReplicationAdapter, ChannelBlobReplicationAdapter, ChannelReplicationAdapter,
-    channel_blob_topic, channel_topic, install_channel_blob_replication_resolver,
-    install_channel_replication_resolver, resolve_observability_geo,
-    server_id_from_channel_blob_topic, server_id_from_channel_topic,
+    install_channel_blob_replication_resolver, install_channel_replication_resolver,
+    resolve_observability_geo,
 };
 use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier};
 use serde::Deserialize;
 use serde::de::Error as _;
 use shitspeak_runtime_config::{ObservabilityConfig, S2sConfig};
 use shitspeak_s2s::overlay::{ApplicationServices, OverlayNetwork, ReplicationServices};
+use shitspeak_s2s::replications::channel_topics::{
+    channel_blob_topic, channel_topic, server_id_from_channel_blob_topic,
+    server_id_from_channel_topic,
+};
 use shitspeak_s2s::replications::{
     ReplicationConfig, ReplicationManager, encode_replication_upper_layer_capabilities,
 };

@@ -1,5 +1,4 @@
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -11,7 +10,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -35,6 +34,11 @@ use shitspeak_state::{
 
 use shitspeak_s2s::application as s2s_application;
 use shitspeak_s2s::application::error::ApplicationError;
+use shitspeak_s2s::application::gateway::{
+    AdaptiveReceiver as S2SAdaptiveReceiver, AdaptiveSender as S2SAdaptiveSender,
+    EstimatedCommand as EstimatedS2SCommand, QueueBudget as S2SQueueBudget,
+    run_sender_sharded_gateway,
+};
 use shitspeak_s2s::application::moderation::ModerationApplier;
 use shitspeak_s2s::application::proto::{
     ModerationCommand, ModerationEnvelope, PluginDataEnvelope, TextMessageEnvelope,
@@ -46,6 +50,10 @@ use shitspeak_s2s::application::voice::{
 use shitspeak_s2s::overlay as s2s_overlay;
 use shitspeak_s2s::overlay::OverlayNetwork;
 use shitspeak_s2s::replications as s2s_replications;
+pub use shitspeak_s2s::replications::channel_topics::{
+    channel_blob_topic, channel_topic, server_id_from_channel_blob_topic,
+    server_id_from_channel_topic,
+};
 use shitspeak_s2s::replications::owner::{OwnerSnapshotInstallError, OwnerSnapshotInstallOutcome};
 use shitspeak_s2s::replications::{
     BlobReplicable, OwnerReplicable, ReplicationManager, StrictReplicable,
@@ -77,7 +85,6 @@ const S2S_GATEWAY_CONTROL_MIN_BYTES: usize = 1024 * 1024;
 const S2S_GATEWAY_LANE_MIN_BYTES: usize = 512 * 1024;
 const S2S_VOICE_GATEWAY_MIN_SHARDS: usize = 2;
 const S2S_VOICE_GATEWAY_MAX_SHARDS: usize = 16;
-const MAX_DYNAMIC_CHANNEL_SERVER_ID_BYTES: usize = 256;
 
 fn strict_proposal_gateway_response_timeout(cfg: &s2s_replications::ReplicationConfig) -> Duration {
     let slack = cfg
@@ -397,129 +404,6 @@ fn estimate_recipient_index_snapshot(update: &RecipientIndexUpdate) -> usize {
 }
 
 #[derive(Clone)]
-struct S2SQueueBudget {
-    inner: Arc<S2SQueueBudgetInner>,
-}
-
-struct S2SQueueBudgetInner {
-    max_bytes: usize,
-    used_bytes: AtomicUsize,
-    notify: Notify,
-}
-
-impl S2SQueueBudget {
-    fn auto() -> Self {
-        Self::new(auto_s2s_gateway_budget_bytes())
-    }
-
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            inner: Arc::new(S2SQueueBudgetInner {
-                max_bytes: max_bytes.max(S2S_GATEWAY_LANE_MIN_BYTES),
-                used_bytes: AtomicUsize::new(0),
-                notify: Notify::new(),
-            }),
-        }
-    }
-
-    fn split(&self, max_bytes: usize) -> S2SQueueLaneBudget {
-        S2SQueueLaneBudget {
-            global: self.clone(),
-            max_bytes: max_bytes.max(S2S_GATEWAY_LANE_MIN_BYTES),
-            used_bytes: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct S2SQueueLaneBudget {
-    global: S2SQueueBudget,
-    max_bytes: usize,
-    used_bytes: Arc<AtomicUsize>,
-}
-
-impl S2SQueueLaneBudget {
-    async fn reserve(&self, bytes: usize) -> Option<S2SQueuePermit> {
-        let bytes = bytes.max(1);
-        if bytes > self.max_bytes || bytes > self.global.inner.max_bytes {
-            return None;
-        }
-        loop {
-            if let Some(permit) = self.try_reserve(bytes) {
-                return Some(permit);
-            }
-            self.global.inner.notify.notified().await;
-        }
-    }
-
-    fn try_reserve(&self, bytes: usize) -> Option<S2SQueuePermit> {
-        let bytes = bytes.max(1);
-        if bytes > self.max_bytes || bytes > self.global.inner.max_bytes {
-            return None;
-        }
-        try_add_with_limit(&self.used_bytes, bytes, self.max_bytes)?;
-        if try_add_with_limit(
-            &self.global.inner.used_bytes,
-            bytes,
-            self.global.inner.max_bytes,
-        )
-        .is_none()
-        {
-            self.used_bytes.fetch_sub(bytes, Ordering::Release);
-            return None;
-        }
-        Some(S2SQueuePermit {
-            lane: self.clone(),
-            bytes,
-        })
-    }
-
-    #[cfg(test)]
-    fn available_bytes(&self) -> usize {
-        self.max_bytes
-            .saturating_sub(self.used_bytes.load(Ordering::Acquire))
-    }
-}
-
-struct S2SQueuePermit {
-    lane: S2SQueueLaneBudget,
-    bytes: usize,
-}
-
-impl Drop for S2SQueuePermit {
-    fn drop(&mut self) {
-        self.lane
-            .used_bytes
-            .fetch_sub(self.bytes, Ordering::Release);
-        self.lane
-            .global
-            .inner
-            .used_bytes
-            .fetch_sub(self.bytes, Ordering::Release);
-        self.lane.global.inner.notify.notify_waiters();
-    }
-}
-
-struct S2SQueued<T> {
-    command: T,
-    _permit: S2SQueuePermit,
-}
-
-fn try_add_with_limit(counter: &AtomicUsize, add: usize, limit: usize) -> Option<()> {
-    let mut current = counter.load(Ordering::Acquire);
-    loop {
-        let next = current.checked_add(add)?;
-        if next > limit {
-            return None;
-        }
-        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Some(()),
-            Err(actual) => current = actual,
-        }
-    }
-}
-
-#[derive(Clone)]
 struct S2SGatewayTx {
     control: S2SAdaptiveSender<NativeToS2SCommand>,
     replication: S2SAdaptiveSender<NativeToS2SCommand>,
@@ -538,7 +422,7 @@ struct S2SGatewayRx {
 
 impl S2SGatewayTx {
     fn new(budget: S2SQueueBudget) -> (Self, S2SGatewayRx) {
-        let max = budget.inner.max_bytes;
+        let max = budget.max_bytes();
         let control_bytes = max
             .saturating_mul(30)
             .checked_div(100)
@@ -627,7 +511,7 @@ struct S2SNativeGatewayRx {
 
 impl S2SNativeGatewayTx {
     fn new(budget: S2SQueueBudget) -> (Self, S2SNativeGatewayRx) {
-        let max = budget.inner.max_bytes;
+        let max = budget.max_bytes();
         let control_bytes = max
             .saturating_mul(40)
             .checked_div(100)
@@ -677,89 +561,6 @@ impl S2SNativeGatewayTx {
     }
 }
 
-struct S2SAdaptiveSender<T> {
-    tx: mpsc::UnboundedSender<S2SQueued<T>>,
-    budget: S2SQueueLaneBudget,
-}
-
-struct S2SAdaptiveReceiver<T> {
-    rx: mpsc::UnboundedReceiver<S2SQueued<T>>,
-}
-
-impl<T> Clone for S2SAdaptiveSender<T> {
-    fn clone(&self) -> Self {
-        Self {
-            tx: self.tx.clone(),
-            budget: self.budget.clone(),
-        }
-    }
-}
-
-impl<T> S2SAdaptiveSender<T>
-where
-    T: EstimatedS2SCommand,
-{
-    fn new(budget: S2SQueueLaneBudget) -> (Self, S2SAdaptiveReceiver<T>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx, budget }, S2SAdaptiveReceiver { rx })
-    }
-
-    async fn send(&self, command: T) -> bool {
-        let label = command.label();
-        let Some(permit) = self.budget.reserve(command.estimated_bytes()).await else {
-            warn!(
-                label,
-                "s2s gateway command exceeds adaptive queue budget; dropping command"
-            );
-            return false;
-        };
-        match self.tx.send(S2SQueued {
-            command,
-            _permit: permit,
-        }) {
-            Ok(()) => true,
-            Err(_) => {
-                trace!(label, "s2s gateway closed; dropping command");
-                false
-            }
-        }
-    }
-
-    fn try_send(&self, command: T) -> bool {
-        let label = command.label();
-        let Some(permit) = self.budget.try_reserve(command.estimated_bytes()) else {
-            warn!(label, "s2s gateway full; dropping command");
-            return false;
-        };
-        match self.tx.send(S2SQueued {
-            command,
-            _permit: permit,
-        }) {
-            Ok(()) => true,
-            Err(_) => {
-                trace!(label, "s2s gateway closed; dropping command");
-                false
-            }
-        }
-    }
-}
-
-impl<T> S2SAdaptiveReceiver<T> {
-    async fn recv(&mut self) -> Option<T> {
-        self.rx.recv().await.map(|queued| queued.command)
-    }
-
-    async fn recv_queued(&mut self) -> Option<S2SQueued<T>> {
-        self.rx.recv().await
-    }
-}
-
-trait EstimatedS2SCommand {
-    fn label(&self) -> &'static str;
-
-    fn estimated_bytes(&self) -> usize;
-}
-
 impl EstimatedS2SCommand for NativeToS2SCommand {
     fn label(&self) -> &'static str {
         NativeToS2SCommand::label(self)
@@ -790,6 +591,10 @@ fn auto_s2s_gateway_budget_bytes() -> usize {
     bytes
         .clamp(S2S_GATEWAY_MIN_BUDGET_BYTES, S2S_GATEWAY_MAX_BUDGET_BYTES)
         .min(usize::MAX as u64) as usize
+}
+
+fn auto_s2s_gateway_budget() -> S2SQueueBudget {
+    S2SQueueBudget::new(auto_s2s_gateway_budget_bytes(), S2S_GATEWAY_LANE_MIN_BYTES)
 }
 
 #[cfg(windows)]
@@ -1722,7 +1527,7 @@ impl S2SManager {
         shutdown: watch::Receiver<()>,
     ) -> S2SRuntimeTask {
         let native_runtime = tokio::runtime::Handle::current();
-        let gateway_budget = S2SQueueBudget::auto();
+        let gateway_budget = auto_s2s_gateway_budget();
         let (native_tx, native_rx) = S2SNativeGatewayTx::new(gateway_budget.clone());
         let (s2s_tx, s2s_rx) = S2SGatewayTx::new(gateway_budget);
         if self.enabled && self.config_error.is_none() && self.transport_config.is_some() {
@@ -2588,50 +2393,6 @@ fn s2s_voice_gateway_shard_count() -> usize {
         .clamp(S2S_VOICE_GATEWAY_MIN_SHARDS, S2S_VOICE_GATEWAY_MAX_SHARDS)
 }
 
-async fn run_sender_sharded_gateway<T, K, H, F>(
-    mut rx: S2SAdaptiveReceiver<T>,
-    shard_count: usize,
-    shard_key: K,
-    handler: H,
-) where
-    T: Send + 'static,
-    K: Fn(&T) -> u32,
-    H: Fn(T) -> F + Send + Sync + 'static,
-    F: Future<Output = ()> + Send + 'static,
-{
-    let shard_count = shard_count.max(1);
-    let handler = Arc::new(handler);
-    let mut shard_txs = Vec::with_capacity(shard_count);
-    let mut workers = Vec::with_capacity(shard_count);
-
-    for _ in 0..shard_count {
-        let (tx, mut shard_rx) = mpsc::unbounded_channel::<S2SQueued<T>>();
-        shard_txs.push(tx);
-        let handler = Arc::clone(&handler);
-        workers.push(tokio::spawn(async move {
-            while let Some(queued) = shard_rx.recv().await {
-                let S2SQueued { command, _permit } = queued;
-                handler(command).await;
-                drop(_permit);
-            }
-        }));
-    }
-
-    while let Some(queued) = rx.recv_queued().await {
-        let shard = shard_key(&queued.command) as usize % shard_count;
-        if shard_txs[shard].send(queued).is_err() {
-            warn!(shard, "s2s voice gateway shard stopped; dropping command");
-        }
-    }
-
-    drop(shard_txs);
-    for worker in workers {
-        if let Err(error) = worker.await {
-            warn!(%error, "s2s voice gateway shard failed");
-        }
-    }
-}
-
 async fn run_s2s_voice_command(
     application: Arc<s2s_application::ApplicationLayer>,
     command: NativeToS2SCommand,
@@ -3406,47 +3167,6 @@ async fn apply_user_remove_patch(
         old_channel_id,
     )
     .await;
-}
-
-pub fn server_id_from_channel_topic(topic: &str) -> Option<String> {
-    if topic == "channels" {
-        Some(DEFAULT_SERVER_ID.to_owned())
-    } else {
-        let server_id = validated_dynamic_channel_server_id(topic.strip_prefix("channels:")?)?;
-        (channel_topic(server_id) == topic).then(|| server_id.to_owned())
-    }
-}
-
-pub fn server_id_from_channel_blob_topic(topic: &str) -> Option<String> {
-    if topic == "channel_blobs" {
-        Some(DEFAULT_SERVER_ID.to_owned())
-    } else {
-        let server_id = validated_dynamic_channel_server_id(topic.strip_prefix("channel_blobs:")?)?;
-        (channel_blob_topic(server_id) == topic).then(|| server_id.to_owned())
-    }
-}
-
-fn validated_dynamic_channel_server_id(server_id: &str) -> Option<&str> {
-    (!server_id.is_empty()
-        && server_id.len() <= MAX_DYNAMIC_CHANNEL_SERVER_ID_BYTES
-        && !server_id.chars().any(char::is_control))
-    .then_some(server_id)
-}
-
-pub fn channel_topic(server_id: &str) -> String {
-    if server_id == DEFAULT_SERVER_ID {
-        "channels".to_owned()
-    } else {
-        format!("channels:{server_id}")
-    }
-}
-
-pub fn channel_blob_topic(server_id: &str) -> String {
-    if server_id == DEFAULT_SERVER_ID {
-        "channel_blobs".to_owned()
-    } else {
-        format!("channel_blobs:{server_id}")
-    }
 }
 
 pub fn install_channel_replication_resolver(
@@ -4376,235 +4096,6 @@ mod tests {
             strict_proposal_gateway_response_timeout(&cfg),
             S2S_GATEWAY_RESPONSE_TIMEOUT
         );
-    }
-
-    #[test]
-    fn dynamic_channel_topics_are_canonical_bounded_and_control_free() {
-        assert_eq!(
-            server_id_from_channel_topic("channels"),
-            Some(DEFAULT_SERVER_ID.to_owned())
-        );
-        assert_eq!(
-            server_id_from_channel_topic("channels:tenant-a"),
-            Some("tenant-a".to_owned())
-        );
-        assert_eq!(
-            server_id_from_channel_blob_topic("channel_blobs:tenant-a"),
-            Some("tenant-a".to_owned())
-        );
-        assert!(server_id_from_channel_topic("channels:default").is_none());
-        assert!(server_id_from_channel_topic("channels:").is_none());
-        assert!(server_id_from_channel_topic("channels:tenant\nnext").is_none());
-        assert!(
-            server_id_from_channel_topic(&format!(
-                "channels:{}",
-                "x".repeat(MAX_DYNAMIC_CHANNEL_SERVER_ID_BYTES + 1)
-            ))
-            .is_none()
-        );
-    }
-
-    #[derive(Debug, PartialEq, Eq)]
-    struct TestGatewayCommand {
-        label: &'static str,
-        bytes: usize,
-    }
-
-    impl EstimatedS2SCommand for TestGatewayCommand {
-        fn label(&self) -> &'static str {
-            self.label
-        }
-
-        fn estimated_bytes(&self) -> usize {
-            self.bytes
-        }
-    }
-
-    #[derive(Debug)]
-    struct ShardedTestCommand {
-        sender_session: u32,
-        sequence: usize,
-        bytes: usize,
-    }
-
-    impl EstimatedS2SCommand for ShardedTestCommand {
-        fn label(&self) -> &'static str {
-            "test_voice"
-        }
-
-        fn estimated_bytes(&self) -> usize {
-            self.bytes
-        }
-    }
-
-    #[test]
-    fn queue_budget_releases_permits_when_command_is_dropped() {
-        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
-        let lane = budget.split(S2S_GATEWAY_LANE_MIN_BYTES);
-        let permit = lane
-            .try_reserve(S2S_GATEWAY_LANE_MIN_BYTES * 3 / 4)
-            .expect("reserve fits");
-
-        assert!(lane.try_reserve(S2S_GATEWAY_LANE_MIN_BYTES / 2).is_none());
-        drop(permit);
-        assert!(lane.try_reserve(S2S_GATEWAY_LANE_MIN_BYTES / 2).is_some());
-    }
-
-    #[tokio::test]
-    async fn adaptive_sender_drops_voice_style_command_when_budget_is_full() {
-        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
-        let (tx, mut rx) = S2SAdaptiveSender::new(budget.split(S2S_GATEWAY_LANE_MIN_BYTES));
-
-        assert!(tx.try_send(TestGatewayCommand {
-            label: "voice",
-            bytes: S2S_GATEWAY_LANE_MIN_BYTES * 3 / 4,
-        }));
-        assert!(!tx.try_send(TestGatewayCommand {
-            label: "voice",
-            bytes: S2S_GATEWAY_LANE_MIN_BYTES / 2,
-        }));
-
-        assert_eq!(
-            rx.recv().await,
-            Some(TestGatewayCommand {
-                label: "voice",
-                bytes: S2S_GATEWAY_LANE_MIN_BYTES * 3 / 4,
-            })
-        );
-        assert!(tx.try_send(TestGatewayCommand {
-            label: "voice",
-            bytes: S2S_GATEWAY_LANE_MIN_BYTES / 2,
-        }));
-    }
-
-    #[tokio::test]
-    async fn adaptive_sender_rejects_oversized_lossless_command_without_waiting() {
-        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
-        let (tx, _rx) = S2SAdaptiveSender::new(budget.split(S2S_GATEWAY_LANE_MIN_BYTES));
-
-        assert!(
-            !tx.send(TestGatewayCommand {
-                label: "control",
-                bytes: S2S_GATEWAY_LANE_MIN_BYTES + 1,
-            })
-            .await
-        );
-    }
-
-    #[tokio::test]
-    async fn sender_sharded_gateway_preserves_same_sender_fifo() {
-        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
-        let (tx, rx) = S2SAdaptiveSender::new(budget.split(S2S_GATEWAY_LANE_MIN_BYTES));
-        let observed = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let handler_observed = Arc::clone(&observed);
-        let runner = tokio::spawn(run_sender_sharded_gateway(
-            rx,
-            2,
-            |command: &ShardedTestCommand| command.sender_session,
-            move |command| {
-                let observed = Arc::clone(&handler_observed);
-                async move {
-                    observed.lock().await.push(command.sequence);
-                }
-            },
-        ));
-
-        for sequence in 0..4 {
-            assert!(tx.try_send(ShardedTestCommand {
-                sender_session: 7,
-                sequence,
-                bytes: 1,
-            }));
-        }
-        drop(tx);
-        runner.await.expect("shard runner completes");
-
-        assert_eq!(*observed.lock().await, vec![0, 1, 2, 3]);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sender_sharded_gateway_overlaps_different_senders() {
-        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
-        let (tx, rx) = S2SAdaptiveSender::new(budget.split(S2S_GATEWAY_LANE_MIN_BYTES));
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let rendezvous = Arc::new(tokio::sync::Barrier::new(2));
-        let runner = tokio::spawn(run_sender_sharded_gateway(
-            rx,
-            2,
-            |command: &ShardedTestCommand| command.sender_session,
-            {
-                let active = Arc::clone(&active);
-                let max_active = Arc::clone(&max_active);
-                let rendezvous = Arc::clone(&rendezvous);
-                move |_command| {
-                    let active = Arc::clone(&active);
-                    let max_active = Arc::clone(&max_active);
-                    let rendezvous = Arc::clone(&rendezvous);
-                    async move {
-                        let now_active = active.fetch_add(1, Ordering::AcqRel) + 1;
-                        max_active.fetch_max(now_active, Ordering::AcqRel);
-                        rendezvous.wait().await;
-                        active.fetch_sub(1, Ordering::AcqRel);
-                    }
-                }
-            },
-        ));
-
-        for sender_session in [0, 1] {
-            assert!(tx.try_send(ShardedTestCommand {
-                sender_session,
-                sequence: 0,
-                bytes: 1,
-            }));
-        }
-        drop(tx);
-        tokio::time::timeout(Duration::from_secs(1), runner)
-            .await
-            .expect("different sender shards should overlap")
-            .expect("shard runner completes");
-
-        assert_eq!(max_active.load(Ordering::Acquire), 2);
-    }
-
-    #[tokio::test]
-    async fn sender_sharded_gateway_retains_permit_until_handler_completes() {
-        let budget = S2SQueueBudget::new(S2S_GATEWAY_LANE_MIN_BYTES);
-        let lane = budget.split(S2S_GATEWAY_LANE_MIN_BYTES);
-        let (tx, rx) = S2SAdaptiveSender::new(lane.clone());
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let release = Arc::new(Semaphore::new(0));
-        let handler_release = Arc::clone(&release);
-        let runner = tokio::spawn(run_sender_sharded_gateway(
-            rx,
-            2,
-            |command: &ShardedTestCommand| command.sender_session,
-            move |_command| {
-                let started_tx = started_tx.clone();
-                let release = Arc::clone(&handler_release);
-                async move {
-                    started_tx.send(()).expect("test observer remains open");
-                    let permit = release.acquire().await.expect("release semaphore open");
-                    permit.forget();
-                }
-            },
-        ));
-
-        assert!(tx.try_send(ShardedTestCommand {
-            sender_session: 3,
-            sequence: 0,
-            bytes: S2S_GATEWAY_LANE_MIN_BYTES * 3 / 4,
-        }));
-        started_rx.recv().await.expect("handler starts");
-        assert!(
-            lane.try_reserve(S2S_GATEWAY_LANE_MIN_BYTES / 2).is_none(),
-            "the queued byte permit must remain held during command execution"
-        );
-
-        release.add_permits(1);
-        drop(tx);
-        runner.await.expect("shard runner completes");
-        assert!(lane.try_reserve(S2S_GATEWAY_LANE_MIN_BYTES / 2).is_some());
     }
 
     #[test]

@@ -29,6 +29,7 @@
 
 pub mod blob;
 mod capability;
+pub mod channel_topics;
 pub mod config;
 mod durability;
 pub mod error;

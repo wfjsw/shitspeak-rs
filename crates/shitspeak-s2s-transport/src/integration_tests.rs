@@ -16,8 +16,8 @@ use crate::testing::{
     s2s_network_test_guard,
 };
 use crate::{
-    ConnectionManager, Inbound, LinkMetrics, MessageClass, PeerAddress, SendOptions, ServiceLevel,
-    TransportConfig, TransportKind,
+    ConnectionManager, Inbound, LinkMetrics, MessageClass, PeerAddress, SeedAddress, SendOptions,
+    ServiceLevel, TransportConfig, TransportKind,
 };
 
 fn config_for(pki: &Pki, node_idx: usize, tcp: SocketAddr) -> TransportConfig {
@@ -101,6 +101,35 @@ impl WireEfficiency {
         100.0 * (baseline.wire_bytes.saturating_sub(self.wire_bytes) as f64)
             / baseline.wire_bytes as f64
     }
+}
+
+/// Checks that a manager discovers a seed peer without knowing its node id in
+/// advance.
+/// Expected: the seed address is enough to establish mTLS, read the peer's
+/// identity from its certificate, and register a live TCP link on both sides.
+#[tokio::test]
+async fn seed_address_discovers_peer_without_node_id() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[1, 2]);
+    let port_a = pick_free_port().await;
+    let port_b = pick_free_port().await;
+    let cfg_a = config_for(&pki, 0, loopback(port_a)).with_seed_target(SeedAddress::new(
+        loopback(port_b).to_string(),
+        TransportKind::Tcp,
+    ));
+    let cfg_b = config_for(&pki, 1, loopback(port_b));
+
+    // Start the listener before A performs its initial, unidentified seed
+    // dial. `cfg_a` has only B's socket address, not B's node id.
+    let (mgr_b, _inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
+    let (mgr_a, _inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
+
+    wait_for_link(&mgr_a, 2, TransportKind::Tcp).await;
+    wait_for_link(&mgr_b, 1, TransportKind::Tcp).await;
+
+    mgr_a.shutdown().await;
+    mgr_b.shutdown().await;
 }
 
 /// Checks that two S2S transport managers establish mTLS over TCP and exchange
