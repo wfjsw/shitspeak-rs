@@ -3081,6 +3081,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         }
     }
 
+    #[cfg(test)]
     fn apply_terminal_commit(
         &self,
         op_id: OpId,
@@ -3227,6 +3228,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         state_changed
     }
 
+    #[cfg(test)]
     fn apply_terminal_abort(&self, op_id: OpId, ballot: u64) -> bool {
         self.apply_terminal_abort_with_descriptor(op_id, ballot, None)
     }
