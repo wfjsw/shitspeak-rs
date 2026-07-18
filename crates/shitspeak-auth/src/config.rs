@@ -159,7 +159,7 @@ impl ExecAuthenticatorConfig {
     }
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct WasmAuthenticatorConfig {
     /// Optional WASM authenticator module loaded by the binary at startup and
     /// on hot reload.
@@ -173,16 +173,6 @@ pub struct WasmAuthenticatorConfig {
     /// file stream paths. Access is still bounded by `file_access_dir`.
     #[serde(default)]
     working_dir: Option<PathBuf>,
-}
-
-impl Default for WasmAuthenticatorConfig {
-    fn default() -> Self {
-        Self {
-            path: None,
-            file_access_dir: Vec::new(),
-            working_dir: None,
-        }
-    }
 }
 
 impl WasmAuthenticatorConfig {

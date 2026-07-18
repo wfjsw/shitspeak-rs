@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Write as _};
@@ -55,6 +56,8 @@ const FILE_OPEN_CREATE: i32 = 0x04;
 const FILE_OPEN_TRUNCATE: i32 = 0x08;
 const FILE_OPEN_APPEND: i32 = 0x10;
 static WASM_AUTH_STATE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+type DeallocFunc = TypedFunc<(i32, i32), ()>;
 
 #[derive(Debug, Error)]
 pub enum WasmAuthenticatorError {
@@ -1493,8 +1496,8 @@ impl WasmAuthCache {
 
     fn put(&self, key: Vec<u8>, value: Vec<u8>) {
         let mut inner = self.inner.write().expect("WASM auth cache RwLock poisoned");
-        if inner.entries.contains_key(&key) {
-            inner.entries.insert(key, value);
+        if let Entry::Occupied(mut entry) = inner.entries.entry(key.clone()) {
+            entry.insert(value);
             return;
         }
         while inner.entries.len() >= MAX_WASM_AUTH_CACHE_ENTRIES {
@@ -1638,10 +1641,10 @@ impl WasmAuthState {
         let Some(path) = self.path_for_file(path)? else {
             return Ok(None);
         };
-        if let Some(parent) = path.parent() {
-            if flags & FILE_OPEN_CREATE != 0 {
-                tokio::fs::create_dir_all(parent).await?;
-            }
+        if flags & FILE_OPEN_CREATE != 0
+            && let Some(parent) = path.parent()
+        {
+            tokio::fs::create_dir_all(parent).await?;
         }
         let mut options = tokio::fs::OpenOptions::new();
         options
@@ -1668,7 +1671,7 @@ impl WasmAuthState {
         if self.file_roots.is_empty() {
             return Ok(None);
         }
-        if path.as_bytes().len() > MAX_WASM_AUTH_FILE_PATH_BYTES {
+        if path.len() > MAX_WASM_AUTH_FILE_PATH_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "file path exceeds host limit",
@@ -1687,10 +1690,10 @@ impl WasmAuthState {
         {
             Ok(Some(resolved))
         } else {
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "file path is outside authenticator.wasm.file_access_dir",
-            ));
+            ))
         }
     }
 }
