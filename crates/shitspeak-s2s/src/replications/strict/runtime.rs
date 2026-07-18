@@ -6041,11 +6041,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             return None;
         }
         let frozen_targets = pending.frozen_targets.clone()?;
-        let coordinator_boot_epoch = FrozenTarget::find_in_canonical(
-            &frozen_targets,
-            coordinator,
-        )?
-        .boot_epoch();
+        let coordinator_boot_epoch =
+            FrozenTarget::find_in_canonical(&frozen_targets, coordinator)?.boot_epoch();
         if FrozenTarget::find_in_canonical(&frozen_targets, self.self_id)
             .is_none_or(|target| target.boot_epoch() != self.boot_epoch)
         {
@@ -6128,11 +6125,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 if !rt.accept_ack_retry_is_valid(op_id, &ack, &fence) {
                     break;
                 }
-                let delay = rt.cfg.delivery_tick_interval().min(
-                    fence
-                        .deadline
-                        .saturating_duration_since(Instant::now()),
-                );
+                let delay = rt
+                    .cfg
+                    .delivery_tick_interval()
+                    .min(fence.deadline.saturating_duration_since(Instant::now()));
                 tokio::select! {
                     _ = rt.shutdown.cancelled() => break,
                     _ = sleep(delay) => {},
@@ -14037,10 +14033,8 @@ mod tests {
     fn v2_accept_ack_retry_deadline_is_scoped_to_the_original_pending_value() {
         let cfg = ReplicationConfig::default().with_propose_ttl(Duration::from_millis(10));
         let (rt, _net, _repo) = v1_runtime(cfg);
-        let (op_id, ack) = accepted_v2_ack_retry_fixture(
-            &rt,
-            Instant::now() - Duration::from_millis(20),
-        );
+        let (op_id, ack) =
+            accepted_v2_ack_retry_fixture(&rt, Instant::now() - Duration::from_millis(20));
 
         assert!(
             rt.accept_ack_retry_fence(op_id, &ack).is_none(),

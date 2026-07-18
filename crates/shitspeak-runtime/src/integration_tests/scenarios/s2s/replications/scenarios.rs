@@ -1162,9 +1162,7 @@ async fn strict_quorum_lost_on_partition() {
         wait_until(Duration::from_secs(10), || {
             handles.iter().all(|handle| {
                 let state = handle.debug_state();
-                state.admitted_peers() == 3
-                    && !state.election_pending()
-                    && !state.election_active()
+                state.admitted_peers() == 3 && !state.election_pending() && !state.election_active()
             })
         })
         .await,
