@@ -663,7 +663,7 @@ impl<Output: Write> Kcp<Output> {
         }
     }
 
-    fn parse_fastack(&mut self, sn: u32, ts: u32) {
+    fn parse_fastack(&mut self, sn: u32, _ts: u32) {
         if timediff(sn, self.snd_una) < 0 || timediff(sn, self.snd_nxt) >= 0 {
             return;
         }
@@ -677,7 +677,7 @@ impl<Output: Write> Kcp<Output> {
                     seg.fastack += 1;
                 }
                 #[cfg(not(feature = "fastack-conserve"))]
-                if timediff(ts, seg.ts) >= 0 {
+                if timediff(_ts, seg.ts) >= 0 {
                     seg.fastack += 1;
                 }
             }
