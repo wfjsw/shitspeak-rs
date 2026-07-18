@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-tests:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1.9
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Cache Cargo build artifacts
+        uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run all Rust tests
+        run: cargo test --workspace --all-features --locked
+
+  sdk-tests:
+    name: JavaScript SDK tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+
+      - name: Run JavaScript SDK tests
+        run: node web/sdk/shitspeak.test.mjs
