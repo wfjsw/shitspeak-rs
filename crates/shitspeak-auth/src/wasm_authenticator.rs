@@ -642,7 +642,7 @@ struct WasmAuthenticatorInstance {
     store: Store<HostState>,
     instance: Instance,
     alloc: TypedFunc<i32, i32>,
-    dealloc: Option<TypedFunc<(i32, i32), ()>>,
+    dealloc: Option<DeallocFunc>,
     memory: Memory,
 }
 
@@ -820,7 +820,7 @@ fn build_linker(engine: &WasmEngine) -> Result<Linker<HostState>, WasmAuthentica
 fn optional_dealloc(
     store: &mut Store<HostState>,
     instance: &Instance,
-) -> Result<Option<wasmtime::TypedFunc<(i32, i32), ()>>, WasmAuthenticatorError> {
+) -> Result<Option<DeallocFunc>, WasmAuthenticatorError> {
     let Some(func) = instance.get_func(&mut *store, "dealloc") else {
         return Ok(None);
     };
