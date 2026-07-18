@@ -64,6 +64,7 @@ pub struct MemberSnapshot {
     application_services: ApplicationServices,
     strict_replication_protocol_version: u32,
     strict_replication_transit_protocol_version: u32,
+    upper_layer_capabilities: Option<Vec<u8>>,
 }
 
 impl MemberSnapshot {
@@ -92,6 +93,9 @@ impl MemberSnapshot {
         self.transit_disabled
     }
 
+    /// Deprecated wire-compatibility service bits. Upper layers should use
+    /// `upper_layer_capabilities`; these bits are consulted only when that
+    /// authoritative field is absent.
     pub fn replication_services(&self) -> ReplicationServices {
         self.replication_services
     }
@@ -100,16 +104,22 @@ impl MemberSnapshot {
         self.application_services.clone()
     }
 
-    /// Cumulative strict-replication protocol version advertised by this
-    /// member. Zero means this member is a legacy peer.
+    /// Deprecated rolling-upgrade participant version. Replication decodes
+    /// the opaque capability envelope whenever it is present.
     pub fn strict_replication_protocol_version(&self) -> u32 {
         self.strict_replication_protocol_version
     }
 
-    /// Cumulative strict-replication protocol version this member can relay
-    /// opaquely, independent of local replication participation.
+    /// Deprecated rolling-upgrade transit marker. Overlay payload forwarding
+    /// is opaque and current replication negotiation does not consume it.
     pub fn strict_replication_transit_protocol_version(&self) -> u32 {
         self.strict_replication_transit_protocol_version
+    }
+
+    /// Opaque upper-layer capabilities advertised by this member. Absence
+    /// identifies a legacy LSA without the generic capability envelope.
+    pub fn upper_layer_capabilities(&self) -> Option<&[u8]> {
+        self.upper_layer_capabilities.as_deref()
     }
 
     /// Whether this alive member can relay the requested generic
@@ -212,6 +222,7 @@ impl MembershipTable {
                 strict_replication_protocol_version: e.strict_replication_protocol_version(),
                 strict_replication_transit_protocol_version: e
                     .strict_replication_transit_protocol_version(),
+                upper_layer_capabilities: e.upper_layer_capabilities().map(<[u8]>::to_vec),
             })
             .collect();
         out.sort_by_key(|m| m.node_id);
@@ -235,27 +246,13 @@ impl MembershipTable {
             strict_replication_protocol_version: e.strict_replication_protocol_version(),
             strict_replication_transit_protocol_version: e
                 .strict_replication_transit_protocol_version(),
+            upper_layer_capabilities: e.upper_layer_capabilities().map(<[u8]>::to_vec),
         })
     }
 
     /// IDs of every origin with a current non-tombstone LSA.
     pub fn alive_members(&self) -> Vec<NodeIdentifier> {
         self.lsdb.active_origins()
-    }
-
-    /// IDs of active origins that advertise strict replication service.
-    pub fn strict_replication_members(&self) -> Vec<NodeIdentifier> {
-        self.lsdb.strict_replication_origins()
-    }
-
-    /// IDs of active origins that advertise content/blob replication service.
-    pub fn content_replication_members(&self) -> Vec<NodeIdentifier> {
-        self.lsdb.content_replication_origins()
-    }
-
-    /// IDs of active origins that advertise owner-scoped replication service.
-    pub fn owner_replication_members(&self) -> Vec<NodeIdentifier> {
-        self.lsdb.owner_replication_origins()
     }
 
     /// IDs of active origins that advertise application voice service.
@@ -398,6 +395,7 @@ mod tests {
             application_services: ApplicationServices::ALL,
             strict_replication_protocol_version: 0,
             strict_replication_transit_protocol_version: 0,
+            upper_layer_capabilities: None,
         }
     }
 
@@ -416,30 +414,24 @@ mod tests {
     }
 
     #[test]
-    fn replication_members_filter_by_service_kind() {
+    fn snapshot_preserves_upper_layer_capability_presence_and_bytes() {
         let floor = Arc::new(LsaFloor::new(0, None));
         let lsdb = Arc::new(LinkStateDb::new(floor));
         let (table, _) = new_table(1, lsdb.clone(), 8);
 
-        let strict = entry(1, 1, false, 100);
-        let mut content = entry(2, 1, false, 200);
-        content.replication_services = ReplicationServices::new(false, true, false);
-        let mut owner = entry(3, 1, false, 300);
-        owner.replication_services = ReplicationServices::new(false, false, true);
+        let legacy = entry(1, 1, false, 100);
+        let mut current = entry(2, 1, false, 100);
+        current.upper_layer_capabilities = Some(vec![7, 8, 9]);
+        lsdb.admit(legacy);
+        lsdb.admit(current);
 
-        lsdb.admit(strict);
-        lsdb.admit(content);
-        lsdb.admit(owner);
-
-        assert_eq!(table.strict_replication_members(), vec![1]);
-        assert_eq!(table.content_replication_members(), vec![1, 2]);
-        assert_eq!(table.owner_replication_members(), vec![1, 3]);
-        assert!(
-            table
-                .snapshot_one(2)
-                .unwrap()
-                .replication_services()
-                .content()
+        assert_eq!(
+            table.snapshot_one(1).unwrap().upper_layer_capabilities(),
+            None
+        );
+        assert_eq!(
+            table.snapshot_one(2).unwrap().upper_layer_capabilities(),
+            Some(&[7, 8, 9][..])
         );
     }
 

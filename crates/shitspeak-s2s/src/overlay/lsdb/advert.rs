@@ -48,9 +48,12 @@ use super::super::proto::{OverlayBody, encode_message, wrap};
 use super::super::routing::dijkstra::MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
 use super::store::{
     AdmissionResult, ApplicationServices, DistributionCapabilities, LinkAdvertised, LinkStateDb,
-    LinkTransportAdvertised, LsaEntry, ReplicationServices, STRICT_REPLICATION_PROTOCOL_VERSION,
+    LinkTransportAdvertised, LsaEntry, MAX_UPPER_LAYER_CAPABILITIES_BYTES, ReplicationServices,
     STRICT_REPLICATION_TRANSIT_PROTOCOL_VERSION, is_strictly_newer,
 };
+
+#[cfg(test)]
+use super::store::STRICT_REPLICATION_PROTOCOL_VERSION;
 
 const RTT_GATE_BUCKET_US: u64 = 25_000;
 const JITTER_GATE_BUCKET_US: u64 = 10_000;
@@ -59,30 +62,6 @@ const VOICE_UDP_LOSS_GATE_BUCKET_PPM: u32 = 10_000;
 const VOICE_UDP_REPAIR_LOSS_START_PPM: u32 = 10_000;
 const VOICE_UDP_FULL_DUP_LOSS_PPM: u32 = 30_000;
 const VOICE_UDP_REPAIR_JITTER_START_US: u64 = 40_000;
-
-#[derive(Clone, Copy)]
-struct StrictReplicationProtocolState {
-    durable_state_ready: bool,
-    repository_registration_ready: bool,
-    /// A coordinated manager setup grants one promotion attempt. A
-    /// repository capability loss revokes it so a later lazy registration
-    /// cannot accidentally restore v2.
-    repository_registration_rearm_permitted: bool,
-    permanently_disabled: bool,
-}
-
-impl StrictReplicationProtocolState {
-    fn advertised_version(self) -> u32 {
-        if self.durable_state_ready
-            && self.repository_registration_ready
-            && !self.permanently_disabled
-        {
-            STRICT_REPLICATION_PROTOCOL_VERSION
-        } else {
-            0
-        }
-    }
-}
 
 /// Local-LSA emitter state.
 pub struct LsaEmitter {
@@ -96,7 +75,7 @@ pub struct LsaEmitter {
     strict_replication_enabled: AtomicBool,
     strict_replication_protocol_version: AtomicU32,
     strict_replication_transit_protocol_version: AtomicU32,
-    strict_replication_protocol_state: parking_lot::Mutex<StrictReplicationProtocolState>,
+    upper_layer_capabilities: parking_lot::RwLock<Option<Vec<u8>>>,
     content_replication_enabled: AtomicBool,
     owner_replication_enabled: AtomicBool,
     voice_service_enabled: AtomicBool,
@@ -119,18 +98,8 @@ impl LsaEmitter {
         max_users: Arc<AtomicU64>,
         route_transit_messages: bool,
         replication_services: ReplicationServices,
-        strict_replication_durable_state_available: bool,
         application_services: ApplicationServices,
     ) -> Self {
-        let strict_replication_protocol_state = StrictReplicationProtocolState {
-            durable_state_ready: strict_replication_durable_state_available,
-            // The overlay cannot infer whether the server's Channel and Ban
-            // repositories are durable. ReplicationManager opens this gate
-            // before a coordinated expected-topic registration pass.
-            repository_registration_ready: false,
-            repository_registration_rearm_permitted: false,
-            permanently_disabled: false,
-        };
         Self {
             self_id,
             boot_epoch,
@@ -138,18 +107,13 @@ impl LsaEmitter {
             force_next_emit: AtomicBool::new(false),
             transit_disabled: AtomicBool::new(!route_transit_messages),
             strict_replication_enabled: AtomicBool::new(replication_services.strict()),
-            strict_replication_protocol_version: AtomicU32::new(
-                strict_replication_protocol_state.advertised_version(),
-            ),
-            // Transit support is a property of the overlay wire implementation,
-            // not of local replication repositories. Modern binaries can relay
-            // opaque strict-replication frames even when participation is off.
+            strict_replication_protocol_version: AtomicU32::new(0),
+            // Legacy tag 17 remains version 2 during the rolling transition.
+            // The upper layer owns the authoritative generic payload.
             strict_replication_transit_protocol_version: AtomicU32::new(
                 STRICT_REPLICATION_TRANSIT_PROTOCOL_VERSION,
             ),
-            strict_replication_protocol_state: parking_lot::Mutex::new(
-                strict_replication_protocol_state,
-            ),
+            upper_layer_capabilities: parking_lot::RwLock::new(None),
             content_replication_enabled: AtomicBool::new(replication_services.content()),
             owner_replication_enabled: AtomicBool::new(replication_services.owner()),
             voice_service_enabled: AtomicBool::new(application_services.voice()),
@@ -211,119 +175,75 @@ impl LsaEmitter {
             .load(Ordering::Relaxed)
     }
 
-    /// Update shared S2S-state readiness. This is necessary but not sufficient
-    /// for the current cumulative protocol: repository registration must also
-    /// have completed successfully.
-    pub(crate) fn update_strict_replication_durable_state_ready(&self, ready: bool) {
-        let mut state = self.strict_replication_protocol_state.lock();
-        if state.durable_state_ready == ready {
-            return;
-        }
-        state.durable_state_ready = ready;
-        let advertised_version = state.advertised_version();
-        let changed = self
-            .strict_replication_protocol_version
-            .swap(advertised_version, Ordering::Relaxed)
-            != advertised_version;
-        drop(state);
-        if changed {
-            self.poke_force();
-        }
+    /// Return the opaque upper-layer capability payload without interpreting
+    /// its schema. `None` retains legacy-advertisement presence semantics.
+    pub(crate) fn upper_layer_capabilities(&self) -> Option<Vec<u8>> {
+        self.upper_layer_capabilities.read().clone()
     }
 
-    /// Begin a new manager-coordinated strict repository registration pass.
-    ///
-    /// This is the only operation that may clear a prior repository-loss
-    /// latch. The manager first drives readiness false, then promotes it only
-    /// after its complete expected topic registry has registered and passed
-    /// capability probing.
-    pub(crate) fn begin_strict_replication_repository_registration(&self) {
-        let mut state = self.strict_replication_protocol_state.lock();
-        state.repository_registration_ready = false;
-        state.repository_registration_rearm_permitted = true;
-        let advertised_version = state.advertised_version();
-        let changed = self
-            .strict_replication_protocol_version
-            .swap(advertised_version, Ordering::Relaxed)
-            != advertised_version;
-        drop(state);
-        if changed {
-            self.poke_force();
+    /// Replace the opaque upper-layer capability payload and schedule an LSA
+    /// when its bytes or presence changed. Returns `false` for unchanged or
+    /// oversized payloads.
+    pub(crate) fn update_upper_layer_capabilities(&self, capabilities: Option<Vec<u8>>) -> bool {
+        if capabilities
+            .as_ref()
+            .is_some_and(|payload| payload.len() > MAX_UPPER_LAYER_CAPABILITIES_BYTES)
+        {
+            return false;
         }
+        let mut current = self.upper_layer_capabilities.write();
+        if *current == capabilities {
+            return false;
+        }
+        *current = capabilities;
+        drop(current);
+        self.poke_force();
+        true
     }
 
-    /// Update the manager-derived readiness of the current coordinated strict
-    /// repository registration pass.
-    ///
-    /// A `true` value is accepted only while the corresponding pass retains
-    /// its one-shot rearm permit. Once promoted, a repository capability loss
-    /// must be followed by another explicit coordinated setup; a later lazy
-    /// topic registration cannot silently re-enable the LSA.
-    pub(crate) fn update_strict_replication_repository_registration_ready(
+    /// Atomically transform the opaque upper-layer payload. The overlay
+    /// supplies the current bytes to the caller but never interprets them.
+    /// This lets independent upper layers merge their entries without a
+    /// read/replace race.
+    pub(crate) fn modify_upper_layer_capabilities<E>(
         &self,
-        ready: bool,
+        update: impl FnOnce(Option<&[u8]>) -> Result<Option<Vec<u8>>, E>,
+    ) -> Result<bool, E> {
+        let mut current = self.upper_layer_capabilities.write();
+        let next = update(current.as_deref())?;
+        if next
+            .as_ref()
+            .is_some_and(|payload| payload.len() > MAX_UPPER_LAYER_CAPABILITIES_BYTES)
+            || *current == next
+        {
+            return Ok(false);
+        }
+        *current = next;
+        drop(current);
+        self.poke_force();
+        Ok(true)
+    }
+
+    /// Update deprecated strict-replication wire fields during a rolling
+    /// upgrade. The overlay publishes these raw values without deriving them.
+    pub(crate) fn update_legacy_strict_replication_protocol_versions(
+        &self,
+        participant: u32,
+        transit: u32,
     ) -> bool {
-        let mut state = self.strict_replication_protocol_state.lock();
-        if ready && !state.repository_registration_ready {
-            if !state.repository_registration_rearm_permitted {
-                return false;
-            }
-            state.repository_registration_rearm_permitted = false;
-        }
-        if state.repository_registration_ready == ready {
-            return ready;
-        }
-        state.repository_registration_ready = ready;
-        let advertised_version = state.advertised_version();
-        let changed = self
+        let participant_changed = self
             .strict_replication_protocol_version
-            .swap(advertised_version, Ordering::Relaxed)
-            != advertised_version;
-        drop(state);
+            .swap(participant, Ordering::Relaxed)
+            != participant;
+        let transit_changed = self
+            .strict_replication_transit_protocol_version
+            .swap(transit, Ordering::Relaxed)
+            != transit;
+        let changed = participant_changed || transit_changed;
         if changed {
             self.poke_force();
         }
-        ready
-    }
-
-    /// Clamp the current protocol when an already registered repository loses
-    /// its v2 contract. The production manager must explicitly complete a new
-    /// coordinated registration before this can be advertised again.
-    pub(crate) fn report_strict_replication_repository_capability_loss(&self) {
-        let mut state = self.strict_replication_protocol_state.lock();
-        if !state.repository_registration_ready && !state.repository_registration_rearm_permitted {
-            return;
-        }
-        state.repository_registration_ready = false;
-        state.repository_registration_rearm_permitted = false;
-        let changed = self
-            .strict_replication_protocol_version
-            .swap(0, Ordering::Relaxed)
-            != 0;
-        drop(state);
-        if changed {
-            self.poke_force();
-        }
-    }
-
-    /// Stop advertising the current strict-replication protocol and force a
-    /// replacement LSA so peers promptly fail closed. This remains sticky for
-    /// the process lifetime because a later storage probe cannot repair a
-    /// terminal journal that failed to load or write.
-    pub(crate) fn disable_strict_replication_protocol(&self) {
-        let mut state = self.strict_replication_protocol_state.lock();
-        if state.permanently_disabled {
-            return;
-        }
-        state.permanently_disabled = true;
-        let changed = self
-            .strict_replication_protocol_version
-            .swap(0, Ordering::Relaxed)
-            != 0;
-        drop(state);
-        if changed {
-            self.poke_force();
-        }
+        changed
     }
 
     pub fn application_services(&self) -> ApplicationServices {
@@ -363,6 +283,7 @@ struct LsaContent {
     application_services: ApplicationServices,
     strict_replication_protocol_version: u32,
     strict_replication_transit_protocol_version: u32,
+    upper_layer_capabilities: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -448,6 +369,11 @@ fn build_local_lsa_content(
         } else {
             emitter.strict_replication_transit_protocol_version()
         },
+        upper_layer_capabilities: if tombstone {
+            None
+        } else {
+            emitter.upper_layer_capabilities()
+        },
     }
 }
 
@@ -467,6 +393,7 @@ fn stamp_local_lsa(emitter: &LsaEmitter, content: LsaContent) -> LsaEntry {
         strict_replication_protocol_version: content.strict_replication_protocol_version,
         strict_replication_transit_protocol_version: content
             .strict_replication_transit_protocol_version,
+        upper_layer_capabilities: content.upper_layer_capabilities,
     }
 }
 
@@ -687,6 +614,7 @@ fn content_gate_fingerprint(content: &LsaContent, cfg: &OverlayConfig) -> u64 {
     content
         .strict_replication_transit_protocol_version
         .hash(&mut hasher);
+    content.upper_layer_capabilities.hash(&mut hasher);
     content.application_services.voice().hash(&mut hasher);
     content
         .application_services
@@ -722,6 +650,7 @@ fn content_identity_fingerprint(content: &LsaContent) -> u64 {
     content
         .strict_replication_transit_protocol_version
         .hash(&mut hasher);
+    content.upper_layer_capabilities.hash(&mut hasher);
     content.application_services.voice().hash(&mut hasher);
     content
         .application_services
@@ -1537,19 +1466,15 @@ mod tests {
     }
 
     fn test_emitter() -> LsaEmitter {
-        let emitter = LsaEmitter::new(
+        LsaEmitter::new(
             1,
             100,
             vec![],
             Arc::new(AtomicU64::new(10)),
             true,
             ReplicationServices::ALL,
-            true,
             ApplicationServices::ALL,
-        );
-        emitter.begin_strict_replication_repository_registration();
-        assert!(emitter.update_strict_replication_repository_registration_ready(true));
-        emitter
+        )
     }
 
     #[test]
@@ -1569,8 +1494,12 @@ mod tests {
     }
 
     #[test]
-    fn local_lsa_advertises_strict_replication_protocol_version_and_fingerprints_it() {
+    fn local_lsa_dual_writes_legacy_strict_versions_and_fingerprints_them() {
         let emitter = test_emitter();
+        assert!(emitter.update_legacy_strict_replication_protocol_versions(
+            STRICT_REPLICATION_PROTOCOL_VERSION,
+            STRICT_REPLICATION_PROTOCOL_VERSION,
+        ));
         let lsa = build_local_lsa(&emitter, &[], false);
         assert_eq!(
             lsa.strict_replication_protocol_version(),
@@ -1606,189 +1535,36 @@ mod tests {
     }
 
     #[test]
-    fn transport_only_emitter_advertises_transit_without_participating() {
-        let emitter = LsaEmitter::new(
-            1,
-            100,
-            vec![],
-            Arc::new(AtomicU64::new(10)),
-            true,
-            ReplicationServices::NONE,
-            false,
-            ApplicationServices::NONE,
+    fn local_lsa_publishes_opaque_upper_layer_capabilities_and_fingerprints_them() {
+        let emitter = test_emitter();
+        assert_eq!(emitter.upper_layer_capabilities(), None);
+        assert!(emitter.update_upper_layer_capabilities(Some(vec![1, 2, 3])));
+        assert!(!emitter.update_upper_layer_capabilities(Some(vec![1, 2, 3])));
+        assert!(!emitter.update_upper_layer_capabilities(Some(vec![
+            0;
+            MAX_UPPER_LAYER_CAPABILITIES_BYTES
+                + 1
+        ])));
+        assert_eq!(
+            emitter.upper_layer_capabilities().as_deref(),
+            Some(&[1, 2, 3][..])
         );
+
         let lsa = build_local_lsa(&emitter, &[], false);
-        assert_eq!(lsa.strict_replication_protocol_version(), 0);
+        assert_eq!(lsa.upper_layer_capabilities(), Some(&[1, 2, 3][..]));
         assert_eq!(
-            lsa.strict_replication_transit_protocol_version(),
-            STRICT_REPLICATION_PROTOCOL_VERSION
+            lsa.to_pb().upper_layer_capabilities.as_deref(),
+            Some(&[1, 2, 3][..])
         );
-    }
 
-    #[test]
-    fn local_lsa_fails_closed_when_strict_durable_state_is_unavailable() {
-        let emitter = LsaEmitter::new(
-            1,
-            100,
-            vec![],
-            Arc::new(AtomicU64::new(10)),
-            true,
-            ReplicationServices::ALL,
-            false,
-            ApplicationServices::ALL,
-        );
-        emitter.begin_strict_replication_repository_registration();
-        assert!(emitter.update_strict_replication_repository_registration_ready(true));
-
-        assert_eq!(
-            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
-            0
-        );
-    }
-
-    #[test]
-    fn local_lsa_can_downgrade_strict_replication_protocol_version() {
-        let emitter = test_emitter();
-        emitter.disable_strict_replication_protocol();
-
-        assert!(emitter.force_next_emit.load(Ordering::Relaxed));
-        assert_eq!(
-            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
-            0
-        );
-    }
-
-    #[test]
-    fn local_lsa_re_advertises_when_durable_storage_recovers() {
-        let emitter = LsaEmitter::new(
-            1,
-            100,
-            vec![],
-            Arc::new(AtomicU64::new(10)),
-            true,
-            ReplicationServices::ALL,
-            false,
-            ApplicationServices::ALL,
-        );
         let cfg = OverlayConfig::new(vec![]);
-        let unavailable = content_fingerprint(&build_local_lsa_content(&emitter, &[], false), &cfg);
-
-        emitter.begin_strict_replication_repository_registration();
-        assert!(emitter.update_strict_replication_repository_registration_ready(true));
-        emitter.update_strict_replication_durable_state_ready(true);
-        assert!(emitter.force_next_emit.load(Ordering::Relaxed));
-        let ready = content_fingerprint(&build_local_lsa_content(&emitter, &[], false), &cfg);
-        assert_ne!(unavailable.identity, ready.identity);
-        assert_ne!(unavailable.gate, ready.gate);
-        assert_eq!(
-            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
-            STRICT_REPLICATION_PROTOCOL_VERSION
-        );
-
-        emitter.force_next_emit.store(false, Ordering::Relaxed);
-        emitter.update_strict_replication_durable_state_ready(false);
-        assert!(emitter.force_next_emit.load(Ordering::Relaxed));
-        assert_eq!(
-            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
-            0
-        );
-    }
-
-    #[test]
-    fn strict_journal_failure_keeps_current_protocol_disabled_after_storage_recovers() {
-        let emitter = test_emitter();
-        emitter.disable_strict_replication_protocol();
-        emitter.update_strict_replication_durable_state_ready(false);
-        emitter.update_strict_replication_durable_state_ready(true);
-
-        assert_eq!(
-            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
-            0
-        );
-    }
-
-    #[test]
-    fn shared_s2s_persistence_advertises_v2_only_after_verified_repository_registration() {
-        let emitter = LsaEmitter::new(
-            1,
-            100,
-            vec![],
-            Arc::new(AtomicU64::new(10)),
-            true,
-            ReplicationServices::ALL,
-            true,
-            ApplicationServices::ALL,
-        );
-
-        assert_eq!(
-            emitter.strict_replication_protocol_version(),
-            0,
-            "durable shared S2S state alone must not advertise v2"
-        );
-        assert_eq!(
-            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
-            0
-        );
-        emitter.begin_strict_replication_repository_registration();
-        assert!(!emitter.update_strict_replication_repository_registration_ready(false));
-        assert_eq!(emitter.strict_replication_protocol_version(), 0);
-        assert_eq!(
-            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
-            0,
-            "an incomplete coordinated repository registration must keep the LSA at v0"
-        );
-
-        assert!(emitter.update_strict_replication_repository_registration_ready(true));
-        assert_eq!(
-            emitter.strict_replication_protocol_version(),
-            STRICT_REPLICATION_PROTOCOL_VERSION
-        );
-        assert_eq!(
-            build_local_lsa(&emitter, &[], false).strict_replication_protocol_version(),
-            STRICT_REPLICATION_PROTOCOL_VERSION,
-            "durable v2 repositories promote automatically after registration"
-        );
-
-        emitter.report_strict_replication_repository_capability_loss();
-        assert_eq!(emitter.strict_replication_protocol_version(), 0);
-
-        assert!(!emitter.update_strict_replication_repository_registration_ready(true));
-        emitter.begin_strict_replication_repository_registration();
-        assert!(emitter.update_strict_replication_repository_registration_ready(true));
-        assert_eq!(
-            emitter.strict_replication_protocol_version(),
-            STRICT_REPLICATION_PROTOCOL_VERSION,
-            "only an explicit coordinated re-registration can restore v2"
-        );
-    }
-
-    #[test]
-    fn repository_loss_before_initial_promotion_revokes_the_pending_rearm_permit() {
-        let emitter = LsaEmitter::new(
-            1,
-            100,
-            vec![],
-            Arc::new(AtomicU64::new(10)),
-            true,
-            ReplicationServices::ALL,
-            true,
-            ApplicationServices::ALL,
-        );
-
-        emitter.begin_strict_replication_repository_registration();
-        emitter.report_strict_replication_repository_capability_loss();
-        assert!(
-            !emitter.update_strict_replication_repository_registration_ready(true),
-            "a late registration must not re-enable a capability loss"
-        );
-        assert_eq!(emitter.strict_replication_protocol_version(), 0);
-
-        emitter.begin_strict_replication_repository_registration();
-        assert!(emitter.update_strict_replication_repository_registration_ready(true));
-        assert_eq!(
-            emitter.strict_replication_protocol_version(),
-            STRICT_REPLICATION_PROTOCOL_VERSION
-        );
+        let content = build_local_lsa_content(&emitter, &[], false);
+        let original = content_fingerprint(&content, &cfg);
+        let mut changed = content.clone();
+        changed.upper_layer_capabilities = Some(vec![1, 2, 4]);
+        let changed = content_fingerprint(&changed, &cfg);
+        assert_ne!(original.identity, changed.identity);
+        assert_ne!(original.gate, changed.gate);
     }
 
     fn pb_lsa(origin: NodeIdentifier, seq: u64) -> pb::LinkStateAdvert {
@@ -2153,6 +1929,7 @@ mod tests {
                 application_services: ApplicationServices::ALL,
                 strict_replication_protocol_version: 0,
                 strict_replication_transit_protocol_version: 0,
+                upper_layer_capabilities: None,
             }),
             AdmissionResult::Accepted
         );
@@ -2257,7 +2034,6 @@ mod tests {
             max_users.clone(),
             true,
             ReplicationServices::ALL,
-            true,
             ApplicationServices::ALL,
         );
         let cfg = OverlayConfig::new(vec![])

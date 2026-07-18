@@ -1,6 +1,18 @@
 syntax = "proto3";
 package s2s_replication;
 
+// Replication's service-tag entry in the opaque upper-layer capability
+// envelope. This is interpreted only by the replication subsystem.
+message ReplicationCapabilities {
+  uint32 format_version = 1;
+  bool strict_enabled = 2;
+  bool content_enabled = 3;
+  bool owner_enabled = 4;
+  // Cumulative strict participant version. Zero is unsupported, including
+  // while an enabled participant's durability/readiness gates are closed.
+  uint32 strict_participant_protocol_version = 5;
+}
+
 // Outer envelope for replications. Carried as the `payload` of an
 // overlay `OverlayData` frame with `service_tag = 1`.
 message ReplicationMessage {

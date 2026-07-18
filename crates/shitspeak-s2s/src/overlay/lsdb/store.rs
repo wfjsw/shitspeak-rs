@@ -39,16 +39,17 @@ use super::super::proto::{address_from_pb, address_to_pb, kind_to_u32, u32_to_ki
 use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_proto::s2s_overlay_proto::link_state_advert_capabilities as lsa_caps;
 
-/// Latest strict-replication protocol understood by this binary.
-///
-/// Values are cumulative: a node advertising this version supports every
-/// earlier strict-replication protocol version too. Zero is reserved for
-/// legacy peers that omit the capability from their LSA.
+/// Maximum opaque upper-layer capability payload admitted into the LSDB.
+/// This bounds every entry before count-based flood and sync batching.
+pub(crate) const MAX_UPPER_LAYER_CAPABILITIES_BYTES: usize = 4 * 1024;
+
+/// Deprecated field-16 value retained for rolling-upgrade compatibility.
+/// Replication owns the authoritative participant version in the opaque
+/// upper-layer capability envelope.
 pub const STRICT_REPLICATION_PROTOCOL_VERSION: u32 = 2;
 
-/// Latest strict-replication protocol this binary can forward opaquely
-/// through the overlay. Kept separate from the local participant capability
-/// so transport-only nodes can advertise relay support without repositories.
+/// Deprecated field-17 value retained while upgrading from the transitional
+/// transit-version build. Current overlay forwarding keeps L3 payloads opaque.
 pub const STRICT_REPLICATION_TRANSIT_PROTOCOL_VERSION: u32 = 2;
 
 /// Replication service kinds advertised by one overlay member.
@@ -266,6 +267,7 @@ pub struct LsaEntry {
     pub application_services: ApplicationServices,
     pub(crate) strict_replication_protocol_version: u32,
     pub(crate) strict_replication_transit_protocol_version: u32,
+    pub(crate) upper_layer_capabilities: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -390,6 +392,13 @@ fn describe_lsa_entry_delta(previous: Option<&LsaEntry>, current: &LsaEntry) -> 
         previous.strict_replication_transit_protocol_version,
         current.strict_replication_transit_protocol_version,
     );
+    if previous.upper_layer_capabilities != current.upper_layer_capabilities {
+        changes.push(format!(
+            "upper_layer_capabilities {:?}->{:?}",
+            previous.upper_layer_capabilities.as_ref().map(Vec::len),
+            current.upper_layer_capabilities.as_ref().map(Vec::len),
+        ));
+    }
     push_scalar_change(
         &mut changes,
         "voice_service",
@@ -620,22 +629,35 @@ fn describe_single_link_delta(
 }
 
 impl LsaEntry {
-    /// Cumulative strict-replication protocol version advertised by this
-    /// member. A missing field from an older LSA is represented as zero.
+    /// Deprecated rolling-upgrade participant version. A missing legacy field
+    /// is represented as zero.
     pub fn strict_replication_protocol_version(&self) -> u32 {
         self.strict_replication_protocol_version
     }
 
-    /// Cumulative strict-replication protocol version this member can forward
-    /// opaquely through the overlay. This is independent of local
-    /// replication repositories and may be non-zero for transport-only nodes.
+    /// Deprecated rolling-upgrade transit marker. Current overlay forwarding
+    /// keeps upper-layer payloads opaque and does not interpret this value.
     pub fn strict_replication_transit_protocol_version(&self) -> u32 {
         self.strict_replication_transit_protocol_version
     }
 
+    /// Opaque upper-layer capability advertisement. `None` represents an LSA
+    /// produced before the generic capability envelope was introduced.
+    pub fn upper_layer_capabilities(&self) -> Option<&[u8]> {
+        self.upper_layer_capabilities.as_deref()
+    }
+
     /// Build from a wire LSA. Returns `None` if `origin` is not a valid
-    /// `NodeIdentifier` (overflows u16).
+    /// `NodeIdentifier` (overflows u16) or its opaque capability payload
+    /// exceeds the admission limit.
     pub fn from_pb(pb: &pb::LinkStateAdvert) -> Option<Self> {
+        if pb
+            .upper_layer_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.len() > MAX_UPPER_LAYER_CAPABILITIES_BYTES)
+        {
+            return None;
+        }
         let origin = NodeIdentifier::try_from(pb.origin).ok()?;
         let addresses = pb.addresses.iter().filter_map(address_from_pb).collect();
         let links = pb
@@ -713,6 +735,7 @@ impl LsaEntry {
             strict_replication_protocol_version: pb.strict_replication_protocol_version,
             strict_replication_transit_protocol_version: pb
                 .strict_replication_transit_protocol_version,
+            upper_layer_capabilities: pb.upper_layer_capabilities.clone(),
         })
     }
 
@@ -790,6 +813,7 @@ impl LsaEntry {
             strict_replication_protocol_version: self.strict_replication_protocol_version,
             strict_replication_transit_protocol_version: self
                 .strict_replication_transit_protocol_version,
+            upper_layer_capabilities: self.upper_layer_capabilities.clone(),
         }
     }
 }
@@ -1253,21 +1277,6 @@ impl LinkStateDb {
         out
     }
 
-    fn active_origins_by_replication_kind(
-        &self,
-        enabled: impl Fn(ReplicationServices) -> bool,
-    ) -> Vec<NodeIdentifier> {
-        let mut out: Vec<_> = self
-            .inner
-            .read()
-            .values()
-            .filter(|e| !e.tombstone && enabled(e.replication_services))
-            .map(|e| e.origin)
-            .collect();
-        out.sort();
-        out
-    }
-
     fn active_origins_by_application_kind(
         &self,
         enabled: impl Fn(&ApplicationServices) -> bool,
@@ -1281,21 +1290,6 @@ impl LinkStateDb {
             .collect();
         out.sort();
         out
-    }
-
-    /// Set of active origins that advertise strict replication service.
-    pub fn strict_replication_origins(&self) -> Vec<NodeIdentifier> {
-        self.active_origins_by_replication_kind(ReplicationServices::strict)
-    }
-
-    /// Set of active origins that advertise content/blob replication service.
-    pub fn content_replication_origins(&self) -> Vec<NodeIdentifier> {
-        self.active_origins_by_replication_kind(ReplicationServices::content)
-    }
-
-    /// Set of active origins that advertise owner-scoped replication service.
-    pub fn owner_replication_origins(&self) -> Vec<NodeIdentifier> {
-        self.active_origins_by_replication_kind(ReplicationServices::owner)
     }
 
     /// Set of active origins that advertise application voice service.
@@ -1377,6 +1371,7 @@ mod tests {
             application_services: ApplicationServices::ALL,
             strict_replication_protocol_version: 0,
             strict_replication_transit_protocol_version: 0,
+            upper_layer_capabilities: None,
         }
     }
 
@@ -1754,6 +1749,52 @@ mod tests {
     }
 
     #[test]
+    fn upper_layer_capabilities_roundtrip_and_preserve_absence() {
+        let mut lsa = entry(1, 100, 1, false);
+        lsa.upper_layer_capabilities = Some(vec![0, 1, 2, 255]);
+
+        let pb = lsa.to_pb();
+        assert_eq!(
+            pb.upper_layer_capabilities.as_deref(),
+            Some(&[0, 1, 2, 255][..])
+        );
+        assert_eq!(
+            LsaEntry::from_pb(&pb).unwrap().upper_layer_capabilities(),
+            Some(&[0, 1, 2, 255][..])
+        );
+
+        let legacy = pb::LinkStateAdvert {
+            origin: 2,
+            boot_epoch: 100,
+            seq: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            LsaEntry::from_pb(&legacy)
+                .unwrap()
+                .upper_layer_capabilities(),
+            None
+        );
+
+        let authoritative_empty = pb::LinkStateAdvert {
+            upper_layer_capabilities: Some(Vec::new()),
+            ..legacy.clone()
+        };
+        assert_eq!(
+            LsaEntry::from_pb(&authoritative_empty)
+                .unwrap()
+                .upper_layer_capabilities(),
+            Some(&[][..])
+        );
+
+        let oversized = pb::LinkStateAdvert {
+            upper_layer_capabilities: Some(vec![0; MAX_UPPER_LAYER_CAPABILITIES_BYTES + 1]),
+            ..legacy
+        };
+        assert!(LsaEntry::from_pb(&oversized).is_none());
+    }
+
+    #[test]
     fn v2_capability_remains_version_two_after_v3_upgrade() {
         let capability = DistributionCapabilities::v2([3]);
         assert_eq!(
@@ -1842,31 +1883,6 @@ mod tests {
         db.admit(left);
 
         assert_eq!(db.edge_rtt_snapshot(), vec![Duration::from_micros(1_500)]);
-    }
-
-    #[test]
-    fn replication_origins_filter_by_enabled_service() {
-        let floor = Arc::new(LsaFloor::new(0, None));
-        let db = LinkStateDb::new(floor);
-        let strict_only = entry(1, 100, 1, false);
-        let mut content_only = entry(2, 100, 1, false);
-        content_only.replication_services = ReplicationServices::new(false, true, false);
-        let mut owner_only = entry(3, 100, 1, false);
-        owner_only.replication_services = ReplicationServices::new(false, false, true);
-        let mut none = entry(4, 100, 1, false);
-        none.replication_services = ReplicationServices::NONE;
-        let mut left = entry(5, 100, 1, true);
-        left.replication_services = ReplicationServices::ALL;
-
-        db.admit(strict_only);
-        db.admit(content_only);
-        db.admit(owner_only);
-        db.admit(none);
-        db.admit(left);
-
-        assert_eq!(db.strict_replication_origins(), vec![1]);
-        assert_eq!(db.content_replication_origins(), vec![1, 2]);
-        assert_eq!(db.owner_replication_origins(), vec![1, 3]);
     }
 
     #[test]

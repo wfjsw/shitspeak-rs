@@ -1,0 +1,16 @@
+syntax = "proto3";
+package s2s_upper_layer;
+
+// Generic upper-layer capability envelope carried opaquely by overlay LSAs.
+// The overlay never decodes this message. Entries are encoded in strictly
+// increasing service_tag order and each service owns its payload schema.
+message UpperLayerCapabilityEnvelope {
+  uint32 format_version = 1;
+  repeated UpperLayerCapabilityEntry entries = 2;
+}
+
+message UpperLayerCapabilityEntry {
+  // Stable OverlayData service tag of the capability owner.
+  uint32 service_tag = 1;
+  bytes payload = 2;
+}

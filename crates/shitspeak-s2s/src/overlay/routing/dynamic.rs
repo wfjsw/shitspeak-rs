@@ -421,6 +421,7 @@ mod tests {
             application_services: ApplicationServices::ALL,
             strict_replication_protocol_version: 0,
             strict_replication_transit_protocol_version: 0,
+            upper_layer_capabilities: None,
         }
     }
 

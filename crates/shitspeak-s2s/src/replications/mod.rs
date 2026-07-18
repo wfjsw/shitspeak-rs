@@ -28,7 +28,9 @@
 //! bottleneck, switch to per-topic mpsc + drain task.
 
 pub mod blob;
+mod capability;
 pub mod config;
+mod durability;
 pub mod error;
 pub mod metrics;
 pub mod owner;
@@ -63,7 +65,35 @@ pub use owner::{OwnerHandle, OwnerReplicable};
 pub use proto::REPLICATION_SERVICE_TAG;
 pub use strict::{StrictHandle, StrictReplicable, StrictSnapshotError};
 
+/// Encode the replication service's entry in the generic opaque LSA
+/// capability envelope.
+///
+/// Callers that construct the overlay before [`ReplicationManager`] exists
+/// use this to publish an authoritative initial state. A fully disabled node
+/// emits a valid empty envelope, so peers do not mistake it for a legacy LSA.
+pub fn encode_replication_upper_layer_capabilities(
+    strict_enabled: bool,
+    content_enabled: bool,
+    owner_enabled: bool,
+    strict_participant_protocol_version: u32,
+) -> Vec<u8> {
+    let strict_participant_protocol_version = if strict_enabled {
+        strict_participant_protocol_version
+    } else {
+        0
+    };
+    protocol::encode_upper_layer_capabilities(protocol::ReplicationProtocolCapabilities::new(
+        strict_enabled,
+        content_enabled,
+        owner_enabled,
+        strict_participant_protocol_version,
+    ))
+    .expect("built-in replication capabilities fit the bounded envelope")
+}
+
 use self::blob::{BlobNet, BlobRuntime, OverlayBlobNet};
+use self::capability::StrictParticipantCapability;
+use self::durability::{participant_journal_ready, spawn_participant_durability_monitor};
 use self::metrics::{ReplicationPipelineKind, ReplicationPipelineStage};
 use self::owner::runtime::{OverlayOwnerNet, OwnerNet, OwnerRuntime};
 use self::proto::ReplBody;
@@ -142,6 +172,7 @@ struct ManagerInner {
     self_id: NodeIdentifier,
     self_epoch: u64,
     strict_topics: Arc<SccMap<String, Arc<dyn ErasedStrictRuntime>>>,
+    strict_participant_capability: Arc<StrictParticipantCapability>,
     strict_capability_registry: Mutex<StrictCapabilityRegistry>,
     owner_topics: Arc<SccMap<String, Arc<dyn ErasedOwnerRuntime>>>,
     blob_topics: Arc<SccMap<String, Arc<dyn ErasedBlobRuntime>>>,
@@ -266,6 +297,52 @@ impl ReplicationManager {
     pub fn with_config(overlay: OverlayNetwork, cfg: ReplicationConfig) -> Arc<Self> {
         let self_id = overlay.local_node_id();
         let self_epoch = overlay.local_boot_epoch();
+        let legacy_services = overlay.legacy_local_replication_services();
+        let initial_journal_ready = if legacy_services.strict() {
+            match participant_journal_ready(overlay.persistence_dir().as_deref(), self_id) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    warn!(
+                        persistence_dir = ?overlay.persistence_dir(),
+                        %error,
+                        "strict replication durable storage is not ready; advertising v0"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let initial_durable_state_ready =
+            initial_journal_ready && overlay.local_boot_epoch_durable();
+        let publisher_overlay = overlay.clone();
+        let strict_participant_capability = StrictParticipantCapability::new(
+            legacy_services.strict(),
+            initial_durable_state_ready,
+            protocol::STRICT_PROTOCOL_VERSION,
+            move |participant_version| {
+                let replication_capabilities = protocol::ReplicationProtocolCapabilities::new(
+                    legacy_services.strict(),
+                    legacy_services.content(),
+                    legacy_services.owner(),
+                    participant_version,
+                );
+                match publisher_overlay.modify_upper_layer_capabilities(|current| {
+                    protocol::merge_upper_layer_capabilities(current, replication_capabilities)
+                        .map(Some)
+                }) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(%error, "refusing to replace malformed local upper-layer capabilities");
+                    }
+                }
+                // Deprecated rolling-upgrade fields. New readers ignore
+                // transit policy and consume the opaque participant record.
+                publisher_overlay
+                    .update_legacy_strict_replication_protocol_versions(participant_version, 2);
+            },
+        );
+        strict_participant_capability.publish_current();
         let strict_topics: Arc<SccMap<String, Arc<dyn ErasedStrictRuntime>>> =
             Arc::new(SccMap::new());
         let owner_topics: Arc<SccMap<String, Arc<dyn ErasedOwnerRuntime>>> =
@@ -274,9 +351,10 @@ impl ReplicationManager {
         let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
 
-        let strict_net: Arc<dyn StrictNet> = Arc::new(OverlayStrictNet {
-            overlay: overlay.clone(),
-        });
+        let strict_net: Arc<dyn StrictNet> = Arc::new(OverlayStrictNet::new(
+            overlay.clone(),
+            strict_participant_capability.clone(),
+        ));
         let owner_net: Arc<dyn OwnerNet> = Arc::new(OverlayOwnerNet {
             overlay: overlay.clone(),
         });
@@ -290,6 +368,7 @@ impl ReplicationManager {
             self_id,
             self_epoch,
             strict_topics: strict_topics.clone(),
+            strict_participant_capability: strict_participant_capability.clone(),
             strict_capability_registry: Mutex::new(StrictCapabilityRegistry::default()),
             owner_topics: owner_topics.clone(),
             blob_topics: blob_topics.clone(),
@@ -302,6 +381,15 @@ impl ReplicationManager {
             blob_topic_resolver: RwLock::new(None),
             cfg,
         });
+
+        if legacy_services.strict() {
+            spawn_participant_durability_monitor(
+                overlay.clone(),
+                strict_participant_capability,
+                shutdown.clone(),
+                initial_journal_ready,
+            );
+        }
 
         // Register the L3 service handler. The overlay calls `handle`
         // synchronously per the trait contract; we just decode and push.
@@ -353,6 +441,12 @@ impl ReplicationManager {
     /// Local node boot epoch captured by the overlay at S2S runtime start.
     pub fn local_boot_epoch(&self) -> u64 {
         self.inner.self_epoch
+    }
+
+    /// Effective strict participant protocol floor observed by this manager.
+    /// Nonparticipants never enter this calculation.
+    pub fn strict_protocol_version(&self) -> u32 {
+        self.inner.strict_net.strict_replication_protocol_version()
     }
 
     /// Register a strict (Tempo) topic. Returns the caller-facing handle
@@ -574,8 +668,8 @@ impl ManagerInner {
         });
         registry.activation_pending = true;
         registry.activation_completed = false;
-        self.overlay
-            .begin_strict_replication_repository_registration();
+        self.strict_participant_capability
+            .begin_repository_registration();
         self.refresh_strict_capability_activation_locked(&mut registry)
     }
 
@@ -621,8 +715,8 @@ impl ManagerInner {
         }
         registry.vetted_topics.insert(topic.clone());
         if registry.start_implicit_registration_pass(&topic) {
-            self.overlay
-                .begin_strict_replication_repository_registration();
+            self.strict_participant_capability
+                .begin_repository_registration();
         }
         let _ = self.refresh_strict_capability_activation_locked(&mut registry);
         Ok(())
@@ -656,8 +750,8 @@ impl ManagerInner {
         registry: &StrictCapabilityRegistry,
     ) -> bool {
         registry.activation_completed
-            && self.overlay.local_strict_replication_protocol_version()
-                >= crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION
+            && self.strict_participant_capability.protocol_version()
+                >= protocol::STRICT_PROTOCOL_VERSION
     }
 
     fn refresh_strict_capability_activation_locked(
@@ -667,8 +761,8 @@ impl ManagerInner {
         match self.strict_capability_readiness(registry) {
             StrictCapabilityReadiness::AwaitingRegistration => {
                 if registry.activation_pending {
-                    self.overlay
-                        .update_strict_replication_repository_registration_ready(false);
+                    self.strict_participant_capability
+                        .update_repository_registration_ready(false);
                 }
                 false
             }
@@ -679,14 +773,14 @@ impl ManagerInner {
                 // rearm it.
                 registry.activation_pending = false;
                 registry.activation_completed = false;
-                self.overlay
-                    .report_strict_replication_repository_capability_loss();
+                self.strict_participant_capability
+                    .report_repository_capability_loss();
                 false
             }
             StrictCapabilityReadiness::Ready if registry.activation_pending => {
                 let accepted = self
-                    .overlay
-                    .update_strict_replication_repository_registration_ready(true);
+                    .strict_participant_capability
+                    .update_repository_registration_ready(true);
                 registry.activation_pending = false;
                 registry.activation_completed = accepted;
                 self.strict_capability_activation_ready_locked(registry)

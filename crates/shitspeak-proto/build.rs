@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         proto_dir.join("MumbleUDP.proto"),
         proto_dir.join("S2STransport.proto"),
         proto_dir.join("S2SOverlay.proto"),
+        proto_dir.join("S2SUpperLayer.proto"),
         proto_dir.join("S2SReplication.proto"),
         proto_dir.join("S2SApplication.proto"),
     ];
@@ -20,6 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ".MumbleProto.UserStats.certificates",
         ".s2s_transport.Frame.payload",
         ".s2s_overlay.OverlayData.payload",
+        ".s2s_upper_layer.UpperLayerCapabilityEntry.payload",
         ".s2s_application.PluginDataEnvelope.data",
         ".s2s_application.VoiceFrame.payload",
         ".s2s_application.UserStatsReply.payload",

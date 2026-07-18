@@ -17,7 +17,9 @@ use serde::Deserialize;
 use serde::de::Error as _;
 use shitspeak_runtime_config::{ObservabilityConfig, S2sConfig};
 use shitspeak_s2s::overlay::{ApplicationServices, OverlayNetwork, ReplicationServices};
-use shitspeak_s2s::replications::{ReplicationConfig, ReplicationManager};
+use shitspeak_s2s::replications::{
+    ReplicationConfig, ReplicationManager, encode_replication_upper_layer_capabilities,
+};
 use shitspeak_s2s::status;
 use shitspeak_s2s_transport::{ConnectionManager, TransportConfig};
 use shitspeak_state::BanRepository;
@@ -211,15 +213,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
-    let overlay = OverlayNetwork::start_with_max_users_replication_and_application_services(
-        transport.clone(),
-        inbound,
-        overlay_config,
-        Arc::new(AtomicU64::new(0)),
-        replication_config.services,
-        ApplicationServices::NONE,
-    )
-    .await?;
+    let initial_replication_capabilities = encode_replication_upper_layer_capabilities(
+        replication_config.services.strict(),
+        replication_config.services.content(),
+        replication_config.services.owner(),
+        0,
+    );
+    let overlay =
+        OverlayNetwork::start_with_max_users_replication_application_and_upper_layer_capabilities(
+            transport.clone(),
+            inbound,
+            overlay_config,
+            Arc::new(AtomicU64::new(0)),
+            replication_config.services,
+            ApplicationServices::NONE,
+            Some(initial_replication_capabilities),
+        )
+        .await?;
     let replication_manager = match repositories {
         Some(repositories) => Some(start_forwarder_replications(
             overlay.clone(),

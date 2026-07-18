@@ -651,30 +651,19 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
         .unwrap();
     assert!(
         wait_until(Duration::from_secs(8), || {
-            new_overlay.minimum_strict_replication_protocol_version()
-                >= STRICT_REPLICATION_PROTOCOL_VERSION
+            new_manager.strict_protocol_version() >= STRICT_REPLICATION_PROTOCOL_VERSION
                 && [2u16, 3].into_iter().all(|node| {
                     cluster
-                        .cluster
-                        .node(node)
-                        .overlay
-                        .minimum_strict_replication_protocol_version()
+                        .manager(usize::from(node - 1))
+                        .strict_protocol_version()
                         >= STRICT_REPLICATION_PROTOCOL_VERSION
                 })
         })
         .await,
         "restarted strict protocol capability did not converge after repository registration: restarted={}, node2={}, node3={}",
-        new_overlay.minimum_strict_replication_protocol_version(),
-        cluster
-            .cluster
-            .node(2)
-            .overlay
-            .minimum_strict_replication_protocol_version(),
-        cluster
-            .cluster
-            .node(3)
-            .overlay
-            .minimum_strict_replication_protocol_version()
+        new_manager.strict_protocol_version(),
+        cluster.manager(1).strict_protocol_version(),
+        cluster.manager(2).strict_protocol_version()
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1246,10 +1235,11 @@ fn strict_protocol_floors(cluster: &ReplCluster) -> Vec<(u16, u32)> {
         .cluster
         .nodes
         .iter()
-        .map(|node| {
+        .zip(&cluster.managers)
+        .map(|(node, manager)| {
             (
                 node.overlay.local_node_id(),
-                node.overlay.minimum_strict_replication_protocol_version(),
+                manager.strict_protocol_version(),
             )
         })
         .collect()

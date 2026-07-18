@@ -19,6 +19,7 @@ use super::proto::{
     self as repl_proto, BlobBody, BlobChunk, BlobChunkReq, BlobFind, BlobOffer,
     REPLICATION_SERVICE_TAG,
 };
+use super::protocol::advertised_replication_capabilities;
 use super::topic::ErasedBlobRuntime;
 use crate::overlay::{MembershipEvent, OverlayNetwork, OverlaySendOptions};
 use shitspeak_core::NodeIdentifier;
@@ -166,7 +167,23 @@ impl BlobNet for OverlayBlobNet {
     }
 
     fn alive_members(&self) -> Vec<NodeIdentifier> {
-        self.overlay.content_replication_members()
+        self.overlay
+            .members()
+            .into_iter()
+            .filter(|member| member.status().is_reachable())
+            .filter(|member| {
+                let legacy = member.replication_services();
+                advertised_replication_capabilities(
+                    member.upper_layer_capabilities(),
+                    legacy.strict(),
+                    legacy.content(),
+                    legacy.owner(),
+                    member.strict_replication_protocol_version(),
+                )
+                .content_enabled()
+            })
+            .map(|member| member.node_id())
+            .collect()
     }
 
     fn local_node_id(&self) -> NodeIdentifier {

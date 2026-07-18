@@ -73,13 +73,16 @@ message LinkStateAdvert {
   // Stable distribution profile IDs supported by this node's generic tree
   // transport. Empty means no distribution profile is active here.
   repeated uint32 distribution_profile_ids = 15;
-  // Cumulative strict-replication protocol version. Zero, including an
-  // absent field from an older peer, means terminal resolution is unsupported.
+  // Deprecated rolling-upgrade compatibility for strict replication. New
+  // upper-layer capabilities belong in upper_layer_capabilities.
   uint32 strict_replication_protocol_version = 16;
-  // Cumulative protocol version this node can forward opaquely through the
-  // overlay. This is independent of local replication repositories and lets
-  // transport-only nodes relay newer replication frames safely.
+  // Deprecated rolling-upgrade compatibility for opaque strict-replication
+  // transit support. New upper-layer capabilities belong below.
   uint32 strict_replication_transit_protocol_version = 17;
+  // Opaque, upper-layer-owned capability payload. The overlay stores, floods,
+  // and fingerprints these bytes without interpreting their schema. Presence
+  // distinguishes an authoritative empty set from a legacy advertisement.
+  optional bytes upper_layer_capabilities = 18;
 }
 
 // One advertised edge from `origin` to `neighbor`.

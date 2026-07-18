@@ -29,10 +29,39 @@ pub mod s2s_overlay_proto {
     }
 }
 
+pub mod s2s_upper_layer_proto {
+    include!(concat!(env!("OUT_DIR"), "/s2s_upper_layer.rs"));
+}
+
 pub mod s2s_replication_proto {
     include!(concat!(env!("OUT_DIR"), "/s2s_replication.rs"));
 }
 
 pub mod s2s_application_proto {
     include!(concat!(env!("OUT_DIR"), "/s2s_application.rs"));
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use crate::s2s_overlay_proto::LinkStateAdvert;
+
+    #[test]
+    fn upper_layer_capabilities_preserve_absent_and_explicitly_empty_states() {
+        // A legacy peer can carry tag 16 without knowing about the opaque
+        // capability envelope at tag 18.
+        let legacy = LinkStateAdvert::decode([0x80, 0x01, 0x02].as_slice()).unwrap();
+        assert_eq!(legacy.strict_replication_protocol_version, 2);
+        assert_eq!(legacy.upper_layer_capabilities, None);
+
+        // An upgraded peer can authoritatively advertise no upper-layer
+        // capabilities. This must not be confused with a legacy omission.
+        let explicit_empty = LinkStateAdvert::decode([0x92, 0x01, 0x00].as_slice()).unwrap();
+        assert_eq!(explicit_empty.upper_layer_capabilities, Some(Vec::new()));
+
+        let mut reencoded = Vec::new();
+        explicit_empty.encode(&mut reencoded).unwrap();
+        assert_eq!(reencoded, [0x92, 0x01, 0x00]);
+    }
 }

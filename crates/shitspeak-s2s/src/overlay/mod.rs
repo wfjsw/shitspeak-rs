@@ -382,6 +382,39 @@ impl OverlayNetwork {
         replication_services: ReplicationServices,
         application_services: ApplicationServices,
     ) -> Result<Self, OverlayError> {
+        Self::start_with_max_users_replication_application_and_upper_layer_capabilities(
+            transport,
+            inbound,
+            cfg,
+            max_users,
+            replication_services,
+            application_services,
+            None,
+        )
+        .await
+    }
+
+    /// Bring up the overlay with an initial opaque upper-layer capability
+    /// payload installed before any LSA task starts. `None` preserves legacy
+    /// absence; `Some(Vec::new())` is an authoritative empty payload.
+    pub async fn start_with_max_users_replication_application_and_upper_layer_capabilities(
+        transport: ConnectionManager,
+        inbound: Inbound,
+        cfg: OverlayConfig,
+        max_users: Arc<AtomicU64>,
+        replication_services: ReplicationServices,
+        application_services: ApplicationServices,
+        upper_layer_capabilities: Option<Vec<u8>>,
+    ) -> Result<Self, OverlayError> {
+        if upper_layer_capabilities
+            .as_ref()
+            .is_some_and(|payload| payload.len() > lsdb::store::MAX_UPPER_LAYER_CAPABILITIES_BYTES)
+        {
+            return Err(OverlayError::Config(format!(
+                "upper-layer capability payload exceeds {} bytes",
+                lsdb::store::MAX_UPPER_LAYER_CAPABILITIES_BYTES
+            )));
+        }
         let inner = runtime::start_inner(
             transport,
             inbound,
@@ -389,6 +422,7 @@ impl OverlayNetwork {
             max_users,
             replication_services,
             application_services,
+            upper_layer_capabilities,
         )
         .await?;
         let network = Self { inner };
@@ -433,25 +467,32 @@ impl OverlayNetwork {
             .verify_origin_payload(claimed_node, proof, payload)
     }
 
-    /// Locally advertised strict-replication protocol version. Unlike the
-    /// cluster floor, this reflects this node's synchronous durable-state and
-    /// coordinated-repository registration gates.
-    pub(crate) fn local_strict_replication_protocol_version(&self) -> u32 {
-        self.inner.emitter.strict_replication_protocol_version()
+    /// Rolling-upgrade bridge for seeding the replication-owned opaque
+    /// capability record from the deprecated LSA service bits.
+    pub(crate) fn legacy_local_replication_services(&self) -> ReplicationServices {
+        self.inner.emitter.replication_services()
     }
 
-    /// Whether this node is configured as a strict-replication participant.
-    /// A disabled participant can still advertise opaque transit support.
-    pub(crate) fn local_strict_replication_enabled(&self) -> bool {
-        self.inner.emitter.replication_services().strict()
+    /// Atomically transform the opaque upper-layer capability payload. The
+    /// overlay serializes the update but leaves decoding and merge policy to
+    /// the caller.
+    pub(crate) fn modify_upper_layer_capabilities<E>(
+        &self,
+        update: impl FnOnce(Option<&[u8]>) -> Result<Option<Vec<u8>>, E>,
+    ) -> Result<bool, E> {
+        self.inner.emitter.modify_upper_layer_capabilities(update)
     }
 
-    /// Locally advertised opaque strict-frame transit capability. This is
-    /// independent of local strict-replication participation/readiness.
-    pub(crate) fn local_strict_replication_transit_protocol_version(&self) -> u32 {
+    /// Update deprecated strict-replication wire fields during a rolling
+    /// upgrade. Capability policy remains entirely with the caller.
+    pub(crate) fn update_legacy_strict_replication_protocol_versions(
+        &self,
+        participant: u32,
+        transit: u32,
+    ) -> bool {
         self.inner
             .emitter
-            .strict_replication_transit_protocol_version()
+            .update_legacy_strict_replication_protocol_versions(participant, transit)
     }
 
     /// Conservative budget for a complete strict routed-unicast replication
@@ -482,45 +523,16 @@ impl OverlayNetwork {
         self.inner.cfg.persistence_dir().cloned()
     }
 
-    /// Begin a manager-owned coordinated strict repository registration pass.
-    ///
-    /// Only `ReplicationManager` uses this lifecycle hook. It deliberately
-    /// does not accept repository versions from callers: the manager probes
-    /// its registered runtimes directly before it can promote the local LSA.
-    pub(crate) fn begin_strict_replication_repository_registration(&self) {
-        self.inner
-            .emitter
-            .begin_strict_replication_repository_registration();
+    /// Whether the overlay-owned local boot epoch is durably persisted.
+    /// Upper layers may consume this fact without placing their capability
+    /// policy in the overlay.
+    pub(crate) fn local_boot_epoch_durable(&self) -> bool {
+        self.inner.local_boot_epoch_durable()
     }
 
-    /// Apply manager-derived readiness for the currently coordinated strict
-    /// repository registration pass. A capability loss revokes the pass's
-    /// rearm permit, so `true` is accepted only after an explicit new setup.
-    pub(crate) fn update_strict_replication_repository_registration_ready(
-        &self,
-        ready: bool,
-    ) -> bool {
-        self.inner
-            .emitter
-            .update_strict_replication_repository_registration_ready(ready)
-    }
-
-    /// Immediately clamp the local LSA when an already registered strict
-    /// repository loses its current protocol capability. Only a coordinated
-    /// re-registration can clear this latch.
-    pub(crate) fn report_strict_replication_repository_capability_loss(&self) {
-        self.inner
-            .emitter
-            .report_strict_replication_repository_capability_loss();
-    }
-
-    /// Stop advertising the current strict-replication protocol in the local
-    /// LSA.
-    ///
-    /// The strict runtime calls this when it cannot restore its durable
-    /// terminal journal.
-    pub(crate) fn disable_strict_replication_protocol(&self) {
-        self.inner.emitter.disable_strict_replication_protocol();
+    /// Suggested cadence for upper-layer persistence health probes.
+    pub(crate) fn persistence_health_probe_interval(&self) -> Duration {
+        self.inner.cfg.peer_persistence_interval()
     }
 
     #[cfg(feature = "pre-release-workload")]
@@ -598,82 +610,11 @@ impl OverlayNetwork {
             .collect()
     }
 
-    /// Compatibility view of the participant protocol floor across active,
-    /// non-quarantined strict-replication members. Legacy participants and an
-    /// empty view both yield zero.
-    ///
-    /// Deprecated: protocol negotiation belongs to the replication layer.
-    /// New callers should derive participant and transit floors from a
-    /// replication protocol snapshot rather than asking the overlay to make
-    /// a replication policy decision.
-    #[deprecated(note = "derive replication protocol floors in the replication layer")]
-    pub fn minimum_strict_replication_protocol_version(&self) -> u32 {
-        self.members()
-            .into_iter()
-            .filter(|member| member.status().is_reachable())
-            .filter(|member| member.replication_services().strict())
-            .map(|member| member.strict_replication_protocol_version())
-            .chain(
-                self.inner
-                    .emitter
-                    .replication_services()
-                    .strict()
-                    .then_some(self.inner.emitter.strict_replication_protocol_version()),
-            )
-            .min()
-            .unwrap_or_default()
-    }
-
-    /// Number of active, non-quarantined strict participants below the
-    /// requested cumulative protocol version.
-    ///
-    /// Deprecated: unsupported-peer diagnostics are replication policy and
-    /// should be calculated by the replication layer from a frozen snapshot.
-    #[deprecated(note = "calculate unsupported replication peers in the replication layer")]
-    pub fn unsupported_strict_replication_protocol_peers(&self, required_version: u32) -> usize {
-        self.members()
-            .into_iter()
-            .filter(|member| member.status().is_reachable())
-            .filter(|member| member.replication_services().strict())
-            .filter(|member| member.strict_replication_protocol_version() < required_version)
-            .count()
-    }
-
     /// IDs of active members that advertise application voice service.
     pub(crate) fn voice_members(&self) -> Vec<NodeIdentifier> {
         self.inner
             .table
             .voice_members()
-            .into_iter()
-            .filter(|node| !self.is_node_quarantined(*node))
-            .collect()
-    }
-
-    /// IDs of active members that advertise strict replication service.
-    pub fn strict_replication_members(&self) -> Vec<NodeIdentifier> {
-        self.inner
-            .table
-            .strict_replication_members()
-            .into_iter()
-            .filter(|node| !self.is_node_quarantined(*node))
-            .collect()
-    }
-
-    /// IDs of active members that advertise content/blob replication service.
-    pub fn content_replication_members(&self) -> Vec<NodeIdentifier> {
-        self.inner
-            .table
-            .content_replication_members()
-            .into_iter()
-            .filter(|node| !self.is_node_quarantined(*node))
-            .collect()
-    }
-
-    /// IDs of active members that advertise owner-scoped replication service.
-    pub fn owner_replication_members(&self) -> Vec<NodeIdentifier> {
-        self.inner
-            .table
-            .owner_replication_members()
             .into_iter()
             .filter(|node| !self.is_node_quarantined(*node))
             .collect()

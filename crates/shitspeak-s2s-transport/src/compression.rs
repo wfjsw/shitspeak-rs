@@ -1188,6 +1188,7 @@ mod tests {
                     distribution_profile_ids: Vec::new(),
                     strict_replication_protocol_version: 0,
                     strict_replication_transit_protocol_version: 0,
+                    upper_layer_capabilities: None,
                 })
                 .collect(),
         };

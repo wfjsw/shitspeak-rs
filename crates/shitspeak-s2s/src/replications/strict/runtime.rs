@@ -21,6 +21,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
 
+use super::super::capability::StrictParticipantCapability;
 use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
 use super::super::metrics::{self, CatchupMode, ReplicationPipelineKind, ReplicationPipelineStage};
@@ -33,7 +34,9 @@ use super::super::proto::{
     StrictResolutionAck, StrictResolutionHint, StrictResolutionObserved, StrictResolutionPrepare,
     StrictTerminalOutcome, StrictTerminalState,
 };
-use super::super::protocol::{self as replication_protocol, ProtocolMember};
+use super::super::protocol::{
+    self as replication_protocol, ProtocolMember, ReplicationProtocolCapabilities,
+};
 use super::super::topic::ErasedStrictRuntime;
 use super::terminal_journal::{
     FrozenTarget, TerminalDecision as JournalTerminalDecision, TerminalJournal,
@@ -57,8 +60,7 @@ const CLOCK_TICK_BURST_COOLDOWN_MULTIPLIER: u32 = 4;
 pub(super) const STRICT_REPLICATION_SLOW_STAGE: Duration = Duration::from_secs(1);
 const STRICT_DELIVERY_BLOCKED_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STRICT_PROTOCOL_VERSION_V1: u32 = 1;
-pub(super) const STRICT_PROTOCOL_VERSION_V2: u32 =
-    crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION;
+pub(super) const STRICT_PROTOCOL_VERSION_V2: u32 = super::super::protocol::STRICT_PROTOCOL_VERSION;
 const NORMAL_ACCEPT_BALLOT: u64 = 0;
 const OP_ID_BOOT_EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// Compute p95 of a slice of edge RTTs, clamped to
@@ -310,36 +312,68 @@ pub(crate) trait StrictNet: Send + Sync + 'static {
 
 /// Production `StrictNet` impl that wraps `OverlayNetwork`.
 pub(crate) struct OverlayStrictNet {
-    pub overlay: OverlayNetwork,
+    overlay: OverlayNetwork,
+    participant_capability: Arc<StrictParticipantCapability>,
 }
 
 impl OverlayStrictNet {
+    pub(crate) fn new(
+        overlay: OverlayNetwork,
+        participant_capability: Arc<StrictParticipantCapability>,
+    ) -> Self {
+        Self {
+            overlay,
+            participant_capability,
+        }
+    }
+
+    fn member_replication_capabilities(
+        member: &crate::overlay::MemberSnapshot,
+    ) -> ReplicationProtocolCapabilities {
+        let legacy = member.replication_services();
+        replication_protocol::advertised_replication_capabilities(
+            member.upper_layer_capabilities(),
+            legacy.strict(),
+            legacy.content(),
+            legacy.owner(),
+            member.strict_replication_protocol_version(),
+        )
+    }
+
+    fn local_replication_capabilities(&self) -> ReplicationProtocolCapabilities {
+        let services = self.overlay.legacy_local_replication_services();
+        ReplicationProtocolCapabilities::new(
+            services.strict(),
+            services.content(),
+            services.owner(),
+            self.participant_capability.protocol_version(),
+        )
+    }
+
     fn protocol_members(&self) -> Vec<ProtocolMember> {
         self.overlay
             .members()
             .into_iter()
             .map(|member| {
+                let capabilities = Self::member_replication_capabilities(&member);
                 ProtocolMember::new(
                     member.node_id(),
                     member.boot_epoch(),
                     member.status().is_reachable(),
-                    member.replication_services().strict(),
-                    member.strict_replication_protocol_version(),
-                    !member.transit_disabled(),
-                    member.strict_replication_transit_protocol_version(),
+                    capabilities.strict_enabled(),
+                    capabilities.strict_participant_protocol_version(),
                 )
             })
             .collect()
     }
 
     fn protocol_snapshot(&self) -> StrictProtocolSnapshot {
+        let local = self.local_replication_capabilities();
         replication_protocol::strict_protocol_snapshot(
             self.protocol_members(),
-            self.overlay
-                .local_strict_replication_enabled()
-                .then(|| self.overlay.local_strict_replication_protocol_version()),
-            self.overlay
-                .local_strict_replication_transit_protocol_version(),
+            local
+                .strict_enabled()
+                .then(|| local.strict_participant_protocol_version()),
         )
     }
 
@@ -392,7 +426,7 @@ impl OverlayStrictNet {
         let origin_auth = match self.strict_origin_auth(topic, &body, false) {
             Ok(origin_auth) => origin_auth,
             Err(error) => {
-                self.overlay.disable_strict_replication_protocol();
+                self.participant_capability.disable_permanently();
                 return Err(error);
             }
         };
@@ -780,25 +814,25 @@ impl StrictNet for OverlayStrictNet {
     }
 
     fn strict_replication_protocol_version(&self) -> u32 {
-        replication_protocol::strict_protocol_floors(
-            self.protocol_members(),
-            self.overlay
-                .local_strict_replication_enabled()
-                .then(|| self.overlay.local_strict_replication_protocol_version()),
-            self.overlay
-                .local_strict_replication_transit_protocol_version(),
+        let local = self.local_replication_capabilities();
+        replication_protocol::strict_protocol_floor(
+            &self.protocol_members(),
+            local
+                .strict_enabled()
+                .then(|| local.strict_participant_protocol_version()),
         )
-        .2
     }
 
     fn local_strict_replication_protocol_version(&self) -> u32 {
-        self.overlay.local_strict_replication_protocol_version()
+        self.participant_capability.protocol_version()
     }
 
     fn peer_strict_replication_protocol_version(&self, peer: NodeIdentifier) -> u32 {
         self.overlay
             .member(peer)
-            .map(|member| member.strict_replication_protocol_version())
+            .map(|member| {
+                Self::member_replication_capabilities(&member).strict_participant_protocol_version()
+            })
             .unwrap_or_default()
     }
 
@@ -808,7 +842,6 @@ impl StrictNet for OverlayStrictNet {
 
     fn unsupported_active_protocol_peers(&self, required_version: u32) -> usize {
         replication_protocol::unsupported_protocol_peers(self.protocol_members(), required_version)
-            .total()
     }
 
     fn strict_protocol_state_dir(&self) -> Option<PathBuf> {
@@ -843,12 +876,12 @@ impl StrictNet for OverlayStrictNet {
     }
 
     fn disable_strict_replication_protocol(&self) {
-        self.overlay.disable_strict_replication_protocol();
+        self.participant_capability.disable_permanently();
     }
 
     fn report_strict_replication_repository_capability_loss(&self) {
-        self.overlay
-            .report_strict_replication_repository_capability_loss();
+        self.participant_capability
+            .report_repository_capability_loss();
     }
 
     fn member_boot_epoch(&self, node: NodeIdentifier) -> Option<u64> {

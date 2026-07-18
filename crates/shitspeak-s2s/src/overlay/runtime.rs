@@ -17,7 +17,7 @@ use std::fs::{self, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -43,10 +43,6 @@ use super::routing::{RoutingHandle, new_handle as new_routing_handle, spawn_reco
 static LAST_PROCESS_BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 static LOCAL_BOOT_EPOCH_PROCESS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 static NEXT_LOCAL_BOOT_EPOCH_TEMP_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_STRICT_REPLICATION_DURABILITY_PROBE_ID: AtomicU64 = AtomicU64::new(1);
-
-const STRICT_REPLICATION_JOURNAL_DIRECTORY: &str = "strict-terminal-journal";
-const STRICT_REPLICATION_DURABILITY_PROBE_PAYLOAD: &[u8] = b"strict-replication-durability-v2\n";
 
 #[cfg(windows)]
 const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
@@ -86,61 +82,6 @@ struct BootEpochDurability {
 struct CapturedBootEpoch {
     value: u64,
     durability: BootEpochDurability,
-}
-
-/// Probe the durable state required by a local strict-replication participant.
-///
-/// This deliberately does not describe transit support: a transport-only
-/// forwarder can relay opaque strict frames without opening a local journal.
-fn strict_replication_participant_journal_ready(
-    persistence_dir: Option<&Path>,
-    self_id: NodeIdentifier,
-) -> io::Result<bool> {
-    let Some(persistence_dir) = persistence_dir.filter(|dir| !dir.as_os_str().is_empty()) else {
-        return Ok(false);
-    };
-    probe_strict_replication_durable_state(persistence_dir, self_id)?;
-    Ok(true)
-}
-
-fn probe_strict_replication_durable_state(
-    persistence_dir: &Path,
-    self_id: NodeIdentifier,
-) -> io::Result<()> {
-    let journal_dir = persistence_dir.join(STRICT_REPLICATION_JOURNAL_DIRECTORY);
-    create_directory_with_durable_entries(&journal_dir)?;
-
-    let probe_id = NEXT_STRICT_REPLICATION_DURABILITY_PROBE_ID.fetch_add(1, Ordering::Relaxed);
-    let probe_path = journal_dir.join(format!(
-        ".strict-replication-durability-{self_id}-{}-{probe_id}",
-        std::process::id()
-    ));
-    let temporary_path = probe_path.with_extension("tmp");
-    let result = (|| {
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary_path)?;
-            file.write_all(STRICT_REPLICATION_DURABILITY_PROBE_PAYLOAD)?;
-            file.sync_all()?;
-        }
-        replace_file_atomically(&temporary_path, &probe_path)?;
-        if fs::read(&probe_path)? != STRICT_REPLICATION_DURABILITY_PROBE_PAYLOAD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "strict replication durability probe readback mismatch",
-            ));
-        }
-        sync_parent_directory(&journal_dir)?;
-        fs::remove_file(&probe_path)?;
-        sync_parent_directory(&journal_dir)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-        let _ = fs::remove_file(&probe_path);
-    }
-    result
 }
 
 #[cfg(not(windows))]
@@ -204,44 +145,19 @@ fn sync_parent_directory(_directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Create a directory tree and persist each new directory entry before it is
-/// used as durable protocol state.
-fn create_directory_with_durable_entries(path: &Path) -> io::Result<()> {
-    let mut missing_directories = Vec::new();
-    let mut ancestor = path;
-    while !ancestor.exists() {
-        missing_directories.push(ancestor.to_path_buf());
-        ancestor = ancestor.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "directory path has no existing ancestor",
-            )
-        })?;
-    }
-
-    fs::create_dir_all(path)?;
-    for directory in missing_directories.into_iter().rev() {
-        let parent = directory
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        sync_parent_directory(parent)?;
-    }
-    Ok(())
-}
-
-/// Track local participant durability and update only the participant
-/// capability advertised by `LsaEmitter`. Transit capability is initialized
-/// independently by the emitter and is never changed by this task.
-fn spawn_strict_replication_participant_durability_monitor(
+/// Track durability of the overlay-owned local boot epoch.
+///
+/// Upper layers may require this property, but the overlay does not interpret
+/// their capability policy. It only maintains the fact alongside the epoch it
+/// owns and exposes it through [`OverlayNetwork`].
+fn spawn_local_boot_epoch_durability_monitor(
     persistence_dir: Option<PathBuf>,
     self_id: NodeIdentifier,
     boot_epoch: u64,
     boot_epoch_durability: BootEpochDurability,
-    emitter: Arc<LsaEmitter>,
+    boot_epoch_durable: Arc<AtomicBool>,
     interval: Duration,
     shutdown: CancellationToken,
-    initial_journal_ready: bool,
 ) {
     let Some(persistence_dir) = persistence_dir.filter(|dir| !dir.as_os_str().is_empty()) else {
         return;
@@ -249,39 +165,13 @@ fn spawn_strict_replication_participant_durability_monitor(
     let boot_epoch_path = local_boot_epoch_path(&persistence_dir, self_id);
     let interval = interval.max(Duration::from_secs(1));
     tokio::spawn(async move {
-        let mut journal_ready = initial_journal_ready;
         let mut boot_epoch_durability = boot_epoch_durability;
-        let mut ready = journal_ready && boot_epoch_durability.readiness.is_ready();
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await;
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {
-                    let next_journal_ready = match probe_strict_replication_durable_state(
-                        &persistence_dir,
-                        self_id,
-                    ) {
-                        Ok(()) => true,
-                        Err(error) => {
-                            if journal_ready {
-                                warn!(
-                                    ?persistence_dir,
-                                    %error,
-                                    "strict replication terminal journal storage became unavailable"
-                                );
-                            }
-                            false
-                        }
-                    };
-                    if !journal_ready && next_journal_ready {
-                        info!(
-                            ?persistence_dir,
-                            "strict replication terminal journal storage is ready"
-                        );
-                    }
-                    journal_ready = next_journal_ready;
-
                     if boot_epoch_durability.readiness != ExactBootEpochReadiness::Blocked {
                         let next_boot_epoch_readiness = ensure_exact_local_boot_epoch(
                             &boot_epoch_path,
@@ -314,19 +204,10 @@ fn spawn_strict_replication_participant_durability_monitor(
                         }
                         boot_epoch_durability.readiness = next_boot_epoch_readiness;
                     }
-
-                    let next_ready = journal_ready && boot_epoch_durability.readiness.is_ready();
-                    if next_ready != ready {
-                        if next_ready {
-                            info!(
-                                ?persistence_dir,
-                                active_boot_epoch = boot_epoch,
-                                "strict replication durable storage is ready for v2"
-                            );
-                        }
-                        emitter.update_strict_replication_durable_state_ready(next_ready);
-                        ready = next_ready;
-                    }
+                    boot_epoch_durable.store(
+                        boot_epoch_durability.readiness.is_ready(),
+                        Ordering::Release,
+                    );
                 }
             }
         }
@@ -622,11 +503,8 @@ pub(crate) struct OverlayInner {
     pub hello: Arc<HelloContext>,
     pub shutdown: CancellationToken,
     pub cfg: OverlayConfig,
-    /// Whether this overlay owns local strict-replication state. Transport-
-    /// only forwarders leave this disabled while still advertising transit.
-    strict_replication_participation_enabled: bool,
-    strict_replication_boot_epoch_durability: BootEpochDurability,
-    strict_replication_journal_ready_at_start: bool,
+    boot_epoch_durability: BootEpochDurability,
+    boot_epoch_durable: Arc<AtomicBool>,
 }
 
 impl OverlayInner {
@@ -636,34 +514,15 @@ impl OverlayInner {
         max_users: Arc<AtomicU64>,
         replication_services: ReplicationServices,
         application_services: ApplicationServices,
+        upper_layer_capabilities: Option<Vec<u8>>,
         self_addresses: Vec<PeerAddress>,
     ) -> Self {
         let self_id = transport.local_node_id();
-        let strict_replication_participation_enabled = replication_services.strict();
         let captured_boot_epoch = capture_monotonic_boot_epoch(self_id, cfg.persistence_dir());
         let boot_epoch = captured_boot_epoch.value;
-        let strict_replication_journal_ready_at_start = if strict_replication_participation_enabled
-        {
-            match strict_replication_participant_journal_ready(
-                cfg.persistence_dir().map(|dir| dir.as_path()),
-                self_id,
-            ) {
-                Ok(ready) => ready,
-                Err(error) => {
-                    warn!(
-                        persistence_dir = ?cfg.persistence_dir(),
-                        %error,
-                        "strict replication durable storage is not ready; advertising v0"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        let strict_replication_durable_state_ready_at_start =
-            captured_boot_epoch.durability.readiness.is_ready()
-                && strict_replication_journal_ready_at_start;
+        let boot_epoch_durable = Arc::new(AtomicBool::new(
+            captured_boot_epoch.durability.readiness.is_ready(),
+        ));
 
         let floor = Arc::new(LsaFloor::new(self_id, cfg.persistence_dir().cloned()));
         floor.load();
@@ -697,9 +556,9 @@ impl OverlayInner {
             max_users,
             cfg.route_transit_messages(),
             replication_services,
-            strict_replication_durable_state_ready_at_start,
             application_services,
         ));
+        emitter.update_upper_layer_capabilities(upper_layer_capabilities);
         #[cfg(feature = "pre-release-workload")]
         let distribution_profiles = vec![
             super::distribution::VOICE_REALTIME_PROFILE_ID,
@@ -742,10 +601,13 @@ impl OverlayInner {
             hello,
             shutdown,
             cfg,
-            strict_replication_participation_enabled,
-            strict_replication_boot_epoch_durability: captured_boot_epoch.durability,
-            strict_replication_journal_ready_at_start,
+            boot_epoch_durability: captured_boot_epoch.durability,
+            boot_epoch_durable,
         }
+    }
+
+    pub(super) fn local_boot_epoch_durable(&self) -> bool {
+        self.boot_epoch_durable.load(Ordering::Acquire)
     }
 
     /// Spawn every long-running task: Hello ticker, link-up watcher,
@@ -794,18 +656,15 @@ impl OverlayInner {
 
         spawn_hello_task(self.hello.clone());
         spawn_link_up_watcher(self.hello.clone(), self.neighbor.subscribe_link_up());
-        if self.strict_replication_participation_enabled {
-            spawn_strict_replication_participant_durability_monitor(
-                self.cfg.persistence_dir().cloned(),
-                self.self_id,
-                self.boot_epoch,
-                self.strict_replication_boot_epoch_durability,
-                self.emitter.clone(),
-                self.cfg.peer_persistence_interval(),
-                self.shutdown.clone(),
-                self.strict_replication_journal_ready_at_start,
-            );
-        }
+        spawn_local_boot_epoch_durability_monitor(
+            self.cfg.persistence_dir().cloned(),
+            self.self_id,
+            self.boot_epoch,
+            self.boot_epoch_durability,
+            self.boot_epoch_durable.clone(),
+            self.cfg.peer_persistence_interval(),
+            self.shutdown.clone(),
+        );
         self.flood_pacer
             .clone()
             .spawn(self.cfg.clone(), self.shutdown.clone());
@@ -940,6 +799,7 @@ pub(crate) async fn start_inner(
     max_users: Arc<AtomicU64>,
     replication_services: ReplicationServices,
     application_services: ApplicationServices,
+    upper_layer_capabilities: Option<Vec<u8>>,
 ) -> Result<Arc<OverlayInner>, OverlayError> {
     let self_addresses = transport.listen_addresses_with_public_ip_probe().await;
     let inner = Arc::new(OverlayInner::new(
@@ -948,6 +808,7 @@ pub(crate) async fn start_inner(
         max_users,
         replication_services,
         application_services,
+        upper_layer_capabilities,
         self_addresses,
     ));
 
@@ -1086,22 +947,5 @@ mod tests {
         );
         assert!(!captured.durability.allow_missing_repair);
         assert_eq!(std::fs::read(&path).unwrap(), corrupt);
-    }
-
-    #[test]
-    fn strict_replication_participant_v2_requires_active_durable_storage() {
-        assert!(!strict_replication_participant_journal_ready(None, 7).unwrap());
-        assert!(!strict_replication_participant_journal_ready(Some(Path::new("")), 7).unwrap());
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path().join("persistence");
-        assert!(strict_replication_participant_journal_ready(Some(&root), 7).unwrap());
-        let journal_dir = root.join(STRICT_REPLICATION_JOURNAL_DIRECTORY);
-        assert!(journal_dir.is_dir());
-        assert!(std::fs::read_dir(&journal_dir).unwrap().next().is_none());
-
-        let regular_file = dir.path().join("not-a-directory");
-        std::fs::write(&regular_file, b"not a directory").unwrap();
-        assert!(strict_replication_participant_journal_ready(Some(&regular_file), 7).is_err());
     }
 }
