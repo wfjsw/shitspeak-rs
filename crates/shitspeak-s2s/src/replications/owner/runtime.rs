@@ -5,7 +5,7 @@
 //! `OwnerOp.origin_epoch` and from `MembershipEvent::Restarted`. The
 //! runtime never mints epochs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
+use prost::Message as _;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
@@ -48,6 +50,21 @@ pub(crate) trait OwnerNet: Send + Sync + 'static {
         self.send_unicast(dst, topic, body).await
     }
     async fn send_broadcast(&self, topic: &str, body: OwnerBody) -> Result<(), ReplicationError>;
+    /// Exact encoded replication payload length before the overlay envelope
+    /// is added. Keeping this on the network abstraction makes catchup
+    /// admission use the same representation as transmission.
+    fn encoded_owner_payload_len(
+        &self,
+        topic: &str,
+        body: &OwnerBody,
+    ) -> Result<usize, ReplicationError> {
+        Ok(repl_proto::wrap_owner(topic, body.clone()).encoded_len())
+    }
+    /// Maximum payload budget for one replication message after accounting
+    /// for the local transport frame and overlay envelope.
+    fn max_replication_payload_bytes(&self) -> usize {
+        usize::MAX
+    }
     fn alive_members(&self) -> Vec<NodeIdentifier>;
     fn local_node_id(&self) -> NodeIdentifier;
     /// Look up an origin's `boot_epoch` via the overlay's LSDB. Used after
@@ -201,6 +218,10 @@ impl OwnerNet for OverlayOwnerNet {
     fn member_boot_epoch(&self, node: NodeIdentifier) -> Option<u64> {
         self.overlay.member(node).map(|m| m.boot_epoch())
     }
+
+    fn max_replication_payload_bytes(&self) -> usize {
+        self.overlay.max_replication_payload_bytes()
+    }
 }
 
 fn replication_bulk_backpressure(error: &crate::overlay::OverlayError) -> bool {
@@ -216,6 +237,15 @@ pub(crate) struct OwnerBufferedOp {
     pub op_msgpack: Bytes,
 }
 
+#[derive(Clone, Copy)]
+struct OwnerCatchupAttempt {
+    generation: u64,
+    epoch: u64,
+    since_version: u64,
+    chunk_token: u64,
+    dst: NodeIdentifier,
+}
+
 pub(crate) struct OwnerState {
     /// `known[origin] = (epoch, last_applied_version)` for every origin
     /// we've ever seen.
@@ -227,14 +257,29 @@ pub(crate) struct OwnerState {
     /// historical name, this remains set after a response so periodic
     /// anti-entropy cannot retry faster than `CATCHUP_TIMEOUT`.
     pub catchup_in_flight: HashMap<NodeIdentifier, Instant>,
+    /// Origins whose transient repository state was removed while offline.
+    /// Their `known` entry remains as a non-regression floor until an atomic
+    /// snapshot at the same or a newer epoch is installed.
+    inactive_origins: HashSet<NodeIdentifier>,
+    catchup_attempts: HashMap<NodeIdentifier, OwnerCatchupAttempt>,
+    empty_confirmations: HashMap<NodeIdentifier, (u64, u8)>,
+    next_catchup_generation: u64,
 }
 
 impl OwnerState {
     pub fn new() -> Self {
+        Self::with_known(HashMap::new())
+    }
+
+    pub fn with_known(known: HashMap<NodeIdentifier, (u64, u64)>) -> Self {
         Self {
-            known: HashMap::new(),
+            known,
             pending_buffers: HashMap::new(),
             catchup_in_flight: HashMap::new(),
+            inactive_origins: HashSet::new(),
+            catchup_attempts: HashMap::new(),
+            empty_confirmations: HashMap::new(),
+            next_catchup_generation: 0,
         }
     }
 
@@ -284,6 +329,15 @@ impl OwnerState {
                 self.known.insert(origin, (epoch, version));
             }
         }
+        if let Some(buffer) = self.pending_buffers.get_mut(&origin) {
+            buffer.retain(|pending_version, _| *pending_version > version);
+            if buffer.is_empty() {
+                self.pending_buffers.remove(&origin);
+            }
+        }
+        if version > 0 {
+            self.empty_confirmations.remove(&origin);
+        }
     }
 
     /// Insert a buffered out-of-order op. Returns `true` if the buffer was
@@ -315,10 +369,75 @@ impl OwnerState {
         out
     }
 
+    /// Discard snapshot-covered buffered entries while retaining a valid
+    /// same-epoch suffix that can be drained after installation.
+    pub fn discard_pending_through(&mut self, origin: NodeIdentifier, version: u64) {
+        let Some(buffer) = self.pending_buffers.get_mut(&origin) else {
+            return;
+        };
+        buffer.retain(|pending_version, _| *pending_version > version);
+        if buffer.is_empty() {
+            self.pending_buffers.remove(&origin);
+        }
+    }
+
+    pub fn take_next_buffered(&mut self, origin: NodeIdentifier, version: u64) -> Option<Bytes> {
+        let buffer = self.pending_buffers.get_mut(&origin)?;
+        let bytes = buffer
+            .remove(&(version + 1))
+            .map(|buffered| buffered.op_msgpack);
+        if buffer.is_empty() {
+            self.pending_buffers.remove(&origin);
+        }
+        bytes
+    }
+
     /// Wipe pending state for `origin` (used on epoch reset).
     pub fn wipe_origin(&mut self, origin: NodeIdentifier) {
         self.pending_buffers.remove(&origin);
         self.catchup_in_flight.remove(&origin);
+        self.catchup_attempts.remove(&origin);
+        self.empty_confirmations.remove(&origin);
+    }
+
+    fn record_empty_confirmation(&mut self, origin: NodeIdentifier, epoch: u64) -> u8 {
+        let entry = self.empty_confirmations.entry(origin).or_insert((epoch, 0));
+        if entry.0 != epoch {
+            *entry = (epoch, 0);
+        }
+        entry.1 = entry.1.saturating_add(1).min(2);
+        entry.1
+    }
+
+    fn empty_is_confirmed(&self, origin: NodeIdentifier, epoch: u64) -> bool {
+        self.empty_confirmations
+            .get(&origin)
+            .is_some_and(|(confirmed_epoch, confirmations)| {
+                *confirmed_epoch == epoch && *confirmations >= 2
+            })
+    }
+
+    fn record_catchup_attempt(
+        &mut self,
+        origin: NodeIdentifier,
+        epoch: u64,
+        since_version: u64,
+        chunk_token: u64,
+        dst: NodeIdentifier,
+    ) -> u64 {
+        self.next_catchup_generation = self.next_catchup_generation.wrapping_add(1).max(1);
+        let generation = self.next_catchup_generation;
+        self.catchup_attempts.insert(
+            origin,
+            OwnerCatchupAttempt {
+                generation,
+                epoch,
+                since_version,
+                chunk_token,
+                dst,
+            },
+        );
+        generation
     }
 
     /// Should we issue a catchup for `origin`? Suppresses duplicates within
@@ -372,6 +491,7 @@ pub(crate) struct OwnerRuntime<R: OwnerReplicable> {
     pub weak_self: Mutex<Option<Weak<Self>>>,
     pub shutdown: CancellationToken,
     pub cfg: Arc<ReplicationConfig>,
+    origin_locks: Mutex<HashMap<NodeIdentifier, Arc<AsyncMutex<()>>>>,
 }
 
 impl<R: OwnerReplicable> OwnerRuntime<R> {
@@ -387,17 +507,22 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         // Seed local_counter from the repo's existing local_version (so a
         // restart with state already loaded continues monotonically).
         let initial = repo.local_version();
+        let mut known = repo.known_versions();
+        // The local incarnation is authoritative even when an intentionally
+        // empty, in-memory repository has no local shard to report yet.
+        known.insert(self_id, (self_epoch, initial));
         let arc = Arc::new(Self {
             repo,
             self_id,
             self_epoch,
             topic,
             net,
-            state: Mutex::new(OwnerState::new()),
+            state: Mutex::new(OwnerState::with_known(known)),
             local_counter: AtomicU64::new(initial),
             weak_self: Mutex::new(None),
             shutdown,
             cfg,
+            origin_locks: Mutex::new(HashMap::new()),
         });
         *arc.weak_self.lock() = Some(Arc::downgrade(&arc));
         arc
@@ -423,31 +548,302 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         });
     }
 
-    async fn bootstrap_catchup_alive_members(&self) {
-        let deadline =
-            Instant::now() + self.cfg.owner_catchup_timeout().max(Duration::from_secs(1));
-        let retry_delay = owner_bootstrap_retry_delay(self.cfg.owner_catchup_timeout());
-        loop {
-            if self.catchup_alive_members().await || Instant::now() >= deadline {
-                return;
-            }
-            sleep(retry_delay).await;
+    pub(super) async fn lock_origin(&self, origin: NodeIdentifier) -> OwnedMutexGuard<()> {
+        let lock = self
+            .origin_locks
+            .lock()
+            .entry(origin)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone();
+        lock.lock_owned().await
+    }
+
+    pub(super) fn authoritative_epoch(&self, origin: NodeIdentifier) -> Option<u64> {
+        if origin == self.self_id {
+            Some(self.self_epoch)
+        } else {
+            self.net.member_boot_epoch(origin)
         }
     }
 
-    async fn catchup_alive_members(&self) -> bool {
+    pub(super) fn epoch_is_current(&self, origin: NodeIdentifier, epoch: u64) -> bool {
+        origin == self.self_id
+            || (self.net.alive_members().contains(&origin)
+                && self.authoritative_epoch(origin) == Some(epoch))
+    }
+
+    pub(super) fn origin_is_inactive(&self, origin: NodeIdentifier) -> bool {
+        self.state.lock().inactive_origins.contains(&origin)
+    }
+
+    pub(super) fn mark_origin_active(&self, origin: NodeIdentifier) {
+        self.state.lock().inactive_origins.remove(&origin);
+    }
+
+    /// Repair repository state when membership changes while a serialized
+    /// reset/remove/snapshot operation is awaiting repository work.
+    pub(super) async fn restore_current_epoch_after_race_locked(&self, origin: NodeIdentifier) {
+        loop {
+            if self.net.alive_members().contains(&origin) {
+                let Some(current_epoch) = self.authoritative_epoch(origin) else {
+                    self.repo.remove_origin(origin).await;
+                    if self.authoritative_epoch(origin).is_some() {
+                        continue;
+                    }
+                    let mut state = self.state.lock();
+                    state.pending_buffers.remove(&origin);
+                    state.catchup_in_flight.remove(&origin);
+                    state.catchup_attempts.remove(&origin);
+                    state.empty_confirmations.remove(&origin);
+                    state.inactive_origins.insert(origin);
+                    return;
+                };
+                let previous = self.state.lock().known.get(&origin).copied();
+                self.repo.reset_origin(origin, current_epoch).await;
+                if !self.epoch_is_current(origin, current_epoch) {
+                    continue;
+                }
+                {
+                    let mut state = self.state.lock();
+                    state.wipe_origin(origin);
+                    if previous.is_some_and(|(known_epoch, _)| known_epoch == current_epoch) {
+                        // Same-incarnation rejoin: retain the monotonic floor,
+                        // but require an atomic cold snapshot to rematerialize.
+                        state.inactive_origins.insert(origin);
+                    } else {
+                        state.known.insert(origin, (current_epoch, 0));
+                        state.inactive_origins.remove(&origin);
+                    }
+                }
+                self.rearm_catchup_retry(origin, current_epoch);
+                return;
+            }
+
+            self.repo.remove_origin(origin).await;
+            if self.net.alive_members().contains(&origin) {
+                continue;
+            }
+            let mut state = self.state.lock();
+            state.pending_buffers.remove(&origin);
+            state.catchup_in_flight.remove(&origin);
+            state.catchup_attempts.remove(&origin);
+            state.empty_confirmations.remove(&origin);
+            state.inactive_origins.insert(origin);
+            return;
+        }
+    }
+
+    pub(super) fn complete_catchup_attempt(&self, origin: NodeIdentifier) -> Option<u64> {
+        self.state
+            .lock()
+            .catchup_attempts
+            .remove(&origin)
+            .map(|attempt| attempt.chunk_token)
+    }
+
+    pub(super) fn record_empty_origin_confirmation(
+        &self,
+        origin: NodeIdentifier,
+        epoch: u64,
+    ) -> u8 {
+        self.state.lock().record_empty_confirmation(origin, epoch)
+    }
+
+    pub(super) fn clear_empty_origin_confirmation(&self, origin: NodeIdentifier) {
+        self.state.lock().empty_confirmations.remove(&origin);
+    }
+
+    fn track_catchup_attempt(
+        &self,
+        origin: NodeIdentifier,
+        epoch: u64,
+        since_version: u64,
+        chunk_token: u64,
+        dst: NodeIdentifier,
+    ) {
+        let generation = {
+            let mut state = self.state.lock();
+            state.catchup_in_flight.insert(origin, Instant::now());
+            state.record_catchup_attempt(origin, epoch, since_version, chunk_token, dst)
+        };
+        let timeout = self.cfg.owner_catchup_timeout();
+        let weak = self.weak_self.lock().clone();
+        if let Some(weak) = weak {
+            tokio::spawn(async move {
+                let Some(runtime) = weak.upgrade() else {
+                    return;
+                };
+                tokio::select! {
+                    _ = runtime.shutdown.cancelled() => return,
+                    _ = sleep(timeout) => {}
+                }
+                runtime.retry_timed_out_catchup(origin, generation).await;
+            });
+        }
+    }
+
+    async fn retry_timed_out_catchup(&self, origin: NodeIdentifier, generation: u64) {
+        let attempt = {
+            let mut state = self.state.lock();
+            let Some(attempt) = state.catchup_attempts.get(&origin).copied() else {
+                return;
+            };
+            if attempt.generation != generation {
+                return;
+            }
+            state.catchup_attempts.remove(&origin);
+            attempt
+        };
+        if !self.epoch_is_current(origin, attempt.epoch) {
+            return;
+        }
+
+        let alive = self.net.alive_members();
+        let mut relays: Vec<_> = alive
+            .iter()
+            .copied()
+            .filter(|node| *node != self.self_id && *node != origin && *node != attempt.dst)
+            .collect();
+        {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::rng();
+            relays.shuffle(&mut rng);
+        }
+        let mut destinations = Vec::new();
+        if attempt.dst == origin {
+            destinations.extend(relays);
+            if alive.contains(&origin) {
+                destinations.push(origin);
+            }
+        } else {
+            if alive.contains(&origin) {
+                destinations.push(origin);
+            }
+            destinations.extend(relays);
+        }
+        for dst in destinations {
+            if self
+                .send_catchup_req_to(
+                    dst,
+                    origin,
+                    attempt.epoch,
+                    attempt.since_version,
+                    attempt.chunk_token,
+                )
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.rearm_catchup_retry(origin, attempt.epoch);
+    }
+
+    async fn bootstrap_catchup_alive_members(&self) {
+        let retry_delay = owner_bootstrap_retry_delay(self.cfg.owner_catchup_timeout());
+        let stabilization_window = owner_stabilization_window(self.cfg.owner_catchup_timeout());
+        let mut stable_since: Option<(Vec<(NodeIdentifier, u64)>, Instant)> = None;
+        loop {
+            let signature = self.alive_origin_epoch_signature();
+            if signature
+                .as_ref()
+                .is_some_and(|signature| signature.is_empty())
+            {
+                return;
+            }
+            if self.alive_origins_known_at_current_epochs() {
+                if let Some(signature) = signature.clone() {
+                    match &mut stable_since {
+                        Some((stable_signature, since)) if *stable_signature == signature => {
+                            if since.elapsed() >= stabilization_window {
+                                return;
+                            }
+                        }
+                        slot => *slot = Some((signature, Instant::now())),
+                    }
+                }
+            } else {
+                stable_since = None;
+            }
+            self.catchup_alive_members().await;
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return,
+                _ = sleep(retry_delay) => {}
+            }
+        }
+    }
+
+    fn alive_origin_epoch_signature(&self) -> Option<Vec<(NodeIdentifier, u64)>> {
+        let mut signature = Vec::new();
+        for origin in self
+            .net
+            .alive_members()
+            .into_iter()
+            .filter(|origin| *origin != self.self_id)
+        {
+            signature.push((origin, self.authoritative_epoch(origin)?));
+        }
+        signature.sort_unstable();
+        Some(signature)
+    }
+
+    pub(super) fn schedule_origin_stabilization(&self, origin: NodeIdentifier, epoch: u64) {
+        let retry_delay = owner_bootstrap_retry_delay(self.cfg.owner_catchup_timeout());
+        let deadline =
+            Instant::now() + owner_stabilization_window(self.cfg.owner_catchup_timeout());
+        let weak = self.weak_self.lock().clone();
+        if let Some(weak) = weak {
+            tokio::spawn(async move {
+                let Some(runtime) = weak.upgrade() else {
+                    return;
+                };
+                loop {
+                    tokio::select! {
+                        _ = runtime.shutdown.cancelled() => return,
+                        _ = sleep(retry_delay) => {}
+                    }
+                    if Instant::now() >= deadline || !runtime.epoch_is_current(origin, epoch) {
+                        return;
+                    }
+                    let since = runtime.origin_is_inactive(origin).then_some(0);
+                    runtime.request_catchup(origin, epoch, since).await;
+                }
+            });
+        }
+    }
+
+    fn alive_origins_known_at_current_epochs(&self) -> bool {
         let members = self.net.alive_members();
-        let mut saw_remote = false;
-        let mut requests_ready = true;
+        let state = self.state.lock();
+        members
+            .into_iter()
+            .filter(|origin| *origin != self.self_id)
+            .all(|origin| {
+                let Some(current_epoch) = self.authoritative_epoch(origin) else {
+                    return false;
+                };
+                state
+                    .known
+                    .get(&origin)
+                    .is_some_and(|(known_epoch, known_version)| {
+                        *known_epoch == current_epoch
+                            && (*known_version > 0
+                                || state.empty_is_confirmed(origin, current_epoch))
+                    })
+                    && !state.inactive_origins.contains(&origin)
+            })
+    }
+
+    async fn catchup_alive_members(&self) {
+        let members = self.net.alive_members();
         for origin in members {
             if origin == self.self_id {
                 continue;
             }
-            saw_remote = true;
             let known_epoch = self.known_epoch_for_origin(origin);
-            requests_ready &= self.request_catchup(origin, known_epoch, None).await;
+            let since = self.origin_is_inactive(origin).then_some(0);
+            self.request_catchup(origin, known_epoch, since).await;
         }
-        saw_remote && requests_ready
     }
 
     fn known_epoch_for_origin(&self, origin: NodeIdentifier) -> u64 {
@@ -494,21 +890,92 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         state.known.remove(&origin);
         state.pending_buffers.remove(&origin);
         state.catchup_in_flight.remove(&origin);
+        state.catchup_attempts.remove(&origin);
+        state.empty_confirmations.remove(&origin);
     }
 
-    async fn handle_origin_offline(&self, origin: NodeIdentifier) {
+    async fn handle_origin_offline(&self, origin: NodeIdentifier, event_epoch: u64) {
+        let _guard = self.lock_origin(origin).await;
+        if self.net.alive_members().contains(&origin)
+            || self
+                .authoritative_epoch(origin)
+                .is_some_and(|current_epoch| current_epoch != event_epoch)
+            || self
+                .state
+                .lock()
+                .known
+                .get(&origin)
+                .is_some_and(|(known_epoch, _)| *known_epoch > event_epoch)
+        {
+            return;
+        }
+        {
+            let mut state = self.state.lock();
+            state.pending_buffers.remove(&origin);
+            state.catchup_in_flight.remove(&origin);
+            state.catchup_attempts.remove(&origin);
+            state.empty_confirmations.remove(&origin);
+            state.inactive_origins.insert(origin);
+        }
         self.repo.remove_origin(origin).await;
+        if self.net.alive_members().contains(&origin) {
+            self.restore_current_epoch_after_race_locked(origin).await;
+        }
     }
 
-    async fn handle_origin_restarted(&self, origin: NodeIdentifier) {
-        let new_epoch = self.known_epoch_for_origin(origin);
-        self.repo.reset_origin(origin, new_epoch).await;
-        self.request_catchup(origin, new_epoch, Some(0)).await;
+    async fn handle_origin_restarted(&self, origin: NodeIdentifier, new_epoch: u64) {
+        let _guard = self.lock_origin(origin).await;
+        if !self.epoch_is_current(origin, new_epoch) {
+            return;
+        }
+        let known = self.state.lock().known.get(&origin).copied();
+        if known.is_some_and(|(known_epoch, _)| known_epoch > new_epoch) {
+            return;
+        }
+        let since = if let Some((known_epoch, known_version)) = known {
+            if known_epoch == new_epoch {
+                if self.origin_is_inactive(origin) {
+                    0
+                } else {
+                    known_version
+                }
+            } else {
+                self.clear_origin_tracking(origin);
+                self.repo.reset_origin(origin, new_epoch).await;
+                if !self.epoch_is_current(origin, new_epoch) {
+                    self.restore_current_epoch_after_race_locked(origin).await;
+                    return;
+                }
+                let mut state = self.state.lock();
+                state.known.insert(origin, (new_epoch, 0));
+                state.inactive_origins.remove(&origin);
+                0
+            }
+        } else {
+            self.clear_origin_tracking(origin);
+            self.repo.reset_origin(origin, new_epoch).await;
+            if !self.epoch_is_current(origin, new_epoch) {
+                self.restore_current_epoch_after_race_locked(origin).await;
+                return;
+            }
+            let mut state = self.state.lock();
+            state.known.insert(origin, (new_epoch, 0));
+            state.inactive_origins.remove(&origin);
+            0
+        };
+        if !self.epoch_is_current(origin, new_epoch) {
+            return;
+        }
+        self.request_catchup(origin, new_epoch, Some(since)).await;
+        self.schedule_origin_stabilization(origin, new_epoch);
     }
 
     async fn handle_origin_joined(&self, origin: NodeIdentifier) {
+        let _guard = self.lock_origin(origin).await;
         let known_epoch = self.known_epoch_for_origin(origin);
-        self.request_catchup(origin, known_epoch, None).await;
+        let since = self.origin_is_inactive(origin).then_some(0);
+        self.request_catchup(origin, known_epoch, since).await;
+        self.schedule_origin_stabilization(origin, known_epoch);
     }
 
     /// Local-side propose. Broadcasts first, then applies locally — see
@@ -589,10 +1056,47 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             }
             return;
         }
+        if from != origin {
+            warn!(from=%from, origin=%origin, "owner op sender does not match origin; dropping");
+            return;
+        }
         self.process_remote_op(origin, op).await;
     }
 
     pub(super) async fn process_remote_op(&self, origin: NodeIdentifier, op: OwnerOp) {
+        let _guard = self.lock_origin(origin).await;
+        self.process_remote_op_locked(origin, op).await;
+    }
+
+    pub(super) async fn process_remote_op_locked(&self, origin: NodeIdentifier, op: OwnerOp) {
+        if !self.epoch_is_current(origin, op.origin_epoch) {
+            trace!(
+                origin=%origin,
+                op_epoch=op.origin_epoch,
+                current_epoch=?self.authoritative_epoch(origin),
+                "owner op is not fenced by the current LSDB epoch; dropping"
+            );
+            return;
+        }
+        if self.origin_is_inactive(origin) {
+            if op.origin_version == 0 {
+                return;
+            }
+            let should_request = {
+                let mut state = self.state.lock();
+                let was_empty =
+                    state.buffer_op(origin, op.origin_version, Bytes::from(op.op_msgpack));
+                if was_empty {
+                    state.arm_gap_catchup(origin, Instant::now());
+                }
+                was_empty
+            };
+            if should_request {
+                self.send_catchup_req_since(origin, op.origin_epoch, Some(0))
+                    .await;
+            }
+            return;
+        }
         // Classify and act.
         let classification = {
             let s = self.state.lock();
@@ -605,6 +1109,10 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             }
             Classification::Reset { new_epoch } => {
                 self.repo.reset_origin(origin, new_epoch).await;
+                if !self.epoch_is_current(origin, new_epoch) {
+                    self.restore_current_epoch_after_race_locked(origin).await;
+                    return;
+                }
                 {
                     let mut s = self.state.lock();
                     s.wipe_origin(origin);
@@ -693,6 +1201,10 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             ReplicationPipelineStage::RepoApply,
             apply_started_at.elapsed(),
         );
+        if !self.epoch_is_current(origin, epoch) {
+            self.restore_current_epoch_after_race_locked(origin).await;
+            return;
+        }
         let drained = {
             let mut s = self.state.lock();
             s.record_applied(origin, epoch, version);
@@ -726,11 +1238,73 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                 ReplicationPipelineStage::RepoApply,
                 apply_started_at.elapsed(),
             );
+            if !self.epoch_is_current(origin, epoch) {
+                self.restore_current_epoch_after_race_locked(origin).await;
+                return;
+            }
             let mut s = self.state.lock();
             s.record_applied(origin, epoch, v);
             prev_v = v;
         }
         let _ = prev_v;
+    }
+
+    pub(super) async fn drain_pending_after_snapshot_locked(
+        &self,
+        origin: NodeIdentifier,
+        epoch: u64,
+    ) {
+        loop {
+            let (version, bytes) = {
+                let mut state = self.state.lock();
+                let Some((known_epoch, known_version)) = state.known.get(&origin).copied() else {
+                    return;
+                };
+                if known_epoch != epoch {
+                    return;
+                }
+                let Some(bytes) = state.take_next_buffered(origin, known_version) else {
+                    return;
+                };
+                (known_version + 1, bytes)
+            };
+            self.apply_op(
+                origin,
+                OwnerOp {
+                    origin_node: origin as u32,
+                    origin_epoch: epoch,
+                    origin_version: version,
+                    op_msgpack: bytes,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// Keep the catchup throttle armed and arrange a bounded retry instead of
+    /// waiting for the much slower periodic anti-entropy interval.
+    pub(super) fn rearm_catchup_retry(&self, origin: NodeIdentifier, epoch: u64) {
+        self.state
+            .lock()
+            .catchup_in_flight
+            .insert(origin, Instant::now());
+        let timeout = self.cfg.owner_catchup_timeout();
+        let weak = self.weak_self.lock().clone();
+        if let Some(weak) = weak {
+            tokio::spawn(async move {
+                let Some(runtime) = weak.upgrade() else {
+                    return;
+                };
+                tokio::select! {
+                    _ = runtime.shutdown.cancelled() => return,
+                    _ = sleep(timeout) => {}
+                }
+                if runtime.epoch_is_current(origin, epoch) {
+                    let since = runtime.origin_is_inactive(origin).then_some(0);
+                    runtime.request_catchup(origin, epoch, since).await;
+                }
+            });
+        }
     }
 
     async fn send_catchup_req(&self, origin: NodeIdentifier, known_epoch: u64) -> bool {
@@ -749,34 +1323,39 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             s.known.get(&origin).map(|(_, v)| *v).unwrap_or(0)
         });
 
-        // Prefer a non-origin alive peer; fall back to origin.
+        // A cold catchup must consult the owner first. Only the owner can
+        // authoritatively establish a new incarnation at version zero.
+        // Incremental repairs may use fully-materialized relay state first.
         let mut candidates: Vec<NodeIdentifier> = alive
             .iter()
             .filter(|n| **n != self.self_id && **n != origin)
             .copied()
             .collect();
-        let pick = if !candidates.is_empty() {
+        {
             use rand::seq::SliceRandom;
             let mut rng = rand::rng();
             candidates.shuffle(&mut rng);
-            candidates[0]
-        } else if alive.contains(&origin) {
-            origin
-        } else {
-            // No one to ask.
-            return false;
-        };
-        let first = self
-            .send_catchup_req_to(pick, origin, known_epoch, since, 0)
-            .await;
-        if first.is_ok() {
-            return true;
         }
-        if pick != origin && alive.contains(&origin) {
-            return self
-                .send_catchup_req_to(origin, origin, known_epoch, since, 0)
+
+        let origin_alive = alive.contains(&origin);
+        let mut destinations = Vec::with_capacity(candidates.len() + usize::from(origin_alive));
+        if since == 0 && origin_alive {
+            destinations.push(origin);
+            destinations.extend(candidates);
+        } else {
+            destinations.extend(candidates);
+            if origin_alive {
+                destinations.push(origin);
+            }
+        }
+        for dst in destinations {
+            if self
+                .send_catchup_req_to(dst, origin, known_epoch, since, 0)
                 .await
-                .is_ok();
+                .is_ok()
+            {
+                return true;
+            }
         }
         false
     }
@@ -799,7 +1378,65 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         metrics::record_catchup_request(CatchupMode::Owner);
         self.net
             .send_unicast(dst, &self.topic, OwnerBody::CatchupReq(req))
+            .await?;
+        self.track_catchup_attempt(origin, known_epoch, since_version, chunk_token, dst);
+        Ok(())
+    }
+
+    /// Send a multi-response continuation without losing its cursor when the
+    /// preferred destination rejects the send immediately. A successful send
+    /// installs the normal generation watchdog; if every live destination
+    /// fails, re-arm the bounded retry path instead of waiting for periodic
+    /// anti-entropy.
+    pub(super) async fn send_catchup_continuation_with_fallback(
+        &self,
+        preferred_dst: NodeIdentifier,
+        origin: NodeIdentifier,
+        known_epoch: u64,
+        since_version: u64,
+        chunk_token: u64,
+    ) {
+        if self
+            .send_catchup_req_to(
+                preferred_dst,
+                origin,
+                known_epoch,
+                since_version,
+                chunk_token,
+            )
             .await
+            .is_ok()
+        {
+            return;
+        }
+
+        let alive = self.net.alive_members();
+        let mut relays: Vec<_> = alive
+            .iter()
+            .copied()
+            .filter(|node| *node != self.self_id && *node != origin && *node != preferred_dst)
+            .collect();
+        {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::rng();
+            relays.shuffle(&mut rng);
+        }
+        let mut alternatives = Vec::with_capacity(relays.len() + 1);
+        if preferred_dst != origin && alive.contains(&origin) {
+            alternatives.push(origin);
+        }
+        alternatives.extend(relays);
+
+        for dst in alternatives {
+            if self
+                .send_catchup_req_to(dst, origin, known_epoch, since_version, chunk_token)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.rearm_catchup_retry(origin, known_epoch);
     }
 
     pub async fn recv_catchup_req(&self, from: NodeIdentifier, req: OwnerCatchupReq) {
@@ -820,25 +1457,23 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
     pub fn on_membership_event(&self, ev: &MembershipEvent) {
         match ev {
             MembershipEvent::Restarted(node) => {
-                self.clear_origin_tracking(node.node_id());
                 let weak = self.weak_self.lock().clone();
-                let node = node.node_id();
+                let (node, epoch) = (node.node_id(), node.incarnation());
                 if let Some(weak) = weak {
                     tokio::spawn(async move {
                         if let Some(runtime) = weak.upgrade() {
-                            runtime.handle_origin_restarted(node).await;
+                            runtime.handle_origin_restarted(node, epoch).await;
                         }
                     });
                 }
             }
             MembershipEvent::Failed(node) | MembershipEvent::Left(node) => {
-                self.clear_origin_tracking(node.node_id());
                 let weak = self.weak_self.lock().clone();
-                let node = node.node_id();
+                let (node, epoch) = (node.node_id(), node.incarnation());
                 if let Some(weak) = weak {
                     tokio::spawn(async move {
                         if let Some(runtime) = weak.upgrade() {
-                            runtime.handle_origin_offline(node).await;
+                            runtime.handle_origin_offline(node, epoch).await;
                         }
                     });
                 }
@@ -884,6 +1519,13 @@ fn owner_bootstrap_retry_delay(catchup_timeout: Duration) -> Duration {
         .clamp(Duration::from_millis(50), Duration::from_millis(500))
 }
 
+fn owner_stabilization_window(catchup_timeout: Duration) -> Duration {
+    catchup_timeout
+        .checked_mul(4)
+        .unwrap_or(Duration::from_secs(20))
+        .min(Duration::from_secs(20))
+}
+
 #[inline]
 fn node_from_u32(v: u32) -> Option<NodeIdentifier> {
     if v <= u16::MAX as u32 {
@@ -898,6 +1540,9 @@ fn node_from_u32(v: u32) -> Option<NodeIdentifier> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replications::proto::OwnerCatchupResp;
+    use crate::replications::test_support::{CountingOwnerRepo, MockNet};
+    use std::sync::atomic::AtomicBool;
 
     fn op(origin: u16, epoch: u64, ver: u64) -> OwnerOp {
         OwnerOp {
@@ -1017,5 +1662,153 @@ mod tests {
         s.wipe_origin(7);
         assert!(s.pending_buffers.get(&7).is_none());
         assert!(s.catchup_in_flight.get(&7).is_none());
+    }
+
+    #[tokio::test]
+    async fn origin_lock_serializes_same_origin_without_blocking_another() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            1,
+            100,
+            "clients".into(),
+            net as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let first = runtime.lock_origin(2).await;
+        let acquired = Arc::new(AtomicBool::new(false));
+        let task_runtime = runtime.clone();
+        let task_acquired = acquired.clone();
+        let waiter = tokio::spawn(async move {
+            let _guard = task_runtime.lock_origin(2).await;
+            task_acquired.store(true, Ordering::Relaxed);
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!acquired.load(Ordering::Relaxed));
+        let other_origin = tokio::time::timeout(Duration::from_millis(50), runtime.lock_origin(3))
+            .await
+            .expect("different origins must not share a serializer");
+        drop(other_origin);
+        drop(first);
+        waiter.await.unwrap();
+        assert!(acquired.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn empty_origin_requires_bounded_second_confirmation() {
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(2, 200);
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            1,
+            100,
+            "clients".into(),
+            net as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(
+                ReplicationConfig::default().with_owner_catchup_timeout(Duration::from_millis(30)),
+            ),
+        );
+        let response = OwnerCatchupResp {
+            origin_node: 2,
+            origin_epoch: 200,
+            snapshot_version: 0,
+            snapshot_msgpack: Bytes::new(),
+            ops: Vec::new(),
+            has_more: false,
+            next_chunk_token: 0,
+            too_old_use_snapshot: false,
+        };
+
+        runtime.recv_catchup_resp(2, response.clone()).await;
+        assert_eq!(runtime.state.lock().known.get(&2), Some(&(200, 0)));
+        assert!(!runtime.alive_origins_known_at_current_epochs());
+
+        runtime.recv_catchup_resp(2, response).await;
+        assert!(runtime.alive_origins_known_at_current_epochs());
+    }
+
+    #[tokio::test]
+    async fn serialized_empty_snapshot_requires_bounded_second_confirmation() {
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(2, 200);
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            1,
+            100,
+            "clients".into(),
+            net as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(
+                ReplicationConfig::default().with_owner_catchup_timeout(Duration::from_millis(30)),
+            ),
+        );
+        let response = OwnerCatchupResp {
+            origin_node: 2,
+            origin_epoch: 200,
+            snapshot_version: 0,
+            snapshot_msgpack: Bytes::from(rmp_serde::to_vec(&Vec::<(u64, u64)>::new()).unwrap()),
+            ops: Vec::new(),
+            has_more: false,
+            next_chunk_token: 0,
+            too_old_use_snapshot: true,
+        };
+
+        runtime.recv_catchup_resp(2, response.clone()).await;
+        assert_eq!(runtime.state.lock().known.get(&2), Some(&(200, 0)));
+        assert!(!runtime.alive_origins_known_at_current_epochs());
+
+        runtime.recv_catchup_resp(2, response).await;
+        assert!(runtime.alive_origins_known_at_current_epochs());
+    }
+
+    #[tokio::test]
+    async fn operation_between_empty_confirmations_converges_immediately() {
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(2, 200);
+        let repo = CountingOwnerRepo::new();
+        let runtime = OwnerRuntime::new(
+            repo.clone(),
+            1,
+            100,
+            "clients".into(),
+            net as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(
+                ReplicationConfig::default().with_owner_catchup_timeout(Duration::from_millis(30)),
+            ),
+        );
+        runtime
+            .recv_catchup_resp(
+                2,
+                OwnerCatchupResp {
+                    origin_node: 2,
+                    origin_epoch: 200,
+                    snapshot_version: 0,
+                    snapshot_msgpack: Bytes::new(),
+                    ops: Vec::new(),
+                    has_more: false,
+                    next_chunk_token: 0,
+                    too_old_use_snapshot: false,
+                },
+            )
+            .await;
+
+        runtime
+            .recv_op(
+                2,
+                OwnerOp {
+                    origin_node: 2,
+                    origin_epoch: 200,
+                    origin_version: 1,
+                    op_msgpack: Bytes::from(rmp_serde::to_vec(&42u64).unwrap()),
+                },
+            )
+            .await;
+
+        assert_eq!(repo.applied_for(2), vec![(1, 42)]);
+        assert!(runtime.alive_origins_known_at_current_epochs());
     }
 }

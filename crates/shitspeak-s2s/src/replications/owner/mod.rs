@@ -7,6 +7,8 @@ pub mod catchup;
 pub mod runtime;
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,6 +24,43 @@ pub enum LogSlice<Op> {
     Available(Vec<(u64, Op)>),
     TooOld,
 }
+
+/// Result of asking a repository to atomically install an owner snapshot.
+///
+/// A deferred snapshot has not changed repository state. The runtime will
+/// retain its current version, ignore the response tail, and retry catchup
+/// after the configured throttle window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerSnapshotInstallOutcome {
+    Installed,
+    Deferred,
+}
+
+/// Repository-reported failure to validate or install an owner snapshot.
+#[derive(Debug)]
+pub struct OwnerSnapshotInstallError {
+    message: String,
+}
+
+impl OwnerSnapshotInstallError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for OwnerSnapshotInstallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for OwnerSnapshotInstallError {}
 
 /// Repository-side contract for the owner-scoped replication mode.
 ///
@@ -72,7 +111,7 @@ pub trait OwnerReplicable: Send + Sync + 'static {
         epoch: u64,
         version: u64,
         snapshot: Bytes,
-    );
+    ) -> Result<OwnerSnapshotInstallOutcome, OwnerSnapshotInstallError>;
 
     /// Called whenever the runtime detects a strictly-greater epoch for
     /// `origin` -- either via a fresh `OwnerOp` carrying the new epoch or

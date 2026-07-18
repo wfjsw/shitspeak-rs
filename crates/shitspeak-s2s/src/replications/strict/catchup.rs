@@ -1839,21 +1839,28 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                 );
                 return;
             }
-            let mut should_wake = false;
             {
                 let mut state = rt.state.lock();
                 if state.ordinary_commit_is_fenced(op_id) {
                     metrics::record_strict_fence_rejection();
                     continue;
                 }
+                // Catchup can replay a commit whose final timestamp is far
+                // ahead of a restarted replica's in-memory Tempo clock. Keep
+                // the local clock and its peer-clock slot in sync before the
+                // committed-id dedup check so a duplicate response can still
+                // repair stale clock state.
+                state.clock = state.clock.max(metadata.metadata.ts_final);
+                let clock = state.clock;
+                state.peer_clocks.insert(rt.self_id, clock);
                 if state.mark_committed(op_id, metadata.metadata.ts_final) {
                     state.buffer_commit(op_id, metadata.metadata.ts_final, op_msgpack);
-                    should_wake = true;
                 }
             }
-            if should_wake {
-                rt.deliver_signal.notify_one();
-            }
+            // The clock-tick loop supplies the next tick needed to move the
+            // delivery watermark past ts_final. Wake both loops even when
+            // the catchup commit was already known.
+            rt.wake_delivery_and_clock_tick();
         } else if can_bootstrap {
             let repo_apply_started_at = std::time::Instant::now();
             rt.repo.apply_committed(cop.version, op).await;
@@ -1949,7 +1956,7 @@ fn strict_metadata(op: &CatchupOp) -> Result<Option<CatchupStrictMetadata>, ()> 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use bytes::Bytes;
     use tokio_util::sync::CancellationToken;
@@ -2062,6 +2069,32 @@ mod tests {
         state.1 = (1..=version)
             .map(|entry| (entry, salt + entry, None))
             .collect();
+    }
+
+    fn proofless_catchup_response(
+        op_id: (u64, u64),
+        ts_final: u64,
+        value: u64,
+    ) -> StrictCatchupResp {
+        StrictCatchupResp {
+            ops: vec![CatchupOp {
+                version: 1,
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&value).unwrap()),
+                strict_op_id_hi: op_id.0,
+                strict_op_id_lo: op_id.1,
+                strict_ts_final: ts_final,
+                strict_terminal_ballot: 0,
+                strict_terminal_resolver_node: 0,
+                strict_terminal_resolver_boot_epoch: 0,
+                strict_terminal_frozen_targets: Vec::new(),
+            }],
+            next_chunk_token: 1,
+            history_version: 1,
+            runtime_started_at: 1,
+            history_node: 1,
+            next_terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
+            ..Default::default()
+        }
     }
 
     #[tokio::test]
@@ -2764,6 +2797,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proofless_catchup_raises_far_behind_clock_and_delivers_after_tick() {
+        let (rt, net, repo) = test_runtime(2, ReplicationConfig::default());
+        let op_id = make_op_id(1, 1, 80_277);
+
+        apply_response(&rt, 1, proofless_catchup_response(op_id, 80_277, 41)).await;
+
+        {
+            let state = rt.state.lock();
+            assert_eq!(state.clock, 80_277, "catchup must not add an extra tick");
+            assert_eq!(state.peer_clocks.get(&2), Some(&80_277));
+            assert!(state.committed_ids.contains(&op_id));
+        }
+
+        // With no remote delivery-watermark participant, the catchup wake
+        // must make the normal clock loop cross ts_final and unblock delivery.
+        net.set_alive(vec![2]);
+        rt.start();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while repo.current_version() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("far-ahead catchup commit did not converge after a clock tick");
+        assert_eq!(repo.log(), vec![(1, 41)]);
+        rt.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn duplicate_proofless_catchup_repairs_clock_and_wakes_both_loops() {
+        let (rt, _, _) = test_runtime(2, ReplicationConfig::default());
+        let op_id = make_op_id(1, 1, 72);
+        let response = proofless_catchup_response(op_id, 72, 42);
+
+        apply_response(&rt, 1, response.clone()).await;
+        tokio::time::timeout(Duration::from_millis(100), rt.deliver_signal.notified())
+            .await
+            .expect("initial catchup did not wake delivery");
+        tokio::time::timeout(Duration::from_millis(100), rt.clock_tick_signal.notified())
+            .await
+            .expect("initial catchup did not wake clock ticking");
+
+        {
+            let mut state = rt.state.lock();
+            state.clock = 1;
+            state.peer_clocks.insert(2, 1);
+        }
+        apply_response(&rt, 1, response).await;
+
+        {
+            let state = rt.state.lock();
+            assert_eq!(state.clock, 72);
+            assert_eq!(state.peer_clocks.get(&2), Some(&72));
+            assert_eq!(state.commit_buffer.len(), 1, "duplicate was re-buffered");
+        }
+        tokio::time::timeout(Duration::from_millis(100), rt.deliver_signal.notified())
+            .await
+            .expect("duplicate catchup did not wake delivery");
+        tokio::time::timeout(Duration::from_millis(100), rt.clock_tick_signal.notified())
+            .await
+            .expect("duplicate catchup did not wake clock ticking");
+    }
+
+    #[tokio::test]
+    async fn proofless_catchup_does_not_regress_a_higher_clock() {
+        let (rt, _, _) = test_runtime(2, ReplicationConfig::default());
+        {
+            let mut state = rt.state.lock();
+            state.clock = 90_000;
+            state.peer_clocks.insert(2, 90_000);
+        }
+
+        apply_response(
+            &rt,
+            1,
+            proofless_catchup_response(make_op_id(1, 1, 73), 80_277, 43),
+        )
+        .await;
+
+        let state = rt.state.lock();
+        assert_eq!(state.clock, 90_000);
+        assert_eq!(state.peer_clocks.get(&2), Some(&90_000));
+    }
+
+    #[tokio::test]
     async fn catchup_ops_do_not_bypass_terminal_or_resolution_promise_fences() {
         let (rt, net, repo) = test_runtime(2, ReplicationConfig::default());
         let terminal_id = make_op_id(1, 1, 3);
@@ -2782,6 +2900,10 @@ mod tests {
         )
         .await;
         net.drain_captures();
+        let clock_before_catchup = {
+            let state = rt.state.lock();
+            (state.clock, state.peer_clocks.get(&2).copied())
+        };
 
         apply_response(
             &rt,
@@ -2840,6 +2962,11 @@ mod tests {
                 .commit_buffer
                 .values()
                 .all(|buffered| buffered.op_id != terminal_id && buffered.op_id != promised_id)
+        );
+        assert_eq!(
+            (state.clock, state.peer_clocks.get(&2).copied()),
+            clock_before_catchup,
+            "fenced catchup metadata must not advance the local clock"
         );
         assert!(repo.log().is_empty());
     }

@@ -18,7 +18,9 @@ use tracing::{debug, error, info, trace, warn};
 use crate::blob_store::ChannelBlobStore;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
-use crate::client_repository::ClientRepository;
+use crate::client_repository::{
+    ClientOriginLogSlice, ClientRepository, ClientSnapshotInstallOutcome,
+};
 use crate::geoip::NodeGeo;
 use crate::server::Server;
 use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier, StrictReplicationMetadata};
@@ -44,6 +46,7 @@ use shitspeak_s2s::application::voice::{
 use shitspeak_s2s::overlay as s2s_overlay;
 use shitspeak_s2s::overlay::OverlayNetwork;
 use shitspeak_s2s::replications as s2s_replications;
+use shitspeak_s2s::replications::owner::{OwnerSnapshotInstallError, OwnerSnapshotInstallOutcome};
 use shitspeak_s2s::replications::{
     BlobReplicable, OwnerReplicable, ReplicationManager, StrictReplicable,
 };
@@ -57,6 +60,8 @@ use shitspeak_s2s_transport::{ConnectionManager, TransportConfig};
 mod pre_release_workload;
 
 const S2S_CLIENT_REPLICATION_WORKER_CAPACITY: usize = 4096;
+const MAX_CLIENT_ORIGIN_SNAPSHOT_ENTRIES: usize = 1_000_000;
+const MAX_CLIENT_ORIGIN_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 const S2S_GATEWAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const STRICT_PROPOSAL_GATEWAY_SLACK_TICKS: u32 = 4;
 const VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
@@ -4176,27 +4181,42 @@ impl OwnerReplicable for ClientReplicationAdapter {
         let clients = self.clients.clone();
         let local_node = self.clients.local_node_id();
         let local_epoch = self.local_epoch;
-        block_in_place_or_current(|handle| {
-            let (_, versions) = handle.block_on(clients.snapshot_with_versions());
-            versions
-                .get(&local_node)
-                .copied()
-                .map(|version| HashMap::from([(local_node, (local_epoch, version))]))
-                .unwrap_or_default()
-        })
-        .unwrap_or_default()
+        let mut versions = HashMap::from([(local_node, (local_epoch, self.local_version()))]);
+        if let Some(remote_versions) = block_in_place_or_current(|handle| {
+            handle.block_on(clients.known_remote_origin_versions())
+        }) {
+            versions.extend(remote_versions);
+        }
+        versions
     }
 
     fn snapshot_for_origin(&self, origin: NodeIdentifier) -> Option<(u64, u64, Bytes)> {
         let clients = self.clients.clone();
+        let channels = Arc::clone(&self.channels);
+        let local_node = self.clients.local_node_id();
+        let local_epoch = self.local_epoch;
         block_in_place_or_current(|handle| {
-            let (version, entries) = handle.block_on(clients.local_origin_snapshot_entries());
-            let bytes =
-                Bytes::from(rmp_serde::to_vec(&ClientOriginSnapshot { version, entries }).ok()?);
-            Some((self.local_epoch, version, bytes))
+            let (epoch, version, mut entries) = if origin == local_node {
+                let (version, entries) = handle.block_on(clients.local_origin_snapshot_entries());
+                (local_epoch, version, entries)
+            } else {
+                handle.block_on(clients.remote_origin_snapshot_entries(origin))?
+            };
+            for entry in &mut entries {
+                entry.channel_version_dep =
+                    Some(channels.current_version_in_server(entry.op.server_id()));
+            }
+            if entries.len() > MAX_CLIENT_ORIGIN_SNAPSHOT_ENTRIES {
+                return None;
+            }
+            let encoded = rmp_serde::to_vec(&ClientOriginSnapshot { version, entries }).ok()?;
+            if encoded.len() > MAX_CLIENT_ORIGIN_SNAPSHOT_BYTES {
+                return None;
+            }
+            let bytes = Bytes::from(encoded);
+            Some((epoch, version, bytes))
         })
         .flatten()
-        .filter(|_| origin == self.clients.local_node_id())
     }
 
     fn log_for_origin(
@@ -4204,29 +4224,27 @@ impl OwnerReplicable for ClientReplicationAdapter {
         origin: NodeIdentifier,
         since: u64,
     ) -> s2s_replications::owner::LogSlice<Self::Op> {
-        if since == 0 {
-            return s2s_replications::owner::LogSlice::TooOld;
-        }
-
         let clients = self.clients.clone();
-        let entries = block_in_place_or_current(|handle| {
-            handle.block_on(clients.get_log_since_for_node(origin, since))
+        let slice = block_in_place_or_current(|handle| {
+            handle.block_on(clients.get_log_slice_for_node(origin, since))
         });
-        match entries {
-            Some(entries) => s2s_replications::owner::LogSlice::Available(
-                entries
-                    .into_iter()
-                    .map(|entry| (entry.version, (*entry).clone()))
-                    .collect(),
-            ),
-            None => s2s_replications::owner::LogSlice::TooOld,
+        match slice {
+            Some(ClientOriginLogSlice::Available(entries)) => {
+                s2s_replications::owner::LogSlice::Available(
+                    entries
+                        .into_iter()
+                        .map(|entry| (entry.version, (*entry).clone()))
+                        .collect(),
+                )
+            }
+            Some(ClientOriginLogSlice::TooOld) | None => s2s_replications::owner::LogSlice::TooOld,
         }
     }
 
     async fn apply_remote(
         &self,
         origin: NodeIdentifier,
-        _epoch: u64,
+        epoch: u64,
         version: u64,
         mut op: Self::Op,
     ) {
@@ -4237,7 +4255,7 @@ impl OwnerReplicable for ClientReplicationAdapter {
             .await;
         if let Err(()) = self
             .clients
-            .apply_remote_operation(Arc::new(op), current_channel_version)
+            .apply_remote_operation_with_epoch(epoch, Arc::new(op), current_channel_version)
             .await
         {
             warn!(origin, version, "s2s client operation apply failed");
@@ -4247,40 +4265,67 @@ impl OwnerReplicable for ClientReplicationAdapter {
     async fn install_snapshot_for_origin(
         &self,
         origin: NodeIdentifier,
-        _epoch: u64,
-        _version: u64,
+        epoch: u64,
+        version: u64,
         snapshot: Bytes,
-    ) {
+    ) -> Result<OwnerSnapshotInstallOutcome, OwnerSnapshotInstallError> {
+        if snapshot.len() > MAX_CLIENT_ORIGIN_SNAPSHOT_BYTES {
+            return Err(OwnerSnapshotInstallError::new(format!(
+                "s2s client snapshot for origin {origin} is {} bytes; maximum is {MAX_CLIENT_ORIGIN_SNAPSHOT_BYTES}",
+                snapshot.len()
+            )));
+        }
         let decoded: ClientOriginSnapshot = match rmp_serde::from_slice(&snapshot) {
             Ok(snapshot) => snapshot,
             Err(e) => {
-                warn!(origin, error = %e, "s2s client snapshot decode failed");
-                return;
+                return Err(OwnerSnapshotInstallError::new(format!(
+                    "s2s client snapshot decode failed for origin {origin}: {e}"
+                )));
             }
         };
+        let mut current_channel_versions = HashMap::new();
         let mut entries = Vec::with_capacity(decoded.entries.len());
         for mut entry in decoded.entries {
             let current_channel_version = self
                 .channels
                 .current_version_in_server(entry.op.server_id());
+            current_channel_versions
+                .entry(entry.op.server_id().to_owned())
+                .and_modify(|version: &mut u64| *version = (*version).max(current_channel_version))
+                .or_insert(current_channel_version);
             self.sanitize_channel_dependencies(&mut entry, current_channel_version)
                 .await;
             entries.push(entry);
         }
-        self.clients
-            .install_remote_client_snapshot(origin, decoded.version, entries)
-            .await;
+        match self
+            .clients
+            .install_remote_client_snapshot(
+                origin,
+                epoch,
+                version,
+                decoded.version,
+                entries,
+                &current_channel_versions,
+            )
+            .await
+            .map_err(|error| OwnerSnapshotInstallError::new(error.to_string()))?
+        {
+            ClientSnapshotInstallOutcome::Installed => Ok(OwnerSnapshotInstallOutcome::Installed),
+            ClientSnapshotInstallOutcome::Deferred => Ok(OwnerSnapshotInstallOutcome::Deferred),
+        }
     }
 
-    async fn reset_origin(&self, origin: NodeIdentifier, _new_epoch: u64) {
+    async fn reset_origin(&self, origin: NodeIdentifier, new_epoch: u64) {
         if origin != self.clients.local_node_id() {
-            self.clients.clear_clients_from_node(origin).await;
+            self.clients
+                .reset_clients_from_node(origin, new_epoch)
+                .await;
         }
     }
 
     async fn remove_origin(&self, origin: NodeIdentifier) {
         if origin != self.clients.local_node_id() {
-            self.clients.clear_clients_from_node(origin).await;
+            self.clients.remove_clients_from_node(origin).await;
         }
     }
 
@@ -5232,7 +5277,8 @@ mod tests {
 
         assert!(matches!(
             adapter.log_for_origin(clients.local_node_id(), 0),
-            s2s_replications::owner::LogSlice::TooOld
+            s2s_replications::owner::LogSlice::Available(entries)
+                if entries.first().map(|(version, _)| *version) == Some(1)
         ));
 
         let (_epoch, version, bytes) = adapter
@@ -5291,15 +5337,28 @@ mod tests {
 
         peer_adapter
             .install_snapshot_for_origin(origin_clients.local_node_id(), 42, version, bytes)
-            .await;
-
-        let snapshot_message = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
-            .expect("snapshot should broadcast live AddClient")
+            .expect("valid client snapshot installs");
+
+        let snapshot_start = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("snapshot should broadcast reset start")
             .expect("snapshot broadcast channel open");
+        assert!(matches!(
+            snapshot_start.entry.op,
+            ClientStateOperation::ResetNode { .. }
+        ));
+        assert_eq!(snapshot_start.versions.get(&1), Some(&0));
+        let snapshot_message = rx.recv().await.expect("snapshot AddClient");
         assert!(matches!(
             snapshot_message.entry.op,
             ClientStateOperation::AddClient { .. }
+        ));
+        let snapshot_marker = rx.recv().await.expect("snapshot version marker");
+        assert_eq!(snapshot_marker.versions.get(&1), Some(&version));
+        assert!(matches!(
+            snapshot_marker.entry.op,
+            ClientStateOperation::ResetNode { .. }
         ));
         assert!(rx.try_recv().is_err());
 
@@ -5314,26 +5373,21 @@ mod tests {
             Some("live-user")
         );
 
-        let (messages, versions) = peer_clients
-            .replay_since_in_server(DEFAULT_SERVER_ID, &HashMap::new())
-            .await
-            .expect("snapshot replay succeeds");
-        assert_eq!(
-            versions.get(&origin_clients.local_node_id()),
-            Some(&version)
-        );
-        assert_eq!(
-            messages
-                .iter()
-                .filter(|message| matches!(message, Message::UserState(_)))
-                .count(),
-            1
-        );
         assert!(
-            messages
-                .iter()
-                .all(|message| !matches!(message, Message::UserRemove(_)))
+            peer_clients
+                .replay_since_in_server(DEFAULT_SERVER_ID, &HashMap::new())
+                .await
+                .is_err(),
+            "synthetic snapshot baseline is not incremental replay history"
         );
+        let (messages, _) = peer_clients
+            .replay_since_in_server(
+                DEFAULT_SERVER_ID,
+                &HashMap::from([(origin_clients.local_node_id(), version)]),
+            )
+            .await
+            .expect("replay from the installed snapshot floor succeeds");
+        assert!(messages.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5364,26 +5418,305 @@ mod tests {
 
         peer_adapter
             .install_snapshot_for_origin(origin_clients.local_node_id(), 42, version, bytes)
-            .await;
-
-        let snapshot_marker = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
-            .expect("snapshot should broadcast version marker")
+            .expect("valid empty client snapshot installs");
+
+        let snapshot_start = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("snapshot should broadcast reset start")
             .expect("snapshot broadcast channel open");
         assert!(matches!(
-            snapshot_marker.entry.op,
+            snapshot_start.entry.op,
+            ClientStateOperation::ResetNode { .. }
+        ));
+        assert_eq!(snapshot_start.versions.get(&1), Some(&0));
+        let snapshot_marker = rx.recv().await.expect("snapshot version marker");
+        assert_eq!(snapshot_marker.versions.get(&1), Some(&version));
+        assert!(rx.try_recv().is_err());
+
+        assert!(
+            peer_clients
+                .replay_since_in_server(DEFAULT_SERVER_ID, &HashMap::new())
+                .await
+                .is_err()
+        );
+        let (messages, _) = peer_clients
+            .replay_since_in_server(
+                DEFAULT_SERVER_ID,
+                &HashMap::from([(origin_clients.local_node_id(), version)]),
+            )
+            .await
+            .expect("replay from empty snapshot floor succeeds");
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_replication_reports_empty_local_epoch_and_materialized_remote_versions() {
+        let clients = Arc::new(ClientRepository::new(2, 128));
+        let adapter = ClientReplicationAdapter::new(Arc::clone(&clients), test_channel_repo(2), 77);
+
+        assert_eq!(adapter.known_versions(), HashMap::from([(2, (77, 0))]));
+
+        clients.reset_clients_from_node(1, 42).await;
+        assert_eq!(
+            adapter.known_versions(),
+            HashMap::from([(1, (42, 0)), (2, (77, 0))])
+        );
+        clients.remove_clients_from_node(1).await;
+        assert_eq!(adapter.known_versions(), HashMap::from([(2, (77, 0))]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_snapshot_defers_atomically_then_installs_and_relays_canonically() {
+        let origin_clients = Arc::new(ClientRepository::new(1, 128));
+        let origin_adapter =
+            ClientReplicationAdapter::new(Arc::clone(&origin_clients), test_channel_repo(1), 42);
+        let live =
+            make_published_web_client(&origin_clients, DEFAULT_SERVER_ID, 30301, "dependent-user")
+                .await;
+        {
+            let mut state = live.write_global_state(&origin_clients);
+            state.set_current_channel_id(42);
+        }
+        let (_, version, bytes) = origin_adapter
+            .snapshot_for_origin(1)
+            .expect("origin snapshot available");
+        let mut decoded: ClientOriginSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(
+            decoded
+                .entries
+                .iter()
+                .all(|entry| entry.channel_version_dep == Some(0)),
+            "snapshot provider stamps its source channel version"
+        );
+        for entry in &mut decoded.entries {
+            entry.channel_version_dep = Some(1);
+        }
+        let dependent_bytes = Bytes::from(rmp_serde::to_vec(&decoded).unwrap());
+
+        let peer_clients = Arc::new(ClientRepository::new(2, 128));
+        let peer_channels = test_channel_repo(2);
+        let peer_adapter = ClientReplicationAdapter::new(
+            Arc::clone(&peer_clients),
+            Arc::clone(&peer_channels),
+            77,
+        );
+        assert_eq!(
+            peer_adapter
+                .install_snapshot_for_origin(1, 42, version, dependent_bytes.clone())
+                .await
+                .unwrap(),
+            OwnerSnapshotInstallOutcome::Deferred
+        );
+        assert!(
+            peer_clients
+                .get_client(live.get_session_id())
+                .await
+                .is_none()
+        );
+        assert!(!peer_adapter.known_versions().contains_key(&1));
+
+        let mut channel_snapshot = peer_channels.get_all().await;
+        channel_snapshot.push(shitspeak_state::Channel::new(42, "ready", 0, 0, Some(0)));
+        peer_channels
+            .install_s2s_snapshot(1, channel_snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            peer_adapter
+                .install_snapshot_for_origin(1, 42, version, dependent_bytes.clone())
+                .await
+                .unwrap(),
+            OwnerSnapshotInstallOutcome::Installed
+        );
+        let replicated = peer_clients
+            .get_client(live.get_session_id())
+            .await
+            .expect("deferred snapshot installs after channel convergence");
+        assert_eq!(replicated.get_current_channel_id(), 42);
+        assert_eq!(peer_adapter.known_versions().get(&1), Some(&(42, version)));
+
+        let (relay_epoch, relay_version, relay_bytes) = peer_adapter
+            .snapshot_for_origin(1)
+            .expect("materialized remote origin can be relayed");
+        assert_eq!((relay_epoch, relay_version), (42, version));
+        let relay: ClientOriginSnapshot = rmp_serde::from_slice(&relay_bytes).unwrap();
+        assert_eq!(relay.version, version);
+        assert_eq!(relay.entries.len(), 1);
+        assert_eq!(relay.entries[0].channel_version_dep, Some(1));
+        assert!(matches!(
+            peer_adapter.log_for_origin(1, 0),
+            s2s_replications::owner::LogSlice::TooOld
+        ));
+        assert!(matches!(
+            peer_adapter.log_for_origin(1, version),
+            s2s_replications::owner::LogSlice::Available(entries) if entries.is_empty()
+        ));
+
+        assert!(
+            peer_adapter
+                .install_snapshot_for_origin(1, 42, version + 1, dependent_bytes.clone())
+                .await
+                .is_err(),
+            "envelope/embedded version mismatch is rejected"
+        );
+        if version > 1 {
+            let mut regressive = decoded.clone();
+            regressive.version = version - 1;
+            assert!(
+                peer_adapter
+                    .install_snapshot_for_origin(
+                        1,
+                        42,
+                        regressive.version,
+                        Bytes::from(rmp_serde::to_vec(&regressive).unwrap()),
+                    )
+                    .await
+                    .is_err(),
+                "same-epoch snapshot cannot roll the materialized version backward"
+            );
+        }
+        let mut stale_epoch = decoded.clone();
+        stale_epoch.version = version + 1;
+        assert!(
+            peer_adapter
+                .install_snapshot_for_origin(
+                    1,
+                    41,
+                    stale_epoch.version,
+                    Bytes::from(rmp_serde::to_vec(&stale_epoch).unwrap()),
+                )
+                .await
+                .is_err(),
+            "older-epoch snapshot is fenced"
+        );
+
+        let mut malformed = relay;
+        malformed.version += 1;
+        malformed.entries[0].op = ClientStateOperation::ResetNode {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+        };
+        assert!(
+            peer_adapter
+                .install_snapshot_for_origin(
+                    1,
+                    42,
+                    malformed.version,
+                    Bytes::from(rmp_serde::to_vec(&malformed).unwrap()),
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            peer_clients
+                .get_client(live.get_session_id())
+                .await
+                .is_some()
+        );
+        assert_eq!(peer_adapter.known_versions().get(&1), Some(&(42, version)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_snapshot_replacement_publishes_global_reset_adds_and_final_vector() {
+        let origin_clients = Arc::new(ClientRepository::new(1, 128));
+        let origin_adapter =
+            ClientReplicationAdapter::new(Arc::clone(&origin_clients), test_channel_repo(1), 42);
+        let live =
+            make_published_web_client(&origin_clients, DEFAULT_SERVER_ID, 30401, "removed-user")
+                .await;
+        let (_, version, bytes) = origin_adapter.snapshot_for_origin(1).unwrap();
+        let mut replacement: ClientOriginSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+
+        let peer_clients = Arc::new(ClientRepository::new(2, 128));
+        let peer_adapter =
+            ClientReplicationAdapter::new(Arc::clone(&peer_clients), test_channel_repo(2), 77);
+        peer_adapter
+            .install_snapshot_for_origin(1, 42, version, bytes)
+            .await
+            .unwrap();
+        let mut rx = peer_clients.subscribe();
+        replacement.version = version + 1;
+        let ClientStateOperation::AddClient {
+            client_instance_id, ..
+        } = &mut replacement.entries[0].op
+        else {
+            unreachable!()
+        };
+        *client_instance_id = client_instance_id.saturating_add(1);
+        let replacement_version = replacement.version;
+        peer_adapter
+            .install_snapshot_for_origin(
+                1,
+                42,
+                replacement_version,
+                Bytes::from(rmp_serde::to_vec(&replacement).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let identity_start = rx.recv().await.unwrap();
+        assert_eq!(identity_start.versions.get(&1), Some(&0));
+        assert!(matches!(
+            identity_start.entry.op,
+            ClientStateOperation::ResetNode { .. }
+        ));
+        let identity_add = rx.recv().await.unwrap();
+        assert_eq!(identity_add.versions.get(&1), Some(&0));
+        assert!(matches!(
+            identity_add.entry.op,
+            ClientStateOperation::AddClient { .. }
+        ));
+        let identity_marker = rx.recv().await.unwrap();
+        assert_eq!(identity_marker.versions.get(&1), Some(&replacement_version));
+        assert!(matches!(
+            identity_marker.entry.op,
             ClientStateOperation::ResetNode { .. }
         ));
         assert!(rx.try_recv().is_err());
 
-        let (messages, versions) = peer_clients
-            .replay_since_in_server(DEFAULT_SERVER_ID, &HashMap::new())
-            .await
-            .expect("empty snapshot replay succeeds");
-        assert_eq!(
-            versions.get(&origin_clients.local_node_id()),
-            Some(&version)
+        let empty_version = replacement_version + 1;
+        let empty = Bytes::from(
+            rmp_serde::to_vec(&ClientOriginSnapshot {
+                version: empty_version,
+                entries: Vec::new(),
+            })
+            .unwrap(),
         );
-        assert!(messages.is_empty());
+        assert_eq!(
+            peer_adapter
+                .install_snapshot_for_origin(1, 42, empty_version, empty.clone())
+                .await
+                .unwrap(),
+            OwnerSnapshotInstallOutcome::Installed
+        );
+        assert!(
+            peer_clients
+                .get_client(live.get_session_id())
+                .await
+                .is_none()
+        );
+
+        let empty_start = rx.recv().await.unwrap();
+        assert_eq!(empty_start.versions.get(&1), Some(&0));
+        assert!(matches!(
+            empty_start.entry.op,
+            ClientStateOperation::ResetNode { .. }
+        ));
+        let empty_end = rx.recv().await.unwrap();
+        assert_eq!(empty_end.versions.get(&1), Some(&empty_version));
+        assert!(matches!(
+            empty_end.entry.op,
+            ClientStateOperation::ResetNode { .. }
+        ));
+        assert!(rx.try_recv().is_err());
+
+        peer_adapter
+            .install_snapshot_for_origin(1, 42, empty_version, empty)
+            .await
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate snapshot is side-effect free"
+        );
     }
 }

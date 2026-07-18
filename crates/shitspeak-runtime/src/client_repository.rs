@@ -28,6 +28,8 @@ use crate::{
     types::{DEFAULT_SERVER_ID, ScopedChannelId, ScopedSessionId, default_server_id},
 };
 
+const MAX_CLIENT_ORIGIN_SNAPSHOT_ENTRIES: usize = 1_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct UdpBindingKey {
     remote_addr: SocketAddr,
@@ -90,6 +92,31 @@ impl ClientSnapshotWithVersions {
 struct DeferredClientCommit {
     op: ClientStateOperation,
     channel_version_dep: Option<u64>,
+}
+
+pub(crate) enum ClientOriginLogSlice {
+    Available(Vec<Arc<ClientStateLogEntry>>),
+    TooOld,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientSnapshotInstallOutcome {
+    Installed,
+    Deferred,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct ClientSnapshotInstallError {
+    message: String,
+}
+
+impl ClientSnapshotInstallError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -157,6 +184,18 @@ pub struct ClientRegister {
 }
 
 struct RemoteClientRegister {
+    /// Overlay boot epoch that owns the materialized state in this shard.
+    /// `None` means that no epoch-fenced owner state has been observed yet.
+    epoch: Option<u64>,
+    /// Whether this shard represents a currently materialized origin. An
+    /// offline removal retains the epoch fence but is not relay-advertised.
+    materialized: bool,
+    /// Versions at or below this point came from a materialized snapshot and
+    /// must not be offered as an incremental owner-replication history.
+    snapshot_history_floor: u64,
+    /// Highest version admitted in this epoch. Unlike `version`, this survives
+    /// transient offline removal and fences stale same-epoch resurrection.
+    epoch_version_floor: u64,
     clients: HashMap<ScopedSessionId, Arc<Box<Client>>>,
     log: VecDeque<Arc<ClientStateLogEntry>>,
     version: u64,
@@ -258,19 +297,15 @@ impl ClientRegister {
             self.listener_index_add(scoped_id.clone(), channel_id);
         }
     }
-
-    fn log_version_in_server(&self, server_id: &str) -> Option<u64> {
-        self.local_log
-            .iter()
-            .filter(|entry| entry.op.server_id() == server_id)
-            .map(|entry| entry.version)
-            .max()
-    }
 }
 
 impl RemoteClientRegister {
     fn new() -> Self {
         Self {
+            epoch: None,
+            materialized: false,
+            snapshot_history_floor: 0,
+            epoch_version_floor: 0,
             clients: HashMap::new(),
             log: VecDeque::new(),
             version: 0,
@@ -281,6 +316,19 @@ impl RemoteClientRegister {
             last_pending_effective_dep_by_server: HashMap::new(),
             pending_channel_versions: HashMap::new(),
         }
+    }
+
+    fn clear_materialized_state(&mut self) {
+        self.clients.clear();
+        self.log.clear();
+        self.version = 0;
+        self.snapshot_history_floor = 0;
+        self.clients_by_channel.clear();
+        self.client_channel.clear();
+        self.listeners_by_channel.clear();
+        self.pending_ops.clear();
+        self.last_pending_effective_dep_by_server.clear();
+        self.pending_channel_versions.clear();
     }
 
     fn channel_index_insert(&mut self, id: ScopedSessionId, channel_id: u32) {
@@ -348,14 +396,6 @@ impl RemoteClientRegister {
             set.remove(id);
             !set.is_empty()
         });
-    }
-
-    fn log_version_in_server(&self, server_id: &str) -> Option<u64> {
-        self.log
-            .iter()
-            .filter(|entry| entry.op.server_id() == server_id)
-            .map(|entry| entry.version)
-            .max()
     }
 }
 
@@ -1068,69 +1108,96 @@ impl ClientRepository {
         Some(client)
     }
 
-    pub async fn clear_clients_from_node(&self, node_id: u16) {
+    /// Reset an origin after LSDB admits a strictly newer boot epoch.
+    /// Duplicate same-epoch reset notifications are intentionally no-ops so
+    /// they cannot erase operations already accepted in that epoch.
+    pub(crate) async fn reset_clients_from_node(&self, node_id: u16, new_epoch: u64) {
         if node_id == self.local_node_id {
             panic!("Not supposed to clear clients from the local node");
         }
 
+        let remote_register = self.get_or_create_remote_register(node_id).await;
+        let mut register = remote_register.write().await;
+        match register.epoch {
+            Some(epoch) if new_epoch < epoch => {
+                tracing::warn!(
+                    node_id,
+                    new_epoch,
+                    current_epoch = epoch,
+                    "ignoring stale remote client epoch reset"
+                );
+                return;
+            }
+            Some(epoch) if new_epoch == epoch => return,
+            _ => {}
+        }
+        let removals = register
+            .clients
+            .iter()
+            .map(|(id, client)| {
+                (
+                    id.clone(),
+                    client.is_published(),
+                    client.client_instance_id(),
+                )
+            })
+            .collect();
+        let base_version = register.version;
+        register.clear_materialized_state();
+        register.epoch = Some(new_epoch);
+        register.epoch_version_floor = 0;
+        register.materialized = true;
+        self.broadcast_origin_removals(node_id, removals, base_version);
+    }
+
+    /// Remove the visible transient state for an offline origin while
+    /// retaining its epoch fence against delayed packets.
+    pub(crate) async fn remove_clients_from_node(&self, node_id: u16) {
+        if node_id == self.local_node_id {
+            panic!("Not supposed to clear clients from the local node");
+        }
         let Some(remote_register) = self.get_remote_register(node_id).await else {
             return;
         };
-        let (removals, base_version) = {
-            let mut register = remote_register.write().await;
-            let result: Vec<_> = register
-                .clients
-                .iter()
-                .map(|(id, client)| {
-                    (
-                        id.clone(),
-                        client.is_published(),
-                        client.client_instance_id(),
-                    )
-                })
-                .collect();
-            let base_version = register.version;
-            register.clients.clear();
-            register.clients_by_channel.clear();
-            register.client_channel.clear();
-            register.listeners_by_channel.clear();
-            register.log.clear();
-            register.version = 0;
-            register.pending_ops.clear();
-            register.last_pending_effective_dep_by_server.clear();
-            register.pending_channel_versions.clear();
-            (result, base_version)
-        };
-        self.remote_registers.write().await.remove(&node_id);
-        let reset_versions = HashMap::from([(node_id, 0)]);
-        let mut emitted_reset = false;
+        let mut register = remote_register.write().await;
+        let removals = register
+            .clients
+            .iter()
+            .map(|(id, client)| {
+                (
+                    id.clone(),
+                    client.is_published(),
+                    client.client_instance_id(),
+                )
+            })
+            .collect();
+        let base_version = register.version;
+        let epoch_version_floor = register
+            .pending_ops
+            .back()
+            .map(|(entry, _)| entry.version)
+            .unwrap_or(base_version)
+            .max(base_version);
+        register.clear_materialized_state();
+        register.epoch_version_floor = register.epoch_version_floor.max(epoch_version_floor);
+        register.materialized = false;
+        self.broadcast_origin_removals(node_id, removals, base_version);
+    }
 
-        for (index, (id, was_published, client_instance_id)) in removals.iter().enumerate() {
-            if *was_published {
-                let entry = Arc::new(ClientStateLogEntry {
-                    version: base_version + index as u64 + 1,
-                    node_id,
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                    channel_version_dep: None,
-                    op: ClientStateOperation::RemoveClient {
-                        server_id: id.server_id().to_owned(),
-                        session_id: id.session_id(),
-                        client_instance_id: *client_instance_id,
-                        actor: None,
-                        reason: None,
-                        ban: false,
-                    },
-                });
-                let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
-                    entry,
-                    versions: reset_versions.clone(),
-                }));
-                emitted_reset = true;
-            }
-        }
-        if !emitted_reset && base_version > 0 {
+    /// Legacy un-fenced removal retained for local consumers and tests.
+    pub async fn clear_clients_from_node(&self, node_id: u16) {
+        self.remove_clients_from_node(node_id).await;
+    }
+
+    fn broadcast_origin_removals(
+        &self,
+        node_id: u16,
+        removals: Vec<(ScopedSessionId, bool, ClientInstanceId)>,
+        base_version: u64,
+    ) {
+        if base_version > 0 || removals.iter().any(|(_, published, _)| *published) {
             let entry = Arc::new(ClientStateLogEntry {
-                version: base_version + 1,
+                version: 1,
                 node_id,
                 timestamp: chrono::Utc::now().timestamp_millis(),
                 channel_version_dep: None,
@@ -1140,7 +1207,7 @@ impl ClientRepository {
             });
             let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
                 entry,
-                versions: reset_versions,
+                versions: HashMap::from([(node_id, 0)]),
             }));
         }
     }
@@ -1800,8 +1867,8 @@ impl ClientRepository {
                     .filter(|client| client.server_id() == server_id)
                     .cloned(),
             );
-            if let Some(version) = register.log_version_in_server(server_id) {
-                versions.insert(self.local_node_id, version);
+            if register.version > 0 {
+                versions.insert(self.local_node_id, register.version);
             }
         }
         for (node_id, register) in self.remote_register_snapshots().await {
@@ -1813,8 +1880,8 @@ impl ClientRepository {
                     .filter(|client| client.server_id() == server_id)
                     .cloned(),
             );
-            if let Some(version) = register.log_version_in_server(server_id) {
-                versions.insert(node_id, version);
+            if register.materialized && register.version > 0 {
+                versions.insert(node_id, register.version);
             }
         }
         (clients, versions)
@@ -1835,8 +1902,8 @@ impl ClientRepository {
                     .filter(|client| client.is_published())
                     .cloned(),
             );
-            if let Some(version) = register.log_version_in_server(server_id) {
-                versions.insert(self.local_node_id, version);
+            if register.version > 0 {
+                versions.insert(self.local_node_id, register.version);
             }
         }
         for (node_id, register) in self.remote_register_snapshots().await {
@@ -1848,8 +1915,8 @@ impl ClientRepository {
                     .filter(|client| client.server_id() == server_id)
                     .cloned(),
             );
-            if let Some(version) = register.log_version_in_server(server_id) {
-                versions.insert(node_id, version);
+            if register.materialized && register.version > 0 {
+                versions.insert(node_id, register.version);
             }
         }
         ClientSnapshotWithVersions { clients, versions }
@@ -1885,146 +1952,342 @@ impl ClientRepository {
     }
 
     pub(crate) async fn local_origin_snapshot_entries(&self) -> (u64, Vec<ClientStateLogEntry>) {
-        let (version, clients) = {
-            let register = self.register.read().await;
-            (
-                register.version,
-                register
-                    .local_clients()
-                    .filter(|client| client.is_published())
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
-        };
+        loop {
+            self.wait_for_deferred_commits().await;
+            // A write guard prevents any operation from committing a version
+            // while the matching immutable client states are captured.
+            let register = self.register.write().await;
+            if self.deferred_commit_pending.load(Ordering::Acquire) > 0 {
+                drop(register);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let version = register.version;
+            let timestamp = chrono::Utc::now().timestamp_millis();
+            let mut entries = register
+                .local_clients()
+                .filter(|client| client.is_published())
+                .map(|client| Self::snapshot_add_entry(self.local_node_id, client, timestamp))
+                .collect::<Vec<_>>();
+            if self.deferred_commit_pending.load(Ordering::Acquire) > 0 {
+                drop(register);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            entries.sort_by(Self::compare_snapshot_entries);
+            return (version, entries);
+        }
+    }
 
+    /// Return only repository-materialized epoch/version pairs. Pending
+    /// channel-gated operations are deliberately not advertised.
+    pub(crate) async fn known_remote_origin_versions(&self) -> HashMap<u16, (u64, u64)> {
+        let mut versions = HashMap::new();
+        for (node_id, register) in self.remote_register_snapshots().await {
+            let register = register.read().await;
+            if register.materialized {
+                if let Some(epoch) = register.epoch {
+                    versions.insert(node_id, (epoch, register.version));
+                }
+            }
+        }
+        versions
+    }
+
+    /// Canonical materialized snapshot for a remote origin, used only as a
+    /// relay fallback. Runtime pending buffers are never included.
+    pub(crate) async fn remote_origin_snapshot_entries(
+        &self,
+        origin: u16,
+    ) -> Option<(u64, u64, Vec<ClientStateLogEntry>)> {
+        let register = self.get_remote_register(origin).await?;
+        let register = register.read().await;
+        if !register.materialized {
+            return None;
+        }
+        let epoch = register.epoch?;
+        let version = register.version;
         let timestamp = chrono::Utc::now().timestamp_millis();
-        let entries = clients
-            .into_iter()
-            .map(|client| ClientStateLogEntry {
-                version: 0,
-                node_id: self.local_node_id,
-                timestamp,
-                channel_version_dep: None,
-                op: ClientStateOperation::AddClient {
-                    server_id: client.server_id(),
-                    session_id: client.get_session_id(),
-                    client_instance_id: client.client_instance_id(),
-                    real_ip: client.get_real_ip_address(),
-                    tcp_addr: client.get_tcp_address(),
-                    udp_addr: client.get_udp_address(),
-                    local_addr: client.get_local_address(),
-                    cert_hash: client
-                        .get_certificate_hash()
-                        .map(bytes::Bytes::copy_from_slice),
-                    login_time: client.get_login_time(),
-                    initial_state: ClientGlobalStateDelta::from_global_state(
-                        &client.read_global_state(),
-                    ),
-                },
-            })
-            .collect();
+        let mut entries = register
+            .clients
+            .values()
+            .map(|client| Self::snapshot_add_entry(origin, client, timestamp))
+            .collect::<Vec<_>>();
+        entries.sort_by(Self::compare_snapshot_entries);
+        Some((epoch, version, entries))
+    }
 
-        (version, entries)
+    fn compare_snapshot_entries(
+        a: &ClientStateLogEntry,
+        b: &ClientStateLogEntry,
+    ) -> std::cmp::Ordering {
+        a.op.server_id().cmp(b.op.server_id()).then_with(|| {
+            a.op.session_id()
+                .map(u32::from)
+                .cmp(&b.op.session_id().map(u32::from))
+        })
+    }
+
+    fn snapshot_add_entry(origin: u16, client: &Client, timestamp: i64) -> ClientStateLogEntry {
+        ClientStateLogEntry {
+            version: 0,
+            node_id: origin,
+            timestamp,
+            channel_version_dep: None,
+            op: ClientStateOperation::AddClient {
+                server_id: client.server_id(),
+                session_id: client.get_session_id(),
+                client_instance_id: client.client_instance_id(),
+                real_ip: client.get_real_ip_address(),
+                tcp_addr: client.get_tcp_address(),
+                udp_addr: client.get_udp_address(),
+                local_addr: client.get_local_address(),
+                cert_hash: client
+                    .get_certificate_hash()
+                    .map(bytes::Bytes::copy_from_slice),
+                login_time: client.get_login_time(),
+                initial_state: ClientGlobalStateDelta::from_global_state(
+                    &client.read_global_state(),
+                ),
+            },
+        }
     }
 
     pub(crate) async fn install_remote_client_snapshot(
         &self,
         origin: u16,
-        snapshot_version: u64,
+        epoch: u64,
+        envelope_version: u64,
+        embedded_version: u64,
         entries: Vec<ClientStateLogEntry>,
-    ) {
+        current_channel_versions: &HashMap<String, u64>,
+    ) -> Result<ClientSnapshotInstallOutcome, ClientSnapshotInstallError> {
         if origin == self.local_node_id {
-            return;
+            return Err(ClientSnapshotInstallError::new(
+                "refusing to install a remote snapshot for the local origin",
+            ));
+        }
+        if envelope_version != embedded_version {
+            return Err(ClientSnapshotInstallError::new(format!(
+                "client snapshot version mismatch: envelope={envelope_version}, embedded={embedded_version}"
+            )));
+        }
+        if entries.len() as u64 > envelope_version {
+            return Err(ClientSnapshotInstallError::new(format!(
+                "client snapshot contains {} live entries at version {envelope_version}",
+                entries.len()
+            )));
+        }
+        if entries.len() > MAX_CLIENT_ORIGIN_SNAPSHOT_ENTRIES {
+            return Err(ClientSnapshotInstallError::new(format!(
+                "client snapshot contains {} entries; maximum is {MAX_CLIENT_ORIGIN_SNAPSHOT_ENTRIES}",
+                entries.len()
+            )));
         }
 
-        let mut snapshot_entries = Vec::with_capacity(entries.len());
-        for entry in entries {
-            match &entry.op {
-                ClientStateOperation::AddClient { session_id, .. }
-                    if session_id.get_node_id() == origin =>
-                {
-                    snapshot_entries.push(entry);
-                }
-                other => {
-                    tracing::warn!(
-                        origin,
-                        op = ?other,
-                        "s2s client snapshot ignored non-local AddClient entry"
-                    );
-                }
+        let remote_register = self.get_or_create_remote_register(origin).await;
+        let mut register = remote_register.write().await;
+        match register.epoch {
+            Some(current_epoch) if epoch < current_epoch => {
+                return Err(ClientSnapshotInstallError::new(format!(
+                    "stale client snapshot epoch {epoch}; current epoch is {current_epoch}"
+                )));
+            }
+            Some(current_epoch)
+                if epoch == current_epoch
+                    && envelope_version < register.version.max(register.epoch_version_floor) =>
+            {
+                return Err(ClientSnapshotInstallError::new(format!(
+                    "regressive client snapshot version {envelope_version}; current floor is {}",
+                    register.version.max(register.epoch_version_floor)
+                )));
+            }
+            _ => {}
+        }
+
+        let mut scoped_sessions = HashSet::with_capacity(entries.len());
+        for entry in &entries {
+            if entry.node_id != origin {
+                return Err(ClientSnapshotInstallError::new(format!(
+                    "client snapshot entry origin {} does not match envelope origin {origin}",
+                    entry.node_id
+                )));
+            }
+            let ClientStateOperation::AddClient {
+                server_id,
+                session_id,
+                ..
+            } = &entry.op
+            else {
+                return Err(ClientSnapshotInstallError::new(
+                    "client snapshot contains a non-AddClient operation",
+                ));
+            };
+            if session_id.get_node_id() != origin {
+                return Err(ClientSnapshotInstallError::new(format!(
+                    "client snapshot session {} belongs to another origin",
+                    u32::from(*session_id)
+                )));
+            }
+            if !scoped_sessions.insert(ScopedSessionId::new(server_id.clone(), *session_id)) {
+                return Err(ClientSnapshotInstallError::new(
+                    "client snapshot contains a duplicate scoped session",
+                ));
+            }
+            let available = current_channel_versions
+                .get(server_id)
+                .copied()
+                .unwrap_or(0);
+            if entry.channel_version_dep.unwrap_or(0) > available {
+                return Ok(ClientSnapshotInstallOutcome::Deferred);
             }
         }
-
-        if snapshot_entries.len() as u64 > snapshot_version {
-            tracing::warn!(
-                origin,
-                snapshot_version,
-                entries = snapshot_entries.len(),
-                "s2s client snapshot has more live entries than origin version; dropping snapshot"
-            );
-            return;
+        if register.materialized
+            && register.epoch == Some(epoch)
+            && envelope_version == register.version
+        {
+            return Ok(ClientSnapshotInstallOutcome::Installed);
         }
 
-        let first_entry_version = snapshot_version
-            .checked_sub(snapshot_entries.len() as u64)
-            .map(|version| version + 1);
+        let first_entry_version = envelope_version - entries.len() as u64 + 1;
         let now = chrono::Utc::now().timestamp_millis();
-        let normalized_entries = snapshot_entries
+        let normalized_entries = entries
             .into_iter()
             .enumerate()
-            .filter_map(|(index, mut entry)| {
-                let version = first_entry_version? + index as u64;
+            .map(|(index, mut entry)| {
+                let version = first_entry_version + index as u64;
                 entry.node_id = origin;
                 entry.version = version;
                 entry.timestamp = now + index as i64;
-                entry.channel_version_dep = None;
-                Some(Arc::new(entry))
+                Arc::new(entry)
             })
             .collect::<Vec<_>>();
 
-        let remote_register = self.get_or_create_remote_register(origin).await;
-        let mut broadcasts = Vec::with_capacity(normalized_entries.len());
-        {
-            let mut register = remote_register.write().await;
-            register.clients.clear();
-            register.log.clear();
-            register.version = 0;
-            register.clients_by_channel.clear();
-            register.client_channel.clear();
-            register.listeners_by_channel.clear();
-            register.pending_ops.clear();
-            register.last_pending_effective_dep_by_server.clear();
-            register.pending_channel_versions.clear();
+        let retained_pending = if register.epoch == Some(epoch) {
+            register
+                .pending_ops
+                .iter()
+                .filter(|(entry, _)| entry.version > envelope_version)
+                .cloned()
+                .collect::<VecDeque<_>>()
+        } else {
+            VecDeque::new()
+        };
 
-            for entry in normalized_entries {
-                Self::apply_op_inner(&mut register, &entry, origin, self.log_max_entries);
-                broadcasts.push(Arc::new(ClientStateBroadcastPayload {
-                    entry: Arc::clone(&entry),
-                    versions: HashMap::from([(origin, entry.version)]),
-                }));
-            }
-            if register.version == 0 && snapshot_version > 0 {
-                let entry = Arc::new(ClientStateLogEntry {
-                    version: snapshot_version,
-                    node_id: origin,
-                    timestamp: now,
-                    channel_version_dep: None,
-                    op: ClientStateOperation::ResetNode {
-                        server_id: crate::types::default_server_id(),
-                    },
-                });
-                Self::apply_op_inner(&mut register, &entry, origin, self.log_max_entries);
-                broadcasts.push(Arc::new(ClientStateBroadcastPayload {
-                    entry,
-                    versions: HashMap::from([(origin, snapshot_version)]),
-                }));
-            }
-            register.version = register.version.max(snapshot_version);
+        let mut replacement = RemoteClientRegister::new();
+        replacement.epoch = Some(epoch);
+        replacement.materialized = true;
+        replacement.snapshot_history_floor = envelope_version;
+        replacement.epoch_version_floor = envelope_version;
+        for entry in &normalized_entries {
+            Self::apply_op_inner(&mut replacement, entry, origin, self.log_max_entries);
+        }
+        if normalized_entries.is_empty() && envelope_version > 0 {
+            let marker = Arc::new(ClientStateLogEntry {
+                version: envelope_version,
+                node_id: origin,
+                timestamp: now,
+                channel_version_dep: None,
+                op: ClientStateOperation::ResetNode {
+                    server_id: crate::types::default_server_id(),
+                },
+            });
+            Self::apply_op_inner(&mut replacement, &marker, origin, self.log_max_entries);
+        }
+        replacement.version = envelope_version;
+        replacement.pending_ops = retained_pending;
+        replacement.pending_channel_versions = register.pending_channel_versions.clone();
+        for (server_id, version) in current_channel_versions {
+            replacement
+                .pending_channel_versions
+                .entry(server_id.clone())
+                .and_modify(|current| *current = (*current).max(*version))
+                .or_insert(*version);
+        }
+        for (entry, effective_dep) in &replacement.pending_ops {
+            replacement
+                .last_pending_effective_dep_by_server
+                .entry(entry.op.server_id().to_owned())
+                .and_modify(|dep| *dep = (*dep).max(*effective_dep))
+                .or_insert(*effective_dep);
         }
 
-        for broadcast in broadcasts {
-            let _ = self.tx.send(broadcast);
+        *register = replacement;
+
+        // Snapshot replacement is an atomic state transition, not a sequence
+        // from the owner's retained log. Publish a global reset boundary,
+        // followed by materialized adds and a final version marker. Connection
+        // subscribers use the start boundary to clear this origin from their
+        // per-server shadows, including session identities that were reused.
+        let reset_versions = HashMap::from([(origin, 0)]);
+        let start = Arc::new(ClientStateLogEntry {
+            version: 1,
+            node_id: origin,
+            timestamp: now,
+            channel_version_dep: None,
+            op: ClientStateOperation::ResetNode {
+                server_id: crate::types::default_server_id(),
+            },
+        });
+        let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
+            entry: start,
+            versions: reset_versions.clone(),
+        }));
+        for entry in normalized_entries {
+            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
+                entry,
+                versions: reset_versions.clone(),
+            }));
         }
+        if envelope_version > 0 {
+            let marker = Arc::new(ClientStateLogEntry {
+                version: 1,
+                node_id: origin,
+                timestamp: now,
+                channel_version_dep: None,
+                op: ClientStateOperation::ResetNode {
+                    server_id: crate::types::default_server_id(),
+                },
+            });
+            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
+                entry: marker,
+                versions: HashMap::from([(origin, envelope_version)]),
+            }));
+        }
+
+        loop {
+            let Some((entry, effective_dep)) = register.pending_ops.front() else {
+                break;
+            };
+            let available_channel_version = register
+                .pending_channel_versions
+                .get(entry.op.server_id())
+                .copied()
+                .unwrap_or(0);
+            if *effective_dep > available_channel_version || entry.version > register.version + 1 {
+                break;
+            }
+            let (entry, _) = register.pending_ops.pop_front().unwrap();
+            if entry.version <= register.version {
+                continue;
+            }
+            Self::apply_op_inner(&mut register, &entry, origin, self.log_max_entries);
+            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
+                entry,
+                versions: HashMap::from([(origin, register.version)]),
+            }));
+        }
+        register.last_pending_effective_dep_by_server.clear();
+        let remaining = register.pending_ops.iter().cloned().collect::<Vec<_>>();
+        for (entry, effective_dep) in remaining {
+            register
+                .last_pending_effective_dep_by_server
+                .entry(entry.op.server_id().to_owned())
+                .and_modify(|dep| *dep = (*dep).max(effective_dep))
+                .or_insert(effective_dep);
+        }
+
+        Ok(ClientSnapshotInstallOutcome::Installed)
     }
 
     /// Replay all log entries newer than the given per-node versions.
@@ -2141,17 +2404,18 @@ impl ClientRepository {
         {
             let register = self.register.read().await;
 
-            if local_since > 0 {
-                match register.local_log.front() {
-                    Some(oldest) if oldest.version > local_since => {
-                        tracing::error!(
-                            "Local log pruned past requested version: oldest={} requested={}",
-                            oldest.version,
-                            local_since,
-                        );
-                        return Err(());
-                    }
-                    _ => {}
+            if local_since > 0 && local_since < register.version {
+                let next = register
+                    .local_log
+                    .iter()
+                    .find(|entry| entry.version > local_since);
+                if next.map(|entry| entry.version) != Some(local_since + 1) {
+                    tracing::error!(
+                        "Local log pruned past requested version: next={:?} requested={}",
+                        next.map(|entry| entry.version),
+                        local_since,
+                    );
+                    return Err(());
                 }
             }
 
@@ -2165,17 +2429,25 @@ impl ClientRepository {
         for (node_id, remote_register) in self.remote_register_snapshots().await {
             let since = last_seen.get(&node_id).copied().unwrap_or(0);
             let register = remote_register.read().await;
-            if since > 0 {
-                if let Some(oldest) = register.log.front() {
-                    if oldest.version > since {
-                        tracing::error!(
-                            "Remote log for node {} pruned past requested version: oldest={} requested={}",
-                            node_id,
-                            oldest.version,
-                            since,
-                        );
-                        return Err(());
-                    }
+            if since < register.snapshot_history_floor {
+                tracing::error!(
+                    "Remote snapshot history for node {} starts at {} but requested version is {}",
+                    node_id,
+                    register.snapshot_history_floor,
+                    since,
+                );
+                return Err(());
+            }
+            if since > 0 && since < register.version {
+                let next = register.log.iter().find(|entry| entry.version > since);
+                if next.map(|entry| entry.version) != Some(since + 1) {
+                    tracing::error!(
+                        "Remote log for node {} pruned past requested version: next={:?} requested={}",
+                        node_id,
+                        next.map(|entry| entry.version),
+                        since,
+                    );
+                    return Err(());
                 }
             }
             for entry in &register.log {
@@ -2283,6 +2555,63 @@ impl ClientRepository {
             .collect()
     }
 
+    pub(crate) async fn get_log_slice_for_node(
+        &self,
+        node_id: u16,
+        since_version: u64,
+    ) -> ClientOriginLogSlice {
+        if node_id == self.local_node_id {
+            let register = self.register.read().await;
+            return Self::continuous_log_slice(
+                &register.local_log,
+                register.version,
+                0,
+                since_version,
+            );
+        }
+
+        let Some(register) = self.get_remote_register(node_id).await else {
+            return ClientOriginLogSlice::TooOld;
+        };
+        let register = register.read().await;
+        if !register.materialized {
+            return ClientOriginLogSlice::TooOld;
+        }
+        Self::continuous_log_slice(
+            &register.log,
+            register.version,
+            register.snapshot_history_floor,
+            since_version,
+        )
+    }
+
+    fn continuous_log_slice(
+        log: &VecDeque<Arc<ClientStateLogEntry>>,
+        current_version: u64,
+        snapshot_history_floor: u64,
+        since_version: u64,
+    ) -> ClientOriginLogSlice {
+        if since_version < snapshot_history_floor || since_version > current_version {
+            return ClientOriginLogSlice::TooOld;
+        }
+        if since_version == current_version {
+            return ClientOriginLogSlice::Available(Vec::new());
+        }
+        let expected = since_version + 1;
+        let Some(first) = log.iter().find(|entry| entry.version > since_version) else {
+            return ClientOriginLogSlice::TooOld;
+        };
+        if first.version != expected {
+            return ClientOriginLogSlice::TooOld;
+        }
+        ClientOriginLogSlice::Available(
+            log.iter()
+                .filter(|entry| entry.version > since_version)
+                .cloned()
+                .collect(),
+        )
+    }
+
     /// Apply an operation that arrived from a remote node.
     ///
     /// The operation is applied to the local in-memory map but **not**
@@ -2299,13 +2628,70 @@ impl ClientRepository {
         op: Arc<ClientStateLogEntry>,
         current_channel_version: u64,
     ) -> Result<(), ()> {
+        self.apply_remote_operation_with_epoch(0, op, current_channel_version)
+            .await
+    }
+
+    /// Epoch-fenced remote application used by owner replication.
+    pub(crate) async fn apply_remote_operation_with_epoch(
+        &self,
+        origin_epoch: u64,
+        op: Arc<ClientStateLogEntry>,
+        current_channel_version: u64,
+    ) -> Result<(), ()> {
         let remote_node = op.node_id;
         if remote_node == self.local_node_id {
             return Ok(());
         }
         let remote_register = self.get_or_create_remote_register(remote_node).await;
-        let broadcast = {
+        {
             let mut register = remote_register.write().await;
+            match register.epoch {
+                Some(current_epoch) if origin_epoch < current_epoch => {
+                    tracing::warn!(
+                        remote_node,
+                        origin_epoch,
+                        current_epoch,
+                        "rejecting stale-epoch remote client operation"
+                    );
+                    return Err(());
+                }
+                Some(current_epoch) if origin_epoch > current_epoch => {
+                    let removals = register
+                        .clients
+                        .iter()
+                        .map(|(id, client)| {
+                            (
+                                id.clone(),
+                                client.is_published(),
+                                client.client_instance_id(),
+                            )
+                        })
+                        .collect();
+                    let base_version = register.version;
+                    register.clear_materialized_state();
+                    register.epoch = Some(origin_epoch);
+                    register.epoch_version_floor = 0;
+                    register.materialized = true;
+                    self.broadcast_origin_removals(remote_node, removals, base_version);
+                }
+                None => {
+                    register.epoch = Some(origin_epoch);
+                    register.materialized = true;
+                }
+                Some(_) if !register.materialized => {
+                    tracing::warn!(
+                        remote_node,
+                        origin_epoch,
+                        version = op.version,
+                        "rejecting remote client operation while same-epoch origin is inactive; snapshot required"
+                    );
+                    return Err(());
+                }
+                Some(_) => {
+                    register.materialized = true;
+                }
+            }
             let server_id = op.op.server_id().to_owned();
 
             // Check version against the remote node's tracked version and pending window.
@@ -2369,14 +2755,10 @@ impl ClientRepository {
                 return Ok(());
             }
             Self::apply_op_inner(&mut register, &op, remote_node, self.log_max_entries);
-            Some(Arc::new(ClientStateBroadcastPayload {
+            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
                 entry: Arc::clone(&op),
                 versions: HashMap::from([(remote_node, register.version)]),
-            }))
-        };
-
-        if let Some(broadcast) = broadcast {
-            let _ = self.tx.send(broadcast);
+            }));
         }
         Ok(())
     }
@@ -2384,7 +2766,6 @@ impl ClientRepository {
     /// Drain pending remote ops for `server_id` whose effective dependency is <= `channel_version`.
     /// Called after channel state in that server scope is advanced.
     pub async fn drain_pending_ops(&self, server_id: &str, channel_version: u64) {
-        let mut broadcasts = Vec::new();
         for (remote_node, remote_register) in self.remote_register_snapshots().await {
             let mut register = remote_register.write().await;
             register
@@ -2424,7 +2805,7 @@ impl ClientRepository {
                     available_channel_version,
                 );
                 Self::apply_op_inner(&mut register, &op, remote_node, self.log_max_entries);
-                broadcasts.push(Arc::new(ClientStateBroadcastPayload {
+                let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
                     entry: Arc::clone(&op),
                     versions: HashMap::from([(remote_node, register.version)]),
                 }));
@@ -2443,10 +2824,6 @@ impl ClientRepository {
                     .and_modify(|dep| *dep = (*dep).max(effective_dep))
                     .or_insert(effective_dep);
             }
-        }
-
-        for broadcast in broadcasts {
-            let _ = self.tx.send(broadcast);
         }
     }
 
@@ -2581,6 +2958,7 @@ impl ClientRepository {
             register.log.pop_front();
         }
         register.version = op.version;
+        register.epoch_version_floor = register.epoch_version_floor.max(op.version);
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
@@ -2855,6 +3233,15 @@ mod tests {
         local_session_id: u32,
         version: u64,
     ) -> Arc<ClientStateLogEntry> {
+        remote_add_entry_in_server("alpha", node_id, local_session_id, version).await
+    }
+
+    async fn remote_add_entry_in_server(
+        server_id: &str,
+        node_id: u16,
+        local_session_id: u32,
+        version: u64,
+    ) -> Arc<ClientStateLogEntry> {
         let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let tcp_addr = SocketAddr::new(real_ip, 30001 + u16::try_from(local_session_id).unwrap());
         let local_addr = SocketAddr::new(real_ip, 64738);
@@ -2865,7 +3252,7 @@ mod tests {
             timestamp: Utc::now().timestamp_millis(),
             channel_version_dep: None,
             op: ClientStateOperation::AddClient {
-                server_id: "alpha".to_string(),
+                server_id: server_id.to_owned(),
                 session_id,
                 client_instance_id: u64::from(node_id) << 32 | u64::from(local_session_id),
                 real_ip,
@@ -2978,8 +3365,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_with_versions_in_server_is_scoped_to_matching_log_entries() {
-        let repo = ClientRepository::new(1, 128);
+    async fn scoped_snapshot_uses_global_local_sequence_baseline() {
+        let repo = ClientRepository::new(1, 1);
         let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let tcp_addr = SocketAddr::new(real_ip, 30001);
         let local_addr = SocketAddr::new(real_ip, 64738);
@@ -3021,9 +3408,107 @@ mod tests {
 
         let (_, alpha_versions) = repo.snapshot_with_versions_in_server("alpha").await;
         let (_, beta_versions) = repo.snapshot_with_versions_in_server("beta").await;
+        let (_, alpha_auth_versions) = repo
+            .published_snapshot_with_versions_in_server("alpha")
+            .await
+            .into_parts();
 
-        assert_eq!(alpha_versions.get(&1), Some(&1));
+        assert_eq!(alpha_versions.get(&1), Some(&2));
         assert_eq!(beta_versions.get(&1), Some(&2));
+        assert_eq!(alpha_auth_versions.get(&1), Some(&2));
+
+        let next_alpha_session = ClientSessionIdentifier::new(1, 9).unwrap();
+        repo.commit_operation(
+            ClientStateOperation::AddClient {
+                server_id: "alpha".to_string(),
+                session_id: next_alpha_session,
+                client_instance_id: 9,
+                real_ip,
+                tcp_addr,
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta::default(),
+            },
+            None,
+        )
+        .await;
+
+        let (entries, versions) = repo
+            .replay_entries_since_in_server_for_client(
+                "alpha",
+                &alpha_auth_versions,
+                ClientSessionIdentifier::new(7, 1).unwrap(),
+                700,
+            )
+            .await
+            .expect("global auth baseline remains replayable after old entries are pruned");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].version, 3);
+        assert_eq!(versions.get(&1), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_uses_materialized_version_for_every_server_scope() {
+        let repo = ClientRepository::new(1, 128);
+        let alpha = (*remote_add_entry_in_server("alpha", 2, 1, 0).await).clone();
+        let beta = (*remote_add_entry_in_server("beta", 2, 2, 0).await).clone();
+
+        assert_eq!(
+            repo.install_remote_client_snapshot(
+                2,
+                7,
+                5,
+                5,
+                vec![alpha, beta],
+                &HashMap::from([("alpha".to_owned(), 0), ("beta".to_owned(), 0)]),
+            )
+            .await
+            .unwrap(),
+            ClientSnapshotInstallOutcome::Installed
+        );
+
+        for server_id in ["alpha", "beta"] {
+            let (clients, versions) = repo.snapshot_with_versions_in_server(server_id).await;
+            assert_eq!(clients.len(), 1);
+            assert_eq!(versions.get(&2), Some(&5));
+            assert!(
+                repo.replay_since_in_server(server_id, &versions)
+                    .await
+                    .is_ok(),
+                "scope {server_id} must not replay from before the remote snapshot floor"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_remote_snapshot_gives_auth_snapshot_a_replayable_baseline() {
+        let repo = ClientRepository::new(1, 128);
+
+        assert_eq!(
+            repo.install_remote_client_snapshot(2, 7, 5, 5, Vec::new(), &HashMap::new())
+                .await
+                .unwrap(),
+            ClientSnapshotInstallOutcome::Installed
+        );
+
+        let (clients, versions, _subscription) = repo
+            .published_snapshot_with_versions_and_subscription_in_server("empty-scope")
+            .await;
+        assert!(clients.is_empty());
+        assert_eq!(versions.get(&2), Some(&5));
+        assert!(
+            repo.replay_entries_since_in_server_for_client(
+                "empty-scope",
+                &versions,
+                ClientSessionIdentifier::new(1, 1).unwrap(),
+                1,
+            )
+            .await
+            .is_ok(),
+            "the baseline staged during authentication must not produce an unrecoverable log gap"
+        );
     }
 
     #[tokio::test]
@@ -3631,7 +4116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_clients_from_node_broadcasts_remote_user_remove_without_local_log() {
+    async fn clear_clients_from_node_broadcasts_global_origin_reset_without_local_log() {
         let repo = ClientRepository::new(1, 128);
         let mut rx = repo.subscribe();
         let remote_session = ClientSessionIdentifier::new(2, 7).unwrap();
@@ -3668,25 +4153,15 @@ mod tests {
         assert!(repo.get_client(remote_session).await.is_none());
         assert_eq!(repo.current_version(), 0);
 
-        let payload = rx.recv().await.expect("remove broadcast");
+        let payload = rx.recv().await.expect("global reset broadcast");
         assert_eq!(payload.entry.node_id, 2);
-        assert_eq!(payload.entry.version, 2);
+        assert_eq!(payload.entry.version, 1);
         assert_eq!(payload.versions.get(&2), Some(&0));
-        match &payload.entry.op {
-            ClientStateOperation::RemoveClient {
-                session_id,
-                client_instance_id,
-                ..
-            } => {
-                assert_eq!(*session_id, remote_session);
-                assert_eq!(*client_instance_id, 22);
-            }
-            other => panic!("expected RemoveClient, got {other:?}"),
-        }
         assert!(matches!(
-            payload.entry.to_message(&repo).await,
-            Some(Message::UserRemove(remove)) if remove.session == u32::from(remote_session)
+            payload.entry.op,
+            ClientStateOperation::ResetNode { .. }
         ));
+        assert!(payload.entry.to_message(&repo).await.is_none());
 
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let client = repo
@@ -3755,7 +4230,7 @@ mod tests {
         assert!(!repo.snapshot_with_versions().await.1.contains_key(&2));
         let reset = rx.recv().await.expect("reset broadcast");
         assert_eq!(reset.entry.node_id, 2);
-        assert_eq!(reset.entry.version, 3);
+        assert_eq!(reset.entry.version, 1);
         assert_eq!(reset.versions.get(&2), Some(&0));
         assert!(matches!(
             reset.entry.op,
@@ -3782,7 +4257,16 @@ mod tests {
             },
         });
 
-        repo.apply_remote_operation(restarted_add, 0).await.unwrap();
+        assert!(
+            repo.apply_remote_operation(Arc::clone(&restarted_add), 0)
+                .await
+                .is_err(),
+            "same-epoch version reuse is fenced after an offline removal"
+        );
+        repo.reset_clients_from_node(2, 1).await;
+        repo.apply_remote_operation_with_epoch(1, restarted_add, 0)
+            .await
+            .unwrap();
         let client = repo
             .get_client(remote_session)
             .await
@@ -4212,6 +4696,158 @@ mod tests {
             .is_some()
         );
         assert!(repo.get_client_in_server("alpha", session).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_epoch_fence_rejects_stale_ops_and_makes_same_epoch_reset_idempotent() {
+        let repo = ClientRepository::new(1, 16);
+        let session = ClientSessionIdentifier::new(2, 1).unwrap();
+
+        repo.apply_remote_operation_with_epoch(10, remote_add_entry(2, 1, 1).await, 0)
+            .await
+            .unwrap();
+        repo.reset_clients_from_node(2, 10).await;
+        assert!(repo.get_client_in_server("alpha", session).await.is_some());
+
+        repo.reset_clients_from_node(2, 9).await;
+        assert!(repo.get_client_in_server("alpha", session).await.is_some());
+        assert!(
+            repo.apply_remote_operation_with_epoch(9, remote_add_entry(2, 2, 2).await, 0)
+                .await
+                .is_err()
+        );
+        assert!(
+            repo.get_client_in_server("alpha", ClientSessionIdentifier::new(2, 2).unwrap())
+                .await
+                .is_none()
+        );
+
+        repo.apply_remote_operation_with_epoch(11, remote_add_entry(2, 1, 1).await, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.known_remote_origin_versions().await.get(&2),
+            Some(&(11, 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_same_epoch_retains_version_floor_until_snapshot_rebuilds_state() {
+        let repo = ClientRepository::new(1, 16);
+        repo.apply_remote_operation_with_epoch(10, remote_add_entry(2, 1, 1).await, 0)
+            .await
+            .unwrap();
+        repo.remove_clients_from_node(2).await;
+
+        assert!(
+            repo.install_remote_client_snapshot(2, 10, 0, 0, Vec::new(), &HashMap::new())
+                .await
+                .is_err(),
+            "an offline shard cannot regress within the same boot epoch"
+        );
+        assert_eq!(
+            repo.install_remote_client_snapshot(
+                2,
+                10,
+                1,
+                1,
+                vec![(*remote_add_entry(2, 1, 0).await).clone()],
+                &HashMap::from([("alpha".to_owned(), 0)]),
+            )
+            .await
+            .unwrap(),
+            ClientSnapshotInstallOutcome::Installed
+        );
+        assert_eq!(
+            repo.known_remote_origin_versions().await.get(&2),
+            Some(&(10, 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_log_slice_detects_pruning_and_hides_snapshot_baseline() {
+        let repo = ClientRepository::new(1, 2);
+        for version in 1..=3 {
+            repo.apply_remote_operation_with_epoch(
+                7,
+                remote_add_entry(2, version as u32, version).await,
+                0,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(matches!(
+            repo.get_log_slice_for_node(2, 0).await,
+            ClientOriginLogSlice::TooOld
+        ));
+        assert!(matches!(
+            repo.get_log_slice_for_node(2, 1).await,
+            ClientOriginLogSlice::Available(entries)
+                if entries.iter().map(|entry| entry.version).collect::<Vec<_>>() == vec![2, 3]
+        ));
+
+        let snapshot_entry = (*remote_add_entry(2, 9, 0).await).clone();
+        assert_eq!(
+            repo.install_remote_client_snapshot(
+                2,
+                7,
+                5,
+                5,
+                vec![snapshot_entry],
+                &HashMap::from([("alpha".to_owned(), 0)]),
+            )
+            .await
+            .unwrap(),
+            ClientSnapshotInstallOutcome::Installed
+        );
+        assert!(matches!(
+            repo.get_log_slice_for_node(2, 4).await,
+            ClientOriginLogSlice::TooOld
+        ));
+        assert!(matches!(
+            repo.get_log_slice_for_node(2, 5).await,
+            ClientOriginLogSlice::Available(entries) if entries.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_replacement_preserves_and_drains_newer_pending_suffix() {
+        let repo = ClientRepository::new(1, 16);
+        let pending_session = ClientSessionIdentifier::new(2, 3).unwrap();
+        repo.apply_remote_operation_with_epoch(7, remote_add_entry(2, 3, 3).await, 0)
+            .await
+            .unwrap();
+        assert!(
+            repo.get_client_in_server("alpha", pending_session)
+                .await
+                .is_none()
+        );
+
+        let baseline = (*remote_add_entry(2, 1, 0).await).clone();
+        assert_eq!(
+            repo.install_remote_client_snapshot(
+                2,
+                7,
+                2,
+                2,
+                vec![baseline],
+                &HashMap::from([("alpha".to_owned(), 0)]),
+            )
+            .await
+            .unwrap(),
+            ClientSnapshotInstallOutcome::Installed
+        );
+        repo.drain_pending_ops("alpha", 0).await;
+        assert!(
+            repo.get_client_in_server("alpha", pending_session)
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            repo.known_remote_origin_versions().await.get(&2),
+            Some(&(7, 3))
+        );
     }
 }
 

@@ -1164,7 +1164,51 @@ async fn append_client_log_broadcast_messages(
     tracing::trace!("Received client log broadcast: {:?}", broadcast);
 
     let entry = &broadcast.entry;
-    if entry.op.server_id() != client_server_id {
+    if matches!(entry.op, ClientStateOperation::ResetNode { .. }) {
+        match broadcast.versions.get(&entry.node_id).copied() {
+            Some(0) => {
+                // Snapshot/reset start is global to an origin, whereas a
+                // connection shadow is scoped to one virtual server. Handle
+                // it before the server-id filter and explicitly evict every
+                // shadowed session from that origin. This also makes a reused
+                // numeric session accept the replacement AddClient.
+                let sessions =
+                    take_origin_sessions_from_shadow(session_channel_shadow, entry.node_id);
+                for session in sessions {
+                    let removal: Message = crate::messages::encoder::UserRemove {
+                        session: u32::from(session),
+                        actor: None,
+                        reason: None,
+                        ban: Some(false),
+                    }
+                    .into();
+                    out.extend(
+                        crate::client::visibility::project_message_with_shadow(
+                            server,
+                            client,
+                            user_visibility,
+                            session_channel_shadow,
+                            client_server_id,
+                            &removal,
+                        )
+                        .await,
+                    );
+                }
+                client.remove_last_client_version(entry.node_id).await;
+                return Ok(());
+            }
+            Some(_) => {
+                // Snapshot/reset end: materialized AddClient entries have
+                // already rebuilt the shadow. Only publish the final owner
+                // vector; replaying ResetNode visibility here would disturb
+                // that freshly reconstructed state.
+                apply_client_snapshot_end_vector(client, &broadcast.versions).await;
+                return Ok(());
+            }
+            None => {}
+        }
+    }
+    if advance_client_log_vector_if_out_of_scope(client, client_server_id, &broadcast).await {
         return Ok(());
     }
     let mut last_seen = client.get_last_client_versions().await;
@@ -1233,6 +1277,47 @@ async fn append_client_log_broadcast_messages(
         .update_last_client_versions(&broadcast.versions)
         .await;
     Ok(())
+}
+
+async fn advance_client_log_vector_if_out_of_scope(
+    client: &Arc<Box<Client>>,
+    client_server_id: &str,
+    broadcast: &ClientStateBroadcastPayload,
+) -> bool {
+    let entry = &broadcast.entry;
+    if entry.op.server_id() == client_server_id {
+        return false;
+    }
+
+    // Client log versions are global per origin, even though the messages
+    // projected onto a connection are scoped to one virtual server. Consume
+    // the origin's sequence position before dropping an out-of-scope entry so
+    // a later in-scope entry does not try to replay already-pruned history.
+    if let Some(&version) = broadcast.versions.get(&entry.node_id) {
+        client
+            .update_last_client_versions(&HashMap::from([(entry.node_id, version)]))
+            .await;
+    }
+    true
+}
+
+fn take_origin_sessions_from_shadow(
+    shadow: &mut SessionChannelShadow,
+    origin: u16,
+) -> Vec<ClientSessionIdentifier> {
+    let sessions = shadow
+        .iter()
+        .map(|(session, _)| session)
+        .filter(|session| session.get_node_id() == origin)
+        .collect::<Vec<_>>();
+    for session in &sessions {
+        shadow.remove(session);
+    }
+    sessions
+}
+
+async fn apply_client_snapshot_end_vector(client: &Arc<Box<Client>>, versions: &HashMap<u16, u64>) {
+    client.update_last_client_versions(versions).await;
 }
 
 fn should_skip_client_add_entry(
@@ -1840,4 +1925,115 @@ async fn replay_client_log_gap(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod client_snapshot_boundary_tests {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use super::*;
+    use crate::client_repository::ClientRepository;
+
+    #[test]
+    fn global_snapshot_start_clears_non_default_shadow_and_allows_reused_session_add() {
+        let old_session = ClientSessionIdentifier::new(1, 7).unwrap();
+        let unrelated_session = ClientSessionIdentifier::new(3, 8).unwrap();
+        let viewer_session = ClientSessionIdentifier::new(2, 9).unwrap();
+        let mut shadow = SessionChannelShadow::new();
+        shadow.insert(old_session, 42);
+        shadow.insert(unrelated_session, 84);
+
+        assert_eq!(
+            take_origin_sessions_from_shadow(&mut shadow, 1),
+            vec![old_session]
+        );
+        assert!(!shadow.contains_key(&old_session));
+        assert!(shadow.contains_key(&unrelated_session));
+
+        let replacement = ClientStateOperation::AddClient {
+            server_id: "tenant-alpha".to_owned(),
+            session_id: old_session,
+            client_instance_id: 200,
+            real_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            tcp_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001),
+            udp_addr: None,
+            local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738),
+            cert_hash: None,
+            login_time: chrono::Utc::now(),
+            initial_state: ClientGlobalStateDelta::default(),
+        };
+        assert!(
+            !should_skip_client_add_entry(&replacement, viewer_session, 300, &shadow),
+            "the reused numeric session must be re-added after the global start boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_end_boundary_sets_final_origin_vector() {
+        let repo = ClientRepository::new(2, 16);
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let peer = SocketAddr::new(ip, 30002);
+        let local = SocketAddr::new(ip, 64738);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let viewer = repo
+            .allocate_web_client_in_server("tenant-alpha", ip, peer, local, tx)
+            .await;
+        viewer
+            .update_last_client_versions(&HashMap::from([(1, 5)]))
+            .await;
+
+        apply_client_snapshot_end_vector(&viewer, &HashMap::from([(1, 17)])).await;
+        assert_eq!(viewer.get_last_client_versions().await.get(&1), Some(&17));
+    }
+
+    #[tokio::test]
+    async fn filtered_cross_server_broadcast_advances_global_origin_vector() {
+        let repo = ClientRepository::new(2, 16);
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let peer = SocketAddr::new(ip, 30002);
+        let local = SocketAddr::new(ip, 64738);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let viewer = repo
+            .allocate_web_client_in_server("tenant-alpha", ip, peer, local, tx)
+            .await;
+        viewer
+            .update_last_client_versions(&HashMap::from([(1, 5)]))
+            .await;
+
+        let remote_session = ClientSessionIdentifier::new(1, 7).unwrap();
+        let entry = Arc::new(ClientStateLogEntry {
+            version: 17,
+            node_id: 1,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            channel_version_dep: None,
+            op: ClientStateOperation::AddClient {
+                server_id: "tenant-beta".to_owned(),
+                session_id: remote_session,
+                client_instance_id: 700,
+                real_ip: ip,
+                tcp_addr: SocketAddr::new(ip, 30001),
+                udp_addr: None,
+                local_addr: local,
+                cert_hash: None,
+                login_time: chrono::Utc::now(),
+                initial_state: ClientGlobalStateDelta::default(),
+            },
+        });
+        let broadcast = ClientStateBroadcastPayload {
+            entry,
+            versions: HashMap::from([(1, 17)]),
+        };
+
+        assert!(
+            advance_client_log_vector_if_out_of_scope(&viewer, "tenant-alpha", &broadcast).await
+        );
+        assert_eq!(viewer.get_last_client_versions().await.get(&1), Some(&17));
+        assert!(
+            repo.get_client_in_server("tenant-beta", remote_session)
+                .await
+                .is_none(),
+            "the connection consumer must advance only its vector, not apply the operation"
+        );
+    }
 }
