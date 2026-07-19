@@ -662,7 +662,10 @@ async fn s2s_tree_voice_long_haul_repair_is_delivered_without_server_pacing() {
         let missing_s2s_seq = repair_rx.await.expect("missing sequence signal");
         // Let the following tree original open the receiver-side gap before
         // supplying the same frame through the marked repair ingress path.
-        tokio::time::sleep(Duration::from_millis(140)).await;
+        // Stay inside the shaped path's 104 +/- 4 ms route-delay hint plus
+        // the reorder deadline. At 140 ms this races the deadline and can
+        // flush the suffix before the injected repair arrives.
+        tokio::time::sleep(Duration::from_millis(120)).await;
         let body = proto::encode_voice(&repair_frame(
             sender_session,
             sender_epoch,

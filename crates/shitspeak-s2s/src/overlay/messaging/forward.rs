@@ -1214,7 +1214,7 @@ async fn send_control_to(
     }
     let tables = routing.load();
     let path_trace_set = path_trace_set(&control.path_trace);
-    let next_hop = match select_forward_next_hop(
+    let next_hop = match select_forward_next_hop_for_send(
         &tables,
         self_id,
         target,
@@ -1222,6 +1222,10 @@ async fn send_control_to(
         CONTROL_METRIC,
         &path_trace_set,
         false,
+        Some(transport),
+        MessageClass::Control,
+        TransportSendOptions::default(),
+        None,
     )? {
         ForwardNextHop::Send { next_hop } => next_hop,
         ForwardNextHop::DropAlreadyVisited => {
@@ -2521,6 +2525,7 @@ fn transport_options_for_overlay_data(
     options
 }
 
+#[cfg(test)]
 fn select_forward_next_hop(
     tables: &RoutingTables,
     self_id: NodeIdentifier,
@@ -2602,7 +2607,7 @@ fn select_forward_next_hop_for_send(
         return Ok(ForwardNextHop::DropNoRoute);
     }
 
-    let next_hop = deadline_pressure_alternate(
+    let next_hop = queue_pressure_alternate(
         tables,
         self_id,
         dst,
@@ -2619,7 +2624,7 @@ fn select_forward_next_hop_for_send(
     Ok(ForwardNextHop::Send { next_hop })
 }
 
-fn deadline_pressure_alternate(
+fn queue_pressure_alternate(
     tables: &RoutingTables,
     self_id: NodeIdentifier,
     dst: NodeIdentifier,
@@ -2631,9 +2636,6 @@ fn deadline_pressure_alternate(
     send_options: TransportSendOptions,
     current_next_hop: NodeIdentifier,
 ) -> Option<NodeIdentifier> {
-    if send_options.expires_at().is_none() {
-        return None;
-    }
     let transport = transport?;
     let current_pressure = transport
         .best_send_queue_pressure(
@@ -2644,7 +2646,12 @@ fn deadline_pressure_alternate(
             send_options,
         )
         .unwrap_or(3);
-    if current_pressure < 2 {
+    let reroute_threshold = if send_options.expires_at().is_some() {
+        2
+    } else {
+        3
+    };
+    if current_pressure < reroute_threshold {
         return None;
     }
     let alternate = tables.lookup_avoiding_first_hop_with_metric(
@@ -2999,11 +3006,14 @@ mod tests {
         );
     }
 
-    fn tables_with_direct_and_indirect_route() -> RoutingTables {
+    fn tables_with_direct_and_indirect_route_for(
+        metric: RoutingMetric,
+        level: ServiceLevel,
+    ) -> RoutingTables {
         let mut tables = RoutingTables::empty();
         tables.insert_table_with_adjacency(
-            RoutingMetric::ReliableCost,
-            ServiceLevel::Reliable,
+            metric,
+            level,
             HashMap::from([(
                 4,
                 RouteEntry {
@@ -3020,9 +3030,25 @@ mod tests {
         tables
     }
 
+    fn tables_with_direct_and_indirect_route() -> RoutingTables {
+        tables_with_direct_and_indirect_route_for(
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+        )
+    }
+
     fn routing_with_direct_and_indirect_route() -> RoutingHandle {
         let routing = new_handle();
         routing.store(Arc::new(tables_with_direct_and_indirect_route()));
+        routing
+    }
+
+    fn control_routing_with_direct_and_indirect_route() -> RoutingHandle {
+        let routing = new_handle();
+        routing.store(Arc::new(tables_with_direct_and_indirect_route_for(
+            CONTROL_METRIC,
+            CONTROL_LEVEL,
+        )));
         routing
     }
 
@@ -3142,6 +3168,52 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("stream queue pressure did not become visible");
+    }
+
+    async fn build_saturated_stream_pressure(transport: &ConnectionManager, peer: NodeIdentifier) {
+        for seed in 0..2 {
+            transport
+                .try_send_with_options(
+                    peer,
+                    CONTROL_LEVEL,
+                    Some(CONTROL_METRIC),
+                    MessageClass::Control,
+                    Bytes::from(vec![0; 960 * 1024]),
+                    TransportSendOptions::default(),
+                )
+                .await
+                .expect("stream saturation seed should enqueue");
+            if seed == 0 {
+                for _ in 0..20 {
+                    let pressure = transport.best_send_queue_pressure(
+                        peer,
+                        CONTROL_LEVEL,
+                        CONTROL_METRIC,
+                        MessageClass::Control,
+                        TransportSendOptions::default(),
+                    );
+                    if pressure.is_some_and(|pressure| pressure < 3) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
+
+        for _ in 0..20 {
+            if transport.best_send_queue_pressure(
+                peer,
+                CONTROL_LEVEL,
+                CONTROL_METRIC,
+                MessageClass::Control,
+                TransportSendOptions::default(),
+            ) == Some(3)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("saturated stream queue pressure did not become visible");
     }
 
     #[test]
@@ -3588,6 +3660,49 @@ mod tests {
         .expect("route should be selectable");
 
         assert_eq!(selected, ForwardNextHop::Send { next_hop: 4 });
+    }
+
+    #[tokio::test]
+    async fn overlay_control_avoids_saturated_first_hop() {
+        let (transport, mut direct_receivers) =
+            ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Kcp]);
+        let _direct_kcp_rx = direct_receivers.pop().expect("direct KCP receiver");
+        let mut alternate_tcp_rx = transport.test_install_live_stream(3, TransportKind::Tcp);
+        build_saturated_stream_pressure(&transport, 4).await;
+        let routing = control_routing_with_direct_and_indirect_route();
+
+        let selected = select_forward_next_hop_for_send(
+            &routing.load(),
+            1,
+            4,
+            CONTROL_LEVEL,
+            CONTROL_METRIC,
+            &HashSet::new(),
+            false,
+            Some(&transport),
+            MessageClass::Control,
+            TransportSendOptions::default(),
+            None,
+        )
+        .expect("control route should be selectable");
+        assert_eq!(selected, ForwardNextHop::Send { next_hop: 3 });
+
+        send_control_to(
+            &transport,
+            &routing,
+            1,
+            4,
+            test_control(vec![node_to_wire(1)]),
+        )
+        .await
+        .expect("control should use the clear alternate");
+
+        let forwarded = timeout(Duration::from_millis(50), alternate_tcp_rx.recv())
+            .await
+            .expect("alternate first hop should receive control")
+            .expect("alternate receiver should stay open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay control");
+        assert!(matches!(decoded.body, Some(OverlayBody::Control(_))));
     }
 
     #[tokio::test]

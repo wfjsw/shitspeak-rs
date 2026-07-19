@@ -45,7 +45,7 @@ use super::terminal_journal::{
 use super::{HistoryMetadata, StrictCommitApplyOutcome, StrictLogMetadata, StrictReplicable};
 use crate::overlay::{MembershipEvent, OverlayNetwork, OverlaySendOptions};
 use shitspeak_core::NodeIdentifier;
-use shitspeak_s2s_transport::{MessageClass, RoutingMetric, ServiceLevel};
+use shitspeak_s2s_transport::{MessageClass, OriginSignature, RoutingMetric, ServiceLevel};
 
 // ---------- Tunables ----------
 
@@ -316,6 +316,110 @@ pub(crate) struct OverlayStrictNet {
     participant_capability: Arc<StrictParticipantCapability>,
 }
 
+struct StrictOriginProofMetadata<'a> {
+    certificate_chain: &'a [Vec<u8>],
+    maximum_signature_len: usize,
+}
+
+trait StrictOriginProofProvider {
+    fn origin_signature_metadata(&self) -> Result<StrictOriginProofMetadata<'_>, ReplicationError>;
+
+    fn sign_origin_payload(&self, payload: &[u8]) -> Result<OriginSignature, ReplicationError>;
+}
+
+impl StrictOriginProofProvider for OverlayNetwork {
+    fn origin_signature_metadata(&self) -> Result<StrictOriginProofMetadata<'_>, ReplicationError> {
+        let metadata = OverlayNetwork::origin_signature_metadata(self)
+            .map_err(|error| ReplicationError::OriginAuthentication(error.to_string()))?;
+        Ok(StrictOriginProofMetadata {
+            certificate_chain: metadata.certificate_chain(),
+            maximum_signature_len: metadata.maximum_signature_len(),
+        })
+    }
+
+    fn sign_origin_payload(&self, payload: &[u8]) -> Result<OriginSignature, ReplicationError> {
+        OverlayNetwork::sign_origin_payload(self, payload)
+            .map_err(|error| ReplicationError::OriginAuthentication(error.to_string()))
+    }
+}
+
+fn strict_origin_auth_with_provider(
+    provider: &(impl StrictOriginProofProvider + ?Sized),
+    topic: &str,
+    body: &StrictBody,
+    origin_node: u32,
+    origin_boot_epoch: u64,
+) -> Result<StrictOriginAuth, ReplicationError> {
+    let signing_payload =
+        repl_proto::strict_origin_signing_payload(topic, body, origin_node, origin_boot_epoch)?;
+    let proof = provider.sign_origin_payload(&signing_payload)?;
+    let origin_auth = StrictOriginAuth {
+        origin_node,
+        origin_boot_epoch,
+        signature_scheme: u32::from(proof.signature_scheme()),
+        certificate_chain: proof
+            .certificate_chain()
+            .iter()
+            .map(|certificate| Bytes::copy_from_slice(certificate))
+            .collect(),
+        signature: Bytes::copy_from_slice(proof.signature()),
+    };
+    if !repl_proto::strict_origin_auth_within_bounds(&origin_auth) {
+        return Err(ReplicationError::OriginAuthentication(
+            "local certificate proof exceeds the strict v2 wire bound".to_owned(),
+        ));
+    }
+    Ok(origin_auth)
+}
+
+fn encode_strict_payload_with_provider(
+    provider: &(impl StrictOriginProofProvider + ?Sized),
+    topic: &str,
+    body: StrictBody,
+    origin_node: u32,
+    origin_boot_epoch: u64,
+    on_origin_auth_failure: impl FnOnce(),
+) -> Result<Bytes, ReplicationError> {
+    let origin_auth = match strict_origin_auth_with_provider(
+        provider,
+        topic,
+        &body,
+        origin_node,
+        origin_boot_epoch,
+    ) {
+        Ok(origin_auth) => origin_auth,
+        Err(error) => {
+            on_origin_auth_failure();
+            return Err(error);
+        }
+    };
+    let message = repl_proto::wrap_strict_with_origin_auth(topic, body, origin_auth);
+    Ok(repl_proto::encode(&message)?)
+}
+
+fn encoded_v2_strict_payload_len_with_provider(
+    provider: &(impl StrictOriginProofProvider + ?Sized),
+    topic: &str,
+    body: &StrictBody,
+) -> Result<usize, ReplicationError> {
+    let metadata = provider.origin_signature_metadata()?;
+    if !repl_proto::strict_origin_auth_shape_within_bounds(
+        metadata
+            .certificate_chain
+            .iter()
+            .map(|certificate| certificate.len()),
+        metadata.maximum_signature_len,
+    ) {
+        return Err(ReplicationError::OriginAuthentication(
+            "local certificate proof exceeds the strict v2 wire bound".to_owned(),
+        ));
+    }
+
+    Ok(repl_proto::strict_encoded_len_with_origin_auth_budget(
+        topic, body,
+    ))
+}
+
 impl OverlayStrictNet {
     pub(crate) fn new(
         overlay: OverlayNetwork,
@@ -377,44 +481,6 @@ impl OverlayStrictNet {
         )
     }
 
-    fn strict_origin_auth(
-        &self,
-        topic: &str,
-        body: &StrictBody,
-        reserve_max_signature_len: bool,
-    ) -> Result<StrictOriginAuth, ReplicationError> {
-        let origin_node = self.overlay.local_node_id() as u32;
-        let origin_boot_epoch = self.overlay.local_boot_epoch();
-        let signing_payload =
-            repl_proto::strict_origin_signing_payload(topic, body, origin_node, origin_boot_epoch)?;
-        let proof = self
-            .overlay
-            .sign_origin_payload(&signing_payload)
-            .map_err(|error| ReplicationError::OriginAuthentication(error.to_string()))?;
-        let signature = if reserve_max_signature_len {
-            vec![0; proof.maximum_signature_len()]
-        } else {
-            proof.signature().to_vec()
-        };
-        let origin_auth = StrictOriginAuth {
-            origin_node,
-            origin_boot_epoch,
-            signature_scheme: u32::from(proof.signature_scheme()),
-            certificate_chain: proof
-                .certificate_chain()
-                .iter()
-                .map(|certificate| Bytes::copy_from_slice(certificate))
-                .collect(),
-            signature: Bytes::from(signature),
-        };
-        if !repl_proto::strict_origin_auth_within_bounds(&origin_auth) {
-            return Err(ReplicationError::OriginAuthentication(
-                "local certificate proof exceeds the strict v2 wire bound".to_owned(),
-            ));
-        }
-        Ok(origin_auth)
-    }
-
     fn encode_strict_payload(
         &self,
         topic: &str,
@@ -423,15 +489,14 @@ impl OverlayStrictNet {
         // Always attach an end-to-end proof in production. The field is
         // additive, so legacy decoders ignore it, but this avoids an LSA
         // transition racing a v2-associated response into an unsigned frame.
-        let origin_auth = match self.strict_origin_auth(topic, &body, false) {
-            Ok(origin_auth) => origin_auth,
-            Err(error) => {
-                self.participant_capability.disable_permanently();
-                return Err(error);
-            }
-        };
-        let message = repl_proto::wrap_strict_with_origin_auth(topic, body, origin_auth);
-        Ok(repl_proto::encode(&message)?)
+        encode_strict_payload_with_provider(
+            &self.overlay,
+            topic,
+            body,
+            self.overlay.local_node_id() as u32,
+            self.overlay.local_boot_epoch(),
+            || self.participant_capability.disable_permanently(),
+        )
     }
 }
 
@@ -809,16 +874,10 @@ impl StrictNet for OverlayStrictNet {
         topic: &str,
         body: &StrictBody,
     ) -> Result<usize, ReplicationError> {
-        // Construct a proof first so unavailable local signing material or an
-        // oversized local certificate fails closed. Size every v2 candidate
-        // against the protocol maximum, not this node's smaller proof.
-        let _ = self.strict_origin_auth(topic, body, false)?;
-        let origin_auth = repl_proto::strict_origin_auth_budget_template();
-        Ok(repl_proto::strict_encoded_len_with_origin_auth(
-            topic,
-            body,
-            &origin_auth,
-        ))
+        // Fail closed on unavailable or oversized local proof material, but
+        // never perform a real signature for a readiness/size query. Identity
+        // metadata is cached when the transport loads its key and certificate.
+        encoded_v2_strict_payload_len_with_provider(&self.overlay, topic, body)
     }
 
     fn alive_members(&self) -> Vec<NodeIdentifier> {
@@ -10604,6 +10663,68 @@ mod tests {
         assert!(long_len > short_len);
         assert!(v2_prerequisite_payload_fits(ceiling, short_len, short_len));
         assert!(!v2_prerequisite_payload_fits(ceiling, short_len, long_len));
+    }
+
+    struct CountingOriginProofProvider {
+        certificate_chain: Vec<Vec<u8>>,
+        sign_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingOriginProofProvider {
+        fn new() -> Self {
+            Self {
+                certificate_chain: vec![vec![1; 32]],
+                sign_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl StrictOriginProofProvider for CountingOriginProofProvider {
+        fn origin_signature_metadata(
+            &self,
+        ) -> Result<StrictOriginProofMetadata<'_>, ReplicationError> {
+            Ok(StrictOriginProofMetadata {
+                certificate_chain: &self.certificate_chain,
+                maximum_signature_len: 64,
+            })
+        }
+
+        fn sign_origin_payload(
+            &self,
+            _payload: &[u8],
+        ) -> Result<OriginSignature, ReplicationError> {
+            self.sign_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(OriginSignature::from_parts(
+                0x0807,
+                self.certificate_chain.clone(),
+                vec![2; 64],
+            ))
+        }
+    }
+
+    #[test]
+    fn strict_v2_readiness_sizing_does_not_sign_but_encoding_does() {
+        let provider = CountingOriginProofProvider::new();
+        let bodies = v2_control_prerequisite_bodies(1);
+
+        for _ in 0..8 {
+            for body in &bodies {
+                encoded_v2_strict_payload_len_with_provider(&provider, "channels", body).unwrap();
+            }
+        }
+        assert_eq!(provider.sign_calls.load(Ordering::Relaxed), 0);
+
+        let encoded = encode_strict_payload_with_provider(
+            &provider,
+            "channels",
+            StrictBody::ClockTick(Default::default()),
+            1,
+            42,
+            || {},
+        )
+        .unwrap();
+        assert!(!encoded.is_empty());
+        assert_eq!(provider.sign_calls.load(Ordering::Relaxed), 1);
     }
 
     struct BlockingStrictRepo {

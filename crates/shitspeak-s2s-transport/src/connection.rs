@@ -342,6 +342,15 @@ impl PeerOutboundSender {
     pub(crate) fn capacity_bytes(&self) -> usize {
         self.capacity_bytes
     }
+
+    pub(crate) fn class_depth_and_capacity(&self, class: MessageClass) -> (usize, usize) {
+        let sender = match class {
+            MessageClass::Control => &self.control,
+            MessageClass::HighPriority => &self.high_priority,
+            MessageClass::Regular => &self.regular,
+        };
+        (sender.depth_bytes(), sender.capacity_bytes())
+    }
 }
 
 pub(crate) struct PeerOutboundReceiver {
@@ -1346,8 +1355,8 @@ impl PeerState {
             streams
                 .values()
                 .filter(|stream| stream.is_alive() && stream.transport() == transport)
+                .max_by_key(|stream| stream.installed_at())
                 .map(|stream| (stream.sender.depth_bytes(), stream.sender.capacity_bytes()))
-                .max_by_key(|(depth, _)| *depth)
         };
 
         let mut status = self

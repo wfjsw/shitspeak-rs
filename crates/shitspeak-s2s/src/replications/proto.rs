@@ -3,6 +3,8 @@
 //! The outer overlay envelope (`OverlayData`) is provided by L2; this module
 //! deals only with the bytes we put into the envelope's `payload`.
 
+use std::sync::OnceLock;
+
 use bytes::{Bytes, BytesMut};
 use prost::Message as _;
 
@@ -267,36 +269,72 @@ pub fn strict_encoded_len_with_origin_auth(
     wrap_strict_with_origin_auth(topic, body.clone(), origin_auth.clone()).encoded_len()
 }
 
+/// Replication-payload size with the protocol-wide maximum origin proof.
+/// The large byte buffers in the budget template are initialized once and
+/// shared by cheap `Bytes` clones across repeated readiness checks.
+pub(crate) fn strict_encoded_len_with_origin_auth_budget(topic: &str, body: &StrictBody) -> usize {
+    strict_encoded_len_with_origin_auth(topic, body, strict_origin_auth_budget_template_ref())
+}
+
 /// Whether a received or locally generated proof satisfies the bounded v2
 /// wire contract. Limit it before cryptographic verification and use the
 /// matching budget template for every frame-size admission decision.
 pub fn strict_origin_auth_within_bounds(auth: &StrictOriginAuth) -> bool {
-    auth.certificate_chain.len() <= STRICT_ORIGIN_AUTH_MAX_CERTIFICATES
-        && auth
-            .certificate_chain
+    strict_origin_auth_shape_within_bounds(
+        auth.certificate_chain
             .iter()
-            .map(|certificate| certificate.len())
-            .sum::<usize>()
-            <= STRICT_ORIGIN_AUTH_MAX_CERTIFICATE_CHAIN_BYTES
-        && auth.signature.len() <= STRICT_ORIGIN_AUTH_MAX_SIGNATURE_BYTES
+            .map(|certificate| certificate.len()),
+        auth.signature.len(),
+    )
+}
+
+/// Whether proof metadata satisfies the bounded v2 wire contract. This lets
+/// readiness and frame-size admission validate the local proof shape without
+/// creating a detached signature merely to learn its maximum encoded size.
+pub(crate) fn strict_origin_auth_shape_within_bounds(
+    certificate_lengths: impl IntoIterator<Item = usize>,
+    maximum_signature_len: usize,
+) -> bool {
+    let mut certificate_count = 0usize;
+    let mut certificate_bytes = 0usize;
+    for length in certificate_lengths {
+        certificate_count = match certificate_count.checked_add(1) {
+            Some(count) if count <= STRICT_ORIGIN_AUTH_MAX_CERTIFICATES => count,
+            _ => return false,
+        };
+        certificate_bytes = match certificate_bytes.checked_add(length) {
+            Some(bytes) if bytes <= STRICT_ORIGIN_AUTH_MAX_CERTIFICATE_CHAIN_BYTES => bytes,
+            _ => return false,
+        };
+    }
+
+    maximum_signature_len <= STRICT_ORIGIN_AUTH_MAX_SIGNATURE_BYTES
 }
 
 /// Conservative proof shape used for v2 frame admission. Scalar values use
 /// their largest protobuf encoding and certificate bytes are split across the
 /// maximum number of repeated fields to include every tag/length overhead.
 pub fn strict_origin_auth_budget_template() -> StrictOriginAuth {
-    let certificate_bytes_per_entry =
-        (STRICT_ORIGIN_AUTH_MAX_CERTIFICATE_CHAIN_BYTES + STRICT_ORIGIN_AUTH_MAX_CERTIFICATES - 1)
+    strict_origin_auth_budget_template_ref().clone()
+}
+
+fn strict_origin_auth_budget_template_ref() -> &'static StrictOriginAuth {
+    static TEMPLATE: OnceLock<StrictOriginAuth> = OnceLock::new();
+    TEMPLATE.get_or_init(|| {
+        let certificate_bytes_per_entry = (STRICT_ORIGIN_AUTH_MAX_CERTIFICATE_CHAIN_BYTES
+            + STRICT_ORIGIN_AUTH_MAX_CERTIFICATES
+            - 1)
             / STRICT_ORIGIN_AUTH_MAX_CERTIFICATES;
-    StrictOriginAuth {
-        origin_node: u32::MAX,
-        origin_boot_epoch: u64::MAX,
-        signature_scheme: u32::MAX,
-        certificate_chain: (0..STRICT_ORIGIN_AUTH_MAX_CERTIFICATES)
-            .map(|_| Bytes::from(vec![0; certificate_bytes_per_entry]))
-            .collect(),
-        signature: Bytes::from(vec![0; STRICT_ORIGIN_AUTH_MAX_SIGNATURE_BYTES]),
-    }
+        StrictOriginAuth {
+            origin_node: u32::MAX,
+            origin_boot_epoch: u64::MAX,
+            signature_scheme: u32::MAX,
+            certificate_chain: (0..STRICT_ORIGIN_AUTH_MAX_CERTIFICATES)
+                .map(|_| Bytes::from(vec![0; certificate_bytes_per_entry]))
+                .collect(),
+            signature: Bytes::from(vec![0; STRICT_ORIGIN_AUTH_MAX_SIGNATURE_BYTES]),
+        }
+    })
 }
 
 /// Build an owner outer message for a given topic.
@@ -444,9 +482,38 @@ mod tests {
         signature.push(0);
         let oversized = StrictOriginAuth {
             signature: Bytes::from(signature),
-            ..template
+            ..template.clone()
         };
         assert!(!strict_origin_auth_within_bounds(&oversized));
+
+        let body = StrictBody::ClockTick(Default::default());
+        assert_eq!(
+            strict_encoded_len_with_origin_auth_budget("channels", &body),
+            strict_encoded_len_with_origin_auth("channels", &body, &template),
+        );
+    }
+
+    #[test]
+    fn strict_origin_auth_shape_checks_metadata_without_signature_bytes() {
+        assert!(strict_origin_auth_shape_within_bounds(
+            [
+                STRICT_ORIGIN_AUTH_MAX_CERTIFICATE_CHAIN_BYTES / 2,
+                STRICT_ORIGIN_AUTH_MAX_CERTIFICATE_CHAIN_BYTES / 2,
+            ],
+            STRICT_ORIGIN_AUTH_MAX_SIGNATURE_BYTES,
+        ));
+        assert!(!strict_origin_auth_shape_within_bounds(
+            [0; STRICT_ORIGIN_AUTH_MAX_CERTIFICATES + 1],
+            0,
+        ));
+        assert!(!strict_origin_auth_shape_within_bounds(
+            [STRICT_ORIGIN_AUTH_MAX_CERTIFICATE_CHAIN_BYTES + 1],
+            0,
+        ));
+        assert!(!strict_origin_auth_shape_within_bounds(
+            [],
+            STRICT_ORIGIN_AUTH_MAX_SIGNATURE_BYTES + 1,
+        ));
     }
 
     #[test]

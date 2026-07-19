@@ -91,7 +91,9 @@ pub use frame::{
     Frame, FrameType, build_frame, decode_frame, encode_frame, encode_frame_to_bytes,
     encoded_data_frame_len,
 };
-pub use identity::{OriginAuthenticationError, OriginSignature, node_id_from_cert_file};
+pub use identity::{
+    OriginAuthenticationError, OriginSignature, OriginSignatureMetadata, node_id_from_cert_file,
+};
 pub use manager::PeerAddressSnapshot;
 pub use manager::{AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage};
 pub use metrics::{

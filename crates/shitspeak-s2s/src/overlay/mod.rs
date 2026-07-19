@@ -56,8 +56,8 @@ use tokio::time::{Instant, timeout};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{
     AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage, MessageClass,
-    OriginAuthenticationError, OriginSignature, ServiceLevel, TransportKind,
-    encoded_data_frame_len,
+    OriginAuthenticationError, OriginSignature, OriginSignatureMetadata, ServiceLevel,
+    TransportKind, encoded_data_frame_len,
 };
 
 const DISTRIBUTION_HOP_TTL: Duration = Duration::from_millis(80);
@@ -453,6 +453,13 @@ impl OverlayNetwork {
         payload: &[u8],
     ) -> Result<OriginSignature, OriginAuthenticationError> {
         self.inner.transport.sign_origin_payload(payload)
+    }
+
+    /// Describe the local origin proof without performing a signature.
+    pub(crate) fn origin_signature_metadata(
+        &self,
+    ) -> Result<&OriginSignatureMetadata, OriginAuthenticationError> {
+        self.inner.transport.origin_signature_metadata()
     }
 
     /// Verify a routed logical-origin proof against the configured S2S CA.

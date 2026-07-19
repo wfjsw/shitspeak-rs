@@ -42,7 +42,9 @@ use super::endpoint::{
 };
 use super::error::{ConfigError, SendError, TransportError};
 use super::frame::encoded_data_frame_len;
-use super::identity::{NodeIdentity, OriginAuthenticationError, OriginSignature};
+use super::identity::{
+    NodeIdentity, OriginAuthenticationError, OriginSignature, OriginSignatureMetadata,
+};
 use super::metrics::{
     ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot,
     MetricsTuning, QueueWatermark, QueueWatermarkReport, TransportHealthExclusionReason,
@@ -56,6 +58,7 @@ use super::tls::build_tls_configs;
 const OUTBOUND_DISPATCH_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 const DEADLINE_DRAIN_FALLBACK_BYTES_PER_SEC: f64 = 16.0 * 1024.0;
 const DEADLINE_NEAR_EXPIRED_TTL: Duration = Duration::from_millis(20);
+const OUTBOUND_QUEUE_SATURATED_PERCENT: usize = 90;
 const MAX_CONSECUTIVE_HIGH_PRIORITY: usize = 32;
 const MAX_OUTBOUND_INGRESS_PER_TURN: usize = 256;
 const MAX_OUTBOUND_DISPATCH_ATTEMPTS_PER_TURN: usize = 128;
@@ -800,6 +803,19 @@ impl ConnectionManager {
             .sign_origin_payload(payload)
     }
 
+    /// Return the cached wire metadata for this node's detached origin proof
+    /// without performing a signature operation.
+    pub fn origin_signature_metadata(
+        &self,
+    ) -> Result<&OriginSignatureMetadata, OriginAuthenticationError> {
+        Ok(self
+            .inner
+            .identity
+            .as_ref()
+            .ok_or(OriginAuthenticationError::IdentityUnavailable)?
+            .origin_signature_metadata())
+    }
+
     /// Verify a detached origin proof against this node's configured S2S CA
     /// and the claimed logical node identifier.
     pub fn verify_origin_payload(
@@ -1419,8 +1435,9 @@ impl ConnectionManager {
     }
 
     /// Best queue-pressure penalty the sender would see for this peer now.
-    /// Lower is better; expiring sends use adaptive deadline pressure while
-    /// non-expiring regular sends use the existing queued-stream penalty.
+    /// Lower is better; this combines the peer dispatcher backlog with the
+    /// selected stream. Expiring sends include estimated drain time while
+    /// non-expiring sends use current fill for every message class.
     pub fn best_send_queue_pressure(
         &self,
         node: NodeIdentifier,
@@ -1568,12 +1585,16 @@ fn pick_transports(
     );
 
     if options.expires_at().is_some() {
-        ranked.sort_by_key(|kind| deadline_queue_penalty(peer, *kind, options, now));
+        ranked.sort_by_key(|kind| deadline_queue_penalty(peer, *kind, class, options, now));
         if class == MessageClass::HighPriority {
-            ranked.retain(|kind| deadline_queue_penalty(peer, *kind, options, now) < 3);
+            ranked.retain(|kind| deadline_queue_penalty(peer, *kind, class, options, now) < 3);
         }
-    } else if class == MessageClass::Regular {
-        ranked.sort_by_key(|kind| regular_queue_penalty(peer, *kind));
+    } else {
+        // A full stream cannot accept control or repair traffic any more than
+        // it can accept bulk traffic. Apply current queue pressure to every
+        // class so a reliable send does not keep selecting a saturated KCP
+        // stream merely because it has the best historical link metric.
+        ranked.sort_by_key(|kind| non_deadline_queue_penalty(peer, *kind));
     }
 
     ranked
@@ -1962,7 +1983,7 @@ fn tcp_transport_usable(
 ) -> bool {
     if peer
         .outbound_stream_queue_status(TransportKind::Tcp)
-        .is_some_and(|status| status.full_samples() > 0 && status.depth() > 0)
+        .is_some_and(|status| status.capacity() > 0 && status.depth() >= status.capacity())
     {
         return false;
     }
@@ -2040,19 +2061,56 @@ fn send_queue_penalty(
     now: Instant,
 ) -> u8 {
     if options.expires_at().is_some() {
-        deadline_queue_penalty(peer, transport, options, now)
-    } else if class == MessageClass::Regular {
-        regular_queue_penalty(peer, transport)
+        route_deadline_queue_penalty(peer, transport, class, options, now)
     } else {
-        0
+        non_deadline_queue_penalty(peer, transport).max(peer_queue_fill_penalty(peer, class))
     }
+}
+
+/// Queue pressure used while choosing an overlay first hop must include the
+/// routed peer queue as well as the selected transport's handoff queue. A
+/// saturated peer dispatcher otherwise looks healthy until after routing has
+/// already selected it and enqueue reports backpressure.
+fn route_deadline_queue_penalty(
+    peer: &PeerState,
+    transport: TransportKind,
+    class: MessageClass,
+    options: SendOptions,
+    now: Instant,
+) -> u8 {
+    let (peer_depth, peer_fill_penalty, peer_queue_full) = peer_queue_pressure(peer, class);
+    if peer_queue_full {
+        return 3;
+    }
+    deadline_queue_penalty_with_additional_depth(
+        peer,
+        transport,
+        class,
+        options,
+        now,
+        peer_depth,
+        peer_fill_penalty,
+    )
 }
 
 fn deadline_queue_penalty(
     peer: &PeerState,
     transport: TransportKind,
+    class: MessageClass,
     options: SendOptions,
     now: Instant,
+) -> u8 {
+    deadline_queue_penalty_with_additional_depth(peer, transport, class, options, now, 0, 0)
+}
+
+fn deadline_queue_penalty_with_additional_depth(
+    peer: &PeerState,
+    transport: TransportKind,
+    class: MessageClass,
+    options: SendOptions,
+    now: Instant,
+    additional_depth: usize,
+    additional_fill_penalty: u8,
 ) -> u8 {
     let Some(expires_at) = options.expires_at() else {
         return 0;
@@ -2065,11 +2123,17 @@ fn deadline_queue_penalty(
     let Some(status) = peer.outbound_stream_queue_status(transport) else {
         return 0;
     };
-    if status.full_samples() > 0 && status.depth() > 0 {
+    if status.capacity() > 0 && status.depth() >= status.capacity() {
+        return 3;
+    }
+    if class == MessageClass::Control
+        && (current_queue_fill_penalty(status.depth(), status.capacity()) == 3
+            || additional_fill_penalty == 3)
+    {
         return 3;
     }
 
-    let depth_bytes = status.depth();
+    let depth_bytes = status.depth().saturating_add(additional_depth);
     if depth_bytes == 0 {
         return 0;
     }
@@ -2092,6 +2156,22 @@ fn deadline_queue_penalty(
     }
 }
 
+fn peer_queue_fill_penalty(peer: &PeerState, class: MessageClass) -> u8 {
+    peer_queue_pressure(peer, class).1
+}
+
+fn peer_queue_pressure(peer: &PeerState, class: MessageClass) -> (usize, u8, bool) {
+    let sender = peer.outbound_sender();
+    let depth = sender.depth_bytes();
+    let capacity = sender.capacity_bytes();
+    let (class_depth, class_capacity) = sender.class_depth_and_capacity(class);
+    let fill_penalty = current_queue_fill_penalty(depth, capacity)
+        .max(current_queue_fill_penalty(class_depth, class_capacity));
+    let full = (capacity > 0 && depth >= capacity)
+        || (class_capacity > 0 && class_depth >= class_capacity);
+    (depth, fill_penalty, full)
+}
+
 fn estimated_drain_bytes_per_ms(peer: &PeerState, transport: TransportKind) -> f64 {
     let drain_bytes_per_sec = peer
         .metrics()
@@ -2103,14 +2183,23 @@ fn estimated_drain_bytes_per_ms(peer: &PeerState, transport: TransportKind) -> f
     drain_bytes_per_sec / 1_000.0
 }
 
-fn regular_queue_penalty(peer: &PeerState, transport: TransportKind) -> u8 {
+fn non_deadline_queue_penalty(peer: &PeerState, transport: TransportKind) -> u8 {
     let Some(status) = peer.outbound_stream_queue_status(transport) else {
         return 0;
     };
-    if status.depth() > 0 || status.full_samples() > 0 {
-        1
+    current_queue_fill_penalty(status.depth(), status.capacity())
+}
+
+fn current_queue_fill_penalty(depth: usize, capacity: usize) -> u8 {
+    if depth == 0 || capacity == 0 {
+        return 0;
+    }
+    if depth >= capacity
+        || depth.saturating_mul(100) >= capacity.saturating_mul(OUTBOUND_QUEUE_SATURATED_PERCENT)
+    {
+        3
     } else {
-        0
+        1
     }
 }
 
@@ -3032,6 +3121,75 @@ mod tests {
                 Bytes::from(vec![0; bytes]),
             ))
             .expect("stream queue should accept test payload");
+    }
+
+    fn fill_peer_dispatch_queue(peer: &PeerState, bytes: usize) {
+        peer.outbound_sender()
+            .try_send(OutboundEnvelope::routed(
+                ServiceLevel::Reliable,
+                RoutingMetric::ReliableCost,
+                MessageClass::Control,
+                Bytes::from(vec![0; bytes]),
+                SendOptions::default(),
+            ))
+            .expect("peer dispatch queue should accept test payload");
+    }
+
+    #[test]
+    fn same_kind_queue_status_tracks_newest_stream_used_for_send() {
+        let peer = PeerState::new(
+            2,
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+            MetricsTuning::default(),
+            1024 * 1024,
+        );
+        let (old_tx, mut old_rx) = test_outbound_queue(1);
+        old_tx
+            .try_send(OutboundFrame::new(
+                MessageClass::Regular,
+                Bytes::from(vec![0; 64 * 1024]),
+            ))
+            .expect("old stream queue should accept test payload");
+        peer.install_stream(ActiveStream::new(
+            TransportKind::Tcp,
+            Some(socket("127.0.0.1:41001")),
+            old_tx,
+            CancellationToken::new(),
+            false,
+        ));
+
+        std::thread::sleep(Duration::from_millis(1));
+        let (new_tx, mut new_rx) = test_outbound_queue(1);
+        peer.install_stream(ActiveStream::new(
+            TransportKind::Tcp,
+            Some(socket("127.0.0.1:41002")),
+            new_tx,
+            CancellationToken::new(),
+            false,
+        ));
+
+        let status = peer
+            .outbound_stream_queue_status(TransportKind::Tcp)
+            .expect("TCP queue status");
+        assert_eq!(status.depth(), 0, "status must describe the newest stream");
+
+        peer.try_get_stream(TransportKind::Tcp)
+            .expect("newest TCP stream")
+            .try_send(OutboundFrame::new(
+                MessageClass::Regular,
+                Bytes::from_static(b"newest"),
+            ))
+            .expect("newest stream should accept payload");
+        assert_eq!(
+            old_rx.try_recv().expect("old backlog").payload().len(),
+            64 * 1024
+        );
+        assert!(old_rx.try_recv().is_err());
+        assert_eq!(
+            new_rx.try_recv().expect("new stream payload").payload(),
+            &Bytes::from_static(b"newest")
+        );
     }
 
     fn age_zero_wire_metric(peer: &PeerState, kind: TransportKind, age: Duration) {
@@ -4016,14 +4174,7 @@ mod tests {
         for _ in 0..policy.udp_family_probe_loss_block_count() {
             peer.metrics().record_probe_lost(TransportKind::Quic);
         }
-        peer.record_outbound_stream_queue_sample(
-            TransportKind::Tcp,
-            MessageClass::HighPriority,
-            1024 * 1024,
-            1024 * 1024,
-            true,
-        );
-        fill_stream_queue(&peer, TransportKind::Tcp, 1);
+        fill_stream_queue(&peer, TransportKind::Tcp, 1024 * 1024 - 512);
 
         let ranked = pick_transports(
             &peer,
@@ -4195,14 +4346,7 @@ mod tests {
     fn expiring_high_priority_skips_saturated_kcp_when_alternative_exists() {
         let (peer, _receivers) =
             peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
-        peer.record_outbound_stream_queue_sample(
-            TransportKind::Kcp,
-            MessageClass::HighPriority,
-            1024 * 1024,
-            1024 * 1024,
-            true,
-        );
-        fill_stream_queue(&peer, TransportKind::Kcp, 1);
+        fill_stream_queue(&peer, TransportKind::Kcp, 1024 * 1024 - 512);
 
         let ranked = pick_transports(
             &peer,
@@ -4215,6 +4359,108 @@ mod tests {
         );
 
         assert_eq!(ranked, vec![TransportKind::Tcp]);
+    }
+
+    #[test]
+    fn non_expiring_repair_skips_currently_saturated_kcp_without_full_sample() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
+        // Reproduce the production watermark: the queue is effectively at
+        // capacity, but the periodic full-sample counter has already reset.
+        // Before current fill was considered for every class, best-effort
+        // control/repair traffic kept selecting KCP ahead of TCP.
+        fill_stream_queue(&peer, TransportKind::Kcp, 1024 * 1024 - 512);
+
+        let kcp_status = peer
+            .outbound_stream_queue_status(TransportKind::Kcp)
+            .expect("KCP queue status");
+        assert_eq!(kcp_status.full_samples(), 0);
+        assert!(kcp_status.depth() < kcp_status.capacity());
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::Control,
+            SendOptions::default(),
+            0,
+            TransportRoutingPolicy::default(),
+        );
+
+        assert_eq!(ranked.first().copied(), Some(TransportKind::Tcp));
+        assert_eq!(non_deadline_queue_penalty(&peer, TransportKind::Kcp), 3);
+    }
+
+    #[test]
+    fn route_pressure_includes_saturated_peer_dispatch_queue() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        let capacity = peer.outbound_queue_capacity_bytes();
+        fill_peer_dispatch_queue(
+            &peer,
+            capacity - super::super::adaptive_queue::QUEUE_ITEM_OVERHEAD_BYTES,
+        );
+
+        assert_eq!(non_deadline_queue_penalty(&peer, TransportKind::Tcp), 0);
+        assert_eq!(peer.outbound_queue_depth_bytes(), capacity);
+        assert_eq!(
+            send_queue_penalty(
+                &peer,
+                TransportKind::Tcp,
+                MessageClass::Control,
+                SendOptions::default(),
+                Instant::now(),
+            ),
+            3,
+        );
+    }
+
+    #[test]
+    fn expiring_control_repair_hard_penalizes_currently_saturated_kcp() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Kcp]);
+        fill_stream_queue(&peer, TransportKind::Kcp, 1024 * 1024 - 512);
+        peer.metrics()
+            .record_payload_sent(TransportKind::Kcp, 8 * 1024 * 1024);
+
+        let penalty = deadline_queue_penalty(
+            &peer,
+            TransportKind::Kcp,
+            MessageClass::Control,
+            SendOptions::default().expire_after(Duration::from_secs(2)),
+            Instant::now(),
+        );
+
+        assert_eq!(penalty, 3);
+    }
+
+    #[test]
+    fn expiring_primary_voice_uses_drain_time_at_ninety_percent_fill() {
+        let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Kcp]);
+        fill_stream_queue(&peer, TransportKind::Kcp, 1024 * 1024 - 512);
+        peer.metrics()
+            .record_payload_sent(TransportKind::Kcp, 8 * 1024 * 1024);
+        let options = SendOptions::default().expire_after(Duration::from_secs(2));
+
+        assert!(
+            deadline_queue_penalty(
+                &peer,
+                TransportKind::Kcp,
+                MessageClass::HighPriority,
+                options,
+                Instant::now(),
+            ) < 3
+        );
+
+        let ranked = pick_transports(
+            &peer,
+            ServiceLevel::ReliableLowLatency,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            options,
+            0,
+            TransportRoutingPolicy::default(),
+        );
+
+        assert_eq!(ranked, vec![TransportKind::Kcp]);
     }
 
     #[test]
@@ -4289,14 +4535,7 @@ mod tests {
     #[test]
     fn expiring_high_priority_reports_no_choice_when_only_kcp_is_saturated() {
         let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Kcp]);
-        peer.record_outbound_stream_queue_sample(
-            TransportKind::Kcp,
-            MessageClass::HighPriority,
-            1024 * 1024,
-            1024 * 1024,
-            true,
-        );
-        fill_stream_queue(&peer, TransportKind::Kcp, 1);
+        fill_stream_queue(&peer, TransportKind::Kcp, 1024 * 1024 - 512);
 
         let ranked = pick_transports(
             &peer,
@@ -4312,7 +4551,7 @@ mod tests {
     }
 
     #[test]
-    fn expiring_high_priority_reuses_drained_stream_after_historical_full_sample() {
+    fn expiring_high_priority_reuses_recovered_stream_after_historical_full_sample() {
         let (peer, _receivers) = peer_with_live_transports(&[TransportKind::Kcp]);
         peer.record_outbound_stream_queue_sample(
             TransportKind::Kcp,
@@ -4321,6 +4560,13 @@ mod tests {
             1024 * 1024,
             true,
         );
+        fill_stream_queue(&peer, TransportKind::Kcp, 1);
+
+        let status = peer
+            .outbound_stream_queue_status(TransportKind::Kcp)
+            .expect("KCP queue status");
+        assert_eq!(status.full_samples(), 1);
+        assert!(status.depth() < status.capacity());
 
         let ranked = pick_transports(
             &peer,
@@ -4360,6 +4606,7 @@ mod tests {
         let penalty = deadline_queue_penalty(
             &peer,
             TransportKind::Tcp,
+            MessageClass::Regular,
             SendOptions::default().expire_after(Duration::from_secs(1)),
             Instant::now(),
         );
@@ -4368,7 +4615,7 @@ mod tests {
     }
 
     #[test]
-    fn non_expiring_high_priority_keeps_existing_metric_order() {
+    fn non_expiring_high_priority_prefers_clear_stream_over_metric_order() {
         let (peer, _receivers) =
             peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
         fill_stream_queue(&peer, TransportKind::Tcp, 64 * 1024);
@@ -4383,7 +4630,7 @@ mod tests {
             TransportRoutingPolicy::default(),
         );
 
-        assert_eq!(ranked.first().copied(), Some(TransportKind::Tcp));
+        assert_eq!(ranked.first().copied(), Some(TransportKind::Kcp));
     }
 
     #[test]
