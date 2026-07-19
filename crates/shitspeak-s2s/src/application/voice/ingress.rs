@@ -64,6 +64,7 @@ const TAIL_REPAIR_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const TAIL_REPAIR_INTERVAL: Duration = Duration::from_millis(100);
 const TAIL_REPAIR_FAILURE_BACKOFF_MAX: Duration = Duration::from_millis(800);
 const TAIL_REPAIR_SEND_TIMEOUT_MAX: Duration = Duration::from_millis(100);
+const TAIL_REPAIR_CREDIT_COST_DIVISOR: usize = 2;
 
 /// Decoded inbound voice frame along with the immediate sender (next-hop
 /// peer that delivered the overlay frame, not necessarily the originator).
@@ -1998,7 +1999,8 @@ async fn dispatch_due_tail_repairs(
                 publish_proactive_budget(voice_budget);
                 break;
             };
-            let Some(credit_permit) = voice_budget.try_reserve_proactive_credit(body.len()) else {
+            let credit_cost = tail_repair_credit_cost(body.len());
+            let Some(credit_permit) = voice_budget.try_reserve_proactive_credit(credit_cost) else {
                 drop(queue_permit);
                 pressure.cancel_send(key.destination, pressure_token);
                 pressure_completed = true;
@@ -2006,9 +2008,12 @@ async fn dispatch_due_tail_repairs(
                 publish_proactive_budget(voice_budget);
                 break;
             };
-            // Tail retries share the same 25% source-side traffic credit as
-            // ordinary proactive copies. Consume credit once the transport
-            // attempt begins so a rejection cannot mint retry traffic.
+            // Tail retries share the source-side traffic credit with ordinary
+            // proactive copies, but consume it at half price. Since accepted
+            // primary traffic mints 25% credit, tail-only repair remains
+            // bounded to roughly 50% of primary voice bytes.
+            // Consume credit once the transport attempt begins so a rejection
+            // cannot mint retry traffic.
             credit_permit.commit();
             let send_result = tokio::time::timeout(
                 tail_repair_send_timeout(ttl),
@@ -2106,6 +2111,10 @@ fn tail_repair_send_timeout(transport_ttl: Duration) -> Duration {
     transport_ttl
         .min(TAIL_REPAIR_SEND_TIMEOUT_MAX)
         .max(Duration::from_millis(1))
+}
+
+fn tail_repair_credit_cost(bytes: usize) -> usize {
+    bytes.div_ceil(TAIL_REPAIR_CREDIT_COST_DIVISOR)
 }
 
 fn spawn_tail_ack(
@@ -3724,7 +3733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tail_repairs_require_proactive_credit() {
+    async fn tail_repairs_charge_half_proactive_credit() {
         let transport = FakeVoiceTransport::new(7, vec![2]);
         let repairs: TailRepairState = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let repair_cache = RepairCache::new(Duration::from_secs(10));
@@ -3747,7 +3756,12 @@ mod tests {
         assert!(transport.calls().is_empty());
         assert_eq!(voice_budget.proactive_reserved_bytes(), 0);
 
-        voice_budget.mint_proactive_credit(usize::MAX);
+        let cached = repair_cache.lookup_range(0xABB, 42, 0, 0);
+        let marked_body = send::mark_proactive_copy(cached[0].body()).unwrap();
+        let credit_cost = tail_repair_credit_cost(marked_body.len());
+        assert_eq!(credit_cost, marked_body.len().div_ceil(2));
+        assert!(credit_cost < marked_body.len());
+        voice_budget.mint_proactive_credit(credit_cost * 4);
         let retry_at = repairs.lock()[&key].next_retry;
         dispatch_due_tail_repairs(
             &repairs,
@@ -3761,6 +3775,7 @@ mod tests {
         .await;
         assert_eq!(transport.calls().len(), 1);
         assert_eq!(voice_budget.proactive_reserved_bytes(), 0);
+        assert_eq!(voice_budget.proactive_credit_balance_quarters(), 0);
     }
 
     #[tokio::test]
