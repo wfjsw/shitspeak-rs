@@ -29,7 +29,7 @@ impl TryFrom<crate::mumble_proto::user_state::VolumeAdjustment> for VolumeAdjust
     type Error = UserStateProtocolError;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UserState {
     pub session: Option<ClientSessionIdentifier>,
     pub actor: Option<ClientSessionIdentifier>,
