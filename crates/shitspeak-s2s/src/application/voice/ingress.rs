@@ -24,8 +24,8 @@ use crate::application::proto::{
 };
 use crate::application::voice::metrics;
 use crate::application::voice::metrics::{
-    VoiceIngressClass, VoiceProactiveResult, VoiceReceiveResult, VoiceRepairResult, VoiceSendMode,
-    VoiceSendResult,
+    VoiceIngressClass, VoiceProactiveKind, VoiceProactiveResult, VoiceReceiveResult,
+    VoiceRepairResult, VoiceSendMode, VoiceSendResult,
 };
 use crate::application::voice::reorder::{
     self, GapReport, Reorderer, VoiceCopyKind, VoiceRouteHint,
@@ -37,7 +37,7 @@ use crate::application::voice::send::{
 use crate::application::voice::sink::AudioSink;
 use crate::application::voice::targeted::{RecipientIndex, RemoteNodeLookup};
 use crate::application::voice::{AdaptiveVoiceBudget, VoiceBytePermit};
-use crate::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound};
+use crate::overlay::{OverlayInboundMessage, OverlayNetwork, ServiceInbound, VoiceRouteQuality};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::TransportKind;
 
@@ -502,6 +502,7 @@ impl VoiceService {
         max_users: Arc<AtomicU64>,
     ) -> Arc<Self> {
         let voice_budget = AdaptiveVoiceBudget::new(max_users.clone());
+        publish_proactive_budget(&voice_budget);
         let (primary_inbox_tx, primary_inbox_rx) = mpsc::unbounded_channel::<InboundVoiceWork>();
         let (proactive_inbox_tx, proactive_inbox_rx) =
             mpsc::unbounded_channel::<InboundVoiceWork>();
@@ -1198,11 +1199,20 @@ impl VoiceService {
         let now = Instant::now();
         let expires_at = now + tail_repair_lifetime(&self.cfg);
         self.extend_terminal_cache(sender_session, terminal_seq, terminal_body);
+        let destinations = dsts
+            .iter()
+            .copied()
+            .filter(|&destination| destination != self.transport.local_node_id())
+            .map(|destination| {
+                let delay = tail_repair_initial_delay(
+                    &self.cfg,
+                    self.transport.voice_route_quality(destination),
+                );
+                (destination, delay)
+            })
+            .collect::<Vec<_>>();
         let mut repairs = self.tail_repairs.lock();
-        for &destination in dsts {
-            if destination == self.transport.local_node_id() {
-                continue;
-            }
+        for (destination, initial_delay) in destinations {
             repairs.insert(
                 TailRepairKey {
                     destination,
@@ -1212,7 +1222,7 @@ impl VoiceService {
                 },
                 TailRepairEntry {
                     attempts: 0,
-                    next_retry: now + TAIL_REPAIR_INITIAL_DELAY,
+                    next_retry: now + initial_delay,
                     expires_at,
                 },
             );
@@ -1272,7 +1282,10 @@ impl VoiceService {
                 continue;
             }
             if self.proactive_pressure.is_blocked(dst, Instant::now()) {
-                metrics::record_proactive_outcome(VoiceProactiveResult::QueueShed);
+                metrics::record_proactive_outcome(
+                    VoiceProactiveKind::Ordinary,
+                    VoiceProactiveResult::QueueShed,
+                );
                 continue;
             }
             let quality = self.transport.voice_route_quality(dst);
@@ -1297,7 +1310,10 @@ impl VoiceService {
                 let reserve_bytes = original_body.len().saturating_add(3);
                 let Some(queue_permit) = self.voice_budget.try_reserve_proactive(reserve_bytes)
                 else {
-                    metrics::record_proactive_outcome(VoiceProactiveResult::BudgetShed);
+                    metrics::record_proactive_outcome(
+                        VoiceProactiveKind::Ordinary,
+                        VoiceProactiveResult::QueueBudgetShed,
+                    );
                     publish_proactive_budget(&self.voice_budget);
                     continue;
                 };
@@ -1306,7 +1322,10 @@ impl VoiceService {
                     .try_reserve_proactive_credit(reserve_bytes)
                 else {
                     drop(queue_permit);
-                    metrics::record_proactive_outcome(VoiceProactiveResult::BudgetShed);
+                    metrics::record_proactive_outcome(
+                        VoiceProactiveKind::Ordinary,
+                        VoiceProactiveResult::CreditShed,
+                    );
                     publish_proactive_budget(&self.voice_budget);
                     continue;
                 };
@@ -1332,9 +1351,15 @@ impl VoiceService {
                 };
                 if self.proactive_send_tx.send(work).is_ok() {
                     credit_permit.commit();
-                    metrics::record_proactive_outcome(VoiceProactiveResult::Queued);
+                    metrics::record_proactive_outcome(
+                        VoiceProactiveKind::Ordinary,
+                        VoiceProactiveResult::Queued,
+                    );
                 } else {
-                    metrics::record_proactive_outcome(VoiceProactiveResult::QueueShed);
+                    metrics::record_proactive_outcome(
+                        VoiceProactiveKind::Ordinary,
+                        VoiceProactiveResult::QueueShed,
+                    );
                 }
                 publish_proactive_budget(&self.voice_budget);
             }
@@ -1451,6 +1476,28 @@ fn adaptive_repair_transport_ttl(
         .map(|hint| Reorderer::route_repair_delay_ms_for_config(cfg, hint))
         .unwrap_or(base);
     Duration::from_millis(base.max(adaptive))
+}
+
+/// Wait long enough for a healthy terminal ACK to make a round trip before
+/// retransmitting the cached suffix. Route latency is an effective one-way
+/// estimate, so add it to the existing route-aware repair delay to cover the
+/// return leg. Keep one worker interval before cache expiry for a final try.
+fn tail_repair_initial_delay(cfg: &VoiceConfig, quality: Option<VoiceRouteQuality>) -> Duration {
+    let fallback_ms = TAIL_REPAIR_INITIAL_DELAY.as_millis() as u64;
+    let Some(quality) = quality else {
+        return TAIL_REPAIR_INITIAL_DELAY;
+    };
+    let lifetime_ms = tail_repair_lifetime(cfg).as_millis() as u64;
+    let scan_ms = TAIL_REPAIR_INTERVAL.as_millis() as u64;
+    let maximum_ms = lifetime_ms.saturating_sub(scan_ms).max(fallback_ms);
+    let path_ms = quality.path_latency_us().saturating_add(999) / 1_000;
+    let route_delay_ms =
+        Reorderer::route_repair_delay_ms_for_config(cfg, route_hint_from_quality(quality));
+    Duration::from_millis(
+        route_delay_ms
+            .saturating_add(path_ms)
+            .clamp(fallback_ms, maximum_ms),
+    )
 }
 
 fn normal_intent(channel_id: u32) -> VoiceIntent {
@@ -1815,7 +1862,10 @@ fn spawn_proactive_worker(
                 let pressure_token = match pressure.try_start_send(dst, Instant::now()) {
                     Ok(token) => token,
                     Err(_) => {
-                        metrics::record_proactive_outcome(VoiceProactiveResult::QueueShed);
+                        metrics::record_proactive_outcome(
+                            VoiceProactiveKind::Ordinary,
+                            VoiceProactiveResult::QueueShed,
+                        );
                         drop(_permit);
                         publish_proactive_budget(&voice_budget);
                         continue;
@@ -1842,7 +1892,10 @@ fn spawn_proactive_worker(
                             VoiceRepairResult::ProactiveCopySent,
                             1,
                         );
-                        metrics::record_proactive_outcome(VoiceProactiveResult::Sent);
+                        metrics::record_proactive_outcome(
+                            VoiceProactiveKind::Ordinary,
+                            VoiceProactiveResult::Sent,
+                        );
                     }
                     Err(error) => {
                         pressure.complete_failure(
@@ -1853,7 +1906,10 @@ fn spawn_proactive_worker(
                             PROACTIVE_FAILURE_BACKOFF_MAX,
                         );
                         trace!(%error, %dst, "voice proactive repair send failed; cooling down destination");
-                        metrics::record_proactive_outcome(VoiceProactiveResult::SendFailed);
+                        metrics::record_proactive_outcome(
+                            VoiceProactiveKind::Ordinary,
+                            VoiceProactiveResult::SendFailed,
+                        );
                     }
                 }
                 drop(_permit);
@@ -1995,7 +2051,10 @@ async fn dispatch_due_tail_repairs(
             let Some(queue_permit) = voice_budget.try_reserve_proactive(body.len()) else {
                 pressure.cancel_send(key.destination, pressure_token);
                 pressure_completed = true;
-                metrics::record_proactive_outcome(VoiceProactiveResult::BudgetShed);
+                metrics::record_proactive_outcome(
+                    VoiceProactiveKind::Tail,
+                    VoiceProactiveResult::QueueBudgetShed,
+                );
                 publish_proactive_budget(voice_budget);
                 break;
             };
@@ -2004,7 +2063,10 @@ async fn dispatch_due_tail_repairs(
                 drop(queue_permit);
                 pressure.cancel_send(key.destination, pressure_token);
                 pressure_completed = true;
-                metrics::record_proactive_outcome(VoiceProactiveResult::BudgetShed);
+                metrics::record_proactive_outcome(
+                    VoiceProactiveKind::Tail,
+                    VoiceProactiveResult::CreditShed,
+                );
                 publish_proactive_budget(voice_budget);
                 break;
             };
@@ -2023,13 +2085,23 @@ async fn dispatch_due_tail_repairs(
             drop(queue_permit);
             publish_proactive_budget(voice_budget);
             match send_result {
-                Ok(Ok(())) => metrics::record_repair(
-                    transport.local_node_id(),
-                    key.destination,
-                    VoiceRepairResult::TailRetrySent,
-                    1,
-                ),
+                Ok(Ok(())) => {
+                    metrics::record_repair(
+                        transport.local_node_id(),
+                        key.destination,
+                        VoiceRepairResult::TailRetrySent,
+                        1,
+                    );
+                    metrics::record_proactive_outcome(
+                        VoiceProactiveKind::Tail,
+                        VoiceProactiveResult::Sent,
+                    );
+                }
                 Ok(Err(error)) => {
+                    metrics::record_proactive_outcome(
+                        VoiceProactiveKind::Tail,
+                        VoiceProactiveResult::SendFailed,
+                    );
                     // A full or unavailable transport cannot usefully accept
                     // the rest of this suffix. Stop immediately so one tail
                     // does not amplify one queue rejection into eight.
@@ -2047,6 +2119,10 @@ async fn dispatch_due_tail_repairs(
                     break;
                 }
                 Err(_) => {
+                    metrics::record_proactive_outcome(
+                        VoiceProactiveKind::Tail,
+                        VoiceProactiveResult::SendFailed,
+                    );
                     failed = true;
                     let failure_completed_at = Instant::now().max(now);
                     destination_retry = Some(pressure.complete_failure(
@@ -3624,6 +3700,75 @@ mod tests {
             }
             other => panic!("expected tail acknowledgement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tail_retry_delay_uses_fallback_without_route_quality() {
+        assert_eq!(
+            tail_repair_initial_delay(&VoiceConfig::default(), None),
+            TAIL_REPAIR_INITIAL_DELAY,
+        );
+    }
+
+    #[test]
+    fn tail_retry_delay_covers_route_round_trip_and_quality_margin() {
+        let quality = VoiceRouteQuality::new(2, TransportKind::Tcp, 90_001, 20_999, 10_001);
+
+        assert_eq!(
+            tail_repair_initial_delay(&VoiceConfig::default(), Some(quality)),
+            Duration::from_millis(255),
+        );
+    }
+
+    #[test]
+    fn tail_retry_delay_leaves_one_worker_interval_before_cache_expiry() {
+        let quality = VoiceRouteQuality::new(2, TransportKind::Tcp, 1_000_000, 1_000_000, 100_000);
+        assert_eq!(
+            tail_repair_initial_delay(&VoiceConfig::default(), Some(quality)),
+            Duration::from_millis(1_500),
+        );
+
+        let mut short_cache = VoiceConfig::default();
+        short_cache.repair_cache_ms = 1;
+        assert_eq!(
+            tail_repair_initial_delay(&short_cache, Some(quality)),
+            Duration::from_millis(150),
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_repairs_use_destination_specific_route_delay() {
+        let transport = FakeVoiceTransport::new(7, vec![2, 3]);
+        transport.set_voice_route_quality(
+            2,
+            VoiceRouteQuality::new(2, TransportKind::Tcp, 1_000, 0, 0),
+        );
+        transport.set_voice_route_quality(
+            3,
+            VoiceRouteQuality::new(3, TransportKind::Tcp, 237_000, 0, 0),
+        );
+        let svc = VoiceService::new_with_transport(
+            transport,
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+
+        svc.register_terminal_repairs(0xABC, 0, Bytes::from_static(b"terminal"), true, &[2, 3]);
+
+        let repairs = svc.tail_repairs.lock();
+        let retry_for = |destination| {
+            repairs
+                .iter()
+                .find_map(|(key, entry)| {
+                    (key.destination == destination).then_some(entry.next_retry)
+                })
+                .expect("destination tail repair")
+        };
+        assert_eq!(
+            retry_for(3).duration_since(retry_for(2)),
+            Duration::from_millis(444),
+        );
     }
 
     #[tokio::test]

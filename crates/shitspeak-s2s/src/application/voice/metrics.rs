@@ -170,10 +170,26 @@ impl VoiceDeadlineWakeResult {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum VoiceProactiveKind {
+    Ordinary,
+    Tail,
+}
+
+impl VoiceProactiveKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::Tail => "tail",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum VoiceProactiveResult {
     Queued,
     Sent,
-    BudgetShed,
+    QueueBudgetShed,
+    CreditShed,
     QueueShed,
     SendFailed,
 }
@@ -183,7 +199,8 @@ impl VoiceProactiveResult {
         match self {
             Self::Queued => "queued",
             Self::Sent => "sent",
-            Self::BudgetShed => "budget_shed",
+            Self::QueueBudgetShed => "queue_budget_shed",
+            Self::CreditShed => "credit_shed",
             Self::QueueShed => "queue_shed",
             Self::SendFailed => "send_failed",
         }
@@ -281,7 +298,7 @@ struct VoiceAppMetrics {
     reorder_speaker_cap: u64,
     deadline_wakes: HashMap<VoiceDeadlineWakeResult, u64>,
     proactive_budget: ProactiveBudget,
-    proactive_outcomes: HashMap<VoiceProactiveResult, u64>,
+    proactive_outcomes: HashMap<(VoiceProactiveKind, VoiceProactiveResult), u64>,
     repair_cache: RepairCacheTelemetry,
 }
 
@@ -390,9 +407,12 @@ pub(crate) fn set_proactive_credit(balance_bytes: usize, cap_bytes: usize) {
     metrics.proactive_budget.credit_cap_bytes = cap_bytes as u64;
 }
 
-pub(crate) fn record_proactive_outcome(result: VoiceProactiveResult) {
+pub(crate) fn record_proactive_outcome(kind: VoiceProactiveKind, result: VoiceProactiveResult) {
     let mut metrics = METRICS.lock().unwrap();
-    *metrics.proactive_outcomes.entry(result).or_default() += 1;
+    *metrics
+        .proactive_outcomes
+        .entry((kind, result))
+        .or_default() += 1;
 }
 
 pub(crate) fn record_repair_cache_evictions(count: u64) {
@@ -522,10 +542,13 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         Vec::new(),
         metrics.proactive_budget.credit_cap_bytes as f64,
     ));
-    for (result, count) in &metrics.proactive_outcomes {
+    for ((kind, result), count) in &metrics.proactive_outcomes {
         out.push(PrometheusSample::new(
             "shitspeak_s2s_voice_proactive_events_total",
-            vec![("result".to_owned(), result.label().to_owned())],
+            vec![
+                ("kind".to_owned(), kind.label().to_owned()),
+                ("result".to_owned(), result.label().to_owned()),
+            ],
             *count as f64,
         ));
     }
@@ -677,11 +700,25 @@ mod tests {
         set_proactive_queue_budget(320_000, 65_536);
         set_proactive_credit(32_768, 80_000);
         record_repair_cache_evictions(3);
-        record_proactive_outcome(VoiceProactiveResult::Queued);
-        record_proactive_outcome(VoiceProactiveResult::Sent);
-        record_proactive_outcome(VoiceProactiveResult::BudgetShed);
-        record_proactive_outcome(VoiceProactiveResult::QueueShed);
-        record_proactive_outcome(VoiceProactiveResult::SendFailed);
+        record_proactive_outcome(VoiceProactiveKind::Ordinary, VoiceProactiveResult::Queued);
+        record_proactive_outcome(VoiceProactiveKind::Ordinary, VoiceProactiveResult::Sent);
+        record_proactive_outcome(
+            VoiceProactiveKind::Ordinary,
+            VoiceProactiveResult::QueueBudgetShed,
+        );
+        record_proactive_outcome(
+            VoiceProactiveKind::Ordinary,
+            VoiceProactiveResult::CreditShed,
+        );
+        record_proactive_outcome(
+            VoiceProactiveKind::Ordinary,
+            VoiceProactiveResult::QueueShed,
+        );
+        record_proactive_outcome(
+            VoiceProactiveKind::Ordinary,
+            VoiceProactiveResult::SendFailed,
+        );
+        record_proactive_outcome(VoiceProactiveKind::Tail, VoiceProactiveResult::Sent);
 
         let primary_drop = find_sample(
             "shitspeak_s2s_voice_ingress_admission_drops_total",
@@ -734,14 +771,31 @@ mod tests {
         assert!(credit_cap.labels().is_empty());
         let proactive_sent = find_sample(
             "shitspeak_s2s_voice_proactive_events_total",
-            &[("result", "sent")],
+            &[("kind", "ordinary"), ("result", "sent")],
         )
         .expect("proactive sent outcome");
         assert!(proactive_sent.value() >= 1.0);
         assert_eq!(
             proactive_sent.labels(),
-            &[("result".to_owned(), "sent".to_owned())]
+            &[
+                ("kind".to_owned(), "ordinary".to_owned()),
+                ("result".to_owned(), "sent".to_owned()),
+            ]
         );
+        for result in ["queue_budget_shed", "credit_shed"] {
+            let shed = find_sample(
+                "shitspeak_s2s_voice_proactive_events_total",
+                &[("kind", "ordinary"), ("result", result)],
+            )
+            .expect("distinct proactive budget outcome");
+            assert!(shed.value() >= 1.0);
+        }
+        let tail_sent = find_sample(
+            "shitspeak_s2s_voice_proactive_events_total",
+            &[("kind", "tail"), ("result", "sent")],
+        )
+        .expect("tail proactive outcome");
+        assert!(tail_sent.value() >= 1.0);
 
         let repair_cache_occupancy = find_sample("shitspeak_s2s_voice_repair_cache_occupancy", &[])
             .expect("repair cache occupancy");

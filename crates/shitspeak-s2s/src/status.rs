@@ -1048,7 +1048,7 @@ impl<'a> PrometheusWriter<'a> {
         );
         self.header(
             "shitspeak_s2s_voice_proactive_events_total",
-            "S2S voice proactive repair outcomes by bounded result.",
+            "S2S voice proactive repair outcomes by bounded kind and result.",
             "counter",
         );
         self.header(

@@ -637,13 +637,14 @@ Per-edge tree traffic comes from
 `direction="sent"`. It exposes original and repair frames/bytes separately by
 directed edge without adding group or tree-version label cardinality.
 
-Adaptive voice protection observability is cluster-aggregated in Grafana.
-`shitspeak_s2s_voice_ingress_admission_drops_total` and
-`shitspeak_s2s_voice_proactive_events_total` retain only bounded `class` or
-`result` labels. Capacity, tracked-speaker, deadline-wake, queue, and credit
-metrics are aggregated across nodes so the dashboard does not create per-node
-legends. `shitspeak_s2s_voice_receive_events_total{result="speaker_state_drop"}`
-reports a dynamic speaker-cap admission refusal.
+Adaptive voice protection observability uses bounded labels.
+`shitspeak_s2s_voice_ingress_admission_drops_total` retains the bounded `class`
+label, while `shitspeak_s2s_voice_proactive_events_total` uses bounded `kind`
+and `result` labels to distinguish ordinary copies from terminal-tail work and
+credit exhaustion from queue pressure. Grafana shows proactive queue and credit
+utilization per node because those limits are enforced locally.
+`shitspeak_s2s_voice_receive_events_total{result="speaker_state_drop"}` reports
+a dynamic speaker-cap admission refusal.
 
 See [Clustering](clustering.md) for certificate generation, local demos, and S2S operational notes.
 

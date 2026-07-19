@@ -8010,8 +8010,15 @@
         "defaults": {
           "color": { "mode": "palette-classic" },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
-          "unit": "bytes"
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": 0 },
+              { "color": "orange", "value": 75 },
+              { "color": "red", "value": 90 }
+            ]
+          },
+          "unit": "percent"
         },
         "overrides": []
       },
@@ -8031,21 +8038,13 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum(shitspeak_s2s_voice_proactive_queue_capacity_bytes{job=~\"$job\"})",
-          "legendFormat": "capacity",
+          "expr": "(100 * sum by (job, instance) (shitspeak_s2s_voice_proactive_queue_used_bytes{job=~\"$job\"}) / sum by (job, instance) (shitspeak_s2s_voice_proactive_queue_capacity_bytes{job=~\"$job\"})) and on (job, instance) (sum by (job, instance) (shitspeak_s2s_voice_proactive_queue_capacity_bytes{job=~\"$job\"}) > 0)",
+          "legendFormat": "{{instance}} utilization",
           "range": true,
           "refId": "A"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "editorMode": "code",
-          "expr": "sum(shitspeak_s2s_voice_proactive_queue_used_bytes{job=~\"$job\"})",
-          "legendFormat": "used",
-          "range": true,
-          "refId": "B"
         }
       ],
-      "title": "Proactive Queue Capacity and Usage",
+      "title": "Proactive Queue Utilization by Node",
       "type": "timeseries"
     },
     {
@@ -8057,8 +8056,15 @@
         "defaults": {
           "color": { "mode": "palette-classic" },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
-          "unit": "bytes"
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "orange", "value": 25 },
+              { "color": "green", "value": 50 }
+            ]
+          },
+          "unit": "percent"
         },
         "overrides": []
       },
@@ -8078,21 +8084,13 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum(shitspeak_s2s_voice_proactive_credit_balance_bytes{job=~\"$job\"})",
-          "legendFormat": "credit balance",
+          "expr": "(100 * sum by (job, instance) (shitspeak_s2s_voice_proactive_credit_balance_bytes{job=~\"$job\"}) / sum by (job, instance) (shitspeak_s2s_voice_proactive_credit_cap_bytes{job=~\"$job\"})) and on (job, instance) (sum by (job, instance) (shitspeak_s2s_voice_proactive_credit_cap_bytes{job=~\"$job\"}) > 0)",
+          "legendFormat": "{{instance}} available",
           "range": true,
           "refId": "A"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "editorMode": "code",
-          "expr": "sum(shitspeak_s2s_voice_proactive_credit_cap_bytes{job=~\"$job\"})",
-          "legendFormat": "credit capacity",
-          "range": true,
-          "refId": "B"
         }
       ],
-      "title": "Proactive Credit Balance",
+      "title": "Proactive Available Credit by Node",
       "type": "timeseries"
     },
     {
@@ -8128,13 +8126,13 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum by (result) (rate(shitspeak_s2s_voice_proactive_events_total{job=~\"$job\"}[$__rate_interval]))",
-          "legendFormat": "{{result}}",
+          "expr": "sum by (job, instance, kind, result) (rate(shitspeak_s2s_voice_proactive_events_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} {{kind}} {{result}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Proactive Repair Outcomes/s",
+      "title": "Proactive Repair Outcomes/s by Node and Kind",
       "type": "timeseries"
     }
   ],
@@ -8198,6 +8196,6 @@
   "timezone": "browser",
   "title": "ShitSpeak",
   "uid": "shitspeak-s2s-topology",
-  "version": 61,
+  "version": 62,
   "weekStart": ""
 }
