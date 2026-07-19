@@ -1307,6 +1307,7 @@ enum SnapshotReceiveOutcome {
         snapshot_msgpack: Vec<u8>,
         snapshot_sha256: Bytes,
     },
+    Duplicate,
     Restart,
 }
 
@@ -1397,9 +1398,19 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
             || transfer.snapshot_sha256 != resp.snapshot_sha256
             || transfer.rank != remote_rank
             || transfer.terminal_decision_generation != resp.terminal_decision_generation
-            || transfer.next_cursor != resp.snapshot_chunk_cursor
+        {
+            receivers.remove(&from);
+            return SnapshotReceiveOutcome::Restart;
+        }
+        if transfer.next_cursor != resp.snapshot_chunk_cursor
             || transfer.snapshot_msgpack.len() != chunk_cursor
         {
+            let duplicate = next_cursor <= transfer.snapshot_msgpack.len()
+                && transfer.snapshot_msgpack.get(chunk_cursor..next_cursor)
+                    == Some(resp.snapshot_msgpack.as_ref());
+            if duplicate {
+                return SnapshotReceiveOutcome::Duplicate;
+            }
             receivers.remove(&from);
             return SnapshotReceiveOutcome::Restart;
         }
@@ -1570,6 +1581,14 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
                 apply_started_at,
             )
             .await;
+        }
+        SnapshotReceiveOutcome::Duplicate => {
+            trace!(
+                from,
+                transfer_id = resp.snapshot_transfer_id,
+                chunk_cursor = resp.snapshot_chunk_cursor,
+                "ignoring already-applied strict v2 snapshot chunk"
+            );
         }
         SnapshotReceiveOutcome::Restart => {
             rt.snapshot_receivers.lock().remove(&from);
@@ -2444,6 +2463,86 @@ mod tests {
 
         assert_eq!(sink_repo.current_version(), 96);
         assert_eq!(sink_repo.log(), expected_log);
+    }
+
+    #[tokio::test]
+    async fn duplicate_v2_snapshot_chunk_is_idempotent() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
+        let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
+        populate_repo(&source_repo, 96, 4_000);
+        let (sink, sink_net, sink_repo) = test_runtime(2, cfg);
+        begin_snapshot_fetch(&sink, 96);
+
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_response = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(first_response.snapshot_has_more);
+
+        apply_response(&sink, 1, first_response.clone()).await;
+        let continuation = catchup_request(sink_net.drain_captures().pop().unwrap());
+        let receiver_before_duplicate = {
+            let receivers = sink.snapshot_receivers.lock();
+            let receiver = receivers.get(&1).unwrap();
+            (receiver.next_cursor, receiver.snapshot_msgpack.clone())
+        };
+        apply_response(&sink, 1, first_response).await;
+
+        assert!(sink_net.drain_captures().is_empty());
+        let receiver_after_duplicate = {
+            let receivers = sink.snapshot_receivers.lock();
+            let receiver = receivers.get(&1).unwrap();
+            (receiver.next_cursor, receiver.snapshot_msgpack.clone())
+        };
+        assert_eq!(receiver_after_duplicate, receiver_before_duplicate);
+        assert!(
+            sink.state
+                .lock()
+                .history_election_fetching_snapshot()
+                .is_some()
+        );
+        assert_eq!(sink_repo.current_version(), 0);
+
+        let mut request = continuation;
+        loop {
+            respond_to_request(&source, 2, request).await;
+            let response = catchup_response(source_net.drain_captures().pop().unwrap());
+            let has_more = response.snapshot_has_more;
+            apply_response(&sink, 1, response).await;
+            let captures = sink_net.drain_captures();
+            if has_more {
+                assert_eq!(captures.len(), 1);
+                request = catchup_request(captures.into_iter().next().unwrap());
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(sink_repo.current_version(), 96);
+        assert_eq!(sink_repo.log(), source_repo.log());
+    }
+
+    #[tokio::test]
+    async fn altered_duplicate_v2_snapshot_chunk_rearms_without_installing() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
+        let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
+        populate_repo(&source_repo, 96, 5_000);
+        let (sink, sink_net, sink_repo) = test_runtime(2, cfg);
+        begin_snapshot_fetch(&sink, 96);
+
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_response = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(first_response.snapshot_has_more);
+        apply_response(&sink, 1, first_response.clone()).await;
+        sink_net.drain_captures();
+
+        let mut altered = first_response;
+        let mut chunk = altered.snapshot_msgpack.to_vec();
+        chunk[0] ^= 0x80;
+        altered.snapshot_msgpack = Bytes::from(chunk);
+        apply_response(&sink, 1, altered).await;
+
+        assert_eq!(sink_repo.current_version(), 0);
+        assert!(!sink.snapshot_receivers.lock().contains_key(&1));
+        assert!(sink.state.lock().history_election_pending());
     }
 
     #[tokio::test]
