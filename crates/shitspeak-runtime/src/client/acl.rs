@@ -46,7 +46,8 @@ async fn compute_permissions_for_client_inner(
 
     let channels = server.get_channels();
     let server_id = client.server_id();
-    let client_acl_generation = client.get_acl_generation();
+    let (client_acl_subject_generation, client_acl_home_generation) =
+        client.get_acl_cache_generations();
     let channel_acl_generation =
         channels.channel_acl_generation_for_channel(&server_id, channel_id);
     let cache_session = u64::from(session);
@@ -54,25 +55,36 @@ async fn compute_permissions_for_client_inner(
     let use_acl_cache = !is_superuser && home_channel_override.is_none();
 
     if use_acl_cache
-        && let Some(permissions) = channels
-            .get_cached_permissions_in_server(
+        && let Some(cache_hit) = channels
+            .get_cached_permissions_in_server_with_generations(
                 &server_id,
                 cache_session,
                 cache_client_instance,
                 channel_id,
                 channel_acl_generation,
-                client_acl_generation,
+                client_acl_subject_generation,
+                client_acl_home_generation,
                 explicit_enter_deny_overrides_write,
             )
             .await
     {
-        tracing::trace!(
-            session,
-            channel_id,
-            permissions = ?permissions,
-            "ACL cache hit"
-        );
-        return permissions;
+        let (current_subject_generation, current_home_generation) =
+            client.get_acl_cache_generations();
+        if channels.channel_acl_generation_for_channel(&server_id, channel_id)
+            == channel_acl_generation
+            && current_subject_generation == client_acl_subject_generation
+            && (!cache_hit.depends_on_home_channel()
+                || current_home_generation == client_acl_home_generation)
+        {
+            let permissions = cache_hit.permissions();
+            tracing::trace!(
+                session,
+                channel_id,
+                permissions = ?permissions,
+                "ACL cache hit"
+            );
+            return permissions;
+        }
     }
 
     let (channel_acl_generation, channel, ancestors) = channels
@@ -82,6 +94,8 @@ async fn compute_permissions_for_client_inner(
         tracing::trace!(session, channel_id, "ACL compute found no channel");
         return enumflags2::BitFlags::empty();
     };
+    let depends_on_home_channel =
+        shitspeak_state::effective_acl_chain_has_home_channel_dependent_group(&channel, &ancestors);
 
     let user_id = client.get_user_id();
     let groups: Vec<String> = client.get_groups_clone().into_iter().collect();
@@ -181,19 +195,23 @@ async fn compute_permissions_for_client_inner(
         "Computed ACL permissions"
     );
 
+    let (current_subject_generation, current_home_generation) = client.get_acl_cache_generations();
     if use_acl_cache
         && channels.channel_acl_generation_for_channel(&server_id, channel_id)
             == channel_acl_generation
-        && client.get_acl_generation() == client_acl_generation
+        && current_subject_generation == client_acl_subject_generation
+        && (!depends_on_home_channel || current_home_generation == client_acl_home_generation)
     {
         channels
-            .cache_permissions_in_server(
+            .cache_permissions_in_server_with_generations(
                 &server_id,
                 cache_session,
                 cache_client_instance,
                 channel_id,
                 channel_acl_generation,
-                client_acl_generation,
+                client_acl_subject_generation,
+                client_acl_home_generation,
+                depends_on_home_channel,
                 explicit_enter_deny_overrides_write,
                 permissions,
             )

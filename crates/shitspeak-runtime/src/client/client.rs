@@ -875,6 +875,10 @@ impl Client {
         self.global_state.read().get_acl_generation()
     }
 
+    pub fn get_acl_cache_generations(&self) -> (u64, u64) {
+        self.global_state.read().get_acl_cache_generations()
+    }
+
     // pub fn get_display_name(&self) -> Option<String> {
     //     match &*self.user_info.lock() {
     //         Some(info) => Some(info.get_display_name().clone()),

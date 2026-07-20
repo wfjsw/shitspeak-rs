@@ -491,9 +491,47 @@ struct Snapshot {
 #[derive(Clone, Copy, Debug)]
 struct CachedAclPermissions {
     channel_acl_generation: u64,
-    client_acl_generation: u64,
+    client_acl_subject_generation: u64,
+    client_acl_home_generation: u64,
+    depends_on_home_channel: bool,
     explicit_enter_deny_overrides_write: bool,
     permissions: BitFlags<ACLPermissions>,
+}
+
+impl CachedAclPermissions {
+    fn hit_for(
+        &self,
+        channel_acl_generation: u64,
+        client_acl_subject_generation: u64,
+        client_acl_home_generation: u64,
+        explicit_enter_deny_overrides_write: bool,
+    ) -> Option<AclCacheHit> {
+        let cache_key_matches = self.channel_acl_generation == channel_acl_generation
+            && self.client_acl_subject_generation == client_acl_subject_generation
+            && (!self.depends_on_home_channel
+                || self.client_acl_home_generation == client_acl_home_generation)
+            && self.explicit_enter_deny_overrides_write == explicit_enter_deny_overrides_write;
+        cache_key_matches.then_some(AclCacheHit {
+            permissions: self.permissions,
+            depends_on_home_channel: self.depends_on_home_channel,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AclCacheHit {
+    permissions: BitFlags<ACLPermissions>,
+    depends_on_home_channel: bool,
+}
+
+impl AclCacheHit {
+    pub fn permissions(self) -> BitFlags<ACLPermissions> {
+        self.permissions
+    }
+
+    pub fn depends_on_home_channel(self) -> bool {
+        self.depends_on_home_channel
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2194,6 +2232,31 @@ impl ChannelRepository {
         client_acl_generation: u64,
         explicit_enter_deny_overrides_write: bool,
     ) -> Option<BitFlags<ACLPermissions>> {
+        self.get_cached_permissions_in_server_with_generations(
+            server_id,
+            session_id,
+            client_instance_id,
+            channel_id,
+            channel_acl_generation,
+            client_acl_generation,
+            client_acl_generation,
+            explicit_enter_deny_overrides_write,
+        )
+        .await
+        .map(AclCacheHit::permissions)
+    }
+
+    pub async fn get_cached_permissions_in_server_with_generations(
+        &self,
+        server_id: &str,
+        session_id: u64,
+        client_instance_id: u64,
+        channel_id: u32,
+        channel_acl_generation: u64,
+        client_acl_subject_generation: u64,
+        client_acl_home_generation: u64,
+        explicit_enter_deny_overrides_write: bool,
+    ) -> Option<AclCacheHit> {
         self.acl_cache
             .get_sync(&(
                 server_id.to_owned(),
@@ -2202,11 +2265,12 @@ impl ChannelRepository {
                 channel_id,
             ))
             .and_then(|entry| {
-                let cache_key_matches = entry.channel_acl_generation == channel_acl_generation
-                    && entry.client_acl_generation == client_acl_generation
-                    && entry.explicit_enter_deny_overrides_write
-                        == explicit_enter_deny_overrides_write;
-                cache_key_matches.then_some(entry.permissions)
+                entry.hit_for(
+                    channel_acl_generation,
+                    client_acl_subject_generation,
+                    client_acl_home_generation,
+                    explicit_enter_deny_overrides_write,
+                )
             })
     }
 
@@ -2243,6 +2307,34 @@ impl ChannelRepository {
         explicit_enter_deny_overrides_write: bool,
         permissions: BitFlags<ACLPermissions>,
     ) {
+        self.cache_permissions_in_server_with_generations(
+            server_id,
+            session_id,
+            client_instance_id,
+            channel_id,
+            channel_acl_generation,
+            client_acl_generation,
+            client_acl_generation,
+            true,
+            explicit_enter_deny_overrides_write,
+            permissions,
+        )
+        .await;
+    }
+
+    pub async fn cache_permissions_in_server_with_generations(
+        &self,
+        server_id: &str,
+        session_id: u64,
+        client_instance_id: u64,
+        channel_id: u32,
+        channel_acl_generation: u64,
+        client_acl_subject_generation: u64,
+        client_acl_home_generation: u64,
+        depends_on_home_channel: bool,
+        explicit_enter_deny_overrides_write: bool,
+        permissions: BitFlags<ACLPermissions>,
+    ) {
         let key = (
             server_id.to_owned(),
             session_id,
@@ -2254,7 +2346,9 @@ impl ChannelRepository {
             .entry_sync(key)
             .put_entry(CachedAclPermissions {
                 channel_acl_generation,
-                client_acl_generation,
+                client_acl_subject_generation,
+                client_acl_home_generation,
+                depends_on_home_channel,
                 explicit_enter_deny_overrides_write,
                 permissions,
             });
@@ -4160,6 +4254,37 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    fn cached_permissions(depends_on_home_channel: bool) -> CachedAclPermissions {
+        CachedAclPermissions {
+            channel_acl_generation: 3,
+            client_acl_subject_generation: 5,
+            client_acl_home_generation: 7,
+            depends_on_home_channel,
+            explicit_enter_deny_overrides_write: false,
+            permissions: ACLPermissions::Enter.into(),
+        }
+    }
+
+    #[test]
+    fn home_independent_acl_cache_entry_survives_home_generation_change() {
+        let entry = cached_permissions(false);
+
+        let hit = entry.hit_for(3, 5, 99, false).unwrap();
+        let expected_permissions: BitFlags<ACLPermissions> = ACLPermissions::Enter.into();
+
+        assert_eq!(hit.permissions(), expected_permissions);
+        assert!(!hit.depends_on_home_channel());
+        assert!(entry.hit_for(3, 6, 7, false).is_none());
+    }
+
+    #[test]
+    fn home_dependent_acl_cache_entry_validates_home_generation() {
+        let entry = cached_permissions(true);
+
+        assert!(entry.hit_for(3, 5, 99, false).is_none());
+        assert!(entry.hit_for(3, 5, 7, false).is_some());
+    }
 
     #[derive(Default)]
     struct RecordingObserver {

@@ -398,28 +398,28 @@ fn is_acl_cache_flush_message(message: &Message) -> bool {
 }
 
 #[derive(Clone, Copy)]
-enum PermissionInfoRefreshScope {
+enum PermissionInfoRefreshKind {
     All,
-    HomeChannelDependent {
-        old_channel_id: Option<u32>,
-        new_channel_id: u32,
-    },
+    HomeChannelDependent { new_channel_id: u32 },
+}
+
+#[derive(Clone, Copy)]
+enum PermissionInfoRefreshScope<'a> {
+    All,
+    HomeChannelDependent(&'a crate::channel_handler::HomeChannelMoveImpact),
 }
 
 fn permission_info_refresh_scope_for_delta(
     delta: &ClientGlobalStateDelta,
-) -> Option<PermissionInfoRefreshScope> {
+) -> Option<PermissionInfoRefreshKind> {
     if delta.user_id.is_some()
         || delta.groups.is_some()
         || delta.is_superuser.is_some()
         || delta.tokens.is_some()
     {
-        Some(PermissionInfoRefreshScope::All)
+        Some(PermissionInfoRefreshKind::All)
     } else if let Some(new_channel_id) = delta.current_channel_id {
-        Some(PermissionInfoRefreshScope::HomeChannelDependent {
-            old_channel_id: None,
-            new_channel_id,
-        })
+        Some(PermissionInfoRefreshKind::HomeChannelDependent { new_channel_id })
     } else {
         None
     }
@@ -429,7 +429,7 @@ fn permission_info_refresh_scope_for_entry(
     entry: &crate::client::state_log::ClientStateLogEntry,
     viewer_session_id: ClientSessionIdentifier,
     viewer_client_instance_id: ClientInstanceId,
-) -> Option<PermissionInfoRefreshScope> {
+) -> Option<PermissionInfoRefreshKind> {
     match &entry.op {
         ClientStateOperation::UpdateGlobalState {
             session_id,
@@ -462,7 +462,7 @@ pub(super) fn sorted_channel_ids(channel_ids: &HashSet<u32>) -> Vec<u32> {
 async fn permission_info_refresh_messages(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    scope: PermissionInfoRefreshScope,
+    scope: PermissionInfoRefreshScope<'_>,
 ) -> Vec<Message> {
     match scope {
         PermissionInfoRefreshScope::All => {
@@ -485,16 +485,9 @@ async fn permission_info_refresh_messages(
             }
             messages
         }
-        PermissionInfoRefreshScope::HomeChannelDependent {
-            old_channel_id,
-            new_channel_id,
-        } => {
-            crate::channel_handler::build_home_channel_permission_info_refresh_messages(
-                server,
-                client,
-                server.get_channels(),
-                old_channel_id,
-                new_channel_id,
+        PermissionInfoRefreshScope::HomeChannelDependent(impact) => {
+            crate::channel_handler::build_home_channel_permission_info_refresh_messages_from_impact(
+                server, client, impact,
             )
             .await
         }
@@ -528,7 +521,7 @@ async fn write_projected_client_log_message_with_acl_refresh_scope(
     session_channel_shadow: &mut SessionChannelShadow,
     server_id: &str,
     message: &Message,
-    refresh_scope: PermissionInfoRefreshScope,
+    refresh_scope: PermissionInfoRefreshScope<'_>,
 ) -> Result<(), HandleIncomingConnectionError> {
     let mut out = crate::client::visibility::project_message_with_shadow(
         server,
@@ -577,7 +570,7 @@ async fn projected_client_log_messages_with_acl_refresh_scope(
     session_channel_shadow: &mut SessionChannelShadow,
     server_id: &str,
     message: &Message,
-    refresh_scope: PermissionInfoRefreshScope,
+    refresh_scope: PermissionInfoRefreshScope<'_>,
 ) -> Vec<Message> {
     let mut out = project_message_with_visibility_shadows(
         server,
@@ -696,38 +689,60 @@ async fn append_client_log_entry_messages(
     let old_viewer_channel_id = session_channel_shadow
         .get(&client.get_session_id())
         .copied();
-    let permission_refresh_scope = permission_info_refresh_scope_for_entry(
+    let permission_refresh_kind = permission_info_refresh_scope_for_entry(
         entry,
         client.get_session_id(),
         client.client_instance_id(),
     )
-    .map(|scope| match scope {
-        PermissionInfoRefreshScope::HomeChannelDependent {
-            old_channel_id: _,
-            new_channel_id,
-        } => PermissionInfoRefreshScope::HomeChannelDependent {
-            old_channel_id: old_viewer_channel_id,
-            new_channel_id,
-        },
-        scope => scope,
-    })
-    .unwrap_or(PermissionInfoRefreshScope::All);
+    .unwrap_or(PermissionInfoRefreshKind::All);
+
+    let home_move_impact = match permission_refresh_kind {
+        PermissionInfoRefreshKind::HomeChannelDependent { new_channel_id } => Some(
+            crate::channel_handler::HomeChannelMoveImpact::calculate(
+                server,
+                client,
+                old_viewer_channel_id,
+                new_channel_id,
+            )
+            .await,
+        ),
+        PermissionInfoRefreshKind::All => None,
+    };
+    let permission_refresh_scope = match home_move_impact.as_ref() {
+        Some(impact) => PermissionInfoRefreshScope::HomeChannelDependent(impact),
+        None => PermissionInfoRefreshScope::All,
+    };
 
     let visibility_refresh_scope =
-        crate::client::visibility::visibility_refresh_scope_for_client_log_entry(
+        crate::client::visibility::visibility_refresh_scope_for_client_log_entry_with_home_move_impact(
             server,
             client,
             entry,
             old_viewer_channel_id,
+            home_move_impact.as_ref(),
         )
         .await;
-    let channel_refresh = crate::channel_handler::prepare_channel_visibility_refresh(
-        server,
-        client,
-        channel_tree_shadow,
-        &visibility_refresh_scope,
-    )
-    .await;
+    let channel_refresh = match home_move_impact.as_ref() {
+        Some(impact) => {
+            crate::channel_handler::prepare_channel_visibility_refresh_for_home_move(
+                server,
+                client,
+                channel_tree_shadow,
+                &visibility_refresh_scope,
+                impact,
+            )
+            .await
+        }
+        None => {
+            crate::channel_handler::prepare_channel_visibility_refresh(
+                server,
+                client,
+                channel_tree_shadow,
+                &visibility_refresh_scope,
+            )
+            .await
+        }
+    };
 
     channel_refresh.apply_additions(channel_tree_shadow);
     channel_refresh.append_additions_to(out);

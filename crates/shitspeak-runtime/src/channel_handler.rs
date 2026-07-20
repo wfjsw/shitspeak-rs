@@ -134,6 +134,78 @@ pub struct ChannelTreeShadow {
     channel_ids: HashSet<u32>,
 }
 
+/// The channel-tree work shared by permission and visibility refreshes after
+/// the viewing client moves.  Keeping the snapshot here prevents each path
+/// from independently cloning and indexing the complete channel tree.
+#[derive(Debug)]
+pub(crate) struct HomeChannelMoveImpact {
+    channels: Vec<Channel>,
+    channel_indexes: HashMap<u32, usize>,
+    permission_channel_ids: HashSet<u32>,
+    visibility_channel_ids: HashSet<u32>,
+}
+
+impl HomeChannelMoveImpact {
+    pub(crate) async fn calculate(
+        server: &Arc<Box<Server>>,
+        client: &Arc<Box<Client>>,
+        old_channel_id: Option<u32>,
+        new_channel_id: u32,
+    ) -> Self {
+        let server_id = client.server_id();
+        let channels = server.get_channels().get_all_in_server(&server_id).await;
+        Self::from_channels(channels, old_channel_id, new_channel_id)
+    }
+
+    fn from_channels(
+        channels: Vec<Channel>,
+        old_channel_id: Option<u32>,
+        new_channel_id: u32,
+    ) -> Self {
+        let tree = ChannelTree::new(&channels);
+        let permission_channel_ids = match old_channel_id {
+            Some(old_channel_id) => tree.home_channel_move_affected_channel_ids_for_channel_ids(
+                old_channel_id,
+                new_channel_id,
+            ),
+            None => tree.home_channel_dependent_acl_channel_ids(),
+        };
+        let mut visibility_channel_ids = permission_channel_ids.clone();
+        tree.expand_descendant_closure(&mut visibility_channel_ids);
+        drop(tree);
+        let channel_indexes = channels
+            .iter()
+            .enumerate()
+            .map(|(index, channel)| (channel.id, index))
+            .collect();
+
+        Self {
+            channels,
+            channel_indexes,
+            permission_channel_ids,
+            visibility_channel_ids,
+        }
+    }
+
+    pub(crate) fn channels(&self) -> &[Channel] {
+        &self.channels
+    }
+
+    pub(crate) fn permission_channel_ids(&self) -> &HashSet<u32> {
+        &self.permission_channel_ids
+    }
+
+    fn channel(&self, channel_id: u32) -> Option<&Channel> {
+        self.channel_indexes
+            .get(&channel_id)
+            .map(|index| &self.channels[*index])
+    }
+
+    pub(crate) fn visibility_channel_ids(&self) -> &HashSet<u32> {
+        &self.visibility_channel_ids
+    }
+}
+
 impl ChannelTreeShadow {
     pub fn new() -> Self {
         Self::default()
@@ -597,6 +669,33 @@ pub async fn prepare_channel_visibility_refresh(
     channel_tree_shadow: &ChannelTreeShadow,
     scope: &crate::client::visibility::VisibilityRefreshScope,
 ) -> ChannelVisibilityRefresh {
+    prepare_channel_visibility_refresh_inner(server, client, channel_tree_shadow, scope, None).await
+}
+
+pub(crate) async fn prepare_channel_visibility_refresh_for_home_move(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &ChannelTreeShadow,
+    scope: &crate::client::visibility::VisibilityRefreshScope,
+    impact: &HomeChannelMoveImpact,
+) -> ChannelVisibilityRefresh {
+    prepare_channel_visibility_refresh_inner(
+        server,
+        client,
+        channel_tree_shadow,
+        scope,
+        Some(impact),
+    )
+    .await
+}
+
+async fn prepare_channel_visibility_refresh_inner(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &ChannelTreeShadow,
+    scope: &crate::client::visibility::VisibilityRefreshScope,
+    home_move_impact: Option<&HomeChannelMoveImpact>,
+) -> ChannelVisibilityRefresh {
     if !server.get_hide_channels_without_traverse()
         || (!scope.includes_all_channels() && scope.channel_ids().is_empty())
     {
@@ -606,10 +705,28 @@ pub async fn prepare_channel_visibility_refresh(
     let server_id = client.server_id();
     let mut affected_channel_ids = scope.channel_ids().clone();
     let candidate_channels = if scope.includes_all_channels() {
-        let channels = server.get_channels().get_all_in_server(&server_id).await;
+        let channels = match home_move_impact {
+            Some(impact) => impact.channels().to_vec(),
+            None => server.get_channels().get_all_in_server(&server_id).await,
+        };
         affected_channel_ids.extend(channel_tree_shadow.channel_ids().iter().copied());
         affected_channel_ids.extend(channels.iter().map(|channel| channel.id));
         channels
+    } else if let Some(impact) = home_move_impact {
+        let mut candidate_channels = HashMap::with_capacity(affected_channel_ids.len());
+        let mut pending = affected_channel_ids.iter().copied().collect::<Vec<_>>();
+        while let Some(channel_id) = pending.pop() {
+            if let Some(channel) = impact.channel(channel_id)
+                && candidate_channels
+                    .insert(channel.id, channel.clone())
+                    .is_none()
+                && let Some(parent_id) = channel.parent_id
+            {
+                pending.push(parent_id);
+                affected_channel_ids.insert(parent_id);
+            }
+        }
+        candidate_channels.into_values().collect()
     } else {
         // Include each candidate's ancestors.  A directly traversable child
         // must not be introduced (or retained) when one of those ancestors
@@ -1455,7 +1572,7 @@ mod tests {
     use shitspeak_state::ChannelHierarchy;
 
     use super::{
-        ChannelTreeShadow, SessionChannelShadow, channel_and_ancestor_ids,
+        ChannelTreeShadow, HomeChannelMoveImpact, SessionChannelShadow, channel_and_ancestor_ids,
         channel_removal_ids_descendant_first, channels_affected_by_home_channel_move,
         channels_with_home_channel_dependent_acls, close_visible_channel_ancestors,
         expand_channel_ids_to_descendant_closure, ordered_snapshot_channels,
@@ -1728,6 +1845,29 @@ mod tests {
     }
 
     #[test]
+    fn home_channel_move_impact_reuses_snapshot_for_permission_and_visibility_scopes() {
+        let root = channel(0, None, 0);
+        let mut parent = channel(10, Some(0), 0);
+        parent.acls = vec![home_acl("~sub", true, false)];
+        let home = channel(11, Some(10), 0);
+        let child = channel(12, Some(10), 1);
+        let grandchild = channel(13, Some(12), 0);
+
+        let impact = HomeChannelMoveImpact::from_channels(
+            vec![root, parent, home, child, grandchild],
+            Some(11),
+            0,
+        );
+
+        assert_eq!(impact.channels().len(), 5);
+        assert_eq!(impact.permission_channel_ids(), &HashSet::from([10]));
+        assert_eq!(
+            impact.visibility_channel_ids(),
+            &HashSet::from([10, 11, 12, 13])
+        );
+    }
+
+    #[test]
     fn session_channel_shadow_tracks_insert_overwrite_remove_and_clear() {
         let mut shadow = SessionChannelShadow::new();
         shadow.insert(session(10), 1);
@@ -1981,12 +2121,20 @@ pub async fn build_home_channel_permission_info_refresh_messages(
 ) -> Vec<Message> {
     let server_id = client.server_id();
     let all_channels = channels.get_all_in_server(&server_id).await;
-    let channels = match old_channel_id {
-        Some(old_channel_id) => {
-            channels_affected_by_home_channel_move(all_channels, old_channel_id, new_channel_id)
-        }
-        None => channels_with_home_channel_dependent_acls(all_channels),
-    };
+    let impact = HomeChannelMoveImpact::from_channels(all_channels, old_channel_id, new_channel_id);
+    build_home_channel_permission_info_refresh_messages_from_impact(server, client, &impact).await
+}
+
+pub(crate) async fn build_home_channel_permission_info_refresh_messages_from_impact(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    impact: &HomeChannelMoveImpact,
+) -> Vec<Message> {
+    let channels = impact
+        .permission_channel_ids()
+        .iter()
+        .filter_map(|channel_id| impact.channel(*channel_id).cloned())
+        .collect();
     build_scoped_permission_info_refresh_messages_for_channels(server, client, channels).await
 }
 
@@ -1996,16 +2144,12 @@ pub async fn home_channel_dependent_channel_ids(
     old_channel_id: Option<u32>,
     new_channel_id: u32,
 ) -> Vec<u32> {
-    let server_id = client.server_id();
-    let all_channels = server.get_channels().get_all_in_server(&server_id).await;
-    let tree = ChannelTree::new(&all_channels);
-    let mut affected = match old_channel_id {
-        Some(old_channel_id) => tree
-            .home_channel_move_affected_channel_ids_for_channel_ids(old_channel_id, new_channel_id),
-        None => tree.home_channel_dependent_acl_channel_ids(),
-    };
-    tree.expand_descendant_closure(&mut affected);
-    affected.into_iter().collect()
+    HomeChannelMoveImpact::calculate(server, client, old_channel_id, new_channel_id)
+        .await
+        .visibility_channel_ids()
+        .iter()
+        .copied()
+        .collect()
 }
 
 async fn build_channel_permission_info_refresh_messages_for_channels(

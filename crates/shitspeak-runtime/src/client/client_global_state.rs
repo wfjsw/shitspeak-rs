@@ -35,7 +35,14 @@ pub struct ClientGlobalState {
     is_superuser: bool,
     tokens: HashSet<String>,
     display_name: Option<String>,
+    /// Broad generation retained for voice-routing caches, which depend on
+    /// both the client's ACL subjects and current channel.
     acl_generation: u64,
+    /// Changes when ACL membership inputs such as the user, groups, or tokens
+    /// change.
+    acl_subject_generation: u64,
+    /// Changes only when the client's current (home) channel changes.
+    acl_home_generation: u64,
 
     delta_recording: bool,
     pending_delta: ClientGlobalStateDelta,
@@ -69,6 +76,8 @@ impl ClientGlobalState {
             tokens: HashSet::new(),
             display_name: None,
             acl_generation: 0,
+            acl_subject_generation: 0,
+            acl_home_generation: 0,
 
             delta_recording: false,
             pending_delta: ClientGlobalStateDelta::default(),
@@ -95,7 +104,7 @@ impl ClientGlobalState {
             return false;
         }
         self.current_channel_id = channel_id;
-        self.bump_acl_generation();
+        self.bump_acl_home_generation();
         if self.delta_recording {
             self.pending_delta.current_channel_id = Some(channel_id);
         }
@@ -348,8 +357,22 @@ impl ClientGlobalState {
         self.acl_generation
     }
 
+    pub fn get_acl_cache_generations(&self) -> (u64, u64) {
+        (self.acl_subject_generation, self.acl_home_generation)
+    }
+
     fn bump_acl_generation(&mut self) {
         self.acl_generation = self.acl_generation.wrapping_add(1);
+    }
+
+    fn bump_acl_subject_generation(&mut self) {
+        self.bump_acl_generation();
+        self.acl_subject_generation = self.acl_subject_generation.wrapping_add(1);
+    }
+
+    fn bump_acl_home_generation(&mut self) {
+        self.bump_acl_generation();
+        self.acl_home_generation = self.acl_home_generation.wrapping_add(1);
     }
 
     pub fn set_user_id(&mut self, user_id: Option<u32>) {
@@ -357,7 +380,7 @@ impl ClientGlobalState {
             return;
         }
         self.user_id = user_id;
-        self.bump_acl_generation();
+        self.bump_acl_subject_generation();
         if self.delta_recording {
             self.pending_delta.user_id = Some(user_id);
         }
@@ -388,7 +411,7 @@ impl ClientGlobalState {
             return;
         }
         self.is_superuser = value;
-        self.bump_acl_generation();
+        self.bump_acl_subject_generation();
         if self.delta_recording {
             self.pending_delta.is_superuser = Some(value);
         }
@@ -396,7 +419,7 @@ impl ClientGlobalState {
 
     pub fn add_group(&mut self, group: String) {
         if self.groups.insert(group) {
-            self.bump_acl_generation();
+            self.bump_acl_subject_generation();
             if self.delta_recording {
                 self.pending_delta.groups = Some(self.groups.clone());
             }
@@ -405,7 +428,7 @@ impl ClientGlobalState {
 
     pub fn del_group(&mut self, group: &str) {
         if self.groups.remove(&group.to_string()) {
-            self.bump_acl_generation();
+            self.bump_acl_subject_generation();
             if self.delta_recording {
                 self.pending_delta.groups = Some(self.groups.clone());
             }
@@ -417,7 +440,7 @@ impl ClientGlobalState {
             return;
         }
         self.groups = groups;
-        self.bump_acl_generation();
+        self.bump_acl_subject_generation();
         if self.delta_recording {
             self.pending_delta.groups = Some(self.groups.clone());
         }
@@ -429,7 +452,7 @@ impl ClientGlobalState {
 
     pub fn add_token(&mut self, token: String) {
         if self.tokens.insert(token.to_ascii_lowercase()) {
-            self.bump_acl_generation();
+            self.bump_acl_subject_generation();
             if self.delta_recording {
                 self.pending_delta.tokens = Some(self.tokens.clone());
             }
@@ -438,7 +461,7 @@ impl ClientGlobalState {
 
     pub fn del_token(&mut self, token: &str) {
         if self.tokens.remove(&token.to_ascii_lowercase()) {
-            self.bump_acl_generation();
+            self.bump_acl_subject_generation();
             if self.delta_recording {
                 self.pending_delta.tokens = Some(self.tokens.clone());
             }
@@ -455,7 +478,7 @@ impl ClientGlobalState {
             return;
         }
         self.tokens = tokens;
-        self.bump_acl_generation();
+        self.bump_acl_subject_generation();
         if self.delta_recording {
             self.pending_delta.tokens = Some(self.tokens.clone());
         }
@@ -489,5 +512,41 @@ impl ClientGlobalState {
 impl Default for ClientGlobalState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientGlobalState;
+
+    #[test]
+    fn channel_move_only_bumps_home_acl_generation() {
+        let mut state = ClientGlobalState::new();
+
+        assert!(state.set_current_channel_id(42));
+
+        assert_eq!(state.get_acl_generation(), 1);
+        assert_eq!(state.get_acl_cache_generations(), (0, 1));
+    }
+
+    #[test]
+    fn subject_change_only_bumps_subject_acl_generation() {
+        let mut state = ClientGlobalState::new();
+
+        state.set_groups(["moderator".to_owned()].into_iter().collect());
+
+        assert_eq!(state.get_acl_generation(), 1);
+        assert_eq!(state.get_acl_cache_generations(), (1, 0));
+    }
+
+    #[test]
+    fn unchanged_acl_inputs_do_not_bump_generations() {
+        let mut state = ClientGlobalState::new();
+
+        assert!(!state.set_current_channel_id(0));
+        state.set_tokens(Default::default());
+
+        assert_eq!(state.get_acl_generation(), 0);
+        assert_eq!(state.get_acl_cache_generations(), (0, 0));
     }
 }

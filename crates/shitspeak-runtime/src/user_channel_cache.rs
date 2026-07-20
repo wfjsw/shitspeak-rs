@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
@@ -16,6 +17,8 @@ const CACHE_DB_FILE_NAME: &str = "user_channel_cache.db";
 const LEGACY_CACHE_FILE_NAME: &str = "user_channel_cache.json";
 const LAST_CHANNEL_TTL_DAYS: i64 = 30;
 const LISTENING_CHANNEL_TTL_HOURS: i64 = 6;
+const PRUNE_INTERVAL: StdDuration = StdDuration::from_secs(60 * 60);
+const PRUNE_RETRY_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CachedUserChannels {
@@ -42,7 +45,12 @@ struct UserChannelCacheEntry {
 }
 
 pub struct UserChannelCache {
-    conn: Mutex<Connection>,
+    db: Mutex<UserChannelCacheDb>,
+}
+
+struct UserChannelCacheDb {
+    conn: Connection,
+    next_prune_at: Instant,
 }
 
 impl UserChannelCache {
@@ -60,11 +68,12 @@ impl UserChannelCache {
         init_schema(&conn)
             .map_err(|error| sqlite_io_error("initialize user channel cache database", error))?;
         import_legacy_json_cache(&mut conn, &storage_dir.join(LEGACY_CACHE_FILE_NAME)).await?;
-        prune_expired_rows(&conn, Utc::now())
+        let now = Utc::now();
+        prune_expired_rows(&conn, now)
             .map_err(|error| sqlite_io_error("prune user channel cache database", error))?;
 
         Ok(Arc::new(Self {
-            conn: Mutex::new(conn),
+            db: Mutex::new(UserChannelCacheDb::new(conn)),
         }))
     }
 
@@ -73,14 +82,14 @@ impl UserChannelCache {
         configure_connection(&conn, false).expect("in-memory SQLite should configure");
         init_schema(&conn).expect("in-memory SQLite schema should initialize");
         Arc::new(Self {
-            conn: Mutex::new(conn),
+            db: Mutex::new(UserChannelCacheDb::new(conn)),
         })
     }
 
     pub async fn get(&self, key: &str) -> Option<CachedUserChannels> {
         let now = Utc::now();
-        let conn = self.conn.lock();
-        match load_entry(&conn, key) {
+        let db = self.db.lock();
+        match load_entry(&db.conn, key) {
             Ok(Some(entry)) => entry.cached_channels_at(now),
             Ok(None) => None,
             Err(error) => {
@@ -97,9 +106,10 @@ impl UserChannelCache {
     pub async fn remember_last_channel(&self, key: &str, channel_id: u32) -> io::Result<()> {
         let now = Utc::now();
         let expires_at = now + Duration::days(LAST_CHANNEL_TTL_DAYS);
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO user_channel_cache (
+        let mut db = self.db.lock();
+        db.conn
+            .execute(
+                "INSERT INTO user_channel_cache (
                 cache_key,
                 last_channel_id,
                 last_channel_expires_at,
@@ -110,15 +120,16 @@ impl UserChannelCache {
                 last_channel_id = excluded.last_channel_id,
                 last_channel_expires_at = excluded.last_channel_expires_at,
                 updated_at = excluded.updated_at",
-            params![
-                key,
-                i64::from(channel_id),
-                expires_at.timestamp_millis(),
-                now.timestamp_millis(),
-            ],
-        )
-        .and_then(|_| prune_expired_rows(&conn, now))
-        .map_err(|error| sqlite_io_error("store user last channel cache", error))
+                params![
+                    key,
+                    i64::from(channel_id),
+                    expires_at.timestamp_millis(),
+                    now.timestamp_millis(),
+                ],
+            )
+            .map_err(|error| sqlite_io_error("store user last channel cache", error))?;
+        db.prune_if_due_best_effort(now);
+        Ok(())
     }
 
     pub async fn remember_listening_channels<I>(&self, key: &str, channels: I) -> io::Result<()>
@@ -136,8 +147,9 @@ impl UserChannelCache {
         } else {
             Some(now + Duration::hours(LISTENING_CHANNEL_TTL_HOURS))
         };
-        let mut conn = self.conn.lock();
-        let tx = conn
+        let mut db = self.db.lock();
+        let tx = db
+            .conn
             .transaction()
             .map_err(|error| sqlite_io_error("begin user channel cache transaction", error))?;
         tx.execute(
@@ -180,10 +192,50 @@ impl UserChannelCache {
                     })?;
             }
         }
-        prune_expired_rows(&tx, now)
-            .map_err(|error| sqlite_io_error("prune user channel cache database", error))?;
         tx.commit()
-            .map_err(|error| sqlite_io_error("commit user channel cache transaction", error))
+            .map_err(|error| sqlite_io_error("commit user channel cache transaction", error))?;
+        db.prune_if_due_best_effort(now);
+        Ok(())
+    }
+}
+
+impl UserChannelCacheDb {
+    fn new(conn: Connection) -> Self {
+        Self {
+            conn,
+            next_prune_at: Instant::now() + PRUNE_INTERVAL,
+        }
+    }
+
+    fn prune_is_due(&self) -> bool {
+        Instant::now() >= self.next_prune_at
+    }
+
+    fn prune_if_due(&mut self, now: DateTime<Utc>) -> rusqlite::Result<()> {
+        if !self.prune_is_due() {
+            return Ok(());
+        }
+
+        let result = prune_expired_rows(&self.conn, now);
+        self.schedule_next_prune(if result.is_ok() {
+            PRUNE_INTERVAL
+        } else {
+            PRUNE_RETRY_INTERVAL
+        });
+        result
+    }
+
+    fn prune_if_due_best_effort(&mut self, now: DateTime<Utc>) {
+        if let Err(error) = self.prune_if_due(now) {
+            tracing::warn!(
+                error = %error,
+                "failed to prune user channel cache database; will retry later"
+            );
+        }
+    }
+
+    fn schedule_next_prune(&mut self, delay: StdDuration) {
+        self.next_prune_at = Instant::now() + delay;
     }
 }
 
@@ -388,15 +440,10 @@ fn prune_expired_rows(conn: &Connection, now: DateTime<Utc>) -> rusqlite::Result
         "UPDATE user_channel_cache
          SET last_channel_id = NULL,
              last_channel_expires_at = NULL
-         WHERE last_channel_expires_at IS NULL
-            OR last_channel_expires_at <= ?1",
-        params![now],
-    )?;
-    conn.execute(
-        "UPDATE user_channel_cache
-         SET listening_channel_expires_at = NULL
-         WHERE listening_channel_expires_at IS NULL
-            OR listening_channel_expires_at <= ?1",
+         WHERE (last_channel_expires_at IS NOT NULL
+                AND last_channel_expires_at <= ?1)
+            OR (last_channel_expires_at IS NULL
+                AND last_channel_id IS NOT NULL)",
         params![now],
     )?;
     conn.execute(
@@ -405,8 +452,16 @@ fn prune_expired_rows(conn: &Connection, now: DateTime<Utc>) -> rusqlite::Result
             SELECT cache_key
             FROM user_channel_cache
             WHERE listening_channel_expires_at IS NULL
+               OR listening_channel_expires_at <= ?1
          )",
-        [],
+        params![now],
+    )?;
+    conn.execute(
+        "UPDATE user_channel_cache
+         SET listening_channel_expires_at = NULL
+         WHERE listening_channel_expires_at IS NOT NULL
+           AND listening_channel_expires_at <= ?1",
+        params![now],
     )?;
     conn.execute(
         "DELETE FROM user_channel_cache
@@ -817,6 +872,196 @@ mod tests {
         assert_eq!(cached.last_channel_id, Some(5));
         assert_eq!(cached.listening_channel_ids, vec![5, 9]);
         assert!(dir.path().join(CACHE_DB_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn pruning_does_not_update_already_cleared_expirations() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_connection(&conn, false).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE update_audit (count INTEGER NOT NULL);
+             INSERT INTO update_audit VALUES (0);
+             CREATE TEMP TRIGGER audit_cache_updates
+             AFTER UPDATE ON user_channel_cache
+             BEGIN
+                UPDATE update_audit SET count = count + 1;
+             END;",
+        )
+        .unwrap();
+
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO user_channel_cache (
+                cache_key,
+                last_channel_id,
+                last_channel_expires_at,
+                listening_channel_expires_at,
+                updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "alice",
+                7_i64,
+                (now - Duration::seconds(1)).timestamp_millis(),
+                (now + Duration::hours(1)).timestamp_millis(),
+                now.timestamp_millis(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_channel_listening_channels (cache_key, channel_id)
+             VALUES ('alice', 9)",
+            [],
+        )
+        .unwrap();
+
+        prune_expired_rows(&conn, now).unwrap();
+        prune_expired_rows(&conn, now).unwrap();
+
+        let update_count: i64 = conn
+            .query_row("SELECT count FROM update_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(update_count, 1);
+        let entry = load_entry(&conn, "alice").unwrap().expect("cache row");
+        assert_eq!(entry.last_channel_id, None);
+        assert_eq!(entry.listening_channel_ids, vec![9]);
+    }
+
+    #[test]
+    fn pruning_removes_expired_and_missing_expiry_payloads() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure_connection(&conn, false).unwrap();
+        init_schema(&conn).unwrap();
+        let now = Utc::now();
+
+        conn.execute(
+            "INSERT INTO user_channel_cache (
+                cache_key,
+                last_channel_id,
+                last_channel_expires_at,
+                listening_channel_expires_at,
+                updated_at
+             ) VALUES ('valid-last', 7, ?1, ?2, ?3),
+                      ('missing-expiry', 8, NULL, NULL, ?3)",
+            params![
+                (now + Duration::hours(1)).timestamp_millis(),
+                (now - Duration::seconds(1)).timestamp_millis(),
+                now.timestamp_millis(),
+            ],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO user_channel_listening_channels (cache_key, channel_id)
+             VALUES ('valid-last', 9), ('missing-expiry', 10);",
+        )
+        .unwrap();
+
+        prune_expired_rows(&conn, now).unwrap();
+
+        let valid = load_entry(&conn, "valid-last")
+            .unwrap()
+            .expect("valid last channel");
+        assert_eq!(valid.last_channel_id, Some(7));
+        assert!(valid.listening_channel_ids.is_empty());
+        assert!(load_entry(&conn, "missing-expiry").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn writes_prune_expired_rows_only_when_interval_is_due() {
+        let cache = UserChannelCache::new_in_memory();
+        let now = Utc::now();
+        {
+            let db = cache.db.lock();
+            db.conn
+                .execute(
+                    "INSERT INTO user_channel_cache (
+                        cache_key,
+                        last_channel_id,
+                        last_channel_expires_at,
+                        listening_channel_expires_at,
+                        updated_at
+                     ) VALUES (?1, ?2, ?3, NULL, ?4)",
+                    params![
+                        "expired",
+                        4_i64,
+                        (now - Duration::seconds(1)).timestamp_millis(),
+                        now.timestamp_millis(),
+                    ],
+                )
+                .unwrap();
+        }
+
+        assert!(cache.get("expired").await.is_none());
+        cache.remember_last_channel("active", 5).await.unwrap();
+        {
+            let mut db = cache.db.lock();
+            let expired_row_count: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM user_channel_cache WHERE cache_key = 'expired'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(expired_row_count, 1);
+            db.next_prune_at = Instant::now();
+        }
+
+        cache.remember_last_channel("active", 6).await.unwrap();
+        let db = cache.db.lock();
+        let expired_row_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_channel_cache WHERE cache_key = 'expired'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(expired_row_count, 0);
+    }
+
+    #[tokio::test]
+    async fn prune_failure_does_not_fail_write_or_retry_immediately() {
+        let cache = UserChannelCache::new_in_memory();
+        let now = Utc::now();
+        {
+            let mut db = cache.db.lock();
+            db.conn
+                .execute(
+                    "INSERT INTO user_channel_cache (
+                        cache_key,
+                        last_channel_id,
+                        last_channel_expires_at,
+                        listening_channel_expires_at,
+                        updated_at
+                     ) VALUES ('expired', 4, ?1, NULL, ?2)",
+                    params![
+                        (now - Duration::seconds(1)).timestamp_millis(),
+                        now.timestamp_millis(),
+                    ],
+                )
+                .unwrap();
+            db.conn
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fail_expired_prune
+                     BEFORE UPDATE ON user_channel_cache
+                     WHEN OLD.cache_key = 'expired'
+                     BEGIN
+                        SELECT RAISE(FAIL, 'forced prune failure');
+                     END;",
+                )
+                .unwrap();
+            db.next_prune_at = Instant::now();
+        }
+
+        cache.remember_last_channel("active", 5).await.unwrap();
+
+        let db = cache.db.lock();
+        assert!(db.next_prune_at > Instant::now());
+        let active = load_entry(&db.conn, "active")
+            .unwrap()
+            .expect("foreground write should commit");
+        assert_eq!(active.last_channel_id, Some(5));
     }
 
     #[tokio::test]

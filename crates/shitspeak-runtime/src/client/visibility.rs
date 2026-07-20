@@ -1393,6 +1393,23 @@ pub async fn visibility_refresh_scope_for_client_log_entry(
     entry: &ClientStateLogEntry,
     old_viewer_channel_id: Option<u32>,
 ) -> VisibilityRefreshScope {
+    visibility_refresh_scope_for_client_log_entry_with_home_move_impact(
+        server,
+        viewer,
+        entry,
+        old_viewer_channel_id,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn visibility_refresh_scope_for_client_log_entry_with_home_move_impact(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    entry: &ClientStateLogEntry,
+    old_viewer_channel_id: Option<u32>,
+    home_move_impact: Option<&crate::channel_handler::HomeChannelMoveImpact>,
+) -> VisibilityRefreshScope {
     let mut scope = VisibilityRefreshScope::new();
     match &entry.op {
         ClientStateOperation::UpdateGlobalState {
@@ -1409,6 +1426,7 @@ pub async fn visibility_refresh_scope_for_client_log_entry(
                     viewer,
                     delta,
                     old_viewer_channel_id,
+                    home_move_impact,
                 )
                 .await,
             );
@@ -1577,6 +1595,7 @@ async fn visibility_refresh_scope_for_viewer_delta(
     viewer: &Arc<Box<Client>>,
     delta: &ClientGlobalStateDelta,
     old_viewer_channel_id: Option<u32>,
+    home_move_impact: Option<&crate::channel_handler::HomeChannelMoveImpact>,
 ) -> VisibilityRefreshScope {
     let mut scope = VisibilityRefreshScope::new();
     if delta.user_id.is_some()
@@ -1597,15 +1616,24 @@ async fn visibility_refresh_scope_for_viewer_delta(
         if let Some(old_channel_id) = old_viewer_channel_id {
             scope.include_channel(old_channel_id);
         }
-        scope.include_channels(
-            crate::channel_handler::home_channel_dependent_channel_ids(
-                server,
-                viewer,
-                old_viewer_channel_id,
-                new_channel_id,
-            )
-            .await,
-        );
+        let impact = match home_move_impact {
+            Some(impact) => impact,
+            None => {
+                // Non-connection callers may not already have the shared move
+                // analysis. Preserve their behavior without making the common
+                // connection path take a second channel snapshot.
+                let calculated = crate::channel_handler::HomeChannelMoveImpact::calculate(
+                    server,
+                    viewer,
+                    old_viewer_channel_id,
+                    new_channel_id,
+                )
+                .await;
+                scope.include_channels(calculated.visibility_channel_ids().iter().copied());
+                return scope;
+            }
+        };
+        scope.include_channels(impact.visibility_channel_ids().iter().copied());
     }
     scope
 }

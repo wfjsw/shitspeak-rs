@@ -1716,6 +1716,160 @@ async fn send_token_update(client: &TestClient, tokens: Vec<&str>) {
 }
 
 #[tokio::test]
+async fn acl_cache_home_move_only_invalidates_home_dependent_entries() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let channels = server.server.get_channels();
+    channels
+        .create_channel(Channel::new(200, "Static ACL".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    channels
+        .create_channel(Channel::new(201, "Home ACL".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    channels
+        .create_channel(Channel::new(202, "Destination".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    channels
+        .set_acls(
+            200,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Enter.into(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+    channels
+        .set_acls(
+            201,
+            true,
+            vec![acl_for_group(
+                "in",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Enter.into(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let client = connected_client(&server, &bob).await;
+    let _ = cached_permissions(&server, &bob, 200).await;
+    let _ = cached_permissions(&server, &bob, 201).await;
+
+    let server_id = client.server_id();
+    let session_id = u64::from(u32::from(client.get_session_id()));
+    let client_instance_id = client.client_instance_id();
+    let static_channel_generation = channels.channel_acl_generation_for_channel(&server_id, 200);
+    let home_channel_generation = channels.channel_acl_generation_for_channel(&server_id, 201);
+    let (subject_generation, old_home_generation) = client.get_acl_cache_generations();
+
+    assert!(
+        channels
+            .get_cached_permissions_in_server_with_generations(
+                &server_id,
+                session_id,
+                client_instance_id,
+                200,
+                static_channel_generation,
+                subject_generation,
+                old_home_generation,
+                false,
+            )
+            .await
+            .is_some()
+    );
+    assert!(
+        channels
+            .get_cached_permissions_in_server_with_generations(
+                &server_id,
+                session_id,
+                client_instance_id,
+                201,
+                home_channel_generation,
+                subject_generation,
+                old_home_generation,
+                false,
+            )
+            .await
+            .is_some()
+    );
+
+    assert!(
+        client
+            .write_global_state_direct()
+            .set_current_channel_id(202)
+    );
+    let (same_subject_generation, new_home_generation) = client.get_acl_cache_generations();
+    assert_eq!(same_subject_generation, subject_generation);
+    assert_ne!(new_home_generation, old_home_generation);
+
+    assert!(
+        channels
+            .get_cached_permissions_in_server_with_generations(
+                &server_id,
+                session_id,
+                client_instance_id,
+                200,
+                static_channel_generation,
+                same_subject_generation,
+                new_home_generation,
+                false,
+            )
+            .await
+            .is_some()
+    );
+    assert!(
+        channels
+            .get_cached_permissions_in_server_with_generations(
+                &server_id,
+                session_id,
+                client_instance_id,
+                201,
+                home_channel_generation,
+                same_subject_generation,
+                new_home_generation,
+                false,
+            )
+            .await
+            .is_none()
+    );
+
+    client
+        .write_global_state_direct()
+        .set_groups(std::iter::once("member".to_owned()).collect());
+    let (new_subject_generation, current_home_generation) = client.get_acl_cache_generations();
+    assert_ne!(new_subject_generation, same_subject_generation);
+    assert!(
+        channels
+            .get_cached_permissions_in_server_with_generations(
+                &server_id,
+                session_id,
+                client_instance_id,
+                200,
+                static_channel_generation,
+                new_subject_generation,
+                current_home_generation,
+                false,
+            )
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn acl_cache_parent_acl_change_updates_descendant_permissions() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
