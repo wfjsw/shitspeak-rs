@@ -192,6 +192,15 @@ pub trait VoiceTransport: Send + Sync + 'static {
     fn local_node_id(&self) -> NodeIdentifier;
 
     fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality>;
+
+    /// Return route quality for each destination in the same order as
+    /// `dsts`. Production transports can override this to share work across
+    /// destinations whose routes use the same next hop.
+    fn voice_route_qualities(&self, dsts: &[NodeIdentifier]) -> Vec<Option<VoiceRouteQuality>> {
+        dsts.iter()
+            .map(|&dst| self.voice_route_quality(dst))
+            .collect()
+    }
 }
 
 /// Production `VoiceTransport` impl backed by the overlay network.
@@ -387,6 +396,10 @@ impl VoiceTransport for OverlayVoiceTransport {
     fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
         self.overlay.voice_route_quality(dst)
     }
+
+    fn voice_route_qualities(&self, dsts: &[NodeIdentifier]) -> Vec<Option<VoiceRouteQuality>> {
+        self.overlay.voice_route_qualities(dsts)
+    }
 }
 
 /// A voice envelope prepared for ordinary delivery and, if admitted, one
@@ -508,6 +521,7 @@ pub(crate) mod testing {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
@@ -519,6 +533,8 @@ pub(crate) mod testing {
         pub calls: Mutex<Vec<FakeCall>>,
         voice_members: Mutex<Option<Vec<NodeIdentifier>>>,
         route_qualities: Mutex<HashMap<NodeIdentifier, VoiceRouteQuality>>,
+        route_quality_scalar_calls: AtomicU64,
+        route_quality_batches: Mutex<Vec<Vec<NodeIdentifier>>>,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -565,6 +581,8 @@ pub(crate) mod testing {
                 calls: Mutex::new(Vec::new()),
                 voice_members: Mutex::new(None),
                 route_qualities: Mutex::new(HashMap::new()),
+                route_quality_scalar_calls: AtomicU64::new(0),
+                route_quality_batches: Mutex::new(Vec::new()),
             })
         }
 
@@ -578,6 +596,14 @@ pub(crate) mod testing {
 
         pub fn set_voice_members(&self, nodes: Vec<NodeIdentifier>) {
             *self.voice_members.lock().unwrap() = Some(nodes);
+        }
+
+        pub fn route_quality_scalar_calls(&self) -> u64 {
+            self.route_quality_scalar_calls.load(Ordering::SeqCst)
+        }
+
+        pub fn route_quality_batches(&self) -> Vec<Vec<NodeIdentifier>> {
+            self.route_quality_batches.lock().unwrap().clone()
         }
     }
 
@@ -698,14 +724,127 @@ pub(crate) mod testing {
         }
 
         fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
+            self.route_quality_scalar_calls
+                .fetch_add(1, Ordering::SeqCst);
             self.route_qualities.lock().unwrap().get(&dst).copied()
+        }
+
+        fn voice_route_qualities(&self, dsts: &[NodeIdentifier]) -> Vec<Option<VoiceRouteQuality>> {
+            self.route_quality_batches
+                .lock()
+                .unwrap()
+                .push(dsts.to_vec());
+            let qualities = self.route_qualities.lock().unwrap();
+            dsts.iter().map(|dst| qualities.get(dst).copied()).collect()
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
     use super::*;
+
+    struct ScalarOnlyVoiceTransport {
+        qualities: HashMap<NodeIdentifier, VoiceRouteQuality>,
+        quality_calls: Mutex<Vec<NodeIdentifier>>,
+    }
+
+    #[async_trait]
+    impl VoiceTransport for ScalarOnlyVoiceTransport {
+        async fn send_unicast(
+            &self,
+            _dst: NodeIdentifier,
+            _body: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            Ok(())
+        }
+
+        async fn send_multicast(
+            &self,
+            _dsts: &[NodeIdentifier],
+            _body: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            Ok(())
+        }
+
+        async fn send_broadcast(
+            &self,
+            _body: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            Ok(())
+        }
+
+        async fn send_repair_request(
+            &self,
+            _dst: NodeIdentifier,
+            _body: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            Ok(())
+        }
+
+        async fn send_repair_frame(
+            &self,
+            _dst: NodeIdentifier,
+            _body: Bytes,
+            _avoid_first_hop: Option<NodeIdentifier>,
+            _ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            Ok(())
+        }
+
+        async fn send_proactive_repair_frame(
+            &self,
+            _dst: NodeIdentifier,
+            _body: Bytes,
+            _avoid_first_hop: Option<NodeIdentifier>,
+            _ttl: Duration,
+        ) -> Result<(), ApplicationError> {
+            Ok(())
+        }
+
+        fn alive_members(&self) -> Vec<NodeIdentifier> {
+            Vec::new()
+        }
+
+        fn local_node_id(&self) -> NodeIdentifier {
+            1
+        }
+
+        fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
+            self.quality_calls.lock().unwrap().push(dst);
+            self.qualities.get(&dst).copied()
+        }
+    }
+
+    #[test]
+    fn default_quality_batch_preserves_alignment_and_scalar_fallback_behavior() {
+        let quality_two =
+            VoiceRouteQuality::new(2, shitspeak_s2s_transport::TransportKind::Tcp, 10, 20, 30);
+        let quality_four =
+            VoiceRouteQuality::new(4, shitspeak_s2s_transport::TransportKind::Udp, 40, 50, 60);
+        let transport = ScalarOnlyVoiceTransport {
+            qualities: HashMap::from([(2, quality_two), (4, quality_four)]),
+            quality_calls: Mutex::new(Vec::new()),
+        };
+
+        assert_eq!(
+            transport.voice_route_qualities(&[2, 3, 2, 4]),
+            vec![
+                Some(quality_two),
+                None,
+                Some(quality_two),
+                Some(quality_four)
+            ],
+        );
+        assert_eq!(*transport.quality_calls.lock().unwrap(), vec![2, 3, 2, 4]);
+    }
 
     #[test]
     fn envelope_roundtrip() {

@@ -1355,8 +1355,8 @@ impl SlidingCounters {
             self.window_start = Instant::now();
         }
     }
-    fn snapshot(&self) -> (u64, Duration) {
-        let age = self.window_start.elapsed();
+    fn snapshot_at(&self, now: Instant) -> (u64, Duration) {
+        let age = now.saturating_duration_since(self.window_start);
         if age >= self.window {
             return (0, age);
         }
@@ -1424,8 +1424,8 @@ impl LossWindow {
         }
     }
 
-    fn snapshot(&self) -> (u64, u64, Duration) {
-        let age = self.window_start.elapsed();
+    fn snapshot_at(&self, now: Instant) -> (u64, u64, Duration) {
+        let age = now.saturating_duration_since(self.window_start);
         if age >= self.window {
             return (0, 0, age);
         }
@@ -1546,6 +1546,8 @@ pub struct PeerMetrics {
     inner: Mutex<HashMap<TransportKind, LinkInner>>,
     window: Duration,
     tuning: MetricsTuning,
+    #[cfg(test)]
+    snapshot_count: AtomicU64,
 }
 
 impl PeerMetrics {
@@ -1554,6 +1556,8 @@ impl PeerMetrics {
             inner: Mutex::new(HashMap::new()),
             window,
             tuning,
+            #[cfg(test)]
+            snapshot_count: AtomicU64::new(0),
         }
     }
 
@@ -1744,22 +1748,59 @@ impl PeerMetrics {
 
     pub fn snapshot_per_transport(&self) -> HashMap<TransportKind, LinkMetrics> {
         let g = self.inner.lock();
-        g.iter()
+        #[cfg(test)]
+        self.snapshot_count.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        self.snapshot_per_transport_locked(&g, now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_per_transport_at(
+        &self,
+        now: Instant,
+    ) -> HashMap<TransportKind, LinkMetrics> {
+        let g = self.inner.lock();
+        #[cfg(test)]
+        self.snapshot_count.fetch_add(1, Ordering::Relaxed);
+        self.snapshot_per_transport_locked(&g, now)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_count(&self) -> u64 {
+        self.snapshot_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_snapshot_count(&self) {
+        self.snapshot_count.store(0, Ordering::Relaxed);
+    }
+
+    fn snapshot_per_transport_locked(
+        &self,
+        inner_by_transport: &HashMap<TransportKind, LinkInner>,
+        now: Instant,
+    ) -> HashMap<TransportKind, LinkMetrics> {
+        inner_by_transport
+            .iter()
             .map(|(t, inner)| {
-                let (sent_bytes, sent_age) = inner.sent.snapshot();
-                let (recv_bytes, recv_age) = inner.recv.snapshot();
-                let (wire_sent_bytes, wire_sent_age) = inner.wire_sent.snapshot();
-                let (wire_recv_bytes, wire_recv_age) = inner.wire_recv.snapshot();
+                let (sent_bytes, sent_age) = inner.sent.snapshot_at(now);
+                let (recv_bytes, recv_age) = inner.recv.snapshot_at(now);
+                let (wire_sent_bytes, wire_sent_age) = inner.wire_sent.snapshot_at(now);
+                let (wire_recv_bytes, wire_recv_age) = inner.wire_recv.snapshot_at(now);
                 let (l1_uncompressed_sent_bytes, l1_uncompressed_sent_age) =
-                    inner.l1_uncompressed_sent.snapshot();
-                let (l1_encoded_sent_bytes, l1_encoded_sent_age) = inner.l1_encoded_sent.snapshot();
+                    inner.l1_uncompressed_sent.snapshot_at(now);
+                let (l1_encoded_sent_bytes, l1_encoded_sent_age) =
+                    inner.l1_encoded_sent.snapshot_at(now);
                 let (l1_uncompressed_recv_bytes, l1_uncompressed_recv_age) =
-                    inner.l1_uncompressed_recv.snapshot();
-                let (l1_encoded_recv_bytes, l1_encoded_recv_age) = inner.l1_encoded_recv.snapshot();
-                let (probe_delivered, probe_lost, probe_loss_age) = inner.probe_loss.snapshot();
-                let (native_delivered, native_lost, native_loss_age) = inner.native_loss.snapshot();
+                    inner.l1_uncompressed_recv.snapshot_at(now);
+                let (l1_encoded_recv_bytes, l1_encoded_recv_age) =
+                    inner.l1_encoded_recv.snapshot_at(now);
+                let (probe_delivered, probe_lost, probe_loss_age) =
+                    inner.probe_loss.snapshot_at(now);
+                let (native_delivered, native_lost, native_loss_age) =
+                    inner.native_loss.snapshot_at(now);
                 let (data_health_ok, data_health_failed, data_health_age) =
-                    inner.data_health.snapshot();
+                    inner.data_health.snapshot_at(now);
                 let probe_packets = probe_delivered.saturating_add(probe_lost);
                 let native_samples = native_delivered.saturating_add(native_lost);
                 let data_health_samples = data_health_ok.saturating_add(data_health_failed);
@@ -1839,6 +1880,16 @@ impl PeerMetrics {
         candidates: &[TransportKind],
     ) -> Vec<TransportKind> {
         let snapshot = self.snapshot_per_transport();
+        self.ranked_transports_for_snapshot(requested, metric, candidates, &snapshot)
+    }
+
+    pub(crate) fn ranked_transports_for_snapshot(
+        &self,
+        requested: ServiceLevel,
+        metric: RoutingMetric,
+        candidates: &[TransportKind],
+        snapshot: &HashMap<TransportKind, LinkMetrics>,
+    ) -> Vec<TransportKind> {
         let mut ranked: Vec<(TransportKind, f64)> = candidates
             .iter()
             .filter(|&&transport| transport.is_acceptable_for(requested))
@@ -2426,6 +2477,188 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sliding_counter_snapshot_at_handles_window_boundaries_deterministically() {
+        let start = Instant::now();
+        let counter = SlidingCounters {
+            bytes: 42,
+            window_start: start,
+            window: Duration::from_secs(10),
+        };
+
+        assert_eq!(
+            counter.snapshot_at(start + Duration::from_secs(9)),
+            (42, Duration::from_secs(9))
+        );
+        assert_eq!(
+            counter.snapshot_at(start + Duration::from_secs(10)),
+            (0, Duration::from_secs(10))
+        );
+        assert_eq!(
+            counter.snapshot_at(start + Duration::from_secs(11)),
+            (0, Duration::from_secs(11))
+        );
+        assert_eq!(
+            SlidingCounters {
+                window_start: start + Duration::from_secs(1),
+                ..counter
+            }
+            .snapshot_at(start),
+            (42, Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn loss_window_snapshot_at_handles_window_boundaries_deterministically() {
+        let start = Instant::now();
+        let loss = LossWindow {
+            delivered: 7,
+            lost: 3,
+            window_start: start,
+            window: Duration::from_secs(10),
+        };
+
+        assert_eq!(
+            loss.snapshot_at(start + Duration::from_secs(9)),
+            (7, 3, Duration::from_secs(9))
+        );
+        assert_eq!(
+            loss.snapshot_at(start + Duration::from_secs(10)),
+            (0, 0, Duration::from_secs(10))
+        );
+        assert_eq!(
+            loss.snapshot_at(start + Duration::from_secs(11)),
+            (0, 0, Duration::from_secs(11))
+        );
+        assert_eq!(
+            LossWindow {
+                window_start: start + Duration::from_secs(1),
+                ..loss
+            }
+            .snapshot_at(start),
+            (7, 3, Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn peer_snapshot_uses_one_supplied_instant_for_all_windows() {
+        let metrics = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+        let start = Instant::now();
+        let now = start + Duration::from_secs(5);
+
+        metrics.inner.lock().insert(
+            TransportKind::Udp,
+            LinkInner {
+                rtt_us: Some(12_000.0),
+                samples: 1,
+                sent: SlidingCounters {
+                    bytes: 11,
+                    window_start: start,
+                    window: Duration::from_secs(60),
+                },
+                recv: SlidingCounters {
+                    bytes: 12,
+                    window_start: start,
+                    window: Duration::from_secs(60),
+                },
+                wire_sent: SlidingCounters {
+                    bytes: 13,
+                    window_start: start,
+                    window: Duration::from_secs(60),
+                },
+                wire_recv: SlidingCounters {
+                    bytes: 14,
+                    window_start: start,
+                    window: Duration::from_secs(60),
+                },
+                probe_loss: LossWindow {
+                    delivered: 3,
+                    lost: 1,
+                    window_start: start,
+                    window: Duration::from_secs(60),
+                },
+                native_loss: LossWindow {
+                    delivered: 7,
+                    lost: 1,
+                    window_start: start,
+                    window: Duration::from_secs(60),
+                },
+                data_health: LossWindow {
+                    delivered: 9,
+                    lost: 1,
+                    window_start: start,
+                    window: Duration::from_secs(60),
+                },
+                ..LinkInner::new(Duration::from_secs(60))
+            },
+        );
+
+        let snapshot = metrics.snapshot_per_transport_at(now);
+        let udp = snapshot.get(&TransportKind::Udp).expect("UDP metrics");
+        assert_eq!(udp.window(), Duration::from_secs(5));
+        assert_eq!(udp.sent_bytes(), 11);
+        assert_eq!(udp.recv_bytes(), 12);
+        assert_eq!(udp.wire_sent_bytes(), 13);
+        assert_eq!(udp.wire_recv_bytes(), 14);
+        assert_eq!(udp.probe_packets(), 4);
+        assert_eq!(udp.lost_probe_packets(), 1);
+        assert_eq!(udp.native_loss_samples(), 8);
+        assert_eq!(udp.native_lost_samples(), 1);
+        assert_eq!(udp.data_health_samples(), 10);
+        assert_eq!(udp.data_health_failures(), 1);
+    }
+
+    #[test]
+    fn transport_ranking_reuses_the_supplied_snapshot() {
+        let metrics = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+        let candidates = [TransportKind::Tcp, TransportKind::Udp];
+        let snapshot = HashMap::from([
+            (
+                TransportKind::Tcp,
+                LinkMetrics {
+                    rtt_us: 50_000.0,
+                    samples: 1,
+                    ..LinkMetrics::default()
+                },
+            ),
+            (
+                TransportKind::Udp,
+                LinkMetrics {
+                    rtt_us: 10_000.0,
+                    samples: 1,
+                    ..LinkMetrics::default()
+                },
+            ),
+        ]);
+
+        metrics.record_rtt(TransportKind::Tcp, Duration::from_millis(1));
+        metrics.record_rtt(TransportKind::Udp, Duration::from_millis(100));
+
+        assert_eq!(
+            metrics.ranked_transports_for_snapshot(
+                ServiceLevel::BestEffort,
+                RoutingMetric::BestEffortCost,
+                &candidates,
+                &snapshot,
+            ),
+            vec![TransportKind::Udp, TransportKind::Tcp]
+        );
+    }
+
+    #[test]
+    fn peer_snapshot_counter_is_instance_local_and_resettable() {
+        let first = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+        let second = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+
+        first.snapshot_per_transport();
+        first.snapshot_per_transport_at(Instant::now());
+
+        assert_eq!(first.snapshot_count(), 2);
+        assert_eq!(second.snapshot_count(), 0);
+        first.reset_snapshot_count();
+        assert_eq!(first.snapshot_count(), 0);
+    }
 
     #[test]
     fn transport_io_snapshots_record_bounded_bidirectional_labels() {

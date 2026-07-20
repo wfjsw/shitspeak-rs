@@ -691,8 +691,16 @@ impl VoiceService {
             intent,
         )?;
         let bytes = envelope.original_body();
+        let terminal_route_qualities = self.capture_terminal_route_qualities(is_terminator, &dsts);
         self.cache_original(sender_session, seq, bytes.clone());
-        self.register_terminal_repairs(sender_session, seq, bytes.clone(), is_terminator, &dsts);
+        self.register_terminal_repairs(
+            sender_session,
+            seq,
+            bytes.clone(),
+            is_terminator,
+            &dsts,
+            terminal_route_qualities.as_deref(),
+        );
         let result = if self.cfg.tree_delivery_enabled {
             self.transport
                 .send_tree_multicast(
@@ -722,7 +730,13 @@ impl VoiceService {
             self.cancel_terminal_repairs(sender_session, seq, &dsts);
         }
         result?;
-        self.refresh_cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, &dsts);
+        self.refresh_cache_and_queue_proactive_repairs(
+            sender_session,
+            seq,
+            &mut envelope,
+            &dsts,
+            terminal_route_qualities.as_deref(),
+        );
         if is_terminator {
             self.extend_terminal_cache(sender_session, seq, bytes);
         }
@@ -785,8 +799,16 @@ impl VoiceService {
             intent,
         )?;
         let bytes = envelope.original_body();
+        let terminal_route_qualities = self.capture_terminal_route_qualities(is_terminator, dsts);
         self.cache_original(sender_session, seq, bytes.clone());
-        self.register_terminal_repairs(sender_session, seq, bytes.clone(), is_terminator, dsts);
+        self.register_terminal_repairs(
+            sender_session,
+            seq,
+            bytes.clone(),
+            is_terminator,
+            dsts,
+            terminal_route_qualities.as_deref(),
+        );
         let result = if self.cfg.tree_delivery_enabled {
             self.transport
                 .send_tree_multicast(dsts, group, bytes.clone(), self.cfg.transport_ttl())
@@ -811,7 +833,13 @@ impl VoiceService {
             self.cancel_terminal_repairs(sender_session, seq, dsts);
         }
         result?;
-        self.refresh_cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, dsts);
+        self.refresh_cache_and_queue_proactive_repairs(
+            sender_session,
+            seq,
+            &mut envelope,
+            dsts,
+            terminal_route_qualities.as_deref(),
+        );
         if is_terminator {
             self.extend_terminal_cache(sender_session, seq, bytes);
         }
@@ -1113,8 +1141,16 @@ impl VoiceService {
             intent,
         )?;
         let bytes = envelope.original_body();
+        let terminal_route_qualities = self.capture_terminal_route_qualities(is_terminator, &[dst]);
         self.cache_original(sender_session, seq, bytes.clone());
-        self.register_terminal_repairs(sender_session, seq, bytes.clone(), is_terminator, &[dst]);
+        self.register_terminal_repairs(
+            sender_session,
+            seq,
+            bytes.clone(),
+            is_terminator,
+            &[dst],
+            terminal_route_qualities.as_deref(),
+        );
         let result = self
             .transport
             .send_unicast(dst, bytes.clone(), self.cfg.transport_ttl())
@@ -1134,7 +1170,13 @@ impl VoiceService {
             self.cancel_terminal_repairs(sender_session, seq, &[dst]);
         }
         result?;
-        self.refresh_cache_and_queue_proactive_repairs(sender_session, seq, &mut envelope, &[dst]);
+        self.refresh_cache_and_queue_proactive_repairs(
+            sender_session,
+            seq,
+            &mut envelope,
+            &[dst],
+            terminal_route_qualities.as_deref(),
+        );
         if is_terminator {
             self.extend_terminal_cache(sender_session, seq, bytes);
         }
@@ -1192,6 +1234,7 @@ impl VoiceService {
         terminal_body: Bytes,
         is_terminator: bool,
         dsts: &[NodeIdentifier],
+        route_qualities: Option<&[Option<VoiceRouteQuality>]>,
     ) {
         if !self.cfg.repair_enabled || !is_terminator {
             return;
@@ -1199,14 +1242,20 @@ impl VoiceService {
         let now = Instant::now();
         let expires_at = now + tail_repair_lifetime(&self.cfg);
         self.extend_terminal_cache(sender_session, terminal_seq, terminal_body);
+        debug_assert!(route_qualities.is_none_or(|qualities| qualities.len() == dsts.len()));
+        let local_node = self.transport.local_node_id();
         let destinations = dsts
             .iter()
             .copied()
-            .filter(|&destination| destination != self.transport.local_node_id())
-            .map(|destination| {
+            .enumerate()
+            .filter(|(_, destination)| *destination != local_node)
+            .map(|(index, destination)| {
                 let delay = tail_repair_initial_delay(
                     &self.cfg,
-                    self.transport.voice_route_quality(destination),
+                    route_qualities
+                        .and_then(|qualities| qualities.get(index))
+                        .copied()
+                        .flatten(),
                 );
                 (destination, delay)
             })
@@ -1265,6 +1314,7 @@ impl VoiceService {
         s2s_seq: u64,
         envelope: &mut send::PreparedVoiceEnvelope,
         dsts: &[NodeIdentifier],
+        route_qualities: Option<&[Option<VoiceRouteQuality>]>,
     ) {
         if !self.cfg.repair_enabled {
             return;
@@ -1276,19 +1326,49 @@ impl VoiceService {
         // them would violate the source-side 25% traffic ratio.
         self.voice_budget.mint_proactive_credit(original_body.len());
         publish_proactive_budget(&self.voice_budget);
+        let local_node = self.transport.local_node_id();
+        let blocked = dsts
+            .iter()
+            .map(|&dst| {
+                dst != local_node && self.proactive_pressure.is_blocked(dst, Instant::now())
+            })
+            .collect::<Vec<_>>();
+        let calculated_route_qualities;
+        let route_qualities = if let Some(route_qualities) = route_qualities {
+            debug_assert_eq!(route_qualities.len(), dsts.len());
+            route_qualities
+        } else {
+            let eligible = dsts
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(index, dst)| *dst != local_node && !blocked[*index])
+                .collect::<Vec<_>>();
+            let eligible_destinations = eligible
+                .iter()
+                .map(|(_, destination)| *destination)
+                .collect::<Vec<_>>();
+            let eligible_qualities = self.transport.voice_route_qualities(&eligible_destinations);
+            let mut aligned = vec![None; dsts.len()];
+            for ((index, _), quality) in eligible.into_iter().zip(eligible_qualities) {
+                aligned[index] = quality;
+            }
+            calculated_route_qualities = aligned;
+            &calculated_route_qualities
+        };
         let mut proactive_body: Option<Bytes> = None;
-        for &dst in dsts {
-            if dst == self.transport.local_node_id() {
+        for (index, &dst) in dsts.iter().enumerate() {
+            if dst == local_node {
                 continue;
             }
-            if self.proactive_pressure.is_blocked(dst, Instant::now()) {
+            if blocked[index] {
                 metrics::record_proactive_outcome(
                     VoiceProactiveKind::Ordinary,
                     VoiceProactiveResult::QueueShed,
                 );
                 continue;
             }
-            let quality = self.transport.voice_route_quality(dst);
+            let quality = route_qualities.get(index).copied().flatten();
             let avoid_first_hop = quality.map(|q| q.next_hop());
             let transport_ttl = adaptive_repair_transport_ttl(&self.cfg, quality);
             let extra_copies = proactive_repair_score_micros(&self.cfg, quality)
@@ -1364,6 +1444,33 @@ impl VoiceService {
                 publish_proactive_budget(&self.voice_budget);
             }
         }
+    }
+
+    fn capture_terminal_route_qualities(
+        &self,
+        is_terminator: bool,
+        dsts: &[NodeIdentifier],
+    ) -> Option<Vec<Option<VoiceRouteQuality>>> {
+        if !self.cfg.repair_enabled || !is_terminator {
+            return None;
+        }
+        let local_node = self.transport.local_node_id();
+        let remote = dsts
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, destination)| *destination != local_node)
+            .collect::<Vec<_>>();
+        let remote_destinations = remote
+            .iter()
+            .map(|(_, destination)| *destination)
+            .collect::<Vec<_>>();
+        let remote_qualities = self.transport.voice_route_qualities(&remote_destinations);
+        let mut aligned = vec![None; dsts.len()];
+        for ((index, _), quality) in remote.into_iter().zip(remote_qualities) {
+            aligned[index] = quality;
+        }
+        Some(aligned)
     }
 }
 
@@ -2828,6 +2935,13 @@ mod tests {
         ) -> Option<crate::overlay::VoiceRouteQuality> {
             self.inner.voice_route_quality(dst)
         }
+
+        fn voice_route_qualities(
+            &self,
+            dsts: &[NodeIdentifier],
+        ) -> Vec<Option<crate::overlay::VoiceRouteQuality>> {
+            self.inner.voice_route_qualities(dsts)
+        }
     }
 
     struct PressuredProactiveTransport {
@@ -3748,13 +3862,24 @@ mod tests {
             VoiceRouteQuality::new(3, TransportKind::Tcp, 237_000, 0, 0),
         );
         let svc = VoiceService::new_with_transport(
-            transport,
+            transport.clone(),
             VoiceConfig::default(),
             CancellationToken::new(),
             42,
         );
 
-        svc.register_terminal_repairs(0xABC, 0, Bytes::from_static(b"terminal"), true, &[2, 3]);
+        let destinations = [2, 3];
+        let qualities = svc
+            .capture_terminal_route_qualities(true, &destinations)
+            .expect("terminator quality capture");
+        svc.register_terminal_repairs(
+            0xABC,
+            0,
+            Bytes::from_static(b"terminal"),
+            true,
+            &destinations,
+            Some(&qualities),
+        );
 
         let repairs = svc.tail_repairs.lock();
         let retry_for = |destination| {
@@ -3769,6 +3894,8 @@ mod tests {
             retry_for(3).duration_since(retry_for(2)),
             Duration::from_millis(444),
         );
+        assert_eq!(transport.route_quality_batches(), vec![vec![2, 3]]);
+        assert_eq!(transport.route_quality_scalar_calls(), 0);
     }
 
     #[tokio::test]
@@ -4708,6 +4835,9 @@ mod tests {
         )
         .await
         .unwrap();
+
+        assert_eq!(transport.route_quality_batches(), vec![vec![2]]);
+        assert_eq!(transport.route_quality_scalar_calls(), 0);
 
         let calls = wait_for_call_count(&transport, 2).await;
         assert_eq!(calls.len(), 2);
@@ -6424,6 +6554,122 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(svc.voice_budget.proactive_credit_balance_quarters(), 0);
         assert_eq!(transport.inner.calls().len(), 1);
+        assert!(transport.inner.route_quality_batches().is_empty());
+        assert_eq!(transport.inner.route_quality_scalar_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_terminator_captures_quality_once_and_cancels_tail_repair() {
+        let transport = ControlledUnicastTransport::new(true);
+        transport.inner.set_voice_route_quality(
+            2,
+            VoiceRouteQuality::new(2, TransportKind::Udp, 20_000, 0, 0),
+        );
+        let svc = VoiceService::new_with_transport(
+            transport.clone(),
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        transport.primary_release.add_permits(1);
+
+        let result = svc
+            .send_unicast(
+                0xABC,
+                shitspeak_core::default_server_id(),
+                0,
+                true,
+                Bytes::from_static(b"failed-terminator"),
+                normal_intent(5),
+                2,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(transport.inner.route_quality_batches(), vec![vec![2]]);
+        assert_eq!(transport.inner.route_quality_scalar_calls(), 0);
+        assert!(svc.tail_repairs.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminator_reuses_one_quality_batch_for_tail_and_proactive_repairs() {
+        let transport = FakeVoiceTransport::new(7, vec![2, 3]);
+        transport.set_voice_route_quality(
+            2,
+            VoiceRouteQuality::new(2, TransportKind::Udp, 20_000, 0, 0),
+        );
+        transport.set_voice_route_quality(
+            3,
+            VoiceRouteQuality::new(3, TransportKind::Udp, 40_000, 0, 0),
+        );
+        let svc = make_legacy_service(transport.clone());
+
+        svc.send_multicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            0,
+            true,
+            Bytes::from_static(b"terminator"),
+            normal_intent(5),
+            &[2, 3],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(transport.route_quality_batches(), vec![vec![2, 3]]);
+        assert_eq!(transport.route_quality_scalar_calls(), 0);
+        assert_eq!(svc.tail_repairs.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn repair_disabled_send_captures_no_route_quality() {
+        let transport = FakeVoiceTransport::new(7, vec![2]);
+        transport.set_voice_route_quality(
+            2,
+            VoiceRouteQuality::new(2, TransportKind::Udp, 20_000, 1_000_000, 0),
+        );
+        let mut cfg = VoiceConfig::default();
+        cfg.repair_enabled = false;
+        cfg.tree_delivery_enabled = false;
+        let svc =
+            VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
+
+        svc.send_unicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            0,
+            false,
+            Bytes::from_static(b"repair-disabled"),
+            normal_intent(5),
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert!(transport.route_quality_batches().is_empty());
+        assert_eq!(transport.route_quality_scalar_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn ordinary_send_omits_pressure_blocked_destinations_from_quality_batch() {
+        let transport = FakeVoiceTransport::new(7, vec![2, 3]);
+        let svc = make_legacy_service(transport.clone());
+        svc.proactive_pressure.record_failure(2, Instant::now());
+
+        svc.send_multicast(
+            0xABC,
+            shitspeak_core::default_server_id(),
+            0,
+            false,
+            Bytes::from_static(b"pressure-filter"),
+            normal_intent(5),
+            &[2, 3],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(transport.route_quality_batches(), vec![vec![3]]);
+        assert_eq!(transport.route_quality_scalar_calls(), 0);
     }
 
     #[tokio::test]

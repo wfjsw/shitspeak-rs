@@ -40,7 +40,7 @@ pub(crate) mod proto;
 pub mod routing;
 mod runtime;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
@@ -317,6 +317,8 @@ fn startup_duplicate_evidence(
 #[derive(Clone)]
 pub struct OverlayNetwork {
     inner: Arc<runtime::OverlayInner>,
+    #[cfg(test)]
+    voice_route_quality_selections: Arc<parking_lot::Mutex<HashMap<NodeIdentifier, u64>>>,
 }
 
 impl OverlayNetwork {
@@ -425,7 +427,11 @@ impl OverlayNetwork {
             upper_layer_capabilities,
         )
         .await?;
-        let network = Self { inner };
+        let network = Self {
+            inner,
+            #[cfg(test)]
+            voice_route_quality_selections: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        };
         distribution::register_control_handler(&network);
         Ok(network)
     }
@@ -2055,14 +2061,8 @@ impl OverlayNetwork {
             .load()
             .lookup_with_metric(dst, level, routing_metric)?;
         let next_hop = entry.next_hop;
-        let transport = self
-            .inner
-            .transport
-            .ranked_live_transports_for(next_hop, level, routing_metric)
-            .into_iter()
-            .next()?;
-        let metrics = self.inner.transport.metrics_snapshot();
-        let link = metrics.for_node(next_hop)?.get(&transport)?;
+        let (transport, link) =
+            self.selected_voice_transport_metrics(next_hop, level, routing_metric)?;
         Some(VoiceRouteQuality::new(
             next_hop,
             transport,
@@ -2070,6 +2070,61 @@ impl OverlayNetwork {
             link.effective_packet_loss_ppm(),
             link.jitter_us().max(0.0) as u64,
         ))
+    }
+
+    /// Return destination-aligned voice route qualities while snapshotting a
+    /// direct peer at most once. Multiple routed destinations commonly share
+    /// one next hop, especially for source-rooted voice distribution.
+    pub fn voice_route_qualities(&self, dsts: &[NodeIdentifier]) -> Vec<Option<VoiceRouteQuality>> {
+        let level = ServiceLevel::BestEffort;
+        let routing_metric = RoutingMetric::ConversationalQuality;
+        let routing = self.inner.routing.load();
+        let routes = dsts
+            .iter()
+            .map(|&dst| {
+                routing
+                    .lookup_with_metric(dst, level, routing_metric)
+                    .map(|entry| (entry.next_hop, entry.latency_us))
+            })
+            .collect::<Vec<_>>();
+        let mut next_hop_metrics = HashMap::new();
+
+        routes
+            .into_iter()
+            .map(|route| {
+                let (next_hop, path_latency_us) = route?;
+                let selected = next_hop_metrics.entry(next_hop).or_insert_with(|| {
+                    self.selected_voice_transport_metrics(next_hop, level, routing_metric)
+                });
+                let (transport, link) = selected.as_ref()?;
+                Some(VoiceRouteQuality::new(
+                    next_hop,
+                    *transport,
+                    path_latency_us,
+                    link.effective_packet_loss_ppm(),
+                    link.jitter_us().max(0.0) as u64,
+                ))
+            })
+            .collect()
+    }
+
+    fn selected_voice_transport_metrics(
+        &self,
+        next_hop: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+    ) -> Option<(TransportKind, shitspeak_s2s_transport::LinkMetrics)> {
+        #[cfg(test)]
+        {
+            *self
+                .voice_route_quality_selections
+                .lock()
+                .entry(next_hop)
+                .or_default() += 1;
+        }
+        self.inner
+            .transport
+            .selected_live_transport_metrics(next_hop, level, routing_metric)
     }
 
     /// Returns true if any route can satisfy `level` for `dst`.
@@ -2128,6 +2183,7 @@ impl OverlayNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::overlay::routing::RoutingTables;
 
     const TEST_MAX_FRAME_BYTES: usize = 64 * 1024;
 
@@ -2153,6 +2209,91 @@ mod tests {
         assert!(
             strict_unicast_replication_frame_len(budget + AUTH_OVERHEAD_BYTES + 1)
                 > TEST_MAX_FRAME_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_route_qualities_selects_once_per_unique_next_hop_and_aligns_results() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let _peer_three_rx = transport.test_install_live_stream(3, TransportKind::Tcp);
+        transport.record_peer_rtt(2, TransportKind::Tcp, Duration::from_millis(17));
+        transport.record_peer_rtt(3, TransportKind::Tcp, Duration::from_millis(29));
+
+        let inner = runtime::OverlayInner::new(
+            transport,
+            OverlayConfig::new(Vec::new()),
+            Arc::new(AtomicU64::new(0)),
+            ReplicationServices::ALL,
+            ApplicationServices::ALL,
+            None,
+            Vec::new(),
+        );
+        let mut tables = RoutingTables::empty();
+        tables.insert_table(
+            RoutingMetric::ConversationalQuality,
+            ServiceLevel::BestEffort,
+            HashMap::from([
+                (
+                    10,
+                    RouteEntry {
+                        next_hop: 2,
+                        cost: 1,
+                        latency_us: 1_000,
+                    },
+                ),
+                (
+                    11,
+                    RouteEntry {
+                        next_hop: 2,
+                        cost: 1,
+                        latency_us: 2_000,
+                    },
+                ),
+                (
+                    12,
+                    RouteEntry {
+                        next_hop: 3,
+                        cost: 1,
+                        latency_us: 3_000,
+                    },
+                ),
+                (
+                    13,
+                    RouteEntry {
+                        next_hop: 4,
+                        cost: 1,
+                        latency_us: 4_000,
+                    },
+                ),
+            ]),
+        );
+        inner.routing.store(Arc::new(tables));
+        let network = OverlayNetwork {
+            inner: Arc::new(inner),
+            voice_route_quality_selections: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        };
+
+        let qualities = network.voice_route_qualities(&[10, 11, 10, 12, 13, 13, 99]);
+
+        assert_eq!(qualities.len(), 7);
+        let first = qualities[0].expect("first route quality");
+        let second = qualities[1].expect("second route quality");
+        let duplicate = qualities[2].expect("duplicate route quality");
+        let third = qualities[3].expect("third route quality");
+        assert_eq!((first.next_hop(), first.path_latency_us()), (2, 1_000));
+        assert_eq!((second.next_hop(), second.path_latency_us()), (2, 2_000));
+        assert_eq!(duplicate, first);
+        assert_eq!((third.next_hop(), third.path_latency_us()), (3, 3_000));
+        assert_eq!(first.transport(), TransportKind::Tcp);
+        assert_eq!(third.transport(), TransportKind::Tcp);
+        assert!(qualities[4].is_none());
+        assert!(qualities[5].is_none());
+        assert!(qualities[6].is_none());
+        assert_eq!(
+            *network.voice_route_quality_selections.lock(),
+            HashMap::from([(2, 1), (3, 1), (4, 1)]),
+            "shared next hops and missing-peer None results must be cached within the batch",
         );
     }
 }

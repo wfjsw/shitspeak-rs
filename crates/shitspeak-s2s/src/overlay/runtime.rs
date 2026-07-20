@@ -43,6 +43,54 @@ use super::routing::{RoutingHandle, new_handle as new_routing_handle, spawn_reco
 static LAST_PROCESS_BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 static LOCAL_BOOT_EPOCH_PROCESS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 static NEXT_LOCAL_BOOT_EPOCH_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+const HELLO_ACK_METRIC_DEBOUNCE: Duration = Duration::from_millis(500);
+
+async fn forward_neighbor_notifications<F>(
+    on_change: Arc<tokio::sync::Notify>,
+    on_metric_change: Arc<tokio::sync::Notify>,
+    on_hello_ack_metric_change: Arc<tokio::sync::Notify>,
+    shutdown: CancellationToken,
+    hello_ack_debounce: Duration,
+    poke: F,
+) where
+    F: Fn(),
+{
+    let mut hello_ack_deadline = None;
+    loop {
+        if let Some(deadline) = hello_ack_deadline {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = on_change.notified() => {
+                    hello_ack_deadline = None;
+                    poke();
+                }
+                _ = on_metric_change.notified() => {
+                    hello_ack_deadline = None;
+                    poke();
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    hello_ack_deadline = None;
+                    poke();
+                }
+                _ = on_hello_ack_metric_change.notified() => {
+                    // Keep the original deadline: a continuous stream of
+                    // acknowledgements must not postpone emission forever.
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = on_change.notified() => poke(),
+                _ = on_metric_change.notified() => poke(),
+                _ = on_hello_ack_metric_change.notified() => {
+                    hello_ack_deadline = Some(tokio::time::Instant::now() + hello_ack_debounce);
+                }
+            }
+        }
+    }
+}
 
 #[cfg(windows)]
 const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
@@ -620,38 +668,25 @@ impl OverlayInner {
         // Our emitter listens to its own `trigger` Notify which the
         // neighbor monitor pokes; that's separate from LSDB changes.
 
-        // Forward neighbor on_change → emitter.trigger.
+        // Structural changes and urgent loss/eligibility metric changes wake
+        // the emitter immediately. Routine matched HelloAck samples share a
+        // fixed debounce window so a busy peer set cannot trigger a full
+        // metrics census for every acknowledgement.
         {
             let mon = self.neighbor.clone();
             let em = self.emitter.clone();
             let shutdown = self.shutdown.clone();
             let on_change = mon.on_change();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        _ = on_change.notified() => {}
-                    }
-                    em.poke();
-                }
-            });
-        }
-
-        // The emitter classifies and stabilizes metric changes. Forward every
-        // notification so service-eligibility loss is still immediate.
-        {
-            let em = self.emitter.clone();
-            let shutdown = self.shutdown.clone();
-            let on_metric_change = self.neighbor.on_metric_change();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        _ = on_metric_change.notified() => {}
-                    }
-                    em.poke();
-                }
-            });
+            let on_metric_change = mon.on_metric_change();
+            let on_hello_ack_metric_change = mon.on_hello_ack_metric_change();
+            tokio::spawn(forward_neighbor_notifications(
+                on_change,
+                on_metric_change,
+                on_hello_ack_metric_change,
+                shutdown,
+                HELLO_ACK_METRIC_DEBOUNCE,
+                move || em.poke(),
+            ));
         }
 
         spawn_hello_task(self.hello.clone());
@@ -822,12 +857,150 @@ pub(crate) async fn start_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct NotificationForwarderHarness {
+        on_change: Arc<tokio::sync::Notify>,
+        on_metric_change: Arc<tokio::sync::Notify>,
+        on_hello_ack_metric_change: Arc<tokio::sync::Notify>,
+        shutdown: CancellationToken,
+        pokes: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl NotificationForwarderHarness {
+        fn spawn(debounce: Duration) -> Self {
+            let on_change = Arc::new(tokio::sync::Notify::new());
+            let on_metric_change = Arc::new(tokio::sync::Notify::new());
+            let on_hello_ack_metric_change = Arc::new(tokio::sync::Notify::new());
+            let shutdown = CancellationToken::new();
+            let pokes = Arc::new(AtomicUsize::new(0));
+            let task = tokio::spawn(forward_neighbor_notifications(
+                on_change.clone(),
+                on_metric_change.clone(),
+                on_hello_ack_metric_change.clone(),
+                shutdown.clone(),
+                debounce,
+                {
+                    let pokes = pokes.clone();
+                    move || {
+                        pokes.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            ));
+            Self {
+                on_change,
+                on_metric_change,
+                on_hello_ack_metric_change,
+                shutdown,
+                pokes,
+                task,
+            }
+        }
+
+        async fn wait_for_pokes(&self, expected: usize) {
+            for _ in 0..16 {
+                if self.pokes.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("notification forwarder did not produce {expected} pokes");
+        }
+
+        async fn shutdown(self) {
+            self.shutdown.cancel();
+            self.task
+                .await
+                .expect("notification forwarder task panicked");
+        }
+    }
 
     #[test]
     fn next_boot_epoch_handles_backward_clock() {
         assert_eq!(next_boot_epoch(100, Some(200)), 201);
         assert_eq!(next_boot_epoch(300, Some(200)), 300);
         assert_eq!(next_boot_epoch(100, Some(u64::MAX)), 100);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hello_ack_metric_notifications_use_one_fixed_window() {
+        let harness = NotificationForwarderHarness::spawn(HELLO_ACK_METRIC_DEBOUNCE);
+
+        for _ in 0..5 {
+            harness.on_hello_ack_metric_change.notify_one();
+            // Ensure each notification reaches the forwarder instead of being
+            // coalesced by Notify itself.
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(80)).await;
+        }
+
+        assert_eq!(harness.pokes.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(harness.pokes.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        harness.wait_for_pokes(1).await;
+        assert_eq!(harness.pokes.load(Ordering::SeqCst), 1);
+        tokio::time::advance(HELLO_ACK_METRIC_DEBOUNCE).await;
+        tokio::task::yield_now().await;
+        assert_eq!(harness.pokes.load(Ordering::SeqCst), 1);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_hello_ack_notifications_cannot_starve_deadline_pokes() {
+        let harness = NotificationForwarderHarness::spawn(HELLO_ACK_METRIC_DEBOUNCE);
+
+        for expected in 1..=3 {
+            harness.on_hello_ack_metric_change.notify_one();
+            tokio::task::yield_now().await;
+            for _ in 0..4 {
+                tokio::time::advance(Duration::from_millis(100)).await;
+                harness.on_hello_ack_metric_change.notify_one();
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+            harness.wait_for_pokes(expected).await;
+        }
+
+        assert_eq!(harness.pokes.load(Ordering::SeqCst), 3);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn urgent_and_structural_notifications_cancel_pending_hello_ack_work() {
+        let harness = NotificationForwarderHarness::spawn(HELLO_ACK_METRIC_DEBOUNCE);
+
+        harness.on_hello_ack_metric_change.notify_one();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        harness.on_metric_change.notify_one();
+        harness.wait_for_pokes(1).await;
+        tokio::time::advance(HELLO_ACK_METRIC_DEBOUNCE).await;
+        tokio::task::yield_now().await;
+        assert_eq!(harness.pokes.load(Ordering::SeqCst), 1);
+
+        harness.on_hello_ack_metric_change.notify_one();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        harness.on_change.notify_one();
+        harness.wait_for_pokes(2).await;
+        tokio::time::advance(HELLO_ACK_METRIC_DEBOUNCE).await;
+        tokio::task::yield_now().await;
+        assert_eq!(harness.pokes.load(Ordering::SeqCst), 2);
+        harness.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_discards_pending_hello_ack_work() {
+        let harness = NotificationForwarderHarness::spawn(HELLO_ACK_METRIC_DEBOUNCE);
+        let pokes = harness.pokes.clone();
+        harness.on_hello_ack_metric_change.notify_one();
+        tokio::task::yield_now().await;
+        harness.shutdown().await;
+        tokio::time::advance(HELLO_ACK_METRIC_DEBOUNCE).await;
+        assert_eq!(pokes.load(Ordering::SeqCst), 0);
     }
 
     #[test]

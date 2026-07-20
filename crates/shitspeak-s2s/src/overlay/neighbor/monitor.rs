@@ -347,6 +347,9 @@ pub struct NeighborMonitor {
     on_change: Arc<Notify>,
     /// Notified when only volatile quality metrics changed.
     on_metric_change: Arc<Notify>,
+    /// Notified for matched steady-state HelloAck metric samples. The runtime
+    /// debounces these separately from urgent loss and eligibility changes.
+    on_hello_ack_metric_change: Arc<Notify>,
     /// To emit `Restarted` events directly on Hello-driven boot_epoch
     /// increase (faster than waiting for the LSA).
     membership_events: broadcast::Sender<MembershipEvent>,
@@ -371,6 +374,7 @@ impl NeighborMonitor {
             state: Mutex::new(HashMap::new()),
             on_change: Arc::new(Notify::new()),
             on_metric_change: Arc::new(Notify::new()),
+            on_hello_ack_metric_change: Arc::new(Notify::new()),
             membership_events,
             link_up_events: broadcast::channel(256).0,
         }
@@ -382,6 +386,10 @@ impl NeighborMonitor {
 
     pub fn on_metric_change(&self) -> Arc<Notify> {
         self.on_metric_change.clone()
+    }
+
+    pub fn on_hello_ack_metric_change(&self) -> Arc<Notify> {
+        self.on_hello_ack_metric_change.clone()
     }
 
     pub fn subscribe_link_up(&self) -> broadcast::Receiver<NodeIdentifier> {
@@ -696,7 +704,7 @@ impl NeighborMonitor {
         } else if restarted {
             self.on_change.notify_one();
         } else if matched_ack {
-            self.on_metric_change.notify_one();
+            self.on_hello_ack_metric_change.notify_one();
         }
     }
 

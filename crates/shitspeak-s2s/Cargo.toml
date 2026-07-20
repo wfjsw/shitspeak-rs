@@ -45,3 +45,4 @@ rustls = { workspace = true }
 shitspeak-s2s-transport = { workspace = true, features = ["test-support"] }
 shitspeak-state = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

@@ -8,6 +8,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -396,6 +398,8 @@ pub(crate) struct ManagerInner {
     shutdown: CancellationToken,
     cfg: TransportConfig,
     endpoints: EndpointRegistry,
+    #[cfg(test)]
+    iter_peers_count: Arc<AtomicU64>,
 }
 
 impl ManagerInner {
@@ -472,6 +476,8 @@ impl ManagerInner {
             shutdown: self.shutdown.clone(),
             cfg: self.cfg.clone(),
             endpoints: self.endpoints.clone(),
+            #[cfg(test)]
+            iter_peers_count: self.iter_peers_count.clone(),
         }
     }
 
@@ -484,12 +490,24 @@ impl ManagerInner {
     }
 
     pub fn iter_peers(&self) -> Vec<(NodeIdentifier, Arc<PeerState>)> {
+        #[cfg(test)]
+        self.iter_peers_count.fetch_add(1, Ordering::Relaxed);
         let mut out = Vec::new();
         self.peers.iter_sync(|id, peer| {
             out.push((*id, peer.clone()));
             true
         });
         out
+    }
+
+    #[cfg(test)]
+    fn reset_iter_peers_count(&self) {
+        self.iter_peers_count.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn iter_peers_count(&self) -> u64 {
+        self.iter_peers_count.load(Ordering::Relaxed)
     }
 
     pub fn outgoing_connection_count(&self) -> usize {
@@ -704,6 +722,8 @@ impl ConnectionManager {
             shutdown: CancellationToken::new(),
             endpoints,
             cfg,
+            #[cfg(test)]
+            iter_peers_count: Arc::new(AtomicU64::new(0)),
         });
 
         super::endpoint::start_all(inner.clone()).await?;
@@ -739,8 +759,30 @@ impl ConnectionManager {
         kinds: &[TransportKind],
         queue_bytes: usize,
     ) -> (Self, Vec<AdaptiveQueueReceiver<OutboundFrame>>) {
-        let (inbound, _inbound_rx) = test_inbound_dispatch();
         let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into());
+        Self::test_with_live_streams_config(self_id, peer_node, kinds, queue_bytes, cfg)
+    }
+
+    #[cfg(test)]
+    fn test_with_live_streams_bandwidth_window(
+        self_id: NodeIdentifier,
+        peer_node: NodeIdentifier,
+        kinds: &[TransportKind],
+        bandwidth_window: Duration,
+    ) -> (Self, Vec<AdaptiveQueueReceiver<OutboundFrame>>) {
+        let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into())
+            .with_bandwidth_window(bandwidth_window);
+        Self::test_with_live_streams_config(self_id, peer_node, kinds, 1024 * 1024, cfg)
+    }
+
+    fn test_with_live_streams_config(
+        self_id: NodeIdentifier,
+        peer_node: NodeIdentifier,
+        kinds: &[TransportKind],
+        queue_bytes: usize,
+        cfg: TransportConfig,
+    ) -> (Self, Vec<AdaptiveQueueReceiver<OutboundFrame>>) {
+        let (inbound, _inbound_rx) = test_inbound_dispatch();
         let inner = Arc::new(ManagerInner {
             self_id,
             identity: None,
@@ -753,6 +795,8 @@ impl ConnectionManager {
             shutdown: CancellationToken::new(),
             endpoints: EndpointRegistry::empty(),
             cfg,
+            #[cfg(test)]
+            iter_peers_count: Arc::new(AtomicU64::new(0)),
         });
 
         let peer = inner.insert_peer_with_outbound_queue_bytes(peer_node, queue_bytes);
@@ -1279,25 +1323,24 @@ impl ConnectionManager {
     }
 
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        let entries: Vec<_> = self
-            .inner
-            .iter_peers()
-            .into_iter()
-            .map(|(n, p)| (n, p.metrics().clone()))
-            .collect();
-        let mut outbound_queues = self
-            .inner
-            .iter_peers()
-            .into_iter()
-            .flat_map(|(_, peer)| peer.outbound_queue_status())
-            .collect::<Vec<_>>();
+        let peers = self.inner.iter_peers();
+        let mut entries = Vec::with_capacity(peers.len());
+        let mut outbound_queues = Vec::new();
+        let mut expired_outbound_drops = Vec::new();
+        let mut transport_health_exclusions = Vec::new();
+        let mut voice_transport_bindings = Vec::new();
+        let mut voice_transport_binding_events = Vec::new();
+        let mut voice_transport_challengers = Vec::new();
+        for (node, peer) in peers {
+            entries.push((node, peer.metrics().clone()));
+            outbound_queues.extend(peer.outbound_queue_status());
+            expired_outbound_drops.extend(peer.expired_outbound_drop_status());
+            transport_health_exclusions.extend(peer.transport_health_exclusion_status());
+            voice_transport_bindings.extend(peer.voice_transport_binding_status());
+            voice_transport_binding_events.extend(peer.voice_transport_binding_event_status());
+            voice_transport_challengers.extend(peer.voice_transport_challenger_status());
+        }
         outbound_queues.sort_by_key(|queue| (queue.peer(), queue.queue_key()));
-        let mut expired_outbound_drops = self
-            .inner
-            .iter_peers()
-            .into_iter()
-            .flat_map(|(_, peer)| peer.expired_outbound_drop_status())
-            .collect::<Vec<_>>();
         expired_outbound_drops.sort_by_key(|drop| {
             (
                 drop.peer(),
@@ -1306,27 +1349,9 @@ impl ConnectionManager {
                 drop.class() as u8,
             )
         });
-        let mut transport_health_exclusions = self
-            .inner
-            .iter_peers()
-            .into_iter()
-            .flat_map(|(_, peer)| peer.transport_health_exclusion_status())
-            .collect::<Vec<_>>();
         transport_health_exclusions
             .sort_by_key(|exclusion| (exclusion.peer(), exclusion.transport(), exclusion.reason()));
-        let mut voice_transport_bindings = self
-            .inner
-            .iter_peers()
-            .into_iter()
-            .filter_map(|(_, peer)| peer.voice_transport_binding_status())
-            .collect::<Vec<_>>();
         voice_transport_bindings.sort_by_key(|binding| binding.peer());
-        let mut voice_transport_binding_events = self
-            .inner
-            .iter_peers()
-            .into_iter()
-            .flat_map(|(_, peer)| peer.voice_transport_binding_event_status())
-            .collect::<Vec<_>>();
         voice_transport_binding_events.sort_by_key(|event| {
             (
                 event.peer(),
@@ -1335,12 +1360,6 @@ impl ConnectionManager {
                 event.reason(),
             )
         });
-        let mut voice_transport_challengers = self
-            .inner
-            .iter_peers()
-            .into_iter()
-            .flat_map(|(_, peer)| peer.voice_transport_challenger_status())
-            .collect::<Vec<_>>();
         voice_transport_challengers.sort_by_key(|event| {
             (
                 event.peer(),
@@ -1476,6 +1495,35 @@ impl ConnectionManager {
         )
     }
 
+    /// Return the metrics used to select the best currently live transport
+    /// for `node`. Selection and the returned value are derived from the same
+    /// immutable per-peer snapshot.
+    pub fn selected_live_transport_metrics(
+        &self,
+        node: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+    ) -> Option<(TransportKind, LinkMetrics)> {
+        let peer = self.inner.get_peer(node)?;
+        let snapshot = peer.metrics().snapshot_per_transport();
+        let selected = pick_transports_with_snapshot(
+            &peer,
+            level,
+            routing_metric,
+            MessageClass::HighPriority,
+            SendOptions::default(),
+            0,
+            TransportSelectionConfig::from_config(self.inner.cfg()),
+            &snapshot,
+        )
+        .into_iter()
+        .next()?;
+        snapshot
+            .get(&selected)
+            .cloned()
+            .map(|link| (selected, link))
+    }
+
     /// Best queue-pressure penalty the sender would see for this peer now.
     /// Lower is better; this combines the peer dispatcher backlog with the
     /// selected stream. Expiring sends include estimated drain time while
@@ -1570,9 +1618,32 @@ fn pick_transports(
     payload_len: usize,
     selection: impl Into<TransportSelectionConfig>,
 ) -> Vec<TransportKind> {
+    let snapshot = peer.metrics().snapshot_per_transport();
+    pick_transports_with_snapshot(
+        peer,
+        level,
+        routing_metric,
+        class,
+        options,
+        payload_len,
+        selection,
+        &snapshot,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pick_transports_with_snapshot(
+    peer: &PeerState,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    options: SendOptions,
+    payload_len: usize,
+    selection: impl Into<TransportSelectionConfig>,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+) -> Vec<TransportKind> {
     let selection = selection.into();
     let now = Instant::now();
-    let snapshot = peer.metrics().snapshot_per_transport();
     let mut candidates: Vec<TransportKind> = peer
         .live_kinds()
         .into_iter()
@@ -1583,7 +1654,7 @@ fn pick_transports(
     }
     let has_viable_kcp_alternative = candidates.iter().copied().any(|transport| {
         transport != TransportKind::Kcp
-            && transport_is_viable_alternative(peer, transport, &snapshot, selection.routing, now)
+            && transport_is_viable_alternative(peer, transport, snapshot, selection.routing, now)
     });
     candidates.retain(|transport| {
         if let Some(reason) = transport_candidate_exclusion_reason(
@@ -1592,7 +1663,7 @@ fn pick_transports(
             level,
             class,
             options,
-            &snapshot,
+            snapshot,
             selection,
             has_viable_kcp_alternative,
             now,
@@ -1607,9 +1678,9 @@ fn pick_transports(
         return Vec::new();
     }
 
-    let mut ranked = peer
-        .metrics()
-        .ranked_transports_for(level, routing_metric, &candidates);
+    let mut ranked =
+        peer.metrics()
+            .ranked_transports_for_snapshot(level, routing_metric, &candidates, snapshot);
 
     candidates.sort_by_key(|k| fallback_transport_rank(*k, level));
 
@@ -1628,6 +1699,7 @@ fn pick_transports(
         options,
         payload_len,
         selection.routing,
+        snapshot,
     );
     enforce_expiring_voice_admission(
         peer,
@@ -1637,12 +1709,17 @@ fn pick_transports(
         class,
         options,
         selection.routing,
+        snapshot,
     );
 
     if options.expires_at().is_some() {
-        ranked.sort_by_key(|kind| deadline_queue_penalty(peer, *kind, class, options, now));
+        ranked.sort_by_key(|kind| {
+            deadline_queue_penalty_with_snapshot(peer, *kind, class, options, now, snapshot)
+        });
         if class == MessageClass::HighPriority {
-            ranked.retain(|kind| deadline_queue_penalty(peer, *kind, class, options, now) < 3);
+            ranked.retain(|kind| {
+                deadline_queue_penalty_with_snapshot(peer, *kind, class, options, now, snapshot) < 3
+            });
         }
     } else {
         // A full stream cannot accept control or repair traffic any more than
@@ -1831,6 +1908,7 @@ fn apply_transport_routing_policy(
     options: SendOptions,
     payload_len: usize,
     policy: TransportRoutingPolicy,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
 ) {
     if ranked.len() < 2 || best_effort_without_voice_deadline(level, routing_metric, class, options)
     {
@@ -1850,8 +1928,7 @@ fn apply_transport_routing_policy(
         payload_len,
         policy,
     );
-    let snapshot = peer.metrics().snapshot_per_transport();
-    let health = udp_family_health(peer, ranked, &snapshot, policy);
+    let health = udp_family_health(peer, ranked, snapshot, policy);
     let tcp_usable = tcp_transport_usable(peer, snapshot.get(&TransportKind::Tcp), policy);
 
     match intent {
@@ -1864,7 +1941,7 @@ fn apply_transport_routing_policy(
         TransportSelectionIntent::LatencySensitive => {
             if tcp_usable {
                 if let Some(udp_pos) =
-                    udp_family_promotion_position(ranked, &snapshot, routing_metric, health, policy)
+                    udp_family_promotion_position(ranked, snapshot, routing_metric, health, policy)
                 {
                     move_transport_to_front(ranked, udp_pos);
                 } else {
@@ -2033,13 +2110,13 @@ fn enforce_expiring_voice_admission(
     class: MessageClass,
     options: SendOptions,
     policy: TransportRoutingPolicy,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
 ) {
     if !is_expiring_conversational_voice(level, routing_metric, class, options) {
         return;
     }
 
-    let snapshot = peer.metrics().snapshot_per_transport();
-    if udp_family_health(peer, ranked, &snapshot, policy) == UdpFamilyHealth::Viable {
+    if udp_family_health(peer, ranked, snapshot, policy) == UdpFamilyHealth::Viable {
         return;
     }
 
@@ -2238,7 +2315,8 @@ fn route_deadline_queue_penalty(
     if peer_queue_full {
         return 3;
     }
-    deadline_queue_penalty_with_additional_depth(
+    let snapshot = peer.metrics().snapshot_per_transport();
+    deadline_queue_penalty_with_additional_depth_and_snapshot(
         peer,
         transport,
         class,
@@ -2246,6 +2324,7 @@ fn route_deadline_queue_penalty(
         now,
         peer_depth,
         peer_fill_penalty,
+        &snapshot,
     )
 }
 
@@ -2256,10 +2335,25 @@ fn deadline_queue_penalty(
     options: SendOptions,
     now: Instant,
 ) -> u8 {
-    deadline_queue_penalty_with_additional_depth(peer, transport, class, options, now, 0, 0)
+    let snapshot = peer.metrics().snapshot_per_transport();
+    deadline_queue_penalty_with_snapshot(peer, transport, class, options, now, &snapshot)
 }
 
-fn deadline_queue_penalty_with_additional_depth(
+fn deadline_queue_penalty_with_snapshot(
+    peer: &PeerState,
+    transport: TransportKind,
+    class: MessageClass,
+    options: SendOptions,
+    now: Instant,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+) -> u8 {
+    deadline_queue_penalty_with_additional_depth_and_snapshot(
+        peer, transport, class, options, now, 0, 0, snapshot,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deadline_queue_penalty_with_additional_depth_and_snapshot(
     peer: &PeerState,
     transport: TransportKind,
     class: MessageClass,
@@ -2267,6 +2361,7 @@ fn deadline_queue_penalty_with_additional_depth(
     now: Instant,
     additional_depth: usize,
     additional_fill_penalty: u8,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
 ) -> u8 {
     let Some(expires_at) = options.expires_at() else {
         return 0;
@@ -2294,7 +2389,7 @@ fn deadline_queue_penalty_with_additional_depth(
         return 0;
     }
 
-    let drain_bytes_per_ms = estimated_drain_bytes_per_ms(peer, transport);
+    let drain_bytes_per_ms = estimated_drain_bytes_per_ms(snapshot.get(&transport));
     if !drain_bytes_per_ms.is_finite() || drain_bytes_per_ms <= 0.0 {
         return 3;
     }
@@ -2328,11 +2423,8 @@ fn peer_queue_pressure(peer: &PeerState, class: MessageClass) -> (usize, u8, boo
     (depth, fill_penalty, full)
 }
 
-fn estimated_drain_bytes_per_ms(peer: &PeerState, transport: TransportKind) -> f64 {
-    let drain_bytes_per_sec = peer
-        .metrics()
-        .snapshot_per_transport()
-        .get(&transport)
+fn estimated_drain_bytes_per_ms(link: Option<&LinkMetrics>) -> f64 {
+    let drain_bytes_per_sec = link
         .map(|link| link.estimated_throughput_bps())
         .filter(|rate| rate.is_finite() && *rate >= DEADLINE_DRAIN_FALLBACK_BYTES_PER_SEC)
         .unwrap_or(DEADLINE_DRAIN_FALLBACK_BYTES_PER_SEC);
@@ -4085,6 +4177,147 @@ mod tests {
         assert_eq!(
             pick_transport(&peer, ServiceLevel::Reliable, RoutingMetric::ReliableCost),
             Some(TransportKind::Tcp)
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_live_transport_metrics_requires_a_snapshot_entry() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+
+        assert!(
+            transport
+                .selected_live_transport_metrics(
+                    3,
+                    ServiceLevel::BestEffort,
+                    RoutingMetric::ConversationalQuality,
+                )
+                .is_none()
+        );
+        assert!(
+            transport
+                .selected_live_transport_metrics(
+                    2,
+                    ServiceLevel::BestEffort,
+                    RoutingMetric::ConversationalQuality,
+                )
+                .is_none(),
+            "an unmeasured fallback must not fabricate link metrics"
+        );
+
+        let peer = transport.inner.get_peer(2).expect("peer");
+        peer.metrics().record_payload_sent(TransportKind::Tcp, 128);
+        peer.metrics().record_probe_lost(TransportKind::Tcp);
+        let (selected, link) = transport
+            .selected_live_transport_metrics(
+                2,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            )
+            .expect("partial metrics for the selected fallback");
+        assert_eq!(selected, TransportKind::Tcp);
+        assert_eq!(link.samples(), 0, "the fallback remains unranked");
+        assert_eq!(link.sent_bytes(), 128);
+        assert_eq!(link.probe_packets(), 1);
+    }
+
+    #[tokio::test]
+    async fn selected_live_transport_metrics_returns_the_selected_snapshot_value() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        transport.record_peer_rtt(2, TransportKind::Tcp, Duration::from_millis(37));
+        let peer = transport.inner.get_peer(2).expect("peer");
+        peer.metrics().reset_snapshot_count();
+
+        let (selected, link) = transport
+            .selected_live_transport_metrics(
+                2,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            )
+            .expect("measured live transport");
+
+        assert_eq!(selected, TransportKind::Tcp);
+        assert_eq!(link.rtt_us(), 37_000.0);
+        assert_eq!(link.samples(), 1);
+        assert_eq!(
+            peer.metrics().snapshot_count(),
+            1,
+            "selection and returned metrics must share one peer snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_metrics_snapshot_captures_each_peer_once() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        transport.test_install_live_stream(3, TransportKind::Udp);
+        let peers = [
+            transport.inner.get_peer(2).expect("peer 2"),
+            transport.inner.get_peer(3).expect("peer 3"),
+        ];
+        for peer in &peers {
+            peer.metrics().reset_snapshot_count();
+        }
+        transport.inner.reset_iter_peers_count();
+
+        let snapshot = transport.metrics_snapshot();
+
+        assert_eq!(transport.inner.iter_peers_count(), 1);
+        assert!(snapshot.for_node(2).is_some());
+        assert!(snapshot.for_node(3).is_some());
+        for peer in peers {
+            assert_eq!(peer.metrics().snapshot_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn targeted_and_global_metrics_return_the_same_stable_link_values() {
+        let window = Duration::from_millis(1);
+        let (transport, _receivers) = ConnectionManager::test_with_live_streams_bandwidth_window(
+            1,
+            2,
+            &[TransportKind::Tcp],
+            window,
+        );
+        let peer = transport.inner.get_peer(2).expect("peer");
+        peer.metrics()
+            .record_rtt(TransportKind::Tcp, Duration::from_millis(37));
+        peer.metrics().record_payload_sent(TransportKind::Tcp, 256);
+        peer.metrics().record_probe_delivered(TransportKind::Tcp);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let (_, targeted) = transport
+            .selected_live_transport_metrics(
+                2,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            )
+            .expect("targeted metrics");
+        let global_snapshot = transport.metrics_snapshot();
+        let global = global_snapshot
+            .for_node(2)
+            .and_then(|links| links.get(&TransportKind::Tcp))
+            .expect("global metrics");
+
+        assert_eq!(targeted.rtt_us(), global.rtt_us());
+        assert_eq!(targeted.jitter_us(), global.jitter_us());
+        assert_eq!(targeted.sent_bytes(), global.sent_bytes());
+        assert_eq!(targeted.recv_bytes(), global.recv_bytes());
+        assert_eq!(targeted.wire_sent_bytes(), global.wire_sent_bytes());
+        assert_eq!(targeted.wire_recv_bytes(), global.wire_recv_bytes());
+        assert_eq!(targeted.window(), window);
+        assert_eq!(targeted.window(), global.window());
+        assert_eq!(
+            targeted.throughput_confidence_ppm(),
+            global.throughput_confidence_ppm()
+        );
+        assert_eq!(targeted.loss_breakdown(), global.loss_breakdown());
+        assert_eq!(targeted.samples(), global.samples());
+        assert_eq!(targeted.last_update(), global.last_update());
+        assert_eq!(
+            targeted.kcp_runtime().is_some(),
+            global.kcp_runtime().is_some()
         );
     }
 
