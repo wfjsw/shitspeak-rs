@@ -1898,6 +1898,9 @@ pub struct MetricsSnapshot {
     inbound_queues: Vec<InboundQueueStatusSnapshot>,
     expired_outbound_drops: Vec<ExpiredOutboundDropSnapshot>,
     transport_health_exclusions: Vec<TransportHealthExclusionSnapshot>,
+    voice_transport_bindings: Vec<VoiceTransportBindingSnapshot>,
+    voice_transport_binding_events: Vec<VoiceTransportBindingEventSnapshot>,
+    voice_transport_challengers: Vec<VoiceTransportChallengerSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1978,6 +1981,159 @@ impl ExpiredOutboundDropStage {
 pub enum TransportHealthExclusionReason {
     KcpFailaway,
     StaleQueue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum VoiceTransportBindingEventReason {
+    Initial,
+    IdleReset,
+    ConfirmedChallenger,
+    DeadlineImpossible,
+    TransportUnavailable,
+    QueueFull,
+    StreamClosed,
+    SendRejected,
+    Recovered,
+    NoAlternate,
+}
+
+impl VoiceTransportBindingEventReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::IdleReset => "idle_reset",
+            Self::ConfirmedChallenger => "confirmed_challenger",
+            Self::DeadlineImpossible => "deadline_impossible",
+            Self::TransportUnavailable => "transport_unavailable",
+            Self::QueueFull => "queue_full",
+            Self::StreamClosed => "stream_closed",
+            Self::SendRejected => "send_rejected",
+            Self::Recovered => "recovered",
+            Self::NoAlternate => "no_alternate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum VoiceTransportChallengerOutcome {
+    Started,
+    Reset,
+    Confirmed,
+}
+
+impl VoiceTransportChallengerOutcome {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Reset => "reset",
+            Self::Confirmed => "confirmed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceTransportBindingSnapshot {
+    peer: NodeIdentifier,
+    transport: TransportKind,
+}
+
+impl VoiceTransportBindingSnapshot {
+    pub(crate) fn new(peer: NodeIdentifier, transport: TransportKind) -> Self {
+        Self { peer, transport }
+    }
+
+    pub fn peer(&self) -> NodeIdentifier {
+        self.peer
+    }
+    pub fn transport(&self) -> TransportKind {
+        self.transport
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceTransportBindingEventSnapshot {
+    peer: NodeIdentifier,
+    from: Option<TransportKind>,
+    to: Option<TransportKind>,
+    reason: VoiceTransportBindingEventReason,
+    events: u64,
+}
+
+impl VoiceTransportBindingEventSnapshot {
+    pub(crate) fn new(
+        peer: NodeIdentifier,
+        from: Option<TransportKind>,
+        to: Option<TransportKind>,
+        reason: VoiceTransportBindingEventReason,
+        events: u64,
+    ) -> Self {
+        Self {
+            peer,
+            from,
+            to,
+            reason,
+            events,
+        }
+    }
+
+    pub fn peer(&self) -> NodeIdentifier {
+        self.peer
+    }
+    pub fn from_transport(&self) -> Option<TransportKind> {
+        self.from
+    }
+    pub fn to_transport(&self) -> Option<TransportKind> {
+        self.to
+    }
+    pub fn reason(&self) -> VoiceTransportBindingEventReason {
+        self.reason
+    }
+    pub fn events(&self) -> u64 {
+        self.events
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceTransportChallengerSnapshot {
+    peer: NodeIdentifier,
+    incumbent: TransportKind,
+    challenger: TransportKind,
+    outcome: VoiceTransportChallengerOutcome,
+    events: u64,
+}
+
+impl VoiceTransportChallengerSnapshot {
+    pub(crate) fn new(
+        peer: NodeIdentifier,
+        incumbent: TransportKind,
+        challenger: TransportKind,
+        outcome: VoiceTransportChallengerOutcome,
+        events: u64,
+    ) -> Self {
+        Self {
+            peer,
+            incumbent,
+            challenger,
+            outcome,
+            events,
+        }
+    }
+
+    pub fn peer(&self) -> NodeIdentifier {
+        self.peer
+    }
+    pub fn incumbent(&self) -> TransportKind {
+        self.incumbent
+    }
+    pub fn challenger(&self) -> TransportKind {
+        self.challenger
+    }
+    pub fn outcome(&self) -> VoiceTransportChallengerOutcome {
+        self.outcome
+    }
+    pub fn events(&self) -> u64 {
+        self.events
+    }
 }
 
 impl TransportHealthExclusionReason {
@@ -2223,6 +2379,18 @@ impl MetricsSnapshot {
     pub fn transport_health_exclusions(&self) -> &[TransportHealthExclusionSnapshot] {
         &self.transport_health_exclusions
     }
+
+    pub fn voice_transport_bindings(&self) -> &[VoiceTransportBindingSnapshot] {
+        &self.voice_transport_bindings
+    }
+
+    pub fn voice_transport_binding_events(&self) -> &[VoiceTransportBindingEventSnapshot] {
+        &self.voice_transport_binding_events
+    }
+
+    pub fn voice_transport_challengers(&self) -> &[VoiceTransportChallengerSnapshot] {
+        &self.voice_transport_challengers
+    }
 }
 
 /// Helper for the manager to assemble a `MetricsSnapshot` across all peers.
@@ -2232,6 +2400,9 @@ pub fn assemble_snapshot<I>(
     inbound_queues: Vec<InboundQueueStatusSnapshot>,
     expired_outbound_drops: Vec<ExpiredOutboundDropSnapshot>,
     transport_health_exclusions: Vec<TransportHealthExclusionSnapshot>,
+    voice_transport_bindings: Vec<VoiceTransportBindingSnapshot>,
+    voice_transport_binding_events: Vec<VoiceTransportBindingEventSnapshot>,
+    voice_transport_challengers: Vec<VoiceTransportChallengerSnapshot>,
 ) -> MetricsSnapshot
 where
     I: IntoIterator<Item = (NodeIdentifier, Arc<PeerMetrics>)>,
@@ -2246,6 +2417,9 @@ where
         inbound_queues,
         expired_outbound_drops,
         transport_health_exclusions,
+        voice_transport_bindings,
+        voice_transport_binding_events,
+        voice_transport_challengers,
     }
 }
 

@@ -141,6 +141,83 @@ impl PostAuthBaseline {
     }
 }
 
+/// An owned group of protocol messages ready to be handed to a connection's
+/// writer queue without cloning the individual messages.
+#[derive(Debug)]
+pub struct OwnedMessageBatch {
+    messages: Vec<Message>,
+}
+
+impl OwnedMessageBatch {
+    pub fn new(messages: Vec<Message>) -> Self {
+        Self { messages }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn into_messages(self) -> Vec<Message> {
+        self.messages
+    }
+}
+
+impl From<Vec<Message>> for OwnedMessageBatch {
+    fn from(messages: Vec<Message>) -> Self {
+        Self::new(messages)
+    }
+}
+
+fn try_send_owned_message_batch(
+    sender: Option<&mpsc::Sender<ClientOutboundMessage>>,
+    batch: OwnedMessageBatch,
+) -> Result<(), mpsc::error::TrySendError<ClientOutboundMessage>> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let outbound = ClientOutboundMessage::Batch(batch.into_messages());
+    let Some(sender) = sender else {
+        return Err(mpsc::error::TrySendError::Closed(outbound));
+    };
+    sender.try_send(outbound)
+}
+
+fn try_send_owned_gateway_batch(
+    sender: &mpsc::Sender<Message>,
+    batch: OwnedMessageBatch,
+) -> Result<(), mpsc::error::TrySendError<ClientOutboundMessage>> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let messages = batch.into_messages();
+    if messages.len() > sender.max_capacity() {
+        return Err(mpsc::error::TrySendError::Full(
+            ClientOutboundMessage::Batch(messages),
+        ));
+    }
+    match sender.try_reserve_many(messages.len()) {
+        Ok(permits) => {
+            for (permit, message) in permits.zip(messages) {
+                permit.send(message);
+            }
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Full(())) => Err(mpsc::error::TrySendError::Full(
+            ClientOutboundMessage::Batch(messages),
+        )),
+        Err(mpsc::error::TrySendError::Closed(())) => Err(mpsc::error::TrySendError::Closed(
+            ClientOutboundMessage::Batch(messages),
+        )),
+    }
+}
+
+#[derive(Debug)]
 pub enum ClientOutboundMessage {
     Single(Message),
     Batch(Vec<Message>),
@@ -975,11 +1052,20 @@ impl Client {
         Ok(())
     }
 
-    pub async fn force_disconnect(&self) -> Result<(), WriteProtoMessageError> {
+    /// Request immediate connection teardown from synchronous code.
+    ///
+    /// Projection shards use this when their non-blocking writer delivery
+    /// fails. The watch notification wakes the connection task, while closing
+    /// the native socket also interrupts any in-flight TLS I/O.
+    pub(crate) fn request_disconnect(&self) {
         let _ = self.disconnect_tx.send(true);
         if let ClientTransport::NativeTls { socket, .. } = &self.transport {
             Self::shutdown_socket(socket);
         }
+    }
+
+    pub async fn force_disconnect(&self) -> Result<(), WriteProtoMessageError> {
+        self.request_disconnect();
         Ok(())
     }
 
@@ -1089,6 +1175,29 @@ impl Client {
             ClientTransport::Remote => return Err(transport_not_writable_error().into()),
         }
         Ok(())
+    }
+
+    /// Try to hand an owned message batch to the native connection writer.
+    ///
+    /// This is non-blocking and preserves ownership all the way into the
+    /// bounded writer queue. A full or closed queue returns the original
+    /// outbound value through [`mpsc::error::TrySendError`]. Non-native
+    /// Web gateway transports reserve space for the entire batch before
+    /// handing off any message, so a full queue cannot receive a partial
+    /// batch. Remote transports are reported as closed.
+    pub fn try_write_owned_message_batch(
+        &self,
+        batch: OwnedMessageBatch,
+    ) -> Result<(), mpsc::error::TrySendError<ClientOutboundMessage>> {
+        match &self.transport {
+            ClientTransport::NativeTls { .. } => {
+                try_send_owned_message_batch(self.outbound_message_tx.as_ref(), batch)
+            }
+            ClientTransport::WebGateway { outbound_tx, .. } => {
+                try_send_owned_gateway_batch(outbound_tx, batch)
+            }
+            ClientTransport::Remote => try_send_owned_message_batch(None, batch),
+        }
     }
 
     pub fn take_outbound_message_rx(&self) -> Option<mpsc::Receiver<ClientOutboundMessage>> {
@@ -1808,5 +1917,110 @@ mod tests {
         assert!(client.take_voice_tcp_rx().is_none());
         assert!(client.outbound_message_tx.is_none());
         assert!(client.take_outbound_message_rx().is_none());
+
+        assert!(!*client.disconnect_rx.borrow());
+        client.request_disconnect();
+        assert!(*client.disconnect_rx.borrow());
+    }
+
+    fn ping(timestamp: u64) -> Message {
+        Message::Ping(
+            msg_encoder::Ping {
+                timestamp,
+                ..Default::default()
+            }
+            .into(),
+        )
+    }
+
+    fn outbound_batch_len(message: ClientOutboundMessage) -> usize {
+        match message {
+            ClientOutboundMessage::Batch(messages) => messages.len(),
+            ClientOutboundMessage::Single(_) => panic!("expected an outbound message batch"),
+        }
+    }
+
+    #[test]
+    fn owned_message_batch_round_trips_without_exposing_storage() {
+        let batch = OwnedMessageBatch::new(vec![ping(1), ping(2)]);
+
+        assert!(!batch.is_empty());
+        assert_eq!(batch.len(), 2);
+        let messages = batch.into_messages();
+        assert!(matches!(&messages[0], Message::Ping(ping) if ping.timestamp == Some(1)));
+        assert!(matches!(&messages[1], Message::Ping(ping) if ping.timestamp == Some(2)));
+    }
+
+    #[test]
+    fn owned_message_batch_try_send_is_bounded_and_preserves_rejected_batch() {
+        let (tx, mut rx) = mpsc::channel(1);
+
+        try_send_owned_message_batch(Some(&tx), OwnedMessageBatch::new(vec![ping(1), ping(2)]))
+            .expect("first batch should fit");
+        let full = try_send_owned_message_batch(
+            Some(&tx),
+            OwnedMessageBatch::new(vec![ping(3), ping(4), ping(5)]),
+        )
+        .expect_err("second batch should observe the full queue");
+        assert!(matches!(full, mpsc::error::TrySendError::Full(_)));
+        assert_eq!(outbound_batch_len(full.into_inner()), 3);
+
+        assert_eq!(
+            outbound_batch_len(rx.try_recv().expect("queued batch should remain available")),
+            2
+        );
+        drop(rx);
+
+        let closed = try_send_owned_message_batch(Some(&tx), OwnedMessageBatch::new(vec![ping(6)]))
+            .expect_err("closed queue should reject the batch");
+        assert!(matches!(closed, mpsc::error::TrySendError::Closed(_)));
+        assert_eq!(outbound_batch_len(closed.into_inner()), 1);
+    }
+
+    #[test]
+    fn empty_owned_message_batch_succeeds_without_a_writer() {
+        try_send_owned_message_batch(None, OwnedMessageBatch::new(Vec::new()))
+            .expect("empty batches do not require a writer queue");
+    }
+
+    #[test]
+    fn gateway_owned_batch_reservation_prevents_partial_delivery() {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.try_send(ping(1))
+            .expect("first queue slot should be free");
+
+        let full =
+            try_send_owned_gateway_batch(&tx, OwnedMessageBatch::new(vec![ping(2), ping(3)]))
+                .expect_err("the complete batch does not fit");
+        assert!(matches!(full, mpsc::error::TrySendError::Full(_)));
+        assert_eq!(outbound_batch_len(full.into_inner()), 2);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Message::Ping(ping)) if ping.timestamp == Some(1)
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        try_send_owned_gateway_batch(&tx, OwnedMessageBatch::new(vec![ping(4), ping(5)]))
+            .expect("the complete batch should fit once capacity is available");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Message::Ping(ping)) if ping.timestamp == Some(4)
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Message::Ping(ping)) if ping.timestamp == Some(5)
+        ));
+
+        let oversized = try_send_owned_gateway_batch(
+            &tx,
+            OwnedMessageBatch::new(vec![ping(6), ping(7), ping(8)]),
+        )
+        .expect_err("a batch larger than maximum capacity must not panic");
+        assert!(matches!(oversized, mpsc::error::TrySendError::Full(_)));
+        assert_eq!(outbound_batch_len(oversized.into_inner()), 3);
     }
 }

@@ -27,7 +27,7 @@ use super::adaptive_queue::{
 use super::config::{KcpTuning, TransportConfig, TransportRoutingPolicy};
 use super::connection::{
     AddressBackoffSnapshot, BackoffState, OutboundFrame, PeerOutboundReceiver, PeerOutboundSender,
-    PeerState,
+    PeerState, VoiceTransportCandidateScore,
 };
 use super::connection::{OutboundEnvelope, TransportPayloadPlan};
 use super::endpoint::{
@@ -48,7 +48,7 @@ use super::identity::{
 use super::metrics::{
     ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot,
     MetricsTuning, QueueWatermark, QueueWatermarkReport, TransportHealthExclusionReason,
-    assemble_snapshot,
+    VoiceTransportBindingEventReason, assemble_snapshot,
 };
 use super::service_level::{
     MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel, TransportKind,
@@ -576,6 +576,10 @@ pub struct ConnectionManager {
 }
 
 impl ConnectionManager {
+    pub fn routing_policy(&self) -> TransportRoutingPolicy {
+        self.inner.cfg().routing_policy()
+    }
+
     /// Maximum encoded transport frame size accepted by this manager.
     pub fn max_frame_bytes(&self) -> usize {
         self.inner.cfg().max_frame_bytes()
@@ -1310,12 +1314,50 @@ impl ConnectionManager {
             .collect::<Vec<_>>();
         transport_health_exclusions
             .sort_by_key(|exclusion| (exclusion.peer(), exclusion.transport(), exclusion.reason()));
+        let mut voice_transport_bindings = self
+            .inner
+            .iter_peers()
+            .into_iter()
+            .filter_map(|(_, peer)| peer.voice_transport_binding_status())
+            .collect::<Vec<_>>();
+        voice_transport_bindings.sort_by_key(|binding| binding.peer());
+        let mut voice_transport_binding_events = self
+            .inner
+            .iter_peers()
+            .into_iter()
+            .flat_map(|(_, peer)| peer.voice_transport_binding_event_status())
+            .collect::<Vec<_>>();
+        voice_transport_binding_events.sort_by_key(|event| {
+            (
+                event.peer(),
+                event.from_transport(),
+                event.to_transport(),
+                event.reason(),
+            )
+        });
+        let mut voice_transport_challengers = self
+            .inner
+            .iter_peers()
+            .into_iter()
+            .flat_map(|(_, peer)| peer.voice_transport_challenger_status())
+            .collect::<Vec<_>>();
+        voice_transport_challengers.sort_by_key(|event| {
+            (
+                event.peer(),
+                event.incumbent(),
+                event.challenger(),
+                event.outcome(),
+            )
+        });
         assemble_snapshot(
             entries,
             outbound_queues,
             self.inner.inbound.queue_status(),
             expired_outbound_drops,
             transport_health_exclusions,
+            voice_transport_bindings,
+            voice_transport_binding_events,
+            voice_transport_challengers,
         )
     }
 
@@ -1448,7 +1490,8 @@ impl ConnectionManager {
     ) -> Option<u8> {
         let peer = self.inner.get_peer(node)?;
         let now = Instant::now();
-        pick_transports(
+        let policy = self.inner.cfg().routing_policy();
+        let mut ranked = pick_transports(
             &peer,
             level,
             routing_metric,
@@ -1456,10 +1499,22 @@ impl ConnectionManager {
             options,
             0,
             TransportSelectionConfig::from_config(self.inner.cfg()),
-        )
-        .first()
-        .copied()
-        .map(|transport| send_queue_penalty(&peer, transport, class, options, now))
+        );
+        apply_voice_transport_stickiness(
+            &peer,
+            &mut ranked,
+            level,
+            routing_metric,
+            class,
+            options,
+            policy,
+            now,
+            false,
+        );
+        ranked
+            .first()
+            .copied()
+            .map(|transport| send_queue_penalty(&peer, transport, class, options, now))
     }
 
     pub async fn shutdown(&self) {
@@ -1867,6 +1922,107 @@ fn is_expiring_conversational_voice(
         && routing_metric == RoutingMetric::ConversationalQuality
         && class == MessageClass::HighPriority
         && options.expires_at().is_some()
+}
+
+fn apply_voice_transport_stickiness(
+    peer: &PeerState,
+    ranked: &mut Vec<TransportKind>,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    options: SendOptions,
+    policy: TransportRoutingPolicy,
+    now: Instant,
+    observe: bool,
+) -> Option<super::connection::VoiceTransportDecision> {
+    if !policy.voice_path_stickiness_enabled()
+        || !is_expiring_conversational_voice(level, routing_metric, class, options)
+        || ranked.is_empty()
+    {
+        return None;
+    }
+    let snapshot = peer.metrics().snapshot_per_transport();
+    let candidates = ranked
+        .iter()
+        .copied()
+        .map(|transport| {
+            VoiceTransportCandidateScore::new(
+                transport,
+                deadline_queue_penalty(peer, transport, class, options, now),
+                snapshot
+                    .get(&transport)
+                    .and_then(|link| link.routing_cost(level, routing_metric)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut decision = peer.choose_voice_transport(
+        &candidates,
+        now,
+        policy.voice_path_min_hold(),
+        policy.voice_path_challenger_confirm(),
+        policy.voice_path_idle_reset(),
+        policy.transport_switch_improvement_pct(),
+        observe,
+    )?;
+    if decision.reason() == VoiceTransportBindingEventReason::TransportUnavailable {
+        let exclusion_reason = decision.incumbent().and_then(|incumbent| {
+            if !peer.live_kinds().contains(&incumbent) {
+                return None;
+            }
+            if peer
+                .outbound_stream_queue_status(incumbent)
+                .is_some_and(|status| status.capacity() > 0 && status.depth() >= status.capacity())
+            {
+                Some(VoiceTransportBindingEventReason::QueueFull)
+            } else if deadline_queue_penalty(peer, incumbent, class, options, now) >= 3 {
+                Some(VoiceTransportBindingEventReason::DeadlineImpossible)
+            } else {
+                None
+            }
+        });
+        if let Some(reason) = exclusion_reason {
+            decision = decision.with_reason(reason);
+        }
+    }
+    if let Some(position) = ranked
+        .iter()
+        .position(|transport| *transport == decision.preferred())
+    {
+        move_transport_to_front(ranked, position);
+    }
+    Some(decision)
+}
+
+fn record_voice_transport_no_alternate(
+    peer: &PeerState,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    options: SendOptions,
+    now: Instant,
+) {
+    if !peer.record_voice_transport_no_alternate() {
+        return;
+    }
+    let incumbent = peer
+        .voice_transport_binding_status()
+        .map(|binding| binding.transport());
+    let incumbent_pressure =
+        incumbent.map(|transport| deadline_queue_penalty(peer, transport, class, options, now));
+    let (held_for, confirmation_for) = peer.voice_transport_binding_ages(now);
+    debug!(
+        peer = %peer.node_id(),
+        ?incumbent,
+        challenger = ?Option::<TransportKind>::None,
+        incumbent_pressure,
+        challenger_pressure = ?Option::<u8>::None,
+        held_ms = held_for.as_millis(),
+        confirmation_ms = confirmation_for.as_millis(),
+        ?level,
+        ?routing_metric,
+        reason = VoiceTransportBindingEventReason::NoAlternate.name(),
+        "voice transport escape had no eligible alternate"
+    );
 }
 
 fn enforce_expiring_voice_admission(
@@ -2626,7 +2782,7 @@ fn try_dispatch_envelope_with_policy(
         return Ok(());
     }
     let class = envelope.class();
-    let choices = if let Some(transport) = envelope.target_transport() {
+    let mut choices = if let Some(transport) = envelope.target_transport() {
         let snapshot = peer.metrics().snapshot_per_transport();
         let live = peer.live_kinds();
         let has_viable_alternative = live.iter().copied().any(|candidate| {
@@ -2669,10 +2825,45 @@ fn try_dispatch_envelope_with_policy(
         )
     };
 
+    let sticky_voice = envelope.target_transport().is_none()
+        && selection.routing.voice_path_stickiness_enabled()
+        && is_expiring_conversational_voice(
+            envelope.level(),
+            envelope.routing_metric(),
+            envelope.class(),
+            envelope.options(),
+        );
+    let voice_decision = if sticky_voice {
+        apply_voice_transport_stickiness(
+            peer,
+            &mut choices,
+            envelope.level(),
+            envelope.routing_metric(),
+            envelope.class(),
+            envelope.options(),
+            selection.routing,
+            now,
+            true,
+        )
+    } else {
+        None
+    };
+
     if choices.is_empty() {
+        if sticky_voice {
+            record_voice_transport_no_alternate(
+                peer,
+                envelope.level(),
+                envelope.routing_metric(),
+                class,
+                envelope.options(),
+                now,
+            );
+        }
         return Err(envelope);
     }
 
+    let mut incumbent_failure = None;
     for transport in choices {
         let options = envelope.options();
         if options.is_expired() {
@@ -2684,6 +2875,9 @@ fn try_dispatch_envelope_with_policy(
             return Ok(());
         }
         let Some(sender) = peer.try_get_stream(transport) else {
+            if voice_decision.is_some_and(|decision| decision.incumbent() == Some(transport)) {
+                incumbent_failure = Some(VoiceTransportBindingEventReason::TransportUnavailable);
+            }
             continue;
         };
         let variant = envelope.payloads().variant(transport);
@@ -2707,15 +2901,47 @@ fn try_dispatch_envelope_with_policy(
                     ));
                 }
                 record_outbound_stream_queue_sample(peer, transport, class, &sender, false);
+                if let Some(decision) = voice_decision {
+                    let selected_pressure =
+                        deadline_queue_penalty(peer, transport, class, options, now);
+                    let incumbent_pressure = decision.incumbent().map(|incumbent| {
+                        deadline_queue_penalty(peer, incumbent, class, options, now)
+                    });
+                    peer.record_voice_transport_success(
+                        transport,
+                        now,
+                        decision.reason(),
+                        incumbent_failure,
+                        Some(selected_pressure),
+                        incumbent_pressure,
+                    );
+                }
                 return Ok(());
             }
             Err(TryAdaptiveSendError::Full(_)) => {
                 record_outbound_stream_queue_sample(peer, transport, class, &sender, true);
+                if voice_decision.is_some_and(|decision| decision.incumbent() == Some(transport)) {
+                    incumbent_failure = Some(VoiceTransportBindingEventReason::QueueFull);
+                }
             }
-            Err(TryAdaptiveSendError::Closed(_)) => {}
+            Err(TryAdaptiveSendError::Closed(_)) => {
+                if voice_decision.is_some_and(|decision| decision.incumbent() == Some(transport)) {
+                    incumbent_failure = Some(VoiceTransportBindingEventReason::StreamClosed);
+                }
+            }
         }
     }
 
+    if sticky_voice {
+        record_voice_transport_no_alternate(
+            peer,
+            envelope.level(),
+            envelope.routing_metric(),
+            class,
+            envelope.options(),
+            now,
+        );
+    }
     Err(envelope)
 }
 
@@ -3111,6 +3337,32 @@ mod tests {
             receivers.push(rx);
         }
         (peer, receivers)
+    }
+
+    fn install_test_stream(
+        peer: &PeerState,
+        kind: TransportKind,
+        queue_bytes: usize,
+    ) -> AdaptiveQueueReceiver<OutboundFrame> {
+        let (tx, rx) = test_outbound_queue_with_bytes(queue_bytes);
+        peer.install_stream(ActiveStream::new(
+            kind,
+            None,
+            tx,
+            CancellationToken::new(),
+            false,
+        ));
+        rx
+    }
+
+    fn expiring_voice(payload: &'static [u8]) -> OutboundEnvelope {
+        OutboundEnvelope::routed(
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            Bytes::from_static(payload),
+            SendOptions::default().expire_after(Duration::from_secs(2)),
+        )
     }
 
     fn fill_stream_queue(peer: &PeerState, kind: TransportKind, bytes: usize) {
@@ -4658,6 +4910,132 @@ mod tests {
         );
 
         assert_eq!(ranked.first().copied(), Some(TransportKind::Quic));
+    }
+
+    #[test]
+    fn sticky_voice_hard_escape_commits_only_after_alternate_admission() {
+        let (peer, mut receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        let policy = TransportRoutingPolicy::default();
+
+        try_dispatch_envelope(&peer, expiring_voice(b"initial"), policy)
+            .expect("initial voice frame should bind TCP");
+        assert_eq!(
+            receivers[0].try_recv().unwrap().payload(),
+            &Bytes::from_static(b"initial")
+        );
+        assert_eq!(
+            peer.voice_transport_binding_status().unwrap().transport(),
+            TransportKind::Tcp
+        );
+
+        drop(receivers);
+        let mut kcp_rx = install_test_stream(&peer, TransportKind::Kcp, 1024 * 1024);
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Kcp);
+        }
+
+        try_dispatch_envelope(&peer, expiring_voice(b"fallback"), policy)
+            .expect("a closed incumbent should escape to KCP in the same dispatch");
+        assert_eq!(
+            peer.voice_transport_binding_status().unwrap().transport(),
+            TransportKind::Kcp
+        );
+        assert_eq!(
+            kcp_rx.try_recv().unwrap().payload(),
+            &Bytes::from_static(b"fallback")
+        );
+
+        // Close the incumbent and leave the only alternate apparently
+        // eligible, but too small to admit this frame. The attempted escape
+        // must not poison the existing KCP binding.
+        drop(kcp_rx);
+        let mut tcp_rx = install_test_stream(&peer, TransportKind::Tcp, 257);
+        let rejected = OutboundEnvelope::routed(
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            Bytes::from(vec![b'x'; 1024 * 1024]),
+            SendOptions::default().expire_after(Duration::from_secs(2)),
+        );
+
+        assert!(try_dispatch_envelope(&peer, rejected, policy).is_err());
+        assert!(tcp_rx.try_recv().is_err());
+        assert_eq!(
+            peer.voice_transport_binding_status().unwrap().transport(),
+            TransportKind::Kcp
+        );
+    }
+
+    #[test]
+    fn disabled_fixed_control_and_non_expiring_sends_bypass_voice_stickiness() {
+        let (peer, mut receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        let policy = TransportRoutingPolicy::default();
+        try_dispatch_envelope(&peer, expiring_voice(b"bind"), policy).unwrap();
+        assert_eq!(
+            receivers[0].try_recv().unwrap().payload(),
+            b"bind".as_slice()
+        );
+
+        let mut quic_rx = install_test_stream(&peer, TransportKind::Quic, 1024 * 1024);
+        peer.metrics()
+            .record_rtt(TransportKind::Tcp, Duration::from_millis(180));
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_millis(60));
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+
+        let disabled = policy.with_voice_path_stickiness_enabled(false);
+        try_dispatch_envelope(&peer, expiring_voice(b"disabled"), disabled).unwrap();
+        assert_eq!(
+            receivers[0].try_recv().unwrap().payload(),
+            b"disabled".as_slice(),
+            "disabled policy must preserve legacy transport selection"
+        );
+
+        let fixed = OutboundEnvelope::fixed_transport(
+            TransportKind::Quic,
+            MessageClass::HighPriority,
+            Bytes::from_static(b"fixed"),
+            SendOptions::default().expire_after(Duration::from_secs(2)),
+        );
+        try_dispatch_envelope(&peer, fixed, policy).unwrap();
+        assert_eq!(quic_rx.try_recv().unwrap().payload(), b"fixed".as_slice());
+
+        let control = OutboundEnvelope::routed(
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::Control,
+            Bytes::from_static(b"control"),
+            SendOptions::default().expire_after(Duration::from_secs(2)),
+        );
+        try_dispatch_envelope(&peer, control, policy).unwrap();
+        let control = quic_rx
+            .try_recv()
+            .ok()
+            .or_else(|| receivers[0].try_recv().ok())
+            .expect("control bypass should be admitted");
+        assert_eq!(control.payload(), b"control".as_slice());
+
+        let non_expiring = OutboundEnvelope::routed(
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            Bytes::from_static(b"non-expiring"),
+            SendOptions::default(),
+        );
+        try_dispatch_envelope(&peer, non_expiring, policy).unwrap();
+        let non_expiring = quic_rx
+            .try_recv()
+            .ok()
+            .or_else(|| receivers[0].try_recv().ok())
+            .expect("non-expiring bypass should be admitted");
+        assert_eq!(non_expiring.payload(), b"non-expiring".as_slice());
+        assert_eq!(
+            peer.voice_transport_binding_status().unwrap().transport(),
+            TransportKind::Tcp,
+            "bypass sends must not mutate the sticky voice binding"
+        );
     }
 
     #[test]

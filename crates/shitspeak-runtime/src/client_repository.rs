@@ -1205,10 +1205,10 @@ impl ClientRepository {
                     server_id: crate::types::default_server_id(),
                 },
             });
-            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
+            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload::new(
                 entry,
-                versions: HashMap::from([(node_id, 0)]),
-            }));
+                HashMap::from([(node_id, 0)]),
+            )));
         }
     }
 
@@ -2229,15 +2229,15 @@ impl ClientRepository {
                 server_id: crate::types::default_server_id(),
             },
         });
-        let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
-            entry: start,
-            versions: reset_versions.clone(),
-        }));
+        let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload::new(
+            start,
+            reset_versions.clone(),
+        )));
         for entry in normalized_entries {
-            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
+            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload::new(
                 entry,
-                versions: reset_versions.clone(),
-            }));
+                reset_versions.clone(),
+            )));
         }
         if envelope_version > 0 {
             let marker = Arc::new(ClientStateLogEntry {
@@ -2249,10 +2249,10 @@ impl ClientRepository {
                     server_id: crate::types::default_server_id(),
                 },
             });
-            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
-                entry: marker,
-                versions: HashMap::from([(origin, envelope_version)]),
-            }));
+            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload::new(
+                marker,
+                HashMap::from([(origin, envelope_version)]),
+            )));
         }
 
         loop {
@@ -2272,10 +2272,10 @@ impl ClientRepository {
                 continue;
             }
             Self::apply_op_inner(&mut register, &entry, origin, self.log_max_entries);
-            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
+            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload::new(
                 entry,
-                versions: HashMap::from([(origin, register.version)]),
-            }));
+                HashMap::from([(origin, register.version)]),
+            )));
         }
         register.last_pending_effective_dep_by_server.clear();
         let remaining = register.pending_ops.iter().cloned().collect::<Vec<_>>();
@@ -2755,10 +2755,10 @@ impl ClientRepository {
                 return Ok(());
             }
             Self::apply_op_inner(&mut register, &op, remote_node, self.log_max_entries);
-            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
-                entry: Arc::clone(&op),
-                versions: HashMap::from([(remote_node, register.version)]),
-            }));
+            let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload::new(
+                Arc::clone(&op),
+                HashMap::from([(remote_node, register.version)]),
+            )));
         }
         Ok(())
     }
@@ -2805,10 +2805,10 @@ impl ClientRepository {
                     available_channel_version,
                 );
                 Self::apply_op_inner(&mut register, &op, remote_node, self.log_max_entries);
-                let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload {
-                    entry: Arc::clone(&op),
-                    versions: HashMap::from([(remote_node, register.version)]),
-                }));
+                let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload::new(
+                    Arc::clone(&op),
+                    HashMap::from([(remote_node, register.version)]),
+                )));
             }
 
             register.last_pending_effective_dep_by_server.clear();
@@ -3135,7 +3135,7 @@ impl ClientRepository {
         }
 
         let versions = HashMap::from([(local_node_id, version)]);
-        Some(Arc::new(ClientStateBroadcastPayload { entry, versions }))
+        Some(Arc::new(ClientStateBroadcastPayload::new(entry, versions)))
     }
 }
 

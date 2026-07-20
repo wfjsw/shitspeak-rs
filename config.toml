@@ -216,6 +216,12 @@ lossy_link_threshold_ppm = 20000
 bulk_payload_threshold_bytes = 65536
 bulk_backlog_threshold_bytes = 262144
 transport_switch_improvement_pct = 15
+# Keep expiring conversational voice on a stable transport/tree path while it
+# remains usable. Changes take effect after restart; set false to roll back.
+voice_path_stickiness_enabled = true
+voice_path_min_hold_ms = 750
+voice_path_challenger_confirm_ms = 500
+voice_path_idle_reset_ms = 2000
 # Legacy queue capacity hints. Inbound and outbound transport queues now use
 # adaptive byte budgets sized from available memory; these values only raise
 # the per-lane minimum budget for compatibility with older configs.

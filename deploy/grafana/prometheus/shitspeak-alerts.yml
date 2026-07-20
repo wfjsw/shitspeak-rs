@@ -74,3 +74,61 @@ groups:
         annotations:
           summary: "Realtime voice stale-drop rate is above 1%"
           description: "Stale voice drops exceeded 1% of decoded voice ingress for 2 minutes."
+
+      - alert: ShitSpeakVoicePathSwitchRateHigh
+        expr: |
+          (
+            1000 * (
+              (sum(rate(shitspeak_s2s_voice_transport_binding_events_total{
+                from_transport!="none",to_transport!="none",
+                reason!~"initial|idle_reset|no_alternate"
+              }[2m])) or vector(0))
+              +
+              (sum(rate(shitspeak_s2s_voice_tree_edge_binding_events_total{
+                from_mode!="none",to_mode!="none",
+                reason!~"initial|idle_reset|no_alternate"
+              }[2m])) or vector(0))
+            )
+            /
+            clamp_min(sum(rate(shitspeak_s2s_debug_packet_io_packets_total{
+              direction="sent",packet_kind="application.voice.tree.original"
+            }[2m])), 1e-9)
+          ) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Voice path switching exceeds 10 per 1,000 originals"
+          description: "Transport and tree-edge bindings have switched more than 10 times per 1,000 directed tree-original frames for 2 minutes."
+
+      - alert: ShitSpeakVoicePathNoAlternateHigh
+        expr: |
+          (
+            (sum(rate(shitspeak_s2s_voice_transport_binding_events_total{reason="no_alternate"}[30s])) or vector(0))
+            +
+            (sum(rate(shitspeak_s2s_voice_tree_edge_binding_events_total{reason="no_alternate"}[30s])) or vector(0))
+          ) > 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Voice path failover has no alternate"
+          description: "Sticky transport or tree-edge failover has reported more than one no-alternate event per second for 30 seconds."
+
+      - alert: ShitSpeakChinaDfwDeadlineFlushHigh
+        expr: |
+          (
+            sum(rate(shitspeak_s2s_voice_receive_events_total{
+              source="13",origin_node="12",result="deadline_flush"
+            }[1m]))
+            /
+            clamp_min(sum(rate(shitspeak_s2s_voice_receive_events_total{
+              source="13",origin_node="12",result=~"in_order|gap_filled|deadline_flush"
+            }[1m])), 1e-9)
+          ) > 0.05
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "China to DFW voice deadline-flush share exceeds 5%"
+          description: "DFW node 13 has deadline-flushed more than 5% of emitted frames originated by China node 12 for 1 minute."

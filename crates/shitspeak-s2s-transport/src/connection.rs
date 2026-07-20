@@ -27,11 +27,108 @@ use super::metrics::{
     ExpiredOutboundDropCounters, ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage,
     MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics, QueueStatusSnapshot, QueueWatermark,
     TransportHealthExclusionReason, TransportHealthExclusionSnapshot,
+    VoiceTransportBindingEventReason, VoiceTransportBindingEventSnapshot,
+    VoiceTransportBindingSnapshot, VoiceTransportChallengerOutcome,
+    VoiceTransportChallengerSnapshot,
 };
 use super::service_level::{MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind};
 
 const MAX_OBSERVED_REMOTE_IPS: usize = 8;
 const BACKOFF_JITTER_DIVISOR: u64 = 5;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VoiceTransportCandidateScore {
+    transport: TransportKind,
+    pressure: u8,
+    cost: Option<f64>,
+}
+
+impl VoiceTransportCandidateScore {
+    pub(crate) fn new(transport: TransportKind, pressure: u8, cost: Option<f64>) -> Self {
+        Self {
+            transport,
+            pressure,
+            cost,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VoiceTransportDecision {
+    preferred: TransportKind,
+    incumbent: Option<TransportKind>,
+    reason: VoiceTransportBindingEventReason,
+}
+
+impl VoiceTransportDecision {
+    pub(crate) fn preferred(self) -> TransportKind {
+        self.preferred
+    }
+    pub(crate) fn incumbent(self) -> Option<TransportKind> {
+        self.incumbent
+    }
+    pub(crate) fn reason(self) -> VoiceTransportBindingEventReason {
+        self.reason
+    }
+    pub(crate) fn with_reason(mut self, reason: VoiceTransportBindingEventReason) -> Self {
+        self.reason = reason;
+        self
+    }
+}
+
+#[derive(Debug, Default)]
+struct VoiceTransportBinding {
+    selected_transport: Option<TransportKind>,
+    selected_at: Option<Instant>,
+    last_success_at: Option<Instant>,
+    challenger_transport: Option<TransportKind>,
+    challenger_since: Option<Instant>,
+    challenger_observations: u32,
+    no_alternate_reported: bool,
+    events: HashMap<
+        (
+            Option<TransportKind>,
+            Option<TransportKind>,
+            VoiceTransportBindingEventReason,
+        ),
+        u64,
+    >,
+    challenger_events: HashMap<
+        (
+            TransportKind,
+            TransportKind,
+            VoiceTransportChallengerOutcome,
+        ),
+        u64,
+    >,
+}
+
+impl VoiceTransportBinding {
+    fn clear_challenger(&mut self, outcome: VoiceTransportChallengerOutcome) {
+        if let (Some(incumbent), Some(challenger)) =
+            (self.selected_transport, self.challenger_transport)
+        {
+            let counter = self
+                .challenger_events
+                .entry((incumbent, challenger, outcome))
+                .or_default();
+            *counter = counter.saturating_add(1);
+        }
+        self.challenger_transport = None;
+        self.challenger_since = None;
+        self.challenger_observations = 0;
+    }
+
+    fn record_event(
+        &mut self,
+        from: Option<TransportKind>,
+        to: Option<TransportKind>,
+        reason: VoiceTransportBindingEventReason,
+    ) {
+        let counter = self.events.entry((from, to, reason)).or_default();
+        *counter = counter.saturating_add(1);
+    }
+}
 
 /// One outbound frame, addressed to a specific stream.
 #[derive(Debug, Clone)]
@@ -712,6 +809,7 @@ pub(crate) struct PeerState {
     expired_outbound_drops: ExpiredOutboundDropCounters,
     transport_health_exclusions:
         Mutex<HashMap<(TransportKind, TransportHealthExclusionReason), u64>>,
+    voice_transport_binding: Mutex<VoiceTransportBinding>,
     outbound_dispatch_notify: Notify,
     /// Set true while a connect attempt is in flight, to prevent duplicate
     /// dials racing inside the supervisor.
@@ -749,6 +847,7 @@ impl PeerState {
             udp_datagram_mtu_last_probe: Mutex::new(None),
             expired_outbound_drops: ExpiredOutboundDropCounters::default(),
             transport_health_exclusions: Mutex::new(HashMap::new()),
+            voice_transport_binding: Mutex::new(VoiceTransportBinding::default()),
             outbound_dispatch_notify: Notify::new(),
             connecting: AtomicBool::new(false),
         })
@@ -1416,6 +1515,251 @@ impl PeerState {
         out
     }
 
+    pub(crate) fn choose_voice_transport(
+        &self,
+        candidates: &[VoiceTransportCandidateScore],
+        now: Instant,
+        min_hold: Duration,
+        challenger_confirm: Duration,
+        idle_reset: Duration,
+        improvement_pct: u32,
+        observe: bool,
+    ) -> Option<VoiceTransportDecision> {
+        let best = *candidates.first()?;
+        let mut binding = self.voice_transport_binding.lock();
+
+        if binding
+            .last_success_at
+            .is_some_and(|last| now.saturating_duration_since(last) >= idle_reset)
+        {
+            let previous = binding.selected_transport;
+            return Some(VoiceTransportDecision {
+                preferred: best.transport,
+                incumbent: previous,
+                reason: VoiceTransportBindingEventReason::IdleReset,
+            });
+        }
+
+        let Some(incumbent) = binding.selected_transport else {
+            return Some(VoiceTransportDecision {
+                preferred: best.transport,
+                incumbent: None,
+                reason: VoiceTransportBindingEventReason::Initial,
+            });
+        };
+        let Some(incumbent_score) = candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.transport == incumbent)
+        else {
+            return Some(VoiceTransportDecision {
+                preferred: best.transport,
+                incumbent: Some(incumbent),
+                reason: VoiceTransportBindingEventReason::TransportUnavailable,
+            });
+        };
+
+        if best.transport == incumbent {
+            if observe {
+                binding.clear_challenger(VoiceTransportChallengerOutcome::Reset);
+            }
+            return Some(VoiceTransportDecision {
+                preferred: incumbent,
+                incumbent: Some(incumbent),
+                reason: VoiceTransportBindingEventReason::Recovered,
+            });
+        }
+
+        let held_for = binding
+            .selected_at
+            .map(|selected_at| now.saturating_duration_since(selected_at))
+            .unwrap_or_default();
+        if held_for < min_hold
+            || !voice_transport_materially_better(best, incumbent_score, improvement_pct)
+        {
+            if observe {
+                binding.clear_challenger(VoiceTransportChallengerOutcome::Reset);
+            }
+            return Some(VoiceTransportDecision {
+                preferred: incumbent,
+                incumbent: Some(incumbent),
+                reason: VoiceTransportBindingEventReason::Recovered,
+            });
+        }
+
+        if binding.challenger_transport != Some(best.transport) {
+            if observe {
+                binding.clear_challenger(VoiceTransportChallengerOutcome::Reset);
+                binding.challenger_transport = Some(best.transport);
+                binding.challenger_since = Some(now);
+                binding.challenger_observations = 1;
+                let counter = binding
+                    .challenger_events
+                    .entry((
+                        incumbent,
+                        best.transport,
+                        VoiceTransportChallengerOutcome::Started,
+                    ))
+                    .or_default();
+                *counter = counter.saturating_add(1);
+            }
+            return Some(VoiceTransportDecision {
+                preferred: incumbent,
+                incumbent: Some(incumbent),
+                reason: VoiceTransportBindingEventReason::Recovered,
+            });
+        }
+
+        if observe {
+            binding.challenger_observations = binding.challenger_observations.saturating_add(1);
+        }
+        let confirmed_for = binding
+            .challenger_since
+            .map(|since| now.saturating_duration_since(since))
+            .unwrap_or_default();
+        let confirmed = confirmed_for >= challenger_confirm && binding.challenger_observations >= 2;
+        Some(VoiceTransportDecision {
+            preferred: if confirmed { best.transport } else { incumbent },
+            incumbent: Some(incumbent),
+            reason: if confirmed {
+                VoiceTransportBindingEventReason::ConfirmedChallenger
+            } else {
+                VoiceTransportBindingEventReason::Recovered
+            },
+        })
+    }
+
+    pub(crate) fn record_voice_transport_success(
+        &self,
+        transport: TransportKind,
+        now: Instant,
+        reason: VoiceTransportBindingEventReason,
+        incumbent_failure: Option<VoiceTransportBindingEventReason>,
+        selected_pressure: Option<u8>,
+        incumbent_pressure: Option<u8>,
+    ) {
+        let mut binding = self.voice_transport_binding.lock();
+        let previous = binding.selected_transport;
+        if previous != Some(transport) || reason == VoiceTransportBindingEventReason::IdleReset {
+            let actual_reason = incumbent_failure.unwrap_or(reason);
+            let held_for = binding
+                .selected_at
+                .map(|selected_at| now.saturating_duration_since(selected_at))
+                .unwrap_or_default();
+            let confirmed_for = binding
+                .challenger_since
+                .map(|since| now.saturating_duration_since(since))
+                .unwrap_or_default();
+            if actual_reason == VoiceTransportBindingEventReason::ConfirmedChallenger {
+                binding.clear_challenger(VoiceTransportChallengerOutcome::Confirmed);
+            } else {
+                binding.clear_challenger(VoiceTransportChallengerOutcome::Reset);
+            }
+            binding.record_event(previous, Some(transport), actual_reason);
+            binding.selected_transport = Some(transport);
+            binding.selected_at = Some(now);
+            tracing::debug!(
+                peer = %self.node_id,
+                ?previous,
+                selected = ?transport,
+                selected_pressure,
+                incumbent_pressure,
+                reason = actual_reason.name(),
+                held_ms = held_for.as_millis(),
+                confirmation_ms = confirmed_for.as_millis(),
+                "updated voice transport binding"
+            );
+        } else if reason == VoiceTransportBindingEventReason::ConfirmedChallenger {
+            // The confirmed challenger was attempted first but rejected the
+            // frame, and the incumbent subsequently admitted it. Require a
+            // fresh confirmation window before trying that challenger again.
+            binding.clear_challenger(VoiceTransportChallengerOutcome::Reset);
+        }
+        binding.last_success_at = Some(now);
+        binding.no_alternate_reported = false;
+    }
+
+    pub(crate) fn record_voice_transport_no_alternate(&self) -> bool {
+        let mut binding = self.voice_transport_binding.lock();
+        if binding.no_alternate_reported {
+            return false;
+        }
+        let selected = binding.selected_transport;
+        binding.record_event(
+            selected,
+            None,
+            VoiceTransportBindingEventReason::NoAlternate,
+        );
+        binding.no_alternate_reported = true;
+        true
+    }
+
+    pub(crate) fn voice_transport_binding_status(&self) -> Option<VoiceTransportBindingSnapshot> {
+        self.voice_transport_binding
+            .lock()
+            .selected_transport
+            .map(|transport| VoiceTransportBindingSnapshot::new(self.node_id, transport))
+    }
+
+    pub(crate) fn voice_transport_binding_ages(&self, now: Instant) -> (Duration, Duration) {
+        let binding = self.voice_transport_binding.lock();
+        let held = binding
+            .selected_at
+            .map(|selected_at| now.saturating_duration_since(selected_at))
+            .unwrap_or_default();
+        let confirmation = binding
+            .challenger_since
+            .map(|since| now.saturating_duration_since(since))
+            .unwrap_or_default();
+        (held, confirmation)
+    }
+
+    pub(crate) fn voice_transport_binding_event_status(
+        &self,
+    ) -> Vec<VoiceTransportBindingEventSnapshot> {
+        let binding = self.voice_transport_binding.lock();
+        let mut out = binding
+            .events
+            .iter()
+            .filter_map(|((from, to, reason), events)| {
+                (*events > 0).then(|| {
+                    VoiceTransportBindingEventSnapshot::new(
+                        self.node_id,
+                        *from,
+                        *to,
+                        *reason,
+                        *events,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        out.sort_by_key(|event| (event.from_transport(), event.to_transport(), event.reason()));
+        out
+    }
+
+    pub(crate) fn voice_transport_challenger_status(
+        &self,
+    ) -> Vec<VoiceTransportChallengerSnapshot> {
+        let binding = self.voice_transport_binding.lock();
+        let mut out = binding
+            .challenger_events
+            .iter()
+            .filter_map(|((incumbent, challenger, outcome), events)| {
+                (*events > 0).then(|| {
+                    VoiceTransportChallengerSnapshot::new(
+                        self.node_id,
+                        *incumbent,
+                        *challenger,
+                        *outcome,
+                        *events,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        out.sort_by_key(|event| (event.incumbent(), event.challenger(), event.outcome()));
+        out
+    }
+
     pub fn has_any_live_stream(&self) -> bool {
         let mut g = self.streams.lock();
         prune_dead_streams(&mut g);
@@ -1458,6 +1802,24 @@ impl PeerState {
         *self.udp_addr.lock() = Some(addr);
         self.note_observed_remote_addr(TransportKind::Udp, addr);
     }
+}
+
+fn voice_transport_materially_better(
+    challenger: VoiceTransportCandidateScore,
+    incumbent: VoiceTransportCandidateScore,
+    improvement_pct: u32,
+) -> bool {
+    if challenger.pressure != incumbent.pressure {
+        return challenger.pressure < incumbent.pressure;
+    }
+    let (Some(challenger_cost), Some(incumbent_cost)) = (challenger.cost, incumbent.cost) else {
+        return false;
+    };
+    if !challenger_cost.is_finite() || !incumbent_cost.is_finite() {
+        return false;
+    }
+    let required = 1.0 - (improvement_pct.min(100) as f64 / 100.0);
+    challenger_cost <= incumbent_cost * required
 }
 
 fn prune_dead_streams(streams: &mut HashMap<StreamKey, ActiveStream>) {
@@ -2103,5 +2465,220 @@ mod tests {
         peer.confirm_address(second);
 
         assert_eq!(peer.snapshot_addresses(), vec![second, first]);
+    }
+
+    fn voice_candidate(
+        transport: TransportKind,
+        pressure: u8,
+        cost: f64,
+    ) -> VoiceTransportCandidateScore {
+        VoiceTransportCandidateScore::new(transport, pressure, Some(cost))
+    }
+
+    #[test]
+    fn voice_transport_binding_observes_hold_and_confirmation_boundaries() {
+        let peer = peer_for_address_tests();
+        let start = Instant::now();
+        let initial = [voice_candidate(TransportKind::Tcp, 1, 100.0)];
+        let decision = peer
+            .choose_voice_transport(
+                &initial,
+                start,
+                Duration::from_millis(750),
+                Duration::from_millis(500),
+                Duration::from_millis(2_000),
+                15,
+                true,
+            )
+            .unwrap();
+        peer.record_voice_transport_success(
+            decision.preferred(),
+            start,
+            decision.reason(),
+            None,
+            None,
+            None,
+        );
+
+        let challenger = [
+            voice_candidate(TransportKind::Kcp, 0, 50.0),
+            voice_candidate(TransportKind::Tcp, 1, 100.0),
+        ];
+        for offset in [749, 750, 1_249] {
+            let decision = peer
+                .choose_voice_transport(
+                    &challenger,
+                    start + Duration::from_millis(offset),
+                    Duration::from_millis(750),
+                    Duration::from_millis(500),
+                    Duration::from_millis(2_000),
+                    15,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(decision.preferred(), TransportKind::Tcp, "offset={offset}");
+        }
+        let confirmed = peer
+            .choose_voice_transport(
+                &challenger,
+                start + Duration::from_millis(1_250),
+                Duration::from_millis(750),
+                Duration::from_millis(500),
+                Duration::from_millis(2_000),
+                15,
+                true,
+            )
+            .unwrap();
+        assert_eq!(confirmed.preferred(), TransportKind::Kcp);
+        assert_eq!(
+            confirmed.reason(),
+            VoiceTransportBindingEventReason::ConfirmedChallenger
+        );
+    }
+
+    #[test]
+    fn idle_reset_commits_only_after_success_and_emits_one_transition() {
+        let peer = peer_for_address_tests();
+        let start = Instant::now();
+        peer.record_voice_transport_success(
+            TransportKind::Tcp,
+            start,
+            VoiceTransportBindingEventReason::Initial,
+            None,
+            None,
+            None,
+        );
+        let candidates = [voice_candidate(TransportKind::Kcp, 0, 50.0)];
+
+        let before = peer
+            .choose_voice_transport(
+                &candidates,
+                start + Duration::from_millis(1_999),
+                Duration::from_millis(750),
+                Duration::from_millis(500),
+                Duration::from_millis(2_000),
+                15,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            before.reason(),
+            VoiceTransportBindingEventReason::TransportUnavailable
+        );
+        assert_eq!(
+            peer.voice_transport_binding_status().unwrap().transport(),
+            TransportKind::Tcp
+        );
+
+        let reset = peer
+            .choose_voice_transport(
+                &candidates,
+                start + Duration::from_millis(2_000),
+                Duration::from_millis(750),
+                Duration::from_millis(500),
+                Duration::from_millis(2_000),
+                15,
+                true,
+            )
+            .unwrap();
+        assert_eq!(reset.reason(), VoiceTransportBindingEventReason::IdleReset);
+        assert_eq!(
+            peer.voice_transport_binding_status().unwrap().transport(),
+            TransportKind::Tcp
+        );
+        peer.record_voice_transport_success(
+            reset.preferred(),
+            start + Duration::from_millis(2_000),
+            reset.reason(),
+            None,
+            None,
+            None,
+        );
+        let idle_events = peer
+            .voice_transport_binding_event_status()
+            .into_iter()
+            .filter(|event| event.reason() == VoiceTransportBindingEventReason::IdleReset)
+            .collect::<Vec<_>>();
+        assert_eq!(idle_events.len(), 1);
+        assert_eq!(idle_events[0].from_transport(), Some(TransportKind::Tcp));
+        assert_eq!(idle_events[0].to_transport(), Some(TransportKind::Kcp));
+        assert_eq!(idle_events[0].events(), 1);
+    }
+
+    #[test]
+    fn no_alternate_is_latched_per_failed_episode() {
+        let peer = peer_for_address_tests();
+        peer.record_voice_transport_no_alternate();
+        peer.record_voice_transport_no_alternate();
+        let count = || {
+            peer.voice_transport_binding_event_status()
+                .into_iter()
+                .filter(|event| event.reason() == VoiceTransportBindingEventReason::NoAlternate)
+                .map(|event| event.events())
+                .sum::<u64>()
+        };
+        assert_eq!(count(), 1);
+        peer.record_voice_transport_success(
+            TransportKind::Tcp,
+            Instant::now(),
+            VoiceTransportBindingEventReason::Initial,
+            None,
+            None,
+            None,
+        );
+        peer.record_voice_transport_no_alternate();
+        assert_eq!(count(), 2);
+    }
+
+    #[test]
+    fn challenger_identity_reset_and_read_only_queries_do_not_advance_state() {
+        let peer = peer_for_address_tests();
+        let start = Instant::now();
+        let uncommitted = peer
+            .choose_voice_transport(
+                &[voice_candidate(TransportKind::Tcp, 1, 100.0)],
+                start,
+                Duration::from_millis(750),
+                Duration::from_millis(500),
+                Duration::from_millis(2_000),
+                15,
+                true,
+            )
+            .unwrap();
+        assert!(peer.voice_transport_binding_status().is_none());
+        peer.record_voice_transport_success(
+            uncommitted.preferred(),
+            start,
+            uncommitted.reason(),
+            None,
+            None,
+            None,
+        );
+
+        let kcp = [
+            voice_candidate(TransportKind::Kcp, 0, 50.0),
+            voice_candidate(TransportKind::Tcp, 1, 100.0),
+        ];
+        let quic = [
+            voice_candidate(TransportKind::Quic, 0, 40.0),
+            voice_candidate(TransportKind::Tcp, 1, 100.0),
+        ];
+        let choose = |candidates: &[VoiceTransportCandidateScore], offset, observe| {
+            peer.choose_voice_transport(
+                candidates,
+                start + Duration::from_millis(offset),
+                Duration::from_millis(750),
+                Duration::from_millis(500),
+                Duration::from_millis(2_000),
+                15,
+                observe,
+            )
+            .unwrap()
+            .preferred()
+        };
+        assert_eq!(choose(&kcp, 750, true), TransportKind::Tcp);
+        assert_eq!(choose(&quic, 1_000, true), TransportKind::Tcp);
+        assert_eq!(choose(&quic, 1_500, false), TransportKind::Tcp);
+        assert_eq!(choose(&quic, 1_500, true), TransportKind::Quic);
     }
 }

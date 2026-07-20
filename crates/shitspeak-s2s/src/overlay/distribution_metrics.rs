@@ -211,11 +211,29 @@ struct PeerClockGauge {
     estimate_age_seconds: f64,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct TreeEdgeBindingEventKey {
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    from_mode: &'static str,
+    to_mode: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct TreeEdgeBindingGaugeKey {
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    mode: &'static str,
+}
+
 #[derive(Default)]
 struct DistributionMetrics {
     events: HashMap<EventKey, u64>,
     gauges: HashMap<ProfileBucket, ProfileGauge>,
     peer_clocks: HashMap<NodeIdentifier, PeerClockGauge>,
+    tree_edge_bindings: HashMap<TreeEdgeBindingGaugeKey, u64>,
+    tree_edge_binding_events: HashMap<TreeEdgeBindingEventKey, u64>,
 }
 
 #[cfg(feature = "pre-release-workload")]
@@ -464,6 +482,50 @@ pub(crate) fn set_peer_clock_offsets(offsets: &[(NodeIdentifier, PeerClockOffset
     set_peer_clock_gauges(gauges);
 }
 
+pub(crate) fn update_tree_edge_binding(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    old_mode: Option<&'static str>,
+    new_mode: Option<&'static str>,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    if let Some(mode) = old_mode {
+        let key = TreeEdgeBindingGaugeKey { source, peer, mode };
+        if let Some(value) = metrics.tree_edge_bindings.get_mut(&key) {
+            *value = value.saturating_sub(1);
+            if *value == 0 {
+                metrics.tree_edge_bindings.remove(&key);
+            }
+        }
+    }
+    if let Some(mode) = new_mode {
+        *metrics
+            .tree_edge_bindings
+            .entry(TreeEdgeBindingGaugeKey { source, peer, mode })
+            .or_default() += 1;
+    }
+}
+
+pub(crate) fn record_tree_edge_binding_event(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    from_mode: &'static str,
+    to_mode: &'static str,
+    reason: &'static str,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics
+        .tree_edge_binding_events
+        .entry(TreeEdgeBindingEventKey {
+            source,
+            peer,
+            from_mode,
+            to_mode,
+            reason,
+        })
+        .or_default() += 1;
+}
+
 fn set_peer_clock_gauges(gauges: Vec<(NodeIdentifier, PeerClockGauge)>) {
     let mut metrics = METRICS.lock().unwrap();
     metrics.peer_clocks.clear();
@@ -547,6 +609,30 @@ pub(crate) fn prometheus_samples(local_node: NodeIdentifier) -> Vec<PrometheusSa
             "shitspeak_s2s_distribution_peer_clock_estimate_age_seconds",
             base,
             gauge.estimate_age_seconds,
+        ));
+    }
+    for (key, count) in &metrics.tree_edge_bindings {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_tree_edge_binding",
+            vec![
+                ("source".to_owned(), key.source.to_string()),
+                ("peer".to_owned(), key.peer.to_string()),
+                ("mode".to_owned(), key.mode.to_owned()),
+            ],
+            *count as f64,
+        ));
+    }
+    for (key, count) in &metrics.tree_edge_binding_events {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_tree_edge_binding_events_total",
+            vec![
+                ("source".to_owned(), key.source.to_string()),
+                ("peer".to_owned(), key.peer.to_string()),
+                ("from_mode".to_owned(), key.from_mode.to_owned()),
+                ("to_mode".to_owned(), key.to_mode.to_owned()),
+                ("reason".to_owned(), key.reason.to_owned()),
+            ],
+            *count as f64,
         ));
     }
 

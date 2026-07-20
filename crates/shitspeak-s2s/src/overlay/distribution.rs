@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 use prost::Message as _;
+use tracing::debug;
 
 use bytes::{Bytes, BytesMut};
 use shitspeak_core::NodeIdentifier;
@@ -32,6 +33,253 @@ pub(crate) const DISTRIBUTION_CONTROL_SERVICE_TAG: u32 = 250;
 pub(crate) const VOICE_REALTIME_PROFILE_ID: u32 = 1;
 #[cfg(feature = "pre-release-workload")]
 pub(crate) const PRE_RELEASE_RELIABLE_PROFILE_ID: u32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TreeEdgePath {
+    DirectChild,
+    LegacyVia(NodeIdentifier),
+}
+
+impl TreeEdgePath {
+    pub(crate) fn mode_label(self) -> &'static str {
+        match self {
+            Self::DirectChild => "direct",
+            Self::LegacyVia(_) => "legacy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TreeEdgeCandidate {
+    path: TreeEdgePath,
+    pressure: u8,
+    route_cost: u64,
+}
+
+impl TreeEdgeCandidate {
+    pub(crate) fn direct(pressure: u8) -> Self {
+        Self {
+            path: TreeEdgePath::DirectChild,
+            pressure,
+            route_cost: 0,
+        }
+    }
+
+    pub(crate) fn legacy(first_hop: NodeIdentifier, pressure: u8, route_cost: u64) -> Self {
+        Self {
+            path: TreeEdgePath::LegacyVia(first_hop),
+            pressure,
+            route_cost,
+        }
+    }
+
+    pub(crate) fn path(self) -> TreeEdgePath {
+        self.path
+    }
+
+    pub(crate) fn pressure(self) -> u8 {
+        self.pressure
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TreeEdgeStickinessPolicy {
+    min_hold: Duration,
+    challenger_confirm: Duration,
+    idle_reset: Duration,
+}
+
+impl TreeEdgeStickinessPolicy {
+    pub(crate) fn new(
+        min_hold: Duration,
+        challenger_confirm: Duration,
+        idle_reset: Duration,
+    ) -> Self {
+        Self {
+            min_hold,
+            challenger_confirm,
+            idle_reset,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TreeEdgeBindingKey {
+    source: NodeIdentifier,
+    profile: u32,
+    group: u64,
+    group_version: u64,
+    parent: NodeIdentifier,
+    child: NodeIdentifier,
+}
+
+impl TreeEdgeBindingKey {
+    fn new(key: TreeKey, parent: NodeIdentifier, child: NodeIdentifier) -> Self {
+        Self {
+            source: key.source,
+            profile: key.profile,
+            group: key.group,
+            group_version: key.group_version,
+            parent,
+            child,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TreeEdgeBinding {
+    path: TreeEdgePath,
+    entered_at: Instant,
+    last_used_at: Instant,
+    challenger: Option<TreeEdgePath>,
+    challenger_since: Option<Instant>,
+    challenger_observations: u32,
+    pending: Option<(TreeEdgePath, &'static str)>,
+    pending_held: Duration,
+    pending_confirmation: Duration,
+    generation: u64,
+    bound: bool,
+    no_alternate_reported: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TreeEdgeAttempt {
+    key: TreeEdgeBindingKey,
+    path: TreeEdgePath,
+    generation: u64,
+    reason: &'static str,
+    incumbent_pressure: Option<u8>,
+    chosen_pressure: Option<u8>,
+}
+
+impl TreeEdgeAttempt {
+    pub(crate) fn path(self) -> TreeEdgePath {
+        self.path
+    }
+
+    pub(crate) fn incumbent_pressure(self) -> Option<u8> {
+        self.incumbent_pressure
+    }
+
+    pub(crate) fn chosen_pressure(self) -> Option<u8> {
+        self.chosen_pressure
+    }
+}
+
+fn candidate_for(
+    candidates: &[TreeEdgeCandidate],
+    path: TreeEdgePath,
+) -> Option<TreeEdgeCandidate> {
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| candidate.path == path)
+}
+
+fn best_legacy_candidate(
+    candidates: &[TreeEdgeCandidate],
+    excluded: Option<TreeEdgePath>,
+) -> Option<TreeEdgeCandidate> {
+    candidates.iter().copied().find(|candidate| {
+        matches!(candidate.path, TreeEdgePath::LegacyVia(_)) && excluded != Some(candidate.path)
+    })
+}
+
+fn observe_tree_edge_challenger(
+    binding: &mut TreeEdgeBinding,
+    challenger: TreeEdgePath,
+    now: Instant,
+) {
+    if binding.challenger == Some(challenger) {
+        binding.challenger_observations = binding.challenger_observations.saturating_add(1);
+    } else {
+        binding.challenger = Some(challenger);
+        binding.challenger_since = Some(now);
+        binding.challenger_observations = 1;
+    }
+}
+
+fn clear_tree_edge_challenger(binding: &mut TreeEdgeBinding) {
+    binding.challenger = None;
+    binding.challenger_since = None;
+    binding.challenger_observations = 0;
+}
+
+fn begin_tree_edge_transition(
+    binding: &mut TreeEdgeBinding,
+    path: TreeEdgePath,
+    reason: &'static str,
+    now: Instant,
+) {
+    binding.pending_held = now.saturating_duration_since(binding.entered_at);
+    binding.pending_confirmation = binding
+        .challenger_since
+        .map(|since| now.saturating_duration_since(since))
+        .unwrap_or_default();
+    binding.generation = binding.generation.wrapping_add(1).max(1);
+    binding.pending = Some((path, reason));
+    binding.no_alternate_reported = false;
+    clear_tree_edge_challenger(binding);
+}
+
+fn record_no_tree_edge_alternate(key: TreeEdgeBindingKey, binding: &mut TreeEdgeBinding) {
+    if binding.no_alternate_reported {
+        return;
+    }
+    binding.no_alternate_reported = true;
+    distribution_metrics::record_tree_edge_binding_event(
+        key.parent,
+        key.child,
+        binding.path.mode_label(),
+        binding.path.mode_label(),
+        "no_alternate",
+    );
+}
+
+fn prune_tree_edge_bindings(
+    bindings: &mut HashMap<TreeEdgeBindingKey, TreeEdgeBinding>,
+    current: TreeEdgeBindingKey,
+    idle_reset: Duration,
+    now: Instant,
+) {
+    let mut removed = Vec::new();
+    bindings.retain(|key, binding| {
+        let superseded_group = key.source == current.source
+            && key.profile == current.profile
+            && key.group == current.group
+            && key.group_version != current.group_version;
+        let idle = now.saturating_duration_since(binding.last_used_at) >= idle_reset;
+        let keep = !superseded_group && !idle;
+        if !keep && binding.bound {
+            removed.push((*key, binding.path, idle));
+        }
+        keep
+    });
+    for (key, path, idle) in removed {
+        distribution_metrics::update_tree_edge_binding(
+            key.parent,
+            key.child,
+            Some(path.mode_label()),
+            None,
+        );
+        if idle {
+            distribution_metrics::record_tree_edge_binding_event(
+                key.parent,
+                key.child,
+                path.mode_label(),
+                "none",
+                "idle_reset",
+            );
+            debug!(
+                source = %key.parent,
+                peer = %key.child,
+                from_mode = path.mode_label(),
+                reason = "idle_reset",
+                "voice tree edge binding reset after idle"
+            );
+        }
+    }
+}
 
 /// A stable, service-filtered distribution policy. Profiles deliberately own
 /// transport semantics; callers supply only the recipient group.
@@ -554,9 +802,300 @@ pub(crate) struct DistributionPlane {
     metric_proposals: Mutex<HashMap<StableTreeScope, MetricProposal>>,
     routing_generations: Mutex<HashMap<StableTreeScope, u64>>,
     scope_activity: Mutex<HashMap<TreeScope, Instant>>,
+    tree_edge_bindings: Mutex<HashMap<TreeEdgeBindingKey, TreeEdgeBinding>>,
 }
 
 impl DistributionPlane {
+    pub(crate) fn current_tree_edge_path(
+        &self,
+        tree_key: TreeKey,
+        parent: NodeIdentifier,
+        child: NodeIdentifier,
+    ) -> Option<TreeEdgePath> {
+        self.tree_edge_bindings
+            .lock()
+            .get(&TreeEdgeBindingKey::new(tree_key, parent, child))
+            .filter(|binding| binding.bound)
+            .map(|binding| binding.path)
+    }
+
+    pub(crate) fn choose_tree_edge(
+        &self,
+        tree_key: TreeKey,
+        parent: NodeIdentifier,
+        child: NodeIdentifier,
+        mut candidates: Vec<TreeEdgeCandidate>,
+        policy: TreeEdgeStickinessPolicy,
+        now: Instant,
+    ) -> TreeEdgeAttempt {
+        let key = TreeEdgeBindingKey::new(tree_key, parent, child);
+        candidates.sort_by_key(|candidate| {
+            let mode_order = match candidate.path {
+                TreeEdgePath::DirectChild => 0,
+                TreeEdgePath::LegacyVia(node) => u64::from(node).saturating_add(1),
+            };
+            (candidate.pressure, candidate.route_cost, mode_order)
+        });
+
+        let mut bindings = self.tree_edge_bindings.lock();
+        prune_tree_edge_bindings(&mut bindings, key, policy.idle_reset, now);
+        let binding = bindings.entry(key).or_insert(TreeEdgeBinding {
+            path: TreeEdgePath::DirectChild,
+            entered_at: now,
+            last_used_at: now,
+            challenger: None,
+            challenger_since: None,
+            challenger_observations: 0,
+            pending: Some((TreeEdgePath::DirectChild, "initial")),
+            pending_held: Duration::ZERO,
+            pending_confirmation: Duration::ZERO,
+            generation: 1,
+            bound: false,
+            no_alternate_reported: false,
+        });
+
+        let direct = candidate_for(&candidates, TreeEdgePath::DirectChild);
+        let incumbent = candidate_for(&candidates, binding.path);
+
+        if !binding.bound
+            && binding.pending == Some((TreeEdgePath::DirectChild, "initial"))
+            && direct.is_none_or(|candidate| candidate.pressure >= 3)
+            && let Some(replacement) =
+                best_legacy_candidate(&candidates, None).filter(|candidate| candidate.pressure < 3)
+        {
+            binding.pending = Some((replacement.path, "transport_unavailable"));
+        }
+        if let Some((path, reason)) = binding.pending {
+            return TreeEdgeAttempt {
+                key,
+                path,
+                generation: binding.generation,
+                reason,
+                incumbent_pressure: incumbent.map(|candidate| candidate.pressure),
+                chosen_pressure: candidate_for(&candidates, path)
+                    .map(|candidate| candidate.pressure),
+            };
+        }
+
+        // A missing, closed, or fully pressured incumbent is a hard failure.
+        // Direct is preferred when escaping a failed fallback; otherwise use
+        // the deterministically best usable alternate.
+        if incumbent.is_none_or(|candidate| candidate.pressure >= 3) {
+            let replacement = match binding.path {
+                TreeEdgePath::LegacyVia(_) => direct
+                    .filter(|candidate| candidate.pressure < 3)
+                    .or_else(|| best_legacy_candidate(&candidates, Some(binding.path))),
+                TreeEdgePath::DirectChild => best_legacy_candidate(&candidates, None),
+            };
+            if let Some(replacement) = replacement.filter(|candidate| candidate.pressure < 3) {
+                begin_tree_edge_transition(binding, replacement.path, "transport_unavailable", now);
+            } else {
+                clear_tree_edge_challenger(binding);
+                record_no_tree_edge_alternate(key, binding);
+            }
+            let (path, reason) = binding.pending.unwrap_or((binding.path, "no_alternate"));
+            return TreeEdgeAttempt {
+                key,
+                path,
+                generation: binding.generation,
+                reason,
+                incumbent_pressure: incumbent.map(|candidate| candidate.pressure),
+                chosen_pressure: candidate_for(&candidates, path)
+                    .map(|candidate| candidate.pressure),
+            };
+        }
+
+        let challenger = match binding.path {
+            TreeEdgePath::DirectChild => {
+                if incumbent.is_some_and(|candidate| candidate.pressure >= 2) {
+                    best_legacy_candidate(&candidates, None).filter(|candidate| {
+                        incumbent.is_some_and(|current| candidate.pressure < current.pressure)
+                    })
+                } else {
+                    None
+                }
+            }
+            TreeEdgePath::LegacyVia(_) => {
+                if direct.is_some_and(|candidate| candidate.pressure <= 1) {
+                    direct
+                } else {
+                    best_legacy_candidate(&candidates, Some(binding.path)).filter(|candidate| {
+                        incumbent.is_some_and(|current| candidate.pressure < current.pressure)
+                    })
+                }
+            }
+        };
+
+        if let Some(challenger) = challenger {
+            observe_tree_edge_challenger(binding, challenger.path, now);
+            if now.saturating_duration_since(binding.entered_at) >= policy.min_hold
+                && binding.challenger_observations >= 2
+                && binding.challenger_since.is_some_and(|since| {
+                    now.saturating_duration_since(since) >= policy.challenger_confirm
+                })
+            {
+                begin_tree_edge_transition(
+                    binding,
+                    challenger.path,
+                    if challenger.path == TreeEdgePath::DirectChild {
+                        "recovered"
+                    } else {
+                        "confirmed_challenger"
+                    },
+                    now,
+                );
+            }
+        } else {
+            clear_tree_edge_challenger(binding);
+        }
+
+        let (path, reason) = binding.pending.unwrap_or((binding.path, "incumbent"));
+        TreeEdgeAttempt {
+            key,
+            path,
+            generation: binding.generation,
+            reason,
+            incumbent_pressure: incumbent.map(|candidate| candidate.pressure),
+            chosen_pressure: candidate_for(&candidates, path).map(|candidate| candidate.pressure),
+        }
+    }
+
+    pub(crate) fn hard_escape_tree_edge(
+        &self,
+        attempt: TreeEdgeAttempt,
+        mut candidates: Vec<TreeEdgeCandidate>,
+        reason: &'static str,
+        now: Instant,
+    ) -> Option<TreeEdgeAttempt> {
+        candidates.sort_by_key(|candidate| {
+            (
+                candidate.pressure,
+                candidate.route_cost,
+                match candidate.path {
+                    TreeEdgePath::DirectChild => 0,
+                    TreeEdgePath::LegacyVia(node) => u64::from(node).saturating_add(1),
+                },
+            )
+        });
+        let mut bindings = self.tree_edge_bindings.lock();
+        let binding = bindings.get_mut(&attempt.key)?;
+        if binding.generation != attempt.generation {
+            if binding.path != attempt.path
+                && let Some(current) = candidate_for(&candidates, binding.path)
+                    .filter(|candidate| candidate.pressure < 3)
+            {
+                return Some(TreeEdgeAttempt {
+                    key: attempt.key,
+                    path: current.path,
+                    generation: binding.generation,
+                    reason,
+                    incumbent_pressure: candidate_for(&candidates, attempt.path)
+                        .map(|candidate| candidate.pressure),
+                    chosen_pressure: Some(current.pressure),
+                });
+            }
+            // A sibling completion may have committed the same pending path.
+            // Its rejection still needs one escape retry, but it must create a
+            // fresh generation rather than completing the stale decision.
+        }
+        binding.pending = None;
+        let replacement = match attempt.path {
+            TreeEdgePath::LegacyVia(_) => candidate_for(&candidates, TreeEdgePath::DirectChild)
+                .filter(|candidate| candidate.pressure < 3)
+                .or_else(|| best_legacy_candidate(&candidates, Some(attempt.path))),
+            TreeEdgePath::DirectChild => best_legacy_candidate(&candidates, None),
+        }
+        .filter(|candidate| candidate.pressure < 3);
+        let Some(replacement) = replacement else {
+            record_no_tree_edge_alternate(attempt.key, binding);
+            return None;
+        };
+        begin_tree_edge_transition(binding, replacement.path, reason, now);
+        Some(TreeEdgeAttempt {
+            key: attempt.key,
+            path: replacement.path,
+            generation: binding.generation,
+            reason,
+            incumbent_pressure: candidate_for(&candidates, attempt.path)
+                .map(|candidate| candidate.pressure),
+            chosen_pressure: Some(replacement.pressure),
+        })
+    }
+
+    pub(crate) fn complete_tree_edge_attempt(
+        &self,
+        attempt: TreeEdgeAttempt,
+        success: bool,
+        now: Instant,
+    ) {
+        let mut bindings = self.tree_edge_bindings.lock();
+        let Some(binding) = bindings.get_mut(&attempt.key) else {
+            return;
+        };
+        if binding.generation != attempt.generation {
+            return;
+        }
+        if !success {
+            if binding
+                .pending
+                .is_some_and(|(path, _)| path == attempt.path)
+            {
+                binding.pending = None;
+                binding.generation = binding.generation.wrapping_add(1).max(1);
+            }
+            return;
+        }
+
+        let previous = binding.bound.then_some(binding.path);
+        let changed = previous != Some(attempt.path);
+        if !changed {
+            binding.last_used_at = now;
+            binding.no_alternate_reported = false;
+            return;
+        }
+        let held_for = binding.pending_held;
+        let confirmation_for = binding.pending_confirmation;
+        binding.path = attempt.path;
+        binding.entered_at = changed.then_some(now).unwrap_or(binding.entered_at);
+        binding.last_used_at = now;
+        binding.bound = true;
+        binding.no_alternate_reported = false;
+        binding.pending = None;
+        clear_tree_edge_challenger(binding);
+        binding.generation = binding.generation.wrapping_add(1).max(1);
+        if changed {
+            distribution_metrics::update_tree_edge_binding(
+                attempt.key.parent,
+                attempt.key.child,
+                previous.map(TreeEdgePath::mode_label),
+                Some(attempt.path.mode_label()),
+            );
+            distribution_metrics::record_tree_edge_binding_event(
+                attempt.key.parent,
+                attempt.key.child,
+                previous.map(TreeEdgePath::mode_label).unwrap_or("none"),
+                attempt.path.mode_label(),
+                attempt.reason,
+            );
+            debug!(
+                source = %attempt.key.parent,
+                peer = %attempt.key.child,
+                from_mode = previous.map(TreeEdgePath::mode_label).unwrap_or("none"),
+                to_mode = attempt.path.mode_label(),
+                reason = attempt.reason,
+                held_ms = held_for.as_millis(),
+                confirmation_ms = confirmation_for.as_millis(),
+                incumbent_pressure = ?attempt.incumbent_pressure,
+                chosen_pressure = ?attempt.chosen_pressure,
+                chosen_peer = %match attempt.path {
+                    TreeEdgePath::DirectChild => attempt.key.child,
+                    TreeEdgePath::LegacyVia(first_hop) => first_hop,
+                },
+                "voice tree edge binding changed"
+            );
+        }
+    }
+
     pub(crate) fn configure_recovery(self: &Arc<Self>, sender: RecoverySender) {
         *self.recovery_sender.lock() = Some(sender);
         *self.self_ref.lock() = Arc::downgrade(self);
@@ -826,10 +1365,55 @@ impl DistributionPlane {
                 || key.group != current.group
                 || key.group_version == current.group_version
         });
+        let mut removed_bindings = Vec::new();
+        self.tree_edge_bindings.lock().retain(|key, binding| {
+            let stale = key.source == current.source
+                && key.profile == current.profile
+                && key.group == current.group
+                && key.group_version != current.group_version;
+            if stale && binding.bound {
+                removed_bindings.push((*key, binding.path));
+            }
+            !stale
+        });
+        for (key, path) in removed_bindings {
+            distribution_metrics::update_tree_edge_binding(
+                key.parent,
+                key.child,
+                Some(path.mode_label()),
+                None,
+            );
+        }
         let now = Instant::now();
         self.failure_reported_at.lock().retain(|_, reported_at| {
             now.saturating_duration_since(*reported_at) < EDGE_FAILURE_REPORT_DEDUP
         });
+    }
+
+    fn prune_tree_edge_bindings_for_tree(&self, key: TreeKey, state: &TreeState) {
+        let edges: HashSet<_> = state.edges().collect();
+        let mut removed = Vec::new();
+        self.tree_edge_bindings
+            .lock()
+            .retain(|binding_key, binding| {
+                let in_scope = binding_key.source == key.source
+                    && binding_key.profile == key.profile
+                    && binding_key.group == key.group
+                    && binding_key.group_version == key.group_version;
+                let keep = !in_scope || edges.contains(&(binding_key.parent, binding_key.child));
+                if !keep && binding.bound {
+                    removed.push((*binding_key, binding.path));
+                }
+                keep
+            });
+        for (binding_key, path) in removed {
+            distribution_metrics::update_tree_edge_binding(
+                binding_key.parent,
+                binding_key.child,
+                Some(path.mode_label()),
+                None,
+            );
+        }
     }
 
     pub(crate) fn active_tree(&self, key: TreeKey) -> Option<SelectedTree> {
@@ -972,6 +1556,7 @@ impl DistributionPlane {
         }
         self.prune_scope_state(StableTreeScope::from(key));
         self.prune_install_scopes(key);
+        self.prune_tree_edge_bindings_for_tree(key, &state);
         let tree_edges = state.edges().count();
         let recovered = {
             // Queueing takes these locks in the same order so an install can
@@ -1175,6 +1760,7 @@ impl DistributionPlane {
             .into_iter()
             .filter(|failed| !candidate.state.edges().any(|edge| edge == *failed))
             .collect();
+        self.prune_tree_edge_bindings_for_tree(key, &candidate.state);
         self.active_trees.lock().insert(
             StableTreeScope::from(key),
             ActiveTree {
@@ -1653,6 +2239,196 @@ mod tests {
             topology_epoch: 1,
             version,
         }
+    }
+
+    fn sticky_policy() -> TreeEdgeStickinessPolicy {
+        TreeEdgeStickinessPolicy::new(
+            Duration::from_millis(750),
+            Duration::from_millis(500),
+            Duration::from_secs(2),
+        )
+    }
+
+    #[test]
+    fn tree_edge_soft_switch_requires_hold_and_stable_challenger() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(90, 1);
+        let start = Instant::now();
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct(1)],
+            sticky_policy(),
+            start,
+        );
+        assert_eq!(initial.path(), TreeEdgePath::DirectChild);
+        plane.complete_tree_edge_attempt(initial, true, start);
+
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct(2),
+                TreeEdgeCandidate::legacy(3, 1, 10),
+            ]
+        };
+        let first = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            sticky_policy(),
+            start + Duration::from_millis(249),
+        );
+        assert_eq!(first.path(), TreeEdgePath::DirectChild);
+        let before = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            sticky_policy(),
+            start + Duration::from_millis(749),
+        );
+        assert_eq!(before.path(), TreeEdgePath::DirectChild);
+        let confirmed = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            sticky_policy(),
+            start + Duration::from_millis(750),
+        );
+        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(3));
+        assert_eq!(confirmed.reason, "confirmed_challenger");
+    }
+
+    #[test]
+    fn tree_edge_challenger_change_resets_confirmation() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(91, 1);
+        let start = Instant::now();
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct(1)],
+            sticky_policy(),
+            start,
+        );
+        plane.complete_tree_edge_attempt(initial, true, start);
+        let at = |ms| start + Duration::from_millis(ms);
+        let _ = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct(2),
+                TreeEdgeCandidate::legacy(3, 1, 1),
+            ],
+            sticky_policy(),
+            at(750),
+        );
+        let changed = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct(2),
+                TreeEdgeCandidate::legacy(4, 1, 1),
+            ],
+            sticky_policy(),
+            at(1_250),
+        );
+        assert_eq!(changed.path(), TreeEdgePath::DirectChild);
+        let not_yet = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct(2),
+                TreeEdgeCandidate::legacy(4, 1, 1),
+            ],
+            sticky_policy(),
+            at(1_749),
+        );
+        assert_eq!(not_yet.path(), TreeEdgePath::DirectChild);
+        let confirmed = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct(2),
+                TreeEdgeCandidate::legacy(4, 1, 1),
+            ],
+            sticky_policy(),
+            at(1_750),
+        );
+        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4));
+    }
+
+    #[test]
+    fn tree_edge_idle_reset_and_stale_completion_are_deterministic() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(92, 1);
+        let start = Instant::now();
+        let stale = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct(1)],
+            sticky_policy(),
+            start,
+        );
+        plane.complete_tree_edge_attempt(stale, true, start);
+        plane.complete_tree_edge_attempt(stale, true, start + Duration::from_millis(10));
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::DirectChild)
+        );
+
+        let reset = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct(1)],
+            sticky_policy(),
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(reset.path(), TreeEdgePath::DirectChild);
+        assert_eq!(reset.reason, "initial");
+    }
+
+    #[test]
+    fn hard_escape_prefers_direct_then_deterministic_fallback() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(93, 1);
+        let start = Instant::now();
+        let direct = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct(3),
+                TreeEdgeCandidate::legacy(4, 1, 20),
+                TreeEdgeCandidate::legacy(3, 1, 10),
+            ],
+            sticky_policy(),
+            start,
+        );
+        assert_eq!(direct.path(), TreeEdgePath::LegacyVia(3));
+        plane.complete_tree_edge_attempt(direct, true, start);
+
+        let failed_fallback = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct(1),
+                TreeEdgeCandidate::legacy(3, 3, 10),
+            ],
+            sticky_policy(),
+            start + Duration::from_millis(1),
+        );
+        assert_eq!(failed_fallback.path(), TreeEdgePath::DirectChild);
     }
 
     fn frame(message_id: u64) -> PendingDistributionFrame {

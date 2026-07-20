@@ -1034,6 +1034,53 @@ pub async fn project_client_log_entry_transition(
     session_channel_shadow: &mut SessionChannelShadow,
     entry: &ClientStateLogEntry,
 ) -> Vec<Message> {
+    project_client_log_entry_transition_inner(
+        server,
+        client,
+        channel_tree_shadow,
+        user_visibility,
+        session_channel_shadow,
+        entry,
+        None,
+        false,
+    )
+    .await
+}
+
+/// Payload-aware variant used by projection shards after they have obtained
+/// the publication's shared canonical message.
+pub(crate) async fn project_client_log_entry_transition_with_canonical(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    user_visibility: &mut UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    entry: &ClientStateLogEntry,
+    canonical_message: Option<&Message>,
+) -> Vec<Message> {
+    project_client_log_entry_transition_inner(
+        server,
+        client,
+        channel_tree_shadow,
+        user_visibility,
+        session_channel_shadow,
+        entry,
+        canonical_message,
+        true,
+    )
+    .await
+}
+
+async fn project_client_log_entry_transition_inner(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    user_visibility: &mut UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    entry: &ClientStateLogEntry,
+    canonical_message: Option<&Message>,
+    use_canonical_message: bool,
+) -> Vec<Message> {
     let viewer_session_id = client.get_session_id();
     let viewer_client_instance_id = client.client_instance_id();
     let old_viewer_channel_id = session_channel_shadow.get(&viewer_session_id).copied();
@@ -1098,14 +1145,25 @@ pub async fn project_client_log_entry_transition(
     let viewer_acl_delta =
         viewer_acl_delta_for_entry(entry, viewer_session_id, viewer_client_instance_id);
     let server_id = client.server_id();
-    for message in entry
-        .messages_for_client(
-            server.get_clients(),
-            viewer_session_id,
-            viewer_client_instance_id,
-        )
-        .await
-    {
+    let entry_messages = if use_canonical_message {
+        entry
+            .messages_for_client_with_canonical(
+                server.get_clients(),
+                viewer_session_id,
+                viewer_client_instance_id,
+                canonical_message,
+            )
+            .await
+    } else {
+        entry
+            .messages_for_client(
+                server.get_clients(),
+                viewer_session_id,
+                viewer_client_instance_id,
+            )
+            .await
+    };
+    for message in entry_messages {
         let is_permission_flush =
             matches!(&message, Message::PermissionQuery(query) if query.flush == Some(true));
         let messages = if is_permission_flush {

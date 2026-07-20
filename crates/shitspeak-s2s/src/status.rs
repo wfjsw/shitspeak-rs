@@ -29,7 +29,34 @@ pub(crate) struct TopologySnapshot {
     inbound_queues: Vec<InboundQueueMetric>,
     expired_outbound_drops: Vec<ExpiredOutboundDropMetric>,
     transport_health_exclusions: Vec<TransportHealthExclusionMetric>,
+    voice_transport_bindings: Vec<VoiceTransportBindingMetric>,
+    voice_transport_binding_events: Vec<VoiceTransportBindingEventMetric>,
+    voice_transport_challengers: Vec<VoiceTransportChallengerMetric>,
     debug_packet_io: Vec<crate::debug_io::PacketIoSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct VoiceTransportBindingMetric {
+    peer: NodeIdentifier,
+    transport: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct VoiceTransportBindingEventMetric {
+    peer: NodeIdentifier,
+    from_transport: &'static str,
+    to_transport: &'static str,
+    reason: &'static str,
+    events: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct VoiceTransportChallengerMetric {
+    peer: NodeIdentifier,
+    incumbent: &'static str,
+    challenger: &'static str,
+    outcome: &'static str,
+    events: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -580,6 +607,56 @@ pub(crate) fn build_topology_snapshot(
         .collect::<Vec<_>>();
     transport_health_exclusions.sort_by_key(|entry| (entry.peer, entry.transport, entry.reason));
 
+    let mut voice_transport_bindings = metrics
+        .voice_transport_bindings()
+        .iter()
+        .map(|entry| VoiceTransportBindingMetric {
+            peer: entry.peer(),
+            transport: transport_kind_name(entry.transport()),
+        })
+        .collect::<Vec<_>>();
+    voice_transport_bindings.sort_by_key(|entry| (entry.peer, entry.transport));
+
+    let mut voice_transport_binding_events = metrics
+        .voice_transport_binding_events()
+        .iter()
+        .map(|entry| VoiceTransportBindingEventMetric {
+            peer: entry.peer(),
+            from_transport: entry
+                .from_transport()
+                .map(transport_kind_name)
+                .unwrap_or("none"),
+            to_transport: entry
+                .to_transport()
+                .map(transport_kind_name)
+                .unwrap_or("none"),
+            reason: entry.reason().name(),
+            events: entry.events(),
+        })
+        .collect::<Vec<_>>();
+    voice_transport_binding_events.sort_by_key(|entry| {
+        (
+            entry.peer,
+            entry.from_transport,
+            entry.to_transport,
+            entry.reason,
+        )
+    });
+
+    let mut voice_transport_challengers = metrics
+        .voice_transport_challengers()
+        .iter()
+        .map(|entry| VoiceTransportChallengerMetric {
+            peer: entry.peer(),
+            incumbent: transport_kind_name(entry.incumbent()),
+            challenger: transport_kind_name(entry.challenger()),
+            outcome: entry.outcome().name(),
+            events: entry.events(),
+        })
+        .collect::<Vec<_>>();
+    voice_transport_challengers
+        .sort_by_key(|entry| (entry.peer, entry.incumbent, entry.challenger, entry.outcome));
+
     TopologySnapshot {
         local_node: overlay.local_node_id(),
         generated_at_unix_ms,
@@ -592,6 +669,9 @@ pub(crate) fn build_topology_snapshot(
         inbound_queues,
         expired_outbound_drops,
         transport_health_exclusions,
+        voice_transport_bindings,
+        voice_transport_binding_events,
+        voice_transport_challengers,
         debug_packet_io: crate::debug_io::snapshot(),
     }
 }
@@ -843,6 +923,31 @@ impl<'a> PrometheusWriter<'a> {
         self.header(
             "shitspeak_s2s_transport_health_exclusions_total",
             "Local transport sender exclusions due to health checks.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_transport_binding",
+            "Current sticky voice transport binding by local node and peer.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_transport_binding_events_total",
+            "Sticky voice transport binding transitions by local node, peer, and reason.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_transport_challenger_total",
+            "Sticky voice transport challenger outcomes by local node and peer.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_tree_edge_binding",
+            "Current sticky voice tree-edge binding mode by source and peer.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_tree_edge_binding_events_total",
+            "Sticky voice tree-edge binding transitions by source, peer, and reason.",
             "counter",
         );
         self.header(
@@ -1643,6 +1748,52 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
                 ("reason", entry.reason),
             ],
             entry.exclusions as f64,
+        ));
+    }
+
+    for entry in &snapshot.voice_transport_bindings {
+        let source = local_node.clone();
+        let peer = entry.peer.to_string();
+        out.push(sample(
+            "shitspeak_s2s_voice_transport_binding",
+            vec![
+                ("source", source.as_str()),
+                ("peer", peer.as_str()),
+                ("transport", entry.transport),
+            ],
+            1.0,
+        ));
+    }
+
+    for entry in &snapshot.voice_transport_binding_events {
+        let source = local_node.clone();
+        let peer = entry.peer.to_string();
+        out.push(sample(
+            "shitspeak_s2s_voice_transport_binding_events_total",
+            vec![
+                ("source", source.as_str()),
+                ("peer", peer.as_str()),
+                ("from_transport", entry.from_transport),
+                ("to_transport", entry.to_transport),
+                ("reason", entry.reason),
+            ],
+            entry.events as f64,
+        ));
+    }
+
+    for entry in &snapshot.voice_transport_challengers {
+        let source = local_node.clone();
+        let peer = entry.peer.to_string();
+        out.push(sample(
+            "shitspeak_s2s_voice_transport_challenger_total",
+            vec![
+                ("source", source.as_str()),
+                ("peer", peer.as_str()),
+                ("incumbent", entry.incumbent),
+                ("challenger", entry.challenger),
+                ("outcome", entry.outcome),
+            ],
+            entry.events as f64,
         ));
     }
 
@@ -2575,6 +2726,24 @@ mod tests {
                 reason: "kcp_failaway",
                 exclusions: 7,
             }],
+            voice_transport_bindings: vec![VoiceTransportBindingMetric {
+                peer: 2,
+                transport: "quic",
+            }],
+            voice_transport_binding_events: vec![VoiceTransportBindingEventMetric {
+                peer: 2,
+                from_transport: "kcp",
+                to_transport: "quic",
+                reason: "confirmed_challenger",
+                events: 3,
+            }],
+            voice_transport_challengers: vec![VoiceTransportChallengerMetric {
+                peer: 2,
+                incumbent: "kcp",
+                challenger: "quic",
+                outcome: "confirmed",
+                events: 2,
+            }],
             debug_packet_io: Vec::new(),
         };
 
@@ -2642,6 +2811,28 @@ mod tests {
         assert!(rendered.contains(
             "shitspeak_s2s_transport_health_exclusions_total{source=\"1\",peer=\"2\",transport=\"kcp\",reason=\"kcp_failaway\"} 7"
         ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_voice_transport_binding{source=\"1\",peer=\"2\",transport=\"quic\"} 1"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_voice_transport_binding_events_total{source=\"1\",peer=\"2\",from_transport=\"kcp\",to_transport=\"quic\",reason=\"confirmed_challenger\"} 3"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_voice_transport_challenger_total{source=\"1\",peer=\"2\",incumbent=\"kcp\",challenger=\"quic\",outcome=\"confirmed\"} 2"
+        ));
+        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_transport_binding gauge\n"));
+        assert!(
+            rendered
+                .contains("# TYPE shitspeak_s2s_voice_transport_binding_events_total counter\n")
+        );
+        assert!(
+            rendered.contains("# TYPE shitspeak_s2s_voice_transport_challenger_total counter\n")
+        );
+        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_tree_edge_binding gauge\n"));
+        assert!(
+            rendered
+                .contains("# TYPE shitspeak_s2s_voice_tree_edge_binding_events_total counter\n")
+        );
         assert!(rendered.contains("# TYPE shitspeak_s2s_transport_io_batches_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_transport_io_frames_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_send_events_total counter\n"));

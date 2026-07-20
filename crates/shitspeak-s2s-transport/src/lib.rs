@@ -100,7 +100,9 @@ pub use metrics::{
     ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics,
     MetricsSnapshot, OutboundQueueStatusSnapshot, QueueStatusSnapshot, TransportIoDirection,
     TransportIoFrameSnapshot, TransportIoPressureResult, TransportIoSnapshot,
-    TransportPipelineStageSnapshot,
+    TransportPipelineStageSnapshot, VoiceTransportBindingEventReason,
+    VoiceTransportBindingEventSnapshot, VoiceTransportBindingSnapshot,
+    VoiceTransportChallengerOutcome, VoiceTransportChallengerSnapshot,
 };
 pub use metrics::{
     apply_packet_loss_penalty, conversational_effective_delay_us, conversational_impairment,

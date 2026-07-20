@@ -32,12 +32,13 @@ use crate::utils::{recv_mpsc_optional, recv_optional};
 use shitspeak_state::{ChannelOp, ChannelOperation};
 
 use super::Server;
+use super::client_projection::ClientProjectionState;
+use super::client_projection_pool::ClientProjectionRegistration;
 use super::entrypoints::normalize_sni_name;
 use super::extensions::{ALPN_MUMBLE, AlpnConnectionInfo};
 
 type ClientLogReceiver = tokio::sync::broadcast::Receiver<Arc<ClientStateBroadcastPayload>>;
 type ChannelLogReceiver = tokio::sync::broadcast::Receiver<Arc<ChannelOperation>>;
-type VisibilityReloadReceiver = tokio::sync::broadcast::Receiver<()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChannelLogReceiveOutcome {
@@ -197,6 +198,115 @@ pub(super) async fn activate_client_subscriptions(
     Ok(())
 }
 
+pub(super) async fn activate_client_projection(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    registration: &mut Option<ClientProjectionRegistration>,
+) -> Result<(), HandleIncomingConnectionError> {
+    if !client.is_authenticated() || registration.is_some() {
+        return Ok(());
+    }
+
+    let server_id = client.server_id();
+    let client_session_id = client.get_session_id();
+    let staged_channel_subscription = client.take_channel_state_subscription();
+    let staged_channel_version = staged_channel_subscription
+        .as_ref()
+        .map(|(version, _)| *version)
+        .unwrap_or_else(|| server.channels.current_version_in_server(&server_id));
+    let staged_client_versions = client.get_last_client_versions().await;
+    // Native clients no longer retain their own log receivers after auth. The
+    // shard's registration hook catches up from these exact snapshot cursors.
+    drop(staged_channel_subscription);
+    drop(client.take_client_state_subscription());
+
+    let (baseline, last_client_versions, channel_snapshot_version) =
+        if let Some(baseline) = client.take_post_auth_baseline() {
+            (baseline, staged_client_versions, staged_channel_version)
+        } else {
+            tracing::warn!(
+                server_id,
+                session = u32::from(client_session_id),
+                "post-auth baseline missing; atomically recapturing projection snapshots"
+            );
+            let (snapshot_clients, snapshot_versions, snapshot_client_rx) = server
+                .clients
+                .published_snapshot_with_versions_and_subscription_in_server(&server_id)
+                .await;
+            let (channels, snapshot_channel_version, snapshot_channel_rx) = server
+                .channels
+                .snapshot_with_version_and_subscription_in_server(&server_id);
+            drop(snapshot_client_rx);
+            drop(snapshot_channel_rx);
+            let mut channel_tree_shadow = ChannelTreeShadow::default();
+            let mut session_channel_shadow = SessionChannelShadow::new();
+            let mut user_visibility = UserVisibilityState::default();
+            if server.get_hide_channels_without_traverse() {
+                for channel in &channels {
+                    if crate::channel_handler::can_view_channel_with_ancestors(
+                        server, client, channel.id,
+                    )
+                    .await
+                    {
+                        channel_tree_shadow.insert(channel.id);
+                    }
+                }
+            } else {
+                channel_tree_shadow.extend(channels.iter().map(|channel| channel.id));
+            }
+            if server.get_hide_users_without_traverse() {
+                crate::client::visibility::initialize(
+                    server,
+                    client,
+                    &mut user_visibility,
+                    &mut session_channel_shadow,
+                )
+                .await;
+            } else {
+                session_channel_shadow.extend(
+                    snapshot_clients
+                        .into_iter()
+                        .filter(|client| client.is_authenticated() && client.is_published())
+                        .map(|client| (client.get_session_id(), client.get_current_channel_id())),
+                );
+            }
+            (
+                crate::client::PostAuthBaseline::with_user_visibility(
+                    session_channel_shadow,
+                    channel_tree_shadow,
+                    user_visibility,
+                ),
+                snapshot_versions,
+                snapshot_channel_version,
+            )
+        };
+
+    let state = ClientProjectionState::from_post_auth_baseline(
+        Arc::downgrade(server),
+        Arc::clone(client),
+        baseline,
+        last_client_versions,
+        channel_snapshot_version,
+    );
+
+    server
+        .clients
+        .publish_client_in_server(&server_id, client_session_id)
+        .await;
+    let projection_registration = server
+        .client_projection_pool()
+        .register(state)
+        .await
+        .map_err(|error| {
+            HandleIncomingConnectionError::IOError(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                error,
+            ))
+        })?;
+    *registration = Some(projection_registration);
+    Ok(())
+}
+
 async fn replay_client_log_entries_since(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -253,38 +363,20 @@ async fn finish_handler_result(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     client_session_id: ClientSessionIdentifier,
-    client_log_rx: &mut Option<ClientLogReceiver>,
-    channel_log_rx: &mut Option<ChannelLogReceiver>,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    session_channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
+    projection_registration: &mut Option<ClientProjectionRegistration>,
     result: Result<(), MessageHandlerError>,
 ) -> Result<(), HandleIncomingConnectionError> {
     if matches!(result, Err(MessageHandlerError::AuthRejection(_))) {
         let _ = client.force_disconnect().await;
     }
     map_handler_result(client_session_id, result)?;
-    activate_client_subscriptions(
-        server,
-        client,
-        client_session_id,
-        client_log_rx,
-        channel_log_rx,
-        channel_tree_shadow,
-        session_channel_shadow,
-        user_visibility,
-    )
-    .await
+    activate_client_projection(server, client, projection_registration).await
 }
 
 async fn finish_normal_client_message(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    client_log_rx: &mut Option<ClientLogReceiver>,
-    channel_log_rx: &mut Option<ChannelLogReceiver>,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    session_channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
+    projection_registration: &mut Option<ClientProjectionRegistration>,
     message: Message,
 ) -> Result<(), HandleIncomingConnectionError> {
     let result = client.handle_message(server, message).await;
@@ -292,11 +384,7 @@ async fn finish_normal_client_message(
         server,
         client,
         client.get_session_id(),
-        client_log_rx,
-        channel_log_rx,
-        channel_tree_shadow,
-        session_channel_shadow,
-        user_visibility,
+        projection_registration,
         result,
     )
     .await?;
@@ -307,25 +395,11 @@ async fn finish_normal_client_message(
 async fn finish_deferred_client_messages(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    client_log_rx: &mut Option<ClientLogReceiver>,
-    channel_log_rx: &mut Option<ChannelLogReceiver>,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    session_channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
+    projection_registration: &mut Option<ClientProjectionRegistration>,
     messages: &mut VecDeque<Message>,
 ) -> Result<(), HandleIncomingConnectionError> {
     while let Some(message) = messages.pop_front() {
-        finish_normal_client_message(
-            server,
-            client,
-            client_log_rx,
-            channel_log_rx,
-            channel_tree_shadow,
-            session_channel_shadow,
-            user_visibility,
-            message,
-        )
-        .await?;
+        finish_normal_client_message(server, client, projection_registration, message).await?;
     }
     Ok(())
 }
@@ -334,11 +408,7 @@ async fn continue_deferred_client_messages(
     handler_tasks: &mut JoinSet<Result<(), MessageHandlerError>>,
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    client_log_rx: &mut Option<ClientLogReceiver>,
-    channel_log_rx: &mut Option<ChannelLogReceiver>,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    session_channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
+    projection_registration: &mut Option<ClientProjectionRegistration>,
     messages: &mut VecDeque<Message>,
     pre_auth_handler_in_flight: &mut bool,
 ) -> Result<(), HandleIncomingConnectionError> {
@@ -354,17 +424,7 @@ async fn continue_deferred_client_messages(
         return Ok(());
     }
 
-    finish_deferred_client_messages(
-        server,
-        client,
-        client_log_rx,
-        channel_log_rx,
-        channel_tree_shadow,
-        session_channel_shadow,
-        user_visibility,
-        messages,
-    )
-    .await
+    finish_deferred_client_messages(server, client, projection_registration, messages).await
 }
 
 async fn finish_pre_auth_passthrough_message(
@@ -1235,19 +1295,13 @@ impl Server {
             )
             .await;
 
-        let client_session_id = client.get_session_id();
         let client_span = client.tracing_span();
 
-        // Subscriptions start as None — they're activated after auth.
-        let mut client_log_rx: Option<ClientLogReceiver> = None;
-        let mut channel_log_rx: Option<ChannelLogReceiver> = None;
-        let mut visibility_reload_rx: Option<VisibilityReloadReceiver> =
-            Some(self.subscribe_visibility_reload());
-        let mut visibility_reload_pending = false;
+        // Projection ownership moves to one stable shard after authentication.
+        // Keeping this handle connection-local makes unregister automatic on
+        // every exit path.
+        let mut projection_registration: Option<ClientProjectionRegistration> = None;
         let mut writer_task = spawn_native_client_writer_task(&client);
-        let mut channel_tree_shadow = ChannelTreeShadow::default();
-        let mut session_channel_shadow = SessionChannelShadow::new();
-        let mut user_visibility = UserVisibilityState::default();
 
         // Run the connection loop.  On any unrecoverable error, clean up
         // the client and return the error to the caller.
@@ -1291,45 +1345,16 @@ impl Server {
                             self,
                             &client,
                             client.get_session_id(),
-                            &mut client_log_rx,
-                            &mut channel_log_rx,
-                            &mut channel_tree_shadow,
-                            &mut session_channel_shadow,
-                            &mut user_visibility,
+                            &mut projection_registration,
                             result,
                         )
                         .await?;
-                        if visibility_reload_pending
-                            && client.is_authenticated()
-                            && client_log_rx.is_some()
-                        {
-                            visibility_reload_pending = false;
-                            let messages =
-                                crate::client::visibility::visibility_config_reload_messages(
-                                    self,
-                                    &client,
-                                    &mut user_visibility,
-                                    &mut channel_tree_shadow,
-                                    &mut session_channel_shadow,
-                                )
-                                .await;
-                            if !messages.is_empty() {
-                                client
-                                    .write_proto_message_batch(&messages)
-                                    .await
-                                    .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                            }
-                        }
                         client.touch_activity();
                         continue_deferred_client_messages(
                             &mut handler_tasks,
                             self,
                             &client,
-                            &mut client_log_rx,
-                            &mut channel_log_rx,
-                            &mut channel_tree_shadow,
-                            &mut session_channel_shadow,
-                            &mut user_visibility,
+                            &mut projection_registration,
                             &mut deferred_pre_auth_messages,
                             &mut pre_auth_handler_in_flight,
                         )
@@ -1351,34 +1376,17 @@ impl Server {
                         }
                     }
 
-                    // ── Visibility policy change notification ───────────────
-                    result = recv_optional(visibility_reload_rx.as_mut()), if visibility_reload_rx.is_some() => {
-                        match result {
-                            Some(Ok(())) | Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
-                                if client.is_authenticated() && client_log_rx.is_some() {
-                                    visibility_reload_pending = false;
-                                    let messages = crate::client::visibility::visibility_config_reload_messages(
-                                        self,
-                                        &client,
-                                        &mut user_visibility,
-                                        &mut channel_tree_shadow,
-                                        &mut session_channel_shadow,
-                                    )
-                                    .await;
-                                    if !messages.is_empty() {
-                                        client
-                                            .write_proto_message_batch(&messages)
-                                            .await
-                                            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-                                    }
-                                } else {
-                                    visibility_reload_pending = true;
-                                }
-                            }
-                            Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) | None => {
-                                visibility_reload_rx = None;
-                            }
+                    // ── Projection shard failure ────────────────────────────
+                    _ = async {
+                        match projection_registration.as_mut() {
+                            Some(registration) => registration.failed().await,
+                            None => std::future::pending().await,
                         }
+                    }, if projection_registration.is_some() => {
+                        return Err(HandleIncomingConnectionError::IOError(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "client projection shard stopped",
+                        )));
                     }
 
                     // ── Deferred pre-auth message ───────────────────────────
@@ -1387,11 +1395,7 @@ impl Server {
                             &mut handler_tasks,
                             self,
                             &client,
-                            &mut client_log_rx,
-                            &mut channel_log_rx,
-                            &mut channel_tree_shadow,
-                            &mut session_channel_shadow,
-                            &mut user_visibility,
+                            &mut projection_registration,
                             &mut deferred_pre_auth_messages,
                             &mut pre_auth_handler_in_flight,
                         )
@@ -1436,11 +1440,7 @@ impl Server {
                                     finish_normal_client_message(
                                         self,
                                         &client,
-                                        &mut client_log_rx,
-                                        &mut channel_log_rx,
-                                        &mut channel_tree_shadow,
-                                        &mut session_channel_shadow,
-                                        &mut user_visibility,
+                                        &mut projection_registration,
                                         message,
                                     )
                                     .await?;
@@ -1468,107 +1468,42 @@ impl Server {
                         }
                     }
 
-                    // ── Channel state change notification ────────────────────
-                    // Must come BEFORE client_log_rx in select! to ensure
-                    // channel updates are delivered before client state updates.
-                    result = recv_optional(channel_log_rx.as_mut()), if channel_log_rx.is_some() => {
-                        if process_channel_log_result(
-                            self,
-                            &client,
-                            client_session_id,
-                            &mut channel_tree_shadow,
-                            &mut session_channel_shadow,
-                            &mut user_visibility,
-                            result,
-                        )
-                        .await? == ChannelLogReceiveOutcome::Closed
-                        {
-                            return Ok(());
-                        }
-                    }
-
-                    // ── Client state change notification ─────────────────────
-                    result = recv_optional(client_log_rx.as_mut()), if client_log_rx.is_some() => {
-                        if drain_ready_channel_log_before_client_log(
-                            self,
-                            &client,
-                            client_session_id,
-                            &mut channel_tree_shadow,
-                            &mut session_channel_shadow,
-                            &mut user_visibility,
-                            &mut channel_log_rx,
-                        )
-                        .await? == ChannelLogReceiveOutcome::Closed
-                        {
-                            return Ok(());
-                        }
-
-                        match result {
-                            Some(Ok(broadcast)) => {
-                                if let Some(rx) = client_log_rx.as_mut() {
-                                    process_client_log_broadcasts(
-                                        self,
-                                        &client,
-                                        client_session_id,
-                                        &mut channel_tree_shadow,
-                                        &mut session_channel_shadow,
-                                        &mut user_visibility,
-                                        broadcast,
-                                        rx,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
-                                replay_client_log_subscription_gap(
-                                    self,
-                                    &client,
-                                    client_session_id,
-                                    &mut channel_tree_shadow,
-                                    &mut session_channel_shadow,
-                                    &mut user_visibility,
-                                )
-                                .await?;
-                            }
-                            Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                                return Ok(());
-                            }
-                            None => {} // not subscribed yet
-                        }
-                    }
                 }
             }
         }
         .instrument(client_span.clone())
         .await;
 
-        // Single cleanup point: remove the client on any error.
+        // Stop shard projection before repository removal. This also covers a
+        // non-blocking writer-queue rejection, which signals disconnect and
+        // otherwise reaches this point as a local (successful) shutdown.
+        drop(projection_registration.take());
+        if let Some(task) = writer_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
         if result.is_err() {
-            if let Some(task) = writer_task.take() {
-                task.abort();
-                let _ = task.await;
-            }
             let _ = client.force_disconnect().await;
-            async {
-                let server_id = client.server_id();
-                let old_channel_id = client.get_current_channel_id();
-                self.clients
-                    .remove_client_instance_in_server(
-                        &server_id,
-                        client.get_session_id(),
-                        client.client_instance_id(),
-                    )
-                    .await;
-                crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
-                    self,
+        }
+        async {
+            let server_id = client.server_id();
+            let old_channel_id = client.get_current_channel_id();
+            self.clients
+                .remove_client_instance_in_server(
                     &server_id,
-                    old_channel_id,
+                    client.get_session_id(),
+                    client.client_instance_id(),
                 )
                 .await;
-            }
-            .instrument(client_span.clone())
+            crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
+                self,
+                &server_id,
+                old_channel_id,
+            )
             .await;
         }
+        .instrument(client_span.clone())
+        .await;
         if let Err(error) = &result {
             client.in_tracing_scope(|| {
                 if error.is_clean_disconnect() {
@@ -1726,10 +1661,7 @@ mod client_snapshot_boundary_tests {
                 initial_state: ClientGlobalStateDelta::default(),
             },
         });
-        let broadcast = ClientStateBroadcastPayload {
-            entry,
-            versions: HashMap::from([(1, 17)]),
-        };
+        let broadcast = ClientStateBroadcastPayload::new(entry, HashMap::from([(1, 17)]));
 
         assert!(
             advance_client_log_vector_if_out_of_scope(&viewer, "tenant-alpha", &broadcast).await

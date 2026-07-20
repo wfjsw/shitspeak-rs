@@ -34,9 +34,12 @@ use shitspeak_state::{
 };
 
 mod auth_finalization;
+pub(crate) mod client_projection;
+mod client_projection_pool;
 mod connection;
 mod entrypoints;
 mod extensions;
+pub(crate) mod sharded_subscriber;
 mod tls;
 mod udp_recv_batch;
 
@@ -143,7 +146,7 @@ impl ChannelRepositoryObserver for ClientRepositoryChannelObserver {
 #[cfg(test)]
 use auth_finalization::{AuthFinalizationAdmission, should_send_auth_finalization_queue_notice};
 #[cfg(test)]
-use connection::activate_client_subscriptions;
+use connection::{activate_client_projection, activate_client_subscriptions};
 #[cfg(test)]
 use entrypoints::{
     DYNAMIC_ENTRYPOINT_MAX_PORT, DYNAMIC_ENTRYPOINT_MIN_PORT, dynamic_bind_error_is_retryable,
@@ -185,6 +188,7 @@ pub struct Server {
     geoip_resolver: ParkingRwLock<Arc<GeoIpResolver>>,
     shutdown_tx: tokio::sync::watch::Sender<()>,
     visibility_reload_tx: broadcast::Sender<()>,
+    client_projection_pool: std::sync::OnceLock<client_projection_pool::ClientProjectionPool>,
 }
 
 impl Server {
@@ -331,7 +335,19 @@ impl Server {
             ))),
             shutdown_tx,
             visibility_reload_tx,
+            client_projection_pool: std::sync::OnceLock::new(),
         }));
+
+        let projection_pool = client_projection_pool::ClientProjectionPool::spawn(
+            Arc::downgrade(&server),
+            server.clients.subscribe(),
+            server.channels.subscribe(),
+            server.subscribe_visibility_reload(),
+        )?;
+        server
+            .client_projection_pool
+            .set(projection_pool)
+            .map_err(|_| std::io::Error::other("client projection pool initialized twice"))?;
 
         // Wire cross-repo causal notification: ChannelRepository notifies
         // ClientRepository to drain pending ops after remote channel ops.
@@ -387,6 +403,12 @@ impl Server {
     /// either hide flag changes during a config reload.
     pub fn subscribe_visibility_reload(&self) -> broadcast::Receiver<()> {
         self.visibility_reload_tx.subscribe()
+    }
+
+    pub(crate) fn client_projection_pool(&self) -> &client_projection_pool::ClientProjectionPool {
+        self.client_projection_pool
+            .get()
+            .expect("client projection pool must be initialized before Server is returned")
     }
 
     pub async fn lookup_ip_geo_metadata(&self, ip: std::net::IpAddr) -> Option<IpGeoMetadata> {

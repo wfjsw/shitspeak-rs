@@ -18,7 +18,8 @@ use crate::overlay::LaneId;
 use crate::overlay::attachments::{AttachmentCache, AttachmentKey, TREE_HINT_ATTACHMENT_KIND};
 use crate::overlay::config::OverlayConfig;
 use crate::overlay::distribution::{
-    DistributionPlane, PendingDistributionFrame, TreeKey, TreeState, UnknownTreeEnqueue,
+    DistributionPlane, PendingDistributionFrame, TreeEdgeAttempt, TreeEdgeCandidate, TreeEdgePath,
+    TreeEdgeStickinessPolicy, TreeKey, TreeState, UnknownTreeEnqueue,
 };
 use crate::overlay::neighbor::NeighborMonitor;
 use shitspeak_core::NodeIdentifier;
@@ -1975,6 +1976,7 @@ async fn send_direct_tree_edge(
         path_trace,
         transport_class,
         hop_ttl,
+        true,
     )
     .await
 }
@@ -1989,6 +1991,7 @@ async fn send_direct_tree_edge_with_routing(
     path_trace: Vec<u32>,
     transport_class: MessageClass,
     hop_ttl: Duration,
+    allow_pressure_fallback: bool,
 ) -> TreeEdgeSendOutcome {
     if path_trace.len() > MAX_PATH_TRACE_NODES {
         return TreeEdgeSendOutcome::Loop;
@@ -2033,7 +2036,8 @@ async fn send_direct_tree_edge_with_routing(
     // it expire before dispatch. Expiring voice traffic must use the same
     // pressure-aware alternate first hop as ordinary forwarding, with the
     // tree metadata removed for that one branch.
-    if data.service_tag == VOICE_SERVICE_TAG
+    if allow_pressure_fallback
+        && data.service_tag == VOICE_SERVICE_TAG
         && options.expires_at().is_some()
         && !fallback_recipients.is_empty()
         && let Some(routing) = routing
@@ -2117,6 +2121,340 @@ async fn send_direct_tree_edge_with_routing(
     }
 }
 
+fn tree_edge_candidates(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    distribution: &DistributionPlane,
+    tree_key: TreeKey,
+    self_id: NodeIdentifier,
+    child: NodeIdentifier,
+    recipients: &[NodeIdentifier],
+    data: &pb::OverlayData,
+    path_trace: &[u32],
+    transport_class: MessageClass,
+    hop_ttl: Duration,
+    force_alternates: bool,
+) -> Vec<TreeEdgeCandidate> {
+    let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
+    let metric = route_metric_from_wire(data.route_metric, level)
+        .unwrap_or_else(|| RoutingMetric::default_for_level(level));
+    let options = transport_options_for_overlay_data(data, Some(hop_ttl));
+    let mut candidates = Vec::new();
+    let direct_pressure =
+        transport.best_send_queue_pressure(child, level, metric, transport_class, options);
+    if let Some(pressure) = direct_pressure {
+        candidates.push(TreeEdgeCandidate::direct(pressure));
+    }
+
+    let current_path = distribution.current_tree_edge_path(tree_key, self_id, child);
+    if !force_alternates
+        && !matches!(current_path, Some(TreeEdgePath::LegacyVia(_)))
+        && direct_pressure.is_some_and(|pressure| pressure <= 1)
+    {
+        return candidates;
+    }
+
+    let tables = routing.load();
+    let visited = path_trace_set(path_trace);
+    let legacy_hops = tables
+        .first_hops_reaching_all_with_metric(self_id, recipients, level, metric, &visited)
+        .into_iter()
+        .map(|route| (route.next_hop, route.cost));
+
+    for (first_hop, route_cost) in legacy_hops {
+        if first_hop == child || visited.contains(&first_hop) {
+            continue;
+        }
+        if let Some(pressure) =
+            transport.best_send_queue_pressure(first_hop, level, metric, transport_class, options)
+        {
+            candidates.push(TreeEdgeCandidate::legacy(first_hop, pressure, route_cost));
+        }
+    }
+    candidates
+}
+
+async fn forward_pb_via_first_hop(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    self_id: NodeIdentifier,
+    first_hop: NodeIdentifier,
+    data: pb::OverlayData,
+    transport_class: MessageClass,
+    hop_ttl: Duration,
+) -> Result<(), OverlayError> {
+    if data.path_trace.len() >= MAX_PATH_TRACE_NODES {
+        return Err(OverlayError::NoRoute {
+            dst: first_hop,
+            level: level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable),
+        });
+    }
+    let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
+    let metric = route_metric_from_wire(data.route_metric, level)
+        .unwrap_or_else(|| RoutingMetric::default_for_level(level));
+    let visited = path_trace_set(&data.path_trace);
+    let tables = routing.load();
+    let all_reachable = data.dsts.iter().all(|wire| {
+        NodeIdentifier::try_from(*wire)
+            .ok()
+            .is_some_and(|recipient| {
+                tables
+                    .lookup_via_first_hop_with_metric(
+                        self_id, recipient, level, metric, &visited, first_hop,
+                    )
+                    .is_some()
+            })
+    });
+    if !all_reachable {
+        return Err(OverlayError::NoRoute {
+            dst: first_hop,
+            level,
+        });
+    }
+    let mut trace = data.path_trace.clone();
+    if !append_path_trace(&mut trace, self_id) {
+        return Err(OverlayError::NoRoute {
+            dst: first_hop,
+            level,
+        });
+    }
+    let message = reconstruct_forwarded_data(&data, data.dsts.clone(), trace.clone());
+    let payload_plan = transport_payload_plan(
+        transport,
+        first_hop,
+        level,
+        transport_class,
+        &message,
+        &trace,
+    )
+    .map_err(OverlayError::Encode)?;
+    let body = OverlayBody::Data(message);
+    let packet_kind = crate::debug_io::classify_overlay_body(&body);
+    let payload_len = payload_plan.default_variant().primary().len();
+    crate::debug_io::record_send_attempt(self_id, first_hop, packet_kind.clone());
+    transport
+        .try_send_with_payload_plan(
+            first_hop,
+            level,
+            Some(metric),
+            transport_class,
+            payload_plan,
+            transport_options_for_overlay_data(&data, Some(hop_ttl)),
+        )
+        .await
+        .map_err(OverlayError::Send)?;
+    crate::debug_io::record_sent(self_id, first_hop, packet_kind, payload_len);
+    Ok(())
+}
+
+fn tree_edge_outcome_from_overlay_error(error: OverlayError) -> TreeEdgeSendOutcome {
+    match error {
+        OverlayError::NoRoute { .. } => TreeEdgeSendOutcome::NoRoute,
+        OverlayError::Send(error @ SendError::Backpressure { .. }) => {
+            TreeEdgeSendOutcome::Backpressure(error)
+        }
+        OverlayError::Send(error) => TreeEdgeSendOutcome::Transport(error),
+        _ => TreeEdgeSendOutcome::NoRoute,
+    }
+}
+
+fn hard_escape_reason(outcome: &TreeEdgeSendOutcome) -> &'static str {
+    match outcome {
+        TreeEdgeSendOutcome::NoRoute | TreeEdgeSendOutcome::Loop => "transport_unavailable",
+        TreeEdgeSendOutcome::Backpressure(_) => "queue_full",
+        TreeEdgeSendOutcome::Transport(SendError::StreamClosed { .. }) => "stream_closed",
+        TreeEdgeSendOutcome::Transport(_) => "send_rejected",
+        TreeEdgeSendOutcome::Sent | TreeEdgeSendOutcome::FallbackSent { .. } => "recovered",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_tree_edge_attempt(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    attempt: TreeEdgeAttempt,
+    self_id: NodeIdentifier,
+    child: NodeIdentifier,
+    recipients: &[NodeIdentifier],
+    data: &pb::OverlayData,
+    path_trace: &[u32],
+    transport_class: MessageClass,
+    hop_ttl: Duration,
+    direct_unavailable: bool,
+) -> TreeEdgeSendOutcome {
+    match attempt.path() {
+        TreeEdgePath::DirectChild => {
+            send_direct_tree_edge_with_routing(
+                transport,
+                Some(routing),
+                self_id,
+                child,
+                recipients.to_vec(),
+                data,
+                path_trace.to_vec(),
+                transport_class,
+                hop_ttl,
+                false,
+            )
+            .await
+        }
+        TreeEdgePath::LegacyVia(first_hop) => {
+            let fallback =
+                legacy_subtree_fallback_data(data, recipients.to_vec(), path_trace.to_vec());
+            match forward_pb_via_first_hop(
+                transport,
+                routing,
+                self_id,
+                first_hop,
+                fallback,
+                transport_class,
+                hop_ttl,
+            )
+            .await
+            {
+                Ok(()) => TreeEdgeSendOutcome::FallbackSent { direct_unavailable },
+                Err(error) => tree_edge_outcome_from_overlay_error(error),
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_sticky_tree_edge(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    distribution: &DistributionPlane,
+    tree_key: TreeKey,
+    self_id: NodeIdentifier,
+    child: NodeIdentifier,
+    recipients: Vec<NodeIdentifier>,
+    data: &pb::OverlayData,
+    path_trace: Vec<u32>,
+    transport_class: MessageClass,
+    hop_ttl: Duration,
+    policy: TreeEdgeStickinessPolicy,
+) -> TreeEdgeSendOutcome {
+    let attempt_deadline = Instant::now() + hop_ttl;
+    let mut candidates = tree_edge_candidates(
+        transport,
+        routing,
+        distribution,
+        tree_key,
+        self_id,
+        child,
+        &recipients,
+        data,
+        &path_trace,
+        transport_class,
+        hop_ttl,
+        false,
+    );
+    let attempt = distribution.choose_tree_edge(
+        tree_key,
+        self_id,
+        child,
+        candidates.clone(),
+        policy,
+        Instant::now(),
+    );
+    let direct_unavailable = candidates
+        .iter()
+        .find(|candidate| candidate.path() == TreeEdgePath::DirectChild)
+        .is_none_or(|candidate| candidate.pressure() >= 3);
+    let first_ttl = attempt_deadline.saturating_duration_since(Instant::now());
+    let outcome = send_tree_edge_attempt(
+        transport,
+        routing,
+        attempt,
+        self_id,
+        child,
+        &recipients,
+        data,
+        &path_trace,
+        transport_class,
+        first_ttl,
+        direct_unavailable,
+    )
+    .await;
+    if matches!(
+        outcome,
+        TreeEdgeSendOutcome::Sent | TreeEdgeSendOutcome::FallbackSent { .. }
+    ) {
+        distribution.complete_tree_edge_attempt(attempt, true, Instant::now());
+        return outcome;
+    }
+
+    let remaining_ttl = attempt_deadline.saturating_duration_since(Instant::now());
+    if remaining_ttl.is_zero() {
+        distribution.complete_tree_edge_attempt(attempt, false, Instant::now());
+        return outcome;
+    }
+    candidates = tree_edge_candidates(
+        transport,
+        routing,
+        distribution,
+        tree_key,
+        self_id,
+        child,
+        &recipients,
+        data,
+        &path_trace,
+        transport_class,
+        remaining_ttl,
+        true,
+    );
+    let reason = hard_escape_reason(&outcome);
+    let Some(retry) =
+        distribution.hard_escape_tree_edge(attempt, candidates.clone(), reason, Instant::now())
+    else {
+        distribution.complete_tree_edge_attempt(attempt, false, Instant::now());
+        debug!(parent = %self_id, %child, reason = "no_alternate", "voice tree edge hard escape failed");
+        return outcome;
+    };
+    debug!(
+        parent = %self_id,
+        %child,
+        from_mode = attempt.path().mode_label(),
+        to_mode = retry.path().mode_label(),
+        reason,
+        incumbent_pressure = ?retry.incumbent_pressure(),
+        chosen_pressure = ?retry.chosen_pressure(),
+        "voice tree edge hard escape"
+    );
+    let retry_direct_unavailable = candidates
+        .iter()
+        .find(|candidate| candidate.path() == TreeEdgePath::DirectChild)
+        .is_none_or(|candidate| candidate.pressure() >= 3);
+    let retry_ttl = attempt_deadline.saturating_duration_since(Instant::now());
+    if retry_ttl.is_zero() {
+        distribution.complete_tree_edge_attempt(retry, false, Instant::now());
+        return outcome;
+    }
+    let retry_outcome = send_tree_edge_attempt(
+        transport,
+        routing,
+        retry,
+        self_id,
+        child,
+        &recipients,
+        data,
+        &path_trace,
+        transport_class,
+        retry_ttl,
+        retry_direct_unavailable,
+    )
+    .await;
+    distribution.complete_tree_edge_attempt(
+        retry,
+        matches!(
+            retry_outcome,
+            TreeEdgeSendOutcome::Sent | TreeEdgeSendOutcome::FallbackSent { .. }
+        ),
+        Instant::now(),
+    );
+    retry_outcome
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_tree_data_v3(
     transport: &ConnectionManager,
@@ -2151,29 +2489,65 @@ async fn forward_tree_data_v3(
         return Ok(());
     }
     let mut sends = Vec::new();
+    let routing_policy = transport.routing_policy();
+    let sticky_policy = TreeEdgeStickinessPolicy::new(
+        routing_policy.voice_path_min_hold(),
+        routing_policy.voice_path_challenger_confirm(),
+        routing_policy.voice_path_idle_reset(),
+    );
+    let sticky_key = (routing_policy.voice_path_stickiness_enabled()
+        && data.service_tag == VOICE_SERVICE_TAG
+        && level == ServiceLevel::BestEffort
+        && route_metric_from_wire(data.route_metric, level)
+            == Some(RoutingMetric::ConversationalQuality)
+        && transport_class == MessageClass::HighPriority
+        && transport_options_for_overlay_data(&data, Some(hop_ttl))
+            .expires_at()
+            .is_some())
+    .then(|| tree_key_from_data(&data))
+    .flatten();
     for child in tree.children(self_id).iter().copied() {
         let edge_path_trace = path_trace.clone();
         let fallback_recipients = tree.descendant_members(child);
         let edge_data = tree_branch_data(&data, tree, child, edge_path_trace.clone());
         sends.push(async move {
-            let outcome = send_direct_tree_edge_with_routing(
-                transport,
-                Some(routing),
-                self_id,
-                child,
-                fallback_recipients,
-                &edge_data,
-                edge_path_trace,
-                transport_class,
-                hop_ttl,
-            )
-            .await;
-            (child, outcome)
+            let outcome = if let Some(tree_key) = sticky_key {
+                send_sticky_tree_edge(
+                    transport,
+                    routing,
+                    distribution,
+                    tree_key,
+                    self_id,
+                    child,
+                    fallback_recipients,
+                    &edge_data,
+                    edge_path_trace,
+                    transport_class,
+                    hop_ttl,
+                    sticky_policy,
+                )
+                .await
+            } else {
+                send_direct_tree_edge_with_routing(
+                    transport,
+                    Some(routing),
+                    self_id,
+                    child,
+                    fallback_recipients,
+                    &edge_data,
+                    edge_path_trace,
+                    transport_class,
+                    hop_ttl,
+                    true,
+                )
+                .await
+            };
+            (child, outcome, sticky_key.is_some())
         });
     }
 
     let mut first_err = None;
-    for (child, outcome) in join_all(sends).await {
+    for (child, outcome, sticky_handled) in join_all(sends).await {
         let outcome_label = outcome.label();
         crate::overlay::distribution_metrics::record_edge_forward(profile, outcome_label);
         if matches!(&outcome, TreeEdgeSendOutcome::Sent) {
@@ -2213,6 +2587,13 @@ async fn forward_tree_data_v3(
         );
         if let Some(key) = tree_key_from_data(&data) {
             distribution.report_edge_failure(key, self_id, child);
+        }
+
+        if sticky_handled {
+            if first_err.is_none() {
+                first_err = outcome.into_error(child, level);
+            }
+            continue;
         }
 
         let descendants = tree.descendant_members(child);
@@ -2470,6 +2851,9 @@ fn legacy_subtree_fallback_data(
     fallback.distribution_repair_target = None;
     fallback.distribution_deadline_issuer = None;
     fallback.distribution_deadline_unix_us = None;
+    fallback
+        .inline_attachments
+        .retain(|attachment| attachment.kind != TREE_HINT_ATTACHMENT_KIND);
     fallback
 }
 
@@ -2944,6 +3328,7 @@ mod tests {
             vec![node_to_wire(1)],
             MessageClass::HighPriority,
             Duration::from_millis(100),
+            true,
         )
         .await;
 
@@ -2989,6 +3374,7 @@ mod tests {
             vec![node_to_wire(1)],
             MessageClass::HighPriority,
             Duration::from_millis(100),
+            true,
         )
         .await;
 

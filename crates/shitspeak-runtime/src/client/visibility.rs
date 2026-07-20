@@ -549,8 +549,76 @@ impl UserVisibilityState {
         channel_id: u32,
         listener_channels: HashSet<u32>,
     ) {
-        self.remove(session);
         let packed_session = u32::from(session);
+        if let Some(known) = self.known.get_mut(&packed_session) {
+            let previous_channel_id = known.channel_id;
+            let removed_listener_channels = known
+                .listener_channels
+                .difference(&listener_channels)
+                .copied()
+                .collect::<Vec<_>>();
+            let added_listener_channels = listener_channels
+                .difference(&known.listener_channels)
+                .copied()
+                .collect::<Vec<_>>();
+
+            known.channel_id = channel_id;
+            known.listener_channels = listener_channels;
+
+            if previous_channel_id != channel_id {
+                if remove_indexed_session(
+                    &mut self.sessions_by_channel,
+                    previous_channel_id,
+                    packed_session,
+                ) {
+                    if let Some(registration) = &self.registration {
+                        registration.remove_current_channel(previous_channel_id);
+                    }
+                }
+                let current_bucket_was_empty = self
+                    .sessions_by_channel
+                    .get(&channel_id)
+                    .is_none_or(HashSet::is_empty);
+                self.sessions_by_channel
+                    .entry(channel_id)
+                    .or_default()
+                    .insert(packed_session);
+                if current_bucket_was_empty {
+                    if let Some(registration) = &self.registration {
+                        registration.add_current_channel(channel_id);
+                    }
+                }
+            }
+
+            for listener_channel_id in removed_listener_channels {
+                if remove_indexed_session(
+                    &mut self.sessions_by_listener_channel,
+                    listener_channel_id,
+                    packed_session,
+                ) {
+                    if let Some(registration) = &self.registration {
+                        registration.remove_listener_channel(listener_channel_id);
+                    }
+                }
+            }
+            for listener_channel_id in added_listener_channels {
+                let listener_bucket_was_empty = self
+                    .sessions_by_listener_channel
+                    .get(&listener_channel_id)
+                    .is_none_or(HashSet::is_empty);
+                self.sessions_by_listener_channel
+                    .entry(listener_channel_id)
+                    .or_default()
+                    .insert(packed_session);
+                if listener_bucket_was_empty {
+                    if let Some(registration) = &self.registration {
+                        registration.add_listener_channel(listener_channel_id);
+                    }
+                }
+            }
+            return;
+        }
+
         let current_bucket_was_empty = self
             .sessions_by_channel
             .get(&channel_id)
@@ -2180,6 +2248,45 @@ mod tests {
         assert_eq!(
             visibility.sessions_listening_to_channels(&channels(&[8])),
             HashSet::from([session(10)])
+        );
+    }
+
+    #[test]
+    fn insert_overwrite_diffs_unchanged_and_changed_buckets() {
+        let index = Arc::new(VisibilityFanoutIndex::with_delete_cache_max_entries(8));
+        let mut visibility = UserVisibilityState::default();
+        visibility.register_with_index(Arc::clone(&index), "server-a");
+        let viewer_id = visibility.registered_viewer_id("server-a").unwrap();
+        visibility.insert(session(10), 42, channels(&[7, 8]));
+        visibility.insert(session(11), 42, channels(&[7]));
+
+        visibility.insert(session(10), 42, channels(&[8, 9]));
+
+        assert_eq!(
+            visibility.sessions_in_current_channels(&channels(&[42])),
+            HashSet::from([session(10), session(11)])
+        );
+        assert_eq!(
+            visibility.sessions_listening_to_channels(&channels(&[7])),
+            HashSet::from([session(11)])
+        );
+        assert_eq!(
+            visibility.sessions_listening_to_channels(&channels(&[8, 9])),
+            HashSet::from([session(10)])
+        );
+        assert!(
+            index
+                .delete_fanout("server-a", 1, &[7, 8, 9, 42])
+                .get(viewer_id)
+                .is_some()
+        );
+
+        assert!(visibility.remove(session(11)));
+        assert!(
+            index
+                .delete_fanout("server-a", 2, &[7])
+                .get(viewer_id)
+                .is_none()
         );
     }
 

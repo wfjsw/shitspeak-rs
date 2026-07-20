@@ -17,5 +17,5 @@ pub mod voice_target;
 pub(crate) use client::PostAuthBaseline;
 pub(crate) use client::random_client_instance_id;
 pub use client::{Client, ClientInstanceId, ClientTransportKind};
-pub use client::{ClientOutboundMessage, ClientStateSubscription};
+pub use client::{ClientOutboundMessage, ClientStateSubscription, OwnedMessageBatch};
 pub use handlers::AsyncMessageHandlerExt;

@@ -766,7 +766,7 @@ async fn udp_ping_response_does_not_wait_for_blocked_client_broadcast() {
 }
 
 #[tokio::test]
-async fn activate_subscriptions_fast_path_replays_missed_client_add() {
+async fn sharded_and_legacy_activation_match_for_missed_client_add() {
     install_default_provider();
     let server = Server::new(test_config(Vec::new()), TestAuthenticator)
         .await
@@ -800,6 +800,40 @@ async fn activate_subscriptions_fast_path_replays_missed_client_add() {
         channels.iter().map(|channel| channel.id).collect(),
     ));
 
+    let legacy_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31003);
+    let legacy_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64740);
+    let (legacy_tx, mut legacy_rx) = tokio::sync::mpsc::channel(16);
+    let legacy_viewer = server
+        .clients
+        .allocate_web_client_in_server(
+            DEFAULT_SERVER_ID,
+            legacy_peer.ip(),
+            legacy_peer,
+            legacy_local,
+            legacy_tx,
+        )
+        .await;
+    legacy_viewer.set_authenticated(true);
+    let legacy_session = legacy_viewer.get_session_id();
+    let (_clients, legacy_versions, legacy_client_state_rx) = server
+        .clients
+        .snapshot_with_versions_and_subscription_in_server(DEFAULT_SERVER_ID)
+        .await;
+    legacy_viewer.stage_client_state_subscription(legacy_client_state_rx);
+    legacy_viewer
+        .update_last_client_versions(&legacy_versions)
+        .await;
+    let (legacy_channels, legacy_channel_version, legacy_channel_state_rx) = server
+        .channels
+        .snapshot_with_version_and_subscription_in_server(DEFAULT_SERVER_ID);
+    legacy_viewer.stage_channel_state_subscription(legacy_channel_version, legacy_channel_state_rx);
+    let mut legacy_session_shadow = SessionChannelShadow::new();
+    legacy_session_shadow.insert(legacy_session, legacy_viewer.get_current_channel_id());
+    legacy_viewer.stage_post_auth_baseline(crate::client::PostAuthBaseline::new(
+        legacy_session_shadow,
+        legacy_channels.iter().map(|channel| channel.id).collect(),
+    ));
+
     let target_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31002);
     let target_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64739);
     let (target_tx, _target_rx) = tokio::sync::mpsc::channel(1);
@@ -820,16 +854,117 @@ async fn activate_subscriptions_fast_path_replays_missed_client_add() {
         .publish_client_in_server(DEFAULT_SERVER_ID, target_session)
         .await;
 
+    let mut legacy_client_log_rx = None;
+    let mut legacy_channel_log_rx = None;
+    let mut legacy_channel_tree_shadow = ChannelTreeShadow::default();
+    let mut legacy_session_channel_shadow = SessionChannelShadow::default();
+    let mut legacy_user_visibility = UserVisibilityState::default();
+    activate_client_subscriptions(
+        &server,
+        &legacy_viewer,
+        legacy_session,
+        &mut legacy_client_log_rx,
+        &mut legacy_channel_log_rx,
+        &mut legacy_channel_tree_shadow,
+        &mut legacy_session_channel_shadow,
+        &mut legacy_user_visibility,
+    )
+    .await
+    .expect("legacy activation succeeds");
+
+    let mut projection_registration = None;
+    activate_client_projection(&server, &viewer, &mut projection_registration)
+        .await
+        .expect("sharded activation succeeds");
+
+    let sharded_target = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(message) = viewer_rx.recv().await {
+            if let Message::UserState(user) = message
+                && user.session == Some(u32::from(target_session))
+            {
+                return user;
+            }
+        }
+        panic!("sharded activation queue closed before target UserState");
+    })
+    .await
+    .expect("sharded activation should replay target UserState");
+    let legacy_target = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(message) = legacy_rx.recv().await {
+            if let Message::UserState(user) = message
+                && user.session == Some(u32::from(target_session))
+            {
+                return user;
+            }
+        }
+        panic!("legacy activation queue closed before target UserState");
+    })
+    .await
+    .expect("legacy activation should replay target UserState");
+
+    assert_eq!(
+        format!("{sharded_target:?}"),
+        format!("{legacy_target:?}"),
+        "sharded replay must match the legacy per-connection projection"
+    );
+    assert!(projection_registration.is_some());
+}
+
+async fn stage_projection_parity_viewer(
+    server: &Arc<Box<Server>>,
+    peer_port: u16,
+    local_port: u16,
+) -> (Arc<Box<Client>>, tokio::sync::mpsc::Receiver<Message>) {
+    let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), peer_port);
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let viewer = server
+        .clients
+        .allocate_web_client_in_server(DEFAULT_SERVER_ID, peer.ip(), peer, local, tx)
+        .await;
+    viewer.set_authenticated(true);
+
+    let (published_clients, versions, client_state_rx) = server
+        .clients
+        .published_snapshot_with_versions_and_subscription_in_server(DEFAULT_SERVER_ID)
+        .await;
+    viewer.stage_client_state_subscription(client_state_rx);
+    viewer.update_last_client_versions(&versions).await;
+
+    let (channels, channel_version, channel_state_rx) = server
+        .channels
+        .snapshot_with_version_and_subscription_in_server(DEFAULT_SERVER_ID);
+    viewer.stage_channel_state_subscription(channel_version, channel_state_rx);
+
+    let mut session_shadow = SessionChannelShadow::new();
+    session_shadow.extend(
+        published_clients
+            .into_iter()
+            .filter(|client| client.is_authenticated())
+            .map(|client| (client.get_session_id(), client.get_current_channel_id())),
+    );
+    session_shadow.insert(viewer.get_session_id(), viewer.get_current_channel_id());
+    viewer.stage_post_auth_baseline(crate::client::PostAuthBaseline::new(
+        session_shadow,
+        channels.iter().map(|channel| channel.id).collect(),
+    ));
+
+    (viewer, rx)
+}
+
+async fn activate_legacy_projection_for_parity(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+) {
     let mut client_log_rx = None;
     let mut channel_log_rx = None;
     let mut channel_tree_shadow = ChannelTreeShadow::default();
     let mut session_channel_shadow = SessionChannelShadow::default();
     let mut user_visibility = UserVisibilityState::default();
-
     activate_client_subscriptions(
-        &server,
-        &viewer,
-        viewer_session,
+        server,
+        viewer,
+        viewer.get_session_id(),
         &mut client_log_rx,
         &mut channel_log_rx,
         &mut channel_tree_shadow,
@@ -837,26 +972,286 @@ async fn activate_subscriptions_fast_path_replays_missed_client_add() {
         &mut user_visibility,
     )
     .await
-    .expect("activation succeeds");
+    .expect("legacy activation succeeds");
+}
 
-    let replayed_target = tokio::time::timeout(Duration::from_secs(1), async {
-            while let Some(message) = viewer_rx.recv().await {
-                if matches!(message, Message::UserState(user) if user.session == Some(u32::from(target_session)))
-                {
-                    return true;
+#[tokio::test]
+async fn sharded_and_legacy_activation_match_for_missed_target_move() {
+    install_default_provider();
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("server");
+
+    let target_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31101);
+    let target_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64801);
+    let (target_tx, _target_rx) = tokio::sync::mpsc::channel(1);
+    let target = server
+        .clients
+        .allocate_web_client_in_server(
+            DEFAULT_SERVER_ID,
+            target_peer.ip(),
+            target_peer,
+            target_local,
+            target_tx,
+        )
+        .await;
+    target.set_authenticated(true);
+    let target_session = target.get_session_id();
+    server
+        .clients
+        .publish_client_in_server(DEFAULT_SERVER_ID, target_session)
+        .await;
+
+    let (sharded_viewer, mut sharded_rx) =
+        stage_projection_parity_viewer(&server, 31102, 64802).await;
+    let (legacy_viewer, mut legacy_rx) =
+        stage_projection_parity_viewer(&server, 31103, 64803).await;
+
+    let channel_version = server.channels.current_version_in_server(DEFAULT_SERVER_ID);
+    target.set_current_channel_id(42, &server.clients, channel_version);
+
+    activate_legacy_projection_for_parity(&server, &legacy_viewer).await;
+    let mut projection_registration = None;
+    activate_client_projection(&server, &sharded_viewer, &mut projection_registration)
+        .await
+        .expect("sharded activation succeeds");
+
+    let sharded_move = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(message) = sharded_rx.recv().await {
+            if let Message::UserState(user) = message
+                && user.session == Some(u32::from(target_session))
+                && user.channel_id == Some(42)
+            {
+                return user;
+            }
+        }
+        panic!("sharded activation queue closed before target move");
+    })
+    .await
+    .expect("sharded activation should replay target move");
+    let legacy_move = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(message) = legacy_rx.recv().await {
+            if let Message::UserState(user) = message
+                && user.session == Some(u32::from(target_session))
+                && user.channel_id == Some(42)
+            {
+                return user;
+            }
+        }
+        panic!("legacy activation queue closed before target move");
+    })
+    .await
+    .expect("legacy activation should replay target move");
+
+    assert_eq!(
+        format!("{sharded_move:?}"),
+        format!("{legacy_move:?}"),
+        "sharded target-move replay must match the legacy projection"
+    );
+    assert!(projection_registration.is_some());
+}
+
+#[tokio::test]
+async fn sharded_and_legacy_activation_match_for_missed_target_disconnect() {
+    install_default_provider();
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("server");
+
+    let target_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31201);
+    let target_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64901);
+    let (target_tx, _target_rx) = tokio::sync::mpsc::channel(1);
+    let target = server
+        .clients
+        .allocate_web_client_in_server(
+            DEFAULT_SERVER_ID,
+            target_peer.ip(),
+            target_peer,
+            target_local,
+            target_tx,
+        )
+        .await;
+    target.set_authenticated(true);
+    let target_session = target.get_session_id();
+    server
+        .clients
+        .publish_client_in_server(DEFAULT_SERVER_ID, target_session)
+        .await;
+
+    let (sharded_viewer, mut sharded_rx) =
+        stage_projection_parity_viewer(&server, 31202, 64902).await;
+    let (legacy_viewer, mut legacy_rx) =
+        stage_projection_parity_viewer(&server, 31203, 64903).await;
+
+    server
+        .clients
+        .remove_client_in_server(DEFAULT_SERVER_ID, target_session)
+        .await
+        .expect("target is removed");
+
+    activate_legacy_projection_for_parity(&server, &legacy_viewer).await;
+    let mut projection_registration = None;
+    activate_client_projection(&server, &sharded_viewer, &mut projection_registration)
+        .await
+        .expect("sharded activation succeeds");
+
+    let sharded_remove = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(message) = sharded_rx.recv().await {
+            if let Message::UserRemove(remove) = message
+                && remove.session == u32::from(target_session)
+            {
+                return remove;
+            }
+        }
+        panic!("sharded activation queue closed before target removal");
+    })
+    .await
+    .expect("sharded activation should replay target removal");
+    let legacy_remove = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(message) = legacy_rx.recv().await {
+            if let Message::UserRemove(remove) = message
+                && remove.session == u32::from(target_session)
+            {
+                return remove;
+            }
+        }
+        panic!("legacy activation queue closed before target removal");
+    })
+    .await
+    .expect("legacy activation should replay target removal");
+
+    assert_eq!(
+        format!("{sharded_remove:?}"),
+        format!("{legacy_remove:?}"),
+        "sharded target-removal replay must match the legacy projection"
+    );
+    assert!(projection_registration.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sharded_visibility_reload_is_ordered_and_does_not_wait_for_full_writer() {
+    use super::client_projection::{ClientProjectionEvent, ClientProjectionState};
+    use super::sharded_subscriber::{MIN_PROJECTION_SHARDS, ShardedSubscriberPool};
+
+    install_default_provider();
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("server");
+
+    let slow_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31101);
+    let fast_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31102);
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+    let (slow_tx, mut slow_rx) = tokio::sync::mpsc::channel(1);
+    let (fast_tx, mut fast_rx) = tokio::sync::mpsc::channel(16);
+    let slow = server
+        .clients
+        .allocate_web_client_in_server(DEFAULT_SERVER_ID, slow_peer.ip(), slow_peer, local, slow_tx)
+        .await;
+    let fast = server
+        .clients
+        .allocate_web_client_in_server(DEFAULT_SERVER_ID, fast_peer.ip(), fast_peer, local, fast_tx)
+        .await;
+    for client in [&slow, &fast] {
+        client.set_authenticated(true);
+        server
+            .clients
+            .publish_client_in_server(DEFAULT_SERVER_ID, client.get_session_id())
+            .await;
+    }
+
+    let snapshot = server
+        .clients
+        .published_snapshot_with_versions_in_server(DEFAULT_SERVER_ID)
+        .await;
+    let (published, client_versions) = snapshot.into_parts();
+    let (channels, channel_version, channel_rx) = server
+        .channels
+        .snapshot_with_version_and_subscription_in_server(DEFAULT_SERVER_ID);
+    drop(channel_rx);
+    let mut session_shadow = SessionChannelShadow::new();
+    session_shadow.extend(
+        published
+            .iter()
+            .map(|client| (client.get_session_id(), client.get_current_channel_id())),
+    );
+    let channel_shadow = channels
+        .iter()
+        .map(|channel| channel.id)
+        .collect::<ChannelTreeShadow>();
+    let make_state = |client: &Arc<Box<Client>>| {
+        ClientProjectionState::new(
+            Arc::downgrade(&server),
+            Arc::clone(client),
+            channel_shadow.clone(),
+            session_shadow.clone(),
+            UserVisibilityState::default(),
+            client_versions.clone(),
+            channel_version,
+        )
+    };
+
+    let (event_tx, _) = tokio::sync::broadcast::channel(8);
+    let pool = ShardedSubscriberPool::new(&event_tx, MIN_PROJECTION_SHARDS).expect("pool");
+    let slow_registration = pool
+        .register("visibility-reload", make_state(&slow))
+        .await
+        .expect("slow registration");
+    let fast_registration = pool
+        .register("visibility-reload", make_state(&fast))
+        .await
+        .expect("fast registration");
+    assert_eq!(
+        slow_registration.shard_index(),
+        fast_registration.shard_index(),
+        "the full and writable queues must be exercised by the same shard"
+    );
+
+    let prefill = Message::TextMessage(
+        TextMessage {
+            actor: None,
+            session: Vec::new(),
+            channel_id: Vec::new(),
+            tree_id: Vec::new(),
+            message: "prefill".to_owned(),
+        }
+        .into(),
+    );
+    slow.write_proto_message(&prefill)
+        .await
+        .expect("prefill slow writer");
+    {
+        let mut config = server.config.write().expect("config lock");
+        config.hide_users_without_traverse = true;
+    }
+    event_tx
+        .send(ClientProjectionEvent::VisibilityReload)
+        .expect("visibility reload has shard receivers");
+
+    let projected_sessions = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut sessions = Vec::new();
+        while sessions.len() < 2 {
+            let message = fast_rx.recv().await.expect("fast writer remains open");
+            if let Message::UserState(state) = message {
+                if let Some(session) = state.session {
+                    sessions.push(session);
                 }
             }
-            false
-        })
-        .await
-        .expect("activation should write replayed target UserState");
-
-    assert!(replayed_target);
-    assert_eq!(
-        session_channel_shadow.get(&target_session).copied(),
-        Some(target.get_current_channel_id())
+        }
+        sessions
+    })
+    .await
+    .expect("full peer queue must not stall visibility reload delivery");
+    assert!(
+        projected_sessions.windows(2).all(|pair| pair[0] < pair[1]),
+        "reload projection must retain deterministic session order: {projected_sessions:?}"
     );
-    assert_eq!(user_visibility.known_channel(target_session), None);
+    tokio::time::timeout(Duration::from_secs(1), slow.disconnected())
+        .await
+        .expect("a full writer is removed without awaiting queue capacity");
+    assert!(matches!(
+        slow_rx.recv().await,
+        Some(Message::TextMessage(message)) if message.message == "prefill"
+    ));
 }
 
 #[test]

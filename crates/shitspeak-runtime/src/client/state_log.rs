@@ -405,9 +405,81 @@ pub struct ClientStateBroadcastPayload {
     /// `0` means the node's old epoch was cleared and subscribers should
     /// forget their last-seen version for that node.
     pub versions: HashMap<u16, u64>,
+    canonical_message: tokio::sync::OnceCell<Option<crate::messages::Message>>,
+}
+
+impl ClientStateBroadcastPayload {
+    pub fn new(entry: Arc<ClientStateLogEntry>, versions: HashMap<u16, u64>) -> Self {
+        Self {
+            entry,
+            versions,
+            canonical_message: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Returns the canonical protocol message for this publication.
+    ///
+    /// Message construction is shared by every projection shard, while the
+    /// current-instance check is intentionally repeated for each caller. This
+    /// preserves the existing behavior where an entry for a disconnected,
+    /// replaced client is not delivered after its numeric session is reused.
+    pub async fn canonical_message(
+        &self,
+        repo: &ClientRepository,
+    ) -> Option<&crate::messages::Message> {
+        if !self.entry.is_current_instance(repo).await {
+            return None;
+        }
+        self.canonical_message
+            .get_or_init(|| async { self.entry.to_message_unchecked() })
+            .await
+            .as_ref()
+    }
 }
 
 impl ClientStateLogEntry {
+    async fn is_current_instance(&self, repo: &ClientRepository) -> bool {
+        match &self.op {
+            ClientStateOperation::AddClient {
+                server_id,
+                session_id,
+                client_instance_id,
+                ..
+            } => repo
+                .get_client_in_server(server_id, *session_id)
+                .await
+                .is_some_and(|client| client.client_instance_id() == *client_instance_id),
+            ClientStateOperation::RemoveClient {
+                server_id,
+                session_id,
+                client_instance_id,
+                ..
+            } => repo
+                .get_client_in_server(server_id, *session_id)
+                .await
+                .is_none_or(|client| {
+                    *client_instance_id == 0 || client.client_instance_id() == *client_instance_id
+                }),
+            ClientStateOperation::UpdateGlobalState {
+                server_id,
+                session_id,
+                client_instance_id,
+                delta,
+                ..
+            } => {
+                !delta.is_empty()
+                    && repo
+                        .get_client_in_server(server_id, *session_id)
+                        .await
+                        .is_some_and(|client| {
+                            *client_instance_id == 0
+                                || client.client_instance_id() == *client_instance_id
+                        })
+            }
+            ClientStateOperation::ResetNode { .. } => false,
+        }
+    }
+
     /// Returns the destination carried by this viewer's own channel-change
     /// entry. Legacy replicated entries with instance id zero apply to the
     /// currently connected instance.
@@ -489,6 +561,45 @@ impl ClientStateLogEntry {
         messages
     }
 
+    /// Builds the per-client wrapper messages around an already materialized
+    /// canonical state message. Recipient-specific ACL flushing remains local
+    /// to the subscriber; only the common state message is shared.
+    pub(crate) async fn messages_for_client_with_canonical(
+        &self,
+        repo: &ClientRepository,
+        viewer_session_id: ClientSessionIdentifier,
+        viewer_client_instance_id: ClientInstanceId,
+        canonical_message: Option<&crate::messages::Message>,
+    ) -> Vec<crate::messages::Message> {
+        let mut messages = Vec::new();
+        if matches!(
+            &self.op,
+            ClientStateOperation::AddClient {
+                session_id,
+                client_instance_id,
+                ..
+            } if *session_id == viewer_session_id
+                && *client_instance_id == viewer_client_instance_id
+        ) {
+            return messages;
+        }
+        if let Some(message) = self
+            .acl_cache_flush_message_for(repo, viewer_session_id, viewer_client_instance_id)
+            .await
+        {
+            messages.push(message);
+        }
+        // Revalidate after recipient-specific async work. A session may have
+        // been removed and numerically reused since the shared payload was
+        // first materialized by another shard.
+        if let Some(message) = canonical_message
+            && self.is_current_instance(repo).await
+        {
+            messages.push(message.clone());
+        }
+        messages
+    }
+
     /// Convert this log entry into the protobuf `Message` that should be
     /// sent to a subscriber.
     ///
@@ -496,63 +607,44 @@ impl ClientStateLogEntry {
     /// * `RemoveClient` -> `UserRemove` message
     /// * `UpdateGlobalState` -> `UserState` delta (only changed fields)
     pub async fn to_message(&self, repo: &ClientRepository) -> Option<crate::messages::Message> {
+        if !self.is_current_instance(repo).await {
+            return None;
+        }
+        self.to_message_unchecked()
+    }
+
+    fn to_message_unchecked(&self) -> Option<crate::messages::Message> {
         match &self.op {
             ClientStateOperation::AddClient {
-                server_id,
                 session_id,
-                client_instance_id,
                 cert_hash,
                 initial_state,
                 ..
             } => {
-                let Some(client) = repo.get_client_in_server(server_id, *session_id).await else {
-                    return None;
-                };
-                if client.client_instance_id() != *client_instance_id {
-                    return None;
-                }
                 let us = initial_state.to_initial_user_state(*session_id, cert_hash.as_ref());
                 Some(crate::messages::Message::UserState(us.into()))
             }
             ClientStateOperation::RemoveClient {
-                server_id,
                 session_id,
-                client_instance_id,
                 actor,
                 reason,
                 ban,
-            } => {
-                if let Some(client) = repo.get_client_in_server(server_id, *session_id).await {
-                    if *client_instance_id != 0
-                        && client.client_instance_id() != *client_instance_id
-                    {
-                        return None;
-                    }
+                ..
+            } => Some(
+                crate::messages::encoder::UserRemove {
+                    session: u32::from(*session_id),
+                    actor: actor.map(u32::from),
+                    reason: reason.clone(),
+                    ban: Some(*ban),
                 }
-                Some(
-                    crate::messages::encoder::UserRemove {
-                        session: u32::from(*session_id),
-                        actor: actor.map(u32::from),
-                        reason: reason.clone(),
-                        ban: Some(*ban),
-                    }
-                    .into(),
-                )
-            }
+                .into(),
+            ),
             ClientStateOperation::UpdateGlobalState {
-                server_id,
                 session_id,
-                client_instance_id,
                 sender_session_id,
                 delta,
+                ..
             } => {
-                if delta.is_empty() {
-                    return None;
-                }
-                let client = repo.get_client_in_server(server_id, *session_id).await?;
-                if *client_instance_id != 0 && client.client_instance_id() != *client_instance_id {
-                    return None;
-                }
                 let mut us = crate::messages::encoder::UserState {
                     session: Some(*session_id),
                     actor: *sender_session_id,
@@ -807,6 +899,76 @@ mod tests {
                 crate::messages::Message::UserState(user_state),
             ] if query.flush == Some(true) && user_state.name.as_deref() == Some("updated")
         ));
+    }
+
+    #[tokio::test]
+    async fn broadcast_canonical_message_is_shared_but_stale_instances_stay_suppressed() {
+        let repo = ClientRepository::new(1, 16);
+        let server_id = "alpha".to_owned();
+        let session_id = ClientSessionIdentifier::new(2, 7).unwrap();
+        let ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let tcp_addr = SocketAddr::new(ip, 30_001);
+        let local_addr = SocketAddr::new(ip, 64_738);
+        let add = Arc::new(ClientStateLogEntry {
+            version: 1,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: None,
+            op: ClientStateOperation::AddClient {
+                server_id: server_id.clone(),
+                session_id,
+                client_instance_id: 42,
+                real_ip: ip,
+                tcp_addr,
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta {
+                    display_name: Some(Some("first".to_owned())),
+                    ..Default::default()
+                },
+            },
+        });
+        repo.apply_remote_operation(Arc::clone(&add), 0)
+            .await
+            .unwrap();
+        let payload = ClientStateBroadcastPayload::new(add, HashMap::from([(2, 1)]));
+
+        let first = payload
+            .canonical_message(&repo)
+            .await
+            .expect("current instance has a canonical message") as *const _;
+        let second = payload
+            .canonical_message(&repo)
+            .await
+            .expect("canonical message remains available") as *const _;
+        assert_eq!(first, second, "the payload must reuse one materialization");
+
+        let replacement = Arc::new(ClientStateLogEntry {
+            version: 2,
+            node_id: 2,
+            timestamp: Utc::now().timestamp_millis(),
+            channel_version_dep: None,
+            op: ClientStateOperation::AddClient {
+                server_id,
+                session_id,
+                client_instance_id: 43,
+                real_ip: ip,
+                tcp_addr,
+                udp_addr: None,
+                local_addr,
+                cert_hash: None,
+                login_time: Utc::now(),
+                initial_state: ClientGlobalStateDelta::default(),
+            },
+        });
+        repo.apply_remote_operation(replacement, 0).await.unwrap();
+
+        assert!(
+            payload.canonical_message(&repo).await.is_none(),
+            "a cached message for the prior instance must not escape after session reuse"
+        );
     }
 
     #[test]

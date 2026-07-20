@@ -8134,6 +8134,163 @@
       ],
       "title": "Proactive Repair Outcomes/s by Node and Kind",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 302 },
+      "id": 95,
+      "panels": [],
+      "title": "Soft Voice-Path Stickiness",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 10 } ] },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 303 },
+      "id": 96,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "1000 * sum(rate(shitspeak_s2s_voice_transport_binding_events_total{job=~\"$job\",from_transport!=\"none\",to_transport!=\"none\",reason!~\"initial|idle_reset|no_alternate\"}[$__rate_interval])) / clamp_min(sum(rate(shitspeak_s2s_debug_packet_io_packets_total{job=~\"$job\",direction=\"sent\",packet_kind=\"application.voice.tree.original\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "transport",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "1000 * sum(rate(shitspeak_s2s_voice_tree_edge_binding_events_total{job=~\"$job\",from_mode!=\"none\",to_mode!=\"none\",reason!~\"initial|idle_reset|no_alternate\"}[$__rate_interval])) / clamp_min(sum(rate(shitspeak_s2s_debug_packet_io_packets_total{job=~\"$job\",direction=\"sent\",packet_kind=\"application.voice.tree.original\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "tree edge",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Actual Path Switches per 1,000 Tree Originals",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 1 } ] }, "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 303 },
+      "id": 97,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source, peer, reason) (rate(shitspeak_s2s_voice_transport_binding_events_total{job=~\"$job\",reason=~\"deadline_impossible|transport_unavailable|queue_full|stream_closed|send_rejected|no_alternate\"}[$__rate_interval]))",
+          "legendFormat": "transport {{source}}→{{peer}} {{reason}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source, peer, reason) (rate(shitspeak_s2s_voice_tree_edge_binding_events_total{job=~\"$job\",reason=~\"deadline_impossible|transport_unavailable|queue_full|stream_closed|send_rejected|no_alternate\"}[$__rate_interval]))",
+          "legendFormat": "tree {{source}}→{{peer}} {{reason}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source, peer, transport) (rate(shitspeak_s2s_transport_health_exclusions_total{job=~\"$job\",reason=\"kcp_failaway\"}[$__rate_interval]))",
+          "legendFormat": "KCP failaway {{source}}→{{peer}} {{transport}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Hard Escapes and No Alternate/s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 100000 } ] }, "unit": "µs" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 311 },
+      "id": 101,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "max by (source, peer, transport) (shitspeak_s2s_direct_metric_rtt_us{job=~\"$job\"})",
+          "legendFormat": "RTT {{source}}→{{peer}} {{transport}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "max by (source, peer, transport) (shitspeak_s2s_direct_metric_jitter_us{job=~\"$job\"})",
+          "legendFormat": "jitter {{source}}→{{peer}} {{transport}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Path RTT and Jitter (Aligned with Switches)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 1 } ] }, "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 311 },
+      "id": 102,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source, profile, result) (rate(shitspeak_s2s_distribution_events_total{job=~\"$job\",event=\"compatibility_fallback\"}[$__rate_interval]))",
+          "legendFormat": "fallback {{source}} {{profile}} {{result}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source, peer, mode) (shitspeak_s2s_voice_tree_edge_binding{job=~\"$job\"})",
+          "legendFormat": "bound {{source}}→{{peer}} {{mode}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Fallback and Sticky Tree-Edge State",
+      "type": "timeseries"
     }
   ],
   "preload": false,
@@ -8196,6 +8353,6 @@
   "timezone": "browser",
   "title": "ShitSpeak",
   "uid": "shitspeak-s2s-topology",
-  "version": 62,
+  "version": 64,
   "weekStart": ""
 }

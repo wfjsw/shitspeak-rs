@@ -263,6 +263,133 @@ impl RoutingTables {
         None
     }
 
+    /// Return a loop-free route only when it can be constrained to the exact
+    /// requested first hop. Used by distribution fallback so one subtree is
+    /// admitted in a single envelope instead of being re-bucketed per member.
+    pub(crate) fn lookup_via_first_hop_with_metric(
+        &self,
+        self_id: NodeIdentifier,
+        dst: NodeIdentifier,
+        level: ServiceLevel,
+        metric: RoutingMetric,
+        path_trace: &HashSet<NodeIdentifier>,
+        first_hop: NodeIdentifier,
+    ) -> Option<RouteEntry> {
+        if dst == self_id
+            || first_hop == self_id
+            || path_trace.contains(&dst)
+            || path_trace.contains(&first_hop)
+        {
+            return None;
+        }
+        for key in Self::metric_lookup_keys(metric, level).iter().flatten() {
+            if let Some(entry) =
+                self.lookup_via_first_hop_for_key(self_id, dst, key, path_trace, first_hop)
+            {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn first_hops_reaching_all_with_metric(
+        &self,
+        self_id: NodeIdentifier,
+        destinations: &[NodeIdentifier],
+        level: ServiceLevel,
+        metric: RoutingMetric,
+        path_trace: &HashSet<NodeIdentifier>,
+    ) -> Vec<RouteEntry> {
+        let mut first_hops = HashSet::new();
+        for key in Self::metric_lookup_keys(metric, level).iter().flatten() {
+            if let Some(edges) = self
+                .adjacency
+                .get(key)
+                .and_then(|adjacency| adjacency.get(&self_id))
+            {
+                first_hops.extend(edges.iter().filter_map(|(neighbor, _)| {
+                    (!path_trace.contains(neighbor) && *neighbor != self_id).then_some(*neighbor)
+                }));
+            }
+        }
+        let mut routes = first_hops
+            .into_iter()
+            .filter_map(|first_hop| {
+                let mut aggregate_cost = 0u64;
+                let mut aggregate_latency = 0u64;
+                for destination in destinations {
+                    let route = self.lookup_via_first_hop_with_metric(
+                        self_id,
+                        *destination,
+                        level,
+                        metric,
+                        path_trace,
+                        first_hop,
+                    )?;
+                    aggregate_cost = aggregate_cost.saturating_add(route.cost);
+                    aggregate_latency = aggregate_latency.max(route.latency_us);
+                }
+                Some(RouteEntry {
+                    next_hop: first_hop,
+                    cost: aggregate_cost,
+                    latency_us: aggregate_latency,
+                })
+            })
+            .collect::<Vec<_>>();
+        routes.sort_by_key(|route| (route.cost, route.next_hop));
+        routes
+    }
+
+    fn lookup_via_first_hop_for_key(
+        &self,
+        self_id: NodeIdentifier,
+        dst: NodeIdentifier,
+        key: &RoutingTableKey,
+        path_trace: &HashSet<NodeIdentifier>,
+        first_hop: NodeIdentifier,
+    ) -> Option<RouteEntry> {
+        let adjacency = self.adjacency.get(key)?;
+        let first_edge = adjacency
+            .get(&self_id)?
+            .iter()
+            .find_map(|(neighbor, cost)| (*neighbor == first_hop).then_some(*cost))?;
+        let mut dist: HashMap<NodeIdentifier, PathCost> = HashMap::new();
+        let mut heap: BinaryHeap<Reverse<(PathCost, NodeIdentifier)>> = BinaryHeap::new();
+        let first_cost = PathCost::ZERO.add(first_edge);
+        dist.insert(first_hop, first_cost);
+        heap.push(Reverse((first_cost, first_hop)));
+
+        while let Some(Reverse((cost, node))) = heap.pop() {
+            if dist.get(&node).is_some_and(|known| cost > *known) {
+                continue;
+            }
+            if node == dst {
+                return Some(RouteEntry {
+                    next_hop: first_hop,
+                    cost: cost.primary,
+                    latency_us: cost.latency_us,
+                });
+            }
+            if node != dst && self.transit_disabled.contains(&node) {
+                continue;
+            }
+            let Some(edges) = adjacency.get(&node) else {
+                continue;
+            };
+            for (neighbor, edge_cost) in edges {
+                if *neighbor == self_id || path_trace.contains(neighbor) {
+                    continue;
+                }
+                let next_cost = cost.add(*edge_cost);
+                if dist.get(neighbor).is_none_or(|known| next_cost < *known) {
+                    dist.insert(*neighbor, next_cost);
+                    heap.push(Reverse((next_cost, *neighbor)));
+                }
+            }
+        }
+        None
+    }
+
     fn metric_lookup_keys(
         metric: RoutingMetric,
         level: ServiceLevel,

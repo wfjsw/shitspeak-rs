@@ -892,6 +892,14 @@ impl KcpTuning {
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportRoutingPolicy {
+    #[serde(default = "default_voice_path_stickiness_enabled")]
+    voice_path_stickiness_enabled: bool,
+    #[serde(default = "default_voice_path_min_hold_ms")]
+    voice_path_min_hold_ms: u64,
+    #[serde(default = "default_voice_path_challenger_confirm_ms")]
+    voice_path_challenger_confirm_ms: u64,
+    #[serde(default = "default_voice_path_idle_reset_ms")]
+    voice_path_idle_reset_ms: u64,
     #[serde(default = "default_udp_family_min_samples")]
     udp_family_min_samples: u64,
     #[serde(default = "default_udp_family_probe_loss_block_count")]
@@ -917,6 +925,10 @@ pub struct TransportRoutingPolicy {
 impl Default for TransportRoutingPolicy {
     fn default() -> Self {
         Self {
+            voice_path_stickiness_enabled: default_voice_path_stickiness_enabled(),
+            voice_path_min_hold_ms: default_voice_path_min_hold_ms(),
+            voice_path_challenger_confirm_ms: default_voice_path_challenger_confirm_ms(),
+            voice_path_idle_reset_ms: default_voice_path_idle_reset_ms(),
             udp_family_min_samples: default_udp_family_min_samples(),
             udp_family_probe_loss_block_count: default_udp_family_probe_loss_block_count(),
             udp_family_block_loss_ppm: default_udp_family_block_loss_ppm(),
@@ -932,6 +944,22 @@ impl Default for TransportRoutingPolicy {
 }
 
 impl TransportRoutingPolicy {
+    pub fn voice_path_stickiness_enabled(&self) -> bool {
+        self.voice_path_stickiness_enabled
+    }
+
+    pub fn voice_path_min_hold(&self) -> Duration {
+        Duration::from_millis(self.voice_path_min_hold_ms)
+    }
+
+    pub fn voice_path_challenger_confirm(&self) -> Duration {
+        Duration::from_millis(self.voice_path_challenger_confirm_ms)
+    }
+
+    pub fn voice_path_idle_reset(&self) -> Duration {
+        Duration::from_millis(self.voice_path_idle_reset_ms)
+    }
+
     pub fn udp_family_min_samples(&self) -> u64 {
         self.udp_family_min_samples
     }
@@ -1021,6 +1049,47 @@ impl TransportRoutingPolicy {
         self.transport_metric_stale_after_ms =
             duration.as_millis().min(u128::from(u64::MAX)) as u64;
         self
+    }
+
+    pub fn with_voice_path_stickiness_enabled(mut self, enabled: bool) -> Self {
+        self.voice_path_stickiness_enabled = enabled;
+        self
+    }
+
+    pub fn with_voice_path_min_hold(mut self, duration: Duration) -> Self {
+        self.voice_path_min_hold_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        self
+    }
+
+    pub fn with_voice_path_challenger_confirm(mut self, duration: Duration) -> Self {
+        self.voice_path_challenger_confirm_ms =
+            duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        self
+    }
+
+    pub fn with_voice_path_idle_reset(mut self, duration: Duration) -> Self {
+        self.voice_path_idle_reset_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        self
+    }
+
+    fn validate_voice_path_stickiness(&self) -> Result<(), String> {
+        if self.voice_path_min_hold_ms == 0
+            || self.voice_path_challenger_confirm_ms == 0
+            || self.voice_path_idle_reset_ms == 0
+        {
+            return Err("s2s.transport voice-path stickiness timings must be non-zero".into());
+        }
+        if self.voice_path_idle_reset_ms
+            < self
+                .voice_path_min_hold_ms
+                .max(self.voice_path_challenger_confirm_ms)
+        {
+            return Err(
+                "s2s.transport.voice_path_idle_reset_ms must be at least the larger of voice_path_min_hold_ms and voice_path_challenger_confirm_ms"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1195,6 +1264,7 @@ impl TransportTuning {
 
     /// Apply tunables and load the optional compression dictionary from disk.
     pub fn try_apply(&self, cfg: TransportConfig) -> Result<TransportConfig, String> {
+        self.routing_policy.validate_voice_path_stickiness()?;
         let mut cfg = self.apply(cfg);
         if let Some(path) = &self.compression_dictionary_path {
             let dictionary = fs::read(path).map_err(|e| {
@@ -1342,6 +1412,18 @@ fn default_transport_switch_improvement_pct() -> u32 {
 fn default_transport_metric_stale_after_ms() -> u64 {
     1_500
 }
+fn default_voice_path_stickiness_enabled() -> bool {
+    true
+}
+fn default_voice_path_min_hold_ms() -> u64 {
+    750
+}
+fn default_voice_path_challenger_confirm_ms() -> u64 {
+    500
+}
+fn default_voice_path_idle_reset_ms() -> u64 {
+    2_000
+}
 
 #[cfg(test)]
 mod tests {
@@ -1419,6 +1501,13 @@ mod tests {
         assert_eq!(policy.bulk_payload_threshold_bytes(), 65_536);
         assert_eq!(policy.bulk_backlog_threshold_bytes(), 262_144);
         assert_eq!(policy.transport_switch_improvement_pct(), 15);
+        assert!(policy.voice_path_stickiness_enabled());
+        assert_eq!(policy.voice_path_min_hold(), Duration::from_millis(750));
+        assert_eq!(
+            policy.voice_path_challenger_confirm(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(policy.voice_path_idle_reset(), Duration::from_millis(2_000));
         assert_eq!(
             policy.transport_metric_stale_after(),
             Duration::from_millis(1_500)
@@ -1437,7 +1526,11 @@ mod tests {
             .with_bulk_payload_threshold_bytes(32_768)
             .with_bulk_backlog_threshold_bytes(131_072)
             .with_transport_switch_improvement_pct(25)
-            .with_transport_metric_stale_after(Duration::from_millis(900));
+            .with_transport_metric_stale_after(Duration::from_millis(900))
+            .with_voice_path_stickiness_enabled(false)
+            .with_voice_path_min_hold(Duration::from_millis(800))
+            .with_voice_path_challenger_confirm(Duration::from_millis(600))
+            .with_voice_path_idle_reset(Duration::from_millis(2_500));
 
         assert_eq!(policy.udp_family_min_samples(), 12);
         assert_eq!(policy.udp_family_probe_loss_block_count(), 4);
@@ -1448,6 +1541,13 @@ mod tests {
         assert_eq!(policy.bulk_payload_threshold_bytes(), 32_768);
         assert_eq!(policy.bulk_backlog_threshold_bytes(), 131_072);
         assert_eq!(policy.transport_switch_improvement_pct(), 25);
+        assert!(!policy.voice_path_stickiness_enabled());
+        assert_eq!(policy.voice_path_min_hold(), Duration::from_millis(800));
+        assert_eq!(
+            policy.voice_path_challenger_confirm(),
+            Duration::from_millis(600)
+        );
+        assert_eq!(policy.voice_path_idle_reset(), Duration::from_millis(2_500));
         assert_eq!(
             policy.transport_metric_stale_after(),
             Duration::from_millis(900)
@@ -1469,6 +1569,10 @@ mod tests {
                     bulk_backlog_threshold_bytes = 98304
                     transport_switch_improvement_pct = 20
                     transport_metric_stale_after_ms = 800
+                    voice_path_stickiness_enabled = false
+                    voice_path_min_hold_ms = 900
+                    voice_path_challenger_confirm_ms = 650
+                    voice_path_idle_reset_ms = 3000
                 "#,
                 ::config::FileFormat::Toml,
             ))
@@ -1489,10 +1593,36 @@ mod tests {
         assert_eq!(policy.bulk_payload_threshold_bytes(), 32_768);
         assert_eq!(policy.bulk_backlog_threshold_bytes(), 98_304);
         assert_eq!(policy.transport_switch_improvement_pct(), 20);
+        assert!(!policy.voice_path_stickiness_enabled());
+        assert_eq!(policy.voice_path_min_hold(), Duration::from_millis(900));
+        assert_eq!(
+            policy.voice_path_challenger_confirm(),
+            Duration::from_millis(650)
+        );
+        assert_eq!(policy.voice_path_idle_reset(), Duration::from_millis(3_000));
         assert_eq!(
             policy.transport_metric_stale_after(),
             Duration::from_millis(800)
         );
+    }
+
+    #[test]
+    fn transport_tuning_rejects_invalid_voice_path_timings_on_apply() {
+        for source in [
+            "voice_path_min_hold_ms = 0",
+            "voice_path_challenger_confirm_ms = 0",
+            "voice_path_idle_reset_ms = 0",
+            "voice_path_min_hold_ms = 1000\nvoice_path_idle_reset_ms = 999",
+            "voice_path_challenger_confirm_ms = 1000\nvoice_path_idle_reset_ms = 999",
+        ] {
+            let tuning: TransportTuning = ::config::Config::builder()
+                .add_source(::config::File::from_str(source, ::config::FileFormat::Toml))
+                .build()
+                .expect("config builder")
+                .try_deserialize()
+                .expect("transport tuning parses before semantic validation");
+            assert!(tuning.try_apply(base_config()).is_err(), "source: {source}");
+        }
     }
 
     #[test]

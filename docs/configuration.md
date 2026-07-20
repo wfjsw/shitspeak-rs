@@ -507,6 +507,12 @@ lossy_link_threshold_ppm = 20000
 bulk_payload_threshold_bytes = 65536
 bulk_backlog_threshold_bytes = 262144
 transport_switch_improvement_pct = 15
+# Soft voice-path stickiness prevents frame-by-frame path oscillation while
+# retaining immediate escape from an unusable path.
+voice_path_stickiness_enabled = true
+voice_path_min_hold_ms = 750
+voice_path_challenger_confirm_ms = 500
+voice_path_idle_reset_ms = 2000
 transport_metric_stale_after_ms = 1500
 # Legacy queue capacity hints. Adaptive byte budgets use available memory;
 # these only raise the per-lane minimum budget.
@@ -581,6 +587,13 @@ blob_chunk_size = 65536
 bulk_retry_delay_ms = 250
 bulk_max_in_flight_per_peer = 1
 ```
+
+Voice-path stickiness applies to expiring conversational voice traffic. The
+timing values must be nonzero, and `voice_path_idle_reset_ms` must be at least
+the larger of the hold and challenger-confirmation values. These settings are
+loaded at startup; restart the node after changing them. Set
+`voice_path_stickiness_enabled = false` and restart to use the legacy routing
+behavior as a rollback/kill switch.
 
 S2S inbound and outbound transport queues are adaptive and byte-budgeted. The
 old `inbound_*_capacity` and `outbound_capacity` knobs are still accepted for
