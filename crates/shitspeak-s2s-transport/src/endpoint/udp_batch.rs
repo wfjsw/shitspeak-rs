@@ -263,11 +263,11 @@ async fn sendmmsg_linux(
     socket: &UdpSocket,
     datagrams: &[UdpBatchDatagram<'_>],
 ) -> io::Result<UdpBatchStats> {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::AsFd;
 
     const CHUNK_SIZE: usize = 64;
 
-    let fd = socket.as_raw_fd();
+    let fd = socket.as_fd();
     let mut stats = UdpBatchStats::default();
     let mut cursor = 0;
 
@@ -277,11 +277,13 @@ async fn sendmmsg_linux(
 
         while chunk_cursor < chunk_end {
             let chunk = &datagrams[chunk_cursor..chunk_end];
-            match sendmmsg_chunk(fd, chunk) {
-                Ok(0) => {
-                    stats.record_would_block();
-                    socket.writable().await?;
+            let result = socket.try_io(tokio::io::Interest::WRITABLE, || {
+                match sendmmsg_chunk(fd, chunk)? {
+                    0 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                    sent => Ok(sent),
                 }
+            });
+            match result {
                 Ok(sent) => {
                     if sent < chunk.len() {
                         stats.record_partial();
@@ -292,6 +294,7 @@ async fn sendmmsg_linux(
                     stats.record_would_block();
                     socket.writable().await?;
                 }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(err),
             }
         }
@@ -303,38 +306,16 @@ async fn sendmmsg_linux(
 }
 
 #[cfg(target_os = "linux")]
-fn sendmmsg_chunk(fd: std::os::fd::RawFd, chunk: &[UdpBatchDatagram<'_>]) -> io::Result<usize> {
-    let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(chunk.len());
-    let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(chunk.len());
-    let mut sockaddrs: Vec<SocketAddrStorage> = Vec::with_capacity(chunk.len());
-
-    for datagram in chunk {
-        let payload = datagram.payload();
-        iovecs.push(libc::iovec {
-            iov_base: payload.as_ptr() as *mut libc::c_void,
-            iov_len: payload.len(),
-        });
-        sockaddrs.push(socket_addr_to_storage(&datagram.target()));
-    }
-
-    for index in 0..chunk.len() {
-        let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
-        msg.msg_hdr.msg_name = &sockaddrs[index].storage as *const _ as *mut libc::c_void;
-        msg.msg_hdr.msg_namelen = sockaddrs[index].len;
-        msg.msg_hdr.msg_iov = &iovecs[index] as *const _ as *mut libc::iovec;
-        msg.msg_hdr.msg_iovlen = 1;
-        msg.msg_hdr.msg_control = std::ptr::null_mut();
-        msg.msg_hdr.msg_controllen = 0;
-        msg.msg_hdr.msg_flags = 0;
-        msgs.push(msg);
-    }
-
-    let ret = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), msgs.len() as u32, 0) };
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(ret as usize)
+fn sendmmsg_chunk(
+    fd: std::os::fd::BorrowedFd<'_>,
+    chunk: &[UdpBatchDatagram<'_>],
+) -> io::Result<usize> {
+    shitspeak_core::linux_net::sendmmsg_to(
+        fd,
+        chunk
+            .iter()
+            .map(|datagram| (datagram.target(), datagram.payload())),
+    )
 }
 
 #[cfg(target_os = "linux")]

@@ -4338,6 +4338,7 @@ name = "shitspeak-core"
 version = "3.0.0"
 dependencies = [
  "enumflags2",
+ "libc",
  "serde",
  "thiserror 2.0.18",
 ]

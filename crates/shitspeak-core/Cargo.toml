@@ -7,3 +7,6 @@ edition.workspace = true
 enumflags2 = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }

@@ -1,10 +1,11 @@
 //! Batched UDP send using `sendmmsg` on Linux, falling back to per-packet
 //! `send_to` on other platforms.
 //!
-//! On Linux, `libc::sendmmsg` sends multiple datagrams in a single syscall,
+//! On Linux, `sendmmsg` sends multiple datagrams in a single syscall,
 //! significantly reducing overhead for voice packets (which are small and
-//! frequent).  On non-Linux platforms we fall back to a simple loop of
-//! `send_to` calls.
+//! frequent). On 64-bit musl we use a kernel-layout header and invoke the
+//! syscall directly because musl's wrapper loops over `sendmsg`. On non-Linux
+//! platforms we fall back to a simple loop of `send_to` calls.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -207,9 +208,8 @@ async fn send_each(
 
 /// Linux `sendmmsg` path.
 ///
-/// We use `libc::sendmmsg` directly through a raw file descriptor.  Tokio's
-/// `UdpSocket` exposes `as_raw_fd()` on Unix, which we can use for the
-/// batched send.  Since `sendmmsg` is non-blocking for UDP (datagram sockets
+/// We use the native Linux operation through a borrowed file descriptor.
+/// Since `sendmmsg` is non-blocking for UDP (datagram sockets
 /// don't block on send), this is safe to call from an async context without
 /// blocking the reactor.
 #[cfg(target_os = "linux")]
@@ -218,13 +218,13 @@ async fn sendmmsg_linux(
     batch: &DatagramBatch,
     retry_budget: Duration,
 ) -> std::io::Result<FlushStats> {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::AsFd;
 
     // Maximum number of messages per sendmmsg call (kernel limit is typically
-    // 1024, but we cap lower to keep stack usage reasonable).
-    const CHUNK_SIZE: usize = 64;
+    // 1024, but we cap lower to bound retained per-worker scratch memory).
+    const CHUNK_SIZE: usize = 512;
 
-    let fd = socket.as_raw_fd();
+    let fd = socket.as_fd();
     let started_at = Instant::now();
     let mut stats = FlushStats::default();
     let mut cursor = 0;
@@ -235,11 +235,13 @@ async fn sendmmsg_linux(
 
         while chunk_cursor < chunk_end {
             let chunk = &batch.datagrams[chunk_cursor..chunk_end];
-            match sendmmsg_chunk(fd, batch, chunk) {
-                Ok(0) => {
-                    stats.record_would_block();
-                    wait_for_retry_readiness(socket, started_at, retry_budget).await?;
+            let result = socket.try_io(tokio::io::Interest::WRITABLE, || {
+                match sendmmsg_chunk(fd, batch, chunk)? {
+                    0 => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                    sent => Ok(sent),
                 }
+            });
+            match result {
                 Ok(sent) => {
                     if sent < chunk.len() {
                         stats.record_partial();
@@ -250,6 +252,7 @@ async fn sendmmsg_linux(
                     stats.record_would_block();
                     wait_for_retry_readiness(socket, started_at, retry_budget).await?;
                 }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(err),
             }
         }
@@ -280,80 +283,16 @@ async fn wait_for_retry_readiness(
 
 #[cfg(target_os = "linux")]
 fn sendmmsg_chunk(
-    fd: std::os::fd::RawFd,
+    fd: std::os::fd::BorrowedFd<'_>,
     batch: &DatagramBatch,
     chunk: &[QueuedDatagram],
 ) -> io::Result<usize> {
-    let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(chunk.len());
-    let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(chunk.len());
-    let mut sockaddrs: Vec<SocketAddrStorage> = Vec::with_capacity(chunk.len());
-
-    for d in chunk {
-        let addr = socket_addr_to_storage(&d.addr);
-        let data = batch.data(d);
-
-        iovecs.push(libc::iovec {
-            iov_base: data.as_ptr() as *mut libc::c_void,
-            iov_len: data.len(),
-        });
-
-        sockaddrs.push(addr);
-    }
-
-    for i in 0..chunk.len() {
-        let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
-        msg.msg_hdr.msg_name = &sockaddrs[i].storage as *const _ as *mut libc::c_void;
-        msg.msg_hdr.msg_namelen = sockaddrs[i].len;
-        msg.msg_hdr.msg_iov = &iovecs[i] as *const _ as *mut libc::iovec;
-        msg.msg_hdr.msg_iovlen = 1;
-        msg.msg_hdr.msg_control = std::ptr::null_mut();
-        msg.msg_hdr.msg_controllen = 0;
-        msg.msg_hdr.msg_flags = 0;
-        msgs.push(msg);
-    }
-
-    let ret = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), msgs.len() as u32, 0) };
-
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(ret as usize)
-}
-
-#[cfg(target_os = "linux")]
-struct SocketAddrStorage {
-    storage: libc::sockaddr_storage,
-    len: libc::socklen_t,
-}
-
-#[cfg(target_os = "linux")]
-fn socket_addr_to_storage(addr: &std::net::SocketAddr) -> SocketAddrStorage {
-    use std::net::SocketAddr;
-
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let len = match addr {
-        SocketAddr::V4(v4) => {
-            let sa = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in) };
-            sa.sin_family = libc::AF_INET as libc::sa_family_t;
-            sa.sin_port = v4.port().to_be();
-            sa.sin_addr = libc::in_addr {
-                s_addr: u32::from_ne_bytes(v4.ip().octets()),
-            };
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
-        }
-        SocketAddr::V6(v6) => {
-            let sa = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_in6) };
-            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-            sa.sin6_port = v6.port().to_be();
-            sa.sin6_flowinfo = v6.flowinfo();
-            sa.sin6_addr.s6_addr = v6.ip().octets();
-            sa.sin6_scope_id = v6.scope_id();
-            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
-        }
-    };
-
-    SocketAddrStorage { storage, len }
+    shitspeak_core::linux_net::sendmmsg_to(
+        fd,
+        chunk
+            .iter()
+            .map(|datagram| (datagram.addr, batch.data(datagram))),
+    )
 }
 
 #[cfg(test)]
