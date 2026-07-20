@@ -408,6 +408,30 @@ pub struct ClientStateBroadcastPayload {
 }
 
 impl ClientStateLogEntry {
+    /// Returns the destination carried by this viewer's own channel-change
+    /// entry. Legacy replicated entries with instance id zero apply to the
+    /// currently connected instance.
+    pub fn own_channel_change_for(
+        &self,
+        viewer_session_id: ClientSessionIdentifier,
+        viewer_client_instance_id: ClientInstanceId,
+    ) -> Option<u32> {
+        match &self.op {
+            ClientStateOperation::UpdateGlobalState {
+                session_id,
+                client_instance_id,
+                delta,
+                ..
+            } if *session_id == viewer_session_id
+                && (*client_instance_id == 0
+                    || *client_instance_id == viewer_client_instance_id) =>
+            {
+                delta.current_channel_id
+            }
+            _ => None,
+        }
+    }
+
     async fn acl_cache_flush_message_for(
         &self,
         repo: &ClientRepository,
@@ -628,6 +652,43 @@ impl ClientStateLogEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_channel_change_matches_viewer_and_instance() {
+        let session_id = ClientSessionIdentifier::new(2, 7).unwrap();
+        let entry = ClientStateLogEntry {
+            version: 1,
+            node_id: 2,
+            timestamp: 0,
+            channel_version_dep: None,
+            op: ClientStateOperation::UpdateGlobalState {
+                server_id: "alpha".to_owned(),
+                session_id,
+                client_instance_id: 42,
+                sender_session_id: None,
+                delta: ClientGlobalStateDelta {
+                    current_channel_id: Some(99),
+                    ..Default::default()
+                },
+            },
+        };
+
+        assert_eq!(entry.own_channel_change_for(session_id, 42), Some(99));
+        assert_eq!(entry.own_channel_change_for(session_id, 43), None);
+        assert_eq!(
+            entry.own_channel_change_for(ClientSessionIdentifier::new(2, 8).unwrap(), 42),
+            None
+        );
+
+        let mut legacy = entry.clone();
+        if let ClientStateOperation::UpdateGlobalState {
+            client_instance_id, ..
+        } = &mut legacy.op
+        {
+            *client_instance_id = 0;
+        }
+        assert_eq!(legacy.own_channel_change_for(session_id, 43), Some(99));
+    }
 
     #[test]
     fn voice_routing_delta_classification_is_narrow() {

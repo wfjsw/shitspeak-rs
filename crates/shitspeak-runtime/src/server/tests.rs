@@ -121,6 +121,26 @@ fn channel_visibility_requires_user_visibility() {
     assert!(validate_visibility_config(&config).is_ok());
 }
 
+#[tokio::test]
+async fn allow_move_without_traverse_reads_live_acl_config() {
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("test server");
+    assert!(!server.get_allow_move_without_traverse());
+
+    {
+        let mut config = server.config.write().expect("config lock");
+        config.acl = config.acl.clone().with_allow_move_without_traverse(true);
+    }
+    assert!(server.get_allow_move_without_traverse());
+
+    {
+        let mut config = server.config.write().expect("config lock");
+        config.acl = config.acl.clone().with_allow_move_without_traverse(false);
+    }
+    assert!(!server.get_allow_move_without_traverse());
+}
+
 struct TestIdentityFixture {
     _dir: tempfile::TempDir,
     cert_path: String,

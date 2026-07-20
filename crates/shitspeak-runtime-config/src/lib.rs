@@ -843,6 +843,10 @@ pub struct AclConfig {
     /// changed channel subtree and update their suppress state.
     #[serde(default)]
     reevaluate_speak_on_acl_change: bool,
+    /// When true, a moderator with the required Move permissions may move
+    /// another user into a channel that user cannot Traverse.
+    #[serde(default)]
+    allow_move_without_traverse: bool,
 }
 
 impl Default for AclConfig {
@@ -853,6 +857,7 @@ impl Default for AclConfig {
             preserve_write_acl_on_edit: true,
             grant_temp_channel_creator_acl: true,
             reevaluate_speak_on_acl_change: false,
+            allow_move_without_traverse: false,
         }
     }
 }
@@ -904,7 +909,13 @@ impl AclConfig {
             preserve_write_acl_on_edit,
             grant_temp_channel_creator_acl,
             reevaluate_speak_on_acl_change,
+            allow_move_without_traverse: false,
         }
+    }
+
+    pub fn with_allow_move_without_traverse(mut self, allow: bool) -> Self {
+        self.allow_move_without_traverse = allow;
+        self
     }
 
     pub fn debug_acl_enter(&self) -> bool {
@@ -925,6 +936,10 @@ impl AclConfig {
 
     pub fn reevaluate_speak_on_acl_change(&self) -> bool {
         self.reevaluate_speak_on_acl_change
+    }
+
+    pub fn allow_move_without_traverse(&self) -> bool {
+        self.allow_move_without_traverse
     }
 }
 
@@ -1844,6 +1859,7 @@ mod tests {
         assert!(!cfg.acl.preserve_write_acl_on_edit());
         assert!(cfg.acl.grant_temp_channel_creator_acl());
         assert!(cfg.acl.reevaluate_speak_on_acl_change());
+        assert!(!cfg.acl.allow_move_without_traverse());
         assert_eq!(cfg.root_channel_name, "Root");
         assert_eq!(cfg.authenticator.backend(), AuthenticatorBackend::Demo);
         assert!(cfg.geoip.enabled());
@@ -2342,6 +2358,7 @@ mod tests {
         assert!(default_cfg.preserve_write_acl_on_edit());
         assert!(default_cfg.grant_temp_channel_creator_acl());
         assert!(!default_cfg.reevaluate_speak_on_acl_change());
+        assert!(!default_cfg.allow_move_without_traverse());
 
         let cfg: AclConfig = ::config::Config::builder()
             .add_source(::config::File::from_str(
@@ -2351,6 +2368,7 @@ mod tests {
                     preserve_write_acl_on_edit = false
                     grant_temp_channel_creator_acl = false
                     reevaluate_speak_on_acl_change = true
+                    allow_move_without_traverse = true
                 "#,
                 ::config::FileFormat::Toml,
             ))
@@ -2363,6 +2381,10 @@ mod tests {
         assert!(!cfg.preserve_write_acl_on_edit());
         assert!(!cfg.grant_temp_channel_creator_acl());
         assert!(cfg.reevaluate_speak_on_acl_change());
+        assert!(cfg.allow_move_without_traverse());
+
+        let cfg = AclConfig::default().with_allow_move_without_traverse(true);
+        assert!(cfg.allow_move_without_traverse());
     }
 
     #[test]

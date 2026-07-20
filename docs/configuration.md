@@ -127,6 +127,7 @@ explicit_enter_deny_overrides_write = true
 preserve_write_acl_on_edit = false
 grant_temp_channel_creator_acl = true
 reevaluate_speak_on_acl_change = true
+allow_move_without_traverse = false
 ```
 
 ## Top-Level Server Settings
@@ -347,6 +348,7 @@ explicit_enter_deny_overrides_write = true
 preserve_write_acl_on_edit = false
 grant_temp_channel_creator_acl = true
 reevaluate_speak_on_acl_change = true
+allow_move_without_traverse = false
 ```
 
 - `debug_acl_enter`: when true, superusers ignore channel Enter denies.
@@ -354,6 +356,7 @@ reevaluate_speak_on_acl_change = true
 - `preserve_write_acl_on_edit`: when true, registered non-superuser ACL editors keep a personal Write fallback if their edit would remove their own Write permission.
 - `grant_temp_channel_creator_acl`: when true, temporary channel creators receive local ACL grants for missing Write, Enter, and Speak permissions.
 - `reevaluate_speak_on_acl_change`: when true, ACL edits reevaluate Speak for clients currently in the changed channel subtree and update their `UserState.suppress` state.
+- `allow_move_without_traverse`: when true, a moderator with the required Move permissions may move another user into a channel the target cannot traverse. It does not change self-move authorization. Hidden destination ancestors are revealed to the moved client only while needed and revoked after departure. The default is false.
 
 The checked-in development config sets stricter values than the code defaults for some ACL toggles.
 

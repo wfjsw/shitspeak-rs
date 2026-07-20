@@ -7,10 +7,7 @@ use crate::{
     client::{Client, client_global_state::ClientGlobalState},
     errors::MessageHandlerError,
     localization::channel_does_not_exist,
-    messages::{
-        Message, WriteMessageExt,
-        encoder::{DenyType, PermissionDenied, PermissionQuery, UserState},
-    },
+    messages::encoder::{DenyType, PermissionDenied, UserState},
     server::Server,
 };
 
@@ -51,36 +48,6 @@ fn handle_pre_auth_user_state(
         gs.can_receive_voice()
     };
     sender.set_can_receive_voice(can_receive_voice);
-}
-
-pub(crate) async fn send_enter_permission_queries(
-    server: &Arc<Box<Server>>,
-    target: &Arc<Box<Client>>,
-    channel_id: u32,
-) -> Result<(), MessageHandlerError> {
-    let server_id = target.server_id();
-    let parent_id = server
-        .get_channels()
-        .get_channel_in_server(&server_id, channel_id)
-        .await
-        .and_then(|channel| channel.parent_id);
-
-    let mut channel_ids = vec![channel_id];
-    if let Some(parent_id) = parent_id {
-        channel_ids.push(parent_id);
-    }
-
-    let mut messages = Vec::with_capacity(channel_ids.len());
-    for channel_id in channel_ids {
-        let permissions =
-            crate::client::acl::compute_permissions_for_client(server, target, channel_id).await;
-        messages.push(Message::PermissionQuery(
-            PermissionQuery::refresh_channel_permissions(channel_id, permissions.bits()).into(),
-        ));
-    }
-
-    target.write_proto_message_batch(&messages).await?;
-    Ok(())
 }
 
 pub async fn handle_user_state(
@@ -245,7 +212,9 @@ pub async fn handle_user_state(
                 ));
             }
 
-            if !dst_perms.contains(ACLPermissions::Traverse) {
+            if !dst_perms.contains(ACLPermissions::Traverse)
+                && !server.get_allow_move_without_traverse()
+            {
                 return Err(MessageHandlerError::PermissionDenied(
                     PermissionDenied::for_permission(
                         u32::from(target_id),
@@ -577,7 +546,6 @@ pub async fn handle_user_state(
     } else {
         None
     };
-    let mut entered_channel_id = None;
     let mut cache_last_channel_id = None;
     let mut cache_listening_channel_ids = None;
     let can_receive_voice;
@@ -640,7 +608,6 @@ pub async fn handle_user_state(
         // ── Channel move ──────────────────────────────────────────────────────
         if let Some(new_channel_id) = requested_channel_change {
             if gs.set_current_channel_id(new_channel_id) {
-                entered_channel_id = Some(new_channel_id);
                 tracing::info!(
                     server_id = %server_id,
                     session = u32::from(target_id),
@@ -739,10 +706,6 @@ pub async fn handle_user_state(
             target_current_channel_id,
         )
         .await;
-    }
-
-    if let Some(channel_id) = entered_channel_id {
-        send_enter_permission_queries(server, &target, channel_id).await?;
     }
 
     Ok(())

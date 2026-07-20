@@ -1184,7 +1184,6 @@ impl MoqSessionRuntime {
             &mut self.channel_tree_shadow,
             &mut self.channel_shadow,
             &mut self.user_visibility,
-            &server_id,
             entry,
         )
         .await;
@@ -1221,7 +1220,6 @@ impl MoqSessionRuntime {
                     &mut self.channel_tree_shadow,
                     &mut self.channel_shadow,
                     &mut self.user_visibility,
-                    &server_id,
                     &entry,
                 )
                 .await,
@@ -1462,82 +1460,6 @@ async fn message_with_synthetic_events(
 }
 
 #[cfg(feature = "moq")]
-fn is_acl_cache_flush_message(message: &Message) -> bool {
-    matches!(message, Message::PermissionQuery(pq) if pq.flush == Some(true))
-}
-
-#[cfg(feature = "moq")]
-async fn client_log_message_events_with_acl_refresh(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
-    server_id: &str,
-    message: &Message,
-) -> Vec<ServerEvent> {
-    if is_acl_cache_flush_message(message) {
-        let mut events = Vec::new();
-        for refresh in
-            shitspeak_runtime::channel_handler::build_channel_permission_query_refresh_messages(
-                server,
-                client,
-                server.get_channels(),
-            )
-            .await
-        {
-            events.extend(
-                message_with_synthetic_events(
-                    server,
-                    client,
-                    channel_tree_shadow,
-                    channel_shadow,
-                    user_visibility,
-                    server_id,
-                    &refresh,
-                )
-                .await,
-            );
-        }
-        if server.get_send_permission_info() {
-            for refresh in
-                shitspeak_runtime::channel_handler::build_channel_permission_info_refresh_messages(
-                    server,
-                    client,
-                    server.get_channels(),
-                )
-                .await
-            {
-                events.extend(
-                    message_with_synthetic_events(
-                        server,
-                        client,
-                        channel_tree_shadow,
-                        channel_shadow,
-                        user_visibility,
-                        server_id,
-                        &refresh,
-                    )
-                    .await,
-                );
-            }
-        }
-        return events;
-    }
-
-    message_with_synthetic_events(
-        server,
-        client,
-        channel_tree_shadow,
-        channel_shadow,
-        user_visibility,
-        server_id,
-        message,
-    )
-    .await
-}
-
-#[cfg(feature = "moq")]
 async fn prepared_visibility_refresh_events(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -1620,70 +1542,20 @@ async fn client_log_entry_events(
     channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
-    server_id: &str,
     entry: &ClientStateLogEntry,
 ) -> Vec<ServerEvent> {
-    let old_viewer_channel_id = channel_shadow.get(&client.get_session_id()).copied();
-    let scope =
-        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_client_log_entry(
-            server,
-            client,
-            entry,
-            old_viewer_channel_id,
-        )
-        .await;
-    let channel_refresh = shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh(
+    shitspeak_runtime::channel_handler::project_client_log_entry_transition(
         server,
         client,
         channel_tree_shadow,
-        &scope,
+        user_visibility,
+        channel_shadow,
+        entry,
     )
-    .await;
-    let mut events = Vec::new();
-    let mut additions = Vec::new();
-    channel_refresh.append_additions_to(&mut additions);
-    channel_refresh.apply_additions(channel_tree_shadow);
-    for message in additions {
-        if let Some(event) = server_event_from_message(message) {
-            events.push(event);
-        }
-    }
-
-    for message in entry
-        .messages_for_client(
-            server.get_clients(),
-            client.get_session_id(),
-            client.client_instance_id(),
-        )
-        .await
-    {
-        events.extend(
-            client_log_message_events_with_acl_refresh(
-                server,
-                client,
-                channel_tree_shadow,
-                channel_shadow,
-                user_visibility,
-                server_id,
-                &message,
-            )
-            .await,
-        );
-    }
-    events.extend(
-        visibility_refresh_events_without_channel_additions(
-            server,
-            client,
-            channel_tree_shadow,
-            channel_shadow,
-            user_visibility,
-            server_id,
-            channel_refresh,
-            scope,
-        )
-        .await,
-    );
-    events
+    .await
+    .into_iter()
+    .filter_map(server_event_from_message)
+    .collect()
 }
 
 #[cfg(feature = "moq")]
@@ -1781,6 +1653,67 @@ mod tests {
     use shitspeak_runtime::localization::Language;
     use shitspeak_runtime::messages::encoder::AudioContext;
     use shitspeak_runtime_config::{Config, UdpPingUserCountScope, WebAuthConfig, WebAuthMode};
+
+    #[test]
+    fn moq_event_conversion_preserves_move_messages_and_omits_permission_queries() {
+        let session = ClientSessionIdentifier::from(42);
+        let messages: Vec<Message> = vec![
+            shitspeak_runtime::messages::encoder::ChannelState {
+                channel_id: Some(10),
+                parent: Some(0),
+                name: Some("Hidden parent".to_string()),
+                ..Default::default()
+            }
+            .into(),
+            shitspeak_runtime::messages::encoder::ChannelState {
+                channel_id: Some(11),
+                parent: Some(10),
+                name: Some("Hidden destination".to_string()),
+                ..Default::default()
+            }
+            .into(),
+            shitspeak_runtime::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                11, 0,
+            )
+            .into(),
+            shitspeak_runtime::messages::encoder::UserState {
+                session: Some(session),
+                channel_id: Some(11),
+                ..Default::default()
+            }
+            .into(),
+            shitspeak_runtime::messages::encoder::ChannelRemove { channel_id: 11 }.into(),
+            shitspeak_runtime::messages::encoder::ChannelRemove { channel_id: 10 }.into(),
+        ];
+
+        let events = messages
+            .into_iter()
+            .filter_map(server_event_from_message)
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            &events[0],
+            ServerEvent::ChannelState(channel) if channel.channel_id == Some(10)
+        ));
+        assert!(matches!(
+            &events[1],
+            ServerEvent::ChannelState(channel) if channel.channel_id == Some(11)
+        ));
+        assert!(matches!(
+            &events[2],
+            ServerEvent::UserState(user)
+                if user.session == Some(u32::from(session)) && user.channel_id == Some(11)
+        ));
+        assert!(matches!(
+            &events[3],
+            ServerEvent::ChannelRemove { channel_id: 11 }
+        ));
+        assert!(matches!(
+            &events[4],
+            ServerEvent::ChannelRemove { channel_id: 10 }
+        ));
+        assert_eq!(events.len(), 5, "PermissionQuery must remain native-only");
+    }
 
     #[test]
     fn track_names_are_stable() {

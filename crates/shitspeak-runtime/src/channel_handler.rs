@@ -14,7 +14,12 @@ use std::{
 };
 
 use crate::{
-    client::{Client, client_session_identifier::ClientSessionIdentifier},
+    client::{
+        Client,
+        client_session_identifier::ClientSessionIdentifier,
+        state_log::{ClientStateLogEntry, ClientStateOperation},
+        visibility::UserVisibilityState,
+    },
     errors::WriteProtoMessageError,
     messages::{Message, encoder::ChannelState},
     server::Server,
@@ -141,6 +146,7 @@ pub struct ChannelTreeShadow {
 pub(crate) struct HomeChannelMoveImpact {
     channels: Vec<Channel>,
     channel_indexes: HashMap<u32, usize>,
+    new_channel_id: u32,
     permission_channel_ids: HashSet<u32>,
     visibility_channel_ids: HashSet<u32>,
 }
@@ -182,6 +188,7 @@ impl HomeChannelMoveImpact {
         Self {
             channels,
             channel_indexes,
+            new_channel_id,
             permission_channel_ids,
             visibility_channel_ids,
         }
@@ -193,6 +200,10 @@ impl HomeChannelMoveImpact {
 
     pub(crate) fn permission_channel_ids(&self) -> &HashSet<u32> {
         &self.permission_channel_ids
+    }
+
+    pub(crate) fn new_channel_id(&self) -> u32 {
+        self.new_channel_id
     }
 
     fn channel(&self, channel_id: u32) -> Option<&Channel> {
@@ -409,6 +420,43 @@ pub async fn can_view_channel_with_ancestors(
     }
 }
 
+pub(crate) async fn can_view_channel_with_ancestors_at_home(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_id: u32,
+    home_channel_id: u32,
+) -> bool {
+    if !server.get_hide_channels_without_traverse() {
+        return true;
+    }
+
+    let channels = server.get_channels();
+    let server_id = client.server_id();
+    let mut current_id = channel_id;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current_id)
+            || !crate::client::acl::compute_permissions_for_client_with_home_channel(
+                server,
+                client,
+                current_id,
+                home_channel_id,
+            )
+            .await
+            .contains(shitspeak_state::ACLPermissions::Traverse)
+        {
+            return false;
+        }
+        let Some(channel) = channels.get_channel_in_server(&server_id, current_id).await else {
+            return current_id == 0;
+        };
+        let Some(parent_id) = channel.parent_id else {
+            return true;
+        };
+        current_id = parent_id;
+    }
+}
+
 async fn channel_is_visible_in_shadow(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -508,6 +556,7 @@ pub async fn build_visible_channel_snapshot_messages(
             client,
             &channel,
             include_permission_info,
+            None,
         )
         .await;
         state
@@ -589,17 +638,41 @@ pub async fn project_message_with_visibility_shadows(
     server_id: &str,
     message: &Message,
 ) -> Vec<Message> {
+    project_message_with_visibility_shadows_at_home(
+        server,
+        client,
+        channel_tree_shadow,
+        user_visibility,
+        session_channel_shadow,
+        server_id,
+        message,
+        None,
+    )
+    .await
+}
+
+async fn project_message_with_visibility_shadows_at_home(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    user_visibility: &mut crate::client::visibility::UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    message: &Message,
+    effective_home_channel_id: Option<u32>,
+) -> Vec<Message> {
     let channel_projected =
         project_channel_message(server, client, channel_tree_shadow, message).await;
     let mut out = Vec::new();
     for message in channel_projected {
-        let projected = crate::client::visibility::project_message_with_shadow(
+        let projected = crate::client::visibility::project_message_with_shadow_at_home(
             server,
             client,
             user_visibility,
             session_channel_shadow,
             server_id,
             &message,
+            effective_home_channel_id,
         )
         .await;
         for message in projected {
@@ -752,13 +825,29 @@ async fn prepare_channel_visibility_refresh_inner(
 
     let mut visible_channel_ids = HashSet::with_capacity(candidate_channels.len());
     for channel in &candidate_channels {
-        if can_view_channel(server, client, channel.id).await {
+        let visible = match home_move_impact {
+            Some(impact) if server.get_hide_channels_without_traverse() => {
+                crate::client::acl::compute_permissions_for_client_with_home_channel(
+                    server,
+                    client,
+                    channel.id,
+                    impact.new_channel_id(),
+                )
+                .await
+                .contains(shitspeak_state::ACLPermissions::Traverse)
+            }
+            _ => can_view_channel(server, client, channel.id).await,
+        };
+        if visible {
             visible_channel_ids.insert(channel.id);
         }
     }
+    let effective_home_channel_id = home_move_impact
+        .map(HomeChannelMoveImpact::new_channel_id)
+        .unwrap_or_else(|| client.get_current_channel_id());
     visible_channel_ids.extend(channel_and_ancestor_ids(
         &candidate_channels,
-        client.get_current_channel_id(),
+        effective_home_channel_id,
     ));
     close_visible_channel_ancestors(&candidate_channels, &mut visible_channel_ids);
 
@@ -786,7 +875,14 @@ async fn prepare_channel_visibility_refresh_inner(
         if !visible_channel_ids.contains(&channel.id) || channel_tree_shadow.contains(&channel.id) {
             continue;
         }
-        let mut state = build_channel_state_message(server, client, &channel).await;
+        let mut state = build_channel_state_message_with_options(
+            server,
+            client,
+            &channel,
+            server.get_send_permission_info(),
+            home_move_impact.map(HomeChannelMoveImpact::new_channel_id),
+        )
+        .await;
         state
             .links
             .retain(|linked_id| final_visible_channel_ids.contains(linked_id));
@@ -830,6 +926,246 @@ pub async fn reconcile_channel_visibility(
     refresh.append_removals_to(&mut messages);
     refresh.append_additions_to(&mut messages);
     messages
+}
+
+fn viewer_acl_delta_for_entry<'a>(
+    entry: &'a ClientStateLogEntry,
+    viewer_session_id: ClientSessionIdentifier,
+    viewer_client_instance_id: crate::client::ClientInstanceId,
+) -> Option<&'a crate::client::state_log::ClientGlobalStateDelta> {
+    match &entry.op {
+        ClientStateOperation::UpdateGlobalState {
+            session_id,
+            client_instance_id,
+            delta,
+            ..
+        } if *session_id == viewer_session_id
+            && (*client_instance_id == 0 || *client_instance_id == viewer_client_instance_id) =>
+        {
+            Some(delta)
+        }
+        _ => None,
+    }
+}
+
+async fn client_log_permission_refresh_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    delta: Option<&crate::client::state_log::ClientGlobalStateDelta>,
+    home_move_impact: Option<&HomeChannelMoveImpact>,
+) -> Vec<Message> {
+    let refresh_all = delta.is_some_and(|delta| {
+        delta.user_id.is_some()
+            || delta.groups.is_some()
+            || delta.is_superuser.is_some()
+            || delta.tokens.is_some()
+    });
+
+    if let Some(impact) = home_move_impact {
+        if !refresh_all {
+            return build_home_channel_permission_info_refresh_messages_from_impact(
+                server, client, impact,
+            )
+            .await;
+        }
+
+        let mut channels = impact.channels().to_vec();
+        channels.sort_by_key(|channel| channel.id);
+        let mut messages = Vec::with_capacity(channels.len() * 2);
+        for channel in &channels {
+            let permissions = crate::client::acl::compute_permissions_for_client_with_home_channel(
+                server,
+                client,
+                channel.id,
+                impact.new_channel_id(),
+            )
+            .await;
+            messages.push(
+                crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                    channel.id,
+                    permissions.bits(),
+                )
+                .into(),
+            );
+        }
+        if server.get_send_permission_info() {
+            for channel in ordered_snapshot_channels(&channels) {
+                let (is_enter_restricted, permissions) = permission_info_for_channel_with_home(
+                    server,
+                    client,
+                    channel.id,
+                    impact.new_channel_id(),
+                )
+                .await;
+                messages.push(
+                    ChannelState {
+                        channel_id: Some(channel.id),
+                        ..Default::default()
+                    }
+                    .with_permission_info(is_enter_restricted, permissions)
+                    .into(),
+                );
+            }
+        }
+        return messages;
+    }
+
+    let mut messages =
+        build_channel_permission_query_refresh_messages(server, client, server.get_channels())
+            .await;
+    if server.get_send_permission_info() {
+        messages.extend(
+            build_channel_permission_info_refresh_messages(server, client, server.get_channels())
+                .await,
+        );
+    }
+    messages
+}
+
+/// Projects one versioned client-state entry into a complete, ordered socket
+/// transition. All transports use this path so newly referenced channel IDs
+/// are defined before permission or user messages and stale temporary paths
+/// are removed only after the move has been delivered.
+pub async fn project_client_log_entry_transition(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    user_visibility: &mut UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    entry: &ClientStateLogEntry,
+) -> Vec<Message> {
+    let viewer_session_id = client.get_session_id();
+    let viewer_client_instance_id = client.client_instance_id();
+    let old_viewer_channel_id = session_channel_shadow.get(&viewer_session_id).copied();
+    let new_viewer_channel_id =
+        entry.own_channel_change_for(viewer_session_id, viewer_client_instance_id);
+    let home_move_impact = match new_viewer_channel_id {
+        Some(new_channel_id) => Some(
+            HomeChannelMoveImpact::calculate(server, client, old_viewer_channel_id, new_channel_id)
+                .await,
+        ),
+        None => None,
+    };
+    let visibility_scope =
+        crate::client::visibility::visibility_refresh_scope_for_client_log_entry_with_home_move_impact(
+            server,
+            client,
+            entry,
+            old_viewer_channel_id,
+            home_move_impact.as_ref(),
+        )
+        .await;
+    let channel_refresh = match home_move_impact.as_ref() {
+        Some(impact) => {
+            prepare_channel_visibility_refresh_for_home_move(
+                server,
+                client,
+                channel_tree_shadow,
+                &visibility_scope,
+                impact,
+            )
+            .await
+        }
+        None => {
+            prepare_channel_visibility_refresh(
+                server,
+                client,
+                channel_tree_shadow,
+                &visibility_scope,
+            )
+            .await
+        }
+    };
+
+    let mut out = Vec::new();
+    channel_refresh.apply_additions(channel_tree_shadow);
+    channel_refresh.append_additions_to(&mut out);
+
+    if let Some(destination_channel_id) = new_viewer_channel_id {
+        out.extend(
+            build_enter_permission_query_refresh_messages(server, client, destination_channel_id)
+                .await
+                .into_iter()
+                .filter(|message| {
+                    matches!(message, Message::PermissionQuery(query)
+                    if query.channel_id.is_some_and(|channel_id| {
+                        channel_tree_shadow.contains(&channel_id)
+                    }))
+                }),
+        );
+    }
+
+    let viewer_acl_delta =
+        viewer_acl_delta_for_entry(entry, viewer_session_id, viewer_client_instance_id);
+    let server_id = client.server_id();
+    for message in entry
+        .messages_for_client(
+            server.get_clients(),
+            viewer_session_id,
+            viewer_client_instance_id,
+        )
+        .await
+    {
+        let is_permission_flush =
+            matches!(&message, Message::PermissionQuery(query) if query.flush == Some(true));
+        let messages = if is_permission_flush {
+            client_log_permission_refresh_messages(
+                server,
+                client,
+                viewer_acl_delta,
+                home_move_impact.as_ref(),
+            )
+            .await
+        } else {
+            vec![message]
+        };
+        for message in messages {
+            if is_permission_flush && home_move_impact.is_some() {
+                let channel_id = match &message {
+                    Message::PermissionQuery(query) => query.channel_id,
+                    Message::ChannelState(state) => state.channel_id,
+                    _ => None,
+                };
+                if channel_id.is_some_and(|channel_id| channel_tree_shadow.contains(&channel_id)) {
+                    out.push(message);
+                }
+                continue;
+            }
+            out.extend(
+                project_message_with_visibility_shadows_at_home(
+                    server,
+                    client,
+                    channel_tree_shadow,
+                    user_visibility,
+                    session_channel_shadow,
+                    &server_id,
+                    &message,
+                    new_viewer_channel_id,
+                )
+                .await,
+            );
+        }
+    }
+
+    let visibility_messages =
+        crate::client::visibility::visibility_refresh_messages_with_shadow_at_home(
+            server,
+            client,
+            user_visibility,
+            session_channel_shadow,
+            &server_id,
+            visibility_scope,
+            new_viewer_channel_id,
+        )
+        .await;
+    for message in visibility_messages {
+        channel_tree_shadow.sync_message(&message);
+        out.push(message);
+    }
+
+    channel_refresh.apply_removals(channel_tree_shadow);
+    channel_refresh.append_removals_to(&mut out);
+    out
 }
 
 impl FromIterator<u32> for ChannelTreeShadow {
@@ -877,6 +1213,38 @@ pub(crate) async fn permission_info_for_channel(
     });
     let perms =
         crate::client::acl::compute_permissions_for_client(server, client, channel_id).await;
+    (is_enter_restricted, perms)
+}
+
+async fn permission_info_for_channel_with_home(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_id: u32,
+    home_channel_id: u32,
+) -> (bool, enumflags2::BitFlags<shitspeak_state::ACLPermissions>) {
+    let server_id = client.server_id();
+    let (_, channel, ancestors) = server
+        .get_channels()
+        .get_channel_with_ancestors_for_acl_in_server(&server_id, channel_id)
+        .await;
+    let is_enter_restricted = channel.as_ref().is_some_and(|channel| {
+        shitspeak_state::channel_has_effective_restriction(
+            channel,
+            &ancestors,
+            shitspeak_state::ACLPermissions::Traverse,
+        ) || shitspeak_state::channel_has_effective_restriction(
+            channel,
+            &ancestors,
+            shitspeak_state::ACLPermissions::Enter,
+        )
+    });
+    let perms = crate::client::acl::compute_permissions_for_client_with_home_channel(
+        server,
+        client,
+        channel_id,
+        home_channel_id,
+    )
+    .await;
     (is_enter_restricted, perms)
 }
 
@@ -1970,6 +2338,7 @@ pub async fn build_channel_state_message(
         client,
         channel,
         server.get_send_permission_info(),
+        None,
     )
     .await
 }
@@ -1979,7 +2348,7 @@ pub async fn build_channel_state_message_without_permission_info(
     client: &Arc<Box<Client>>,
     channel: &shitspeak_state::Channel,
 ) -> ChannelState {
-    build_channel_state_message_with_options(server, client, channel, false).await
+    build_channel_state_message_with_options(server, client, channel, false, None).await
 }
 
 async fn build_channel_state_message_with_options(
@@ -1987,6 +2356,7 @@ async fn build_channel_state_message_with_options(
     client: &Arc<Box<Client>>,
     channel: &shitspeak_state::Channel,
     include_permission_info: bool,
+    effective_home_channel_id: Option<u32>,
 ) -> ChannelState {
     let links: Vec<u32> = channel.links.iter().copied().collect();
     let mut cs = ChannelState {
@@ -2010,8 +2380,13 @@ async fn build_channel_state_message_with_options(
 
     // Add permission info if configured
     if include_permission_info {
-        let (is_enter_restricted, perms) =
-            permission_info_for_channel(server, client, channel.id).await;
+        let (is_enter_restricted, perms) = match effective_home_channel_id {
+            Some(home_channel_id) => {
+                permission_info_for_channel_with_home(server, client, channel.id, home_channel_id)
+                    .await
+            }
+            None => permission_info_for_channel(server, client, channel.id).await,
+        };
         cs = cs.with_permission_info(is_enter_restricted, perms);
     }
 
@@ -2110,6 +2485,47 @@ pub async fn build_channel_permission_query_refresh_messages_for_channel_ids(
     messages
 }
 
+/// Builds the destination and immediate-parent permission refreshes emitted
+/// for a viewer's own channel transition. Permissions are evaluated against
+/// the entry's destination home so lagged/replayed moves do not observe a
+/// newer live home channel.
+pub async fn build_enter_permission_query_refresh_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    destination_channel_id: u32,
+) -> Vec<Message> {
+    let server_id = client.server_id();
+    let parent_id = server
+        .get_channels()
+        .get_channel_in_server(&server_id, destination_channel_id)
+        .await
+        .and_then(|channel| channel.parent_id);
+
+    let mut channel_ids = vec![destination_channel_id];
+    if let Some(parent_id) = parent_id {
+        channel_ids.push(parent_id);
+    }
+
+    let mut messages = Vec::with_capacity(channel_ids.len());
+    for channel_id in channel_ids {
+        let permissions = crate::client::acl::compute_permissions_for_client_with_home_channel(
+            server,
+            client,
+            channel_id,
+            destination_channel_id,
+        )
+        .await;
+        messages.push(
+            crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                channel_id,
+                permissions.bits(),
+            )
+            .into(),
+        );
+    }
+    messages
+}
+
 /// Build permission-only `ChannelState` deltas for channels whose permissions
 /// may depend on the viewer's current channel.
 pub async fn build_home_channel_permission_info_refresh_messages(
@@ -2135,7 +2551,13 @@ pub(crate) async fn build_home_channel_permission_info_refresh_messages_from_imp
         .iter()
         .filter_map(|channel_id| impact.channel(*channel_id).cloned())
         .collect();
-    build_scoped_permission_info_refresh_messages_for_channels(server, client, channels).await
+    build_scoped_permission_info_refresh_messages_for_channels(
+        server,
+        client,
+        channels,
+        impact.new_channel_id(),
+    )
+    .await
 }
 
 pub async fn home_channel_dependent_channel_ids(
@@ -2179,6 +2601,7 @@ async fn build_scoped_permission_info_refresh_messages_for_channels(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     mut channels: Vec<Channel>,
+    home_channel_id: u32,
 ) -> Vec<Message> {
     channels.sort_by_key(|channel| (channel.parent_id.unwrap_or(0), channel.position, channel.id));
 
@@ -2186,7 +2609,8 @@ async fn build_scoped_permission_info_refresh_messages_for_channels(
     let mut messages = Vec::with_capacity(channels.len() * 2);
     for channel in channels {
         let (is_enter_restricted, perms) =
-            permission_info_for_channel(server, client, channel.id).await;
+            permission_info_for_channel_with_home(server, client, channel.id, home_channel_id)
+                .await;
         messages.push(
             crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
                 channel.id,

@@ -120,6 +120,9 @@ grant_temp_channel_creator_acl = true
 # When true, ACL edits reevaluate Speak for clients currently in the changed
 # channel subtree and update their suppress state.
 reevaluate_speak_on_acl_change = true
+# When true, a moderator with the required Move permissions may move another
+# user into a channel that user cannot Traverse. The default is false.
+allow_move_without_traverse = false
 
 # Privacy behavior toggles
 [privacy]

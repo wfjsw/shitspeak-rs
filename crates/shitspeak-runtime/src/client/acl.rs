@@ -28,7 +28,21 @@ pub async fn compute_permissions_for_client_as_if_in_channel(
     client: &Arc<Box<Client>>,
     channel_id: u32,
 ) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
-    compute_permissions_for_client_inner(server, client, channel_id, Some(channel_id)).await
+    compute_permissions_for_client_with_home_channel(server, client, channel_id, channel_id).await
+}
+
+/// Compute permissions for `channel_id` using an explicit home channel.
+///
+/// Client-log projection uses this when the live client has already advanced
+/// beyond the entry currently being rendered. Explicit-home evaluations are
+/// deliberately uncached because the cache is keyed to the live home state.
+pub(crate) async fn compute_permissions_for_client_with_home_channel(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_id: u32,
+    home_channel_id: u32,
+) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
+    compute_permissions_for_client_inner(server, client, channel_id, Some(home_channel_id)).await
 }
 
 async fn compute_permissions_for_client_inner(

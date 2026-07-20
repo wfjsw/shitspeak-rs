@@ -756,6 +756,15 @@ pub async fn can_view_user(
     viewer: &Arc<Box<Client>>,
     target: &Arc<Box<Client>>,
 ) -> bool {
+    can_view_user_with_home(server, viewer, target, None).await
+}
+
+async fn can_view_user_with_home(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    target: &Arc<Box<Client>>,
+    effective_home_channel_id: Option<u32>,
+) -> bool {
     if !server.get_hide_users_without_traverse() {
         return true;
     }
@@ -765,12 +774,25 @@ pub async fn can_view_user(
     if !target.is_authenticated() {
         return false;
     }
-    let perms = crate::client::acl::compute_permissions_for_client(
-        server,
-        viewer,
-        target.get_current_channel_id(),
-    )
-    .await;
+    let perms = match effective_home_channel_id {
+        Some(home_channel_id) => {
+            crate::client::acl::compute_permissions_for_client_with_home_channel(
+                server,
+                viewer,
+                target.get_current_channel_id(),
+                home_channel_id,
+            )
+            .await
+        }
+        None => {
+            crate::client::acl::compute_permissions_for_client(
+                server,
+                viewer,
+                target.get_current_channel_id(),
+            )
+            .await
+        }
+    };
     perms.contains(ACLPermissions::Traverse)
 }
 
@@ -779,23 +801,45 @@ async fn can_project_user(
     viewer: &Arc<Box<Client>>,
     target: &Arc<Box<Client>>,
 ) -> bool {
+    can_project_user_with_home(server, viewer, target, None).await
+}
+
+async fn can_project_user_with_home(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    target: &Arc<Box<Client>>,
+    effective_home_channel_id: Option<u32>,
+) -> bool {
     // A viewer must always retain their own UserState. The matching channel
     // and its parent chain are retained separately by channel projection.
     if viewer.get_session_id() == target.get_session_id() {
         return true;
     }
-    if !can_view_user(server, viewer, target).await {
+    if !can_view_user_with_home(server, viewer, target, effective_home_channel_id).await {
         return false;
     }
     if !server.get_hide_channels_without_traverse() {
         return true;
     }
-    crate::channel_handler::can_view_channel_with_ancestors(
-        server,
-        viewer,
-        target.get_current_channel_id(),
-    )
-    .await
+    match effective_home_channel_id {
+        Some(home_channel_id) => {
+            crate::channel_handler::can_view_channel_with_ancestors_at_home(
+                server,
+                viewer,
+                target.get_current_channel_id(),
+                home_channel_id,
+            )
+            .await
+        }
+        None => {
+            crate::channel_handler::can_view_channel_with_ancestors(
+                server,
+                viewer,
+                target.get_current_channel_id(),
+            )
+            .await
+        }
+    }
 }
 
 pub async fn get_visible_client_in_server(
@@ -820,6 +864,15 @@ pub async fn visible_listener_channels(
     viewer: &Arc<Box<Client>>,
     channels: HashSet<u32>,
 ) -> HashSet<u32> {
+    visible_listener_channels_with_home(server, viewer, channels, None).await
+}
+
+async fn visible_listener_channels_with_home(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    channels: HashSet<u32>,
+    effective_home_channel_id: Option<u32>,
+) -> HashSet<u32> {
     if !server.get_hide_users_without_traverse() {
         return channels;
     }
@@ -827,12 +880,40 @@ pub async fn visible_listener_channels(
     let mut visible = HashSet::new();
     for channel_id in channels {
         let traversable = if server.get_hide_channels_without_traverse() {
-            crate::channel_handler::can_view_channel_with_ancestors(server, viewer, channel_id)
-                .await
+            match effective_home_channel_id {
+                Some(home_channel_id) => {
+                    crate::channel_handler::can_view_channel_with_ancestors_at_home(
+                        server,
+                        viewer,
+                        channel_id,
+                        home_channel_id,
+                    )
+                    .await
+                }
+                None => {
+                    crate::channel_handler::can_view_channel_with_ancestors(
+                        server, viewer, channel_id,
+                    )
+                    .await
+                }
+            }
         } else {
-            crate::client::acl::compute_permissions_for_client(server, viewer, channel_id)
-                .await
-                .contains(ACLPermissions::Traverse)
+            match effective_home_channel_id {
+                Some(home_channel_id) => {
+                    crate::client::acl::compute_permissions_for_client_with_home_channel(
+                        server,
+                        viewer,
+                        channel_id,
+                        home_channel_id,
+                    )
+                    .await
+                }
+                None => {
+                    crate::client::acl::compute_permissions_for_client(server, viewer, channel_id)
+                        .await
+                }
+            }
+            .contains(ACLPermissions::Traverse)
         };
 
         if traversable {
@@ -1126,6 +1207,16 @@ pub async fn project_message(
     visibility: &mut UserVisibilityState,
     message: &Message,
 ) -> Vec<Message> {
+    project_message_at_home(server, viewer, visibility, message, None).await
+}
+
+async fn project_message_at_home(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    visibility: &mut UserVisibilityState,
+    message: &Message,
+    effective_home_channel_id: Option<u32>,
+) -> Vec<Message> {
     if server.get_hide_users_without_traverse() {
         visibility.ensure_registered_for_server(server, &viewer.server_id());
     }
@@ -1146,7 +1237,15 @@ pub async fn project_message(
                 };
             };
             if server.get_hide_users_without_traverse() {
-                project_user_state(server, viewer, visibility, &user_state, session).await
+                project_user_state(
+                    server,
+                    viewer,
+                    visibility,
+                    &user_state,
+                    session,
+                    effective_home_channel_id,
+                )
+                .await
             } else {
                 let mut projected = user_state;
                 project_user_state_fields_for_viewer(server, viewer, &mut projected);
@@ -1162,10 +1261,11 @@ pub async fn project_message(
                 return Vec::new();
             }
             let mut projected = UserRemove::from(user_remove.clone());
-            projected.actor = visible_actor(
+            projected.actor = visible_actor_with_home(
                 server,
                 viewer,
                 projected.actor.map(ClientSessionIdentifier::from),
+                effective_home_channel_id,
             )
             .await
             .map(u32::from);
@@ -1183,21 +1283,50 @@ pub async fn project_message_with_shadow(
     server_id: &str,
     message: &Message,
 ) -> Vec<Message> {
+    project_message_with_shadow_at_home(
+        server,
+        viewer,
+        visibility,
+        channel_shadow,
+        server_id,
+        message,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn project_message_with_shadow_at_home(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    visibility: &mut UserVisibilityState,
+    channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    message: &Message,
+    effective_home_channel_id: Option<u32>,
+) -> Vec<Message> {
     if let Message::UserRemove(user_remove) = message {
         channel_shadow.remove(&ClientSessionIdentifier::from(user_remove.session));
     }
 
-    let projected = project_message(server, viewer, visibility, message).await;
+    let projected = project_message_at_home(
+        server,
+        viewer,
+        visibility,
+        message,
+        effective_home_channel_id,
+    )
+    .await;
     let mut out = Vec::new();
     for message in projected {
         out.extend(
-            sync_projected_message_with_shadow(
+            sync_projected_message_with_shadow_at_home(
                 server,
                 viewer,
                 visibility,
                 channel_shadow,
                 server_id,
                 message,
+                effective_home_channel_id,
             )
             .await,
         );
@@ -1213,6 +1342,27 @@ pub async fn sync_projected_message_with_shadow(
     server_id: &str,
     message: Message,
 ) -> Vec<Message> {
+    sync_projected_message_with_shadow_at_home(
+        server,
+        viewer,
+        visibility,
+        channel_shadow,
+        server_id,
+        message,
+        None,
+    )
+    .await
+}
+
+async fn sync_projected_message_with_shadow_at_home(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    visibility: &mut UserVisibilityState,
+    channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    message: Message,
+    effective_home_channel_id: Option<u32>,
+) -> Vec<Message> {
     let mut out = vec![message.clone()];
     let synthetic = crate::channel_handler::sync_shadow_for_client_message(
         server,
@@ -1223,8 +1373,14 @@ pub async fn sync_projected_message_with_shadow(
     )
     .await;
     for synthetic_message in synthetic {
-        let projected_synthetic =
-            project_message(server, viewer, visibility, &synthetic_message).await;
+        let projected_synthetic = project_message_at_home(
+            server,
+            viewer,
+            visibility,
+            &synthetic_message,
+            effective_home_channel_id,
+        )
+        .await;
         for projected in projected_synthetic {
             let _ = crate::channel_handler::sync_shadow_for_client_message(
                 server,
@@ -1244,7 +1400,17 @@ pub async fn visibility_refresh_messages(
     server: &Arc<Box<Server>>,
     viewer: &Arc<Box<Client>>,
     visibility: &mut UserVisibilityState,
+    scope: VisibilityRefreshScope,
+) -> Vec<Message> {
+    visibility_refresh_messages_with_home(server, viewer, visibility, scope, None).await
+}
+
+async fn visibility_refresh_messages_with_home(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    visibility: &mut UserVisibilityState,
     mut scope: VisibilityRefreshScope,
+    effective_home_channel_id: Option<u32>,
 ) -> Vec<Message> {
     let hide_users_without_traverse = server.get_hide_users_without_traverse();
     let include_user_state_names = scope.include_user_state_names;
@@ -1342,6 +1508,7 @@ pub async fn visibility_refresh_messages(
                             visibility,
                             &target,
                             include_user_state_names,
+                            effective_home_channel_id,
                         )
                         .await,
                     );
@@ -1369,7 +1536,35 @@ pub async fn visibility_refresh_messages_with_shadow(
     server_id: &str,
     scope: VisibilityRefreshScope,
 ) -> Vec<Message> {
-    let refresh = visibility_refresh_messages(server, viewer, visibility, scope).await;
+    visibility_refresh_messages_with_shadow_at_home(
+        server,
+        viewer,
+        visibility,
+        channel_shadow,
+        server_id,
+        scope,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn visibility_refresh_messages_with_shadow_at_home(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    visibility: &mut UserVisibilityState,
+    channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    scope: VisibilityRefreshScope,
+    effective_home_channel_id: Option<u32>,
+) -> Vec<Message> {
+    let refresh = visibility_refresh_messages_with_home(
+        server,
+        viewer,
+        visibility,
+        scope,
+        effective_home_channel_id,
+    )
+    .await;
     let mut out = Vec::new();
     for message in refresh {
         out.extend(
@@ -1644,6 +1839,7 @@ async fn project_user_state(
     visibility: &mut UserVisibilityState,
     raw: &UserState,
     session: ClientSessionIdentifier,
+    effective_home_channel_id: Option<u32>,
 ) -> Vec<Message> {
     let server_id = viewer.server_id();
     let Some(target) = server
@@ -1657,7 +1853,8 @@ async fn project_user_state(
         return Vec::new();
     };
 
-    let visible = can_project_user(server, viewer, &target).await;
+    let visible =
+        can_project_user_with_home(server, viewer, &target, effective_home_channel_id).await;
     let known_before = visibility.get(session).cloned();
     if !visible {
         if visibility.remove(session) {
@@ -1666,9 +1863,19 @@ async fn project_user_state(
         return Vec::new();
     }
 
-    let current_channel = target.get_current_channel_id();
-    let new_listeners =
-        visible_listener_channels(server, viewer, target.get_listening_channel_ids()).await;
+    let current_channel = if session == viewer.get_session_id() {
+        raw.channel_id
+            .unwrap_or_else(|| target.get_current_channel_id())
+    } else {
+        target.get_current_channel_id()
+    };
+    let new_listeners = visible_listener_channels_with_home(
+        server,
+        viewer,
+        target.get_listening_channel_ids(),
+        effective_home_channel_id,
+    )
+    .await;
 
     if known_before.is_none() {
         visibility.insert(session, current_channel, new_listeners.clone());
@@ -1682,7 +1889,8 @@ async fn project_user_state(
     let old = known_before.expect("checked is_some");
     visibility.insert(session, current_channel, new_listeners.clone());
     let mut projected = raw.clone();
-    projected.actor = visible_actor(server, viewer, raw.actor).await;
+    projected.actor =
+        visible_actor_with_home(server, viewer, raw.actor, effective_home_channel_id).await;
     projected.listening_channel_add = sorted_difference(&new_listeners, &old.listener_channels);
     projected.listening_channel_remove = sorted_difference(&old.listener_channels, &new_listeners);
     project_user_state_fields_for_viewer(server, viewer, &mut projected);
@@ -1700,10 +1908,12 @@ async fn refresh_target_visibility(
     visibility: &mut UserVisibilityState,
     target: &Arc<Box<Client>>,
     include_user_state_name: bool,
+    effective_home_channel_id: Option<u32>,
 ) -> Vec<Message> {
     let session = target.get_session_id();
     let known_before = visibility.get(session).cloned();
-    let visible = can_project_user(server, viewer, target).await;
+    let visible =
+        can_project_user_with_home(server, viewer, target, effective_home_channel_id).await;
 
     if !visible {
         if visibility.remove(session) {
@@ -1712,9 +1922,18 @@ async fn refresh_target_visibility(
         return Vec::new();
     }
 
-    let current_channel = target.get_current_channel_id();
-    let new_listeners =
-        visible_listener_channels(server, viewer, target.get_listening_channel_ids()).await;
+    let current_channel = if target.get_session_id() == viewer.get_session_id() {
+        effective_home_channel_id.unwrap_or_else(|| target.get_current_channel_id())
+    } else {
+        target.get_current_channel_id()
+    };
+    let new_listeners = visible_listener_channels_with_home(
+        server,
+        viewer,
+        target.get_listening_channel_ids(),
+        effective_home_channel_id,
+    )
+    .await;
 
     match known_before {
         None => {
@@ -1767,13 +1986,22 @@ async fn visible_actor(
     viewer: &Arc<Box<Client>>,
     actor: Option<ClientSessionIdentifier>,
 ) -> Option<ClientSessionIdentifier> {
+    visible_actor_with_home(server, viewer, actor, None).await
+}
+
+async fn visible_actor_with_home(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    actor: Option<ClientSessionIdentifier>,
+    effective_home_channel_id: Option<u32>,
+) -> Option<ClientSessionIdentifier> {
     let actor = actor?;
     let server_id = viewer.server_id();
     let target = server
         .get_clients()
         .get_client_in_server(&server_id, actor)
         .await?;
-    can_project_user(server, viewer, &target)
+    can_project_user_with_home(server, viewer, &target, effective_home_channel_id)
         .await
         .then_some(actor)
 }

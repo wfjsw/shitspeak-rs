@@ -393,58 +393,6 @@ fn spawn_client_message_handler(
     });
 }
 
-fn is_acl_cache_flush_message(message: &Message) -> bool {
-    matches!(message, Message::PermissionQuery(pq) if pq.flush == Some(true))
-}
-
-#[derive(Clone, Copy)]
-enum PermissionInfoRefreshKind {
-    All,
-    HomeChannelDependent { new_channel_id: u32 },
-}
-
-#[derive(Clone, Copy)]
-enum PermissionInfoRefreshScope<'a> {
-    All,
-    HomeChannelDependent(&'a crate::channel_handler::HomeChannelMoveImpact),
-}
-
-fn permission_info_refresh_scope_for_delta(
-    delta: &ClientGlobalStateDelta,
-) -> Option<PermissionInfoRefreshKind> {
-    if delta.user_id.is_some()
-        || delta.groups.is_some()
-        || delta.is_superuser.is_some()
-        || delta.tokens.is_some()
-    {
-        Some(PermissionInfoRefreshKind::All)
-    } else if let Some(new_channel_id) = delta.current_channel_id {
-        Some(PermissionInfoRefreshKind::HomeChannelDependent { new_channel_id })
-    } else {
-        None
-    }
-}
-
-fn permission_info_refresh_scope_for_entry(
-    entry: &crate::client::state_log::ClientStateLogEntry,
-    viewer_session_id: ClientSessionIdentifier,
-    viewer_client_instance_id: ClientInstanceId,
-) -> Option<PermissionInfoRefreshKind> {
-    match &entry.op {
-        ClientStateOperation::UpdateGlobalState {
-            session_id,
-            client_instance_id,
-            delta,
-            ..
-        } if *session_id == viewer_session_id
-            && (*client_instance_id == 0 || *client_instance_id == viewer_client_instance_id) =>
-        {
-            permission_info_refresh_scope_for_delta(delta)
-        }
-        _ => None,
-    }
-}
-
 fn is_own_client_log_entry(
     op: &ClientStateOperation,
     session_id: ClientSessionIdentifier,
@@ -457,155 +405,6 @@ pub(super) fn sorted_channel_ids(channel_ids: &HashSet<u32>) -> Vec<u32> {
     let mut channel_ids: Vec<_> = channel_ids.iter().copied().collect();
     channel_ids.sort_unstable();
     channel_ids
-}
-
-async fn permission_info_refresh_messages(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    scope: PermissionInfoRefreshScope<'_>,
-) -> Vec<Message> {
-    match scope {
-        PermissionInfoRefreshScope::All => {
-            let mut messages =
-                crate::channel_handler::build_channel_permission_query_refresh_messages(
-                    server,
-                    client,
-                    server.get_channels(),
-                )
-                .await;
-            if server.get_send_permission_info() {
-                messages.extend(
-                    crate::channel_handler::build_channel_permission_info_refresh_messages(
-                        server,
-                        client,
-                        server.get_channels(),
-                    )
-                    .await,
-                );
-            }
-            messages
-        }
-        PermissionInfoRefreshScope::HomeChannelDependent(impact) => {
-            crate::channel_handler::build_home_channel_permission_info_refresh_messages_from_impact(
-                server, client, impact,
-            )
-            .await
-        }
-    }
-}
-
-async fn write_projected_client_log_message_with_acl_refresh(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    user_visibility: &mut UserVisibilityState,
-    session_channel_shadow: &mut SessionChannelShadow,
-    server_id: &str,
-    message: &Message,
-) -> Result<(), HandleIncomingConnectionError> {
-    write_projected_client_log_message_with_acl_refresh_scope(
-        server,
-        client,
-        user_visibility,
-        session_channel_shadow,
-        server_id,
-        message,
-        PermissionInfoRefreshScope::All,
-    )
-    .await
-}
-
-async fn write_projected_client_log_message_with_acl_refresh_scope(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    user_visibility: &mut UserVisibilityState,
-    session_channel_shadow: &mut SessionChannelShadow,
-    server_id: &str,
-    message: &Message,
-    refresh_scope: PermissionInfoRefreshScope<'_>,
-) -> Result<(), HandleIncomingConnectionError> {
-    let mut out = crate::client::visibility::project_message_with_shadow(
-        server,
-        client,
-        user_visibility,
-        session_channel_shadow,
-        server_id,
-        message,
-    )
-    .await;
-
-    let should_refresh_permissions = is_acl_cache_flush_message(message);
-    if should_refresh_permissions {
-        out.clear();
-    }
-
-    if should_refresh_permissions {
-        for refresh in permission_info_refresh_messages(server, client, refresh_scope).await {
-            out.extend(
-                crate::client::visibility::project_message_with_shadow(
-                    server,
-                    client,
-                    user_visibility,
-                    session_channel_shadow,
-                    server_id,
-                    &refresh,
-                )
-                .await,
-            );
-        }
-    }
-
-    client
-        .write_proto_message_batch(&out)
-        .await
-        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-
-    Ok(())
-}
-
-async fn projected_client_log_messages_with_acl_refresh_scope(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    user_visibility: &mut UserVisibilityState,
-    session_channel_shadow: &mut SessionChannelShadow,
-    server_id: &str,
-    message: &Message,
-    refresh_scope: PermissionInfoRefreshScope<'_>,
-) -> Vec<Message> {
-    let mut out = project_message_with_visibility_shadows(
-        server,
-        client,
-        channel_tree_shadow,
-        user_visibility,
-        session_channel_shadow,
-        server_id,
-        message,
-    )
-    .await;
-
-    let should_refresh_permissions = is_acl_cache_flush_message(message);
-    if should_refresh_permissions {
-        out.clear();
-    }
-
-    if should_refresh_permissions {
-        for refresh in permission_info_refresh_messages(server, client, refresh_scope).await {
-            out.extend(
-                project_message_with_visibility_shadows(
-                    server,
-                    client,
-                    channel_tree_shadow,
-                    user_visibility,
-                    session_channel_shadow,
-                    server_id,
-                    &refresh,
-                )
-                .await,
-            );
-        }
-    }
-
-    out
 }
 
 async fn project_message_with_visibility_shadows(
@@ -629,28 +428,6 @@ async fn project_message_with_visibility_shadows(
     .await
 }
 
-async fn append_visibility_refresh_messages(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    user_visibility: &mut UserVisibilityState,
-    session_channel_shadow: &mut SessionChannelShadow,
-    server_id: &str,
-    scope: crate::client::visibility::VisibilityRefreshScope,
-    out: &mut Vec<Message>,
-) {
-    out.extend(
-        crate::client::visibility::visibility_refresh_messages_with_shadow(
-            server,
-            client,
-            user_visibility,
-            session_channel_shadow,
-            server_id,
-            scope,
-        )
-        .await,
-    );
-}
-
 async fn append_client_log_entry_messages(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -658,7 +435,7 @@ async fn append_client_log_entry_messages(
     channel_tree_shadow: &mut ChannelTreeShadow,
     user_visibility: &mut UserVisibilityState,
     session_channel_shadow: &mut SessionChannelShadow,
-    server_id: &str,
+    _server_id: &str,
     entry: &ClientStateLogEntry,
     out: &mut Vec<Message>,
 ) -> Result<(), HandleIncomingConnectionError> {
@@ -686,103 +463,17 @@ async fn append_client_log_entry_messages(
         }
     }
 
-    let old_viewer_channel_id = session_channel_shadow
-        .get(&client.get_session_id())
-        .copied();
-    let permission_refresh_kind = permission_info_refresh_scope_for_entry(
-        entry,
-        client.get_session_id(),
-        client.client_instance_id(),
-    )
-    .unwrap_or(PermissionInfoRefreshKind::All);
-
-    let home_move_impact = match permission_refresh_kind {
-        PermissionInfoRefreshKind::HomeChannelDependent { new_channel_id } => Some(
-            crate::channel_handler::HomeChannelMoveImpact::calculate(
-                server,
-                client,
-                old_viewer_channel_id,
-                new_channel_id,
-            )
-            .await,
-        ),
-        PermissionInfoRefreshKind::All => None,
-    };
-    let permission_refresh_scope = match home_move_impact.as_ref() {
-        Some(impact) => PermissionInfoRefreshScope::HomeChannelDependent(impact),
-        None => PermissionInfoRefreshScope::All,
-    };
-
-    let visibility_refresh_scope =
-        crate::client::visibility::visibility_refresh_scope_for_client_log_entry_with_home_move_impact(
+    out.extend(
+        crate::channel_handler::project_client_log_entry_transition(
             server,
             client,
+            channel_tree_shadow,
+            user_visibility,
+            session_channel_shadow,
             entry,
-            old_viewer_channel_id,
-            home_move_impact.as_ref(),
         )
-        .await;
-    let channel_refresh = match home_move_impact.as_ref() {
-        Some(impact) => {
-            crate::channel_handler::prepare_channel_visibility_refresh_for_home_move(
-                server,
-                client,
-                channel_tree_shadow,
-                &visibility_refresh_scope,
-                impact,
-            )
-            .await
-        }
-        None => {
-            crate::channel_handler::prepare_channel_visibility_refresh(
-                server,
-                client,
-                channel_tree_shadow,
-                &visibility_refresh_scope,
-            )
-            .await
-        }
-    };
-
-    channel_refresh.apply_additions(channel_tree_shadow);
-    channel_refresh.append_additions_to(out);
-
-    for msg in entry
-        .messages_for_client(
-            &server.clients,
-            client.get_session_id(),
-            client.client_instance_id(),
-        )
-        .await
-    {
-        out.extend(
-            projected_client_log_messages_with_acl_refresh_scope(
-                server,
-                client,
-                channel_tree_shadow,
-                user_visibility,
-                session_channel_shadow,
-                server_id,
-                &msg,
-                permission_refresh_scope,
-            )
-            .await,
-        );
-    }
-
-    append_visibility_refresh_messages(
-        server,
-        client,
-        user_visibility,
-        session_channel_shadow,
-        server_id,
-        visibility_refresh_scope,
-        out,
-    )
-    .await;
-
-    channel_refresh.apply_removals(channel_tree_shadow);
-    channel_refresh.append_removals_to(out);
+        .await,
+    );
     Ok(())
 }
 

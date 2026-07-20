@@ -10,6 +10,7 @@ use futures_util::{
 };
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
+use crate::client::state_log::ClientStateOperation;
 use crate::integration_tests::harness::{
     TestClient, TestS2sServerOpts, TestServer, TestServerOpts, spawn_s2s_test_server,
     spawn_s2s_test_server_with_config, test_client::ConnectError,
@@ -2243,6 +2244,118 @@ async fn s2s_cross_node_moderation_applies_to_owner() {
         .await;
 
     assert!(msg.is_some(), "Bob should receive the cross-node mute");
+}
+
+/// Checks that a moderator move routed to a remote target owner is committed
+/// to that owner's client log and projected to the target socket from there.
+/// Expected: Bob receives the destination and parent permission refreshes
+/// exactly once before the self `UserState` move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_cross_node_moderator_move_projects_from_target_owner_log() {
+    const DESTINATION_CHANNEL: u32 = 43;
+
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    a.server
+        .get_channels()
+        .create_channel(Channel::new(
+            DESTINATION_CHANNEL,
+            "Remote move destination".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create destination channel");
+    assert!(
+        wait_until(S2S_DEADLINE, || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(b.server.get_channels().get_channel(DESTINATION_CHANNEL))
+                    .is_some()
+            })
+        })
+        .await,
+        "target owner should replicate the destination channel"
+    );
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+    wait_for_server_to_track_client(&a, bob.server_session).await;
+    wait_for_server_to_track_client(&b, alice.server_session).await;
+    bob.drain_now().await;
+
+    let owner_log_version = b.server.get_clients().current_version();
+    alice.move_other(bob.session_id, DESTINATION_CHANNEL).await;
+
+    let mut projected = Vec::new();
+    let classify = |message: &Message| match message {
+        Message::PermissionQuery(query) if query.channel_id == Some(DESTINATION_CHANNEL) => {
+            Some("destination-permissions")
+        }
+        Message::PermissionQuery(query) if query.channel_id == Some(0) => {
+            Some("parent-permissions")
+        }
+        Message::UserState(state)
+            if state.session == Some(bob.session_id)
+                && state.actor == Some(alice.session_id)
+                && state.channel_id == Some(DESTINATION_CHANNEL) =>
+        {
+            Some("self-move")
+        }
+        _ => None,
+    };
+    let deadline = tokio::time::Instant::now() + CLIENT_DEADLINE;
+    while tokio::time::Instant::now() < deadline && projected.len() < 3 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = bob.recv(remaining).await else {
+            break;
+        };
+        if let Some(event) = classify(&message) {
+            projected.push(event);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for message in bob.drain_now().await {
+        if let Some(event) = classify(&message) {
+            projected.push(event);
+        }
+    }
+
+    assert_eq!(
+        projected,
+        vec!["destination-permissions", "parent-permissions", "self-move",],
+        "the target log projection should own permission refresh ordering without a direct send"
+    );
+
+    let owner_log = b
+        .server
+        .get_clients()
+        .get_log_since(owner_log_version)
+        .await;
+    assert!(
+        owner_log.iter().any(|entry| {
+            matches!(
+                &entry.op,
+                ClientStateOperation::UpdateGlobalState {
+                    session_id,
+                    sender_session_id: Some(sender_session_id),
+                    delta,
+                    ..
+                } if *session_id == bob.server_session
+                    && *sender_session_id == alice.server_session
+                    && delta.current_channel_id == Some(DESTINATION_CHANNEL)
+            )
+        }),
+        "the remote target owner should commit the moderator move to its client log"
+    );
 }
 
 /// Checks cross-node normal-channel voice routing.

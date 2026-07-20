@@ -3050,20 +3050,6 @@ async fn apply_user_state_patch(
             }
         }
     }
-
-    if let Some(channel_id) = patch.channel_id {
-        if let Err(error) =
-            crate::client::handlers::send_enter_permission_queries(server, &target, channel_id)
-                .await
-        {
-            tracing::warn!(
-                error = %error,
-                target = u32::from(target_id),
-                channel_id,
-                "failed to send enter permission queries after s2s user-state patch"
-            );
-        }
-    }
 }
 
 async fn apply_user_remove_patch(

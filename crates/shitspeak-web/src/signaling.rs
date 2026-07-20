@@ -1822,7 +1822,6 @@ async fn send_web_client_log_update(
         &mut session.channel_tree_shadow,
         &mut session.channel_shadow,
         &mut session.user_visibility,
-        &server_id,
         entry,
     )
     .await?;
@@ -1839,96 +1838,6 @@ fn is_known_add_client(op: &ClientStateOperation, shadow: &SessionChannelShadow)
         op,
         ClientStateOperation::AddClient { session_id, .. } if shadow.contains_key(session_id)
     )
-}
-
-#[derive(Clone, Copy)]
-enum PermissionInfoRefreshScope {
-    All,
-    HomeChannelDependent {
-        old_channel_id: Option<u32>,
-        new_channel_id: u32,
-    },
-}
-
-fn permission_info_refresh_scope_for_delta(
-    delta: &shitspeak_runtime::client::state_log::ClientGlobalStateDelta,
-) -> Option<PermissionInfoRefreshScope> {
-    if delta.user_id.is_some()
-        || delta.groups.is_some()
-        || delta.is_superuser.is_some()
-        || delta.tokens.is_some()
-    {
-        Some(PermissionInfoRefreshScope::All)
-    } else if let Some(new_channel_id) = delta.current_channel_id {
-        Some(PermissionInfoRefreshScope::HomeChannelDependent {
-            old_channel_id: None,
-            new_channel_id,
-        })
-    } else {
-        None
-    }
-}
-
-fn permission_info_refresh_scope_for_entry(
-    entry: &ClientStateLogEntry,
-    viewer_session_id: ClientSessionIdentifier,
-    viewer_client_instance_id: shitspeak_runtime::client::ClientInstanceId,
-) -> Option<PermissionInfoRefreshScope> {
-    match &entry.op {
-        ClientStateOperation::UpdateGlobalState {
-            session_id,
-            client_instance_id,
-            delta,
-            ..
-        } if *session_id == viewer_session_id
-            && (*client_instance_id == 0 || *client_instance_id == viewer_client_instance_id) =>
-        {
-            permission_info_refresh_scope_for_delta(delta)
-        }
-        _ => None,
-    }
-}
-
-async fn permission_info_refresh_messages(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    scope: PermissionInfoRefreshScope,
-) -> Vec<Message> {
-    match scope {
-        PermissionInfoRefreshScope::All => {
-            let mut messages =
-                shitspeak_runtime::channel_handler::build_channel_permission_query_refresh_messages(
-                    server,
-                    client,
-                    server.get_channels(),
-                )
-                .await;
-            if server.get_send_permission_info() {
-                messages.extend(
-                    shitspeak_runtime::channel_handler::build_channel_permission_info_refresh_messages(
-                        server,
-                        client,
-                        server.get_channels(),
-                    )
-                    .await,
-                );
-            }
-            messages
-        }
-        PermissionInfoRefreshScope::HomeChannelDependent {
-            old_channel_id,
-            new_channel_id,
-        } => {
-            shitspeak_runtime::channel_handler::build_home_channel_permission_info_refresh_messages(
-                server,
-                client,
-                server.get_channels(),
-                old_channel_id,
-                new_channel_id,
-            )
-            .await
-        }
-    }
 }
 
 async fn send_web_client_log_gap(
@@ -1970,85 +1879,11 @@ async fn send_web_client_log_gap(
             &mut session.channel_tree_shadow,
             &mut session.channel_shadow,
             &mut session.user_visibility,
-            &server_id,
             &entry,
         )
         .await?;
     }
     client.update_last_client_versions(&versions).await;
-    Ok(())
-}
-
-fn is_acl_cache_flush_message(message: &Message) -> bool {
-    matches!(message, Message::PermissionQuery(pq) if pq.flush == Some(true))
-}
-
-async fn send_web_client_log_message_with_acl_refresh_scope(
-    stream: &mut (impl AsyncWrite + Unpin),
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    peer: Option<&WebRtcPeer>,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
-    server_id: &str,
-    message: &Message,
-    refresh_scope: PermissionInfoRefreshScope,
-) -> io::Result<()> {
-    if is_acl_cache_flush_message(message) {
-        return send_scoped_web_permission_refresh(
-            stream,
-            server,
-            client,
-            peer,
-            channel_tree_shadow,
-            channel_shadow,
-            user_visibility,
-            server_id,
-            refresh_scope,
-        )
-        .await;
-    }
-
-    send_web_outbound_message_with_synthetic(
-        stream,
-        server,
-        client,
-        peer,
-        channel_tree_shadow,
-        channel_shadow,
-        user_visibility,
-        server_id,
-        message,
-    )
-    .await
-}
-
-async fn send_scoped_web_permission_refresh(
-    stream: &mut (impl AsyncWrite + Unpin),
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    peer: Option<&WebRtcPeer>,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
-    server_id: &str,
-    refresh_scope: PermissionInfoRefreshScope,
-) -> io::Result<()> {
-    for refresh in permission_info_refresh_messages(server, client, refresh_scope).await {
-        send_web_outbound_message_with_synthetic(
-            stream,
-            server,
-            client,
-            peer,
-            channel_tree_shadow,
-            channel_shadow,
-            user_visibility,
-            server_id,
-            &refresh,
-        )
-        .await?;
-    }
     Ok(())
 }
 
@@ -2060,85 +1895,21 @@ async fn send_web_client_log_entry(
     channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
-    server_id: &str,
     entry: &ClientStateLogEntry,
 ) -> io::Result<()> {
-    let old_viewer_channel_id = channel_shadow.get(&client.get_session_id()).copied();
-    let permission_refresh_scope = permission_info_refresh_scope_for_entry(
-        entry,
-        client.get_session_id(),
-        client.client_instance_id(),
-    )
-    .map(|scope| match scope {
-        PermissionInfoRefreshScope::HomeChannelDependent {
-            old_channel_id: _,
-            new_channel_id,
-        } => PermissionInfoRefreshScope::HomeChannelDependent {
-            old_channel_id: old_viewer_channel_id,
-            new_channel_id,
-        },
-        scope => scope,
-    })
-    .unwrap_or(PermissionInfoRefreshScope::All);
-    let visibility_refresh_scope =
-        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_client_log_entry(
-            server,
-            client,
-            entry,
-            old_viewer_channel_id,
-        )
-        .await;
-    let channel_refresh = shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh(
+    for message in shitspeak_runtime::channel_handler::project_client_log_entry_transition(
         server,
         client,
         channel_tree_shadow,
-        &visibility_refresh_scope,
-    )
-    .await;
-
-    let mut channel_additions = Vec::new();
-    channel_refresh.append_additions_to(&mut channel_additions);
-    channel_refresh.apply_additions(channel_tree_shadow);
-    for message in channel_additions {
-        send_web_outbound_message(stream, peer, message).await?;
-    }
-
-    for message in entry
-        .messages_for_client(
-            server.get_clients(),
-            client.get_session_id(),
-            client.client_instance_id(),
-        )
-        .await
-    {
-        send_web_client_log_message_with_acl_refresh_scope(
-            stream,
-            server,
-            client,
-            peer,
-            channel_tree_shadow,
-            channel_shadow,
-            user_visibility,
-            server_id,
-            &message,
-            permission_refresh_scope,
-        )
-        .await?;
-    }
-
-    send_prepared_web_visibility_refresh_without_additions(
-        stream,
-        server,
-        client,
-        peer,
-        channel_tree_shadow,
-        channel_shadow,
         user_visibility,
-        server_id,
-        channel_refresh,
-        visibility_refresh_scope,
+        channel_shadow,
+        entry,
     )
     .await
+    {
+        send_web_outbound_message(stream, peer, message).await?;
+    }
+    Ok(())
 }
 
 async fn send_web_outbound_message_with_synthetic(
@@ -2470,6 +2241,67 @@ mod tests {
     use async_trait::async_trait;
     use shitspeak_runtime::api::{AuthenticateResult, AuthenticationRejection};
     use shitspeak_runtime::localization::Language;
+
+    #[test]
+    fn web_event_conversion_preserves_move_messages_and_omits_permission_queries() {
+        let session = ClientSessionIdentifier::from(42);
+        let messages: Vec<Message> = vec![
+            shitspeak_runtime::messages::encoder::ChannelState {
+                channel_id: Some(10),
+                parent: Some(0),
+                name: Some("Hidden parent".to_string()),
+                ..Default::default()
+            }
+            .into(),
+            shitspeak_runtime::messages::encoder::ChannelState {
+                channel_id: Some(11),
+                parent: Some(10),
+                name: Some("Hidden destination".to_string()),
+                ..Default::default()
+            }
+            .into(),
+            shitspeak_runtime::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                11, 0,
+            )
+            .into(),
+            shitspeak_runtime::messages::encoder::UserState {
+                session: Some(session),
+                channel_id: Some(11),
+                ..Default::default()
+            }
+            .into(),
+            shitspeak_runtime::messages::encoder::ChannelRemove { channel_id: 11 }.into(),
+            shitspeak_runtime::messages::encoder::ChannelRemove { channel_id: 10 }.into(),
+        ];
+
+        let events = messages
+            .into_iter()
+            .filter_map(server_event_from_message)
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            &events[0],
+            ServerEvent::ChannelState(channel) if channel.channel_id == Some(10)
+        ));
+        assert!(matches!(
+            &events[1],
+            ServerEvent::ChannelState(channel) if channel.channel_id == Some(11)
+        ));
+        assert!(matches!(
+            &events[2],
+            ServerEvent::UserState(user)
+                if user.session == Some(u32::from(session)) && user.channel_id == Some(11)
+        ));
+        assert!(matches!(
+            &events[3],
+            ServerEvent::ChannelRemove { channel_id: 11 }
+        ));
+        assert!(matches!(
+            &events[4],
+            ServerEvent::ChannelRemove { channel_id: 10 }
+        ));
+        assert_eq!(events.len(), 5, "PermissionQuery must remain native-only");
+    }
 
     const TEST_WEBSOCKET_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 

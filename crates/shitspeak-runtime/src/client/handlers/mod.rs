@@ -41,7 +41,6 @@ use udp_tunnel::handle_udp_tunnel;
 use user_list::handle_user_list;
 use user_remove::handle_user_remove;
 use user_state::handle_user_state;
-pub(crate) use user_state::send_enter_permission_queries;
 use user_stats::handle_user_stats;
 use version::handle_version;
 use voice_target::handle_voice_target;

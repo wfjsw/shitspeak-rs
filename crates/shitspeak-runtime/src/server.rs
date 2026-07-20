@@ -1687,6 +1687,15 @@ impl Server {
                             new_config.acl.reevaluate_speak_on_acl_change()
                         );
                     }
+                    if current.acl.allow_move_without_traverse()
+                        != new_config.acl.allow_move_without_traverse()
+                    {
+                        tracing::info!(
+                            "config reload: acl.allow_move_without_traverse {} -> {}",
+                            current.acl.allow_move_without_traverse(),
+                            new_config.acl.allow_move_without_traverse()
+                        );
+                    }
                     if current.privacy.certificate_hash_protection()
                         != new_config.privacy.certificate_hash_protection()
                     {
@@ -1874,6 +1883,10 @@ impl Server {
 
     pub fn get_reevaluate_speak_on_acl_change(&self) -> bool {
         self.read_config().acl.reevaluate_speak_on_acl_change()
+    }
+
+    pub fn get_allow_move_without_traverse(&self) -> bool {
+        self.read_config().acl.allow_move_without_traverse()
     }
 
     pub(crate) async fn reevaluate_speak_after_acl_change(
