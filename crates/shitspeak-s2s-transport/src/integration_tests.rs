@@ -45,6 +45,148 @@ fn config_with_udp(pki: &Pki, node_idx: usize, udp: SocketAddr) -> TransportConf
         .with_udp_mtu(1400)
 }
 
+fn config_with_quic(pki: &Pki, node_idx: usize, quic: SocketAddr) -> TransportConfig {
+    let (cert, key) = &pki.nodes[node_idx];
+    TransportConfig::new(pki.ca_path.clone(), cert.clone(), key.clone())
+        .with_quic_listen(quic)
+        .with_reconnect_check_interval(Duration::from_millis(50))
+        .with_backoff_initial(Duration::from_millis(20))
+        .with_backoff_cap(Duration::from_millis(500))
+        .with_ping_interval(Duration::from_millis(200))
+        .with_quic_session_setup_timeout(Duration::from_secs(2))
+}
+
+#[tokio::test]
+async fn quic_v2_maps_reliable_classes_and_best_effort_datagrams() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[41, 42]);
+    let port_a = pick_free_udp_port().await;
+    let port_b = pick_free_udp_port().await;
+    let cfg_a = config_with_quic(&pki, 0, loopback(port_a));
+    let cfg_b = config_with_quic(&pki, 1, loopback(port_b));
+
+    let (mgr_b, mut inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
+    let (mgr_a, _inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
+    mgr_a
+        .add_address(42, PeerAddress::new(loopback(port_b), TransportKind::Quic))
+        .await;
+    wait_for_link(&mgr_a, 42, TransportKind::Quic).await;
+    wait_for_link(&mgr_b, 41, TransportKind::Quic).await;
+
+    for (level, class, payload) in [
+        (
+            ServiceLevel::Reliable,
+            MessageClass::Control,
+            b"control".as_slice(),
+        ),
+        (
+            ServiceLevel::ReliableLowLatency,
+            MessageClass::HighPriority,
+            b"high".as_slice(),
+        ),
+        (
+            ServiceLevel::Reliable,
+            MessageClass::Regular,
+            b"regular".as_slice(),
+        ),
+        (
+            ServiceLevel::BestEffort,
+            MessageClass::HighPriority,
+            b"voice-datagram".as_slice(),
+        ),
+        (
+            ServiceLevel::BestEffort,
+            MessageClass::Control,
+            b"repair-datagram".as_slice(),
+        ),
+    ] {
+        mgr_a
+            .send(42, level, None, class, Bytes::copy_from_slice(payload))
+            .await
+            .unwrap();
+        let received = match class {
+            MessageClass::Control => inbound_b.control().recv(),
+            MessageClass::HighPriority => inbound_b.high_priority().recv(),
+            MessageClass::Regular => inbound_b.regular().recv(),
+        };
+        let received = timeout(Duration::from_secs(2), received)
+            .await
+            .expect("QUIC v2 receive timeout")
+            .expect("inbound queue closed");
+        assert_eq!(received.from(), 41);
+        assert_eq!(received.transport(), TransportKind::Quic);
+        assert_eq!(received.class(), class);
+        assert_eq!(received.payload().as_ref(), payload);
+        assert_eq!(received.level(), level);
+    }
+
+    mgr_a.shutdown().await;
+    mgr_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn quic_v1_fallback_keeps_best_effort_on_legacy_stream() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[43, 44]);
+    let port_a = pick_free_udp_port().await;
+    let port_b = pick_free_udp_port().await;
+    let cfg_a = config_with_quic(&pki, 0, loopback(port_a));
+    let cfg_b = config_with_quic(&pki, 1, loopback(port_b)).with_quic_v1_only_for_test();
+
+    let (mgr_b, mut inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
+    let (mgr_a, _inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
+    mgr_a
+        .add_address(44, PeerAddress::new(loopback(port_b), TransportKind::Quic))
+        .await;
+    wait_for_link(&mgr_a, 44, TransportKind::Quic).await;
+
+    mgr_a
+        .send(
+            44,
+            ServiceLevel::BestEffort,
+            None,
+            MessageClass::HighPriority,
+            Bytes::from_static(b"legacy-best-effort"),
+        )
+        .await
+        .unwrap();
+    let received = timeout(Duration::from_secs(2), inbound_b.high_priority().recv())
+        .await
+        .expect("QUIC v1 receive timeout")
+        .expect("inbound queue closed");
+    assert_eq!(received.payload().as_ref(), b"legacy-best-effort");
+    assert_eq!(received.transport(), TransportKind::Quic);
+
+    mgr_a.shutdown().await;
+    mgr_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn quic_v2_rejects_disabled_local_datagram_support() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[45, 46]);
+    let port_a = pick_free_udp_port().await;
+    let port_b = pick_free_udp_port().await;
+    let cfg_a = config_with_quic(&pki, 0, loopback(port_a))
+        .with_quic_datagram_send_buffer_bytes(0)
+        .with_quic_datagram_receive_buffer_bytes(0);
+    let cfg_b = config_with_quic(&pki, 1, loopback(port_b));
+
+    let (mgr_b, _inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
+    let (mgr_a, _inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
+    mgr_a
+        .add_address(46, PeerAddress::new(loopback(port_b), TransportKind::Quic))
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!mgr_a.has_live_transport_kind(46, TransportKind::Quic));
+
+    mgr_a.shutdown().await;
+    mgr_b.shutdown().await;
+}
+
 fn config_for_compression(pki: &Pki, node_idx: usize, tcp: SocketAddr) -> TransportConfig {
     let (cert, key) = &pki.nodes[node_idx];
     TransportConfig::new(pki.ca_path.clone(), cert.clone(), key.clone())

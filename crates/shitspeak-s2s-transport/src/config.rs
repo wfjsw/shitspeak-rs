@@ -73,6 +73,14 @@ pub struct TransportConfig {
     udp_mtu: usize,
     kcp_tuning: KcpTuning,
     stream_write_timeout: Duration,
+    /// Maximum time allowed to establish and acknowledge all required QUIC v2 lanes.
+    quic_session_setup_timeout: Duration,
+    /// Quinn's unreliable DATAGRAM send-buffer budget. Zero disables sending.
+    quic_datagram_send_buffer_bytes: usize,
+    /// Quinn's unreliable DATAGRAM receive-buffer budget. Zero disables receiving.
+    quic_datagram_receive_buffer_bytes: usize,
+    /// Test seam for emulating an older peer that only advertises s2s/1.
+    quic_alpn_protocols_override: Option<Vec<Vec<u8>>>,
     compression: CompressionConfig,
     routing_policy: TransportRoutingPolicy,
 
@@ -154,6 +162,12 @@ impl TransportConfig {
             udp_mtu: 1200,
             kcp_tuning: KcpTuning::default(),
             stream_write_timeout: Duration::from_millis(default_stream_write_timeout_ms()),
+            quic_session_setup_timeout: Duration::from_millis(
+                default_quic_session_setup_timeout_ms(),
+            ),
+            quic_datagram_send_buffer_bytes: default_quic_datagram_send_buffer_bytes(),
+            quic_datagram_receive_buffer_bytes: default_quic_datagram_receive_buffer_bytes(),
+            quic_alpn_protocols_override: None,
             compression: CompressionConfig::default(),
             routing_policy: TransportRoutingPolicy::default(),
             latency_ewma_alpha: 0.2,
@@ -364,6 +378,22 @@ impl TransportConfig {
 
     pub fn stream_write_timeout(&self) -> Duration {
         self.stream_write_timeout
+    }
+
+    pub fn quic_session_setup_timeout(&self) -> Duration {
+        self.quic_session_setup_timeout
+    }
+
+    pub fn quic_datagram_send_buffer_bytes(&self) -> usize {
+        self.quic_datagram_send_buffer_bytes
+    }
+
+    pub fn quic_datagram_receive_buffer_bytes(&self) -> usize {
+        self.quic_datagram_receive_buffer_bytes
+    }
+
+    pub(crate) fn quic_alpn_protocols_override(&self) -> Option<&[Vec<u8>]> {
+        self.quic_alpn_protocols_override.as_deref()
     }
 
     pub fn compression_enabled(&self) -> bool {
@@ -683,6 +713,27 @@ impl TransportConfig {
 
     pub fn with_stream_write_timeout(mut self, timeout: Duration) -> Self {
         self.stream_write_timeout = timeout;
+        self
+    }
+
+    pub fn with_quic_session_setup_timeout(mut self, timeout: Duration) -> Self {
+        self.quic_session_setup_timeout = timeout;
+        self
+    }
+
+    pub fn with_quic_datagram_send_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.quic_datagram_send_buffer_bytes = bytes;
+        self
+    }
+
+    pub fn with_quic_datagram_receive_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.quic_datagram_receive_buffer_bytes = bytes;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_quic_v1_only_for_test(mut self) -> Self {
+        self.quic_alpn_protocols_override = Some(vec![b"s2s/1".to_vec()]);
         self
     }
 
@@ -1113,6 +1164,12 @@ pub struct TransportTuning {
     pub native_stats_interval_secs: u64,
     #[serde(default = "default_stream_write_timeout_ms")]
     pub stream_write_timeout_ms: u64,
+    #[serde(default = "default_quic_session_setup_timeout_ms")]
+    quic_session_setup_timeout_ms: u64,
+    #[serde(default = "default_quic_datagram_send_buffer_bytes")]
+    quic_datagram_send_buffer_bytes: usize,
+    #[serde(default = "default_quic_datagram_receive_buffer_bytes")]
+    quic_datagram_receive_buffer_bytes: usize,
     #[serde(default = "default_max_pending_pings")]
     pub max_pending_pings: usize,
     #[serde(default = "default_recent_probe_retry_cap_secs")]
@@ -1181,6 +1238,9 @@ impl Default for TransportTuning {
             idle_ping_interval_secs: default_idle_ping_interval_secs(),
             native_stats_interval_secs: default_native_stats_interval_secs(),
             stream_write_timeout_ms: default_stream_write_timeout_ms(),
+            quic_session_setup_timeout_ms: default_quic_session_setup_timeout_ms(),
+            quic_datagram_send_buffer_bytes: default_quic_datagram_send_buffer_bytes(),
+            quic_datagram_receive_buffer_bytes: default_quic_datagram_receive_buffer_bytes(),
             max_pending_pings: default_max_pending_pings(),
             recent_probe_retry_cap_secs: default_recent_probe_retry_cap_secs(),
             stale_probe_retry_cap_secs: default_stale_probe_retry_cap_secs(),
@@ -1229,6 +1289,11 @@ impl TransportTuning {
             .with_idle_ping_interval(Duration::from_secs(self.idle_ping_interval_secs))
             .with_native_stats_interval(Duration::from_secs(self.native_stats_interval_secs))
             .with_stream_write_timeout(Duration::from_millis(self.stream_write_timeout_ms))
+            .with_quic_session_setup_timeout(Duration::from_millis(
+                self.quic_session_setup_timeout_ms,
+            ))
+            .with_quic_datagram_send_buffer_bytes(self.quic_datagram_send_buffer_bytes)
+            .with_quic_datagram_receive_buffer_bytes(self.quic_datagram_receive_buffer_bytes)
             .with_max_pending_pings(self.max_pending_pings)
             .with_backoff_cap(Duration::from_secs(self.recent_probe_retry_cap_secs))
             .with_stale_backoff_cap(Duration::from_secs(self.stale_probe_retry_cap_secs))
@@ -1265,6 +1330,14 @@ impl TransportTuning {
     /// Apply tunables and load the optional compression dictionary from disk.
     pub fn try_apply(&self, cfg: TransportConfig) -> Result<TransportConfig, String> {
         self.routing_policy.validate_voice_path_stickiness()?;
+        validate_quic_datagram_buffer(
+            "quic_datagram_send_buffer_bytes",
+            self.quic_datagram_send_buffer_bytes,
+        )?;
+        validate_quic_datagram_buffer(
+            "quic_datagram_receive_buffer_bytes",
+            self.quic_datagram_receive_buffer_bytes,
+        )?;
         let mut cfg = self.apply(cfg);
         if let Some(path) = &self.compression_dictionary_path {
             let dictionary = fs::read(path).map_err(|e| {
@@ -1306,6 +1379,24 @@ fn default_native_stats_interval_secs() -> u64 {
 }
 fn default_stream_write_timeout_ms() -> u64 {
     1_000
+}
+fn default_quic_session_setup_timeout_ms() -> u64 {
+    10_000
+}
+fn default_quic_datagram_send_buffer_bytes() -> usize {
+    65_536
+}
+fn default_quic_datagram_receive_buffer_bytes() -> usize {
+    262_144
+}
+fn validate_quic_datagram_buffer(name: &str, bytes: usize) -> Result<(), String> {
+    const MIN_ENABLED_QUIC_DATAGRAM_BUFFER_BYTES: usize = 1_200;
+    if bytes != 0 && bytes < MIN_ENABLED_QUIC_DATAGRAM_BUFFER_BYTES {
+        return Err(format!(
+            "s2s.transport.{name} must be zero or at least {MIN_ENABLED_QUIC_DATAGRAM_BUFFER_BYTES} bytes"
+        ));
+    }
+    Ok(())
 }
 fn default_max_pending_pings() -> usize {
     64
@@ -1486,6 +1577,102 @@ mod tests {
         assert_eq!(cfg.inbound_high_capacity(), 4096);
         assert_eq!(cfg.inbound_regular_capacity(), 65_536);
         assert_eq!(cfg.outbound_capacity(), 8192);
+    }
+
+    #[test]
+    fn quic_v2_tuning_defaults_are_enabled_and_bounded() {
+        let cfg = TransportTuning::default().try_apply(base_config()).unwrap();
+
+        assert_eq!(
+            cfg.quic_session_setup_timeout(),
+            Duration::from_millis(10_000)
+        );
+        assert_eq!(cfg.quic_datagram_send_buffer_bytes(), 65_536);
+        assert_eq!(cfg.quic_datagram_receive_buffer_bytes(), 262_144);
+    }
+
+    #[test]
+    fn quic_v2_tuning_parses_and_applies() {
+        let tuning: TransportTuning = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                    quic_session_setup_timeout_ms = 3456
+                    quic_datagram_send_buffer_bytes = 4096
+                    quic_datagram_receive_buffer_bytes = 8192
+                "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("transport tuning parses");
+        let cfg = tuning.try_apply(base_config()).unwrap();
+
+        assert_eq!(
+            cfg.quic_session_setup_timeout(),
+            Duration::from_millis(3_456)
+        );
+        assert_eq!(cfg.quic_datagram_send_buffer_bytes(), 4_096);
+        assert_eq!(cfg.quic_datagram_receive_buffer_bytes(), 8_192);
+    }
+
+    #[test]
+    fn quic_v2_tuning_allows_disabled_datagram_buffers() {
+        let mut tuning = TransportTuning::default();
+        tuning.quic_datagram_send_buffer_bytes = 0;
+        tuning.quic_datagram_receive_buffer_bytes = 0;
+
+        let cfg = tuning.try_apply(base_config()).unwrap();
+        assert_eq!(cfg.quic_datagram_send_buffer_bytes(), 0);
+        assert_eq!(cfg.quic_datagram_receive_buffer_bytes(), 0);
+    }
+
+    #[test]
+    fn quic_v2_tuning_accepts_minimum_enabled_datagram_buffers() {
+        let mut tuning = TransportTuning::default();
+        tuning.quic_datagram_send_buffer_bytes = 1_200;
+        tuning.quic_datagram_receive_buffer_bytes = 1_200;
+
+        let cfg = tuning.try_apply(base_config()).unwrap();
+        assert_eq!(cfg.quic_datagram_send_buffer_bytes(), 1_200);
+        assert_eq!(cfg.quic_datagram_receive_buffer_bytes(), 1_200);
+    }
+
+    #[test]
+    fn quic_v2_tuning_rejects_undersized_enabled_datagram_buffers() {
+        for key in [
+            "quic_datagram_send_buffer_bytes",
+            "quic_datagram_receive_buffer_bytes",
+        ] {
+            for bytes in [1, 1_199] {
+                let source = format!("{key} = {bytes}");
+                let tuning: TransportTuning = ::config::Config::builder()
+                    .add_source(::config::File::from_str(
+                        &source,
+                        ::config::FileFormat::Toml,
+                    ))
+                    .build()
+                    .expect("config builder")
+                    .try_deserialize()
+                    .expect("transport tuning parses before semantic validation");
+                let error = tuning.try_apply(base_config()).unwrap_err();
+
+                assert!(error.contains(key), "error: {error}");
+                assert!(error.contains("zero or at least 1200"), "error: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn quic_v2_transport_config_builders_update_private_fields() {
+        let cfg = base_config()
+            .with_quic_session_setup_timeout(Duration::from_millis(987))
+            .with_quic_datagram_send_buffer_bytes(2_400)
+            .with_quic_datagram_receive_buffer_bytes(4_800);
+
+        assert_eq!(cfg.quic_session_setup_timeout(), Duration::from_millis(987));
+        assert_eq!(cfg.quic_datagram_send_buffer_bytes(), 2_400);
+        assert_eq!(cfg.quic_datagram_receive_buffer_bytes(), 4_800);
     }
 
     #[test]

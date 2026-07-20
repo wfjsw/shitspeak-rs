@@ -494,6 +494,13 @@ Transport and replication tuning examples:
 ping_interval_secs = 2
 idle_ping_interval_secs = 10
 stream_write_timeout_ms = 1000
+# Deadline for establishing and acknowledging all required QUIC v2 lanes.
+quic_session_setup_timeout_ms = 10000
+# QUIC unreliable DATAGRAM queue budgets. Zero disables that local direction,
+# not the s2s/2 ALPN offer; keep both nonzero for normal v2 operation.
+# Nonzero values must be at least 1200 bytes.
+quic_datagram_send_buffer_bytes = 65536
+quic_datagram_receive_buffer_bytes = 262144
 self_seed_quarantine_secs = 3600
 max_dial_attempts_per_peer_tick = 1
 max_outgoing_connections = 1024
@@ -587,6 +594,57 @@ blob_chunk_size = 65536
 bulk_retry_delay_ms = 250
 bulk_max_in_flight_per_peer = 1
 ```
+
+### QUIC S2S Protocol And Delivery
+
+QUIC advertises `[s2s/2, s2s/1]` through ALPN. Upgraded peers select `s2s/2`.
+A peer that supports only `s2s/1` uses the unchanged legacy single reliable
+stream, including BestEffort traffic on that stream.
+
+`s2s/2` uses three persistent reliable streams plus QUIC DATAGRAM:
+
+| Requested service level and class | Delivery |
+|---|---|
+| `BestEffort`, any class | QUIC DATAGRAM |
+| Non-BestEffort `Control` | Control stream |
+| Non-BestEffort `HighPriority` | HighPriority stream |
+| Non-BestEffort `Regular` | Regular stream |
+
+BestEffort overrides the class for delivery selection, while the frame retains
+the class for inbound queue selection. FIFO ordering applies within each
+reliable lane only; there is no cross-lane ordering guarantee. The reliable
+lanes have equal Quinn priority, and session Ping, Pong, KeepAlive, and Bye
+traffic is confined to Control.
+
+Each QUIC DATAGRAM contains exactly one frame without a stream length prefix.
+DATAGRAM is unreliable and may be lost or reordered. It is not retransmitted,
+fragmented, or automatically repaired by the transport, and an oversized item
+is never moved to a reliable lane after enqueue. BestEffort application
+sequencing and repair remain responsible where applicable. Under queue
+pressure, older DATAGRAM traffic is evicted to retain the newest traffic.
+
+DATAGRAM may use configured stateless L1 compression when permitted by the
+send options, but does not negotiate or use adaptive dictionaries. The three
+reliable lanes maintain independent adaptive dictionary state. Streams and
+DATAGRAM share the same congestion controller and path capacity, and Quinn
+schedules queued DATAGRAM frames before stream frames; the separate lanes are
+not bandwidth reservations.
+
+The setup timeout applies after v2 has been negotiated. A v2 lane or DATAGRAM
+capability failure closes the connection rather than retrying `s2s/1` inside
+that connection. Existing v1 sessions stay v1 until reconnect. During a rolling
+upgrade, retain dual-stack support for at least one rollback window and remove
+v1 only after active-v1 and newly-negotiated-v1 metrics have both remained zero
+for that entire window.
+
+The DATAGRAM buffer values default to 65536 send bytes and 262144 receive
+bytes; nonzero values below 1200 are rejected. Zero disables that local Quinn
+DATAGRAM direction, but ALPN still offers `s2s/2`, so zero is not a protocol
+rollback switch. A zero receive buffer prevents advertising the DATAGRAM
+support required by v2. A zero send buffer also prevents the complete v2
+mapping. Negotiated v2 setup therefore fails when either buffer is zero. Keep
+both values nonzero for normal v2 operation. Legacy
+peers that advertise only `s2s/1` can still negotiate v1.
 
 Voice-path stickiness applies to expiring conversational voice traffic. The
 timing values must be nonzero, and `voice_path_idle_reset_ms` must be at least

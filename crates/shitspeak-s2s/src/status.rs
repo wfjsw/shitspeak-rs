@@ -32,7 +32,56 @@ pub(crate) struct TopologySnapshot {
     voice_transport_bindings: Vec<VoiceTransportBindingMetric>,
     voice_transport_binding_events: Vec<VoiceTransportBindingEventMetric>,
     voice_transport_challengers: Vec<VoiceTransportChallengerMetric>,
+    quic_lanes: Vec<QuicLaneMetric>,
+    quic_datagram_drops: Vec<QuicDatagramDropMetric>,
+    quic_protocol_events: Vec<QuicProtocolEventMetric>,
+    quic_protocol_errors: Vec<QuicProtocolErrorMetric>,
+    quic_sessions: Vec<QuicSessionMetric>,
     debug_packet_io: Vec<crate::debug_io::PacketIoSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct QuicSessionMetric {
+    peer: NodeIdentifier,
+    remote_addr: Option<String>,
+    dialer: bool,
+    negotiated_protocol: &'static str,
+    three_lane_ready: bool,
+    max_datagram_size: Option<usize>,
+    datagram_send_buffer_bytes: usize,
+    datagram_receive_buffer_bytes: usize,
+    datagrams_queued: u64,
+    datagrams_received: u64,
+    datagrams_dropped: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct QuicLaneMetric {
+    peer: Option<NodeIdentifier>,
+    direction: &'static str,
+    lane: &'static str,
+    frames: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct QuicDatagramDropMetric {
+    reason: &'static str,
+    drops: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct QuicProtocolEventMetric {
+    stage: &'static str,
+    version: &'static str,
+    result: &'static str,
+    events: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct QuicProtocolErrorMetric {
+    reason: &'static str,
+    errors: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -657,6 +706,57 @@ pub(crate) fn build_topology_snapshot(
     voice_transport_challengers
         .sort_by_key(|entry| (entry.peer, entry.incumbent, entry.challenger, entry.outcome));
 
+    let quic_lanes = shitspeak_s2s_transport::quic_lane_snapshots()
+        .into_iter()
+        .map(|entry| QuicLaneMetric {
+            peer: entry.peer(),
+            direction: entry.direction().name(),
+            lane: entry.lane().name(),
+            frames: entry.frames(),
+            bytes: entry.bytes(),
+        })
+        .collect();
+    let quic_datagram_drops = shitspeak_s2s_transport::quic_datagram_drop_snapshots()
+        .into_iter()
+        .map(|entry| QuicDatagramDropMetric {
+            reason: entry.reason().name(),
+            drops: entry.drops(),
+        })
+        .collect();
+    let quic_protocol_events = shitspeak_s2s_transport::quic_protocol_event_snapshots()
+        .into_iter()
+        .map(|entry| QuicProtocolEventMetric {
+            stage: entry.stage().name(),
+            version: entry.version().name(),
+            result: entry.result().name(),
+            events: entry.events(),
+        })
+        .collect();
+    let quic_protocol_errors = shitspeak_s2s_transport::quic_protocol_error_snapshots()
+        .into_iter()
+        .map(|entry| QuicProtocolErrorMetric {
+            reason: entry.reason().name(),
+            errors: entry.errors(),
+        })
+        .collect();
+    let quic_sessions = transport
+        .quic_session_status()
+        .into_iter()
+        .map(|entry| QuicSessionMetric {
+            peer: entry.peer(),
+            remote_addr: entry.remote_addr().map(|addr| addr.to_string()),
+            dialer: entry.is_dialer(),
+            negotiated_protocol: entry.protocol().name(),
+            three_lane_ready: entry.three_lane_ready(),
+            max_datagram_size: entry.max_datagram_size(),
+            datagram_send_buffer_bytes: entry.datagram_send_buffer_bytes(),
+            datagram_receive_buffer_bytes: entry.datagram_receive_buffer_bytes(),
+            datagrams_queued: entry.datagrams_queued(),
+            datagrams_received: entry.datagrams_received(),
+            datagrams_dropped: entry.datagrams_dropped(),
+        })
+        .collect();
+
     TopologySnapshot {
         local_node: overlay.local_node_id(),
         generated_at_unix_ms,
@@ -672,6 +772,11 @@ pub(crate) fn build_topology_snapshot(
         voice_transport_bindings,
         voice_transport_binding_events,
         voice_transport_challengers,
+        quic_lanes,
+        quic_datagram_drops,
+        quic_protocol_events,
+        quic_protocol_errors,
+        quic_sessions,
         debug_packet_io: crate::debug_io::snapshot(),
     }
 }
@@ -968,6 +1073,31 @@ impl<'a> PrometheusWriter<'a> {
         self.header(
             "shitspeak_s2s_expired_outbound_frames_total",
             "S2S outbound frames dropped because their send deadline expired.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_quic_lane_frames_total",
+            "QUIC v2 frames by peer, direction, and physical delivery lane.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_quic_lane_bytes_total",
+            "QUIC v2 payload bytes by peer, direction, and physical delivery lane.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_quic_datagram_drops_total",
+            "QUIC DATAGRAM drops by bounded reason.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_quic_protocol_events_total",
+            "QUIC S2S protocol negotiation and setup results.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_quic_protocol_errors_total",
+            "QUIC S2S protocol errors by bounded reason.",
             "counter",
         );
         // CPU_ATTRIBUTION_PROMQL s2s_transport_pipeline:
@@ -1884,6 +2014,56 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
         ));
     }
 
+    for entry in &snapshot.quic_lanes {
+        let source = local_node.clone();
+        let peer = entry
+            .peer
+            .map(|peer| peer.to_string())
+            .unwrap_or_else(|| "overflow".to_owned());
+        let labels = vec![
+            ("source", source.as_str()),
+            ("peer", peer.as_str()),
+            ("direction", entry.direction),
+            ("lane", entry.lane),
+        ];
+        out.push(sample_with_base(
+            "shitspeak_s2s_quic_lane_frames_total",
+            &labels,
+            entry.frames as f64,
+        ));
+        out.push(sample_with_base(
+            "shitspeak_s2s_quic_lane_bytes_total",
+            &labels,
+            entry.bytes as f64,
+        ));
+    }
+    for entry in &snapshot.quic_datagram_drops {
+        out.push(sample(
+            "shitspeak_s2s_quic_datagram_drops_total",
+            vec![("source", local_node.as_str()), ("reason", entry.reason)],
+            entry.drops as f64,
+        ));
+    }
+    for entry in &snapshot.quic_protocol_events {
+        out.push(sample(
+            "shitspeak_s2s_quic_protocol_events_total",
+            vec![
+                ("source", local_node.as_str()),
+                ("stage", entry.stage),
+                ("version", entry.version),
+                ("result", entry.result),
+            ],
+            entry.events as f64,
+        ));
+    }
+    for entry in &snapshot.quic_protocol_errors {
+        out.push(sample(
+            "shitspeak_s2s_quic_protocol_errors_total",
+            vec![("source", local_node.as_str()), ("reason", entry.reason)],
+            entry.errors as f64,
+        ));
+    }
+
     for stage in shitspeak_s2s_transport::transport_pipeline_stage_snapshots() {
         add_transport_pipeline_stage_samples(&mut out, &local_node, stage);
     }
@@ -2744,6 +2924,40 @@ mod tests {
                 outcome: "confirmed",
                 events: 2,
             }],
+            quic_lanes: vec![QuicLaneMetric {
+                peer: Some(2),
+                direction: "egress",
+                lane: "datagram",
+                frames: 11,
+                bytes: 1_234,
+            }],
+            quic_datagram_drops: vec![QuicDatagramDropMetric {
+                reason: "too_large",
+                drops: 3,
+            }],
+            quic_protocol_events: vec![QuicProtocolEventMetric {
+                stage: "setup",
+                version: "s2s2",
+                result: "success",
+                events: 4,
+            }],
+            quic_protocol_errors: vec![QuicProtocolErrorMetric {
+                reason: "class_mismatch",
+                errors: 2,
+            }],
+            quic_sessions: vec![QuicSessionMetric {
+                peer: 2,
+                remote_addr: Some("127.0.0.1:64741".to_owned()),
+                dialer: true,
+                negotiated_protocol: "s2s/2",
+                three_lane_ready: true,
+                max_datagram_size: Some(1200),
+                datagram_send_buffer_bytes: 65_536,
+                datagram_receive_buffer_bytes: 262_144,
+                datagrams_queued: 7,
+                datagrams_received: 6,
+                datagrams_dropped: 1,
+            }],
             debug_packet_io: Vec::new(),
         };
 
@@ -2758,6 +2972,16 @@ mod tests {
         assert_eq!(
             topology_json["nodes"][1]["strict_replication_protocol_version"],
             0
+        );
+        assert_eq!(topology_json["quic_lanes"][0]["lane"], "datagram");
+        assert_eq!(
+            topology_json["quic_sessions"][0]["negotiated_protocol"],
+            "s2s/2"
+        );
+        assert_eq!(topology_json["quic_sessions"][0]["datagrams_queued"], 7);
+        assert_eq!(
+            topology_json["quic_datagram_drops"][0]["reason"],
+            "too_large"
         );
 
         assert!(rendered.contains("# TYPE shitspeak_s2s_node_info gauge\n"));
@@ -2819,6 +3043,21 @@ mod tests {
         ));
         assert!(rendered.contains(
             "shitspeak_s2s_voice_transport_challenger_total{source=\"1\",peer=\"2\",incumbent=\"kcp\",challenger=\"quic\",outcome=\"confirmed\"} 2"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_quic_lane_frames_total{source=\"1\",peer=\"2\",direction=\"egress\",lane=\"datagram\"} 11"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_quic_lane_bytes_total{source=\"1\",peer=\"2\",direction=\"egress\",lane=\"datagram\"} 1234"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_quic_datagram_drops_total{source=\"1\",reason=\"too_large\"} 3"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_quic_protocol_events_total{source=\"1\",stage=\"setup\",version=\"s2s2\",result=\"success\"} 4"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_quic_protocol_errors_total{source=\"1\",reason=\"class_mismatch\"} 2"
         ));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_transport_binding gauge\n"));
         assert!(

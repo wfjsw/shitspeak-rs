@@ -29,7 +29,8 @@ use super::adaptive_queue::{
 use super::config::{KcpTuning, TransportConfig, TransportRoutingPolicy};
 use super::connection::{
     AddressBackoffSnapshot, BackoffState, OutboundFrame, PeerOutboundReceiver, PeerOutboundSender,
-    PeerState, VoiceTransportCandidateScore,
+    PeerState, QuicSessionStatusSnapshot, SessionSender, SessionTrySendError,
+    VoiceTransportCandidateScore,
 };
 use super::connection::{OutboundEnvelope, TransportPayloadPlan};
 use super::endpoint::{
@@ -71,6 +72,7 @@ const MAX_BLOCKED_LANE_PASSES: usize = 2;
 struct TransportSelectionConfig {
     routing: TransportRoutingPolicy,
     kcp: KcpTuning,
+    max_frame_bytes: usize,
 }
 
 impl TransportSelectionConfig {
@@ -78,6 +80,7 @@ impl TransportSelectionConfig {
         Self {
             routing: cfg.routing_policy(),
             kcp: cfg.kcp_tuning(),
+            max_frame_bytes: cfg.max_frame_bytes(),
         }
     }
 }
@@ -87,6 +90,7 @@ impl From<TransportRoutingPolicy> for TransportSelectionConfig {
         Self {
             routing,
             kcp: KcpTuning::default(),
+            max_frame_bytes: usize::MAX,
         }
     }
 }
@@ -613,12 +617,64 @@ impl ConnectionManager {
         class: MessageClass,
         payload: &[u8],
     ) -> bool {
+        let encoded_len = encoded_data_frame_len(
+            self.inner.self_id(),
+            node,
+            level,
+            class,
+            transport_timestamp_us(),
+            payload.len(),
+        );
         match transport {
-            TransportKind::Tcp | TransportKind::Kcp | TransportKind::Quic => true,
+            TransportKind::Tcp | TransportKind::Kcp => true,
+            TransportKind::Quic => {
+                if encoded_len > self.inner.cfg().max_frame_bytes() {
+                    return false;
+                }
+                if level != ServiceLevel::BestEffort {
+                    return true;
+                }
+                let Some(sender) = self
+                    .inner
+                    .get_peer(node)
+                    .and_then(|peer| peer.try_get_stream(TransportKind::Quic))
+                else {
+                    return false;
+                };
+                let Some(max_datagram_size) = sender.quic_v2_max_datagram_size() else {
+                    // Negotiated s2s/1 preserves the legacy reliable-stream fallback.
+                    return true;
+                };
+                encoded_len <= max_datagram_size
+            }
             TransportKind::Udp => self
                 .udp_datagram_len(node, level, class, payload.len())
                 .is_some_and(|bytes| bytes <= self.udp_datagram_mtu_for(node)),
         }
+    }
+
+    /// Check a payload against the live v2 DATAGRAM ceiling, or the QUIC
+    /// minimum when planning while the current connection is still v1.
+    pub fn payload_fits_quic_v2_datagram(
+        &self,
+        node: NodeIdentifier,
+        class: MessageClass,
+        payload: &[u8],
+    ) -> bool {
+        let max_datagram_size = self
+            .inner
+            .get_peer(node)
+            .and_then(|peer| peer.try_get_stream(TransportKind::Quic))
+            .and_then(|sender| sender.quic_v2_max_datagram_size())
+            .unwrap_or(1200);
+        encoded_data_frame_len(
+            self.inner.self_id(),
+            node,
+            ServiceLevel::BestEffort,
+            class,
+            transport_timestamp_us(),
+            payload.len(),
+        ) <= max_datagram_size.min(self.inner.cfg().max_frame_bytes())
     }
 
     fn udp_datagram_mtu_for(&self, node: NodeIdentifier) -> usize {
@@ -680,6 +736,20 @@ impl ConnectionManager {
     /// Bring up listeners, build TLS configs, install peer table, and return
     /// the handle along with the two inbound receivers.
     pub async fn start(cfg: TransportConfig) -> Result<(Self, Inbound), TransportError> {
+        for (name, bytes) in [
+            (
+                "quic_datagram_send_buffer_bytes",
+                cfg.quic_datagram_send_buffer_bytes(),
+            ),
+            (
+                "quic_datagram_receive_buffer_bytes",
+                cfg.quic_datagram_receive_buffer_bytes(),
+            ),
+        ] {
+            if bytes != 0 && bytes < 1200 {
+                return Err(ConfigError::InvalidQuicDatagramBuffer { name, bytes }.into());
+            }
+        }
         let identity = Arc::new(NodeIdentity::load(
             cfg.ca_path(),
             cfg.cert_path(),
@@ -1214,16 +1284,30 @@ impl ConnectionManager {
             return Err(SendError::NoSuitableTransport { node });
         }
         let choices_fit = choices.iter().any(|transport| {
+            let quic_v2 = *transport == TransportKind::Quic
+                && peer
+                    .try_get_stream(TransportKind::Quic)
+                    .and_then(|sender| sender.quic_v2_max_datagram_size())
+                    .is_some();
+            let variant = payloads.variant_for_session(*transport, quic_v2);
             *transport == TransportKind::Udp
-                || self.payload_fits_transport(
-                    node,
-                    *transport,
-                    level,
-                    class,
-                    payloads.variant(*transport).primary(),
-                )
+                || std::iter::once(variant.primary())
+                    .chain(variant.sidecars().iter())
+                    .all(|payload| {
+                        self.payload_fits_transport(node, *transport, level, class, payload)
+                    })
         });
         if !choices_fit {
+            if level == ServiceLevel::BestEffort
+                && choices.contains(&TransportKind::Quic)
+                && let Some(sender) = peer.try_get_stream(TransportKind::Quic)
+                && sender.quic_v2_max_datagram_size().is_some()
+            {
+                sender.record_quic_datagram_drop();
+                super::metrics::record_quic_datagram_drop(
+                    super::metrics::QuicDatagramDropReason::NoFit,
+                );
+            }
             return Err(SendError::NoSuitableTransport { node });
         }
 
@@ -1405,6 +1489,31 @@ impl ConnectionManager {
         out
     }
 
+    /// Return immutable runtime status for every currently-live QUIC session.
+    pub fn quic_session_status(&self) -> Vec<QuicSessionStatusSnapshot> {
+        let cfg = self.inner.cfg();
+        let mut out = self
+            .inner
+            .iter_peers()
+            .into_iter()
+            .flat_map(|(_, peer)| {
+                peer.quic_session_status(
+                    cfg.quic_datagram_send_buffer_bytes(),
+                    cfg.quic_datagram_receive_buffer_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        out.sort_by_key(|snapshot| {
+            (
+                snapshot.peer(),
+                snapshot.remote_addr(),
+                snapshot.is_dialer(),
+                snapshot.protocol(),
+            )
+        });
+        out
+    }
+
     pub fn set_required_outgoing_nodes(&self, nodes: HashSet<NodeIdentifier>) {
         self.inner.set_required_outgoing_nodes(nodes);
     }
@@ -1562,7 +1671,7 @@ impl ConnectionManager {
         ranked
             .first()
             .copied()
-            .map(|transport| send_queue_penalty(&peer, transport, class, options, now))
+            .map(|transport| send_queue_penalty(&peer, transport, level, class, options, now))
     }
 
     pub async fn shutdown(&self) {
@@ -1714,11 +1823,13 @@ fn pick_transports_with_snapshot(
 
     if options.expires_at().is_some() {
         ranked.sort_by_key(|kind| {
-            deadline_queue_penalty_with_snapshot(peer, *kind, class, options, now, snapshot)
+            deadline_queue_penalty_with_snapshot(peer, *kind, level, class, options, now, snapshot)
         });
         if class == MessageClass::HighPriority {
             ranked.retain(|kind| {
-                deadline_queue_penalty_with_snapshot(peer, *kind, class, options, now, snapshot) < 3
+                deadline_queue_penalty_with_snapshot(
+                    peer, *kind, level, class, options, now, snapshot,
+                ) < 3
             });
         }
     } else {
@@ -1726,7 +1837,7 @@ fn pick_transports_with_snapshot(
         // it can accept bulk traffic. Apply current queue pressure to every
         // class so a reliable send does not keep selecting a saturated KCP
         // stream merely because it has the best historical link metric.
-        ranked.sort_by_key(|kind| non_deadline_queue_penalty(peer, *kind));
+        ranked.sort_by_key(|kind| non_deadline_queue_penalty(peer, *kind, level, class));
     }
 
     ranked
@@ -1817,6 +1928,15 @@ fn transport_candidate_exclusion_reason(
             selection.routing,
             now,
         )
+        && transport_lane_queue_known_dead(
+            peer,
+            transport,
+            level,
+            class,
+            snapshot.get(&transport),
+            selection.routing,
+            now,
+        )
     {
         return Some(TransportHealthExclusionReason::StaleQueue);
     }
@@ -1877,6 +1997,33 @@ fn transport_queue_known_dead(
         return false;
     }
     link.wire_sent_bps() <= f64::EPSILON && link.wire_recv_bps() <= f64::EPSILON
+}
+
+fn transport_lane_queue_known_dead(
+    peer: &PeerState,
+    transport: TransportKind,
+    level: ServiceLevel,
+    class: MessageClass,
+    link: Option<&LinkMetrics>,
+    policy: TransportRoutingPolicy,
+    now: Instant,
+) -> bool {
+    if !transport.is_stream()
+        || !peer
+            .outbound_lane_queue_status(transport, level, class)
+            .is_some_and(|status| status.depth() > 0)
+    {
+        return false;
+    }
+    let Some(link) = link else {
+        return false;
+    };
+    let Some(last_update) = link.last_update() else {
+        return false;
+    };
+    now.saturating_duration_since(last_update) >= policy.transport_metric_stale_after()
+        && link.wire_sent_bps() <= f64::EPSILON
+        && link.wire_recv_bps() <= f64::EPSILON
 }
 
 fn transport_has_outstanding_queue_work(peer: &PeerState, transport: TransportKind) -> bool {
@@ -2025,7 +2172,7 @@ fn apply_voice_transport_stickiness(
         .map(|transport| {
             VoiceTransportCandidateScore::new(
                 transport,
-                deadline_queue_penalty(peer, transport, class, options, now),
+                deadline_queue_penalty(peer, transport, level, class, options, now),
                 snapshot
                     .get(&transport)
                     .and_then(|link| link.routing_cost(level, routing_metric)),
@@ -2051,7 +2198,7 @@ fn apply_voice_transport_stickiness(
                 .is_some_and(|status| status.capacity() > 0 && status.depth() >= status.capacity())
             {
                 Some(VoiceTransportBindingEventReason::QueueFull)
-            } else if deadline_queue_penalty(peer, incumbent, class, options, now) >= 3 {
+            } else if deadline_queue_penalty(peer, incumbent, level, class, options, now) >= 3 {
                 Some(VoiceTransportBindingEventReason::DeadlineImpossible)
             } else {
                 None
@@ -2084,8 +2231,8 @@ fn record_voice_transport_no_alternate(
     let incumbent = peer
         .voice_transport_binding_status()
         .map(|binding| binding.transport());
-    let incumbent_pressure =
-        incumbent.map(|transport| deadline_queue_penalty(peer, transport, class, options, now));
+    let incumbent_pressure = incumbent
+        .map(|transport| deadline_queue_penalty(peer, transport, level, class, options, now));
     let (held_for, confirmation_for) = peer.voice_transport_binding_ages(now);
     debug!(
         peer = %peer.node_id(),
@@ -2289,14 +2436,16 @@ fn move_transport_to_front(ranked: &mut Vec<TransportKind>, pos: usize) {
 fn send_queue_penalty(
     peer: &PeerState,
     transport: TransportKind,
+    level: ServiceLevel,
     class: MessageClass,
     options: SendOptions,
     now: Instant,
 ) -> u8 {
     if options.expires_at().is_some() {
-        route_deadline_queue_penalty(peer, transport, class, options, now)
+        route_deadline_queue_penalty(peer, transport, level, class, options, now)
     } else {
-        non_deadline_queue_penalty(peer, transport).max(peer_queue_fill_penalty(peer, class))
+        non_deadline_queue_penalty(peer, transport, level, class)
+            .max(peer_queue_fill_penalty(peer, class))
     }
 }
 
@@ -2307,6 +2456,7 @@ fn send_queue_penalty(
 fn route_deadline_queue_penalty(
     peer: &PeerState,
     transport: TransportKind,
+    level: ServiceLevel,
     class: MessageClass,
     options: SendOptions,
     now: Instant,
@@ -2319,6 +2469,7 @@ fn route_deadline_queue_penalty(
     deadline_queue_penalty_with_additional_depth_and_snapshot(
         peer,
         transport,
+        level,
         class,
         options,
         now,
@@ -2331,24 +2482,26 @@ fn route_deadline_queue_penalty(
 fn deadline_queue_penalty(
     peer: &PeerState,
     transport: TransportKind,
+    level: ServiceLevel,
     class: MessageClass,
     options: SendOptions,
     now: Instant,
 ) -> u8 {
     let snapshot = peer.metrics().snapshot_per_transport();
-    deadline_queue_penalty_with_snapshot(peer, transport, class, options, now, &snapshot)
+    deadline_queue_penalty_with_snapshot(peer, transport, level, class, options, now, &snapshot)
 }
 
 fn deadline_queue_penalty_with_snapshot(
     peer: &PeerState,
     transport: TransportKind,
+    level: ServiceLevel,
     class: MessageClass,
     options: SendOptions,
     now: Instant,
     snapshot: &HashMap<TransportKind, LinkMetrics>,
 ) -> u8 {
     deadline_queue_penalty_with_additional_depth_and_snapshot(
-        peer, transport, class, options, now, 0, 0, snapshot,
+        peer, transport, level, class, options, now, 0, 0, snapshot,
     )
 }
 
@@ -2356,6 +2509,7 @@ fn deadline_queue_penalty_with_snapshot(
 fn deadline_queue_penalty_with_additional_depth_and_snapshot(
     peer: &PeerState,
     transport: TransportKind,
+    level: ServiceLevel,
     class: MessageClass,
     options: SendOptions,
     now: Instant,
@@ -2370,8 +2524,17 @@ fn deadline_queue_penalty_with_additional_depth_and_snapshot(
     if remaining.is_zero() || remaining <= DEADLINE_NEAR_EXPIRED_TTL {
         return 3;
     }
+    if level == ServiceLevel::BestEffort
+        && transport == TransportKind::Quic
+        && peer
+            .try_get_stream(TransportKind::Quic)
+            .and_then(|sender| sender.quic_v2_max_datagram_size())
+            .is_some()
+    {
+        return additional_fill_penalty;
+    }
 
-    let Some(status) = peer.outbound_stream_queue_status(transport) else {
+    let Some(status) = peer.outbound_lane_queue_status(transport, level, class) else {
         return 0;
     };
     if status.capacity() > 0 && status.depth() >= status.capacity() {
@@ -2431,8 +2594,22 @@ fn estimated_drain_bytes_per_ms(link: Option<&LinkMetrics>) -> f64 {
     drain_bytes_per_sec / 1_000.0
 }
 
-fn non_deadline_queue_penalty(peer: &PeerState, transport: TransportKind) -> u8 {
-    let Some(status) = peer.outbound_stream_queue_status(transport) else {
+fn non_deadline_queue_penalty(
+    peer: &PeerState,
+    transport: TransportKind,
+    level: ServiceLevel,
+    class: MessageClass,
+) -> u8 {
+    if level == ServiceLevel::BestEffort
+        && transport == TransportKind::Quic
+        && peer
+            .try_get_stream(TransportKind::Quic)
+            .and_then(|sender| sender.quic_v2_max_datagram_size())
+            .is_some()
+    {
+        return 0;
+    }
+    let Some(status) = peer.outbound_lane_queue_status(transport, level, class) else {
         return 0;
     };
     current_queue_fill_penalty(status.depth(), status.capacity())
@@ -2952,10 +3129,14 @@ fn try_dispatch_envelope_with_policy(
                 now,
             );
         }
+        if envelope.level() == ServiceLevel::BestEffort {
+            return Ok(());
+        }
         return Err(envelope);
     }
 
     let mut incumbent_failure = None;
+    let mut no_fit_quic_sender = None;
     for transport in choices {
         let options = envelope.options();
         if options.is_expired() {
@@ -2972,32 +3153,85 @@ fn try_dispatch_envelope_with_policy(
             }
             continue;
         };
-        let variant = envelope.payloads().variant(transport);
-        let frame = OutboundFrame::from_variant(class, variant, options);
-        if class == MessageClass::Regular
-            && !allow_regular_backlog
-            && options.expires_at().is_none()
-            && sender.depth_bytes() > 0
+        let level = envelope.level();
+        let quic_v2 = sender.quic_v2_max_datagram_size().is_some();
+        let variant = envelope.payloads().variant_for_session(transport, quic_v2);
+        if level == ServiceLevel::BestEffort
+            && transport == TransportKind::Quic
+            && let Some(max_datagram_size) = sender.quic_v2_max_datagram_size()
+            && !quic_datagram_variant_fits(
+                peer.node_id(),
+                class,
+                variant,
+                max_datagram_size,
+                selection.max_frame_bytes,
+            )
         {
-            record_outbound_stream_queue_sample(peer, transport, class, &sender, true);
+            no_fit_quic_sender = Some(sender.clone());
             continue;
         }
-        record_outbound_stream_queue_sample(peer, transport, class, &sender, false);
+        let quic_v2_datagram = level == ServiceLevel::BestEffort
+            && transport == TransportKind::Quic
+            && sender.quic_v2_max_datagram_size().is_some();
+        if quic_v2_datagram {
+            for sidecar in variant.sidecars() {
+                record_datagram_enqueue_result(
+                    &sender,
+                    sender.try_send(OutboundFrame::with_options(
+                        level,
+                        class,
+                        sidecar.clone(),
+                        options,
+                    )),
+                );
+            }
+        }
+        let frame = OutboundFrame::from_variant(level, class, variant, options);
+        if class == MessageClass::Regular
+            && level != ServiceLevel::BestEffort
+            && !allow_regular_backlog
+            && options.expires_at().is_none()
+            && sender.depth_capacity(level, class).0 > 0
+        {
+            record_outbound_stream_queue_sample(peer, transport, class, &sender, level, true);
+            continue;
+        }
+        record_outbound_stream_queue_sample(peer, transport, class, &sender, level, false);
         match sender.try_send(frame) {
-            Ok(()) => {
-                for sidecar in variant.sidecars() {
-                    let _ = sender.try_send(OutboundFrame::with_options(
+            Ok(outcome) => {
+                if outcome.dropped_expired() {
+                    return Ok(());
+                }
+                if outcome.evicted_items() > 0 {
+                    for _ in 0..outcome.evicted_items() {
+                        sender.record_quic_datagram_drop();
+                        super::metrics::record_quic_datagram_drop(
+                            super::metrics::QuicDatagramDropReason::AppQueueEvicted,
+                        );
+                    }
+                }
+                for sidecar in variant.sidecars().iter().filter(|_| !quic_v2_datagram) {
+                    let sidecar_outcome = sender.try_send(OutboundFrame::with_options(
+                        level,
                         class,
                         sidecar.clone(),
                         options,
                     ));
+                    if let Ok(outcome) = sidecar_outcome {
+                        for _ in 0..outcome.evicted_items() {
+                            sender.record_quic_datagram_drop();
+                            super::metrics::record_quic_datagram_drop(
+                                super::metrics::QuicDatagramDropReason::AppQueueEvicted,
+                            );
+                        }
+                    }
                 }
-                record_outbound_stream_queue_sample(peer, transport, class, &sender, false);
+                record_outbound_stream_queue_sample(peer, transport, class, &sender, level, false);
                 if let Some(decision) = voice_decision {
                     let selected_pressure =
-                        deadline_queue_penalty(peer, transport, class, options, now);
+                        deadline_queue_penalty(peer, transport, level, class, options, now);
                     let incumbent_pressure = decision.incumbent().map(|incumbent| {
-                        deadline_queue_penalty(peer, incumbent, class, options, now)
+                        deadline_queue_penalty(peer, incumbent, level, class, options, now)
                     });
                     peer.record_voice_transport_success(
                         transport,
@@ -3010,13 +3244,25 @@ fn try_dispatch_envelope_with_policy(
                 }
                 return Ok(());
             }
-            Err(TryAdaptiveSendError::Full(_)) => {
-                record_outbound_stream_queue_sample(peer, transport, class, &sender, true);
+            Err(SessionTrySendError::TooLarge) => {
+                if quic_v2_datagram {
+                    sender.record_quic_datagram_drop();
+                    super::metrics::record_quic_datagram_drop(
+                        super::metrics::QuicDatagramDropReason::TooLarge,
+                    );
+                }
+                record_outbound_stream_queue_sample(peer, transport, class, &sender, level, true);
                 if voice_decision.is_some_and(|decision| decision.incumbent() == Some(transport)) {
                     incumbent_failure = Some(VoiceTransportBindingEventReason::QueueFull);
                 }
             }
-            Err(TryAdaptiveSendError::Closed(_)) => {
+            Err(SessionTrySendError::Full) => {
+                record_outbound_stream_queue_sample(peer, transport, class, &sender, level, true);
+                if voice_decision.is_some_and(|decision| decision.incumbent() == Some(transport)) {
+                    incumbent_failure = Some(VoiceTransportBindingEventReason::QueueFull);
+                }
+            }
+            Err(SessionTrySendError::Closed) => {
                 if voice_decision.is_some_and(|decision| decision.incumbent() == Some(transport)) {
                     incumbent_failure = Some(VoiceTransportBindingEventReason::StreamClosed);
                 }
@@ -3034,7 +3280,60 @@ fn try_dispatch_envelope_with_policy(
             now,
         );
     }
+    if envelope.level() == ServiceLevel::BestEffort {
+        if let Some(sender) = no_fit_quic_sender {
+            sender.record_quic_datagram_drop();
+            super::metrics::record_quic_datagram_drop(
+                super::metrics::QuicDatagramDropReason::NoFit,
+            );
+        }
+        return Ok(());
+    }
     Err(envelope)
+}
+
+fn record_datagram_enqueue_result(
+    sender: &SessionSender,
+    result: Result<super::connection::SessionSendOutcome, SessionTrySendError>,
+) {
+    match result {
+        Ok(outcome) => {
+            for _ in 0..outcome.evicted_items() {
+                sender.record_quic_datagram_drop();
+                super::metrics::record_quic_datagram_drop(
+                    super::metrics::QuicDatagramDropReason::AppQueueEvicted,
+                );
+            }
+        }
+        Err(SessionTrySendError::TooLarge) => {
+            sender.record_quic_datagram_drop();
+            super::metrics::record_quic_datagram_drop(
+                super::metrics::QuicDatagramDropReason::TooLarge,
+            );
+        }
+        Err(SessionTrySendError::Closed) | Err(SessionTrySendError::Full) => {}
+    }
+}
+
+fn quic_datagram_variant_fits(
+    peer: NodeIdentifier,
+    class: MessageClass,
+    variant: &super::connection::TransportPayloadVariant,
+    max_datagram_size: usize,
+    max_frame_bytes: usize,
+) -> bool {
+    let fits = |payload: &Bytes| {
+        let encoded_len = encoded_data_frame_len(
+            u16::MAX,
+            peer,
+            ServiceLevel::BestEffort,
+            class,
+            transport_timestamp_us(),
+            payload.len(),
+        );
+        encoded_len <= max_datagram_size && encoded_len <= max_frame_bytes
+    };
+    fits(variant.primary()) && variant.sidecars().iter().all(fits)
 }
 
 fn accepts(kind: TransportKind, requested: ServiceLevel) -> bool {
@@ -3275,10 +3574,11 @@ fn record_outbound_stream_queue_sample(
     peer: &PeerState,
     transport: TransportKind,
     class: MessageClass,
-    sender: &AdaptiveQueueSender<OutboundFrame>,
+    sender: &SessionSender,
+    level: ServiceLevel,
     is_full: bool,
 ) {
-    let (depth, max_capacity) = sender_queue_depth(sender);
+    let (depth, max_capacity) = sender.depth_capacity(level, class);
     peer.record_outbound_stream_queue_sample(transport, class, depth, max_capacity, is_full);
 }
 
@@ -3350,6 +3650,9 @@ fn build_endpoints(
             client_tls,
             cfg.quic_listen_addrs().iter().copied(),
             mux.clone(),
+            cfg.quic_datagram_send_buffer_bytes(),
+            cfg.quic_datagram_receive_buffer_bytes(),
+            cfg.quic_alpn_protocols_override(),
         )
         .map_err(|e| {
             let (addr, source) = e.into_parts();
@@ -3398,6 +3701,27 @@ mod tests {
     use super::super::connection::ActiveStream;
     use super::super::connection::TransportPayloadVariant;
     use super::*;
+
+    #[tokio::test]
+    async fn direct_config_rejects_undersized_enabled_quic_datagram_buffers() {
+        let cfg = TransportConfig::new(
+            "missing-ca".into(),
+            "missing-cert".into(),
+            "missing-key".into(),
+        )
+        .with_quic_datagram_send_buffer_bytes(1199);
+        let error = match ConnectionManager::start(cfg).await {
+            Ok(_) => panic!("undersized QUIC DATAGRAM buffer must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            TransportError::Config(ConfigError::InvalidQuicDatagramBuffer {
+                name: "quic_datagram_send_buffer_bytes",
+                bytes: 1199,
+            })
+        ));
+    }
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -3431,6 +3755,25 @@ mod tests {
         (peer, receivers)
     }
 
+    #[tokio::test]
+    async fn live_quic_v1_status_reports_legacy_protocol_without_lanes() {
+        let (manager, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Quic]);
+
+        let sessions = manager.quic_session_status();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.peer(), 2);
+        assert_eq!(session.protocol(), super::super::QuicSessionProtocol::S2s1);
+        assert!(!session.three_lane_ready());
+        assert_eq!(session.max_datagram_size(), None);
+        assert_eq!(session.datagram_send_buffer_bytes(), 65_536);
+        assert_eq!(session.datagram_receive_buffer_bytes(), 262_144);
+        assert_eq!(session.datagrams_queued(), 0);
+        assert_eq!(session.datagrams_received(), 0);
+        assert_eq!(session.datagrams_dropped(), 0);
+    }
+
     fn install_test_stream(
         peer: &PeerState,
         kind: TransportKind,
@@ -3461,6 +3804,7 @@ mod tests {
         let sender = peer.try_get_stream(kind).expect("live stream");
         sender
             .try_send(OutboundFrame::new(
+                ServiceLevel::Reliable,
                 MessageClass::Regular,
                 Bytes::from(vec![0; bytes]),
             ))
@@ -3491,6 +3835,7 @@ mod tests {
         let (old_tx, mut old_rx) = test_outbound_queue(1);
         old_tx
             .try_send(OutboundFrame::new(
+                ServiceLevel::Reliable,
                 MessageClass::Regular,
                 Bytes::from(vec![0; 64 * 1024]),
             ))
@@ -3521,6 +3866,7 @@ mod tests {
         peer.try_get_stream(TransportKind::Tcp)
             .expect("newest TCP stream")
             .try_send(OutboundFrame::new(
+                ServiceLevel::Reliable,
                 MessageClass::Regular,
                 Bytes::from_static(b"newest"),
             ))
@@ -4028,6 +4374,7 @@ mod tests {
             .expect("tcp sender");
         tcp_sender
             .try_send(OutboundFrame::new(
+                ServiceLevel::Reliable,
                 MessageClass::Regular,
                 Bytes::from(vec![1; 1024 * 1024 - 512]),
             ))
@@ -4071,6 +4418,7 @@ mod tests {
             .expect("tcp sender");
         tcp_sender
             .try_send(OutboundFrame::new(
+                ServiceLevel::Reliable,
                 MessageClass::Regular,
                 Bytes::from(vec![1; 1024 * 1024 - 512]),
             ))
@@ -4114,6 +4462,7 @@ mod tests {
             .expect("tcp sender");
         tcp_sender
             .try_send(OutboundFrame::new(
+                ServiceLevel::Reliable,
                 MessageClass::Regular,
                 Bytes::from(vec![1; 1024 * 1024 - 512]),
             ))
@@ -4873,7 +5222,15 @@ mod tests {
         );
 
         assert_eq!(ranked.first().copied(), Some(TransportKind::Tcp));
-        assert_eq!(non_deadline_queue_penalty(&peer, TransportKind::Kcp), 3);
+        assert_eq!(
+            non_deadline_queue_penalty(
+                &peer,
+                TransportKind::Kcp,
+                ServiceLevel::BestEffort,
+                MessageClass::Control,
+            ),
+            3
+        );
     }
 
     #[test]
@@ -4885,12 +5242,21 @@ mod tests {
             capacity - super::super::adaptive_queue::QUEUE_ITEM_OVERHEAD_BYTES,
         );
 
-        assert_eq!(non_deadline_queue_penalty(&peer, TransportKind::Tcp), 0);
+        assert_eq!(
+            non_deadline_queue_penalty(
+                &peer,
+                TransportKind::Tcp,
+                ServiceLevel::Reliable,
+                MessageClass::Control,
+            ),
+            0
+        );
         assert_eq!(peer.outbound_queue_depth_bytes(), capacity);
         assert_eq!(
             send_queue_penalty(
                 &peer,
                 TransportKind::Tcp,
+                ServiceLevel::Reliable,
                 MessageClass::Control,
                 SendOptions::default(),
                 Instant::now(),
@@ -4909,6 +5275,7 @@ mod tests {
         let penalty = deadline_queue_penalty(
             &peer,
             TransportKind::Kcp,
+            ServiceLevel::BestEffort,
             MessageClass::Control,
             SendOptions::default().expire_after(Duration::from_secs(2)),
             Instant::now(),
@@ -4929,6 +5296,7 @@ mod tests {
             deadline_queue_penalty(
                 &peer,
                 TransportKind::Kcp,
+                ServiceLevel::ReliableLowLatency,
                 MessageClass::HighPriority,
                 options,
                 Instant::now(),
@@ -5091,6 +5459,7 @@ mod tests {
         let penalty = deadline_queue_penalty(
             &peer,
             TransportKind::Tcp,
+            ServiceLevel::Reliable,
             MessageClass::Regular,
             SendOptions::default().expire_after(Duration::from_secs(1)),
             Instant::now(),
@@ -5191,7 +5560,9 @@ mod tests {
             SendOptions::default().expire_after(Duration::from_secs(2)),
         );
 
-        assert!(try_dispatch_envelope(&peer, rejected, policy).is_err());
+        // BestEffort that loses every viable candidate is dropped instead of
+        // being requeued indefinitely.
+        assert!(try_dispatch_envelope(&peer, rejected, policy).is_ok());
         assert!(tcp_rx.try_recv().is_err());
         assert_eq!(
             peer.voice_transport_binding_status().unwrap().transport(),
@@ -5557,12 +5928,42 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_propagates_requested_level_to_primary_and_sidecars() {
+        let (peer, mut receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+
+        for level in ServiceLevel::ALL {
+            let payloads = TransportPayloadPlan::new(Bytes::from_static(b"primary")).with_variant(
+                TransportKind::Tcp,
+                TransportPayloadVariant::new(Bytes::from_static(b"primary"))
+                    .with_sidecars([Bytes::from_static(b"sidecar")]),
+            );
+            let envelope = OutboundEnvelope::routed_with_payloads(
+                level,
+                RoutingMetric::default_for_level(level),
+                MessageClass::Control,
+                payloads,
+                SendOptions::default(),
+            );
+
+            try_dispatch_envelope(&peer, envelope, TransportRoutingPolicy::default())
+                .expect("live TCP fallback should accept every requested level");
+
+            let primary = receivers[0].try_recv().expect("primary frame");
+            let sidecar = receivers[0].try_recv().expect("sidecar frame");
+            assert_eq!(primary.level(), level);
+            assert_eq!(sidecar.level(), level);
+        }
+    }
+
+    #[test]
     fn payload_plan_keeps_transport_variants_independent() {
-        let plan = TransportPayloadPlan::new(Bytes::from_static(b"rich")).with_variant(
-            TransportKind::Udp,
-            TransportPayloadVariant::new(Bytes::from_static(b"udp"))
-                .with_sidecars([Bytes::from_static(b"sidecar")]),
-        );
+        let plan = TransportPayloadPlan::new(Bytes::from_static(b"rich"))
+            .with_variant(
+                TransportKind::Udp,
+                TransportPayloadVariant::new(Bytes::from_static(b"udp"))
+                    .with_sidecars([Bytes::from_static(b"sidecar")]),
+            )
+            .with_quic_v2_variant(TransportPayloadVariant::new(Bytes::from_static(b"quic-v2")));
         assert_eq!(
             plan.variant(TransportKind::Tcp).primary(),
             &Bytes::from_static(b"rich")
@@ -5572,5 +5973,15 @@ mod tests {
             &Bytes::from_static(b"udp")
         );
         assert_eq!(plan.variant(TransportKind::Udp).sidecars().len(), 1);
+        assert_eq!(
+            plan.variant_for_session(TransportKind::Quic, false)
+                .primary(),
+            &Bytes::from_static(b"rich")
+        );
+        assert_eq!(
+            plan.variant_for_session(TransportKind::Quic, true)
+                .primary(),
+            &Bytes::from_static(b"quic-v2")
+        );
     }
 }

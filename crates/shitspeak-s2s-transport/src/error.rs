@@ -31,6 +31,8 @@ pub enum ConfigError {
     Rustls(#[from] rustls::Error),
     #[error("at least one listener (tcp/kcp/quic/udp) must be configured")]
     NoListener,
+    #[error("{name} must be zero or at least 1200 bytes, got {bytes}")]
+    InvalidQuicDatagramBuffer { name: &'static str, bytes: usize },
 }
 
 #[derive(Debug, Error)]

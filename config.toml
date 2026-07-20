@@ -184,6 +184,14 @@ ping_interval_secs = 2
 idle_ping_interval_secs = 10
 # How often stream transports sample native loss counters; zero disables it.
 native_stats_interval_secs = 10
+# Maximum time to establish and acknowledge all required QUIC v2 class lanes.
+quic_session_setup_timeout_ms = 10000
+# QUIC unreliable DATAGRAM queue budgets; enabled buffers must be at least
+# 1200 bytes. Zero disables that local direction, but does not disable the
+# s2s/2 ALPN offer or request s2s/1 fallback. Negotiated v2 setup fails when
+# either local direction is disabled, so keep both nonzero for v2.
+quic_datagram_send_buffer_bytes = 65536
+quic_datagram_receive_buffer_bytes = 262144
 # Cap on in-flight pings remembered per stream/UDP session.
 max_pending_pings = 64
 # Shared UDP-family S2S mux queues are sized from top-level max_users:

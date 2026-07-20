@@ -1551,24 +1551,58 @@ fn transport_payload_plan(
         return Ok(TransportPayloadPlan::new(rich_payload));
     }
 
-    let mut udp_data = data.clone();
-    udp_data.inline_attachments.clear();
+    let udp_variant = datagram_payload_variant(
+        transport,
+        next_hop,
+        TransportKind::Udp,
+        level,
+        class,
+        data,
+        path_trace,
+    )?;
+    let mut plan =
+        TransportPayloadPlan::new(rich_payload).with_variant(TransportKind::Udp, udp_variant);
+    if level == ServiceLevel::BestEffort {
+        let quic_variant = datagram_payload_variant(
+            transport,
+            next_hop,
+            TransportKind::Quic,
+            level,
+            class,
+            data,
+            path_trace,
+        )?;
+        plan = plan.with_quic_v2_variant(quic_variant);
+    }
+    Ok(plan)
+}
+
+fn datagram_payload_variant(
+    transport: &ConnectionManager,
+    next_hop: NodeIdentifier,
+    kind: TransportKind,
+    level: ServiceLevel,
+    class: MessageClass,
+    data: &pb::OverlayData,
+    path_trace: &[u32],
+) -> Result<TransportPayloadVariant, prost::EncodeError> {
+    let mut datagram_data = data.clone();
+    datagram_data.inline_attachments.clear();
     let mut selected = Vec::with_capacity(data.inline_attachments.len());
     for attachment in &data.inline_attachments {
-        let mut candidate = udp_data.clone();
+        let mut candidate = datagram_data.clone();
         candidate.inline_attachments = selected
             .iter()
             .cloned()
             .chain(std::iter::once(attachment.clone()))
             .collect();
         let candidate_payload = encode_overlay_data(&candidate)?;
-        if transport.payload_fits_transport(
-            next_hop,
-            TransportKind::Udp,
-            level,
-            class,
-            &candidate_payload,
-        ) {
+        let fits = if kind == TransportKind::Quic {
+            transport.payload_fits_quic_v2_datagram(next_hop, class, &candidate_payload)
+        } else {
+            transport.payload_fits_transport(next_hop, kind, level, class, &candidate_payload)
+        };
+        if fits {
             selected.push(attachment.clone());
         }
     }
@@ -1582,20 +1616,33 @@ fn transport_payload_plan(
         })
         .cloned()
         .collect::<Vec<_>>();
-    udp_data.inline_attachments = selected;
-    let udp_payload = encode_overlay_data(&udp_data)?;
+    if kind == TransportKind::Quic
+        && is_realtime_distribution_frame(data)
+        && data
+            .inline_attachments
+            .iter()
+            .any(|attachment| attachment.kind == TREE_HINT_ATTACHMENT_KIND)
+        && !selected
+            .iter()
+            .any(|attachment| attachment.kind == TREE_HINT_ATTACHMENT_KIND)
+    {
+        // A cacheless realtime branch cannot interpret the primary without
+        // its tree hint. Keep the pair atomic and let admission choose a
+        // stream-capable alternate when it cannot fit one DATAGRAM.
+        return Ok(TransportPayloadVariant::new(encode_overlay_data(data)?));
+    }
+    datagram_data.inline_attachments = selected;
+    let datagram_payload = encode_overlay_data(&datagram_data)?;
     let sidecars = encode_attachment_sidecars(
-        transport, next_hop, level, class, data, path_trace, &omitted,
+        transport, next_hop, kind, level, class, data, path_trace, &omitted,
     )?;
-    Ok(TransportPayloadPlan::new(rich_payload).with_variant(
-        TransportKind::Udp,
-        TransportPayloadVariant::new(udp_payload).with_sidecars(sidecars),
-    ))
+    Ok(TransportPayloadVariant::new(datagram_payload).with_sidecars(sidecars))
 }
 
 fn encode_attachment_sidecars(
     transport: &ConnectionManager,
     next_hop: NodeIdentifier,
+    kind: TransportKind,
     level: ServiceLevel,
     class: MessageClass,
     base: &pb::OverlayData,
@@ -1633,13 +1680,12 @@ fn encode_attachment_sidecars(
                 let sidecar =
                     attachment_sidecar_data(base, next_hop, level, path_trace, &chunk, chunk_bytes);
                 let encoded = encode_overlay_data(&sidecar)?;
-                if !transport.payload_fits_transport(
-                    next_hop,
-                    TransportKind::Udp,
-                    level,
-                    class,
-                    &encoded,
-                ) {
+                let candidate_fits = if kind == TransportKind::Quic {
+                    transport.payload_fits_quic_v2_datagram(next_hop, class, &encoded)
+                } else {
+                    transport.payload_fits_transport(next_hop, kind, level, class, &encoded)
+                };
+                if !candidate_fits {
                     fits = false;
                     break;
                 }
@@ -1655,7 +1701,9 @@ fn encode_attachment_sidecars(
             chunk_size = (chunk_size / 2).max(1);
         }
     }
-    crate::overlay::attachment_metrics::record_sidecar_chunks_emitted(sidecars.len());
+    if kind == TransportKind::Udp {
+        crate::overlay::attachment_metrics::record_sidecar_chunks_emitted(sidecars.len());
+    }
     Ok(sidecars)
 }
 

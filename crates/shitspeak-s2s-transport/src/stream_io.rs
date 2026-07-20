@@ -17,6 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -42,8 +43,9 @@ use super::connection::{ActiveStream, OutboundFrame, PeerState};
 use super::frame::{FrameType, build_frame, stream_codec};
 use super::manager::InboundDispatch;
 use super::metrics::{
-    ExpiredOutboundDropStage, TransportIoDirection, TransportIoPressureResult,
-    TransportPipelineStage, record_transport_io_batch, record_transport_io_frames,
+    ExpiredOutboundDropStage, QuicDeliveryLane, QuicProtocolErrorReason, TransportIoDirection,
+    TransportIoPressureResult, TransportPipelineStage, record_quic_lane_delivery,
+    record_quic_protocol_error, record_transport_io_batch, record_transport_io_frames,
     record_transport_io_pressure, record_transport_pipeline_stage,
 };
 use super::native_stats::BoxedNativeLossSampler;
@@ -133,6 +135,8 @@ pub(crate) struct StreamPumpConfig {
     /// dropped when the buffer fills, preventing unbounded memory if pongs
     /// are lost.
     max_pending_pings: usize,
+    quic_v2_lane: Option<MessageClass>,
+    quic_v2_close_code: Option<Arc<AtomicU32>>,
 }
 
 impl StreamPumpConfig {
@@ -161,7 +165,53 @@ impl StreamPumpConfig {
             stream_write_timeout,
             compression,
             max_pending_pings,
+            quic_v2_lane: None,
+            quic_v2_close_code: None,
         }
+    }
+
+    pub(crate) fn with_quic_v2_close_code(mut self, close_code: Arc<AtomicU32>) -> Self {
+        self.quic_v2_close_code = Some(close_code);
+        self
+    }
+
+    fn mark_protocol_violation(&self) {
+        if let Some(close_code) = &self.quic_v2_close_code {
+            close_code.store(
+                super::endpoint::quic::QUIC_CLOSE_SETUP_PROTOCOL,
+                Ordering::Release,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StreamLanePolicy {
+    data_class: Option<MessageClass>,
+    owns_session_control: bool,
+}
+
+impl StreamLanePolicy {
+    pub(crate) const fn legacy() -> Self {
+        Self {
+            data_class: None,
+            owns_session_control: true,
+        }
+    }
+
+    pub(crate) const fn quic_v2(data_class: MessageClass) -> Self {
+        Self {
+            data_class: Some(data_class),
+            owns_session_control: matches!(data_class, MessageClass::Control),
+        }
+    }
+
+    fn hello_class(self) -> MessageClass {
+        self.data_class.unwrap_or(MessageClass::Regular)
+    }
+
+    fn validates_data_lane(self) -> bool {
+        self.data_class.is_some()
     }
 }
 
@@ -186,6 +236,34 @@ where
 
     let active = ActiveStream::new(cfg.transport, remote_addr, tx, closed.clone(), is_dialer);
 
+    spawn_stream_lane_pump(
+        stream,
+        cfg,
+        peer,
+        inbound,
+        rx,
+        closed,
+        native_sampler,
+        StreamLanePolicy::legacy(),
+    );
+
+    active
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_stream_lane_pump<S>(
+    stream: S,
+    mut cfg: StreamPumpConfig,
+    peer: Arc<PeerState>,
+    inbound: InboundDispatch,
+    rx: AdaptiveQueueReceiver<OutboundFrame>,
+    closed: CancellationToken,
+    native_sampler: Option<BoxedNativeLossSampler>,
+    policy: StreamLanePolicy,
+) where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    cfg.quic_v2_lane = policy.data_class;
     tokio::spawn(run_pump(
         stream,
         cfg,
@@ -194,9 +272,8 @@ where
         rx,
         closed,
         native_sampler,
+        policy,
     ));
-
-    active
 }
 
 pub(crate) fn stream_handoff_lane_bytes(global_bytes: usize, max_frame_bytes: usize) -> usize {
@@ -336,12 +413,17 @@ async fn run_pump<S>(
     mut rx: AdaptiveQueueReceiver<OutboundFrame>,
     closed: CancellationToken,
     mut native_sampler: Option<BoxedNativeLossSampler>,
+    policy: StreamLanePolicy,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let codec = stream_codec(cfg.max_frame_bytes);
     let mut framed = Framed::new(stream, codec);
-    let mut ping_tick = MaybeInterval::maybe(cfg.ping_interval);
+    let mut ping_tick = if policy.owns_session_control {
+        MaybeInterval::maybe(cfg.ping_interval)
+    } else {
+        MaybeInterval::Disabled
+    };
     let stable_ping_interval = stabilized_ping_interval(cfg.ping_interval, cfg.idle_ping_interval);
     let mut stable_ping_interval_armed = false;
     let mut native_tick = if native_sampler.is_some() {
@@ -373,7 +455,7 @@ async fn run_pump<S>(
         cfg.peer_node,
         level_for_metrics,
         FrameType::Hello,
-        MessageClass::Regular,
+        policy.hello_class(),
         now_us(),
         dictionary_compression_hello_payload(&cfg.compression),
     );
@@ -440,6 +522,9 @@ async fn run_pump<S>(
                     Some(Ok(b)) => b,
                     Some(Err(e)) => {
                         peer.metrics().record_data_health_failure(cfg.transport);
+                        if e.kind() == io::ErrorKind::InvalidData {
+                            cfg.mark_protocol_violation();
+                        }
                         if is_tls_close_notify_eof(&e) {
                             debug!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "stream closed without TLS close_notify");
                         } else {
@@ -461,9 +546,17 @@ async fn run_pump<S>(
                 );
                 match decoded_frame {
                     Ok(frame) => {
-                        let class = pb::MessageClass::try_from(frame.message_class)
-                            .map(MessageClass::from)
-                            .unwrap_or(MessageClass::Regular);
+                        let class = match pb::MessageClass::try_from(frame.message_class) {
+                            Ok(class) => MessageClass::from(class),
+                            Err(_) if policy.validates_data_lane() => {
+                                cfg.mark_protocol_violation();
+                                peer.metrics().record_data_health_failure(cfg.transport);
+                                record_quic_protocol_error(QuicProtocolErrorReason::ClassMismatch);
+                                warn!(peer=%peer.node_id(), transport=?cfg.transport, message_class=frame.message_class, "invalid message class on strict stream lane");
+                                break;
+                            }
+                            Err(_) => MessageClass::Regular,
+                        };
                         record_transport_io_batch(
                             peer.node_id(),
                             cfg.transport,
@@ -478,6 +571,15 @@ async fn run_pump<S>(
                             class,
                             1,
                         );
+                        if let Some(lane) = cfg.quic_v2_lane {
+                            record_quic_lane_delivery(
+                                peer.node_id(),
+                                TransportIoDirection::Ingress,
+                                quic_delivery_lane(lane),
+                                1,
+                                recv_size,
+                            );
+                        }
                         #[cfg(debug_assertions)]
                         crate::debug_io::record_named_received(
                             stream_frame_kind_name(cfg.transport, frame.frame_type),
@@ -498,6 +600,7 @@ async fn run_pump<S>(
                             &mut pending_adaptive_dictionary_id,
                             &mut peer_dictionary_support,
                             level_for_metrics,
+                            policy,
                         ).await {
                             Ok(transport_link_stable) => {
                                 if let Err(e) = maybe_advertise_local_adaptive_dictionary(
@@ -528,6 +631,7 @@ async fn run_pump<S>(
                         }
                     }
                     Err(e) => {
+                        cfg.mark_protocol_violation();
                         peer.metrics().record_data_health_failure(cfg.transport);
                         warn!(peer=%peer.node_id(), transport=?cfg.transport, error=%e, "frame decode error; dropping connection");
                         break;
@@ -909,10 +1013,18 @@ fn prepare_stream_data_frame(
     let original_payload = out.payload().clone();
     let original_payload_len = original_payload.len();
     let class = out.class();
+    // Legacy transports retain their historical inferred service level.
+    // QUIC v2 carries the caller's requested reliable level on the selected
+    // class lane so the receiver can preserve that logical contract.
+    let wire_level = if cfg.quic_v2_lane.is_some() {
+        out.level()
+    } else {
+        cfg.transport.service_level()
+    };
     let mut frame = build_frame(
         cfg.local_node,
         cfg.peer_node,
-        cfg.transport.service_level(),
+        wire_level,
         FrameType::Data,
         class,
         now_us(),
@@ -1181,6 +1293,15 @@ where
             write.class,
             1,
         );
+        if let Some(lane) = cfg.quic_v2_lane {
+            record_quic_lane_delivery(
+                peer.node_id(),
+                TransportIoDirection::Egress,
+                quic_delivery_lane(lane),
+                1,
+                len,
+            );
+        }
         #[cfg(debug_assertions)]
         crate::debug_io::record_named_sent(
             stream_frame_kind_name(cfg.transport, write.frame_type),
@@ -1196,6 +1317,14 @@ where
         total_len,
     );
     Ok(total_len)
+}
+
+fn quic_delivery_lane(class: MessageClass) -> QuicDeliveryLane {
+    match class {
+        MessageClass::Control => QuicDeliveryLane::Control,
+        MessageClass::HighPriority => QuicDeliveryLane::HighPriority,
+        MessageClass::Regular => QuicDeliveryLane::Regular,
+    }
 }
 
 fn stream_write_deadline(cfg: &StreamPumpConfig, expires_at: Option<Instant>) -> Option<Duration> {
@@ -1271,7 +1400,8 @@ async fn handle_inbound<S>(
     active_adaptive_dictionary_id: &mut Option<u64>,
     pending_adaptive_dictionary_id: &mut Option<u64>,
     peer_dictionary_support: &mut PeerDictionaryCompressionSupport,
-    level: ServiceLevel,
+    legacy_level: ServiceLevel,
+    policy: StreamLanePolicy,
 ) -> std::io::Result<bool>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin,
@@ -1295,18 +1425,80 @@ where
             TransportPipelineStage::L1Decompress,
             decompress_started_at.elapsed(),
         );
-        decompress_result?;
+        if let Err(error) = decompress_result {
+            if policy.validates_data_lane() {
+                cfg.mark_protocol_violation();
+            }
+            return Err(error);
+        }
     }
     let mut transport_link_stable = false;
     let ty = match pb::FrameType::try_from(frame.frame_type) {
         Ok(v) => v,
+        Err(_) if policy.validates_data_lane() => {
+            cfg.mark_protocol_violation();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown frame type on QUIC v2 lane",
+            ));
+        }
         Err(_) => return Ok(false),
     };
     match ty {
         pb::FrameType::FrameData => {
-            let class = pb::MessageClass::try_from(frame.message_class)
-                .map(MessageClass::from)
-                .unwrap_or(MessageClass::Regular);
+            let class = match pb::MessageClass::try_from(frame.message_class) {
+                Ok(class) => MessageClass::from(class),
+                Err(_) if policy.validates_data_lane() => {
+                    cfg.mark_protocol_violation();
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unknown message class",
+                    ));
+                }
+                Err(_) => MessageClass::Regular,
+            };
+            let wire_level = if let Some(expected) = policy.data_class {
+                let wire_level = ServiceLevel::try_from(frame.service_level).map_err(|_| {
+                    cfg.mark_protocol_violation();
+                    record_quic_protocol_error(QuicProtocolErrorReason::ServiceMismatch);
+                    io::Error::new(io::ErrorKind::InvalidData, "unknown service level")
+                })?;
+                if class != expected {
+                    cfg.mark_protocol_violation();
+                    record_quic_protocol_error(QuicProtocolErrorReason::ClassMismatch);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("message class {class:?} does not match {expected:?} QUIC lane"),
+                    ));
+                }
+                if wire_level == ServiceLevel::BestEffort {
+                    cfg.mark_protocol_violation();
+                    record_quic_protocol_error(QuicProtocolErrorReason::ServiceMismatch);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "best-effort data is not allowed on a QUIC v2 stream",
+                    ));
+                }
+                if frame.src_node != u32::from(cfg.peer_node) {
+                    cfg.mark_protocol_violation();
+                    record_quic_protocol_error(QuicProtocolErrorReason::SourceMismatch);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "QUIC v2 stream frame source identity mismatch",
+                    ));
+                }
+                if frame.dst_node != u32::from(cfg.local_node) {
+                    cfg.mark_protocol_violation();
+                    record_quic_protocol_error(QuicProtocolErrorReason::DestinationMismatch);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "QUIC v2 stream frame destination identity mismatch",
+                    ));
+                }
+                wire_level
+            } else {
+                legacy_level
+            };
             let original_payload_len = frame.payload.len();
             peer.metrics()
                 .record_payload_recv(cfg.transport, original_payload_len);
@@ -1318,13 +1510,20 @@ where
             inbound_compression.record_sample(&frame.payload);
             inbound.dispatch(super::manager::InboundMessage::new(
                 cfg.peer_node,
-                level,
+                wire_level,
                 cfg.transport,
                 class,
                 frame.payload,
             ));
         }
         pb::FrameType::FramePing | pb::FrameType::FrameKeepalive => {
+            if !policy.owns_session_control {
+                cfg.mark_protocol_violation();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session-control frame received outside the Control lane",
+                ));
+            }
             // Echo the payload back so the round trip carries enough bytes
             // for the sender to estimate throughput. Empty pings (latency
             // probes) round-trip a tiny pong; large probes round-trip a
@@ -1333,7 +1532,7 @@ where
             let pong = build_frame(
                 cfg.local_node,
                 cfg.peer_node,
-                level,
+                legacy_level,
                 FrameType::Pong,
                 MessageClass::Regular,
                 frame.ts_us,
@@ -1342,6 +1541,13 @@ where
             encode_and_send(framed, &pong, cfg, peer, None).await?;
         }
         pb::FrameType::FramePong => {
+            if !policy.owns_session_control {
+                cfg.mark_protocol_violation();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session-control frame received outside the Control lane",
+                ));
+            }
             if let Some(ping) = pending.take(frame.ts_us) {
                 let rtt = ping.sent_at.elapsed();
                 if cfg.transport != TransportKind::Kcp {
@@ -1365,8 +1571,20 @@ where
             trace!(peer=%cfg.peer_node, transport=?cfg.transport, "received transport hello");
         }
         pb::FrameType::FrameDictionary => {
-            handle_dictionary_advertisement(frame, cfg, peer, framed, peer_adaptive_dictionaries)
-                .await?;
+            if let Err(error) = handle_dictionary_advertisement(
+                frame,
+                cfg,
+                peer,
+                framed,
+                peer_adaptive_dictionaries,
+            )
+            .await
+            {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    cfg.mark_protocol_violation();
+                }
+                return Err(error);
+            }
         }
         pb::FrameType::FrameDictionaryAck => {
             let dictionary_id = frame.payload_dictionary_id;
@@ -1380,6 +1598,13 @@ where
             }
         }
         pb::FrameType::FrameBye => {
+            if !policy.owns_session_control {
+                cfg.mark_protocol_violation();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session-control frame received outside the Control lane",
+                ));
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "peer sent BYE",

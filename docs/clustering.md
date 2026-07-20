@@ -75,18 +75,78 @@ local_interface_advertise = ["tailscale0", "Tailscale"]
 
 Interface names are matched case-insensitively. On Windows, adapter name, friendly name, and description are checked.
 
+## QUIC Protocol Versions And Delivery Lanes
+
+QUIC advertises ALPN protocols in the order `s2s/2`, `s2s/1`. Two upgraded
+peers therefore use `s2s/2`; a connection to a peer that only supports
+`s2s/1` retains the legacy single reliable stream, including its existing
+BestEffort behavior.
+
+An `s2s/2` session maps traffic as follows:
+
+| Requested service level and class | QUIC delivery lane |
+|---|---|
+| `BestEffort`, any message class | QUIC DATAGRAM |
+| Non-BestEffort `Control` | Persistent Control stream |
+| Non-BestEffort `HighPriority` | Persistent HighPriority stream |
+| Non-BestEffort `Regular` | Persistent Regular stream |
+
+BestEffort takes precedence over the message class. The class is still carried
+in the DATAGRAM frame and selects the inbound Control, HighPriority, or Regular
+queue. Each reliable lane preserves FIFO order independently, but there is no
+ordering guarantee between lanes. The three reliable streams have equal QUIC
+priority; only the Control lane carries session liveness frames.
+
+A QUIC DATAGRAM contains one transport frame and has no stream length prefix.
+It is unreliable: QUIC does not retransmit it, it can be lost or reordered,
+and a successful send only means that it was queued locally. ShitSpeak does not
+fragment an oversized QUIC DATAGRAM or automatically move it to a reliable
+lane. Application sequencing and repair remain responsible where needed.
+Under pressure, the application DATAGRAM queue evicts older traffic in favor
+of the newest traffic.
+
+DATAGRAM payloads may use configured stateless L1 compression when the send
+permits compression, but never use an adaptive dictionary. Each reliable lane
+has independent adaptive-compression state. DATAGRAM and stream frames still
+share the connection's congestion controller and path capacity; separate lanes
+do not reserve bandwidth. Quinn sends already-queued DATAGRAM frames before
+stream frames, so keep the DATAGRAM buffers shallow enough for the workload.
+
+Protocol selection happens only during connection establishment. Existing
+`s2s/1` sessions remain v1 until they reconnect, and failure while establishing
+an already-negotiated v2 session does not downgrade that connection to v1.
+Normal routing and reconnection handle the failure. For rolling upgrades,
+deploy a dual-stack release first and retain `s2s/1` for at least one complete
+rollback window. Remove v1 only after both active-v1 and newly-negotiated-v1
+metrics remain zero for that entire window.
+
 ## Transport Compression
 
 S2S transport supports selective payload compression:
 
 ```toml
 [s2s.transport]
+quic_session_setup_timeout_ms = 10000
+quic_datagram_send_buffer_bytes = 65536
+quic_datagram_receive_buffer_bytes = 262144
 compression_enabled = true
 compression_min_bytes = 1024
 compression_min_savings_percent = 10
 compression_level = 1
 compression_adaptive_dictionary_enabled = true
 ```
+
+The QUIC session setup timeout bounds establishment of the required class
+lanes. QUIC DATAGRAM send and receive buffers default to 64 KiB and 256 KiB,
+respectively; enabled buffers must be at least 1200 bytes.
+
+Setting a DATAGRAM buffer to zero disables that local direction, but does not
+disable the `s2s/2` ALPN offer or request an `s2s/1` downgrade. A zero receive
+buffer means the endpoint cannot advertise the DATAGRAM support required by
+v2. A zero send buffer also prevents the complete v2 mapping, so negotiated v2
+setup fails when either local direction is disabled. Keep
+both buffers nonzero for operational v2 sessions. A peer that supports only
+`s2s/1` can still negotiate the legacy protocol normally.
 
 When `s2s.persistence_dir` is configured, the latest learned adaptive compression dictionary is cached below that directory and renegotiated with peers after restart.
 

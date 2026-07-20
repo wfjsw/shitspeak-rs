@@ -67,6 +67,7 @@ mod endpoint;
 mod error;
 mod frame;
 mod identity;
+mod latest_wins_queue;
 mod local_ip;
 mod manager;
 mod metrics;
@@ -85,7 +86,10 @@ mod integration_tests;
 pub use adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
 pub use compression::SendOptions;
 pub use config::{KcpTuning, TransportConfig, TransportRoutingPolicy, TransportTuning};
-pub use connection::{AddressBackoffSnapshot, TransportPayloadPlan, TransportPayloadVariant};
+pub use connection::{
+    AddressBackoffSnapshot, QuicSessionProtocol, QuicSessionStatusSnapshot, TransportPayloadPlan,
+    TransportPayloadVariant,
+};
 pub use error::{ConfigError, SendError, TransportError};
 pub use frame::{
     Frame, FrameType, build_frame, decode_frame, encode_frame, encode_frame_to_bytes,
@@ -98,16 +102,20 @@ pub use manager::PeerAddressSnapshot;
 pub use manager::{AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage};
 pub use metrics::{
     ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics,
-    MetricsSnapshot, OutboundQueueStatusSnapshot, QueueStatusSnapshot, TransportIoDirection,
-    TransportIoFrameSnapshot, TransportIoPressureResult, TransportIoSnapshot,
-    TransportPipelineStageSnapshot, VoiceTransportBindingEventReason,
+    MetricsSnapshot, OutboundQueueStatusSnapshot, QueueStatusSnapshot, QuicDatagramDropReason,
+    QuicDatagramDropSnapshot, QuicDeliveryLane, QuicLaneSnapshot, QuicProtocolErrorReason,
+    QuicProtocolErrorSnapshot, QuicProtocolEventSnapshot, QuicProtocolResult, QuicProtocolStage,
+    QuicProtocolVersion, TransportIoDirection, TransportIoFrameSnapshot, TransportIoPressureResult,
+    TransportIoSnapshot, TransportPipelineStageSnapshot, VoiceTransportBindingEventReason,
     VoiceTransportBindingEventSnapshot, VoiceTransportBindingSnapshot,
     VoiceTransportChallengerOutcome, VoiceTransportChallengerSnapshot,
 };
 pub use metrics::{
     apply_packet_loss_penalty, conversational_effective_delay_us, conversational_impairment,
-    conversational_quality_score, transport_io_frame_snapshots, transport_io_snapshots,
-    transport_pipeline_stage_snapshots,
+    conversational_quality_score, quic_datagram_drop_snapshots, quic_lane_snapshots,
+    quic_protocol_error_snapshots, quic_protocol_event_snapshots, record_quic_datagram_drop,
+    record_quic_lane_delivery, record_quic_protocol_error, record_quic_protocol_event,
+    transport_io_frame_snapshots, transport_io_snapshots, transport_pipeline_stage_snapshots,
 };
 pub use public_ip::discover_public_geo;
 pub use service_level::{

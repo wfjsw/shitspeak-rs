@@ -45,6 +45,14 @@ const EXPIRED_OUTBOUND_DROP_TRANSPORT_COUNT: usize = 5;
 const MESSAGE_CLASS_COUNT: usize = 3;
 const TRANSPORT_KIND_COUNT: usize = 4;
 const TRANSPORT_PIPELINE_STAGE_COUNT: usize = 8;
+const QUIC_DELIVERY_DIRECTION_COUNT: usize = 2;
+const QUIC_DELIVERY_LANE_COUNT: usize = 4;
+const QUIC_DATAGRAM_DROP_REASON_COUNT: usize = 10;
+const QUIC_PROTOCOL_STAGE_COUNT: usize = 2;
+const QUIC_PROTOCOL_VERSION_COUNT: usize = 2;
+const QUIC_PROTOCOL_RESULT_COUNT: usize = 2;
+const QUIC_PROTOCOL_ERROR_REASON_COUNT: usize = 7;
+const MAX_TRACKED_QUIC_METRIC_PEERS: usize = 1024;
 
 const EXPIRED_OUTBOUND_DROP_STAGES: [ExpiredOutboundDropStage; EXPIRED_OUTBOUND_DROP_STAGE_COUNT] = [
     ExpiredOutboundDropStage::PeerQueueEnqueue,
@@ -103,6 +111,8 @@ const TRANSPORT_IO_BATCH_SIZE_BUCKETS: [(&str, u64); 8] = [
 
 static TRANSPORT_IO: LazyLock<StdMutex<TransportIoMetrics>> =
     LazyLock::new(|| StdMutex::new(TransportIoMetrics::default()));
+static QUIC_METRICS: LazyLock<StdMutex<QuicMetrics>> =
+    LazyLock::new(|| StdMutex::new(QuicMetrics::default()));
 
 static TRANSPORT_PIPELINE_STAGE_EVENTS: [[AtomicU64; TRANSPORT_PIPELINE_STAGE_COUNT];
     TRANSPORT_KIND_COUNT] =
@@ -117,6 +127,448 @@ static TRANSPORT_PIPELINE_STAGE_DURATION_BUCKETS: [[[AtomicU64;
     [const { [const { AtomicU64::new(0) }; TRANSPORT_PIPELINE_DURATION_BUCKETS_US.len()] };
         TRANSPORT_PIPELINE_STAGE_COUNT]
 }; TRANSPORT_KIND_COUNT];
+
+/// A physical QUIC v2 delivery lane. The set is deliberately closed so metric
+/// labels cannot grow from untrusted wire values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuicDeliveryLane {
+    Control,
+    HighPriority,
+    Regular,
+    Datagram,
+}
+
+impl QuicDeliveryLane {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::HighPriority => "high_priority",
+            Self::Regular => "regular",
+            Self::Datagram => "datagram",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuicDatagramDropReason {
+    Expired,
+    AppQueueEvicted,
+    QuinnBufferPressure,
+    TooLarge,
+    Unsupported,
+    Disabled,
+    ConnectionLost,
+    Decode,
+    Validation,
+    NoFit,
+}
+
+impl QuicDatagramDropReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::AppQueueEvicted => "app_queue_evicted",
+            Self::QuinnBufferPressure => "quinn_buffer_pressure",
+            Self::TooLarge => "too_large",
+            Self::Unsupported => "unsupported",
+            Self::Disabled => "disabled",
+            Self::ConnectionLost => "connection_lost",
+            Self::Decode => "decode",
+            Self::Validation => "validation",
+            Self::NoFit => "no_fit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuicProtocolStage {
+    Negotiation,
+    Setup,
+}
+
+impl QuicProtocolStage {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Negotiation => "negotiation",
+            Self::Setup => "setup",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuicProtocolVersion {
+    S2s1,
+    S2s2,
+}
+
+impl QuicProtocolVersion {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::S2s1 => "s2s1",
+            Self::S2s2 => "s2s2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuicProtocolResult {
+    Success,
+    Failure,
+}
+
+impl QuicProtocolResult {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuicProtocolErrorReason {
+    InvalidPreface,
+    DuplicateLane,
+    MissingLane,
+    ClassMismatch,
+    ServiceMismatch,
+    SourceMismatch,
+    DestinationMismatch,
+}
+
+impl QuicProtocolErrorReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::InvalidPreface => "invalid_preface",
+            Self::DuplicateLane => "duplicate_lane",
+            Self::MissingLane => "missing_lane",
+            Self::ClassMismatch => "class_mismatch",
+            Self::ServiceMismatch => "service_mismatch",
+            Self::SourceMismatch => "source_mismatch",
+            Self::DestinationMismatch => "destination_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct QuicLaneCounter {
+    frames: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct QuicMetrics {
+    // `None` is the overflow bucket after the fixed peer cardinality cap.
+    lanes: HashMap<
+        Option<NodeIdentifier>,
+        [[QuicLaneCounter; QUIC_DELIVERY_LANE_COUNT]; QUIC_DELIVERY_DIRECTION_COUNT],
+    >,
+    tracked_peers: usize,
+    datagram_drops: [u64; QUIC_DATAGRAM_DROP_REASON_COUNT],
+    protocol_events: [[[u64; QUIC_PROTOCOL_RESULT_COUNT]; QUIC_PROTOCOL_VERSION_COUNT];
+        QUIC_PROTOCOL_STAGE_COUNT],
+    protocol_errors: [u64; QUIC_PROTOCOL_ERROR_REASON_COUNT],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuicLaneSnapshot {
+    peer: Option<NodeIdentifier>,
+    direction: TransportIoDirection,
+    lane: QuicDeliveryLane,
+    frames: u64,
+    bytes: u64,
+}
+
+impl QuicLaneSnapshot {
+    /// Returns `None` for the bounded overflow bucket.
+    pub fn peer(self) -> Option<NodeIdentifier> {
+        self.peer
+    }
+    pub fn direction(self) -> TransportIoDirection {
+        self.direction
+    }
+    pub fn lane(self) -> QuicDeliveryLane {
+        self.lane
+    }
+    pub fn frames(self) -> u64 {
+        self.frames
+    }
+    pub fn bytes(self) -> u64 {
+        self.bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuicDatagramDropSnapshot {
+    reason: QuicDatagramDropReason,
+    drops: u64,
+}
+
+impl QuicDatagramDropSnapshot {
+    pub fn reason(self) -> QuicDatagramDropReason {
+        self.reason
+    }
+    pub fn drops(self) -> u64 {
+        self.drops
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuicProtocolEventSnapshot {
+    stage: QuicProtocolStage,
+    version: QuicProtocolVersion,
+    result: QuicProtocolResult,
+    events: u64,
+}
+
+impl QuicProtocolEventSnapshot {
+    pub fn stage(self) -> QuicProtocolStage {
+        self.stage
+    }
+    pub fn version(self) -> QuicProtocolVersion {
+        self.version
+    }
+    pub fn result(self) -> QuicProtocolResult {
+        self.result
+    }
+    pub fn events(self) -> u64 {
+        self.events
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuicProtocolErrorSnapshot {
+    reason: QuicProtocolErrorReason,
+    errors: u64,
+}
+
+impl QuicProtocolErrorSnapshot {
+    pub fn reason(self) -> QuicProtocolErrorReason {
+        self.reason
+    }
+    pub fn errors(self) -> u64 {
+        self.errors
+    }
+}
+
+/// Record frames accepted by or received from a physical QUIC v2 lane.
+pub fn record_quic_lane_delivery(
+    peer: NodeIdentifier,
+    direction: TransportIoDirection,
+    lane: QuicDeliveryLane,
+    frames: u64,
+    bytes: usize,
+) {
+    let mut metrics = QUIC_METRICS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = if metrics.lanes.contains_key(&Some(peer)) {
+        Some(peer)
+    } else if metrics.tracked_peers < MAX_TRACKED_QUIC_METRIC_PEERS {
+        metrics.tracked_peers += 1;
+        Some(peer)
+    } else {
+        None
+    };
+    let counter = &mut metrics.lanes.entry(key).or_default()[quic_direction_index(direction)]
+        [quic_lane_index(lane)];
+    counter.frames = counter.frames.saturating_add(frames);
+    counter.bytes = counter.bytes.saturating_add(bytes as u64);
+}
+
+pub fn record_quic_datagram_drop(reason: QuicDatagramDropReason) {
+    let mut metrics = QUIC_METRICS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let counter = &mut metrics.datagram_drops[quic_datagram_drop_reason_index(reason)];
+    *counter = counter.saturating_add(1);
+}
+
+pub fn record_quic_protocol_event(
+    stage: QuicProtocolStage,
+    version: QuicProtocolVersion,
+    result: QuicProtocolResult,
+) {
+    let mut metrics = QUIC_METRICS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let counter = &mut metrics.protocol_events[quic_protocol_stage_index(stage)]
+        [quic_protocol_version_index(version)][quic_protocol_result_index(result)];
+    *counter = counter.saturating_add(1);
+}
+
+pub fn record_quic_protocol_error(reason: QuicProtocolErrorReason) {
+    let mut metrics = QUIC_METRICS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let counter = &mut metrics.protocol_errors[quic_protocol_error_reason_index(reason)];
+    *counter = counter.saturating_add(1);
+}
+
+pub fn quic_lane_snapshots() -> Vec<QuicLaneSnapshot> {
+    let metrics = QUIC_METRICS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut snapshots = Vec::new();
+    for (&peer, counters) in &metrics.lanes {
+        for direction in [TransportIoDirection::Ingress, TransportIoDirection::Egress] {
+            for lane in [
+                QuicDeliveryLane::Control,
+                QuicDeliveryLane::HighPriority,
+                QuicDeliveryLane::Regular,
+                QuicDeliveryLane::Datagram,
+            ] {
+                let counter = counters[quic_direction_index(direction)][quic_lane_index(lane)];
+                if counter.frames != 0 || counter.bytes != 0 {
+                    snapshots.push(QuicLaneSnapshot {
+                        peer,
+                        direction,
+                        lane,
+                        frames: counter.frames,
+                        bytes: counter.bytes,
+                    });
+                }
+            }
+        }
+    }
+    snapshots.sort_by_key(|snapshot| {
+        (
+            snapshot.peer,
+            quic_direction_index(snapshot.direction),
+            quic_lane_index(snapshot.lane),
+        )
+    });
+    snapshots
+}
+
+pub fn quic_datagram_drop_snapshots() -> Vec<QuicDatagramDropSnapshot> {
+    let metrics = QUIC_METRICS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    QUIC_DATAGRAM_DROP_REASONS
+        .into_iter()
+        .enumerate()
+        .map(|(index, reason)| QuicDatagramDropSnapshot {
+            reason,
+            drops: metrics.datagram_drops[index],
+        })
+        .collect()
+}
+
+pub fn quic_protocol_event_snapshots() -> Vec<QuicProtocolEventSnapshot> {
+    let metrics = QUIC_METRICS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut snapshots = Vec::new();
+    for stage in [QuicProtocolStage::Negotiation, QuicProtocolStage::Setup] {
+        for version in [QuicProtocolVersion::S2s1, QuicProtocolVersion::S2s2] {
+            for result in [QuicProtocolResult::Success, QuicProtocolResult::Failure] {
+                snapshots.push(QuicProtocolEventSnapshot {
+                    stage,
+                    version,
+                    result,
+                    events: metrics.protocol_events[quic_protocol_stage_index(stage)]
+                        [quic_protocol_version_index(version)][quic_protocol_result_index(result)],
+                });
+            }
+        }
+    }
+    snapshots
+}
+
+pub fn quic_protocol_error_snapshots() -> Vec<QuicProtocolErrorSnapshot> {
+    let metrics = QUIC_METRICS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    QUIC_PROTOCOL_ERROR_REASONS
+        .into_iter()
+        .enumerate()
+        .map(|(index, reason)| QuicProtocolErrorSnapshot {
+            reason,
+            errors: metrics.protocol_errors[index],
+        })
+        .collect()
+}
+
+const QUIC_DATAGRAM_DROP_REASONS: [QuicDatagramDropReason; QUIC_DATAGRAM_DROP_REASON_COUNT] = [
+    QuicDatagramDropReason::Expired,
+    QuicDatagramDropReason::AppQueueEvicted,
+    QuicDatagramDropReason::QuinnBufferPressure,
+    QuicDatagramDropReason::TooLarge,
+    QuicDatagramDropReason::Unsupported,
+    QuicDatagramDropReason::Disabled,
+    QuicDatagramDropReason::ConnectionLost,
+    QuicDatagramDropReason::Decode,
+    QuicDatagramDropReason::Validation,
+    QuicDatagramDropReason::NoFit,
+];
+const QUIC_PROTOCOL_ERROR_REASONS: [QuicProtocolErrorReason; QUIC_PROTOCOL_ERROR_REASON_COUNT] = [
+    QuicProtocolErrorReason::InvalidPreface,
+    QuicProtocolErrorReason::DuplicateLane,
+    QuicProtocolErrorReason::MissingLane,
+    QuicProtocolErrorReason::ClassMismatch,
+    QuicProtocolErrorReason::ServiceMismatch,
+    QuicProtocolErrorReason::SourceMismatch,
+    QuicProtocolErrorReason::DestinationMismatch,
+];
+
+fn quic_direction_index(direction: TransportIoDirection) -> usize {
+    match direction {
+        TransportIoDirection::Ingress => 0,
+        TransportIoDirection::Egress => 1,
+    }
+}
+fn quic_lane_index(lane: QuicDeliveryLane) -> usize {
+    match lane {
+        QuicDeliveryLane::Control => 0,
+        QuicDeliveryLane::HighPriority => 1,
+        QuicDeliveryLane::Regular => 2,
+        QuicDeliveryLane::Datagram => 3,
+    }
+}
+fn quic_datagram_drop_reason_index(reason: QuicDatagramDropReason) -> usize {
+    match reason {
+        QuicDatagramDropReason::Expired => 0,
+        QuicDatagramDropReason::AppQueueEvicted => 1,
+        QuicDatagramDropReason::QuinnBufferPressure => 2,
+        QuicDatagramDropReason::TooLarge => 3,
+        QuicDatagramDropReason::Unsupported => 4,
+        QuicDatagramDropReason::Disabled => 5,
+        QuicDatagramDropReason::ConnectionLost => 6,
+        QuicDatagramDropReason::Decode => 7,
+        QuicDatagramDropReason::Validation => 8,
+        QuicDatagramDropReason::NoFit => 9,
+    }
+}
+fn quic_protocol_stage_index(stage: QuicProtocolStage) -> usize {
+    match stage {
+        QuicProtocolStage::Negotiation => 0,
+        QuicProtocolStage::Setup => 1,
+    }
+}
+fn quic_protocol_version_index(version: QuicProtocolVersion) -> usize {
+    match version {
+        QuicProtocolVersion::S2s1 => 0,
+        QuicProtocolVersion::S2s2 => 1,
+    }
+}
+fn quic_protocol_result_index(result: QuicProtocolResult) -> usize {
+    match result {
+        QuicProtocolResult::Success => 0,
+        QuicProtocolResult::Failure => 1,
+    }
+}
+fn quic_protocol_error_reason_index(reason: QuicProtocolErrorReason) -> usize {
+    match reason {
+        QuicProtocolErrorReason::InvalidPreface => 0,
+        QuicProtocolErrorReason::DuplicateLane => 1,
+        QuicProtocolErrorReason::MissingLane => 2,
+        QuicProtocolErrorReason::ClassMismatch => 3,
+        QuicProtocolErrorReason::ServiceMismatch => 4,
+        QuicProtocolErrorReason::SourceMismatch => 5,
+        QuicProtocolErrorReason::DestinationMismatch => 6,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportPipelineStage {
@@ -2477,6 +2929,55 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quic_metrics_use_bounded_dimensions_and_accumulate() {
+        let peer = NodeIdentifier::MAX;
+        let before = quic_lane_snapshots()
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.peer() == Some(peer)
+                    && snapshot.direction() == TransportIoDirection::Egress
+                    && snapshot.lane() == QuicDeliveryLane::Datagram
+            })
+            .map(|snapshot| (snapshot.frames(), snapshot.bytes()))
+            .unwrap_or_default();
+
+        record_quic_lane_delivery(
+            peer,
+            TransportIoDirection::Egress,
+            QuicDeliveryLane::Datagram,
+            2,
+            321,
+        );
+        let after = quic_lane_snapshots()
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.peer() == Some(peer)
+                    && snapshot.direction() == TransportIoDirection::Egress
+                    && snapshot.lane() == QuicDeliveryLane::Datagram
+            })
+            .expect("recorded QUIC lane snapshot");
+        assert!(after.frames() >= before.0 + 2);
+        assert!(after.bytes() >= before.1 + 321);
+
+        let drop_before = quic_datagram_drop_snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.reason() == QuicDatagramDropReason::TooLarge)
+            .expect("fixed drop dimension")
+            .drops();
+        record_quic_datagram_drop(QuicDatagramDropReason::TooLarge);
+        let drop_after = quic_datagram_drop_snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.reason() == QuicDatagramDropReason::TooLarge)
+            .expect("fixed drop dimension")
+            .drops();
+        assert!(drop_after >= drop_before + 1);
+
+        assert_eq!(quic_datagram_drop_snapshots().len(), 10);
+        assert_eq!(quic_protocol_event_snapshots().len(), 8);
+        assert_eq!(quic_protocol_error_snapshots().len(), 7);
+    }
 
     #[test]
     fn sliding_counter_snapshot_at_handles_window_boundaries_deterministically() {

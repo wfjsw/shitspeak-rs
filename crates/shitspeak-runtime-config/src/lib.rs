@@ -2691,6 +2691,9 @@ mod tests {
             idle_ping_interval_secs = 19
             native_stats_interval_secs = 11
             stream_write_timeout_ms = 444
+            quic_session_setup_timeout_ms = 5555
+            quic_datagram_send_buffer_bytes = 32768
+            quic_datagram_receive_buffer_bytes = 131072
             recent_probe_retry_cap_secs = 31
             stale_probe_retry_cap_secs = 601
             stale_probe_age_secs = 3601
@@ -2817,6 +2820,12 @@ mod tests {
         assert_eq!(transport.idle_ping_interval(), Duration::from_secs(19));
         assert_eq!(transport.native_stats_interval(), Duration::from_secs(11));
         assert_eq!(transport.stream_write_timeout(), Duration::from_millis(444));
+        assert_eq!(
+            transport.quic_session_setup_timeout(),
+            Duration::from_millis(5_555)
+        );
+        assert_eq!(transport.quic_datagram_send_buffer_bytes(), 32_768);
+        assert_eq!(transport.quic_datagram_receive_buffer_bytes(), 131_072);
         assert_eq!(transport.max_outgoing_connections(), 777);
         let routing_policy = transport.routing_policy();
         assert_eq!(routing_policy.udp_family_min_samples(), 9);
@@ -2919,6 +2928,31 @@ mod tests {
         };
         let error = cfg.transport_config().unwrap_err();
         assert!(error.contains("ca_path"));
+    }
+
+    #[test]
+    fn s2s_rejects_undersized_quic_datagram_buffers() {
+        for key in [
+            "quic_datagram_send_buffer_bytes",
+            "quic_datagram_receive_buffer_bytes",
+        ] {
+            let raw = format!(
+                r#"
+                    enabled = true
+                    ca_path = "s2s-ca.pem"
+                    cert_path = "s2s-node.pem"
+                    key_path = "s2s-node.key"
+
+                    [transport]
+                    {key} = 1199
+                "#
+            );
+            let cfg: S2sConfig = parse_s2s(&raw).expect("s2s config parses");
+            let error = cfg.transport_config().unwrap_err();
+
+            assert!(error.contains(key), "error: {error}");
+            assert!(error.contains("zero or at least 1200"), "error: {error}");
+        }
     }
 
     #[test]

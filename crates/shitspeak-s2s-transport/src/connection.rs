@@ -7,11 +7,12 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+use prost::Message as _;
 use rand::RngExt;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +23,10 @@ use super::SendOptions;
 use super::adaptive_queue::{
     AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender, Queued, SendAdaptiveError,
     TryAdaptiveSendError,
+};
+use super::latest_wins_queue::{
+    LatestWinsQueueItem, LatestWinsReceiver, LatestWinsSendError, LatestWinsSender,
+    latest_wins_queue,
 };
 use super::metrics::{
     ExpiredOutboundDropCounters, ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage,
@@ -133,18 +138,25 @@ impl VoiceTransportBinding {
 /// One outbound frame, addressed to a specific stream.
 #[derive(Debug, Clone)]
 pub struct OutboundFrame {
+    level: ServiceLevel,
     class: MessageClass,
     payload: Bytes,
     options: SendOptions,
 }
 
 impl OutboundFrame {
-    pub fn new(class: MessageClass, payload: Bytes) -> Self {
-        Self::with_options(class, payload, SendOptions::default())
+    pub fn new(level: ServiceLevel, class: MessageClass, payload: Bytes) -> Self {
+        Self::with_options(level, class, payload, SendOptions::default())
     }
 
-    pub fn with_options(class: MessageClass, payload: Bytes, options: SendOptions) -> Self {
+    pub fn with_options(
+        level: ServiceLevel,
+        class: MessageClass,
+        payload: Bytes,
+        options: SendOptions,
+    ) -> Self {
         Self {
+            level,
             class,
             payload,
             options,
@@ -152,11 +164,16 @@ impl OutboundFrame {
     }
 
     pub(crate) fn from_variant(
+        level: ServiceLevel,
         class: MessageClass,
         variant: &TransportPayloadVariant,
         options: SendOptions,
     ) -> Self {
-        Self::with_options(class, variant.primary.clone(), options)
+        Self::with_options(level, class, variant.primary.clone(), options)
+    }
+
+    pub fn level(&self) -> ServiceLevel {
+        self.level
     }
 
     pub fn class(&self) -> MessageClass {
@@ -169,6 +186,21 @@ impl OutboundFrame {
 
     pub fn options(&self) -> SendOptions {
         self.options
+    }
+}
+
+impl LatestWinsQueueItem for OutboundFrame {
+    fn estimated_queue_bytes(&self) -> usize {
+        super::frame::build_frame(
+            u16::MAX,
+            u16::MAX,
+            self.level,
+            super::frame::FrameType::Data,
+            self.class,
+            u64::MAX,
+            self.payload.clone(),
+        )
+        .encoded_len()
     }
 }
 
@@ -212,6 +244,7 @@ impl TransportPayloadVariant {
 pub struct TransportPayloadPlan {
     default: TransportPayloadVariant,
     variants: Vec<(TransportKind, TransportPayloadVariant)>,
+    quic_v2: Option<TransportPayloadVariant>,
 }
 
 impl TransportPayloadPlan {
@@ -219,6 +252,7 @@ impl TransportPayloadPlan {
         Self {
             default: TransportPayloadVariant::new(primary),
             variants: Vec::new(),
+            quic_v2: None,
         }
     }
 
@@ -243,6 +277,11 @@ impl TransportPayloadPlan {
         &self.default
     }
 
+    pub fn with_quic_v2_variant(mut self, variant: TransportPayloadVariant) -> Self {
+        self.quic_v2 = Some(variant);
+        self
+    }
+
     pub fn variant(&self, transport: TransportKind) -> &TransportPayloadVariant {
         self.variants
             .iter()
@@ -251,13 +290,32 @@ impl TransportPayloadPlan {
             .unwrap_or(&self.default)
     }
 
+    pub(crate) fn variant_for_session(
+        &self,
+        transport: TransportKind,
+        quic_v2: bool,
+    ) -> &TransportPayloadVariant {
+        if transport == TransportKind::Quic && quic_v2 {
+            return self.quic_v2.as_ref().unwrap_or(&self.default);
+        }
+        self.variant(transport)
+    }
+
     pub(crate) fn estimated_bytes(&self) -> usize {
-        self.default.estimated_bytes().saturating_add(
-            self.variants
-                .iter()
-                .map(|(_, variant)| variant.estimated_bytes())
-                .sum::<usize>(),
-        )
+        self.default
+            .estimated_bytes()
+            .saturating_add(
+                self.variants
+                    .iter()
+                    .map(|(_, variant)| variant.estimated_bytes())
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.quic_v2
+                    .as_ref()
+                    .map(TransportPayloadVariant::estimated_bytes)
+                    .unwrap_or_default(),
+            )
     }
 }
 
@@ -520,6 +578,84 @@ pub(crate) struct StreamKey {
     is_dialer: bool,
 }
 
+/// Negotiated application protocol for a live QUIC session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum QuicSessionProtocol {
+    S2s1,
+    S2s2,
+}
+
+impl QuicSessionProtocol {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::S2s1 => "s2s/1",
+            Self::S2s2 => "s2s/2",
+        }
+    }
+}
+
+/// Immutable status for one currently-live QUIC session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicSessionStatusSnapshot {
+    peer: NodeIdentifier,
+    remote_addr: Option<SocketAddr>,
+    dialer: bool,
+    protocol: QuicSessionProtocol,
+    three_lane_ready: bool,
+    max_datagram_size: Option<usize>,
+    datagram_send_buffer_bytes: usize,
+    datagram_receive_buffer_bytes: usize,
+    datagrams_queued: u64,
+    datagrams_received: u64,
+    datagrams_dropped: u64,
+}
+
+impl QuicSessionStatusSnapshot {
+    pub fn peer(&self) -> NodeIdentifier {
+        self.peer
+    }
+
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr
+    }
+
+    pub fn is_dialer(&self) -> bool {
+        self.dialer
+    }
+
+    pub fn protocol(&self) -> QuicSessionProtocol {
+        self.protocol
+    }
+
+    pub fn three_lane_ready(&self) -> bool {
+        self.three_lane_ready
+    }
+
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.max_datagram_size
+    }
+
+    pub fn datagram_send_buffer_bytes(&self) -> usize {
+        self.datagram_send_buffer_bytes
+    }
+
+    pub fn datagram_receive_buffer_bytes(&self) -> usize {
+        self.datagram_receive_buffer_bytes
+    }
+
+    pub fn datagrams_queued(&self) -> u64 {
+        self.datagrams_queued
+    }
+
+    pub fn datagrams_received(&self) -> u64 {
+        self.datagrams_received
+    }
+
+    pub fn datagrams_dropped(&self) -> u64 {
+        self.datagrams_dropped
+    }
+}
+
 impl StreamKey {
     pub fn new(transport: TransportKind, remote_addr: Option<SocketAddr>, is_dialer: bool) -> Self {
         Self {
@@ -537,7 +673,7 @@ impl StreamKey {
 pub(crate) struct ActiveStream {
     transport: TransportKind,
     remote_addr: Option<SocketAddr>,
-    sender: AdaptiveQueueSender<OutboundFrame>,
+    sender: SessionSender,
     closed: CancellationToken,
     is_dialer: bool,
     installed_at: Instant,
@@ -554,7 +690,23 @@ impl ActiveStream {
         Self {
             transport,
             remote_addr,
-            sender,
+            sender: SessionSender::Legacy(sender),
+            closed,
+            is_dialer,
+            installed_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn new_quic_v2(
+        remote_addr: Option<SocketAddr>,
+        sender: QuicV2SessionSender,
+        closed: CancellationToken,
+        is_dialer: bool,
+    ) -> Self {
+        Self {
+            transport: TransportKind::Quic,
+            remote_addr,
+            sender: SessionSender::QuicV2(sender),
             closed,
             is_dialer,
             installed_at: Instant::now(),
@@ -583,6 +735,369 @@ impl ActiveStream {
 
     pub fn cancel(&self) {
         self.closed.cancel();
+    }
+
+    fn quic_status(
+        &self,
+        peer: NodeIdentifier,
+        configured_send_buffer_bytes: usize,
+        configured_receive_buffer_bytes: usize,
+    ) -> Option<QuicSessionStatusSnapshot> {
+        if self.transport != TransportKind::Quic || !self.is_alive() {
+            return None;
+        }
+        let (
+            protocol,
+            three_lane_ready,
+            max_datagram_size,
+            datagram_send_buffer_bytes,
+            datagram_receive_buffer_bytes,
+            datagrams_queued,
+            datagrams_received,
+            datagrams_dropped,
+        ) = match &self.sender {
+            SessionSender::Legacy(_) => (
+                QuicSessionProtocol::S2s1,
+                false,
+                None,
+                configured_send_buffer_bytes,
+                configured_receive_buffer_bytes,
+                0,
+                0,
+                0,
+            ),
+            SessionSender::QuicV2(sender) => {
+                let runtime = sender.runtime_status();
+                (
+                    QuicSessionProtocol::S2s2,
+                    true,
+                    Some(runtime.max_datagram_size),
+                    runtime.datagram_send_buffer_bytes,
+                    runtime.datagram_receive_buffer_bytes,
+                    runtime.datagrams_queued,
+                    runtime.datagrams_received,
+                    runtime.datagrams_dropped,
+                )
+            }
+        };
+        Some(QuicSessionStatusSnapshot {
+            peer,
+            remote_addr: self.remote_addr,
+            dialer: self.is_dialer,
+            protocol,
+            three_lane_ready,
+            max_datagram_size,
+            datagram_send_buffer_bytes,
+            datagram_receive_buffer_bytes,
+            datagrams_queued,
+            datagrams_received,
+            datagrams_dropped,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum SessionSender {
+    Legacy(AdaptiveQueueSender<OutboundFrame>),
+    QuicV2(QuicV2SessionSender),
+}
+
+#[derive(Clone)]
+pub(crate) struct QuicV2SessionSender {
+    control: AdaptiveQueueSender<OutboundFrame>,
+    high_priority: AdaptiveQueueSender<OutboundFrame>,
+    regular: AdaptiveQueueSender<OutboundFrame>,
+    datagram: LatestWinsSender<OutboundFrame>,
+    runtime: Arc<QuicV2RuntimeState>,
+}
+
+struct QuicV2RuntimeState {
+    max_datagram_size: AtomicUsize,
+    datagram_send_buffer_bytes: usize,
+    datagram_receive_buffer_bytes: usize,
+    datagrams_queued: AtomicU64,
+    datagrams_received: AtomicU64,
+    datagrams_dropped: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuicV2RuntimeStatus {
+    max_datagram_size: usize,
+    datagram_send_buffer_bytes: usize,
+    datagram_receive_buffer_bytes: usize,
+    datagrams_queued: u64,
+    datagrams_received: u64,
+    datagrams_dropped: u64,
+}
+
+pub(crate) struct QuicV2SessionReceivers {
+    control: AdaptiveQueueReceiver<OutboundFrame>,
+    high_priority: AdaptiveQueueReceiver<OutboundFrame>,
+    regular: AdaptiveQueueReceiver<OutboundFrame>,
+    datagram: LatestWinsReceiver<OutboundFrame>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionSendOutcome {
+    evicted_items: usize,
+    dropped_expired: bool,
+}
+
+impl SessionSendOutcome {
+    pub(crate) fn evicted_items(self) -> usize {
+        self.evicted_items
+    }
+
+    pub(crate) fn dropped_expired(self) -> bool {
+        self.dropped_expired
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum SessionTrySendError {
+    Full,
+    Closed,
+    TooLarge,
+}
+
+impl QuicV2SessionSender {
+    pub(crate) fn new(
+        stream_lane_bytes: usize,
+        datagram_bytes: usize,
+        datagram_receive_buffer_bytes: usize,
+        max_datagram_size: usize,
+    ) -> (Self, QuicV2SessionReceivers) {
+        // Each reliable lane owns an independent budget. A stalled Regular
+        // writer must not consume the reservation pool used by Control or
+        // HighPriority.
+        let control_budget = AdaptiveQueueBudget::new(stream_lane_bytes);
+        let high_budget = AdaptiveQueueBudget::new(stream_lane_bytes);
+        let regular_budget = AdaptiveQueueBudget::new(stream_lane_bytes);
+        let (control, control_rx) =
+            AdaptiveQueueSender::new(control_budget.split(stream_lane_bytes));
+        let (high_priority, high_priority_rx) =
+            AdaptiveQueueSender::new(high_budget.split(stream_lane_bytes));
+        let (regular, regular_rx) =
+            AdaptiveQueueSender::new(regular_budget.split(stream_lane_bytes));
+        let (datagram, datagram_rx) = latest_wins_queue(datagram_bytes);
+        (
+            Self {
+                control,
+                high_priority,
+                regular,
+                datagram,
+                runtime: Arc::new(QuicV2RuntimeState {
+                    max_datagram_size: AtomicUsize::new(max_datagram_size),
+                    datagram_send_buffer_bytes: datagram_bytes,
+                    datagram_receive_buffer_bytes,
+                    datagrams_queued: AtomicU64::new(0),
+                    datagrams_received: AtomicU64::new(0),
+                    datagrams_dropped: AtomicU64::new(0),
+                }),
+            },
+            QuicV2SessionReceivers {
+                control: control_rx,
+                high_priority: high_priority_rx,
+                regular: regular_rx,
+                datagram: datagram_rx,
+            },
+        )
+    }
+
+    fn stream_sender(&self, class: MessageClass) -> &AdaptiveQueueSender<OutboundFrame> {
+        match class {
+            MessageClass::Control => &self.control,
+            MessageClass::HighPriority => &self.high_priority,
+            MessageClass::Regular => &self.regular,
+        }
+    }
+
+    fn try_send(&self, frame: OutboundFrame) -> Result<SessionSendOutcome, SessionTrySendError> {
+        if frame.level() == ServiceLevel::BestEffort {
+            if frame.options().is_expired() {
+                self.record_datagram_drop();
+                super::metrics::record_quic_datagram_drop(
+                    super::metrics::QuicDatagramDropReason::Expired,
+                );
+                return Ok(SessionSendOutcome {
+                    dropped_expired: true,
+                    ..SessionSendOutcome::default()
+                });
+            }
+            return self.datagram.try_send(frame).map_or_else(
+                |error| match error {
+                    LatestWinsSendError::Closed(_) => Err(SessionTrySendError::Closed),
+                    LatestWinsSendError::TooLarge { .. } => Err(SessionTrySendError::TooLarge),
+                },
+                |result| {
+                    Ok(SessionSendOutcome {
+                        evicted_items: result.evicted_items(),
+                        dropped_expired: false,
+                    })
+                },
+            );
+        }
+        self.stream_sender(frame.class())
+            .try_send(frame)
+            .map(|()| SessionSendOutcome::default())
+            .map_err(|error| match error {
+                TryAdaptiveSendError::Full(_) => SessionTrySendError::Full,
+                TryAdaptiveSendError::Closed(_) => SessionTrySendError::Closed,
+            })
+    }
+
+    fn depth_capacity(&self, level: ServiceLevel, class: MessageClass) -> (usize, usize) {
+        if level == ServiceLevel::BestEffort {
+            return (self.datagram.depth_bytes(), self.datagram.capacity_bytes());
+        }
+        let sender = self.stream_sender(class);
+        (sender.depth_bytes(), sender.capacity_bytes())
+    }
+
+    fn aggregate_depth_capacity(&self) -> (usize, usize) {
+        let senders = [&self.control, &self.high_priority, &self.regular];
+        let depth = senders
+            .iter()
+            .map(|sender| sender.depth_bytes())
+            .sum::<usize>()
+            .saturating_add(self.datagram.depth_bytes());
+        let capacity = senders
+            .iter()
+            .map(|sender| sender.capacity_bytes())
+            .sum::<usize>()
+            .saturating_add(self.datagram.capacity_bytes());
+        (depth, capacity)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.control.is_closed()
+            || self.high_priority.is_closed()
+            || self.regular.is_closed()
+            || self.datagram.is_closed()
+    }
+
+    pub(crate) fn set_max_datagram_size(&self, bytes: usize) {
+        self.runtime
+            .max_datagram_size
+            .store(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn max_datagram_size(&self) -> usize {
+        self.runtime
+            .max_datagram_size
+            .load(Ordering::Relaxed)
+            .min(self.datagram.capacity_bytes())
+    }
+
+    pub(crate) fn record_datagram_queued(&self) {
+        self.runtime
+            .datagrams_queued
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_datagram_received(&self) {
+        self.runtime
+            .datagrams_received
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_datagram_drop(&self) {
+        self.runtime
+            .datagrams_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn runtime_status(&self) -> QuicV2RuntimeStatus {
+        QuicV2RuntimeStatus {
+            max_datagram_size: self.runtime.max_datagram_size.load(Ordering::Relaxed),
+            datagram_send_buffer_bytes: self.runtime.datagram_send_buffer_bytes,
+            datagram_receive_buffer_bytes: self.runtime.datagram_receive_buffer_bytes,
+            datagrams_queued: self.runtime.datagrams_queued.load(Ordering::Relaxed),
+            datagrams_received: self.runtime.datagrams_received.load(Ordering::Relaxed),
+            datagrams_dropped: self.runtime.datagrams_dropped.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl QuicV2SessionReceivers {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        AdaptiveQueueReceiver<OutboundFrame>,
+        AdaptiveQueueReceiver<OutboundFrame>,
+        AdaptiveQueueReceiver<OutboundFrame>,
+        LatestWinsReceiver<OutboundFrame>,
+    ) {
+        (
+            self.control,
+            self.high_priority,
+            self.regular,
+            self.datagram,
+        )
+    }
+}
+
+impl SessionSender {
+    pub(crate) fn try_send(
+        &self,
+        frame: OutboundFrame,
+    ) -> Result<SessionSendOutcome, SessionTrySendError> {
+        match self {
+            Self::Legacy(sender) => sender
+                .try_send(frame)
+                .map(|()| SessionSendOutcome::default())
+                .map_err(|error| match error {
+                    TryAdaptiveSendError::Full(_) => SessionTrySendError::Full,
+                    TryAdaptiveSendError::Closed(_) => SessionTrySendError::Closed,
+                }),
+            Self::QuicV2(sender) => sender.try_send(frame),
+        }
+    }
+
+    pub(crate) fn depth_capacity(
+        &self,
+        level: ServiceLevel,
+        class: MessageClass,
+    ) -> (usize, usize) {
+        match self {
+            Self::Legacy(sender) => (sender.depth_bytes(), sender.capacity_bytes()),
+            Self::QuicV2(sender) => sender.depth_capacity(level, class),
+        }
+    }
+
+    pub(crate) fn depth_bytes(&self) -> usize {
+        self.aggregate_depth_capacity().0
+    }
+
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        self.aggregate_depth_capacity().1
+    }
+
+    fn aggregate_depth_capacity(&self) -> (usize, usize) {
+        match self {
+            Self::Legacy(sender) => (sender.depth_bytes(), sender.capacity_bytes()),
+            Self::QuicV2(sender) => sender.aggregate_depth_capacity(),
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        match self {
+            Self::Legacy(sender) => sender.is_closed(),
+            Self::QuicV2(sender) => sender.is_closed(),
+        }
+    }
+
+    pub(crate) fn quic_v2_max_datagram_size(&self) -> Option<usize> {
+        match self {
+            Self::QuicV2(sender) => Some(sender.max_datagram_size()),
+            Self::Legacy(_) => None,
+        }
+    }
+
+    pub(crate) fn record_quic_datagram_drop(&self) {
+        if let Self::QuicV2(sender) = self {
+            sender.record_datagram_drop();
+        }
     }
 }
 
@@ -1319,12 +1834,36 @@ impl PeerState {
         kinds
     }
 
+    pub(crate) fn quic_session_status(
+        &self,
+        configured_send_buffer_bytes: usize,
+        configured_receive_buffer_bytes: usize,
+    ) -> Vec<QuicSessionStatusSnapshot> {
+        let mut streams = self.streams.lock();
+        prune_dead_streams(&mut streams);
+        let mut out = streams
+            .values()
+            .filter_map(|stream| {
+                stream.quic_status(
+                    self.node_id,
+                    configured_send_buffer_bytes,
+                    configured_receive_buffer_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        out.sort_by_key(|snapshot| {
+            (
+                snapshot.remote_addr(),
+                snapshot.is_dialer(),
+                snapshot.protocol(),
+            )
+        });
+        out
+    }
+
     /// Attempt to obtain a sender for any stream of the requested transport.
     /// Drops the stream if it has died.
-    pub fn try_get_stream(
-        &self,
-        kind: TransportKind,
-    ) -> Option<AdaptiveQueueSender<OutboundFrame>> {
+    pub fn try_get_stream(&self, kind: TransportKind) -> Option<SessionSender> {
         let mut g = self.streams.lock();
         prune_dead_streams(&mut g);
         g.values()
@@ -1468,6 +2007,24 @@ impl PeerState {
             status = status.with_current(depth, capacity);
         }
         Some(status)
+    }
+
+    pub(crate) fn outbound_lane_queue_status(
+        &self,
+        transport: TransportKind,
+        level: ServiceLevel,
+        class: MessageClass,
+    ) -> Option<QueueStatusSnapshot> {
+        let mut streams = self.streams.lock();
+        prune_dead_streams(&mut streams);
+        streams
+            .values()
+            .filter(|stream| stream.is_alive() && stream.transport() == transport)
+            .max_by_key(|stream| stream.installed_at())
+            .map(|stream| {
+                let (depth, capacity) = stream.sender.depth_capacity(level, class);
+                QueueStatusSnapshot::default().with_current(depth, capacity)
+            })
     }
 
     pub(crate) fn record_expired_outbound_drop(
@@ -1908,6 +2465,121 @@ pub(crate) fn retry_cap_for_last_seen_age(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn quic_v2_sender_routes_best_effort_before_message_class() {
+        let (sender, receivers) = QuicV2SessionSender::new(64 * 1024, 64 * 1024, 256 * 1024, 1200);
+        let (mut control, mut high, mut regular, mut datagram) = receivers.into_parts();
+
+        for class in [
+            MessageClass::Control,
+            MessageClass::HighPriority,
+            MessageClass::Regular,
+        ] {
+            sender
+                .try_send(OutboundFrame::new(
+                    ServiceLevel::BestEffort,
+                    class,
+                    Bytes::from_static(b"datagram"),
+                ))
+                .expect("best-effort enqueue");
+            assert_eq!(datagram.recv().await.expect("datagram").class(), class);
+        }
+
+        for level in [ServiceLevel::Reliable, ServiceLevel::ReliableLowLatency] {
+            for (class, expected) in [
+                (MessageClass::Control, &mut control),
+                (MessageClass::HighPriority, &mut high),
+                (MessageClass::Regular, &mut regular),
+            ] {
+                sender
+                    .try_send(OutboundFrame::new(
+                        level,
+                        class,
+                        Bytes::from_static(b"stream"),
+                    ))
+                    .expect("reliable enqueue");
+                let received = expected.recv().await.expect("stream lane");
+                assert_eq!(received.level(), level);
+                assert_eq!(received.class(), class);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_best_effort_does_not_evict_a_live_datagram() {
+        let (sender, receivers) = QuicV2SessionSender::new(4096, 1200, 1200, 1200);
+        let (_, _, _, mut datagram) = receivers.into_parts();
+        sender
+            .try_send(OutboundFrame::new(
+                ServiceLevel::BestEffort,
+                MessageClass::HighPriority,
+                Bytes::from_static(b"live"),
+            ))
+            .expect("live datagram");
+        sender
+            .try_send(OutboundFrame::with_options(
+                ServiceLevel::BestEffort,
+                MessageClass::HighPriority,
+                Bytes::from(vec![0; 1100]),
+                SendOptions::default().expire_after(Duration::ZERO),
+            ))
+            .expect("expired datagram is consumed as a drop");
+
+        assert_eq!(
+            datagram.recv().await.expect("live item").payload().as_ref(),
+            b"live"
+        );
+        assert_eq!(sender.runtime_status().datagrams_dropped, 1);
+    }
+
+    #[test]
+    fn live_quic_v2_status_is_an_immutable_runtime_snapshot() {
+        let peer = peer_for_address_tests();
+        let (sender, _receivers) = QuicV2SessionSender::new(4096, 65_536, 262_144, 1200);
+        sender.set_max_datagram_size(1376);
+        sender.record_datagram_queued();
+        sender.record_datagram_received();
+        sender.record_datagram_drop();
+        let remote_addr = "127.0.0.1:64741".parse().expect("socket address");
+        peer.install_stream(ActiveStream::new_quic_v2(
+            Some(remote_addr),
+            sender.clone(),
+            CancellationToken::new(),
+            true,
+        ));
+
+        let snapshot = peer.quic_session_status(1, 2);
+        assert_eq!(snapshot.len(), 1);
+        let snapshot = &snapshot[0];
+        assert_eq!(snapshot.peer(), 2);
+        assert_eq!(snapshot.remote_addr(), Some(remote_addr));
+        assert!(snapshot.is_dialer());
+        assert_eq!(snapshot.protocol(), QuicSessionProtocol::S2s2);
+        assert!(snapshot.three_lane_ready());
+        assert_eq!(snapshot.max_datagram_size(), Some(1376));
+        assert_eq!(snapshot.datagram_send_buffer_bytes(), 65_536);
+        assert_eq!(snapshot.datagram_receive_buffer_bytes(), 262_144);
+        assert_eq!(snapshot.datagrams_queued(), 1);
+        assert_eq!(snapshot.datagrams_received(), 1);
+        assert_eq!(snapshot.datagrams_dropped(), 1);
+
+        sender.record_datagram_queued();
+        assert_eq!(snapshot.datagrams_queued(), 1, "snapshot must not be live");
+    }
+
+    #[test]
+    fn outbound_frame_retains_requested_service_level() {
+        let frame = OutboundFrame::with_options(
+            ServiceLevel::BestEffort,
+            MessageClass::HighPriority,
+            Bytes::from_static(b"voice"),
+            SendOptions::default(),
+        );
+
+        assert_eq!(frame.level(), ServiceLevel::BestEffort);
+        assert_eq!(frame.class(), MessageClass::HighPriority);
+    }
+
     #[test]
     fn backoff_doubles_then_caps() {
         let mut b = BackoffState::new(Duration::from_millis(250));
@@ -2260,6 +2932,7 @@ mod tests {
         let sender = peer.try_get_stream(TransportKind::Tcp).unwrap();
         sender
             .try_send(OutboundFrame::new(
+                ServiceLevel::Reliable,
                 MessageClass::Regular,
                 Bytes::from_static(b"new"),
             ))

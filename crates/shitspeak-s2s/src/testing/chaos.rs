@@ -635,6 +635,14 @@ fn spawn_filter(
             let Some(action) = chaos.decide(&msg) else {
                 continue;
             };
+            if action.delay.is_zero() && action.barrier.is_none() {
+                for _ in 0..action.copies {
+                    if tx.send(msg.clone()).await.is_err() {
+                        return;
+                    }
+                }
+                continue;
+            }
             let tx2 = tx.clone();
             tokio::spawn(async move {
                 if let Some(barrier) = action.barrier {
