@@ -230,18 +230,27 @@ pub async fn handle_acl(
             .propose_channel_op(Some(&server_id), op.clone())
             .await;
         if proposed_s2s.should_apply_locally() {
-            if let Err(e) = server
+            let committed = match server
                 .get_channels()
-                .set_acls_in_server(&server_id, channel_id, inherit_acl, new_acls)
+                .set_acls_with_committed_operation_if_changed_in_server(
+                    &server_id,
+                    channel_id,
+                    inherit_acl,
+                    new_acls,
+                )
                 .await
             {
-                tracing::warn!("set_acls {channel_id} failed: {:?}", e);
+                Ok(committed) => committed,
+                Err(e) => {
+                    tracing::warn!("set_acls {channel_id} failed: {:?}", e);
+                    return Ok(());
+                }
+            };
+            let Some(committed) = committed else {
+                tracing::trace!(channel_id, "skipping unchanged ACL update");
                 return Ok(());
-            }
-            let channel_version = server.get_channels().current_version_in_server(&server_id);
-            server
-                .reevaluate_speak_after_acl_change(&server_id, &op, channel_version)
-                .await;
+            };
+            server.reevaluate_speak_after_acl_change(&committed).await;
         } else if !proposed_s2s.is_proposed() {
             return Err(super::channel_op_propose_failed(
                 u32::from(sender.get_session_id()),

@@ -1470,7 +1470,7 @@ pub async fn visibility_refresh_messages(
     visibility: &mut UserVisibilityState,
     scope: VisibilityRefreshScope,
 ) -> Vec<Message> {
-    visibility_refresh_messages_with_home(server, viewer, visibility, scope, None).await
+    visibility_refresh_messages_with_home(server, viewer, visibility, scope, None, None, None).await
 }
 
 async fn visibility_refresh_messages_with_home(
@@ -1479,6 +1479,8 @@ async fn visibility_refresh_messages_with_home(
     visibility: &mut UserVisibilityState,
     mut scope: VisibilityRefreshScope,
     effective_home_channel_id: Option<u32>,
+    acl_context: Option<&crate::channel_handler::ClientAclOperationContext>,
+    channel_shadow: Option<&SessionChannelShadow>,
 ) -> Vec<Message> {
     let hide_users_without_traverse = server.get_hide_users_without_traverse();
     let include_user_state_names = scope.include_user_state_names;
@@ -1577,6 +1579,10 @@ async fn visibility_refresh_messages_with_home(
                             &target,
                             include_user_state_names,
                             effective_home_channel_id,
+                            acl_context,
+                            channel_shadow
+                                .and_then(|shadow| shadow.get(&target.get_session_id()))
+                                .copied(),
                         )
                         .await,
                     );
@@ -1616,6 +1622,28 @@ pub async fn visibility_refresh_messages_with_shadow(
     .await
 }
 
+pub async fn visibility_refresh_messages_with_shadow_and_acl_context(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    visibility: &mut UserVisibilityState,
+    channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    scope: VisibilityRefreshScope,
+    acl_context: Option<&crate::channel_handler::ClientAclOperationContext>,
+) -> Vec<Message> {
+    visibility_refresh_messages_with_shadow_inner(
+        server,
+        viewer,
+        visibility,
+        channel_shadow,
+        server_id,
+        scope,
+        None,
+        acl_context,
+    )
+    .await
+}
+
 pub(crate) async fn visibility_refresh_messages_with_shadow_at_home(
     server: &Arc<Box<Server>>,
     viewer: &Arc<Box<Client>>,
@@ -1625,12 +1653,37 @@ pub(crate) async fn visibility_refresh_messages_with_shadow_at_home(
     scope: VisibilityRefreshScope,
     effective_home_channel_id: Option<u32>,
 ) -> Vec<Message> {
+    visibility_refresh_messages_with_shadow_inner(
+        server,
+        viewer,
+        visibility,
+        channel_shadow,
+        server_id,
+        scope,
+        effective_home_channel_id,
+        None,
+    )
+    .await
+}
+
+async fn visibility_refresh_messages_with_shadow_inner(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    visibility: &mut UserVisibilityState,
+    channel_shadow: &mut SessionChannelShadow,
+    server_id: &str,
+    scope: VisibilityRefreshScope,
+    effective_home_channel_id: Option<u32>,
+    acl_context: Option<&crate::channel_handler::ClientAclOperationContext>,
+) -> Vec<Message> {
     let refresh = visibility_refresh_messages_with_home(
         server,
         viewer,
         visibility,
         scope,
         effective_home_channel_id,
+        acl_context,
+        Some(channel_shadow),
     )
     .await;
     let mut out = Vec::new();
@@ -1706,7 +1759,7 @@ pub async fn visibility_refresh_scope_for_channel_operation(
     server: &Arc<Box<Server>>,
     op: &ChannelOperation,
 ) -> VisibilityRefreshScope {
-    visibility_refresh_scope_for_channel_operation_inner(server, op, None).await
+    visibility_refresh_scope_for_channel_operation_inner(server, None, op, None).await
 }
 
 pub async fn visibility_refresh_scope_for_channel_operation_with_state(
@@ -1714,11 +1767,22 @@ pub async fn visibility_refresh_scope_for_channel_operation_with_state(
     op: &ChannelOperation,
     visibility: &mut UserVisibilityState,
 ) -> VisibilityRefreshScope {
-    visibility_refresh_scope_for_channel_operation_inner(server, op, Some(visibility)).await
+    visibility_refresh_scope_for_channel_operation_inner(server, None, op, Some(visibility)).await
+}
+
+pub async fn visibility_refresh_scope_for_channel_operation_with_state_for_client(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    op: &ChannelOperation,
+    visibility: &mut UserVisibilityState,
+) -> VisibilityRefreshScope {
+    visibility_refresh_scope_for_channel_operation_inner(server, Some(client), op, Some(visibility))
+        .await
 }
 
 async fn visibility_refresh_scope_for_channel_operation_inner(
     server: &Arc<Box<Server>>,
+    client: Option<&Arc<Box<Client>>>,
     op: &ChannelOperation,
     visibility: Option<&mut UserVisibilityState>,
 ) -> VisibilityRefreshScope {
@@ -1753,11 +1817,52 @@ async fn visibility_refresh_scope_for_channel_operation_inner(
             }
         }
         ChannelOp::SetAcls { channel_id, .. } => {
-            scope.include_channels(
-                channels
-                    .subtree_ids_in_server(&op.server_id, *channel_id)
-                    .await,
-            );
+            if let (Some(client), Some(hint)) = (client, channels.acl_change_hint_for_operation(op))
+            {
+                let impact = hint.impact();
+                if impact.state_changed() {
+                    let here = impact
+                        .apply_here()
+                        .effective_permissions()
+                        .contains(ACLPermissions::Traverse)
+                        && crate::client::acl::client_matches_acl_viewer_scope(
+                            client,
+                            impact.apply_here().viewer_scope(),
+                        );
+                    let subs = impact
+                        .apply_subs()
+                        .effective_permissions()
+                        .contains(ACLPermissions::Traverse)
+                        && crate::client::acl::client_matches_acl_viewer_scope(
+                            client,
+                            impact.apply_subs().viewer_scope(),
+                        );
+                    if here {
+                        // Losing Traverse on the edited channel also makes its
+                        // structural descendants unreachable, even though an
+                        // apply-here ACL does not alter their own permissions.
+                        scope.include_channels(hint.tree_snapshot().subtree_ids(*channel_id));
+                    }
+                    if subs {
+                        let snapshot = hint.tree_snapshot();
+                        let structural_closure = snapshot.subtree_closure_ids(
+                            hint.affected_channel_ids()
+                                .iter()
+                                .copied()
+                                .filter(|id| *id != *channel_id),
+                        );
+                        scope.include_channels(structural_closure);
+                    }
+                }
+            } else {
+                // Replayed/evicted operations do not carry transient hints.
+                // Preserve the previous conservative subtree refresh.
+                scope.include_channels(
+                    channels
+                        .subtree_ids_in_server(&op.server_id, *channel_id)
+                        .await,
+                );
+            }
         }
         ChannelOp::DeleteChannel { id, .. } => {
             if let Some(visibility) = visibility.as_deref_mut() {
@@ -1977,11 +2082,23 @@ async fn refresh_target_visibility(
     target: &Arc<Box<Client>>,
     include_user_state_name: bool,
     effective_home_channel_id: Option<u32>,
+    acl_context: Option<&crate::channel_handler::ClientAclOperationContext>,
+    projected_target_channel_id: Option<u32>,
 ) -> Vec<Message> {
     let session = target.get_session_id();
     let known_before = visibility.get(session).cloned();
-    let visible =
-        can_project_user_with_home(server, viewer, target, effective_home_channel_id).await;
+    let target_channel_id = projected_target_channel_id
+        .or_else(|| known_before.as_ref().map(|known| known.channel_id))
+        .unwrap_or_else(|| target.get_current_channel_id());
+    let visible = if viewer.get_session_id() == target.get_session_id() {
+        true
+    } else if let Some(context) = acl_context {
+        context.can_view_channel(target_channel_id)
+            && (!server.get_hide_channels_without_traverse()
+                || context.can_view_channel_with_ancestors(target_channel_id))
+    } else {
+        can_project_user_with_home(server, viewer, target, effective_home_channel_id).await
+    };
 
     if !visible {
         if visibility.remove(session) {
@@ -1991,22 +2108,30 @@ async fn refresh_target_visibility(
     }
 
     let current_channel = if target.get_session_id() == viewer.get_session_id() {
-        effective_home_channel_id.unwrap_or_else(|| target.get_current_channel_id())
+        effective_home_channel_id.unwrap_or(target_channel_id)
     } else {
-        target.get_current_channel_id()
+        target_channel_id
     };
-    let new_listeners = visible_listener_channels_with_home(
-        server,
-        viewer,
-        target.get_listening_channel_ids(),
-        effective_home_channel_id,
-    )
-    .await;
+    let new_listeners = if let Some(context) = acl_context {
+        context.visible_listener_channels(
+            target.get_listening_channel_ids(),
+            server.get_hide_channels_without_traverse(),
+        )
+    } else {
+        visible_listener_channels_with_home(
+            server,
+            viewer,
+            target.get_listening_channel_ids(),
+            effective_home_channel_id,
+        )
+        .await
+    };
 
     match known_before {
         None => {
             visibility.insert(session, current_channel, new_listeners.clone());
             let mut state = target.build_user_state_for_broadcast();
+            state.channel_id = Some(current_channel);
             state.listening_channel_add = sorted_channels(&new_listeners);
             state.listening_channel_remove.clear();
             project_user_state_fields_for_viewer(server, viewer, &mut state);

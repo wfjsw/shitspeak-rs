@@ -930,6 +930,101 @@ async fn traverse_visibility_initial_sync_filters_hidden_users() {
 }
 
 #[tokio::test]
+async fn traverse_visibility_honors_child_allow_over_inherited_deny() {
+    let server = spawn_test_server(TestServerOpts {
+        default_channel: 70,
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let channels = server.server.get_channels();
+    channels
+        .create_channel(Channel::new(70, "Default".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    channels
+        .create_channel(Channel::new(71, "Sibling".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    channels
+        .set_acls(
+            0,
+            true,
+            vec![
+                ACL {
+                    user_id: None,
+                    group: Some("all".to_owned()),
+                    apply_here: true,
+                    apply_subs: false,
+                    allow: ACLPermissions::Traverse.into(),
+                    deny: enumflags2::BitFlags::empty(),
+                },
+                ACL {
+                    user_id: None,
+                    group: Some("all".to_owned()),
+                    apply_here: false,
+                    apply_subs: true,
+                    allow: enumflags2::BitFlags::empty(),
+                    deny: ACLPermissions::Traverse.into(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    for channel_id in [70, 71] {
+        channels
+            .set_acls(
+                channel_id,
+                true,
+                vec![acl_for_group(
+                    "all",
+                    ACLPermissions::Traverse.into(),
+                    enumflags2::BitFlags::empty(),
+                    true,
+                )],
+            )
+            .await
+            .unwrap();
+    }
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    assert!(
+        alice
+            .initial_channel_states
+            .iter()
+            .any(|channel| channel.channel_id == Some(70))
+    );
+    assert!(
+        alice
+            .initial_channel_states
+            .iter()
+            .any(|channel| channel.channel_id == Some(71)),
+        "a sibling with the same local Traverse allow should be visible"
+    );
+    assert!(
+        alice
+            .initial_user_states
+            .iter()
+            .any(|state| { state.session == Some(bob.session_id) && state.channel_id == Some(70) }),
+        "another user in the traversable default channel should be visible"
+    );
+}
+
+#[tokio::test]
 async fn traverse_visibility_filters_hidden_channel_requests() {
     let server = spawn_test_server(TestServerOpts {
         hide_users_without_traverse: true,
@@ -2669,6 +2764,499 @@ async fn acl_cache_acl_update_sends_channel_scoped_permission_refresh_to_all_cli
     assert!(
         alice_flush.is_none() && bob_flush.is_none(),
         "ACL updates should not send global permission cache flushes"
+    );
+}
+
+#[tokio::test]
+async fn identical_acl_save_preserves_version_and_emits_no_permission_refresh() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(68, "Stable".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    alice.drain_now().await;
+    bob.drain_now().await;
+
+    let acls = vec![ChanAcl {
+        apply_here: true,
+        apply_subs: false,
+        inherited: false,
+        user_id: None,
+        group: Some("all".to_owned()),
+        grant: 0,
+        deny: ACLPermissions::TextMessage as u32,
+    }];
+    alice.set_acls(68, acls.clone(), true).await;
+    bob.recv_until(
+        |m| {
+            matches!(m, Message::PermissionQuery(pq)
+                if pq.channel_id == Some(68)
+                    && pq.permissions.is_some()
+                    && pq.flush == Some(false))
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("the first ACL save should refresh Bob's channel permissions");
+    alice.drain_now().await;
+    bob.drain_now().await;
+
+    let bob_client = connected_client(&server, &bob).await;
+    let server_id = bob_client.server_id();
+    let version_before = chans.current_version_in_server(&server_id);
+    let generation_before = chans.channel_acl_generation_for_channel(&server_id, 68);
+
+    alice.set_acls(68, acls, true).await;
+
+    let duplicate_refresh = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionQuery(pq) if pq.channel_id == Some(68))
+                    || matches!(m, Message::ChannelState(cs) if cs.channel_id == Some(68))
+                    || matches!(m, Message::ChannelRemove(remove) if remove.channel_id == 68)
+            },
+            Duration::from_millis(300),
+        )
+        .await;
+    let editor_duplicate_refresh = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionQuery(pq) if pq.channel_id == Some(68))
+                    || matches!(m, Message::ChannelState(cs) if cs.channel_id == Some(68))
+                    || matches!(m, Message::ChannelRemove(remove) if remove.channel_id == 68)
+            },
+            Duration::from_millis(100),
+        )
+        .await;
+    assert!(
+        duplicate_refresh.is_none() && editor_duplicate_refresh.is_none(),
+        "an identical ACL save should not fan out another permission refresh"
+    );
+    assert_eq!(
+        chans.current_version_in_server(&server_id),
+        version_before,
+        "an identical ACL save should not append another channel operation"
+    );
+    assert_eq!(
+        chans.channel_acl_generation_for_channel(&server_id, 68),
+        generation_before,
+        "an identical ACL save should not invalidate the channel ACL cache"
+    );
+}
+
+#[tokio::test]
+async fn explicit_user_non_traverse_acl_delta_refreshes_only_target_user() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_superuser("carol", None, Some(3), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("dave", None, Some(4), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(90, "Parent".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(91, "Child".to_owned(), 0, 0, Some(90)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let dave = TestClient::connect_and_authenticate(&server, "dave", None)
+        .await
+        .expect("dave");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    bob.move_to_channel(91).await;
+    for viewer in [&alice, &dave] {
+        viewer
+            .recv_until(
+                |m| {
+                    matches!(m, Message::UserState(us)
+                        if us.session == Some(bob.session_id)
+                            && us.channel_id == Some(91))
+                },
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("both viewers should see Bob before the ACL edit");
+    }
+    alice.drain_now().await;
+    dave.drain_now().await;
+    bob.drain_now().await;
+    carol.drain_now().await;
+
+    carol
+        .set_acls(
+            90,
+            vec![ChanAcl {
+                apply_here: true,
+                apply_subs: true,
+                inherited: false,
+                user_id: Some(1),
+                group: None,
+                grant: 0,
+                deny: ACLPermissions::TextMessage as u32,
+            }],
+            true,
+        )
+        .await;
+
+    let mut parent_refreshed = false;
+    let mut child_refreshed = false;
+    let mut visibility_churn = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && !(parent_refreshed && child_refreshed) {
+        let Some(message) = alice.recv(Duration::from_millis(100)).await else {
+            continue;
+        };
+        match message {
+            Message::PermissionQuery(query) if query.permissions.is_some() => {
+                parent_refreshed |= query.channel_id == Some(90);
+                child_refreshed |= query.channel_id == Some(91);
+            }
+            Message::ChannelRemove(remove) => {
+                visibility_churn |= matches!(remove.channel_id, 90 | 91);
+            }
+            Message::UserRemove(remove) => {
+                visibility_churn |= remove.session == bob.session_id;
+            }
+            Message::UserState(state) => {
+                visibility_churn |= state.session == Some(bob.session_id);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        parent_refreshed && child_refreshed,
+        "Alice's changed TextMessage permission should refresh on the parent and inherited child"
+    );
+    let delayed_visibility_churn = alice
+        .recv_until(
+            |m| {
+                matches!(m, Message::ChannelRemove(remove)
+                    if matches!(remove.channel_id, 90 | 91))
+                    || matches!(m, Message::UserRemove(remove)
+                        if remove.session == bob.session_id)
+                    || matches!(m, Message::UserState(state)
+                        if state.session == Some(bob.session_id))
+            },
+            Duration::from_millis(200),
+        )
+        .await;
+    assert!(
+        !visibility_churn && delayed_visibility_churn.is_none(),
+        "a non-Traverse ACL delta should not reconcile channel or user visibility"
+    );
+
+    let unaffected_refresh = dave
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionQuery(query)
+                    if matches!(query.channel_id, Some(90 | 91)))
+                    || matches!(m, Message::ChannelRemove(remove)
+                        if matches!(remove.channel_id, 90 | 91))
+                    || matches!(m, Message::UserRemove(remove)
+                        if remove.session == bob.session_id)
+            },
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        unaffected_refresh.is_none(),
+        "Dave's effective permissions and visibility did not change"
+    );
+}
+
+#[tokio::test]
+async fn explicit_user_traverse_delta_reconciles_only_target_across_subtree() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_superuser("carol", None, Some(3), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("dave", None, Some(4), vec![]);
+
+    let chans = server.server.get_channels();
+    for (channel_id, parent_id) in [
+        (100, 0),
+        (101, 100),
+        (102, 100),
+        (103, 101),
+        (104, 101),
+        (105, 102),
+        (106, 105),
+        (107, 0),
+    ] {
+        chans
+            .create_channel(Channel::new(
+                channel_id,
+                format!("Channel {channel_id}"),
+                0,
+                0,
+                Some(parent_id),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let dave = TestClient::connect_and_authenticate(&server, "dave", None)
+        .await
+        .expect("dave");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    bob.move_to_channel(106).await;
+    for viewer in [&alice, &dave] {
+        viewer
+            .recv_until(
+                |m| {
+                    matches!(m, Message::UserState(us)
+                        if us.session == Some(bob.session_id)
+                            && us.channel_id == Some(106))
+                },
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("both viewers should see Bob before the ACL edit");
+    }
+    alice.drain_now().await;
+    dave.drain_now().await;
+    bob.drain_now().await;
+    carol.drain_now().await;
+
+    carol
+        .set_acls(
+            100,
+            vec![ChanAcl {
+                apply_here: true,
+                apply_subs: true,
+                inherited: false,
+                user_id: Some(1),
+                group: None,
+                grant: 0,
+                deny: ACLPermissions::Traverse as u32,
+            }],
+            true,
+        )
+        .await;
+
+    let mut removed_channels = [false; 7];
+    let mut bob_removed = false;
+    let mut unrelated_removed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline
+        && (!bob_removed || removed_channels.iter().any(|removed| !removed))
+    {
+        let Some(message) = alice.recv(Duration::from_millis(100)).await else {
+            continue;
+        };
+        match message {
+            Message::UserRemove(remove) => {
+                bob_removed |= remove.session == bob.session_id;
+            }
+            Message::ChannelRemove(remove) if (100..=106).contains(&remove.channel_id) => {
+                removed_channels[(remove.channel_id - 100) as usize] = true;
+            }
+            Message::ChannelRemove(remove) => {
+                unrelated_removed |= remove.channel_id == 107;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        bob_removed,
+        "Alice should stop seeing Bob in the hidden subtree"
+    );
+    assert!(
+        removed_channels.iter().all(|removed| *removed),
+        "Alice should receive removals for the entire affected subtree"
+    );
+    assert!(
+        !unrelated_removed,
+        "the unrelated root branch should remain visible to Alice"
+    );
+
+    let unaffected_refresh = dave
+        .recv_until(
+            |m| {
+                matches!(m, Message::PermissionQuery(query)
+                    if query.channel_id.is_some_and(|id| (100..=106).contains(&id)))
+                    || matches!(m, Message::ChannelRemove(remove)
+                        if (100..=107).contains(&remove.channel_id))
+                    || matches!(m, Message::UserRemove(remove)
+                        if remove.session == bob.session_id)
+            },
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        unaffected_refresh.is_none(),
+        "Dave's effective permissions and visibility did not change"
+    );
+}
+
+#[tokio::test]
+async fn inherited_traverse_delta_closes_visibility_across_acl_barrier() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_superuser("carol", None, Some(3), vec!["admin".into()]);
+
+    let channels = server.server.get_channels();
+    channels
+        .create_channel(Channel::new(110, "Edited".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    channels
+        .create_channel(Channel::new(111, "Inheriting".to_owned(), 0, 0, Some(110)))
+        .await
+        .unwrap();
+    channels
+        .create_channel(Channel::new(112, "Barrier".to_owned(), 0, 0, Some(111)))
+        .await
+        .unwrap();
+    channels.set_acls(112, false, Vec::new()).await.unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    bob.move_to_channel(112).await;
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(bob.session_id)
+                        && state.channel_id == Some(112))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("Alice should initially see Bob beyond the ACL barrier");
+    alice.drain_now().await;
+    bob.drain_now().await;
+    carol.drain_now().await;
+
+    carol
+        .set_acls(
+            110,
+            vec![ChanAcl {
+                apply_here: false,
+                apply_subs: true,
+                inherited: false,
+                user_id: Some(1),
+                group: None,
+                grant: 0,
+                deny: ACLPermissions::Traverse as u32,
+            }],
+            true,
+        )
+        .await;
+
+    let mut removed_inheriting = false;
+    let mut removed_barrier = false;
+    let mut removed_bob = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline
+        && !(removed_inheriting && removed_barrier && removed_bob)
+    {
+        let Some(message) = alice.recv(Duration::from_millis(100)).await else {
+            continue;
+        };
+        match message {
+            Message::ChannelRemove(remove) => {
+                removed_inheriting |= remove.channel_id == 111;
+                removed_barrier |= remove.channel_id == 112;
+            }
+            Message::UserRemove(remove) => removed_bob |= remove.session == bob.session_id,
+            _ => {}
+        }
+    }
+
+    assert!(
+        removed_inheriting,
+        "the inheriting channel should be hidden"
+    );
+    assert!(
+        removed_barrier,
+        "a structurally unreachable ACL barrier must also be removed"
+    );
+    assert!(
+        removed_bob,
+        "users below the structurally hidden ancestor must be removed"
     );
 }
 

@@ -3253,7 +3253,7 @@ impl ChannelReplicationAdapter {
             _ => None,
         };
         let op_server_id = op.server_id.clone();
-        let applied_op = op.op.clone();
+        let applied_operation = op.clone();
         let outcome = match self
             .repo
             .apply_strict_operation_once(op, strict_log_metadata_to_repo(metadata))
@@ -3280,7 +3280,7 @@ impl ChannelReplicationAdapter {
         }
         if let Some(server) = self.server.as_ref().and_then(Weak::upgrade) {
             server
-                .reevaluate_speak_after_acl_change(&op_server_id, &applied_op, version)
+                .reevaluate_speak_after_acl_change(&applied_operation)
                 .await;
         }
         if let (Some(server), Some((id, nonce, fallback))) = (
@@ -3443,14 +3443,14 @@ impl StrictReplicable for ChannelReplicationAdapter {
             _ => None,
         };
         let op_server_id = op.server_id.clone();
-        let applied_op = op.op.clone();
+        let applied_operation = op.clone();
         if let Err(e) = self.repo.apply_committed_operation(op).await {
             warn!(error = ?e, "s2s channel operation apply failed");
             return;
         }
         if let Some(server) = self.server.as_ref().and_then(Weak::upgrade) {
             server
-                .reevaluate_speak_after_acl_change(&op_server_id, &applied_op, version)
+                .reevaluate_speak_after_acl_change(&applied_operation)
                 .await;
         }
         if let (Some(server), Some((id, nonce, fallback))) = (

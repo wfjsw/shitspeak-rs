@@ -7,7 +7,7 @@ use super::*;
 use crate::api::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
 };
-use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
+use crate::channel_handler::{ChannelPermissionShadow, ChannelTreeShadow, SessionChannelShadow};
 use crate::client::{
     Client, client_session_identifier::ClientSessionIdentifier, visibility::UserVisibilityState,
 };
@@ -857,6 +857,7 @@ async fn sharded_and_legacy_activation_match_for_missed_client_add() {
     let mut legacy_client_log_rx = None;
     let mut legacy_channel_log_rx = None;
     let mut legacy_channel_tree_shadow = ChannelTreeShadow::default();
+    let mut legacy_channel_permission_shadow = ChannelPermissionShadow::default();
     let mut legacy_session_channel_shadow = SessionChannelShadow::default();
     let mut legacy_user_visibility = UserVisibilityState::default();
     activate_client_subscriptions(
@@ -866,6 +867,7 @@ async fn sharded_and_legacy_activation_match_for_missed_client_add() {
         &mut legacy_client_log_rx,
         &mut legacy_channel_log_rx,
         &mut legacy_channel_tree_shadow,
+        &mut legacy_channel_permission_shadow,
         &mut legacy_session_channel_shadow,
         &mut legacy_user_visibility,
     )
@@ -959,6 +961,7 @@ async fn activate_legacy_projection_for_parity(
     let mut client_log_rx = None;
     let mut channel_log_rx = None;
     let mut channel_tree_shadow = ChannelTreeShadow::default();
+    let mut channel_permission_shadow = ChannelPermissionShadow::default();
     let mut session_channel_shadow = SessionChannelShadow::default();
     let mut user_visibility = UserVisibilityState::default();
     activate_client_subscriptions(
@@ -968,6 +971,7 @@ async fn activate_legacy_projection_for_parity(
         &mut client_log_rx,
         &mut channel_log_rx,
         &mut channel_tree_shadow,
+        &mut channel_permission_shadow,
         &mut session_channel_shadow,
         &mut user_visibility,
     )

@@ -1913,19 +1913,132 @@ impl Server {
 
     pub(crate) async fn reevaluate_speak_after_acl_change(
         self: &Arc<Box<Self>>,
-        server_id: &str,
-        op: &ChannelOp,
-        channel_version: u64,
+        operation: &shitspeak_state::ChannelOperation,
     ) {
         if !self.get_reevaluate_speak_on_acl_change() {
             return;
         }
-        let ChannelOp::SetAcls { .. } = op else {
+        let ChannelOp::SetAcls { .. } = &operation.op else {
             return;
         };
+        let server_id = &operation.server_id;
+        if let Some(hint) = self.get_channels().acl_change_hint_for_operation(operation) {
+            let impact = hint.impact();
+            if !impact.state_changed() {
+                return;
+            }
+            let here_may_change = impact
+                .apply_here()
+                .effective_permissions()
+                .contains(shitspeak_state::ACLPermissions::Speak);
+            let subs_may_change = impact
+                .apply_subs()
+                .effective_permissions()
+                .contains(shitspeak_state::ACLPermissions::Speak);
+            if !here_may_change && !subs_may_change {
+                return;
+            }
+            let here_changes_structural_descendants = impact
+                .apply_here()
+                .effective_permissions()
+                .contains(shitspeak_state::ACLPermissions::Traverse);
+
+            let affected_channel_ids = hint
+                .affected_channel_ids()
+                .iter()
+                .copied()
+                .filter(|channel_id| {
+                    (*channel_id == hint.channel_id() && here_may_change)
+                        || (*channel_id != hint.channel_id()
+                            && (subs_may_change
+                                || (here_may_change && here_changes_structural_descendants)))
+                })
+                .collect::<HashSet<_>>();
+            if affected_channel_ids.is_empty() {
+                return;
+            }
+            let affected_clients = self
+                .get_clients()
+                .get_local_clients_in_channels_in_server(
+                    server_id,
+                    &sorted_channel_ids(&affected_channel_ids),
+                )
+                .await;
+            let old_acl = crate::client::acl::ChannelAclOverride::new(
+                hint.channel_id(),
+                hint.old_inherit_acl(),
+                hint.old_acls().to_vec(),
+            );
+            for client in affected_clients {
+                let current_channel_id = client.get_current_channel_id();
+                let matches_here = here_may_change
+                    && crate::client::acl::client_matches_acl_viewer_scope(
+                        &client,
+                        impact.apply_here().viewer_scope(),
+                    );
+                let matches_subs = subs_may_change
+                    && crate::client::acl::client_matches_acl_viewer_scope(
+                        &client,
+                        impact.apply_subs().viewer_scope(),
+                    );
+                let viewer_may_change = if current_channel_id == hint.channel_id() {
+                    matches_here
+                } else {
+                    matches_subs || (here_changes_structural_descendants && matches_here)
+                };
+                if !viewer_may_change {
+                    continue;
+                }
+                let context = crate::client::acl::ClientAclEvaluationContext::new(
+                    self,
+                    &client,
+                    hint.tree_snapshot(),
+                    None,
+                )
+                .await;
+                let new_permissions = context.evaluate(current_channel_id);
+                let old_permissions =
+                    context.evaluate_with_acl_override(current_channel_id, &old_acl);
+                if new_permissions.contains(shitspeak_state::ACLPermissions::Speak)
+                    == old_permissions.contains(shitspeak_state::ACLPermissions::Speak)
+                {
+                    continue;
+                }
+                loop {
+                    let evaluated_channel_id = client.get_current_channel_id();
+                    let evaluated_channel_version =
+                        self.get_channels().current_version_in_server(server_id);
+                    let permissions = crate::client::acl::compute_permissions_for_client(
+                        self,
+                        &client,
+                        evaluated_channel_id,
+                    )
+                    .await;
+                    let mut state = client.write_global_state_as(
+                        self.get_clients(),
+                        None,
+                        Some(evaluated_channel_version),
+                    );
+                    if state.get_current_channel_id() != evaluated_channel_id
+                        || self.get_channels().current_version_in_server(server_id)
+                            != evaluated_channel_version
+                    {
+                        continue;
+                    }
+                    state.set_suppress(
+                        !permissions.contains(shitspeak_state::ACLPermissions::Speak),
+                    );
+                    break;
+                }
+            }
+            return;
+        }
+
+        // Transient hints can be absent for old replayed operations. Keep the
+        // original broad reevaluation as the correctness fallback.
         let Some(affected_channel_ids) = self
             .get_channels()
-            .acl_affected_channel_ids_for_op(server_id, op)
+            .acl_affected_channel_ids_for_op(server_id, &operation.op)
             .await
         else {
             return;
@@ -1943,17 +2056,29 @@ impl Server {
             .await;
 
         for client in affected_clients {
-            let permissions = crate::client::acl::compute_permissions_for_client(
-                self,
-                &client,
-                client.get_current_channel_id(),
-            )
-            .await;
-            let suppress = !permissions.contains(shitspeak_state::ACLPermissions::Speak);
-            {
-                let mut state =
-                    client.write_global_state_as(self.get_clients(), None, Some(channel_version));
-                state.set_suppress(suppress);
+            loop {
+                let evaluated_channel_id = client.get_current_channel_id();
+                let evaluated_channel_version =
+                    self.get_channels().current_version_in_server(server_id);
+                let permissions = crate::client::acl::compute_permissions_for_client(
+                    self,
+                    &client,
+                    evaluated_channel_id,
+                )
+                .await;
+                let mut state = client.write_global_state_as(
+                    self.get_clients(),
+                    None,
+                    Some(evaluated_channel_version),
+                );
+                if state.get_current_channel_id() != evaluated_channel_id
+                    || self.get_channels().current_version_in_server(server_id)
+                        != evaluated_channel_version
+                {
+                    continue;
+                }
+                state.set_suppress(!permissions.contains(shitspeak_state::ACLPermissions::Speak));
+                break;
             }
         }
     }

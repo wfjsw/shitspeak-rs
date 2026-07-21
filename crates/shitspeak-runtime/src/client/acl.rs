@@ -9,6 +9,304 @@ use std::sync::Arc;
 use crate::client::Client;
 use crate::server::Server;
 
+use shitspeak_state::{ACL, ACLPermissions, AclViewerScope, Channel, ChannelTreeSnapshot};
+
+/// The ACL portion of one channel before an operation changed it.
+///
+/// Fan-out reconciliation uses this to evaluate the same tree snapshot both
+/// before and after an ACL update without rebuilding or mutating the snapshot.
+#[derive(Clone, Debug)]
+pub(crate) struct ChannelAclOverride {
+    channel_id: u32,
+    inherit_acl: bool,
+    acls: Vec<ACL>,
+}
+
+impl ChannelAclOverride {
+    pub(crate) fn new(channel_id: u32, inherit_acl: bool, acls: Vec<ACL>) -> Self {
+        Self {
+            channel_id,
+            inherit_acl,
+            acls,
+        }
+    }
+
+    fn apply_to(&self, channel: &Channel) -> Channel {
+        let mut channel = channel.clone();
+        channel.inherit_acl = self.inherit_acl;
+        channel.acls.clone_from(&self.acls);
+        channel
+    }
+}
+
+/// Operation-scoped ACL inputs for one client.
+///
+/// Constructing the context captures all client state and performs the GeoIP
+/// lookup once. Permission checks after that are synchronous and use the
+/// stable channel tree snapshot rather than reacquiring repository locks.
+pub(crate) struct ClientAclEvaluationContext {
+    snapshot: Arc<ChannelTreeSnapshot>,
+    session: u32,
+    user_id: Option<u32>,
+    groups: Vec<String>,
+    tokens: Vec<String>,
+    certificate_hash: Option<Vec<u8>>,
+    verified: bool,
+    real_ip_address: std::net::IpAddr,
+    ip_geo_asn: Option<u32>,
+    ip_geo_country: Option<String>,
+    home_channel_id: u32,
+    home_ancestor_ids: Vec<u32>,
+    is_superuser: bool,
+    debug_acl_enter: bool,
+    explicit_enter_deny_overrides_write: bool,
+}
+
+impl ClientAclEvaluationContext {
+    pub(crate) async fn new(
+        server: &Arc<Box<Server>>,
+        client: &Arc<Box<Client>>,
+        snapshot: Arc<ChannelTreeSnapshot>,
+        home_channel_override: Option<u32>,
+    ) -> Self {
+        let home_channel_id =
+            home_channel_override.unwrap_or_else(|| client.get_current_channel_id());
+        let home_ancestor_ids = snapshot
+            .ancestor_ids(home_channel_id)
+            .unwrap_or_default()
+            .to_vec();
+        let real_ip_address = client.get_real_ip_address();
+        let ip_geo = server.lookup_ip_geo_metadata(real_ip_address).await;
+
+        Self {
+            snapshot,
+            session: u32::from(client.get_session_id()),
+            user_id: client.get_user_id(),
+            groups: client.get_groups_clone().into_iter().collect(),
+            tokens: client.get_tokens_clone().into_iter().collect(),
+            certificate_hash: client.get_certificate_hash().map(<[u8]>::to_vec),
+            verified: client.is_verified(),
+            real_ip_address,
+            ip_geo_asn: ip_geo.as_ref().and_then(|geo| geo.asn()),
+            ip_geo_country: ip_geo
+                .as_ref()
+                .and_then(|geo| geo.country_code())
+                .map(str::to_owned),
+            home_channel_id,
+            home_ancestor_ids,
+            is_superuser: client.is_superuser(),
+            debug_acl_enter: server.get_debug_acl_enter(),
+            explicit_enter_deny_overrides_write: server.get_explicit_enter_deny_overrides_write(),
+        }
+    }
+
+    pub(crate) fn evaluate(&self, channel_id: u32) -> enumflags2::BitFlags<ACLPermissions> {
+        self.evaluate_inner(channel_id, None)
+    }
+
+    pub(crate) fn evaluate_with_acl_override(
+        &self,
+        channel_id: u32,
+        acl_override: &ChannelAclOverride,
+    ) -> enumflags2::BitFlags<ACLPermissions> {
+        self.evaluate_inner(channel_id, Some(acl_override))
+    }
+
+    pub(crate) fn is_enter_restricted(&self, channel_id: u32) -> bool {
+        self.is_enter_restricted_inner(channel_id, None)
+    }
+
+    pub(crate) fn is_enter_restricted_with_acl_override(
+        &self,
+        channel_id: u32,
+        acl_override: &ChannelAclOverride,
+    ) -> bool {
+        self.is_enter_restricted_inner(channel_id, Some(acl_override))
+    }
+
+    fn is_enter_restricted_inner(
+        &self,
+        channel_id: u32,
+        acl_override: Option<&ChannelAclOverride>,
+    ) -> bool {
+        let Some(snapshot_channel) = self.snapshot.channel(channel_id) else {
+            return false;
+        };
+        let overridden_channel = acl_override
+            .filter(|acl_override| acl_override.channel_id == channel_id)
+            .map(|acl_override| acl_override.apply_to(snapshot_channel));
+        let channel = overridden_channel.as_ref().unwrap_or(snapshot_channel);
+        let ancestors = self
+            .snapshot
+            .ancestor_ids(channel_id)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|ancestor_id| {
+                let ancestor = self.snapshot.channel(*ancestor_id)?;
+                Some(match acl_override {
+                    Some(acl_override) if acl_override.channel_id == *ancestor_id => {
+                        acl_override.apply_to(ancestor)
+                    }
+                    _ => ancestor.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        shitspeak_state::channel_has_effective_restriction(
+            channel,
+            &ancestors,
+            ACLPermissions::Traverse,
+        ) || shitspeak_state::channel_has_effective_restriction(
+            channel,
+            &ancestors,
+            ACLPermissions::Enter,
+        )
+    }
+
+    fn evaluate_inner(
+        &self,
+        channel_id: u32,
+        acl_override: Option<&ChannelAclOverride>,
+    ) -> enumflags2::BitFlags<ACLPermissions> {
+        let Some(snapshot_channel) = self.snapshot.channel(channel_id) else {
+            tracing::trace!(
+                session = self.session,
+                channel_id,
+                "ACL snapshot compute found no channel"
+            );
+            return enumflags2::BitFlags::empty();
+        };
+
+        let overridden_channel = acl_override
+            .filter(|acl_override| acl_override.channel_id == channel_id)
+            .map(|acl_override| acl_override.apply_to(snapshot_channel));
+        let channel = overridden_channel.as_ref().unwrap_or(snapshot_channel);
+        let ancestors = self
+            .snapshot
+            .ancestor_ids(channel_id)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|ancestor_id| {
+                let ancestor = self.snapshot.channel(*ancestor_id)?;
+                Some(match acl_override {
+                    Some(acl_override) if acl_override.channel_id == *ancestor_id => {
+                        acl_override.apply_to(ancestor)
+                    }
+                    _ => ancestor.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let group_refs = self.groups.iter().map(String::as_str).collect::<Vec<_>>();
+        let token_refs = self.tokens.iter().map(String::as_str).collect::<Vec<_>>();
+        let membership = shitspeak_state::ClientMembershipQuery::new(
+            &group_refs,
+            self.user_id.is_some(),
+            &token_refs,
+            self.certificate_hash.as_deref(),
+            self.verified,
+            Some(self.real_ip_address),
+        )
+        .with_ip_metadata(self.ip_geo_asn, self.ip_geo_country.as_deref())
+        .with_home_channel(shitspeak_state::ChannelHierarchy::new(
+            self.home_channel_id,
+            &self.home_ancestor_ids,
+        ));
+
+        let permissions = shitspeak_state::evaluate_permission_with_behavior(
+            channel,
+            &ancestors,
+            self.user_id,
+            &membership,
+            self.explicit_enter_deny_overrides_write,
+        );
+        let permissions = elevate_superuser_permissions(
+            permissions,
+            channel_id,
+            self.is_superuser,
+            self.debug_acl_enter,
+        );
+
+        tracing::trace!(
+            session = self.session,
+            channel_id,
+            user_id = self.user_id,
+            home_channel_id = self.home_channel_id,
+            is_superuser = self.is_superuser,
+            debug_acl_enter = self.debug_acl_enter,
+            explicit_enter_deny_overrides_write = self.explicit_enter_deny_overrides_write,
+            has_acl_override = acl_override.is_some(),
+            permissions = ?permissions,
+            "Computed snapshot ACL permissions"
+        );
+
+        permissions
+    }
+}
+
+/// Whether an operation-local ACL viewer scope can affect this client.
+///
+/// The state classifier only exposes exact user ids and ordinary client
+/// groups here. Dynamic group expressions are classified as all-viewer by
+/// the repository and therefore never reach the exact matching branches.
+pub(crate) fn client_matches_acl_viewer_scope(
+    client: &Arc<Box<Client>>,
+    scope: &AclViewerScope,
+) -> bool {
+    if scope.includes_all_viewers() {
+        return true;
+    }
+    if client
+        .get_user_id()
+        .is_some_and(|user_id| scope.user_ids().contains(&(user_id as i32)))
+    {
+        return true;
+    }
+    client.get_groups_clone().iter().any(|group| {
+        scope
+            .plain_client_groups()
+            .contains(&group.trim().to_ascii_lowercase())
+    })
+}
+
+fn elevate_superuser_permissions(
+    permissions: enumflags2::BitFlags<ACLPermissions>,
+    channel_id: u32,
+    is_superuser: bool,
+    debug_acl_enter: bool,
+) -> enumflags2::BitFlags<ACLPermissions> {
+    if !is_superuser {
+        return permissions;
+    }
+
+    let allow_speak = permissions.contains(ACLPermissions::Speak);
+    let allow_whisper = permissions.contains(ACLPermissions::Whisper);
+    let allow_enter = permissions.contains(ACLPermissions::Enter);
+    let mut elevated: enumflags2::BitFlags<ACLPermissions> = enumflags2::BitFlags::all();
+    elevated.remove(ACLPermissions::Speak | ACLPermissions::Whisper);
+    if !debug_acl_enter {
+        elevated.remove(ACLPermissions::Enter);
+    }
+    if allow_speak {
+        elevated.insert(ACLPermissions::Speak);
+    }
+    if allow_whisper {
+        elevated.insert(ACLPermissions::Whisper);
+    }
+    if !debug_acl_enter && allow_enter {
+        elevated.insert(ACLPermissions::Enter);
+    }
+    if channel_id != 0 {
+        elevated.remove(
+            ACLPermissions::Kick
+                | ACLPermissions::Ban
+                | ACLPermissions::Register
+                | ACLPermissions::SelfRegister
+                | ACLPermissions::ResetUserContent,
+        );
+    }
+    elevated
+}
+
 /// Compute effective permissions for a client on a given channel.
 pub async fn compute_permissions_for_client(
     server: &Arc<Box<Server>>,
@@ -168,35 +466,8 @@ async fn compute_permissions_for_client_inner(
         explicit_enter_deny_overrides_write,
     );
 
-    if is_superuser {
-        let allow_speak = permissions.contains(ACLPermissions::Speak);
-        let allow_whisper = permissions.contains(ACLPermissions::Whisper);
-        let allow_enter = permissions.contains(ACLPermissions::Enter);
-        let mut elevated: enumflags2::BitFlags<ACLPermissions> = enumflags2::BitFlags::all();
-        elevated.remove(ACLPermissions::Speak | ACLPermissions::Whisper);
-        if !debug_acl_enter {
-            elevated.remove(ACLPermissions::Enter);
-        }
-        if allow_speak {
-            elevated.insert(ACLPermissions::Speak);
-        }
-        if allow_whisper {
-            elevated.insert(ACLPermissions::Whisper);
-        }
-        if !debug_acl_enter && allow_enter {
-            elevated.insert(ACLPermissions::Enter);
-        }
-        if channel_id != 0 {
-            elevated.remove(
-                ACLPermissions::Kick
-                    | ACLPermissions::Ban
-                    | ACLPermissions::Register
-                    | ACLPermissions::SelfRegister
-                    | ACLPermissions::ResetUserContent,
-            );
-        }
-        permissions = elevated;
-    }
+    permissions =
+        elevate_superuser_permissions(permissions, channel_id, is_superuser, debug_acl_enter);
 
     tracing::trace!(
         session,
@@ -233,4 +504,50 @@ async fn compute_permissions_for_client_inner(
     }
 
     permissions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChannelAclOverride, elevate_superuser_permissions};
+    use shitspeak_state::{ACL, ACLPermissions, Channel};
+
+    #[test]
+    fn superuser_elevation_preserves_acl_controlled_voice_and_enter_permissions() {
+        let evaluated = ACLPermissions::Speak | ACLPermissions::Enter;
+        let elevated = elevate_superuser_permissions(evaluated, 7, true, false);
+
+        assert!(elevated.contains(ACLPermissions::Speak));
+        assert!(!elevated.contains(ACLPermissions::Whisper));
+        assert!(elevated.contains(ACLPermissions::Enter));
+        assert!(!elevated.contains(ACLPermissions::Kick));
+
+        let denied_enter =
+            elevate_superuser_permissions(enumflags2::BitFlags::empty(), 7, true, false);
+        assert!(!denied_enter.contains(ACLPermissions::Enter));
+
+        let debug_enter =
+            elevate_superuser_permissions(enumflags2::BitFlags::empty(), 7, true, true);
+        assert!(debug_enter.contains(ACLPermissions::Enter));
+    }
+
+    #[test]
+    fn acl_override_only_replaces_acl_state() {
+        let mut channel = Channel::new(7, "target", 3, 42, Some(1));
+        channel.inherit_acl = true;
+        channel.acls.push(ACL::new());
+
+        let mut old_acl = ACL::new();
+        old_acl.group = Some("all".to_owned());
+        old_acl.deny = ACLPermissions::Traverse.into();
+        let overridden =
+            ChannelAclOverride::new(7, false, vec![old_acl.clone()]).apply_to(&channel);
+
+        assert_eq!(overridden.id, channel.id);
+        assert_eq!(overridden.name, channel.name);
+        assert_eq!(overridden.parent_id, channel.parent_id);
+        assert_eq!(overridden.position, channel.position);
+        assert_eq!(overridden.max_users, channel.max_users);
+        assert!(!overridden.inherit_acl);
+        assert_eq!(overridden.acls, vec![old_acl]);
+    }
 }

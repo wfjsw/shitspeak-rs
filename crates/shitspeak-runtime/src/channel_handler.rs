@@ -5,7 +5,7 @@
 //! subscription broadcasts, and future features like S2S replication and admin APIs.
 
 use shitspeak_state::{
-    Channel, ChannelHierarchy, ChannelOp, ChannelOperation, ChannelRepository,
+    ACLPermissions, Channel, ChannelHierarchy, ChannelOp, ChannelOperation, ChannelRepository,
     ClientMembershipQuery, group_depends_on_home_channel, is_member_in_group,
 };
 use std::{
@@ -26,6 +26,63 @@ use crate::{
 };
 
 type PackedSessionId = u32;
+
+/// Permission values already sent to one socket.
+///
+/// Values are stored exactly as they appeared on the wire (including the
+/// client-cache marker bit). Keeping this state socket-local lets ACL refresh
+/// projection omit known-identical values without making a cold/unknown value
+/// unsafe: unknown channels always emit their first refresh.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelPermissionShadow {
+    permissions_by_channel: HashMap<u32, u32>,
+}
+
+impl ChannelPermissionShadow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, channel_id: u32) -> Option<u32> {
+        self.permissions_by_channel.get(&channel_id).copied()
+    }
+
+    pub fn contains_value(&self, channel_id: u32, permissions: u32) -> bool {
+        self.get(channel_id) == Some(permissions)
+    }
+
+    pub fn clear(&mut self) {
+        self.permissions_by_channel.clear();
+    }
+
+    pub fn remove(&mut self, channel_id: u32) -> Option<u32> {
+        self.permissions_by_channel.remove(&channel_id)
+    }
+
+    /// Synchronize state from a message after it has survived visibility
+    /// projection and is accepted into the socket's outbound sequence.
+    pub fn sync_message(&mut self, message: &Message) {
+        match message {
+            Message::PermissionQuery(query) if query.flush == Some(true) => self.clear(),
+            Message::PermissionQuery(query) => {
+                if let (Some(channel_id), Some(permissions)) = (query.channel_id, query.permissions)
+                {
+                    self.permissions_by_channel.insert(channel_id, permissions);
+                }
+            }
+            Message::ChannelRemove(remove) => {
+                self.remove(remove.channel_id);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn sync_messages<'a>(&mut self, messages: impl IntoIterator<Item = &'a Message>) {
+        for message in messages {
+            self.sync_message(message);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionChannelShadow {
@@ -699,12 +756,225 @@ pub fn remove_deleted_channels_from_shadow(
     }
 }
 
+pub(crate) fn remove_deleted_channel_permissions_from_shadow(
+    channels: &Arc<ChannelRepository>,
+    op: &ChannelOperation,
+    permission_shadow: &mut ChannelPermissionShadow,
+) {
+    let Some(deleted_channel_ids) = channels.delete_visibility_hint_for_operation(op) else {
+        return;
+    };
+    for channel_id in deleted_channel_ids.iter() {
+        permission_shadow.remove(*channel_id);
+    }
+}
+
+/// Synchronize projected permission messages in projection order.
+pub(crate) fn suppress_known_projected_permission_messages(
+    messages: Vec<Message>,
+    permission_shadow: &mut ChannelPermissionShadow,
+) -> Vec<Message> {
+    let mut out = Vec::with_capacity(messages.len());
+    for message in messages {
+        permission_shadow.sync_message(&message);
+        out.push(message);
+    }
+    out
+}
+
 #[derive(Debug, Default)]
 pub struct ChannelVisibilityRefresh {
     additions: Vec<Message>,
     addition_ids: Vec<u32>,
     removals: Vec<Message>,
     removal_ids: Vec<u32>,
+}
+
+pub struct ClientAclOperationContext {
+    hint: Arc<shitspeak_state::AclChangeHint>,
+    evaluation: Option<crate::client::acl::ClientAclEvaluationContext>,
+    old_acl: crate::client::acl::ChannelAclOverride,
+    new_permissions:
+        parking_lot::Mutex<HashMap<u32, enumflags2::BitFlags<shitspeak_state::ACLPermissions>>>,
+    old_permissions:
+        parking_lot::Mutex<HashMap<u32, enumflags2::BitFlags<shitspeak_state::ACLPermissions>>>,
+    new_restrictions: parking_lot::Mutex<HashMap<u32, bool>>,
+    old_restrictions: parking_lot::Mutex<HashMap<u32, bool>>,
+}
+
+impl ClientAclOperationContext {
+    pub async fn for_operation(
+        server: &Arc<Box<Server>>,
+        client: &Arc<Box<Client>>,
+        channels: &Arc<ChannelRepository>,
+        operation: &ChannelOperation,
+    ) -> Option<Self> {
+        Self::for_operation_with_permission_queries(server, client, channels, operation, true).await
+    }
+
+    pub async fn for_operation_with_permission_queries(
+        server: &Arc<Box<Server>>,
+        client: &Arc<Box<Client>>,
+        channels: &Arc<ChannelRepository>,
+        operation: &ChannelOperation,
+        emit_permission_queries: bool,
+    ) -> Option<Self> {
+        let hint = channels.acl_change_hint_for_operation(operation)?;
+        if !hint.impact().state_changed() {
+            return None;
+        }
+        let impact = hint.impact();
+        let matches_here = crate::client::acl::client_matches_acl_viewer_scope(
+            client,
+            impact.apply_here().viewer_scope(),
+        );
+        let matches_subs = crate::client::acl::client_matches_acl_viewer_scope(
+            client,
+            impact.apply_subs().viewer_scope(),
+        );
+        let restriction_refresh = server.get_send_permission_info()
+            && (impact.apply_here().restriction_may_change()
+                || impact.apply_subs().restriction_may_change());
+        let permission_info_here = server.get_send_permission_info()
+            && impact
+                .apply_here()
+                .effective_permissions()
+                .contains(ACLPermissions::Enter);
+        let permission_info_subs = server.get_send_permission_info()
+            && impact
+                .apply_subs()
+                .effective_permissions()
+                .contains(ACLPermissions::Enter);
+        let visibility_here = impact
+            .apply_here()
+            .effective_permissions()
+            .contains(ACLPermissions::Traverse);
+        let visibility_subs = impact
+            .apply_subs()
+            .effective_permissions()
+            .contains(ACLPermissions::Traverse);
+        let needs_evaluation = restriction_refresh
+            || (matches_here
+                && (emit_permission_queries || permission_info_here || visibility_here))
+            || (matches_subs
+                && (emit_permission_queries || permission_info_subs || visibility_subs));
+        let evaluation = if needs_evaluation {
+            Some(
+                crate::client::acl::ClientAclEvaluationContext::new(
+                    server,
+                    client,
+                    hint.tree_snapshot(),
+                    None,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let old_acl = crate::client::acl::ChannelAclOverride::new(
+            hint.channel_id(),
+            hint.old_inherit_acl(),
+            hint.old_acls().to_vec(),
+        );
+        Some(Self {
+            hint,
+            evaluation,
+            old_acl,
+            new_permissions: parking_lot::Mutex::new(HashMap::new()),
+            old_permissions: parking_lot::Mutex::new(HashMap::new()),
+            new_restrictions: parking_lot::Mutex::new(HashMap::new()),
+            old_restrictions: parking_lot::Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn evaluate(&self, channel_id: u32) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
+        if let Some(permissions) = self.new_permissions.lock().get(&channel_id).copied() {
+            return permissions;
+        }
+        let permissions = self
+            .evaluation
+            .as_ref()
+            .map(|evaluation| evaluation.evaluate(channel_id))
+            .unwrap_or_default();
+        self.new_permissions.lock().insert(channel_id, permissions);
+        permissions
+    }
+
+    fn evaluate_old(
+        &self,
+        channel_id: u32,
+    ) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
+        if let Some(permissions) = self.old_permissions.lock().get(&channel_id).copied() {
+            return permissions;
+        }
+        let permissions = self
+            .evaluation
+            .as_ref()
+            .map(|evaluation| evaluation.evaluate_with_acl_override(channel_id, &self.old_acl))
+            .unwrap_or_default();
+        self.old_permissions.lock().insert(channel_id, permissions);
+        permissions
+    }
+
+    fn is_enter_restricted(&self, channel_id: u32) -> bool {
+        if let Some(restricted) = self.new_restrictions.lock().get(&channel_id).copied() {
+            return restricted;
+        }
+        let restricted = self
+            .evaluation
+            .as_ref()
+            .is_some_and(|evaluation| evaluation.is_enter_restricted(channel_id));
+        self.new_restrictions.lock().insert(channel_id, restricted);
+        restricted
+    }
+
+    fn was_enter_restricted(&self, channel_id: u32) -> bool {
+        if let Some(restricted) = self.old_restrictions.lock().get(&channel_id).copied() {
+            return restricted;
+        }
+        let restricted = self.evaluation.as_ref().is_some_and(|evaluation| {
+            evaluation.is_enter_restricted_with_acl_override(channel_id, &self.old_acl)
+        });
+        self.old_restrictions.lock().insert(channel_id, restricted);
+        restricted
+    }
+
+    pub(crate) fn can_view_channel(&self, channel_id: u32) -> bool {
+        self.evaluate(channel_id)
+            .contains(shitspeak_state::ACLPermissions::Traverse)
+    }
+
+    pub(crate) fn can_view_channel_with_ancestors(&self, channel_id: u32) -> bool {
+        if !self.can_view_channel(channel_id) {
+            return false;
+        }
+        self.hint
+            .tree_snapshot()
+            .ancestor_ids(channel_id)
+            .unwrap_or_default()
+            .iter()
+            .all(|ancestor_id| {
+                self.evaluate(*ancestor_id)
+                    .contains(shitspeak_state::ACLPermissions::Traverse)
+            })
+    }
+
+    pub(crate) fn visible_listener_channels(
+        &self,
+        channel_ids: impl IntoIterator<Item = u32>,
+        include_ancestors: bool,
+    ) -> HashSet<u32> {
+        channel_ids
+            .into_iter()
+            .filter(|channel_id| {
+                if include_ancestors {
+                    self.can_view_channel_with_ancestors(*channel_id)
+                } else {
+                    self.can_view_channel(*channel_id)
+                }
+            })
+            .collect()
+    }
 }
 
 impl ChannelVisibilityRefresh {
@@ -731,6 +1001,15 @@ impl ChannelVisibilityRefresh {
             channel_tree_shadow.remove(channel_id);
         }
     }
+
+    pub(crate) fn apply_permission_removals(
+        &self,
+        permission_shadow: &mut ChannelPermissionShadow,
+    ) {
+        for channel_id in &self.removal_ids {
+            permission_shadow.remove(*channel_id);
+        }
+    }
 }
 
 /// Computes visible channel additions/removals after an ACL-sensitive change.
@@ -742,7 +1021,26 @@ pub async fn prepare_channel_visibility_refresh(
     channel_tree_shadow: &ChannelTreeShadow,
     scope: &crate::client::visibility::VisibilityRefreshScope,
 ) -> ChannelVisibilityRefresh {
-    prepare_channel_visibility_refresh_inner(server, client, channel_tree_shadow, scope, None).await
+    prepare_channel_visibility_refresh_inner(server, client, channel_tree_shadow, scope, None, None)
+        .await
+}
+
+pub async fn prepare_channel_visibility_refresh_with_acl_context(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &ChannelTreeShadow,
+    scope: &crate::client::visibility::VisibilityRefreshScope,
+    acl_context: Option<&ClientAclOperationContext>,
+) -> ChannelVisibilityRefresh {
+    prepare_channel_visibility_refresh_inner(
+        server,
+        client,
+        channel_tree_shadow,
+        scope,
+        None,
+        acl_context,
+    )
+    .await
 }
 
 pub(crate) async fn prepare_channel_visibility_refresh_for_home_move(
@@ -758,6 +1056,7 @@ pub(crate) async fn prepare_channel_visibility_refresh_for_home_move(
         channel_tree_shadow,
         scope,
         Some(impact),
+        None,
     )
     .await
 }
@@ -768,6 +1067,7 @@ async fn prepare_channel_visibility_refresh_inner(
     channel_tree_shadow: &ChannelTreeShadow,
     scope: &crate::client::visibility::VisibilityRefreshScope,
     home_move_impact: Option<&HomeChannelMoveImpact>,
+    acl_context: Option<&ClientAclOperationContext>,
 ) -> ChannelVisibilityRefresh {
     if !server.get_hide_channels_without_traverse()
         || (!scope.includes_all_channels() && scope.channel_ids().is_empty())
@@ -800,6 +1100,20 @@ async fn prepare_channel_visibility_refresh_inner(
             }
         }
         candidate_channels.into_values().collect()
+    } else if let Some(context) = acl_context {
+        let snapshot = context.hint.tree_snapshot();
+        let mut channels_by_id = HashMap::with_capacity(affected_channel_ids.len());
+        let mut pending = affected_channel_ids.iter().copied().collect::<Vec<_>>();
+        while let Some(channel_id) = pending.pop() {
+            if let Some(channel) = snapshot.channel(channel_id)
+                && channels_by_id.insert(channel.id, channel.clone()).is_none()
+                && let Some(parent_id) = channel.parent_id
+            {
+                pending.push(parent_id);
+                affected_channel_ids.insert(parent_id);
+            }
+        }
+        channels_by_id.into_values().collect()
     } else {
         // Include each candidate's ancestors.  A directly traversable child
         // must not be introduced (or retained) when one of those ancestors
@@ -825,8 +1139,8 @@ async fn prepare_channel_visibility_refresh_inner(
 
     let mut visible_channel_ids = HashSet::with_capacity(candidate_channels.len());
     for channel in &candidate_channels {
-        let visible = match home_move_impact {
-            Some(impact) if server.get_hide_channels_without_traverse() => {
+        let visible = match (home_move_impact, acl_context) {
+            (Some(impact), _) if server.get_hide_channels_without_traverse() => {
                 crate::client::acl::compute_permissions_for_client_with_home_channel(
                     server,
                     client,
@@ -836,6 +1150,9 @@ async fn prepare_channel_visibility_refresh_inner(
                 .await
                 .contains(shitspeak_state::ACLPermissions::Traverse)
             }
+            (None, Some(context)) => context
+                .evaluate(channel.id)
+                .contains(shitspeak_state::ACLPermissions::Traverse),
             _ => can_view_channel(server, client, channel.id).await,
         };
         if visible {
@@ -879,15 +1196,32 @@ async fn prepare_channel_visibility_refresh_inner(
             server,
             client,
             &channel,
-            server.get_send_permission_info(),
+            server.get_send_permission_info() && acl_context.is_none(),
             home_move_impact.map(HomeChannelMoveImpact::new_channel_id),
         )
         .await;
+        if server.get_send_permission_info()
+            && let Some(context) = acl_context
+        {
+            state = state.with_permission_info(
+                context.is_enter_restricted(channel.id),
+                context.evaluate(channel.id),
+            );
+        }
         state
             .links
             .retain(|linked_id| final_visible_channel_ids.contains(linked_id));
         addition_ids.push(channel.id);
         additions.push(state.into());
+        if let Some(context) = acl_context {
+            additions.push(
+                crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                    channel.id,
+                    context.evaluate(channel.id).bits(),
+                )
+                .into(),
+            );
+        }
     }
 
     let removals = removed_channel_ids
@@ -1358,28 +1692,119 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
     client: &Arc<Box<Client>>,
     op: &ChannelOperation,
     channels: &Arc<ChannelRepository>,
+    session_channel_shadow: Option<&mut SessionChannelShadow>,
+) -> Vec<crate::messages::Message> {
+    convert_channel_operation_to_messages_with_shadows(
+        server,
+        client,
+        op,
+        channels,
+        session_channel_shadow,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn convert_channel_operation_to_messages_with_shadows(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    op: &ChannelOperation,
+    channels: &Arc<ChannelRepository>,
+    session_channel_shadow: Option<&mut SessionChannelShadow>,
+    permission_shadow: Option<&ChannelPermissionShadow>,
+) -> Vec<crate::messages::Message> {
+    convert_channel_operation_to_messages_with_acl_context(
+        server,
+        client,
+        op,
+        channels,
+        session_channel_shadow,
+        permission_shadow,
+        None,
+    )
+    .await
+}
+
+pub async fn convert_channel_operation_to_messages_with_acl_context(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    op: &ChannelOperation,
+    channels: &Arc<ChannelRepository>,
     mut session_channel_shadow: Option<&mut SessionChannelShadow>,
+    _permission_shadow: Option<&ChannelPermissionShadow>,
+    acl_context: Option<&ClientAclOperationContext>,
+) -> Vec<crate::messages::Message> {
+    convert_channel_operation_to_messages_with_acl_context_options(
+        server,
+        client,
+        op,
+        channels,
+        session_channel_shadow,
+        acl_context,
+        true,
+    )
+    .await
+}
+
+pub async fn convert_channel_operation_to_messages_with_acl_context_options(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    op: &ChannelOperation,
+    channels: &Arc<ChannelRepository>,
+    mut session_channel_shadow: Option<&mut SessionChannelShadow>,
+    acl_context: Option<&ClientAclOperationContext>,
+    emit_permission_queries: bool,
 ) -> Vec<crate::messages::Message> {
     let mut messages = Vec::new();
+    let mut permission_info_messages = Vec::new();
     let send_permission_info = server.read_config().send_permission_info;
     let server_id = client.server_id();
     if op.server_id != server_id {
         return messages;
     }
 
-    if let Some(channel_ids) = channels
+    let include_permission_info =
+        send_permission_info && !matches!(op.op, ChannelOp::InstallSnapshot { .. });
+    let permission_refresh = if !emit_permission_queries && !include_permission_info {
+        None
+    } else if let Some(context) = acl_context {
+        Some(build_precise_acl_permission_refresh_messages_from_context(
+            client,
+            context,
+            include_permission_info,
+        ))
+    } else if let Some(hint) = channels.acl_change_hint_for_operation(op) {
+        Some(
+            build_precise_acl_permission_refresh_messages(
+                server,
+                client,
+                hint,
+                include_permission_info,
+            )
+            .await,
+        )
+    } else if let Some(channel_ids) = channels
         .acl_affected_channel_ids_for_op(&server_id, &op.op)
         .await
     {
-        messages.extend(
-            build_channel_permission_query_refresh_messages_for_channel_ids(
+        Some(
+            build_channel_permission_refresh_messages_for_channel_ids(
                 server,
                 client,
                 channels,
                 channel_ids,
+                include_permission_info,
             )
             .await,
-        );
+        )
+    } else {
+        None
+    };
+    if let Some((permission_queries, permission_info)) = permission_refresh {
+        if emit_permission_queries {
+            messages.extend(permission_queries);
+        }
+        permission_info_messages = permission_info;
     }
 
     match &op.op {
@@ -1464,22 +1889,7 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
         }
     }
 
-    if send_permission_info
-        && let Some(channel_ids) = channels
-            .acl_affected_channel_ids_for_op(&server_id, &op.op)
-            .await
-        && !matches!(op.op, ChannelOp::InstallSnapshot { .. })
-    {
-        messages.extend(
-            build_channel_permission_info_refresh_messages_for_channel_ids(
-                server,
-                client,
-                channels,
-                channel_ids,
-            )
-            .await,
-        );
-    }
+    messages.extend(permission_info_messages);
 
     messages
 }
@@ -1684,6 +2094,60 @@ pub async fn replay_channel_log_gap(
     last: u64,
     current: u64,
 ) -> Result<(), ChannelReplayError> {
+    replay_channel_log_gap_inner(
+        server,
+        client,
+        channels,
+        channel_tree_shadow,
+        session_channel_shadow,
+        user_visibility,
+        session_id,
+        last,
+        current,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn replay_channel_log_gap_with_permission_shadow(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channels: &Arc<ChannelRepository>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut crate::client::visibility::UserVisibilityState,
+    permission_shadow: &mut ChannelPermissionShadow,
+    session_id: crate::client::client_session_identifier::ClientSessionIdentifier,
+    last: u64,
+    current: u64,
+) -> Result<(), ChannelReplayError> {
+    replay_channel_log_gap_inner(
+        server,
+        client,
+        channels,
+        channel_tree_shadow,
+        session_channel_shadow,
+        user_visibility,
+        session_id,
+        last,
+        current,
+        Some(permission_shadow),
+    )
+    .await
+}
+
+async fn replay_channel_log_gap_inner(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channels: &Arc<ChannelRepository>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    session_channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut crate::client::visibility::UserVisibilityState,
+    session_id: crate::client::client_session_identifier::ClientSessionIdentifier,
+    last: u64,
+    current: u64,
+    mut permission_shadow: Option<&mut ChannelPermissionShadow>,
+) -> Result<(), ChannelReplayError> {
     if current <= last + 1 {
         return Ok(());
     }
@@ -1715,6 +2179,7 @@ pub async fn replay_channel_log_gap(
             channel_tree_shadow,
             session_channel_shadow,
             user_visibility,
+            permission_shadow,
             &server_id,
             latest,
         )
@@ -1739,6 +2204,7 @@ pub async fn replay_channel_log_gap(
             channel_tree_shadow,
             session_channel_shadow,
             user_visibility,
+            permission_shadow,
             &server_id,
             latest,
         )
@@ -1750,22 +2216,37 @@ pub async fn replay_channel_log_gap(
         if entry.version >= current {
             break;
         }
+        if matches!(&entry.op, ChannelOp::InstallSnapshot { .. })
+            && let Some(shadow) = permission_shadow.as_deref_mut()
+        {
+            shadow.clear();
+        }
+        let acl_context =
+            ClientAclOperationContext::for_operation(server, client, channels, entry).await;
         let refresh_scope =
-            crate::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+            crate::client::visibility::visibility_refresh_scope_for_channel_operation_with_state_for_client(
                 server,
+                client,
                 entry,
                 user_visibility,
             )
             .await;
-        let channel_refresh =
-            prepare_channel_visibility_refresh(server, client, channel_tree_shadow, &refresh_scope)
-                .await;
-        let messages = convert_channel_operation_to_messages_with_shadow(
+        let channel_refresh = prepare_channel_visibility_refresh_with_acl_context(
+            server,
+            client,
+            channel_tree_shadow,
+            &refresh_scope,
+            acl_context.as_ref(),
+        )
+        .await;
+        let messages = convert_channel_operation_to_messages_with_acl_context(
             server,
             client,
             entry,
             channels,
             Some(session_channel_shadow),
+            permission_shadow.as_deref(),
+            acl_context.as_ref(),
         )
         .await;
         let mut deferred_channel_removals = Vec::new();
@@ -1790,26 +2271,37 @@ pub async fn replay_channel_log_gap(
                 if matches!(&projected, Message::ChannelRemove(_)) {
                     deferred_channel_removals.push(projected);
                 } else {
+                    if let Some(shadow) = permission_shadow.as_deref_mut() {
+                        shadow.sync_message(&projected);
+                    }
                     outbound.push(projected);
                 }
             }
         }
         channel_refresh.apply_additions(channel_tree_shadow);
         channel_refresh.append_additions_to(&mut outbound);
-        let projected = crate::client::visibility::visibility_refresh_messages_with_shadow(
-            server,
-            client,
-            user_visibility,
-            session_channel_shadow,
-            &server_id,
-            refresh_scope,
-        )
-        .await;
+        let projected =
+            crate::client::visibility::visibility_refresh_messages_with_shadow_and_acl_context(
+                server,
+                client,
+                user_visibility,
+                session_channel_shadow,
+                &server_id,
+                refresh_scope,
+                acl_context.as_ref(),
+            )
+            .await;
         for msg in projected {
             channel_tree_shadow.sync_message(&msg);
+            if let Some(shadow) = permission_shadow.as_deref_mut() {
+                shadow.sync_message(&msg);
+            }
             outbound.push(msg);
         }
         channel_refresh.apply_removals(channel_tree_shadow);
+        if let Some(shadow) = permission_shadow.as_deref_mut() {
+            channel_refresh.apply_permission_removals(shadow);
+        }
         channel_refresh.append_removals_to(&mut outbound);
         for message in deferred_channel_removals {
             if let Message::ChannelRemove(channel_remove) = &message {
@@ -1818,9 +2310,15 @@ pub async fn replay_channel_log_gap(
                 }
             }
             channel_tree_shadow.sync_message(&message);
+            if let Some(shadow) = permission_shadow.as_deref_mut() {
+                shadow.sync_message(&message);
+            }
             outbound.push(message);
         }
         remove_deleted_channels_from_shadow(channels, entry, channel_tree_shadow);
+        if let Some(shadow) = permission_shadow.as_deref_mut() {
+            remove_deleted_channel_permissions_from_shadow(channels, entry, shadow);
+        }
         client.set_last_channel_version(entry.version).await;
     }
 
@@ -1839,9 +2337,13 @@ async fn replay_channel_snapshot(
     channel_tree_shadow: &mut ChannelTreeShadow,
     session_channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut crate::client::visibility::UserVisibilityState,
+    mut permission_shadow: Option<&mut ChannelPermissionShadow>,
     server_id: &str,
     latest: u64,
 ) -> Result<(), ChannelReplayError> {
+    if let Some(shadow) = permission_shadow.as_deref_mut() {
+        shadow.clear();
+    }
     let snapshot = channels.get_all_in_server(server_id).await;
     let previous = channel_tree_shadow.clone();
     let mut current = ChannelTreeShadow::new();
@@ -1866,20 +2368,26 @@ async fn replay_channel_snapshot(
     let mut visibility_scope = crate::client::visibility::VisibilityRefreshScope::new();
     visibility_scope.include_all_channels();
     visibility_scope.include_known_users();
-    outbound.extend(
-        crate::client::visibility::visibility_refresh_messages_with_shadow(
-            server,
-            client,
-            user_visibility,
-            session_channel_shadow,
-            server_id,
-            visibility_scope,
-        )
-        .await,
-    );
+    let visibility_messages = crate::client::visibility::visibility_refresh_messages_with_shadow(
+        server,
+        client,
+        user_visibility,
+        session_channel_shadow,
+        server_id,
+        visibility_scope,
+    )
+    .await;
+    if let Some(shadow) = permission_shadow.as_deref_mut() {
+        shadow.sync_messages(visibility_messages.iter());
+    }
+    outbound.extend(visibility_messages);
 
     for channel_id in removed {
-        outbound.push(crate::messages::encoder::ChannelRemove { channel_id }.into());
+        let message = crate::messages::encoder::ChannelRemove { channel_id }.into();
+        if let Some(shadow) = permission_shadow.as_deref_mut() {
+            shadow.sync_message(&message);
+        }
+        outbound.push(message);
     }
 
     client
@@ -1993,16 +2501,59 @@ mod tests {
 
     use crate::client::client_session_identifier::ClientSessionIdentifier;
     use crate::messages::{Message, encoder};
-    use shitspeak_state::ACL;
-    use shitspeak_state::Channel;
-    use shitspeak_state::ChannelHierarchy;
+    use shitspeak_state::{ACL, ACLPermissions, Channel, ChannelHierarchy};
 
     use super::{
-        ChannelTreeShadow, HomeChannelMoveImpact, SessionChannelShadow, channel_and_ancestor_ids,
-        channel_removal_ids_descendant_first, channels_affected_by_home_channel_move,
-        channels_with_home_channel_dependent_acls, close_visible_channel_ancestors,
-        expand_channel_ids_to_descendant_closure, ordered_snapshot_channels,
+        ChannelPermissionShadow, ChannelTreeShadow, HomeChannelMoveImpact, SessionChannelShadow,
+        channel_and_ancestor_ids, channel_removal_ids_descendant_first,
+        channels_affected_by_home_channel_move, channels_with_home_channel_dependent_acls,
+        close_visible_channel_ancestors, expand_channel_ids_to_descendant_closure,
+        ordered_snapshot_channels, suppress_known_projected_permission_messages,
     };
+
+    #[test]
+    fn permission_shadow_tracks_projected_values_without_suppressing_messages() {
+        let first: Message = encoder::PermissionQuery::refresh_channel_permissions(7, 0x10).into();
+        let same = first.clone();
+        let changed: Message =
+            encoder::PermissionQuery::refresh_channel_permissions(7, 0x20).into();
+        let mut shadow = ChannelPermissionShadow::new();
+
+        let projected = suppress_known_projected_permission_messages(
+            vec![first.clone(), same, changed.clone()],
+            &mut shadow,
+        );
+
+        assert_eq!(projected.len(), 3);
+        assert!(matches!(&projected[0], Message::PermissionQuery(query)
+            if query.permissions == match &first { Message::PermissionQuery(query) => query.permissions, _ => None }));
+        assert!(matches!(&projected[2], Message::PermissionQuery(query)
+            if query.permissions == match &changed { Message::PermissionQuery(query) => query.permissions, _ => None }));
+        let expected = match changed {
+            Message::PermissionQuery(query) => query.permissions.expect("permission value"),
+            _ => unreachable!(),
+        };
+        assert_eq!(shadow.get(7), Some(expected));
+    }
+
+    #[test]
+    fn permission_shadow_flush_and_channel_remove_forget_values() {
+        let query: Message = encoder::PermissionQuery::refresh_channel_permissions(9, 0x40).into();
+        let flush: Message = encoder::PermissionQuery::flush_cache().into();
+        let remove: Message = encoder::ChannelRemove { channel_id: 9 }.into();
+        let mut shadow = ChannelPermissionShadow::new();
+
+        shadow.sync_message(&query);
+        assert!(shadow.get(9).is_some());
+        shadow.sync_message(&remove);
+        assert_eq!(shadow.get(9), None);
+
+        shadow.sync_message(&query);
+        let projected =
+            suppress_known_projected_permission_messages(vec![flush, query.clone()], &mut shadow);
+        assert_eq!(projected.len(), 2, "flush makes the following value cold");
+        assert!(shadow.get(9).is_some());
+    }
 
     fn channel(id: u32, parent_id: Option<u32>, position: i32) -> Channel {
         Channel::new(id, format!("channel-{id}"), position, 100, parent_id)
@@ -2228,6 +2779,32 @@ mod tests {
 
         assert_eq!(optimized, baseline);
         assert_eq!(optimized, vec![1, 3]);
+    }
+
+    #[test]
+    fn home_channel_dependent_parent_path_gate_includes_descendants() {
+        let root = channel(0, None, 0);
+        let mut parent = channel(10, Some(0), 0);
+        let mut parent_acl = home_acl("in", true, false);
+        parent_acl.deny = ACLPermissions::Traverse.into();
+        parent.acls = vec![parent_acl];
+        let mut child = channel(11, Some(10), 0);
+        child.inherit_acl = false;
+        let channels = vec![root, parent, child];
+
+        let optimized = ids(channels_with_home_channel_dependent_acls(channels.clone()));
+        let baseline = baseline_home_channel_dependent_ids(&channels);
+        assert_eq!(optimized, baseline);
+        assert_eq!(optimized, vec![10, 11]);
+
+        let optimized_move = ids(channels_affected_by_home_channel_move(
+            channels.clone(),
+            10,
+            0,
+        ));
+        let baseline_move = baseline_home_channel_move_affected_ids(&channels, 10, 0);
+        assert_eq!(optimized_move, baseline_move);
+        assert_eq!(optimized_move, vec![10, 11]);
     }
 
     #[test]
@@ -2507,40 +3084,228 @@ pub async fn build_channel_permission_info_refresh_messages_for_channel_ids(
     build_channel_permission_info_refresh_messages_for_channels(server, client, channels).await
 }
 
+async fn build_precise_acl_permission_refresh_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    hint: Arc<shitspeak_state::AclChangeHint>,
+    include_permission_info: bool,
+) -> (Vec<Message>, Vec<Message>) {
+    if !hint.impact().state_changed() {
+        return (Vec::new(), Vec::new());
+    }
+    let evaluation = crate::client::acl::ClientAclEvaluationContext::new(
+        server,
+        client,
+        hint.tree_snapshot(),
+        None,
+    )
+    .await;
+    let old_acl = crate::client::acl::ChannelAclOverride::new(
+        hint.channel_id(),
+        hint.old_inherit_acl(),
+        hint.old_acls().to_vec(),
+    );
+    let context = ClientAclOperationContext {
+        hint,
+        evaluation: Some(evaluation),
+        old_acl,
+        new_permissions: parking_lot::Mutex::new(HashMap::new()),
+        old_permissions: parking_lot::Mutex::new(HashMap::new()),
+        new_restrictions: parking_lot::Mutex::new(HashMap::new()),
+        old_restrictions: parking_lot::Mutex::new(HashMap::new()),
+    };
+    build_precise_acl_permission_refresh_messages_from_context(
+        client,
+        &context,
+        include_permission_info,
+    )
+}
+
+fn build_precise_acl_permission_refresh_messages_from_context(
+    client: &Arc<Box<Client>>,
+    context: &ClientAclOperationContext,
+    include_permission_info: bool,
+) -> (Vec<Message>, Vec<Message>) {
+    let hint = &context.hint;
+    let impact = hint.impact();
+    if !impact.state_changed() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let here_matches = !impact.apply_here().effective_permissions().is_empty()
+        && crate::client::acl::client_matches_acl_viewer_scope(
+            client,
+            impact.apply_here().viewer_scope(),
+        );
+    let subs_matches = !impact.apply_subs().effective_permissions().is_empty()
+        && crate::client::acl::client_matches_acl_viewer_scope(
+            client,
+            impact.apply_subs().viewer_scope(),
+        );
+    let here_changes_structural_descendants = impact
+        .apply_here()
+        .effective_permissions()
+        .contains(shitspeak_state::ACLPermissions::Traverse);
+    let mut permission_query_ids = HashSet::new();
+    let mut restriction_ids = HashSet::new();
+    for channel_id in hint.affected_channel_ids().iter().copied() {
+        let is_here = channel_id == hint.channel_id();
+        if (is_here && here_matches)
+            || (!is_here && (subs_matches || (here_changes_structural_descendants && here_matches)))
+        {
+            permission_query_ids.insert(channel_id);
+        }
+        let restriction_may_change = if is_here {
+            impact.apply_here().restriction_may_change()
+        } else {
+            impact.apply_subs().restriction_may_change()
+        };
+        if restriction_may_change {
+            // is_enter_restricted is channel metadata shared by all viewers,
+            // even when the ACL permission itself targets one user/group.
+            restriction_ids.insert(channel_id);
+        }
+    }
+    if permission_query_ids.is_empty() && (!include_permission_info || restriction_ids.is_empty()) {
+        return (Vec::new(), Vec::new());
+    }
+
+    let snapshot = hint.tree_snapshot();
+    let mut channel_ids = permission_query_ids
+        .union(&restriction_ids)
+        .copied()
+        .collect::<Vec<_>>();
+    channel_ids.sort_unstable();
+
+    let mut permission_queries = Vec::new();
+    let mut permission_info = Vec::new();
+    for channel_id in channel_ids {
+        let new_permissions = context.evaluate(channel_id);
+        let old_permissions = context.evaluate_old(channel_id);
+        let permission_changed = new_permissions != old_permissions;
+        if permission_changed && permission_query_ids.contains(&channel_id) {
+            permission_queries.push(
+                crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                    channel_id,
+                    new_permissions.bits(),
+                )
+                .into(),
+            );
+        }
+
+        if include_permission_info {
+            let new_restricted = context.is_enter_restricted(channel_id);
+            let restriction_changed = restriction_ids.contains(&channel_id)
+                && new_restricted != context.was_enter_restricted(channel_id);
+            let enter_changed = new_permissions.contains(ACLPermissions::Enter)
+                != old_permissions.contains(ACLPermissions::Enter);
+            if (enter_changed && permission_query_ids.contains(&channel_id)) || restriction_changed
+            {
+                let Some(channel) = snapshot.channel(channel_id).cloned() else {
+                    continue;
+                };
+                permission_info.push((channel, new_restricted, new_permissions));
+            }
+        }
+    }
+
+    permission_info.sort_by_key(|(channel, _, _)| {
+        (channel.parent_id.unwrap_or(0), channel.position, channel.id)
+    });
+    let permission_info = permission_info
+        .into_iter()
+        .map(|(channel, is_enter_restricted, permissions)| {
+            ChannelState {
+                channel_id: Some(channel.id),
+                ..Default::default()
+            }
+            .with_permission_info(is_enter_restricted, permissions)
+            .into()
+        })
+        .collect();
+    (permission_queries, permission_info)
+}
+
+/// Build the two ACL refresh message families from one permission evaluation
+/// per affected channel. PermissionQuery messages retain channel-id ordering,
+/// while optional ChannelState permission deltas retain channel-tree ordering.
+async fn build_channel_permission_refresh_messages_for_channel_ids(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channels: &Arc<ChannelRepository>,
+    channel_ids: HashSet<u32>,
+    include_permission_info: bool,
+) -> (Vec<Message>, Vec<Message>) {
+    if channel_ids.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let server_id = client.server_id();
+    let mut affected_channels = channels
+        .get_all_in_server(&server_id)
+        .await
+        .into_iter()
+        .filter(|channel| channel_ids.contains(&channel.id))
+        .collect::<Vec<_>>();
+    affected_channels.sort_by_key(|channel| channel.id);
+
+    let mut permission_queries = Vec::with_capacity(affected_channels.len());
+    let mut permission_info = Vec::with_capacity(affected_channels.len());
+    for channel in affected_channels {
+        let (is_enter_restricted, permissions) = if include_permission_info {
+            permission_info_for_channel(server, client, channel.id).await
+        } else {
+            (
+                false,
+                crate::client::acl::compute_permissions_for_client(server, client, channel.id)
+                    .await,
+            )
+        };
+        permission_queries.push(
+            crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                channel.id,
+                permissions.bits(),
+            )
+            .into(),
+        );
+        if include_permission_info {
+            permission_info.push((channel, is_enter_restricted, permissions));
+        }
+    }
+
+    permission_info.sort_by_key(|(channel, _, _)| {
+        (channel.parent_id.unwrap_or(0), channel.position, channel.id)
+    });
+    let permission_info = permission_info
+        .into_iter()
+        .map(|(channel, is_enter_restricted, permissions)| {
+            ChannelState {
+                channel_id: Some(channel.id),
+                ..Default::default()
+            }
+            .with_permission_info(is_enter_restricted, permissions)
+            .into()
+        })
+        .collect();
+
+    (permission_queries, permission_info)
+}
+
 pub async fn build_channel_permission_query_refresh_messages_for_channel_ids(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     channels: &Arc<ChannelRepository>,
-    mut channel_ids: HashSet<u32>,
+    channel_ids: HashSet<u32>,
 ) -> Vec<Message> {
-    if channel_ids.is_empty() {
-        return Vec::new();
-    }
-
-    let server_id = client.server_id();
-    let existing_channel_ids: HashSet<u32> = channels
-        .get_all_in_server(&server_id)
-        .await
-        .into_iter()
-        .map(|channel| channel.id)
-        .collect();
-    channel_ids.retain(|channel_id| existing_channel_ids.contains(channel_id));
-    let mut channel_ids: Vec<_> = channel_ids.into_iter().collect();
-    channel_ids.sort_unstable();
-
-    let mut messages = Vec::with_capacity(channel_ids.len());
-    for channel_id in channel_ids {
-        let perms =
-            crate::client::acl::compute_permissions_for_client(server, client, channel_id).await;
-        messages.push(
-            crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
-                channel_id,
-                perms.bits(),
-            )
-            .into(),
-        );
-    }
-    messages
+    build_channel_permission_refresh_messages_for_channel_ids(
+        server,
+        client,
+        channels,
+        channel_ids,
+        false,
+    )
+    .await
+    .0
 }
 
 /// Builds the destination and immediate-parent permission refreshes emitted
@@ -2724,6 +3489,7 @@ struct HomeChannelAcl<'a> {
     group: &'a str,
     channel_id: u32,
     ancestor_ids: Vec<u32>,
+    affects_path: bool,
 }
 
 impl HomeChannelAcl<'_> {
@@ -2799,7 +3565,13 @@ impl<'a> ChannelTree<'a> {
     fn home_channel_dependent_acl_channel_ids(&self) -> HashSet<u32> {
         let mut affected = HashSet::new();
         for root_id in self.root_ids() {
-            self.collect_home_channel_dependent_acl_channel_ids(root_id, false, &mut affected);
+            self.collect_home_channel_dependent_acl_channel_ids(
+                root_id,
+                false,
+                false,
+                false,
+                &mut affected,
+            );
         }
         affected
     }
@@ -2808,6 +3580,8 @@ impl<'a> ChannelTree<'a> {
         &self,
         channel_id: u32,
         inherited_home_channel_dependent_acl: bool,
+        inherited_path_dependent_acl: bool,
+        ancestor_path_dependent_acl: bool,
         affected: &mut HashSet<u32>,
     ) {
         let Some(channel) = self.by_id.get(&channel_id).copied() else {
@@ -2815,19 +3589,28 @@ impl<'a> ChannelTree<'a> {
         };
         let inherited_home_channel_dependent_acl =
             channel.inherit_acl && inherited_home_channel_dependent_acl;
+        let inherited_path_dependent_acl = channel.inherit_acl && inherited_path_dependent_acl;
         let applies_here = inherited_home_channel_dependent_acl
             || has_home_channel_dependent_acl(channel, AclApplication::Here);
+        let path_depends_here = inherited_path_dependent_acl
+            || has_home_channel_dependent_path_acl(channel, AclApplication::Here);
         let applies_to_subs = has_home_channel_dependent_acl(channel, AclApplication::Subs);
+        let path_applies_to_subs =
+            has_home_channel_dependent_path_acl(channel, AclApplication::Subs);
 
-        if applies_here {
+        if applies_here || ancestor_path_dependent_acl {
             affected.insert(channel_id);
         }
 
         let descendant_inherited = inherited_home_channel_dependent_acl || applies_to_subs;
+        let descendant_inherited_path = inherited_path_dependent_acl || path_applies_to_subs;
+        let descendant_ancestor_path = ancestor_path_dependent_acl || path_depends_here;
         self.for_each_child(channel_id, |child_id| {
             self.collect_home_channel_dependent_acl_channel_ids(
                 child_id,
                 descendant_inherited,
+                descendant_inherited_path,
+                descendant_ancestor_path,
                 affected,
             );
         });
@@ -2850,6 +3633,7 @@ impl<'a> ChannelTree<'a> {
                 &mut inherited_acls,
                 0,
                 0,
+                false,
                 old_home,
                 new_home,
                 &mut affected,
@@ -2896,6 +3680,7 @@ impl<'a> ChannelTree<'a> {
         inherited_acls: &mut Vec<HomeChannelAcl<'a>>,
         active_effective_start: usize,
         active_acl_start: usize,
+        ancestor_path_changes: bool,
         old_home: ChannelHierarchy<'_>,
         new_home: ChannelHierarchy<'_>,
         affected: &mut HashSet<u32>,
@@ -2925,6 +3710,10 @@ impl<'a> ChannelTree<'a> {
         let inherited_changes = inherited_acls[effective_acl_start..]
             .iter()
             .any(|acl| acl.match_changes(evaluation_channel, old_home, new_home));
+        let inherited_path_changes = inherited_acls[effective_acl_start..]
+            .iter()
+            .filter(|acl| acl.affects_path)
+            .any(|acl| acl.match_changes(evaluation_channel, old_home, new_home));
         let local_here_changes = home_channel_match_changes_in_acls(
             channel,
             evaluation_channel,
@@ -2933,10 +3722,20 @@ impl<'a> ChannelTree<'a> {
             old_home,
             new_home,
         );
+        let local_here_path_changes = home_channel_path_match_changes_in_acls(
+            channel,
+            evaluation_channel,
+            local_acl_channel,
+            AclApplication::Here,
+            old_home,
+            new_home,
+        );
 
-        if inherited_changes || local_here_changes {
+        if ancestor_path_changes || inherited_changes || local_here_changes {
             affected.insert(channel_id);
         }
+        let descendant_path_changes =
+            ancestor_path_changes || inherited_path_changes || local_here_path_changes;
 
         let inherited_len = inherited_acls.len();
         for acl in channel.acls.iter().filter(|acl| {
@@ -2950,6 +3749,8 @@ impl<'a> ChannelTree<'a> {
                 group: acl.group.as_deref().unwrap_or_default(),
                 channel_id: channel.id,
                 ancestor_ids: acl_ancestor_ids.clone(),
+                affects_path: (acl.allow | acl.deny)
+                    .intersects(ACLPermissions::Traverse | ACLPermissions::Write),
             });
         }
 
@@ -2963,6 +3764,7 @@ impl<'a> ChannelTree<'a> {
                 inherited_acls,
                 effective_start,
                 effective_acl_start,
+                descendant_path_changes,
                 old_home,
                 new_home,
                 affected,
@@ -3030,9 +3832,44 @@ fn home_channel_match_changes_in_acls(
     false
 }
 
+fn home_channel_path_match_changes_in_acls(
+    channel: &Channel,
+    evaluation_channel: ChannelHierarchy<'_>,
+    acl_channel: ChannelHierarchy<'_>,
+    application: AclApplication,
+    old_home: ChannelHierarchy<'_>,
+    new_home: ChannelHierarchy<'_>,
+) -> bool {
+    channel.acls.iter().any(|acl| {
+        acl_applies(acl, application)
+            && (acl.allow | acl.deny).intersects(ACLPermissions::Traverse | ACLPermissions::Write)
+            && acl.group.as_deref().is_some_and(|group| {
+                group_depends_on_home_channel(group)
+                    && group_match_changes(
+                        group,
+                        evaluation_channel,
+                        acl_channel,
+                        old_home,
+                        new_home,
+                    )
+            })
+    })
+}
+
 fn has_home_channel_dependent_acl(channel: &Channel, application: AclApplication) -> bool {
     channel.acls.iter().any(|acl| {
         acl_applies(acl, application)
+            && acl
+                .group
+                .as_deref()
+                .is_some_and(group_depends_on_home_channel)
+    })
+}
+
+fn has_home_channel_dependent_path_acl(channel: &Channel, application: AclApplication) -> bool {
+    channel.acls.iter().any(|acl| {
+        acl_applies(acl, application)
+            && (acl.allow | acl.deny).intersects(ACLPermissions::Traverse | ACLPermissions::Write)
             && acl
                 .group
                 .as_deref()

@@ -1571,27 +1571,39 @@ async fn send_web_channel_log_update(
         }
     }
 
-    let refresh_scope =
-        shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
-            &server,
-            &op,
-            &mut session.user_visibility,
-        )
-        .await;
-    let channel_refresh = shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh(
+    let acl_context = shitspeak_runtime::channel_handler::ClientAclOperationContext::for_operation_with_permission_queries(
         &server,
         &client,
-        &session.channel_tree_shadow,
-        &refresh_scope,
+        server.get_channels(),
+        &op,
+        false,
     )
     .await;
+    let refresh_scope = shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state_for_client(
+        &server,
+        &client,
+        &op,
+        &mut session.user_visibility,
+    )
+    .await;
+    let channel_refresh =
+        shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh_with_acl_context(
+            &server,
+            &client,
+            &session.channel_tree_shadow,
+            &refresh_scope,
+            acl_context.as_ref(),
+        )
+        .await;
     let messages =
-        shitspeak_runtime::channel_handler::convert_channel_operation_to_messages_with_shadow(
+        shitspeak_runtime::channel_handler::convert_channel_operation_to_messages_with_acl_context_options(
             &server,
             &client,
             &op,
             server.get_channels(),
             Some(&mut session.channel_shadow),
+            acl_context.as_ref(),
+            false,
         )
         .await;
     let mut deferred_channel_removals = Vec::new();
@@ -1632,6 +1644,7 @@ async fn send_web_channel_log_update(
         &server_id,
         channel_refresh,
         refresh_scope,
+        acl_context.as_ref(),
     )
     .await?;
     for message in deferred_channel_removals {
@@ -1679,30 +1692,40 @@ async fn send_web_channel_log_gap(
     }
 
     for op in missed {
-        let refresh_scope =
-            shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
-                &server,
-                &op,
-                &mut session.user_visibility,
-            )
-            .await;
-        let channel_refresh =
-            shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh(
+        let acl_context =
+            shitspeak_runtime::channel_handler::ClientAclOperationContext::for_operation_with_permission_queries(
                 &server,
                 &client,
-                &session.channel_tree_shadow,
-                &refresh_scope,
-            )
-            .await;
-        let messages =
-            shitspeak_runtime::channel_handler::convert_channel_operation_to_messages_with_shadow(
-                &server,
-                &client,
-                &op,
                 server.get_channels(),
-                Some(&mut session.channel_shadow),
+                &op,
+                false,
             )
             .await;
+        let refresh_scope = shitspeak_runtime::client::visibility::visibility_refresh_scope_for_channel_operation_with_state_for_client(
+            &server,
+            &client,
+            &op,
+            &mut session.user_visibility,
+        )
+        .await;
+        let channel_refresh = shitspeak_runtime::channel_handler::prepare_channel_visibility_refresh_with_acl_context(
+            &server,
+            &client,
+            &session.channel_tree_shadow,
+            &refresh_scope,
+            acl_context.as_ref(),
+        )
+        .await;
+        let messages = shitspeak_runtime::channel_handler::convert_channel_operation_to_messages_with_acl_context_options(
+            &server,
+            &client,
+            &op,
+            server.get_channels(),
+            Some(&mut session.channel_shadow),
+            acl_context.as_ref(),
+            false,
+        )
+        .await;
         let mut deferred_channel_removals = Vec::new();
         for message in messages {
             if matches!(message, Message::ChannelRemove(_)) {
@@ -1741,6 +1764,7 @@ async fn send_web_channel_log_gap(
             &server_id,
             channel_refresh,
             refresh_scope,
+            acl_context.as_ref(),
         )
         .await?;
         for message in deferred_channel_removals {
@@ -1950,6 +1974,7 @@ async fn send_prepared_web_visibility_refresh(
     server_id: &str,
     channel_refresh: shitspeak_runtime::channel_handler::ChannelVisibilityRefresh,
     scope: shitspeak_runtime::client::visibility::VisibilityRefreshScope,
+    acl_context: Option<&shitspeak_runtime::channel_handler::ClientAclOperationContext>,
 ) -> io::Result<()> {
     let mut additions = Vec::new();
     channel_refresh.append_additions_to(&mut additions);
@@ -1969,6 +1994,7 @@ async fn send_prepared_web_visibility_refresh(
         server_id,
         channel_refresh,
         scope,
+        acl_context,
     )
     .await
 }
@@ -1984,14 +2010,16 @@ async fn send_prepared_web_visibility_refresh_without_additions(
     server_id: &str,
     channel_refresh: shitspeak_runtime::channel_handler::ChannelVisibilityRefresh,
     scope: shitspeak_runtime::client::visibility::VisibilityRefreshScope,
+    acl_context: Option<&shitspeak_runtime::channel_handler::ClientAclOperationContext>,
 ) -> io::Result<()> {
-    for message in shitspeak_runtime::client::visibility::visibility_refresh_messages_with_shadow(
+    for message in shitspeak_runtime::client::visibility::visibility_refresh_messages_with_shadow_and_acl_context(
         server,
         client,
         user_visibility,
         channel_shadow,
         server_id,
         scope,
+        acl_context,
     )
     .await
     {

@@ -11,7 +11,7 @@ use std::sync::{Arc, Weak};
 use async_trait::async_trait;
 use shitspeak_state::ChannelOperation;
 
-use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
+use crate::channel_handler::{ChannelPermissionShadow, ChannelTreeShadow, SessionChannelShadow};
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::{
     ClientStateBroadcastPayload, ClientStateLogEntry, ClientStateOperation,
@@ -46,6 +46,7 @@ pub(crate) struct ClientProjectionState {
     server: Weak<Box<Server>>,
     client: Arc<Box<Client>>,
     channel_tree_shadow: ChannelTreeShadow,
+    channel_permission_shadow: ChannelPermissionShadow,
     session_channel_shadow: SessionChannelShadow,
     user_visibility: UserVisibilityState,
     last_client_versions: HashMap<u16, u64>,
@@ -89,6 +90,7 @@ impl ClientProjectionState {
             server,
             client,
             channel_tree_shadow,
+            channel_permission_shadow: ChannelPermissionShadow::new(),
             session_channel_shadow,
             user_visibility,
             last_client_versions,
@@ -168,16 +170,19 @@ impl ClientProjectionState {
         &mut self,
     ) -> Result<OwnedMessageBatch, HandleIncomingConnectionError> {
         let server = self.server()?;
-        Ok(OwnedMessageBatch::new(
-            crate::client::visibility::visibility_config_reload_messages(
-                &server,
-                &self.client,
-                &mut self.user_visibility,
-                &mut self.channel_tree_shadow,
-                &mut self.session_channel_shadow,
-            )
-            .await,
-        ))
+        let messages = crate::client::visibility::visibility_config_reload_messages(
+            &server,
+            &self.client,
+            &mut self.user_visibility,
+            &mut self.channel_tree_shadow,
+            &mut self.session_channel_shadow,
+        )
+        .await;
+        let messages = crate::channel_handler::suppress_known_projected_permission_messages(
+            messages,
+            &mut self.channel_permission_shadow,
+        );
+        Ok(OwnedMessageBatch::new(messages))
     }
 
     async fn resynchronize(
@@ -235,28 +240,47 @@ impl ClientProjectionState {
         operation: &ChannelOperation,
         outbound: &mut Vec<Message>,
     ) {
+        if matches!(
+            &operation.op,
+            shitspeak_state::ChannelOp::InstallSnapshot { .. }
+        ) {
+            self.channel_permission_shadow.clear();
+        }
+        let acl_context = crate::channel_handler::ClientAclOperationContext::for_operation(
+            server,
+            &self.client,
+            &server.channels,
+            operation,
+        )
+        .await;
         let refresh_scope =
-            crate::client::visibility::visibility_refresh_scope_for_channel_operation_with_state(
+            crate::client::visibility::visibility_refresh_scope_for_channel_operation_with_state_for_client(
                 server,
+                &self.client,
                 operation,
                 &mut self.user_visibility,
             )
             .await;
-        let channel_refresh = crate::channel_handler::prepare_channel_visibility_refresh(
-            server,
-            &self.client,
-            &self.channel_tree_shadow,
-            &refresh_scope,
-        )
-        .await;
-        let messages = crate::channel_handler::convert_channel_operation_to_messages_with_shadow(
-            server,
-            &self.client,
-            operation,
-            &server.channels,
-            Some(&mut self.session_channel_shadow),
-        )
-        .await;
+        let channel_refresh =
+            crate::channel_handler::prepare_channel_visibility_refresh_with_acl_context(
+                server,
+                &self.client,
+                &self.channel_tree_shadow,
+                &refresh_scope,
+                acl_context.as_ref(),
+            )
+            .await;
+        let messages =
+            crate::channel_handler::convert_channel_operation_to_messages_with_acl_context(
+                server,
+                &self.client,
+                operation,
+                &server.channels,
+                Some(&mut self.session_channel_shadow),
+                Some(&self.channel_permission_shadow),
+                acl_context.as_ref(),
+            )
+            .await;
         let mut deferred_channel_removals = Vec::new();
         let server_id = self.client.server_id();
         for message in messages {
@@ -286,6 +310,7 @@ impl ClientProjectionState {
                 if matches!(&projected, Message::ChannelRemove(_)) {
                     deferred_channel_removals.push(projected);
                 } else {
+                    self.channel_permission_shadow.sync_message(&projected);
                     outbound.push(projected);
                 }
             }
@@ -293,20 +318,24 @@ impl ClientProjectionState {
 
         channel_refresh.apply_additions(&mut self.channel_tree_shadow);
         channel_refresh.append_additions_to(outbound);
-        let projected = crate::client::visibility::visibility_refresh_messages_with_shadow(
-            server,
-            &self.client,
-            &mut self.user_visibility,
-            &mut self.session_channel_shadow,
-            &server_id,
-            refresh_scope,
-        )
-        .await;
+        let projected =
+            crate::client::visibility::visibility_refresh_messages_with_shadow_and_acl_context(
+                server,
+                &self.client,
+                &mut self.user_visibility,
+                &mut self.session_channel_shadow,
+                &server_id,
+                refresh_scope,
+                acl_context.as_ref(),
+            )
+            .await;
         for message in projected {
             self.channel_tree_shadow.sync_message(&message);
+            self.channel_permission_shadow.sync_message(&message);
             outbound.push(message);
         }
         channel_refresh.apply_removals(&mut self.channel_tree_shadow);
+        channel_refresh.apply_permission_removals(&mut self.channel_permission_shadow);
         channel_refresh.append_removals_to(outbound);
         for message in deferred_channel_removals {
             if let Message::ChannelRemove(channel_remove) = &message
@@ -317,12 +346,18 @@ impl ClientProjectionState {
                 continue;
             }
             self.channel_tree_shadow.sync_message(&message);
+            self.channel_permission_shadow.sync_message(&message);
             outbound.push(message);
         }
         crate::channel_handler::remove_deleted_channels_from_shadow(
             server.get_channels(),
             operation,
             &mut self.channel_tree_shadow,
+        );
+        crate::channel_handler::remove_deleted_channel_permissions_from_shadow(
+            server.get_channels(),
+            operation,
+            &mut self.channel_permission_shadow,
         );
     }
 
@@ -374,6 +409,7 @@ impl ClientProjectionState {
         outbound: &mut Vec<Message>,
     ) {
         let snapshot = server.channels.get_all_in_server(server_id).await;
+        self.channel_permission_shadow.clear();
         let previous = self.channel_tree_shadow.clone();
         let mut current = ChannelTreeShadow::new();
         let messages = crate::channel_handler::build_visible_channel_snapshot_messages(
@@ -398,7 +434,7 @@ impl ClientProjectionState {
         let mut visibility_scope = crate::client::visibility::VisibilityRefreshScope::new();
         visibility_scope.include_all_channels();
         visibility_scope.include_known_users();
-        outbound.extend(
+        let visibility_messages =
             crate::client::visibility::visibility_refresh_messages_with_shadow(
                 server,
                 &self.client,
@@ -407,13 +443,15 @@ impl ClientProjectionState {
                 server_id,
                 visibility_scope,
             )
-            .await,
-        );
-        outbound.extend(
-            removed
-                .into_iter()
-                .map(|channel_id| crate::messages::encoder::ChannelRemove { channel_id }.into()),
-        );
+            .await;
+        self.channel_permission_shadow
+            .sync_messages(visibility_messages.iter());
+        outbound.extend(visibility_messages);
+        for channel_id in removed {
+            let message = crate::messages::encoder::ChannelRemove { channel_id }.into();
+            self.channel_permission_shadow.sync_message(&message);
+            outbound.push(message);
+        }
         self.last_channel_version = latest;
     }
 
@@ -528,16 +566,20 @@ impl ClientProjectionState {
                 return Err(HandleIncomingConnectionError::ChannelLogGapUnrecoverable);
             }
         }
+        let messages = crate::channel_handler::project_client_log_entry_transition(
+            server,
+            &self.client,
+            &mut self.channel_tree_shadow,
+            &mut self.user_visibility,
+            &mut self.session_channel_shadow,
+            entry,
+        )
+        .await;
         outbound.extend(
-            crate::channel_handler::project_client_log_entry_transition(
-                server,
-                &self.client,
-                &mut self.channel_tree_shadow,
-                &mut self.user_visibility,
-                &mut self.session_channel_shadow,
-                entry,
-            )
-            .await,
+            crate::channel_handler::suppress_known_projected_permission_messages(
+                messages,
+                &mut self.channel_permission_shadow,
+            ),
         );
         Ok(())
     }
@@ -559,17 +601,21 @@ impl ClientProjectionState {
                 return Err(HandleIncomingConnectionError::ChannelLogGapUnrecoverable);
             }
         }
+        let messages = crate::channel_handler::project_client_log_entry_transition_with_canonical(
+            server,
+            &self.client,
+            &mut self.channel_tree_shadow,
+            &mut self.user_visibility,
+            &mut self.session_channel_shadow,
+            entry,
+            canonical_message,
+        )
+        .await;
         outbound.extend(
-            crate::channel_handler::project_client_log_entry_transition_with_canonical(
-                server,
-                &self.client,
-                &mut self.channel_tree_shadow,
-                &mut self.user_visibility,
-                &mut self.session_channel_shadow,
-                entry,
-                canonical_message,
-            )
-            .await,
+            crate::channel_handler::suppress_known_projected_permission_messages(
+                messages,
+                &mut self.channel_permission_shadow,
+            ),
         );
         Ok(())
     }
@@ -620,15 +666,19 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
         let mut outbound = Vec::new();
         self.resynchronize(&mut outbound).await?;
         let server = self.server()?;
+        let messages = crate::client::visibility::visibility_config_reload_messages(
+            &server,
+            &self.client,
+            &mut self.user_visibility,
+            &mut self.channel_tree_shadow,
+            &mut self.session_channel_shadow,
+        )
+        .await;
         outbound.extend(
-            crate::client::visibility::visibility_config_reload_messages(
-                &server,
-                &self.client,
-                &mut self.user_visibility,
-                &mut self.channel_tree_shadow,
-                &mut self.session_channel_shadow,
-            )
-            .await,
+            crate::channel_handler::suppress_known_projected_permission_messages(
+                messages,
+                &mut self.channel_permission_shadow,
+            ),
         );
         Ok((!outbound.is_empty()).then(|| OwnedMessageBatch::new(outbound)))
     }
@@ -669,7 +719,7 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
                         .await?;
                 }
                 ClientProjectionEvent::VisibilityReload => {
-                    outbound.extend(
+                    let messages =
                         crate::client::visibility::visibility_config_reload_messages(
                             &server,
                             &self.client,
@@ -677,7 +727,12 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
                             &mut self.channel_tree_shadow,
                             &mut self.session_channel_shadow,
                         )
-                        .await,
+                        .await;
+                    outbound.extend(
+                        crate::channel_handler::suppress_known_projected_permission_messages(
+                            messages,
+                            &mut self.channel_permission_shadow,
+                        ),
                     );
                 }
                 ClientProjectionEvent::ClientLagged(_)

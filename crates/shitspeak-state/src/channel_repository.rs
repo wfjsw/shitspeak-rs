@@ -44,8 +44,8 @@ use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
 use crate::{
-    ACL, ACLPermissions, Channel, ChannelPatch, ChannelRepoError, PendingDeleteState,
-    group_depends_on_home_channel,
+    ACL, ACLPermissions, AclChangeImpact, Channel, ChannelPatch, ChannelRepoError,
+    PendingDeleteState, classify_acl_change, group_depends_on_home_channel,
 };
 use shitspeak_core::{DEFAULT_SERVER_ID, StrictReplicationMetadata, default_server_id};
 use shitspeak_messages::messages::{Message, encoder};
@@ -534,6 +534,328 @@ impl AclCacheHit {
     }
 }
 
+/// A stable, operation-scoped view of a server's channel tree.
+///
+/// The repository's ordinary read helpers acquire the channel lock and rebuild
+/// tree relationships for each call. Fan-out operations should create one of
+/// these snapshots and share it across their workers instead: child adjacency
+/// and ancestor chains are indexed once when the snapshot is created.
+#[derive(Clone, Debug)]
+pub struct ChannelTreeSnapshot {
+    channels: Arc<HashMap<u32, Channel>>,
+    children_by_parent: Arc<HashMap<u32, Arc<[u32]>>>,
+    ancestor_ids_by_channel: Arc<HashMap<u32, Arc<[u32]>>>,
+}
+
+impl ChannelTreeSnapshot {
+    fn new(channels: HashMap<u32, Channel>) -> Self {
+        let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+        for channel in channels.values() {
+            if let Some(parent_id) = channel.parent_id {
+                children_by_parent
+                    .entry(parent_id)
+                    .or_default()
+                    .push(channel.id);
+            }
+        }
+        for children in children_by_parent.values_mut() {
+            children.sort_unstable();
+        }
+        let children_by_parent = children_by_parent
+            .into_iter()
+            .map(|(parent_id, children)| (parent_id, Arc::from(children.into_boxed_slice())))
+            .collect();
+
+        let ancestor_ids_by_channel = channels
+            .keys()
+            .copied()
+            .map(|channel_id| {
+                let mut ancestor_ids = Vec::new();
+                let mut visited = HashSet::new();
+                let mut current_id = channel_id;
+                while visited.insert(current_id) {
+                    let Some(parent_id) = channels
+                        .get(&current_id)
+                        .and_then(|channel| channel.parent_id)
+                    else {
+                        break;
+                    };
+                    if !channels.contains_key(&parent_id) {
+                        break;
+                    }
+                    ancestor_ids.push(parent_id);
+                    current_id = parent_id;
+                }
+                (channel_id, Arc::from(ancestor_ids.into_boxed_slice()))
+            })
+            .collect();
+
+        Self {
+            channels: Arc::new(channels),
+            children_by_parent: Arc::new(children_by_parent),
+            ancestor_ids_by_channel: Arc::new(ancestor_ids_by_channel),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.channels.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
+
+    pub fn channel(&self, channel_id: u32) -> Option<&Channel> {
+        self.channels.get(&channel_id)
+    }
+
+    pub fn channels(&self) -> impl ExactSizeIterator<Item = &Channel> {
+        self.channels.values()
+    }
+
+    pub fn channel_ids(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.channels.keys().copied()
+    }
+
+    /// Return precomputed ancestor ids, from the immediate parent to root.
+    pub fn ancestor_ids(&self, channel_id: u32) -> Option<&[u32]> {
+        self.ancestor_ids_by_channel
+            .get(&channel_id)
+            .map(AsRef::as_ref)
+    }
+
+    /// Return `root_id` and its descendant ids in breadth-first order.
+    ///
+    /// Temporary channels are protocol leaves even if malformed legacy state
+    /// contains children below one.
+    pub fn subtree_ids(&self, root_id: u32) -> Vec<u32> {
+        if self
+            .channels
+            .get(&root_id)
+            .is_some_and(Channel::is_temporary)
+        {
+            return vec![root_id];
+        }
+
+        let mut result = vec![root_id];
+        let mut queue = VecDeque::from([root_id]);
+        while let Some(channel_id) = queue.pop_front() {
+            if let Some(children) = self.children_by_parent.get(&channel_id) {
+                result.extend(children.iter().copied());
+                queue.extend(children.iter().copied());
+            }
+        }
+        result
+    }
+
+    /// Return the structural closure of multiple subtree roots in one walk.
+    pub fn subtree_closure_ids(&self, root_ids: impl IntoIterator<Item = u32>) -> Vec<u32> {
+        let mut result = Vec::new();
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        for root_id in root_ids {
+            if visited.insert(root_id) {
+                result.push(root_id);
+                queue.push_back(root_id);
+            }
+        }
+        while let Some(channel_id) = queue.pop_front() {
+            if self
+                .channels
+                .get(&channel_id)
+                .is_some_and(Channel::is_temporary)
+            {
+                continue;
+            }
+            let Some(children) = self.children_by_parent.get(&channel_id) else {
+                continue;
+            };
+            for &child_id in children.iter() {
+                if visited.insert(child_id) {
+                    result.push(child_id);
+                    queue.push_back(child_id);
+                }
+            }
+        }
+        result
+    }
+
+    /// Return the part of a subtree that still inherits ACLs from `root_id`.
+    ///
+    /// A channel with `inherit_acl = false` cuts off both itself and all of its
+    /// descendants. This is useful after an operation has already determined
+    /// that an inherited ACL property changed and does not need a conservative
+    /// refresh of the entire structural subtree.
+    pub fn inheriting_subtree_ids(&self, root_id: u32, include_root: bool) -> Vec<u32> {
+        let mut result = include_root
+            .then_some(root_id)
+            .into_iter()
+            .collect::<Vec<_>>();
+        if self
+            .channels
+            .get(&root_id)
+            .is_some_and(Channel::is_temporary)
+        {
+            return result;
+        }
+
+        let mut queue = VecDeque::from([root_id]);
+        while let Some(channel_id) = queue.pop_front() {
+            let Some(children) = self.children_by_parent.get(&channel_id) else {
+                continue;
+            };
+            for &child_id in children.iter() {
+                if self
+                    .channels
+                    .get(&child_id)
+                    .is_some_and(|channel| channel.inherit_acl)
+                {
+                    result.push(child_id);
+                    queue.push_back(child_id);
+                }
+            }
+        }
+        result
+    }
+
+    /// Calculate the ACL cache/visibility scope using this stable tree view.
+    pub fn acl_affected_channel_ids_for_op(&self, op: &ChannelOp) -> Option<HashSet<u32>> {
+        match op {
+            ChannelOp::CreateChannel { .. } => Some(HashSet::new()),
+            ChannelOp::SetAcls { channel_id, .. } => {
+                Some(self.subtree_ids(*channel_id).into_iter().collect())
+            }
+            ChannelOp::UpdateChannel { id, patch } | ChannelOp::EditChannel { id, patch, .. }
+                if patch.parent_id.is_some() =>
+            {
+                let mut affected: HashSet<u32> = self.subtree_ids(*id).into_iter().collect();
+                affected.extend(channels_with_home_channel_dependent_acls_with_children(
+                    &self.channels,
+                    &self.children_by_parent,
+                ));
+                Some(affected)
+            }
+            ChannelOp::DeleteChannel { .. } => Some(HashSet::new()),
+            ChannelOp::InstallSnapshot { channels, .. } => {
+                Some(channels.iter().map(|channel| channel.id).collect())
+            }
+            ChannelOp::UpdateChannel { .. }
+            | ChannelOp::EditChannel { .. }
+            | ChannelOp::MarkPendingDelete { .. }
+            | ChannelOp::CancelPendingDelete { .. }
+            | ChannelOp::AddLink { .. }
+            | ChannelOp::RemoveLink { .. } => Some(HashSet::new()),
+        }
+    }
+}
+
+/// Transient context retained for one committed ACL replacement.
+///
+/// The operation itself remains the durable source of the new ACL state. This
+/// hint supplies the old ACL state and a single indexed view of the resulting
+/// tree so in-process consumers can calculate precise before/after deltas.
+#[derive(Clone, Debug)]
+pub struct AclChangeHint {
+    channel_id: u32,
+    impact: AclChangeImpact,
+    old_inherit_acl: bool,
+    old_acls: Arc<[ACL]>,
+    affected_channel_ids: Arc<[u32]>,
+    tree_snapshot: Arc<ChannelTreeSnapshot>,
+}
+
+impl AclChangeHint {
+    pub fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+
+    pub fn impact(&self) -> &AclChangeImpact {
+        &self.impact
+    }
+
+    pub fn old_inherit_acl(&self) -> bool {
+        self.old_inherit_acl
+    }
+
+    pub fn old_acls(&self) -> &[ACL] {
+        &self.old_acls
+    }
+
+    /// Channels whose effective permissions may change directly from the ACL
+    /// replacement: the edited channel for `apply_here`, plus inheriting
+    /// descendants for `apply_subs`.
+    ///
+    /// This deliberately is not the structural visibility closure. A caller
+    /// reconciling Traverse/Write visibility should expand an affected
+    /// `apply_here` channel through [`ChannelTreeSnapshot::subtree_ids`] using
+    /// [`Self::tree_snapshot`].
+    pub fn affected_channel_ids(&self) -> &[u32] {
+        &self.affected_channel_ids
+    }
+
+    /// The channel tree immediately after the operation was applied.
+    pub fn tree_snapshot(&self) -> Arc<ChannelTreeSnapshot> {
+        Arc::clone(&self.tree_snapshot)
+    }
+}
+
+fn build_acl_change_hint(
+    channels: &HashMap<u32, Channel>,
+    channel_id: u32,
+    old_inherit_acl: bool,
+    old_acls: Vec<ACL>,
+    new_inherit_acl: bool,
+    new_acls: &[ACL],
+) -> AclChangeHint {
+    let impact = classify_acl_change(old_inherit_acl, &old_acls, new_inherit_acl, new_acls);
+    if !impact.state_changed() {
+        return AclChangeHint {
+            channel_id,
+            impact,
+            old_inherit_acl,
+            old_acls: Arc::from(old_acls.into_boxed_slice()),
+            affected_channel_ids: Arc::from([]),
+            tree_snapshot: Arc::new(ChannelTreeSnapshot::new(HashMap::new())),
+        };
+    }
+    let tree_snapshot = Arc::new(ChannelTreeSnapshot::new(channels.clone()));
+    let mut affected_channel_ids = Vec::new();
+    if !impact.apply_here().is_empty() {
+        if impact
+            .apply_here()
+            .effective_permissions()
+            .contains(ACLPermissions::Traverse)
+        {
+            affected_channel_ids.extend(tree_snapshot.subtree_ids(channel_id));
+        } else {
+            affected_channel_ids.push(channel_id);
+        }
+    }
+    if !impact.apply_subs().is_empty() {
+        let inheriting_descendants = tree_snapshot.inheriting_subtree_ids(channel_id, false);
+        if impact
+            .apply_subs()
+            .effective_permissions()
+            .contains(ACLPermissions::Traverse)
+        {
+            affected_channel_ids.extend(tree_snapshot.subtree_closure_ids(inheriting_descendants));
+        } else {
+            affected_channel_ids.extend(inheriting_descendants);
+        }
+    }
+    affected_channel_ids.sort_unstable();
+    affected_channel_ids.dedup();
+
+    AclChangeHint {
+        channel_id,
+        impact,
+        old_inherit_acl,
+        old_acls: Arc::from(old_acls.into_boxed_slice()),
+        affected_channel_ids: Arc::from(affected_channel_ids.into_boxed_slice()),
+        tree_snapshot,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct LinkTopology {
     groups_by_channel: HashMap<u32, Arc<[u32]>>,
@@ -701,6 +1023,7 @@ pub struct ChannelRepository {
     log: ParkingRwLock<std::collections::VecDeque<ChannelLogEntry>>,
     log_max_entries: usize,
     delete_visibility_hints: ParkingRwLock<HashMap<(String, u64), Arc<[u32]>>>,
+    acl_change_hints: ParkingRwLock<HashMap<(String, u64), Arc<AclChangeHint>>>,
     /// Bumped whenever channel state can change effective ACL results.
     channel_acl_generation: AtomicU64,
     /// Per-channel ACL generations for targeted channel cache eviction.
@@ -764,6 +1087,7 @@ impl ChannelRepository {
             log: ParkingRwLock::new(std::collections::VecDeque::new()),
             log_max_entries: tuning.log_max_entries,
             delete_visibility_hints: ParkingRwLock::new(HashMap::new()),
+            acl_change_hints: ParkingRwLock::new(HashMap::new()),
             channel_acl_generation: AtomicU64::new(0),
             channel_acl_generations: ParkingRwLock::new(HashMap::new()),
             acl_cache: HashCache::new(),
@@ -925,6 +1249,7 @@ impl ChannelRepository {
             log: ParkingRwLock::new(log_entries),
             log_max_entries: tuning.log_max_entries,
             delete_visibility_hints: ParkingRwLock::new(HashMap::new()),
+            acl_change_hints: ParkingRwLock::new(HashMap::new()),
             channel_acl_generation: AtomicU64::new(0),
             channel_acl_generations: ParkingRwLock::new(HashMap::new()),
             acl_cache: HashCache::new(),
@@ -1209,6 +1534,23 @@ impl ChannelRepository {
             .or_else(|| (id == 0).then(|| self.root_channel()))
     }
 
+    /// Clone one stable server channel tree and build its reusable indexes.
+    ///
+    /// Callers handling one operation for many clients should create this once
+    /// and share the returned snapshot rather than repeatedly querying the
+    /// repository for subtrees and ancestor chains.
+    pub fn channel_tree_snapshot_in_server(&self, server_id: &str) -> ChannelTreeSnapshot {
+        let root = self.root_channel();
+        let mut channels = self
+            .channels
+            .read()
+            .get(server_id)
+            .cloned()
+            .unwrap_or_default();
+        channels.entry(0).or_insert(root);
+        ChannelTreeSnapshot::new(channels)
+    }
+
     pub fn existing_channel_ids_in_server(
         &self,
         server_id: &str,
@@ -1235,6 +1577,23 @@ impl ChannelRepository {
             return None;
         }
         self.delete_visibility_hints
+            .read()
+            .get(&(op.server_id.clone(), op.version))
+            .cloned()
+    }
+
+    /// Return transient before/after context for a retained ACL operation.
+    ///
+    /// Matching by server and committed version makes this safe for replayed
+    /// operation values without attaching process-local data to the WAL type.
+    pub fn acl_change_hint_for_operation(
+        &self,
+        op: &ChannelOperation,
+    ) -> Option<Arc<AclChangeHint>> {
+        if !matches!(op.op, ChannelOp::SetAcls { .. }) {
+            return None;
+        }
+        self.acl_change_hints
             .read()
             .get(&(op.server_id.clone(), op.version))
             .cloned()
@@ -2162,7 +2521,19 @@ impl ChannelRepository {
         inherit_acl: bool,
         acls: Vec<ACL>,
     ) -> Result<(), ChannelRepoError> {
-        self.set_acls_in_server(DEFAULT_SERVER_ID, channel_id, inherit_acl, acls)
+        self.set_acls_if_changed(channel_id, inherit_acl, acls)
+            .await
+            .map(drop)
+    }
+
+    /// Set a channel's ACLs, returning whether the stored ACL state changed.
+    pub async fn set_acls_if_changed(
+        self: &Arc<Self>,
+        channel_id: u32,
+        inherit_acl: bool,
+        acls: Vec<ACL>,
+    ) -> Result<bool, ChannelRepoError> {
+        self.set_acls_if_changed_in_server(DEFAULT_SERVER_ID, channel_id, inherit_acl, acls)
             .await
     }
 
@@ -2173,8 +2544,40 @@ impl ChannelRepository {
         inherit_acl: bool,
         acls: Vec<ACL>,
     ) -> Result<(), ChannelRepoError> {
+        self.set_acls_if_changed_in_server(server_id, channel_id, inherit_acl, acls)
+            .await
+            .map(drop)
+    }
+
+    /// Set a channel's ACLs, returning whether the stored ACL state changed.
+    pub async fn set_acls_if_changed_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        channel_id: u32,
+        inherit_acl: bool,
+        acls: Vec<ACL>,
+    ) -> Result<bool, ChannelRepoError> {
+        self.set_acls_with_committed_operation_if_changed_in_server(
+            server_id,
+            channel_id,
+            inherit_acl,
+            acls,
+        )
+        .await
+        .map(|operation| operation.is_some())
+    }
+
+    /// Set a channel's ACLs and return the exact committed operation when the
+    /// stored ACL state changed.
+    pub async fn set_acls_with_committed_operation_if_changed_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        channel_id: u32,
+        inherit_acl: bool,
+        acls: Vec<ACL>,
+    ) -> Result<Option<Arc<ChannelOperation>>, ChannelRepoError> {
         let _write_transaction = self.strict_apply_lock.lock().await;
-        {
+        let acl_change_hint = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
@@ -2182,9 +2585,22 @@ impl ChannelRepository {
             let ch = channels
                 .get_mut(&channel_id)
                 .ok_or(ChannelRepoError::NotFound(channel_id))?;
+            if ch.inherit_acl == inherit_acl && ch.acls == acls {
+                return Ok(None);
+            }
+            let old_inherit_acl = ch.inherit_acl;
+            let old_acls = ch.acls.clone();
             ch.inherit_acl = inherit_acl;
             ch.acls = acls.clone();
-        }
+            build_acl_change_hint(
+                channels,
+                channel_id,
+                old_inherit_acl,
+                old_acls,
+                inherit_acl,
+                &acls,
+            )
+        };
 
         let op = self.make_op_in_server(
             server_id,
@@ -2194,10 +2610,20 @@ impl ChannelRepository {
                 acls,
             },
         );
-        self.invalidate_acl_cache_for_op_in_server(server_id, &op.op)
-            .await;
-        self.commit(op).await?;
-        Ok(())
+        if !acl_change_hint.affected_channel_ids.is_empty() {
+            self.invalidate_acl_cache_for_op_scope(
+                server_id,
+                acl_change_hint
+                    .affected_channel_ids
+                    .iter()
+                    .copied()
+                    .collect(),
+            );
+        }
+        let committed = self
+            .commit_with_acl_change_hint(op, acl_change_hint)
+            .await?;
+        Ok(Some(committed))
     }
 
     // ── ACL cache ─────────────────────────────────────────────────────────
@@ -2701,6 +3127,16 @@ impl ChannelRepository {
             ensure_root_channel(channels, &root_config);
             let normalized_op = normalize_op_for_root(&op.op, &root_config);
             let mut should_invalidate_acl = channel_op_invalidates_acl_cache(&normalized_op);
+            if let ChannelOp::SetAcls {
+                channel_id,
+                inherit_acl,
+                acls,
+            } = &normalized_op
+            {
+                should_invalidate_acl = channels.get(channel_id).is_some_and(|channel| {
+                    channel.inherit_acl != *inherit_acl || channel.acls != *acls
+                });
+            }
             let mut deleted_subtree = None;
             let link_topology_effect = match &normalized_op {
                 ChannelOp::DeleteChannel { id, nonce } => {
@@ -2860,12 +3296,18 @@ impl ChannelRepository {
         let mut should_invalidate_acl = channel_op_invalidates_acl_cache(&op.op);
         let server_id = op.server_id.clone();
         let mut deleted_channel_hint = None;
-        let (evicting_pending_delete, affected_acl_channels) = {
+        let (evicting_pending_delete, affected_acl_channels, acl_change_hint) = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.clone()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
             op.op = normalize_op_for_root(&op.op, &root_config);
+            let old_acl_state = match &op.op {
+                ChannelOp::SetAcls { channel_id, .. } => channels
+                    .get(channel_id)
+                    .map(|channel| (channel.inherit_acl, channel.acls.clone())),
+                _ => None,
+            };
             let mut deleted_subtree = None;
             let evicting_pending_delete = match &op.op {
                 ChannelOp::MarkPendingDelete {
@@ -2908,14 +3350,41 @@ impl ChannelRepository {
                 channels,
                 link_topology_effect,
             );
-            let affected_acl_channels = if deleted_subtree.is_some() {
+            let acl_change_hint = match (&op.op, old_acl_state) {
+                (
+                    ChannelOp::SetAcls {
+                        channel_id,
+                        inherit_acl,
+                        acls,
+                    },
+                    Some((old_inherit_acl, old_acls)),
+                ) => Some(build_acl_change_hint(
+                    channels,
+                    *channel_id,
+                    old_inherit_acl,
+                    old_acls,
+                    *inherit_acl,
+                    acls,
+                )),
+                _ => None,
+            };
+            if let Some(hint) = &acl_change_hint {
+                should_invalidate_acl = hint.impact.state_changed();
+            }
+            let affected_acl_channels = if let Some(hint) = &acl_change_hint {
+                Some(hint.affected_channel_ids.iter().copied().collect())
+            } else if deleted_subtree.is_some() {
                 deleted_subtree
             } else {
                 should_invalidate_acl
                     .then(|| acl_affected_channel_ids_for_op_in_map(channels, &op.op))
                     .flatten()
             };
-            (evicting_pending_delete, affected_acl_channels)
+            (
+                evicting_pending_delete,
+                affected_acl_channels,
+                acl_change_hint,
+            )
         };
 
         if let Some(affected_acl_channels) = affected_acl_channels {
@@ -2926,6 +3395,7 @@ impl ChannelRepository {
                 op,
                 strict_metadata,
                 deleted_channel_hint,
+                acl_change_hint,
                 strict_operation_id,
                 wal_already_persisted,
             )
@@ -3151,6 +3621,9 @@ impl ChannelRepository {
                 self.log
                     .write()
                     .retain(|entry| entry.op.server_id != server_id);
+                self.acl_change_hints
+                    .write()
+                    .retain(|(hint_server_id, _), _| hint_server_id != server_id);
             }
             (ids, notification_channels, removed_channel_ids)
         };
@@ -3436,6 +3909,7 @@ impl ChannelRepository {
         mut op: ChannelOperation,
         strict_metadata: Option<StrictReplicationMetadata>,
         deleted_channel_ids: Option<Vec<u32>>,
+        acl_change_hint: Option<AclChangeHint>,
         strict_operation_id: Option<StrictOperationKey>,
         wal_already_persisted: bool,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
@@ -3458,9 +3932,18 @@ impl ChannelRepository {
                     Arc::<[u32]>::from(deleted_channel_ids.into_boxed_slice()),
                 );
             }
+            if let Some(acl_change_hint) = acl_change_hint {
+                self.acl_change_hints.write().insert(
+                    (op.server_id.clone(), op.version),
+                    Arc::new(acl_change_hint),
+                );
+            }
             while log.len() > self.log_max_entries {
                 if let Some(evicted) = log.pop_front() {
                     self.delete_visibility_hints
+                        .write()
+                        .remove(&(evicted.op.server_id.clone(), evicted.op.version));
+                    self.acl_change_hints
                         .write()
                         .remove(&(evicted.op.server_id.clone(), evicted.op.version));
                 }
@@ -3526,9 +4009,33 @@ impl ChannelRepository {
         );
         op.version = version;
         let _ = self
-            .commit_assigned_operation(op, None, None, None, false)
+            .commit_assigned_operation(op, None, None, None, None, false)
             .await?;
         Ok(())
+    }
+
+    async fn commit_with_acl_change_hint(
+        &self,
+        mut op: ChannelOperation,
+        acl_change_hint: AclChangeHint,
+    ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
+        let root_config = self.root_config.read().clone();
+        op.op = normalize_op_for_root(&op.op, &root_config);
+        let version = {
+            let mut versions = self.versions.write();
+            let version = versions.entry(op.server_id.clone()).or_insert(0);
+            *version += 1;
+            *version
+        };
+        debug_assert!(
+            version < u64::MAX - 1_000_000,
+            "ChannelRepository version counter approaching u64::MAX — likely a bug"
+        );
+        op.version = version;
+        let committed = self
+            .commit_assigned_operation(op, None, None, Some(acl_change_hint), None, false)
+            .await?;
+        Ok(committed)
     }
 
     async fn commit_with_delete_visibility_hint(
@@ -3550,7 +4057,7 @@ impl ChannelRepository {
         );
         op.version = version;
         let _ = self
-            .commit_assigned_operation(op, None, deleted_channel_ids, None, false)
+            .commit_assigned_operation(op, None, deleted_channel_ids, None, None, false)
             .await?;
         Ok(())
     }
@@ -4124,14 +4631,27 @@ fn acl_affected_channel_ids_for_op_in_map(
 fn channels_with_home_channel_dependent_acls_in_map(
     channels: &HashMap<u32, Channel>,
 ) -> HashSet<u32> {
-    let mut children_by_parent: HashMap<Option<u32>, Vec<u32>> = HashMap::new();
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
     for channel in channels.values() {
-        children_by_parent
-            .entry(channel.parent_id)
-            .or_default()
-            .push(channel.id);
+        if let Some(parent_id) = channel.parent_id {
+            children_by_parent
+                .entry(parent_id)
+                .or_default()
+                .push(channel.id);
+        }
     }
+    let children_by_parent = children_by_parent
+        .into_iter()
+        .map(|(parent_id, children)| (parent_id, Arc::from(children.into_boxed_slice())))
+        .collect();
 
+    channels_with_home_channel_dependent_acls_with_children(channels, &children_by_parent)
+}
+
+fn channels_with_home_channel_dependent_acls_with_children(
+    channels: &HashMap<u32, Channel>,
+    children_by_parent: &HashMap<u32, Arc<[u32]>>,
+) -> HashSet<u32> {
     let mut roots: Vec<u32> = channels
         .values()
         .filter(|channel| {
@@ -4158,7 +4678,7 @@ fn channels_with_home_channel_dependent_acls_in_map(
 
 fn collect_home_channel_dependent_acl_channel_ids(
     channels: &HashMap<u32, Channel>,
-    children_by_parent: &HashMap<Option<u32>, Vec<u32>>,
+    children_by_parent: &HashMap<u32, Arc<[u32]>>,
     channel_id: u32,
     inherited_home_channel_dependent_acl: bool,
     affected: &mut HashSet<u32>,
@@ -4189,12 +4709,12 @@ fn collect_home_channel_dependent_acl_channel_ids(
     }
 
     let descendant_inherited = inherited_home_channel_dependent_acl || applies_to_subs;
-    if let Some(children) = children_by_parent.get(&Some(channel_id)) {
-        for child_id in children {
+    if let Some(children) = children_by_parent.get(&channel_id) {
+        for &child_id in children.iter() {
             collect_home_channel_dependent_acl_channel_ids(
                 channels,
                 children_by_parent,
-                *child_id,
+                child_id,
                 descendant_inherited,
                 affected,
             );
@@ -4353,6 +4873,17 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn test_acl(group: &str) -> ACL {
+        ACL {
+            user_id: None,
+            group: Some(group.to_owned()),
+            apply_here: true,
+            apply_subs: false,
+            allow: ACLPermissions::Enter.into(),
+            deny: BitFlags::empty(),
+        }
+    }
+
     #[tokio::test]
     async fn linked_channels_form_effective_transitive_groups() {
         let repo = repo();
@@ -4447,6 +4978,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_tree_snapshot_indexes_subtrees_and_ancestors_once() {
+        let repo = repo();
+        repo.create_channel(Channel::new(1, "one", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(3, "three", 0, 0, Some(1)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(2, "two", 0, 0, Some(1)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(4, "four", 0, 0, Some(2)))
+            .await
+            .unwrap();
+
+        let snapshot = repo.channel_tree_snapshot_in_server(DEFAULT_SERVER_ID);
+
+        assert_eq!(snapshot.len(), 5);
+        assert_eq!(snapshot.subtree_ids(1), vec![1, 2, 3, 4]);
+        assert_eq!(snapshot.subtree_closure_ids([2, 3]), vec![2, 3, 4]);
+        assert_eq!(snapshot.ancestor_ids(4), Some([2, 1, 0].as_slice()));
+        assert_eq!(snapshot.ancestor_ids(0), Some([].as_slice()));
+        assert_eq!(snapshot.ancestor_ids(99), None);
+
+        repo.create_channel(Channel::new(5, "later", 0, 0, Some(1)))
+            .await
+            .unwrap();
+        assert!(snapshot.channel(5).is_none(), "snapshot must remain stable");
+        assert_eq!(snapshot.subtree_ids(1), vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn channel_tree_snapshot_reuses_index_for_acl_operation_scope() {
+        let repo = repo();
+        repo.create_channel(Channel::new(1, "one", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(2, "two", 0, 0, Some(1)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(3, "three", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        let snapshot = repo.channel_tree_snapshot_in_server(DEFAULT_SERVER_ID);
+        let affected = snapshot
+            .acl_affected_channel_ids_for_op(&ChannelOp::SetAcls {
+                channel_id: 1,
+                inherit_acl: true,
+                acls: Vec::new(),
+            })
+            .expect("ACL operation has a scoped affected set");
+
+        assert_eq!(affected, HashSet::from([1, 2]));
+        assert_eq!(snapshot.channels().count(), 4);
+        assert_eq!(
+            snapshot.channel_ids().collect::<HashSet<_>>(),
+            HashSet::from([0, 1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn channel_tree_snapshot_inheriting_subtree_stops_at_acl_barriers() {
+        let mut channels = HashMap::from([
+            (0, Channel::new(0, "root", 0, 0, None)),
+            (1, Channel::new(1, "one", 0, 0, Some(0))),
+            (2, Channel::new(2, "two", 0, 0, Some(1))),
+            (3, Channel::new(3, "three", 0, 0, Some(1))),
+            (4, Channel::new(4, "four", 0, 0, Some(2))),
+            (5, Channel::new(5, "five", 0, 0, Some(3))),
+        ]);
+        channels.get_mut(&3).unwrap().inherit_acl = false;
+        let snapshot = ChannelTreeSnapshot::new(channels);
+
+        assert_eq!(snapshot.inheriting_subtree_ids(1, true), vec![1, 2, 4]);
+        assert_eq!(snapshot.inheriting_subtree_ids(1, false), vec![2, 4]);
+    }
+
+    #[tokio::test]
     async fn reparent_acl_scope_includes_home_channel_dependent_channels() {
         let repo = repo();
         for id in 1..=3 {
@@ -4494,6 +5104,262 @@ mod tests {
             .expect("server channel map");
 
         assert_eq!(affected, HashSet::from([1, 3]));
+    }
+
+    #[tokio::test]
+    async fn identical_acl_update_does_not_advance_or_invalidate_repository_state() {
+        let repo = repo();
+        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        let acls = vec![test_acl("all")];
+
+        assert!(
+            repo.set_acls_if_changed(1, false, acls.clone())
+                .await
+                .unwrap()
+        );
+
+        let version = repo.current_version();
+        let log_len = repo.get_log_since(0).await.len();
+        let acl_generation = repo.channel_acl_generation_for_channel(DEFAULT_SERVER_ID, 1);
+        let expected_permissions: BitFlags<ACLPermissions> = ACLPermissions::Enter.into();
+        repo.cache_permissions(10, 20, 1, acl_generation, 30, expected_permissions)
+            .await;
+
+        let observer = Arc::new(RecordingObserver::default());
+        repo.set_observer(observer.clone());
+        let mut operations = repo.subscribe();
+
+        assert!(
+            !repo
+                .set_acls_if_changed(1, false, acls.clone())
+                .await
+                .unwrap()
+        );
+        // The compatibility wrapper must share the same no-op behavior.
+        repo.set_acls(1, false, acls.clone()).await.unwrap();
+
+        assert_eq!(repo.current_version(), version);
+        assert_eq!(repo.get_log_since(0).await.len(), log_len);
+        assert_eq!(
+            repo.channel_acl_generation_for_channel(DEFAULT_SERVER_ID, 1),
+            acl_generation
+        );
+        assert_eq!(
+            repo.get_cached_permissions(10, 20, 1, acl_generation, 30)
+                .await,
+            Some(expected_permissions)
+        );
+        assert_eq!(repo.get_channel(1).await.unwrap().acls, acls);
+        assert!(matches!(
+            operations.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(
+            observer
+                .versions
+                .lock()
+                .expect("recording observer mutex poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_change_result_distinguishes_inheritance_and_entries() {
+        let repo = repo();
+        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+            .await
+            .unwrap();
+
+        assert!(
+            repo.set_acls_if_changed(1, false, vec![test_acl("all")])
+                .await
+                .unwrap()
+        );
+        assert!(
+            repo.set_acls_if_changed(1, true, vec![test_acl("all")])
+                .await
+                .unwrap()
+        );
+        assert!(
+            repo.set_acls_if_changed(1, true, vec![test_acl("auth")])
+                .await
+                .unwrap()
+        );
+
+        let channel = repo.get_channel(1).await.unwrap();
+        assert!(channel.inherit_acl);
+        assert_eq!(channel.acls, vec![test_acl("auth")]);
+    }
+
+    #[tokio::test]
+    async fn local_acl_operation_retains_before_and_shared_after_context() {
+        let repo = repo();
+        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        let old_acls = vec![test_acl("all")];
+        repo.set_acls(1, false, old_acls.clone()).await.unwrap();
+
+        let first_new_version = repo.current_version() + 1;
+        let new_acls = vec![test_acl("auth")];
+        repo.set_acls(1, true, new_acls.clone()).await.unwrap();
+        let op = repo
+            .get_log_since(first_new_version - 1)
+            .await
+            .into_iter()
+            .find(|op| op.version == first_new_version)
+            .expect("ACL operation is retained in the log");
+        let hint = repo
+            .acl_change_hint_for_operation(&op)
+            .expect("ACL operation has transient change context");
+
+        assert_eq!(hint.channel_id(), 1);
+        assert!(!hint.old_inherit_acl());
+        assert_eq!(hint.old_acls(), old_acls);
+        assert!(hint.impact().state_changed());
+        assert!(hint.impact().inheritance_changed());
+        let snapshot = hint.tree_snapshot();
+        let changed = snapshot.channel(1).unwrap();
+        assert!(changed.inherit_acl);
+        assert_eq!(changed.acls, new_acls);
+    }
+
+    #[tokio::test]
+    async fn replicated_acl_noop_advances_version_without_invalidating_cache() {
+        let repo = repo();
+        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        let acls = vec![test_acl("all")];
+        repo.set_acls(1, false, acls.clone()).await.unwrap();
+        let old_version = repo.current_version();
+        let old_generation = repo.channel_acl_generation_for_channel(DEFAULT_SERVER_ID, 1);
+
+        let committed = repo
+            .apply_committed_operation(ChannelOperation {
+                server_id: DEFAULT_SERVER_ID.to_owned(),
+                version: old_version + 1,
+                node_id: 2,
+                timestamp: 123,
+                emits_client_message: true,
+                op: ChannelOp::SetAcls {
+                    channel_id: 1,
+                    inherit_acl: false,
+                    acls: acls.clone(),
+                },
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(repo.current_version(), old_version + 1);
+        assert_eq!(
+            repo.channel_acl_generation_for_channel(DEFAULT_SERVER_ID, 1),
+            old_generation
+        );
+        let hint = repo
+            .acl_change_hint_for_operation(&committed)
+            .expect("replicated no-op publishes an ACL hint");
+        assert!(!hint.impact().state_changed());
+        assert!(hint.affected_channel_ids().is_empty());
+        assert_eq!(hint.old_acls(), acls);
+    }
+
+    #[tokio::test]
+    async fn acl_hint_scopes_here_and_sub_permissions_across_inheritance_barriers() {
+        let repo = repo();
+        for (id, parent_id) in [(1, 0), (2, 1), (3, 1), (4, 2)] {
+            let mut channel = Channel::new(id, format!("ch{id}"), 0, 0, Some(parent_id));
+            if id == 3 {
+                channel.inherit_acl = false;
+            }
+            repo.create_channel(channel).await.unwrap();
+        }
+
+        let mut speak_here = test_acl("all");
+        speak_here.allow = ACLPermissions::Speak.into();
+        let version = repo.current_version() + 1;
+        repo.set_acls(1, true, vec![speak_here]).await.unwrap();
+        let speak_op = repo
+            .get_log_since(version - 1)
+            .await
+            .into_iter()
+            .find(|op| op.version == version)
+            .unwrap();
+        assert_eq!(
+            repo.acl_change_hint_for_operation(&speak_op)
+                .unwrap()
+                .affected_channel_ids(),
+            &[1]
+        );
+
+        let mut traverse_here = test_acl("all");
+        traverse_here.allow = ACLPermissions::Traverse.into();
+        let version = repo.current_version() + 1;
+        repo.set_acls(1, true, vec![traverse_here]).await.unwrap();
+        let traverse_here_op = repo
+            .get_log_since(version - 1)
+            .await
+            .into_iter()
+            .find(|op| op.version == version)
+            .unwrap();
+        let traverse_here_hint = repo
+            .acl_change_hint_for_operation(&traverse_here_op)
+            .unwrap();
+        assert_eq!(traverse_here_hint.affected_channel_ids(), &[1, 2, 3, 4]);
+        assert_eq!(
+            traverse_here_hint.tree_snapshot().subtree_ids(1),
+            vec![1, 2, 3, 4],
+            "structural Traverse visibility closure is intentionally separate"
+        );
+
+        repo.set_acls(1, true, Vec::new()).await.unwrap();
+        let mut traverse_subs = test_acl("all");
+        traverse_subs.apply_here = false;
+        traverse_subs.apply_subs = true;
+        traverse_subs.allow = ACLPermissions::Traverse.into();
+        let version = repo.current_version() + 1;
+        repo.set_acls(1, true, vec![traverse_subs]).await.unwrap();
+        let traverse_op = repo
+            .get_log_since(version - 1)
+            .await
+            .into_iter()
+            .find(|op| op.version == version)
+            .unwrap();
+        assert_eq!(
+            repo.acl_change_hint_for_operation(&traverse_op)
+                .unwrap()
+                .affected_channel_ids(),
+            &[2, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn acl_hints_expire_with_log_eviction_and_snapshot_replacement() {
+        let repo = repo_with_log_max_entries(1);
+        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.set_acls(1, true, vec![test_acl("all")]).await.unwrap();
+        let acl_op = repo.get_log_since(0).await.pop().unwrap();
+        assert!(repo.acl_change_hint_for_operation(&acl_op).is_some());
+
+        repo.create_channel(Channel::new(2, "other", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        assert!(repo.acl_change_hint_for_operation(&acl_op).is_none());
+
+        repo.set_acls(1, true, vec![test_acl("auth")])
+            .await
+            .unwrap();
+        let acl_op = repo.get_log_since(0).await.pop().unwrap();
+        assert!(repo.acl_change_hint_for_operation(&acl_op).is_some());
+        let channels = repo.get_all().await;
+        repo.install_s2s_snapshot(repo.current_version(), channels)
+            .await
+            .unwrap();
+        assert!(repo.acl_change_hint_for_operation(&acl_op).is_none());
     }
 
     #[tokio::test]
