@@ -504,7 +504,8 @@ quic_datagram_receive_buffer_bytes = 262144
 self_seed_quarantine_secs = 3600
 max_dial_attempts_per_peer_tick = 1
 max_outgoing_connections = 1024
-# Conservative UDP-family routing policy.
+# UDP-family sampling and health gates. Unhealthy datagram candidates are
+# excluded; streams remain the fallback when no viable datagram path exists.
 udp_family_min_samples = 32
 udp_family_probe_loss_block_count = 3
 udp_family_block_loss_ppm = 250000
@@ -513,9 +514,13 @@ large_rtt_threshold_ms = 100
 lossy_link_threshold_ppm = 20000
 bulk_payload_threshold_bytes = 65536
 bulk_backlog_threshold_bytes = 262144
+# HighPriority + BestEffort + ConversationalQuality prefers the datagram tier
+# (raw UDP or the fitting s2s/2 QUIC DATAGRAM delivery path). A stream path
+# must be this percentage better to displace the best datagram path.
 transport_switch_improvement_pct = 15
-# Soft voice-path stickiness prevents frame-by-frame path oscillation while
-# retaining immediate escape from an unusable path.
+# Soft voice-path stickiness prevents frame-by-frame path oscillation. A viable
+# datagram path may replace a stream incumbent immediately when the stream is
+# not materially better; timing rules continue to govern other path changes.
 voice_path_stickiness_enabled = true
 voice_path_min_hold_ms = 750
 voice_path_challenger_confirm_ms = 500
@@ -646,12 +651,43 @@ mapping. Negotiated v2 setup therefore fails when either buffer is zero. Keep
 both values nonzero for normal v2 operation. Legacy
 peers that advertise only `s2s/1` can still negotiate v1.
 
+For the `HighPriority` + `BestEffort` + `ConversationalQuality` route, raw UDP
+and the DATAGRAM delivery path on a healthy `s2s/2` QUIC session form the
+preferred datagram tier when the complete frame fits. Normal
+`ConversationalQuality` cost ordering chooses between the eligible raw UDP and
+QUIC DATAGRAM paths, giving them equal tier priority. The best datagram path
+stays ahead of TCP, KCP, and the legacy `s2s/1` QUIC stream unless the best stream path has a
+conversational cost at least `transport_switch_improvement_pct` better. This
+bias favors nonblocking delivery when a stream's advantage is only marginal.
+
+QUIC DATAGRAM is a delivery path on the existing QUIC session, not a separate
+physical `TransportKind`; it shares that connection's network path, congestion
+controller, and capacity. For BestEffort, legacy `s2s/1` QUIC stream delivery
+remains an explicit fallback alongside TCP and KCP; `s2s/2` never converts an
+accepted DATAGRAM item into one of its reliable lanes.
+
+The Prometheus counter `shitspeak_s2s_delivery_path_selections_total`
+distinguishes logical selections with bounded `path` values such as
+`quic_datagram` and `quic_stream`. Physical QUIC RTT, packet loss, and health
+metrics remain shared under `TransportKind::Quic`; delivery-path telemetry does
+not model DATAGRAM as a second physical link.
+
+The preference does not weaken admission checks. Unhealthy or otherwise
+unusable datagram paths are excluded, and the QUIC DATAGRAM path is not a
+candidate when the encoded frame exceeds its current maximum DATAGRAM size.
+If no viable datagram candidate remains, normal stream fallback applies. An
+unexpected QUIC DATAGRAM enqueue failure still does not convert the item to a
+reliable lane within that connection.
+
 Voice-path stickiness applies to expiring conversational voice traffic. The
 timing values must be nonzero, and `voice_path_idle_reset_ms` must be at least
 the larger of the hold and challenger-confirmation values. These settings are
 loaded at startup; restart the node after changing them. Set
 `voice_path_stickiness_enabled = false` and restart to use the legacy routing
-behavior as a rollback/kill switch.
+behavior as a rollback/kill switch. A viable datagram path may replace a stream
+incumbent immediately when that stream lacks the configured material
+advantage. Minimum hold and challenger confirmation continue to govern other
+path changes, and an unusable incumbent can still be escaped immediately.
 
 S2S inbound and outbound transport queues are adaptive and byte-budgeted. The
 old `inbound_*_capacity` and `outbound_capacity` knobs are still accepted for

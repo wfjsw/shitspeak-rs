@@ -109,6 +109,63 @@ impl TransportKind {
     }
 }
 
+/// Logical delivery path selected within a physical transport.
+///
+/// QUIC DATAGRAM and QUIC streams intentionally remain distinct here even
+/// though both use [`TransportKind::Quic`]. This gives routing and
+/// observability the correct blocking/reliability semantics without inventing
+/// a second QUIC endpoint or link metric identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DeliveryPath {
+    UdpDatagram,
+    QuicDatagram,
+    TcpStream,
+    KcpStream,
+    QuicStream,
+}
+
+impl DeliveryPath {
+    pub const ALL: [Self; 5] = [
+        Self::UdpDatagram,
+        Self::QuicDatagram,
+        Self::TcpStream,
+        Self::KcpStream,
+        Self::QuicStream,
+    ];
+
+    pub fn stream(transport: TransportKind) -> Option<Self> {
+        match transport {
+            TransportKind::Tcp => Some(Self::TcpStream),
+            TransportKind::Kcp => Some(Self::KcpStream),
+            TransportKind::Quic => Some(Self::QuicStream),
+            TransportKind::Udp => None,
+        }
+    }
+
+    pub fn transport(self) -> TransportKind {
+        match self {
+            Self::UdpDatagram => TransportKind::Udp,
+            Self::QuicDatagram | Self::QuicStream => TransportKind::Quic,
+            Self::TcpStream => TransportKind::Tcp,
+            Self::KcpStream => TransportKind::Kcp,
+        }
+    }
+
+    pub fn is_datagram(self) -> bool {
+        matches!(self, Self::UdpDatagram | Self::QuicDatagram)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::UdpDatagram => "udp_datagram",
+            Self::QuicDatagram => "quic_datagram",
+            Self::TcpStream => "tcp_stream",
+            Self::KcpStream => "kcp_stream",
+            Self::QuicStream => "quic_stream",
+        }
+    }
+}
+
 /// Receiver-side routing class. Picked by the sender; carried in the frame
 /// header so the receiver can fan inbound traffic into control, high-priority,
 /// or regular queues.

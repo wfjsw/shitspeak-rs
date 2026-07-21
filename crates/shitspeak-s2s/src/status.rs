@@ -29,6 +29,7 @@ pub(crate) struct TopologySnapshot {
     inbound_queues: Vec<InboundQueueMetric>,
     expired_outbound_drops: Vec<ExpiredOutboundDropMetric>,
     transport_health_exclusions: Vec<TransportHealthExclusionMetric>,
+    delivery_path_selections: Vec<DeliveryPathSelectionMetric>,
     voice_transport_bindings: Vec<VoiceTransportBindingMetric>,
     voice_transport_binding_events: Vec<VoiceTransportBindingEventMetric>,
     voice_transport_challengers: Vec<VoiceTransportChallengerMetric>,
@@ -38,6 +39,12 @@ pub(crate) struct TopologySnapshot {
     quic_protocol_errors: Vec<QuicProtocolErrorMetric>,
     quic_sessions: Vec<QuicSessionMetric>,
     debug_packet_io: Vec<crate::debug_io::PacketIoSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DeliveryPathSelectionMetric {
+    path: &'static str,
+    selections: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -706,6 +713,13 @@ pub(crate) fn build_topology_snapshot(
     voice_transport_challengers
         .sort_by_key(|entry| (entry.peer, entry.incumbent, entry.challenger, entry.outcome));
 
+    let delivery_path_selections = shitspeak_s2s_transport::delivery_path_selection_snapshots()
+        .into_iter()
+        .map(|entry| DeliveryPathSelectionMetric {
+            path: entry.path().name(),
+            selections: entry.selections(),
+        })
+        .collect();
     let quic_lanes = shitspeak_s2s_transport::quic_lane_snapshots()
         .into_iter()
         .map(|entry| QuicLaneMetric {
@@ -769,6 +783,7 @@ pub(crate) fn build_topology_snapshot(
         inbound_queues,
         expired_outbound_drops,
         transport_health_exclusions,
+        delivery_path_selections,
         voice_transport_bindings,
         voice_transport_binding_events,
         voice_transport_challengers,
@@ -1028,6 +1043,11 @@ impl<'a> PrometheusWriter<'a> {
         self.header(
             "shitspeak_s2s_transport_health_exclusions_total",
             "Local transport sender exclusions due to health checks.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_delivery_path_selections_total",
+            "Local successful S2S dispatch selections by logical delivery path.",
             "counter",
         );
         self.header(
@@ -2014,6 +2034,14 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
         ));
     }
 
+    for entry in &snapshot.delivery_path_selections {
+        out.push(sample(
+            "shitspeak_s2s_delivery_path_selections_total",
+            vec![("source", local_node.as_str()), ("path", entry.path)],
+            entry.selections as f64,
+        ));
+    }
+
     for entry in &snapshot.quic_lanes {
         let source = local_node.clone();
         let peer = entry
@@ -2906,6 +2934,10 @@ mod tests {
                 reason: "kcp_failaway",
                 exclusions: 7,
             }],
+            delivery_path_selections: vec![DeliveryPathSelectionMetric {
+                path: "quic_datagram",
+                selections: 13,
+            }],
             voice_transport_bindings: vec![VoiceTransportBindingMetric {
                 peer: 2,
                 transport: "quic",
@@ -2975,6 +3007,10 @@ mod tests {
         );
         assert_eq!(topology_json["quic_lanes"][0]["lane"], "datagram");
         assert_eq!(
+            topology_json["delivery_path_selections"][0]["path"],
+            "quic_datagram"
+        );
+        assert_eq!(
             topology_json["quic_sessions"][0]["negotiated_protocol"],
             "s2s/2"
         );
@@ -3036,6 +3072,9 @@ mod tests {
             "shitspeak_s2s_transport_health_exclusions_total{source=\"1\",peer=\"2\",transport=\"kcp\",reason=\"kcp_failaway\"} 7"
         ));
         assert!(rendered.contains(
+            "shitspeak_s2s_delivery_path_selections_total{source=\"1\",path=\"quic_datagram\"} 13"
+        ));
+        assert!(rendered.contains(
             "shitspeak_s2s_voice_transport_binding{source=\"1\",peer=\"2\",transport=\"quic\"} 1"
         ));
         assert!(rendered.contains(
@@ -3060,6 +3099,7 @@ mod tests {
             "shitspeak_s2s_quic_protocol_errors_total{source=\"1\",reason=\"class_mismatch\"} 2"
         ));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_transport_binding gauge\n"));
+        assert!(rendered.contains("# TYPE shitspeak_s2s_delivery_path_selections_total counter\n"));
         assert!(
             rendered
                 .contains("# TYPE shitspeak_s2s_voice_transport_binding_events_total counter\n")

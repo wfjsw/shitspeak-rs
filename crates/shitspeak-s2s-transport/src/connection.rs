@@ -1872,6 +1872,38 @@ impl PeerState {
             .map(|s| s.sender.clone())
     }
 
+    /// Obtain the newest live QUIC v2 sender. QUIC DATAGRAM is a delivery
+    /// path of an s2s/2 session, not a separate physical transport, so callers
+    /// selecting that path must not let a newer legacy s2s/1 stream mask it.
+    pub(crate) fn try_get_quic_v2_stream(&self) -> Option<SessionSender> {
+        let mut streams = self.streams.lock();
+        prune_dead_streams(&mut streams);
+        streams
+            .values()
+            .filter(|stream| {
+                stream.transport() == TransportKind::Quic
+                    && stream.is_alive()
+                    && stream.sender.quic_v2_max_datagram_size().is_some()
+            })
+            .max_by_key(|stream| stream.installed_at())
+            .map(|stream| stream.sender.clone())
+    }
+
+    /// Obtain the newest live legacy QUIC sender for reliable-stream fallback.
+    pub(crate) fn try_get_quic_v1_stream(&self) -> Option<SessionSender> {
+        let mut streams = self.streams.lock();
+        prune_dead_streams(&mut streams);
+        streams
+            .values()
+            .filter(|stream| {
+                stream.transport() == TransportKind::Quic
+                    && stream.is_alive()
+                    && stream.sender.quic_v2_max_datagram_size().is_none()
+            })
+            .max_by_key(|stream| stream.installed_at())
+            .map(|stream| stream.sender.clone())
+    }
+
     pub fn record_outbound_queue_sample(
         &self,
         class: MessageClass,

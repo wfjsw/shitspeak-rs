@@ -11,7 +11,9 @@ use parking_lot::Mutex;
 
 use crate::types::NodeIdentifier;
 
-use super::service_level::{MessageClass, RoutingMetric, ServiceLevel, TransportKind};
+use super::service_level::{
+    DeliveryPath, MessageClass, RoutingMetric, ServiceLevel, TransportKind,
+};
 
 const E_MODEL_R0: f64 = 93.2;
 const E_MODEL_DELAY_KNEE_MS: f64 = 177.3;
@@ -44,6 +46,7 @@ const EXPIRED_OUTBOUND_DROP_STAGE_COUNT: usize = 3;
 const EXPIRED_OUTBOUND_DROP_TRANSPORT_COUNT: usize = 5;
 const MESSAGE_CLASS_COUNT: usize = 3;
 const TRANSPORT_KIND_COUNT: usize = 4;
+const DELIVERY_PATH_COUNT: usize = 5;
 const TRANSPORT_PIPELINE_STAGE_COUNT: usize = 8;
 const QUIC_DELIVERY_DIRECTION_COUNT: usize = 2;
 const QUIC_DELIVERY_LANE_COUNT: usize = 4;
@@ -117,6 +120,8 @@ static QUIC_METRICS: LazyLock<StdMutex<QuicMetrics>> =
 static TRANSPORT_PIPELINE_STAGE_EVENTS: [[AtomicU64; TRANSPORT_PIPELINE_STAGE_COUNT];
     TRANSPORT_KIND_COUNT] =
     [const { [const { AtomicU64::new(0) }; TRANSPORT_PIPELINE_STAGE_COUNT] }; TRANSPORT_KIND_COUNT];
+static DELIVERY_PATH_SELECTIONS: [AtomicU64; DELIVERY_PATH_COUNT] =
+    [const { AtomicU64::new(0) }; DELIVERY_PATH_COUNT];
 static TRANSPORT_PIPELINE_STAGE_DURATION_TOTAL_US: [[AtomicU64; TRANSPORT_PIPELINE_STAGE_COUNT];
     TRANSPORT_KIND_COUNT] =
     [const { [const { AtomicU64::new(0) }; TRANSPORT_PIPELINE_STAGE_COUNT] }; TRANSPORT_KIND_COUNT];
@@ -136,6 +141,22 @@ pub enum QuicDeliveryLane {
     HighPriority,
     Regular,
     Datagram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryPathSelectionSnapshot {
+    path: DeliveryPath,
+    selections: u64,
+}
+
+impl DeliveryPathSelectionSnapshot {
+    pub fn path(self) -> DeliveryPath {
+        self.path
+    }
+
+    pub fn selections(self) -> u64 {
+        self.selections
+    }
 }
 
 impl QuicDeliveryLane {
@@ -351,6 +372,21 @@ impl QuicProtocolErrorSnapshot {
     }
 }
 
+/// Record the logical delivery path that accepted an outbound frame.
+pub fn record_delivery_path_selection(path: DeliveryPath) {
+    DELIVERY_PATH_SELECTIONS[delivery_path_index(path)].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn delivery_path_selection_snapshots() -> Vec<DeliveryPathSelectionSnapshot> {
+    DeliveryPath::ALL
+        .into_iter()
+        .map(|path| DeliveryPathSelectionSnapshot {
+            path,
+            selections: DELIVERY_PATH_SELECTIONS[delivery_path_index(path)].load(Ordering::Relaxed),
+        })
+        .collect()
+}
+
 /// Record frames accepted by or received from a physical QUIC v2 lane.
 pub fn record_quic_lane_delivery(
     peer: NodeIdentifier,
@@ -524,6 +560,16 @@ fn quic_lane_index(lane: QuicDeliveryLane) -> usize {
         QuicDeliveryLane::HighPriority => 1,
         QuicDeliveryLane::Regular => 2,
         QuicDeliveryLane::Datagram => 3,
+    }
+}
+
+fn delivery_path_index(path: DeliveryPath) -> usize {
+    match path {
+        DeliveryPath::UdpDatagram => 0,
+        DeliveryPath::QuicDatagram => 1,
+        DeliveryPath::TcpStream => 2,
+        DeliveryPath::KcpStream => 3,
+        DeliveryPath::QuicStream => 4,
     }
 }
 fn quic_datagram_drop_reason_index(reason: QuicDatagramDropReason) -> usize {
@@ -2929,6 +2975,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_path_selection_metrics_keep_quic_datagram_and_stream_distinct() {
+        assert_eq!(
+            delivery_path_selection_snapshots()
+                .into_iter()
+                .map(DeliveryPathSelectionSnapshot::path)
+                .collect::<Vec<_>>(),
+            DeliveryPath::ALL
+        );
+        let before = |path| {
+            delivery_path_selection_snapshots()
+                .into_iter()
+                .find(|snapshot| snapshot.path() == path)
+                .map(DeliveryPathSelectionSnapshot::selections)
+                .unwrap_or(0)
+        };
+        let datagram_before = before(DeliveryPath::QuicDatagram);
+        let stream_before = before(DeliveryPath::QuicStream);
+
+        record_delivery_path_selection(DeliveryPath::QuicDatagram);
+        record_delivery_path_selection(DeliveryPath::QuicStream);
+
+        assert!(before(DeliveryPath::QuicDatagram) > datagram_before);
+        assert!(before(DeliveryPath::QuicStream) > stream_before);
+    }
 
     #[test]
     fn quic_metrics_use_bounded_dimensions_and_accumulate() {

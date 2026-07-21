@@ -213,8 +213,9 @@ unconfirmed_address_decay_failures = 5
 unselected_link_probe_interval_secs = 30
 # Soft cap on live outbound S2S transport sessions. Inbound is still accepted.
 max_outgoing_connections = 1024
-# Conservative routing policy. KCP/QUIC are promoted over TCP only after UDP
-# family health is sampled and latency/loss makes switching materially better.
+# UDP-family sampling and health gates. Unhealthy datagram candidates are
+# excluded; routing falls back to streams when neither raw UDP nor the QUIC
+# DATAGRAM delivery path is viable and able to fit the frame.
 udp_family_min_samples = 32
 udp_family_probe_loss_block_count = 3
 udp_family_block_loss_ppm = 250000
@@ -223,7 +224,14 @@ large_rtt_threshold_ms = 100
 lossy_link_threshold_ppm = 20000
 bulk_payload_threshold_bytes = 65536
 bulk_backlog_threshold_bytes = 262144
+# For HighPriority BestEffort ConversationalQuality traffic, viable raw UDP
+# and the fitting s2s/2 QUIC DATAGRAM delivery path form a preferred datagram
+# tier. Normal conversational cost orders that tier. A TCP, KCP, or regular
+# QUIC stream path wins only when its cost is better by at least this
+# percentage.
 transport_switch_improvement_pct = 15
+# A viable datagram path may replace a stream incumbent immediately when that
+# stream lacks the material advantage above; stickiness limits other changes.
 # Keep expiring conversational voice on a stable transport/tree path while it
 # remains usable. Changes take effect after restart; set false to roll back.
 voice_path_stickiness_enabled = true

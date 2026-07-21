@@ -120,6 +120,39 @@ deploy a dual-stack release first and retain `s2s/1` for at least one complete
 rollback window. Remove v1 only after both active-v1 and newly-negotiated-v1
 metrics remain zero for that entire window.
 
+## Conversational Datagram Preference
+
+For the `HighPriority` + `BestEffort` + `ConversationalQuality` route, raw UDP
+and the DATAGRAM delivery path on a healthy `s2s/2` QUIC session form one
+preferred datagram tier when the complete frame fits. Normal
+`ConversationalQuality` cost ordering chooses between the eligible raw UDP and
+QUIC DATAGRAM paths, giving them equal tier priority. The best datagram path
+stays ahead of TCP, KCP, and the legacy `s2s/1` QUIC stream unless the best stream path's
+conversational cost is at least `transport_switch_improvement_pct` better.
+Thus, a merely marginal stream advantage does not displace a nonblocking
+datagram path.
+
+QUIC DATAGRAM is a delivery path on the existing QUIC session, not a separate
+physical `TransportKind`; it shares that connection's network path, congestion
+controller, and capacity. For BestEffort, legacy `s2s/1` QUIC stream delivery
+remains an explicit fallback alongside TCP and KCP; `s2s/2` never converts an
+accepted DATAGRAM item into one of its reliable lanes.
+
+Selection telemetry preserves this logical distinction:
+`shitspeak_s2s_delivery_path_selections_total{path="quic_datagram"}` and
+`{path="quic_stream"}` report the two QUIC delivery paths separately. Physical
+QUIC RTT, loss, and health remain shared under `TransportKind::Quic`; the path
+label describes delivery semantics, not a separate network link.
+
+UDP-family health and viability gates still apply. Unhealthy or unusable
+datagram candidates are excluded, and the QUIC DATAGRAM path is excluded from
+the tier when the encoded frame does not fit its current maximum DATAGRAM
+size. Normal stream fallback applies when no viable datagram candidate
+remains. A viable datagram path may replace a stream incumbent immediately
+when that stream lacks the configured material advantage, avoiding stream
+head-of-line blocking. Voice min-hold and challenger confirmation continue to
+govern other path changes.
+
 ## Transport Compression
 
 S2S transport supports selective payload compression:

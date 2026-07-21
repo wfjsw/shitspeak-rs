@@ -101,24 +101,26 @@ pub use identity::{
 pub use manager::PeerAddressSnapshot;
 pub use manager::{AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage};
 pub use metrics::{
-    ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics,
-    MetricsSnapshot, OutboundQueueStatusSnapshot, QueueStatusSnapshot, QuicDatagramDropReason,
-    QuicDatagramDropSnapshot, QuicDeliveryLane, QuicLaneSnapshot, QuicProtocolErrorReason,
-    QuicProtocolErrorSnapshot, QuicProtocolEventSnapshot, QuicProtocolResult, QuicProtocolStage,
-    QuicProtocolVersion, TransportIoDirection, TransportIoFrameSnapshot, TransportIoPressureResult,
-    TransportIoSnapshot, TransportPipelineStageSnapshot, VoiceTransportBindingEventReason,
+    DeliveryPathSelectionSnapshot, ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage,
+    InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot, OutboundQueueStatusSnapshot,
+    QueueStatusSnapshot, QuicDatagramDropReason, QuicDatagramDropSnapshot, QuicDeliveryLane,
+    QuicLaneSnapshot, QuicProtocolErrorReason, QuicProtocolErrorSnapshot,
+    QuicProtocolEventSnapshot, QuicProtocolResult, QuicProtocolStage, QuicProtocolVersion,
+    TransportIoDirection, TransportIoFrameSnapshot, TransportIoPressureResult, TransportIoSnapshot,
+    TransportPipelineStageSnapshot, VoiceTransportBindingEventReason,
     VoiceTransportBindingEventSnapshot, VoiceTransportBindingSnapshot,
     VoiceTransportChallengerOutcome, VoiceTransportChallengerSnapshot,
 };
 pub use metrics::{
     apply_packet_loss_penalty, conversational_effective_delay_us, conversational_impairment,
-    conversational_quality_score, quic_datagram_drop_snapshots, quic_lane_snapshots,
-    quic_protocol_error_snapshots, quic_protocol_event_snapshots, record_quic_datagram_drop,
-    record_quic_lane_delivery, record_quic_protocol_error, record_quic_protocol_event,
-    transport_io_frame_snapshots, transport_io_snapshots, transport_pipeline_stage_snapshots,
+    conversational_quality_score, delivery_path_selection_snapshots, quic_datagram_drop_snapshots,
+    quic_lane_snapshots, quic_protocol_error_snapshots, quic_protocol_event_snapshots,
+    record_delivery_path_selection, record_quic_datagram_drop, record_quic_lane_delivery,
+    record_quic_protocol_error, record_quic_protocol_event, transport_io_frame_snapshots,
+    transport_io_snapshots, transport_pipeline_stage_snapshots,
 };
 pub use public_ip::discover_public_geo;
 pub use service_level::{
-    MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel, ServiceShape,
-    TransportKind,
+    DeliveryPath, MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel,
+    ServiceShape, TransportKind,
 };

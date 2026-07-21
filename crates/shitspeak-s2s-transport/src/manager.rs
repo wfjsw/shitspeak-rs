@@ -51,10 +51,11 @@ use super::identity::{
 use super::metrics::{
     ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot,
     MetricsTuning, QueueWatermark, QueueWatermarkReport, TransportHealthExclusionReason,
-    VoiceTransportBindingEventReason, assemble_snapshot,
+    VoiceTransportBindingEventReason, assemble_snapshot, record_delivery_path_selection,
 };
 use super::service_level::{
-    MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel, TransportKind,
+    DeliveryPath, MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel,
+    TransportKind,
 };
 use super::tls::build_tls_configs;
 
@@ -634,18 +635,13 @@ impl ConnectionManager {
                 if level != ServiceLevel::BestEffort {
                     return true;
                 }
-                let Some(sender) = self
-                    .inner
-                    .get_peer(node)
-                    .and_then(|peer| peer.try_get_stream(TransportKind::Quic))
-                else {
+                let Some(peer) = self.inner.get_peer(node) else {
                     return false;
                 };
-                let Some(max_datagram_size) = sender.quic_v2_max_datagram_size() else {
-                    // Negotiated s2s/1 preserves the legacy reliable-stream fallback.
-                    return true;
-                };
-                encoded_len <= max_datagram_size
+                peer.try_get_quic_v2_stream()
+                    .and_then(|sender| sender.quic_v2_max_datagram_size())
+                    .is_some_and(|max_datagram_size| encoded_len <= max_datagram_size)
+                    || peer.try_get_quic_v1_stream().is_some()
             }
             TransportKind::Udp => self
                 .udp_datagram_len(node, level, class, payload.len())
@@ -664,7 +660,7 @@ impl ConnectionManager {
         let max_datagram_size = self
             .inner
             .get_peer(node)
-            .and_then(|peer| peer.try_get_stream(TransportKind::Quic))
+            .and_then(|peer| peer.try_get_quic_v2_stream())
             .and_then(|sender| sender.quic_v2_max_datagram_size())
             .unwrap_or(1200);
         encoded_data_frame_len(
@@ -1284,24 +1280,48 @@ impl ConnectionManager {
             return Err(SendError::NoSuitableTransport { node });
         }
         let choices_fit = choices.iter().any(|transport| {
-            let quic_v2 = *transport == TransportKind::Quic
-                && peer
-                    .try_get_stream(TransportKind::Quic)
-                    .and_then(|sender| sender.quic_v2_max_datagram_size())
-                    .is_some();
-            let variant = payloads.variant_for_session(*transport, quic_v2);
-            *transport == TransportKind::Udp
-                || std::iter::once(variant.primary())
-                    .chain(variant.sidecars().iter())
-                    .all(|payload| {
-                        self.payload_fits_transport(node, *transport, level, class, payload)
-                    })
+            if *transport == TransportKind::Udp {
+                return true;
+            }
+            if *transport == TransportKind::Quic && level == ServiceLevel::BestEffort {
+                let legacy_variant = payloads.variant(TransportKind::Quic);
+                let legacy_fits = peer.try_get_quic_v1_stream().is_some()
+                    && std::iter::once(legacy_variant.primary())
+                        .chain(legacy_variant.sidecars().iter())
+                        .all(|payload| {
+                            self.payload_fits_transport(
+                                node,
+                                TransportKind::Quic,
+                                level,
+                                class,
+                                payload,
+                            )
+                        });
+                let datagram_fits = peer.try_get_quic_v2_stream().is_some_and(|sender| {
+                    let variant = payloads.variant_for_session(TransportKind::Quic, true);
+                    sender
+                        .quic_v2_max_datagram_size()
+                        .is_some_and(|max_datagram_size| {
+                            quic_datagram_variant_fits(
+                                node,
+                                class,
+                                variant,
+                                max_datagram_size,
+                                selection.max_frame_bytes,
+                            )
+                        })
+                });
+                return datagram_fits || legacy_fits;
+            }
+            let variant = payloads.variant(*transport);
+            std::iter::once(variant.primary())
+                .chain(variant.sidecars().iter())
+                .all(|payload| self.payload_fits_transport(node, *transport, level, class, payload))
         });
         if !choices_fit {
             if level == ServiceLevel::BestEffort
                 && choices.contains(&TransportKind::Quic)
-                && let Some(sender) = peer.try_get_stream(TransportKind::Quic)
-                && sender.quic_v2_max_datagram_size().is_some()
+                && let Some(sender) = peer.try_get_quic_v2_stream()
             {
                 sender.record_quic_datagram_drop();
                 super::metrics::record_quic_datagram_drop(
@@ -1918,9 +1938,13 @@ fn transport_candidate_exclusion_reason(
         return Some(TransportHealthExclusionReason::KcpFailaway);
     }
 
-    if (level == ServiceLevel::BestEffort
-        || class == MessageClass::HighPriority
-        || options.expires_at().is_some())
+    let nonblocking_quic_path_available = level == ServiceLevel::BestEffort
+        && transport == TransportKind::Quic
+        && peer.try_get_quic_v2_stream().is_some();
+    if !nonblocking_quic_path_available
+        && (level == ServiceLevel::BestEffort
+            || class == MessageClass::HighPriority
+            || options.expires_at().is_some())
         && transport_queue_known_dead(
             peer,
             transport,
@@ -1951,6 +1975,9 @@ fn transport_is_viable_alternative(
     policy: TransportRoutingPolicy,
     now: Instant,
 ) -> bool {
+    if transport == TransportKind::Quic && peer.try_get_quic_v2_stream().is_some() {
+        return true;
+    }
     !transport_queue_known_dead(peer, transport, snapshot.get(&transport), policy, now)
 }
 
@@ -2142,10 +2169,17 @@ fn is_expiring_conversational_voice(
     class: MessageClass,
     options: SendOptions,
 ) -> bool {
+    is_conversational_best_effort(level, routing_metric, class) && options.expires_at().is_some()
+}
+
+fn is_conversational_best_effort(
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+) -> bool {
     level == ServiceLevel::BestEffort
         && routing_metric == RoutingMetric::ConversationalQuality
         && class == MessageClass::HighPriority
-        && options.expires_at().is_some()
 }
 
 fn apply_voice_transport_stickiness(
@@ -2267,13 +2301,21 @@ fn enforce_expiring_voice_admission(
         return;
     }
 
+    let udp_datagram_viable = ranked.contains(&TransportKind::Udp)
+        && udp_family_health(peer, &[TransportKind::Udp], snapshot, policy)
+            == UdpFamilyHealth::Viable;
+    let quic_datagram_viable = ranked.contains(&TransportKind::Quic)
+        && peer.try_get_quic_v2_stream().is_some()
+        && udp_family_health(peer, &[TransportKind::Quic], snapshot, policy)
+            == UdpFamilyHealth::Viable;
     let usable_tcp = ranked.contains(&TransportKind::Tcp)
         && tcp_transport_usable(peer, snapshot.get(&TransportKind::Tcp), policy);
-    if usable_tcp {
-        ranked.retain(|kind| *kind == TransportKind::Tcp);
-    } else {
-        ranked.clear();
-    }
+    ranked.retain(|kind| match kind {
+        TransportKind::Tcp => usable_tcp,
+        TransportKind::Udp => udp_datagram_viable,
+        TransportKind::Quic => quic_datagram_viable,
+        TransportKind::Kcp => false,
+    });
 }
 
 fn peer_bulk_backlog_bytes(peer: &PeerState) -> usize {
@@ -2527,7 +2569,7 @@ fn deadline_queue_penalty_with_additional_depth_and_snapshot(
     if level == ServiceLevel::BestEffort
         && transport == TransportKind::Quic
         && peer
-            .try_get_stream(TransportKind::Quic)
+            .try_get_quic_v2_stream()
             .and_then(|sender| sender.quic_v2_max_datagram_size())
             .is_some()
     {
@@ -2603,7 +2645,7 @@ fn non_deadline_queue_penalty(
     if level == ServiceLevel::BestEffort
         && transport == TransportKind::Quic
         && peer
-            .try_get_stream(TransportKind::Quic)
+            .try_get_quic_v2_stream()
             .and_then(|sender| sender.quic_v2_max_datagram_size())
             .is_some()
     {
@@ -3035,6 +3077,238 @@ fn try_dispatch_envelope(
     try_dispatch_envelope_with_policy(peer, envelope, selection.into(), false)
 }
 
+struct DeliveryCandidate {
+    path: DeliveryPath,
+    sender: SessionSender,
+}
+
+fn delivery_candidates(
+    peer: &PeerState,
+    envelope: &OutboundEnvelope,
+    choices: Vec<TransportKind>,
+    max_frame_bytes: usize,
+) -> (Vec<DeliveryCandidate>, Option<SessionSender>) {
+    let mut candidates = Vec::with_capacity(choices.len().saturating_add(1));
+    let mut no_fit_quic_sender = None;
+
+    for transport in choices {
+        if transport == TransportKind::Quic && envelope.level() == ServiceLevel::BestEffort {
+            if let Some(sender) = peer.try_get_quic_v2_stream()
+                && let Some(max_datagram_size) = sender.quic_v2_max_datagram_size()
+            {
+                let variant = envelope
+                    .payloads()
+                    .variant_for_session(TransportKind::Quic, true);
+                if quic_datagram_variant_fits(
+                    peer.node_id(),
+                    envelope.class(),
+                    variant,
+                    max_datagram_size,
+                    max_frame_bytes,
+                ) {
+                    candidates.push(DeliveryCandidate {
+                        path: DeliveryPath::QuicDatagram,
+                        sender,
+                    });
+                } else {
+                    no_fit_quic_sender = Some(sender);
+                }
+            }
+            if let Some(sender) = peer.try_get_quic_v1_stream() {
+                candidates.push(DeliveryCandidate {
+                    path: DeliveryPath::QuicStream,
+                    sender,
+                });
+            }
+            continue;
+        }
+
+        let Some(sender) = peer.try_get_stream(transport) else {
+            continue;
+        };
+        let path = if transport == TransportKind::Udp {
+            DeliveryPath::UdpDatagram
+        } else {
+            DeliveryPath::stream(transport).expect("non-UDP transport must have a stream path")
+        };
+        candidates.push(DeliveryCandidate { path, sender });
+    }
+
+    (candidates, no_fit_quic_sender)
+}
+
+fn prefer_conversational_datagram_paths(
+    peer: &PeerState,
+    candidates: &mut Vec<DeliveryCandidate>,
+    envelope: &OutboundEnvelope,
+    policy: TransportRoutingPolicy,
+) {
+    if !is_conversational_best_effort(
+        envelope.level(),
+        envelope.routing_metric(),
+        envelope.class(),
+    ) {
+        return;
+    }
+
+    let snapshot = peer.metrics().snapshot_per_transport();
+    let promotable = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            if !candidate.path.is_datagram()
+                || udp_family_health(peer, &[candidate.path.transport()], &snapshot, policy)
+                    != UdpFamilyHealth::Viable
+            {
+                return None;
+            }
+            Some(index)
+        })
+        .collect::<Vec<_>>();
+    let Some(best_datagram_index) = promotable.iter().copied().min_by(|left, right| {
+        delivery_candidate_cost(&candidates[*left], envelope, &snapshot)
+            .partial_cmp(&delivery_candidate_cost(
+                &candidates[*right],
+                envelope,
+                &snapshot,
+            ))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        return;
+    };
+    let now = Instant::now();
+    let Some((best_stream_index, _)) = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| !candidate.path.is_datagram())
+        .min_by(|(_, left), (_, right)| {
+            let pressure = |candidate: &DeliveryCandidate| {
+                delivery_candidate_lane_penalty(candidate, envelope, &snapshot, now)
+            };
+            pressure(left).cmp(&pressure(right)).then_with(|| {
+                delivery_candidate_cost(left, envelope, &snapshot)
+                    .partial_cmp(&delivery_candidate_cost(right, envelope, &snapshot))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+    else {
+        return;
+    };
+
+    if stream_path_has_material_advantage(
+        &candidates[best_stream_index],
+        &candidates[best_datagram_index],
+        envelope,
+        policy,
+        &snapshot,
+    ) {
+        return;
+    }
+
+    let mut preferred = Vec::with_capacity(promotable.len());
+    for index in promotable.into_iter().rev() {
+        preferred.push(candidates.remove(index));
+    }
+    preferred.reverse();
+    preferred.sort_by(|left, right| {
+        delivery_candidate_cost(left, envelope, &snapshot)
+            .partial_cmp(&delivery_candidate_cost(right, envelope, &snapshot))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    preferred.append(candidates);
+    *candidates = preferred;
+}
+
+fn delivery_candidate_cost(
+    candidate: &DeliveryCandidate,
+    envelope: &OutboundEnvelope,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+) -> f64 {
+    snapshot
+        .get(&candidate.path.transport())
+        .and_then(|link| link.routing_cost(envelope.level(), envelope.routing_metric()))
+        .filter(|cost| cost.is_finite())
+        .unwrap_or(f64::INFINITY)
+}
+
+fn delivery_candidate_lane_penalty(
+    candidate: &DeliveryCandidate,
+    envelope: &OutboundEnvelope,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    now: Instant,
+) -> u8 {
+    if candidate.path.is_datagram() {
+        return 0;
+    }
+
+    let (depth, capacity) = candidate
+        .sender
+        .depth_capacity(envelope.level(), envelope.class());
+    if capacity > 0 && depth >= capacity {
+        return 3;
+    }
+    let Some(expires_at) = envelope.options().expires_at() else {
+        return current_queue_fill_penalty(depth, capacity);
+    };
+    let remaining = expires_at.saturating_duration_since(now);
+    if remaining.is_zero() || remaining <= DEADLINE_NEAR_EXPIRED_TTL {
+        return 3;
+    }
+    if depth == 0 {
+        return 0;
+    }
+
+    let drain_bytes_per_ms =
+        estimated_drain_bytes_per_ms(snapshot.get(&candidate.path.transport()));
+    if !drain_bytes_per_ms.is_finite() || drain_bytes_per_ms <= 0.0 {
+        return 3;
+    }
+    let queue_delay_ms = depth as f64 / drain_bytes_per_ms;
+    let remaining_ms = remaining.as_secs_f64() * 1_000.0;
+    if queue_delay_ms <= remaining_ms * 0.25 {
+        0
+    } else if queue_delay_ms <= remaining_ms * 0.50 {
+        1
+    } else if queue_delay_ms <= remaining_ms * 0.90 {
+        2
+    } else {
+        3
+    }
+}
+
+fn stream_path_has_material_advantage(
+    stream: &DeliveryCandidate,
+    datagram: &DeliveryCandidate,
+    envelope: &OutboundEnvelope,
+    policy: TransportRoutingPolicy,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+) -> bool {
+    let now = Instant::now();
+    let stream_pressure = delivery_candidate_lane_penalty(stream, envelope, snapshot, now);
+    // The delivery-path queues for raw UDP and QUIC DATAGRAM do not wait for
+    // stream capacity. The common peer dispatcher pressure applies equally to
+    // both candidates and therefore does not affect this comparison.
+    if stream_pressure > 0 {
+        return false;
+    }
+
+    let stream_cost = snapshot
+        .get(&stream.path.transport())
+        .and_then(|link| link.routing_cost(envelope.level(), envelope.routing_metric()));
+    let datagram_cost = snapshot
+        .get(&datagram.path.transport())
+        .and_then(|link| link.routing_cost(envelope.level(), envelope.routing_metric()));
+    let (Some(stream_cost), Some(datagram_cost)) = (stream_cost, datagram_cost) else {
+        return false;
+    };
+    if !stream_cost.is_finite() || !datagram_cost.is_finite() {
+        return false;
+    }
+
+    let required = 1.0 - (policy.transport_switch_improvement_pct().min(100) as f64 / 100.0);
+    stream_cost <= datagram_cost * required
+}
+
 fn try_dispatch_envelope_with_policy(
     peer: &Arc<PeerState>,
     envelope: OutboundEnvelope,
@@ -3135,9 +3409,29 @@ fn try_dispatch_envelope_with_policy(
         return Err(envelope);
     }
 
-    let mut incumbent_failure = None;
-    let mut no_fit_quic_sender = None;
-    for transport in choices {
+    let attempted_transports = choices.clone();
+    let (mut delivery_candidates, no_fit_quic_sender) =
+        delivery_candidates(peer, &envelope, choices, selection.max_frame_bytes);
+    prefer_conversational_datagram_paths(
+        peer,
+        &mut delivery_candidates,
+        &envelope,
+        selection.routing,
+    );
+
+    let mut incumbent_failure = voice_decision.and_then(|decision| {
+        let incumbent = decision.incumbent()?;
+        if !attempted_transports.contains(&incumbent) {
+            return None;
+        }
+        let sender_still_available = delivery_candidates
+            .iter()
+            .any(|candidate| candidate.path.transport() == incumbent)
+            || (incumbent == TransportKind::Quic && no_fit_quic_sender.is_some());
+        (!sender_still_available).then_some(VoiceTransportBindingEventReason::TransportUnavailable)
+    });
+    for candidate in delivery_candidates {
+        let transport = candidate.path.transport();
         let options = envelope.options();
         if options.is_expired() {
             peer.record_expired_outbound_drop(
@@ -3147,32 +3441,12 @@ fn try_dispatch_envelope_with_policy(
             );
             return Ok(());
         }
-        let Some(sender) = peer.try_get_stream(transport) else {
-            if voice_decision.is_some_and(|decision| decision.incumbent() == Some(transport)) {
-                incumbent_failure = Some(VoiceTransportBindingEventReason::TransportUnavailable);
-            }
-            continue;
-        };
+        let sender = candidate.sender;
         let level = envelope.level();
-        let quic_v2 = sender.quic_v2_max_datagram_size().is_some();
+        let quic_v2 = candidate.path == DeliveryPath::QuicDatagram;
         let variant = envelope.payloads().variant_for_session(transport, quic_v2);
-        if level == ServiceLevel::BestEffort
-            && transport == TransportKind::Quic
-            && let Some(max_datagram_size) = sender.quic_v2_max_datagram_size()
-            && !quic_datagram_variant_fits(
-                peer.node_id(),
-                class,
-                variant,
-                max_datagram_size,
-                selection.max_frame_bytes,
-            )
-        {
-            no_fit_quic_sender = Some(sender.clone());
-            continue;
-        }
-        let quic_v2_datagram = level == ServiceLevel::BestEffort
-            && transport == TransportKind::Quic
-            && sender.quic_v2_max_datagram_size().is_some();
+        let quic_v2_datagram = candidate.path == DeliveryPath::QuicDatagram;
+        let stream_path = !candidate.path.is_datagram();
         if quic_v2_datagram {
             for sidecar in variant.sidecars() {
                 record_datagram_enqueue_result(
@@ -3196,7 +3470,9 @@ fn try_dispatch_envelope_with_policy(
             record_outbound_stream_queue_sample(peer, transport, class, &sender, level, true);
             continue;
         }
-        record_outbound_stream_queue_sample(peer, transport, class, &sender, level, false);
+        if stream_path {
+            record_outbound_stream_queue_sample(peer, transport, class, &sender, level, false);
+        }
         match sender.try_send(frame) {
             Ok(outcome) => {
                 if outcome.dropped_expired() {
@@ -3226,7 +3502,19 @@ fn try_dispatch_envelope_with_policy(
                         }
                     }
                 }
-                record_outbound_stream_queue_sample(peer, transport, class, &sender, level, false);
+                if stream_path {
+                    record_outbound_stream_queue_sample(
+                        peer, transport, class, &sender, level, false,
+                    );
+                }
+                record_delivery_path_selection(candidate.path);
+                trace!(
+                    peer = %peer.node_id(),
+                    delivery_path = candidate.path.name(),
+                    ?level,
+                    ?class,
+                    "selected outbound delivery path"
+                );
                 if let Some(decision) = voice_decision {
                     let selected_pressure =
                         deadline_queue_penalty(peer, transport, level, class, options, now);
@@ -3251,13 +3539,21 @@ fn try_dispatch_envelope_with_policy(
                         super::metrics::QuicDatagramDropReason::TooLarge,
                     );
                 }
-                record_outbound_stream_queue_sample(peer, transport, class, &sender, level, true);
+                if stream_path {
+                    record_outbound_stream_queue_sample(
+                        peer, transport, class, &sender, level, true,
+                    );
+                }
                 if voice_decision.is_some_and(|decision| decision.incumbent() == Some(transport)) {
                     incumbent_failure = Some(VoiceTransportBindingEventReason::QueueFull);
                 }
             }
             Err(SessionTrySendError::Full) => {
-                record_outbound_stream_queue_sample(peer, transport, class, &sender, level, true);
+                if stream_path {
+                    record_outbound_stream_queue_sample(
+                        peer, transport, class, &sender, level, true,
+                    );
+                }
                 if voice_decision.is_some_and(|decision| decision.incumbent() == Some(transport)) {
                     incumbent_failure = Some(VoiceTransportBindingEventReason::QueueFull);
                 }
@@ -3698,8 +3994,9 @@ fn udp_family_listen_addrs(cfg: &TransportConfig) -> Vec<(TransportKind, SocketA
 
 #[cfg(test)]
 mod tests {
-    use super::super::connection::ActiveStream;
-    use super::super::connection::TransportPayloadVariant;
+    use super::super::connection::{
+        ActiveStream, QuicV2SessionReceivers, QuicV2SessionSender, TransportPayloadVariant,
+    };
     use super::*;
 
     #[tokio::test]
@@ -3779,15 +4076,40 @@ mod tests {
         kind: TransportKind,
         queue_bytes: usize,
     ) -> AdaptiveQueueReceiver<OutboundFrame> {
+        install_test_stream_at(peer, kind, queue_bytes, None)
+    }
+
+    fn install_test_stream_at(
+        peer: &PeerState,
+        kind: TransportKind,
+        queue_bytes: usize,
+        remote_addr: Option<SocketAddr>,
+    ) -> AdaptiveQueueReceiver<OutboundFrame> {
         let (tx, rx) = test_outbound_queue_with_bytes(queue_bytes);
         peer.install_stream(ActiveStream::new(
             kind,
-            None,
+            remote_addr,
             tx,
             CancellationToken::new(),
             false,
         ));
         rx
+    }
+
+    fn install_test_quic_v2(
+        peer: &PeerState,
+        remote_addr: SocketAddr,
+        max_datagram_size: usize,
+    ) -> QuicV2SessionReceivers {
+        let (sender, receivers) =
+            QuicV2SessionSender::new(1024 * 1024, 64 * 1024, 256 * 1024, max_datagram_size);
+        peer.install_stream(ActiveStream::new_quic_v2(
+            Some(remote_addr),
+            sender,
+            CancellationToken::new(),
+            false,
+        ));
+        receivers
     }
 
     fn expiring_voice(payload: &'static [u8]) -> OutboundEnvelope {
@@ -4851,6 +5173,378 @@ mod tests {
             ),
             Some(TransportKind::Quic)
         );
+    }
+
+    #[tokio::test]
+    async fn conversational_datagram_tier_precedes_slightly_better_streams() {
+        let (peer, mut stream_receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
+        let (_control, _high, _regular, mut quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1400).into_parts();
+        let policy = TransportRoutingPolicy::default();
+
+        peer.metrics()
+            .record_rtt(TransportKind::Tcp, Duration::from_millis(50));
+        peer.metrics()
+            .record_rtt(TransportKind::Kcp, Duration::from_millis(52));
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_millis(60));
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+        let snapshot = peer.metrics().snapshot_per_transport();
+        let tcp_cost = snapshot[&TransportKind::Tcp]
+            .routing_cost(
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            )
+            .unwrap();
+        let quic_cost = snapshot[&TransportKind::Quic]
+            .routing_cost(
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            )
+            .unwrap();
+        let material = 1.0 - (policy.transport_switch_improvement_pct() as f64 / 100.0);
+        assert!(tcp_cost < quic_cost && tcp_cost > quic_cost * material);
+
+        try_dispatch_envelope(&peer, expiring_voice(b"datagram-first"), policy).unwrap();
+
+        assert_eq!(
+            quic_datagram.recv().await.unwrap().payload(),
+            b"datagram-first".as_slice()
+        );
+        assert!(stream_receivers.iter_mut().all(|rx| rx.try_recv().is_err()));
+    }
+
+    #[tokio::test]
+    async fn non_expiring_conversational_route_uses_same_datagram_preference() {
+        let (peer, mut stream_receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
+        let (_control, _high, _regular, mut quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1400).into_parts();
+        let policy = TransportRoutingPolicy::default();
+
+        peer.metrics()
+            .record_rtt(TransportKind::Tcp, Duration::from_millis(50));
+        peer.metrics()
+            .record_rtt(TransportKind::Kcp, Duration::from_millis(52));
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_millis(60));
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+
+        let envelope = OutboundEnvelope::routed(
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            Bytes::from_static(b"non-expiring-datagram"),
+            SendOptions::default(),
+        );
+        try_dispatch_envelope(&peer, envelope, policy).unwrap();
+
+        assert_eq!(
+            quic_datagram.recv().await.unwrap().payload(),
+            b"non-expiring-datagram".as_slice()
+        );
+        assert!(stream_receivers.iter_mut().all(|rx| rx.try_recv().is_err()));
+    }
+
+    #[tokio::test]
+    async fn unhealthy_udp_does_not_suppress_healthy_quic_datagram_voice_path() {
+        let (peer, mut stream_receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Udp]);
+        let (_control, _high, _regular, mut quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1400).into_parts();
+        let policy = TransportRoutingPolicy::default();
+
+        peer.metrics()
+            .record_rtt(TransportKind::Tcp, Duration::from_millis(50));
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_millis(60));
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+        for _ in 0..policy
+            .udp_family_min_samples()
+            .max(u64::from(policy.udp_family_probe_loss_block_count()))
+        {
+            peer.metrics().record_probe_lost(TransportKind::Udp);
+        }
+
+        try_dispatch_envelope(&peer, expiring_voice(b"healthy-quic-datagram"), policy).unwrap();
+
+        assert_eq!(
+            quic_datagram.recv().await.unwrap().payload(),
+            b"healthy-quic-datagram".as_slice()
+        );
+        assert!(stream_receivers.iter_mut().all(|rx| rx.try_recv().is_err()));
+    }
+
+    #[tokio::test]
+    async fn materially_better_stream_displaces_conversational_datagram_tier() {
+        let (peer, mut stream_receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
+        let (_control, _high, _regular, quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1400).into_parts();
+        let policy = TransportRoutingPolicy::default();
+
+        peer.metrics()
+            .record_rtt(TransportKind::Tcp, Duration::from_millis(10));
+        peer.metrics()
+            .record_rtt(TransportKind::Kcp, Duration::from_millis(20));
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_secs(2));
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+        let snapshot = peer.metrics().snapshot_per_transport();
+        let tcp_cost = snapshot[&TransportKind::Tcp]
+            .routing_cost(
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            )
+            .unwrap();
+        let quic_cost = snapshot[&TransportKind::Quic]
+            .routing_cost(
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            )
+            .unwrap();
+        let material = 1.0 - (policy.transport_switch_improvement_pct() as f64 / 100.0);
+        assert!(tcp_cost <= quic_cost * material);
+
+        try_dispatch_envelope(&peer, expiring_voice(b"stream-first"), policy).unwrap();
+
+        assert_eq!(
+            stream_receivers[0].try_recv().unwrap().payload(),
+            b"stream-first".as_slice()
+        );
+        assert!(stream_receivers[1].try_recv().is_err());
+        assert_eq!(quic_datagram.depth_bytes(), 0);
+    }
+
+    #[test]
+    fn udp_and_quic_datagram_share_pre_stream_priority_tier() {
+        let (peer, _stream_receivers) =
+            peer_with_live_transports(&[TransportKind::Udp, TransportKind::Tcp]);
+        let quic_receivers = install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1400);
+        let policy = TransportRoutingPolicy::default();
+
+        for (transport, rtt) in [
+            (TransportKind::Udp, Duration::from_millis(50)),
+            (TransportKind::Tcp, Duration::from_millis(55)),
+            (TransportKind::Quic, Duration::from_millis(60)),
+        ] {
+            peer.metrics().record_rtt(transport, rtt);
+        }
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Udp);
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+
+        let envelope = expiring_voice(b"tier-order");
+        let choices = vec![TransportKind::Udp, TransportKind::Tcp, TransportKind::Quic];
+        let (mut candidates, _) = delivery_candidates(&peer, &envelope, choices, usize::MAX);
+        prefer_conversational_datagram_paths(&peer, &mut candidates, &envelope, policy);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.path)
+                .collect::<Vec<_>>(),
+            vec![
+                DeliveryPath::UdpDatagram,
+                DeliveryPath::QuicDatagram,
+                DeliveryPath::TcpStream,
+            ]
+        );
+        drop(quic_receivers);
+    }
+
+    #[tokio::test]
+    async fn fitting_quic_datagram_is_not_masked_by_newer_legacy_quic() {
+        let (peer, _receivers) = peer_with_live_transports(&[]);
+        let (_control, _high, _regular, mut quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1400).into_parts();
+        let mut legacy_quic = install_test_stream_at(
+            &peer,
+            TransportKind::Quic,
+            1024 * 1024,
+            Some(socket("127.0.0.2:64741")),
+        );
+        let policy = TransportRoutingPolicy::default();
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_millis(60));
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+
+        try_dispatch_envelope(&peer, expiring_voice(b"v2-not-masked"), policy).unwrap();
+
+        assert_eq!(
+            quic_datagram.recv().await.unwrap().payload(),
+            b"v2-not-masked".as_slice()
+        );
+        assert!(legacy_quic.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn datagram_preference_can_leave_stream_voice_binding_without_waiting_for_capacity() {
+        let (peer, mut stream_receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        let policy = TransportRoutingPolicy::default();
+
+        try_dispatch_envelope(&peer, expiring_voice(b"bind-stream"), policy).unwrap();
+        assert_eq!(
+            stream_receivers[0].try_recv().unwrap().payload(),
+            b"bind-stream".as_slice()
+        );
+        assert_eq!(
+            peer.voice_transport_binding_status().unwrap().transport(),
+            TransportKind::Tcp
+        );
+
+        let (_control, _high, _regular, mut quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1400).into_parts();
+        peer.metrics()
+            .record_rtt(TransportKind::Tcp, Duration::from_millis(50));
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_millis(60));
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+
+        try_dispatch_envelope(&peer, expiring_voice(b"prefer-datagram"), policy).unwrap();
+
+        assert_eq!(
+            quic_datagram.recv().await.unwrap().payload(),
+            b"prefer-datagram".as_slice()
+        );
+        assert!(stream_receivers[0].try_recv().is_err());
+        assert_eq!(
+            peer.voice_transport_binding_status().unwrap().transport(),
+            TransportKind::Quic
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_quic_datagram_falls_back_to_legacy_quic_stream() {
+        let (peer, _receivers) = peer_with_live_transports(&[]);
+        let (_control, _high, _regular, quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200).into_parts();
+        let mut legacy_quic = install_test_stream_at(
+            &peer,
+            TransportKind::Quic,
+            1024 * 1024,
+            Some(socket("127.0.0.2:64741")),
+        );
+
+        let envelope = OutboundEnvelope::routed(
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            Bytes::from(vec![b'x'; 1200]),
+            SendOptions::default(),
+        );
+        try_dispatch_envelope(&peer, envelope, TransportRoutingPolicy::default()).unwrap();
+
+        assert_eq!(legacy_quic.try_recv().unwrap().payload().len(), 1200);
+        assert_eq!(quic_datagram.depth_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn backlogged_legacy_quic_stream_cannot_displace_udp_when_datagram_does_not_fit() {
+        let (peer, mut udp_receivers) = peer_with_live_transports(&[TransportKind::Udp]);
+        let (_control, _high, _regular, quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200).into_parts();
+        let mut legacy_quic = install_test_stream_at(
+            &peer,
+            TransportKind::Quic,
+            1024 * 1024,
+            Some(socket("127.0.0.2:64741")),
+        );
+        let policy = TransportRoutingPolicy::default();
+
+        peer.metrics()
+            .record_rtt(TransportKind::Udp, Duration::from_secs(2));
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_millis(10));
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics().record_probe_delivered(TransportKind::Udp);
+            peer.metrics().record_probe_delivered(TransportKind::Quic);
+        }
+        let snapshot = peer.metrics().snapshot_per_transport();
+        let udp_cost = snapshot[&TransportKind::Udp]
+            .routing_cost(
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            )
+            .unwrap();
+        let quic_cost = snapshot[&TransportKind::Quic]
+            .routing_cost(
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            )
+            .unwrap();
+        let material = 1.0 - (policy.transport_switch_improvement_pct() as f64 / 100.0);
+        assert!(quic_cost <= udp_cost * material);
+
+        peer.try_get_quic_v1_stream()
+            .expect("legacy QUIC stream")
+            .try_send(OutboundFrame::new(
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+                Bytes::from(vec![b'q'; 64 * 1024]),
+            ))
+            .expect("legacy QUIC queue should accept backlog");
+
+        let envelope = OutboundEnvelope::routed(
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            MessageClass::HighPriority,
+            Bytes::from(vec![b'x'; 1200]),
+            SendOptions::default(),
+        );
+        try_dispatch_envelope(&peer, envelope, policy).unwrap();
+
+        assert_eq!(udp_receivers[0].recv().await.unwrap().payload().len(), 1200);
+        assert_eq!(legacy_quic.recv().await.unwrap().payload().len(), 64 * 1024);
+        assert!(legacy_quic.try_recv().is_err());
+        assert_eq!(quic_datagram.depth_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn public_send_preflight_preserves_oversized_legacy_quic_fallback() {
+        let (manager, _receivers) = ConnectionManager::test_with_live_streams(1, 2, &[]);
+        let peer = manager.inner.get_peer(2).expect("test peer");
+        let (_control, _high, _regular, quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200).into_parts();
+        let mut legacy_quic = install_test_stream_at(
+            &peer,
+            TransportKind::Quic,
+            1024 * 1024,
+            Some(socket("127.0.0.2:64741")),
+        );
+
+        manager
+            .try_send_with_options(
+                2,
+                ServiceLevel::BestEffort,
+                Some(RoutingMetric::ConversationalQuality),
+                MessageClass::HighPriority,
+                Bytes::from(vec![b'x'; 1200]),
+                SendOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let forwarded = tokio::time::timeout(Duration::from_millis(50), legacy_quic.recv())
+            .await
+            .expect("legacy QUIC fallback should not be rejected by preflight")
+            .expect("legacy QUIC receiver");
+        assert_eq!(forwarded.payload().len(), 1200);
+        assert_eq!(quic_datagram.depth_bytes(), 0);
     }
 
     #[test]
