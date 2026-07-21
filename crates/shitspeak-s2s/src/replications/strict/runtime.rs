@@ -6614,8 +6614,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 return;
             }
         }
-        let relay_decision = StrictBody::Decision(decision.clone());
-        let applied = match decision.outcome {
+        // Apply the authenticated decision locally, but do not originate a new
+        // frame for it. Outbound strict frames are signed as this node, which
+        // cannot preserve a different resolver's authority. The resolver's
+        // own fanout/retries and durable terminal catchup provide repair.
+        match decision.outcome {
             Some(StrictDecisionOutcome::Commit(commit)) => self
                 .apply_terminal_commit_with_descriptor(
                     op_id,
@@ -6639,34 +6642,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
         };
         self.resolution_ack_broadcasts.lock().remove(&op_id);
-        if applied {
-            let mut dsts: Vec<_> = self.net.alive_members();
-            if let Some(targets) = v2_frozen_targets.as_deref() {
-                dsts.extend(targets.iter().map(FrozenTarget::node));
-            }
-            dsts.retain(|node| *node != self.self_id);
-            dsts.sort_unstable();
-            dsts.dedup();
-            if let Err(error) = send_terminal_fanout_with_broadcast(
-                self.net.as_ref(),
-                &dsts,
-                &self.topic,
-                relay_decision.clone(),
-            )
-            .await
-            {
-                trace!(%error, "send relayed strict terminal decision failed");
-            }
-            spawn_commit_fanout_retries(
-                self.net.clone(),
-                self.shutdown.clone(),
-                self.topic.clone(),
-                dsts,
-                relay_decision,
-                self.cfg.delivery_tick_interval(),
-                self.cfg.pending_propose_ttl(),
-            );
-        }
     }
 
     /// Receive an advisory stale-proposal report. Only the deterministic
@@ -7215,6 +7190,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 })
             }
         };
+        if terminal_identity.resolver != TerminalResolver::new(self.self_id, self.boot_epoch) {
+            // An existing terminal decision remains authoritative, but this
+            // resolver cannot re-sign and fan it out as the original resolver
+            // incarnation. Indirect repair proceeds through terminal catchup.
+            return;
+        }
         let dsts: Vec<NodeIdentifier> = targets
             .into_iter()
             .filter(|node| *node != self.self_id && !invalid_targets.contains(node))
@@ -15175,6 +15156,116 @@ mod tests {
             late_retry.expect("terminal fanout must outlive the former fixed retry window"),
             body
         );
+    }
+
+    #[tokio::test]
+    async fn received_terminal_decision_is_not_reoriginated_by_non_resolver() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        let op_id = make_op_id(2, 1, 136);
+        net.drain_captures();
+
+        rt.recv_decision_with_origin_epoch(
+            2,
+            1,
+            StrictDecision {
+                resolver_node: 2,
+                ballot: NORMAL_ACCEPT_BALLOT,
+                coord_node: 2,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                outcome: Some(StrictDecisionOutcome::Abort(StrictDecisionAbort {})),
+                src_clock: 1,
+                resolver_boot_epoch: 1,
+                frozen_targets: v2_frozen_targets_wire(),
+            },
+        )
+        .await;
+
+        assert!(rt.state.lock().terminal_decisions.contains_key(&op_id));
+        assert!(!net.drain_captures().iter().any(|frame| {
+            matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::Decision(_),
+                    ..
+                } | CapturedFrame::StrictMulticast {
+                    body: StrictBody::Decision(_),
+                    ..
+                } | CapturedFrame::StrictBroadcast {
+                    body: StrictBody::Decision(_),
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn existing_terminal_resolution_is_not_reoriginated_by_new_resolver() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        let op_id = make_op_id(2, 1, 137);
+        let frozen_targets = v2_frozen_targets();
+
+        rt.start_resolution(op_id, 2, None, frozen_targets.clone())
+            .await;
+        let prepare = net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictMulticast {
+                    body: StrictBody::ResolutionPrepare(prepare),
+                    ..
+                } => Some(prepare),
+                _ => None,
+            })
+            .expect("resolution must send a prepare");
+        net.drain_captures();
+        let existing_ballot = prepare.ballot + 1;
+
+        rt.recv_resolution_ack_with_origin_epoch(
+            2,
+            1,
+            StrictResolutionAck {
+                ack_node: 2,
+                ballot: prepare.ballot,
+                coord_node: 2,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                promised: true,
+                observed: Some(StrictResolutionObserved::Terminal(StrictTerminalState {
+                    coord_node: 2,
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                    ballot: existing_ballot,
+                    outcome: Some(StrictTerminalOutcome::Abort(StrictDecisionAbort {})),
+                    resolver_node: 2,
+                    resolver_boot_epoch: 1,
+                    frozen_targets: frozen_targets_to_wire(&frozen_targets),
+                })),
+                src_clock: 2,
+                ack_boot_epoch: 1,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            rt.state.lock().terminal_decisions.get(&op_id),
+            Some(TerminalDecision::Abort { ballot }) if *ballot == existing_ballot
+        ));
+        assert!(!net.drain_captures().iter().any(|frame| {
+            matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::Decision(_),
+                    ..
+                } | CapturedFrame::StrictMulticast {
+                    body: StrictBody::Decision(_),
+                    ..
+                } | CapturedFrame::StrictBroadcast {
+                    body: StrictBody::Decision(_),
+                    ..
+                }
+            )
+        }));
     }
 
     #[tokio::test]
