@@ -101,6 +101,14 @@ impl KcpRuntimeSample {
     pub(crate) fn outstanding_no_progress_age_ms(&self) -> Option<u64> {
         self.outstanding_no_progress_age_ms
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_no_progress_closes(no_progress_closes: u64) -> Self {
+        Self {
+            no_progress_closes,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

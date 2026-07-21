@@ -514,13 +514,16 @@ large_rtt_threshold_ms = 100
 lossy_link_threshold_ppm = 20000
 bulk_payload_threshold_bytes = 65536
 bulk_backlog_threshold_bytes = 262144
-# HighPriority + BestEffort + ConversationalQuality prefers the datagram tier
-# (raw UDP or the fitting s2s/2 QUIC DATAGRAM delivery path). A stream path
-# must be this percentage better to displace the best datagram path.
+# Every BestEffort route prefers eligible raw UDP and fitting s2s/2 QUIC
+# DATAGRAM paths over reliable streams. This percentage controls sticky
+# challenger changes between otherwise comparable voice paths.
 transport_switch_improvement_pct = 15
-# Soft voice-path stickiness prevents frame-by-frame path oscillation. A viable
-# datagram path may replace a stream incumbent immediately when the stream is
-# not materially better; timing rules continue to govern other path changes.
+# Penalize KCP's measured cost for every BestEffort route while retaining it as
+# the final fallback. Reliable traffic is unaffected.
+best_effort_kcp_cost_penalty_pct = 25
+# Soft voice-path stickiness prevents frame-by-frame path oscillation. An eligible
+# datagram path may replace a reliable incumbent immediately; timing rules
+# continue to govern other path changes.
 voice_path_stickiness_enabled = true
 voice_path_min_hold_ms = 750
 voice_path_challenger_confirm_ms = 500
@@ -651,20 +654,23 @@ mapping. Negotiated v2 setup therefore fails when either buffer is zero. Keep
 both values nonzero for normal v2 operation. Legacy
 peers that advertise only `s2s/1` can still negotiate v1.
 
-For the `HighPriority` + `BestEffort` + `ConversationalQuality` route, raw UDP
-and the DATAGRAM delivery path on a healthy `s2s/2` QUIC session form the
-preferred datagram tier when the complete frame fits. Normal
-`ConversationalQuality` cost ordering chooses between the eligible raw UDP and
-QUIC DATAGRAM paths, giving them equal tier priority. The best datagram path
-stays ahead of TCP, KCP, and the legacy `s2s/1` QUIC stream unless the best stream path has a
-conversational cost at least `transport_switch_improvement_pct` better. This
-bias favors nonblocking delivery when a stream's advantage is only marginal.
+For every `BestEffort` route, raw UDP and the DATAGRAM delivery path on an
+eligible `s2s/2` QUIC session form the preferred datagram tier when the
+complete frame fits. The requested routing metric chooses between eligible raw
+UDP and QUIC DATAGRAM paths, giving them equal tier priority. Eligible datagram
+paths stay ahead of TCP, KCP, and QUIC reliable streams. Reliable fallback is
+used only when datagrams are unavailable, do not fit the frame, or have
+degraded or blocked health. Probing and viable datagram paths remain eligible;
+lack of samples alone does not force reliable fallback. Within that fallback,
+current queue pressure and the requested routing metric choose between QUIC
+streams and TCP.
 
 QUIC DATAGRAM is a delivery path on the existing QUIC session, not a separate
 physical `TransportKind`; it shares that connection's network path, congestion
-controller, and capacity. For BestEffort, legacy `s2s/1` QUIC stream delivery
-remains an explicit fallback alongside TCP and KCP; `s2s/2` never converts an
-accepted DATAGRAM item into one of its reliable lanes.
+controller, and capacity. For BestEffort, QUIC stream delivery remains an
+explicit reliable fallback alongside TCP and KCP. An item is sent on a reliable
+lane only after routing selects that delivery path; DATAGRAM enqueue failure
+does not silently convert it to a reliable lane.
 
 The Prometheus counter `shitspeak_s2s_delivery_path_selections_total`
 distinguishes logical selections with bounded `path` values such as
@@ -675,19 +681,25 @@ not model DATAGRAM as a second physical link.
 The preference does not weaken admission checks. Unhealthy or otherwise
 unusable datagram paths are excluded, and the QUIC DATAGRAM path is not a
 candidate when the encoded frame exceeds its current maximum DATAGRAM size.
-If no viable datagram candidate remains, normal stream fallback applies. An
-unexpected QUIC DATAGRAM enqueue failure still does not convert the item to a
-reliable lane within that connection.
+If no eligible datagram candidate remains, normal stream fallback applies. For
+every BestEffort route, KCP's measured cost is increased by
+`best_effort_kcp_cost_penalty_pct` (25% by default), while unmeasured KCP is
+ordered after QUIC and TCP. KCP remains available when its adjusted metric
+wins or it is the only fallback. `Reliable` traffic is unaffected. After KCP
+fails away or closes for no forward progress, expiring high-priority
+conversational voice requires fresh KCP acknowledgement/RTT progress before
+admitting it again. An unexpected QUIC DATAGRAM enqueue failure still does not
+convert the item to a reliable lane within that connection.
 
 Voice-path stickiness applies to expiring conversational voice traffic. The
 timing values must be nonzero, and `voice_path_idle_reset_ms` must be at least
 the larger of the hold and challenger-confirmation values. These settings are
 loaded at startup; restart the node after changing them. Set
 `voice_path_stickiness_enabled = false` and restart to use the legacy routing
-behavior as a rollback/kill switch. A viable datagram path may replace a stream
-incumbent immediately when that stream lacks the configured material
-advantage. Minimum hold and challenger confirmation continue to govern other
-path changes, and an unusable incumbent can still be escaped immediately.
+behavior as a rollback/kill switch. An eligible datagram path may replace a
+reliable incumbent immediately. Minimum hold and challenger confirmation
+continue to govern other path changes, and an unusable incumbent can still be
+escaped immediately.
 
 S2S inbound and outbound transport queues are adaptive and byte-budgeted. The
 old `inbound_*_capacity` and `outbound_capacity` knobs are still accepted for

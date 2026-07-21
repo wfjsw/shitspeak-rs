@@ -405,6 +405,51 @@ fn stabilized_ping_interval(active: Duration, idle: Duration) -> Duration {
     if idle.is_zero() { active } else { idle }
 }
 
+fn sample_native_transport_metrics(
+    sampler: &mut BoxedNativeLossSampler,
+    transport: TransportKind,
+    peer: &PeerState,
+) -> bool {
+    let mut kcp_no_progress_close = false;
+    if let Some(rtt) = sampler.sample_rtt() {
+        peer.metrics().record_native_rtt(transport, rtt);
+    }
+    if let Some(sample) = sampler.sample() {
+        peer.metrics().record_native_loss_sample(
+            transport,
+            sample.sent_units(),
+            sample.lost_units(),
+        );
+    }
+    if let Some(runtime) = sampler.kcp_runtime_sample() {
+        peer.metrics().record_kcp_runtime_sample(
+            transport,
+            runtime.closed(),
+            runtime.pending_sender(),
+            runtime.waiting_conv(),
+            runtime.wait_snd(),
+            runtime.snd_wnd(),
+            runtime.rmt_wnd(),
+            runtime.input_queue_drops(),
+            runtime.no_progress_closes(),
+            runtime.last_input_age_ms(),
+            runtime.outstanding_no_progress_age_ms(),
+        );
+        kcp_no_progress_close = transport == TransportKind::Kcp && runtime.no_progress_closes() > 0;
+    }
+    kcp_no_progress_close
+}
+
+fn sample_final_native_transport_metrics(
+    sampler: &mut BoxedNativeLossSampler,
+    transport: TransportKind,
+    peer: &PeerState,
+) {
+    if sample_native_transport_metrics(sampler, transport, peer) {
+        peer.require_kcp_best_effort_recovery();
+    }
+}
+
 async fn run_pump<S>(
     stream: S,
     cfg: StreamPumpConfig,
@@ -701,31 +746,7 @@ async fn run_pump<S>(
 
             _ = native_tick.tick() => {
                 if let Some(sampler) = native_sampler.as_mut() {
-                    if let Some(rtt) = sampler.sample_rtt() {
-                        peer.metrics().record_native_rtt(cfg.transport, rtt);
-                    }
-                    if let Some(sample) = sampler.sample() {
-                        peer.metrics().record_native_loss_sample(
-                            cfg.transport,
-                            sample.sent_units(),
-                            sample.lost_units(),
-                        );
-                    }
-                    if let Some(runtime) = sampler.kcp_runtime_sample() {
-                        peer.metrics().record_kcp_runtime_sample(
-                            cfg.transport,
-                            runtime.closed(),
-                            runtime.pending_sender(),
-                            runtime.waiting_conv(),
-                            runtime.wait_snd(),
-                            runtime.snd_wnd(),
-                            runtime.rmt_wnd(),
-                            runtime.input_queue_drops(),
-                            runtime.no_progress_closes(),
-                            runtime.last_input_age_ms(),
-                            runtime.outstanding_no_progress_age_ms(),
-                        );
-                    }
+                    let _ = sample_native_transport_metrics(sampler, cfg.transport, &peer);
                 }
             }
 
@@ -769,6 +790,12 @@ async fn run_pump<S>(
         }
     }
 
+    // A no-progress KCP close can happen between periodic native-stat ticks.
+    // Take one final handle snapshot before dropping the sampler so BestEffort
+    // does not immediately reselect the replacement session on stale metrics.
+    if let Some(sampler) = native_sampler.as_mut() {
+        sample_final_native_transport_metrics(sampler, cfg.transport, &peer);
+    }
     closed.cancel();
     peer.notify_outbound_dispatch();
     trace!(peer=%peer.node_id(), transport=?cfg.transport, "stream pump exiting");
@@ -1714,6 +1741,23 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex};
 
     use super::super::metrics::MetricsTuning;
+    use super::super::native_stats::{KcpRuntimeSample, NativeLossSample, NativeLossSampler};
+
+    struct KcpRuntimeTestSampler {
+        no_progress_closes: u64,
+    }
+
+    impl NativeLossSampler for KcpRuntimeTestSampler {
+        fn sample(&mut self) -> Option<NativeLossSample> {
+            None
+        }
+
+        fn kcp_runtime_sample(&mut self) -> Option<KcpRuntimeSample> {
+            Some(KcpRuntimeSample::with_no_progress_closes(
+                self.no_progress_closes,
+            ))
+        }
+    }
 
     struct FlushCountingDuplex {
         inner: DuplexStream,
@@ -2098,5 +2142,36 @@ mod tests {
 
         assert!(pending.take(2).is_none());
         assert!(pending.take(1).is_some());
+    }
+
+    #[test]
+    fn native_no_progress_close_requires_fresh_kcp_ack_progress() {
+        let peer = test_peer();
+        let mut sampler: BoxedNativeLossSampler = Box::new(KcpRuntimeTestSampler {
+            no_progress_closes: 1,
+        });
+
+        assert!(sample_native_transport_metrics(
+            &mut sampler,
+            TransportKind::Kcp,
+            &peer
+        ));
+        assert!(
+            !peer.kcp_best_effort_recovery_pending(),
+            "a cumulative runtime counter must not re-arm recovery every periodic tick"
+        );
+
+        sample_final_native_transport_metrics(&mut sampler, TransportKind::Kcp, &peer);
+        assert!(peer.kcp_best_effort_recovery_pending());
+
+        peer.metrics()
+            .record_native_rtt(TransportKind::Kcp, Duration::from_millis(20));
+        assert!(!peer.kcp_best_effort_recovery_pending());
+
+        let mut ordinary_close: BoxedNativeLossSampler = Box::new(KcpRuntimeTestSampler {
+            no_progress_closes: 0,
+        });
+        sample_final_native_transport_metrics(&mut ordinary_close, TransportKind::Kcp, &peer);
+        assert!(!peer.kcp_best_effort_recovery_pending());
     }
 }

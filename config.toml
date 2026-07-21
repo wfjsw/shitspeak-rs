@@ -224,14 +224,16 @@ large_rtt_threshold_ms = 100
 lossy_link_threshold_ppm = 20000
 bulk_payload_threshold_bytes = 65536
 bulk_backlog_threshold_bytes = 262144
-# For HighPriority BestEffort ConversationalQuality traffic, viable raw UDP
-# and the fitting s2s/2 QUIC DATAGRAM delivery path form a preferred datagram
-# tier. Normal conversational cost orders that tier. A TCP, KCP, or regular
-# QUIC stream path wins only when its cost is better by at least this
-# percentage.
+# For every BestEffort route, eligible raw UDP and fitting s2s/2 QUIC DATAGRAM
+# paths are preferred over reliable streams. This percentage controls the
+# measured improvement required for sticky challenger changes between
+# otherwise comparable voice paths.
 transport_switch_improvement_pct = 15
-# A viable datagram path may replace a stream incumbent immediately when that
-# stream lacks the material advantage above; stickiness limits other changes.
+# For every BestEffort route, KCP remains a final fallback, but its measured
+# routing cost is increased by this percentage. Reliable traffic is unaffected.
+best_effort_kcp_cost_penalty_pct = 25
+# An eligible datagram path may replace a reliable incumbent immediately;
+# stickiness limits other changes.
 # Keep expiring conversational voice on a stable transport/tree path while it
 # remains usable. Changes take effect after restart; set false to roll back.
 voice_path_stickiness_enabled = true

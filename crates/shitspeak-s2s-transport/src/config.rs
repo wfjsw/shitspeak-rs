@@ -969,6 +969,8 @@ pub struct TransportRoutingPolicy {
     bulk_backlog_threshold_bytes: usize,
     #[serde(default = "default_transport_switch_improvement_pct")]
     transport_switch_improvement_pct: u32,
+    #[serde(default = "default_best_effort_kcp_cost_penalty_pct")]
+    best_effort_kcp_cost_penalty_pct: u32,
     #[serde(default = "default_transport_metric_stale_after_ms")]
     transport_metric_stale_after_ms: u64,
 }
@@ -989,6 +991,7 @@ impl Default for TransportRoutingPolicy {
             bulk_payload_threshold_bytes: default_bulk_payload_threshold_bytes(),
             bulk_backlog_threshold_bytes: default_bulk_backlog_threshold_bytes(),
             transport_switch_improvement_pct: default_transport_switch_improvement_pct(),
+            best_effort_kcp_cost_penalty_pct: default_best_effort_kcp_cost_penalty_pct(),
             transport_metric_stale_after_ms: default_transport_metric_stale_after_ms(),
         }
     }
@@ -1047,6 +1050,10 @@ impl TransportRoutingPolicy {
         self.transport_switch_improvement_pct
     }
 
+    pub fn best_effort_kcp_cost_penalty_pct(&self) -> u32 {
+        self.best_effort_kcp_cost_penalty_pct
+    }
+
     pub fn transport_metric_stale_after(&self) -> Duration {
         Duration::from_millis(self.transport_metric_stale_after_ms)
     }
@@ -1093,6 +1100,11 @@ impl TransportRoutingPolicy {
 
     pub fn with_transport_switch_improvement_pct(mut self, pct: u32) -> Self {
         self.transport_switch_improvement_pct = pct;
+        self
+    }
+
+    pub fn with_best_effort_kcp_cost_penalty_pct(mut self, pct: u32) -> Self {
+        self.best_effort_kcp_cost_penalty_pct = pct;
         self
     }
 
@@ -1500,6 +1512,9 @@ fn default_bulk_backlog_threshold_bytes() -> usize {
 fn default_transport_switch_improvement_pct() -> u32 {
     15
 }
+fn default_best_effort_kcp_cost_penalty_pct() -> u32 {
+    25
+}
 fn default_transport_metric_stale_after_ms() -> u64 {
     1_500
 }
@@ -1688,6 +1703,7 @@ mod tests {
         assert_eq!(policy.bulk_payload_threshold_bytes(), 65_536);
         assert_eq!(policy.bulk_backlog_threshold_bytes(), 262_144);
         assert_eq!(policy.transport_switch_improvement_pct(), 15);
+        assert_eq!(policy.best_effort_kcp_cost_penalty_pct(), 25);
         assert!(policy.voice_path_stickiness_enabled());
         assert_eq!(policy.voice_path_min_hold(), Duration::from_millis(750));
         assert_eq!(
@@ -1713,6 +1729,7 @@ mod tests {
             .with_bulk_payload_threshold_bytes(32_768)
             .with_bulk_backlog_threshold_bytes(131_072)
             .with_transport_switch_improvement_pct(25)
+            .with_best_effort_kcp_cost_penalty_pct(40)
             .with_transport_metric_stale_after(Duration::from_millis(900))
             .with_voice_path_stickiness_enabled(false)
             .with_voice_path_min_hold(Duration::from_millis(800))
@@ -1728,6 +1745,7 @@ mod tests {
         assert_eq!(policy.bulk_payload_threshold_bytes(), 32_768);
         assert_eq!(policy.bulk_backlog_threshold_bytes(), 131_072);
         assert_eq!(policy.transport_switch_improvement_pct(), 25);
+        assert_eq!(policy.best_effort_kcp_cost_penalty_pct(), 40);
         assert!(!policy.voice_path_stickiness_enabled());
         assert_eq!(policy.voice_path_min_hold(), Duration::from_millis(800));
         assert_eq!(
@@ -1738,6 +1756,24 @@ mod tests {
         assert_eq!(
             policy.transport_metric_stale_after(),
             Duration::from_millis(900)
+        );
+    }
+
+    #[test]
+    fn transport_routing_policy_serde_defaults_kcp_penalty() {
+        let tuning: TransportTuning = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                "transport_switch_improvement_pct = 20",
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("transport tuning parses");
+
+        assert_eq!(
+            tuning.routing_policy().best_effort_kcp_cost_penalty_pct(),
+            25
         );
     }
 
@@ -1755,6 +1791,7 @@ mod tests {
                     bulk_payload_threshold_bytes = 32768
                     bulk_backlog_threshold_bytes = 98304
                     transport_switch_improvement_pct = 20
+                    best_effort_kcp_cost_penalty_pct = 35
                     transport_metric_stale_after_ms = 800
                     voice_path_stickiness_enabled = false
                     voice_path_min_hold_ms = 900
@@ -1780,6 +1817,7 @@ mod tests {
         assert_eq!(policy.bulk_payload_threshold_bytes(), 32_768);
         assert_eq!(policy.bulk_backlog_threshold_bytes(), 98_304);
         assert_eq!(policy.transport_switch_improvement_pct(), 20);
+        assert_eq!(policy.best_effort_kcp_cost_penalty_pct(), 35);
         assert!(!policy.voice_path_stickiness_enabled());
         assert_eq!(policy.voice_path_min_hold(), Duration::from_millis(900));
         assert_eq!(

@@ -36,7 +36,9 @@ use super::metrics::{
     VoiceTransportBindingSnapshot, VoiceTransportChallengerOutcome,
     VoiceTransportChallengerSnapshot,
 };
-use super::service_level::{MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind};
+use super::service_level::{
+    DeliveryPath, MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind,
+};
 
 const MAX_OBSERVED_REMOTE_IPS: usize = 8;
 const BACKOFF_JITTER_DIVISOR: u64 = 5;
@@ -937,6 +939,13 @@ impl QuicV2SessionSender {
                 },
             );
         }
+        self.try_send_stream(frame)
+    }
+
+    fn try_send_stream(
+        &self,
+        frame: OutboundFrame,
+    ) -> Result<SessionSendOutcome, SessionTrySendError> {
         self.stream_sender(frame.class())
             .try_send(frame)
             .map(|()| SessionSendOutcome::default())
@@ -950,6 +959,11 @@ impl QuicV2SessionSender {
         if level == ServiceLevel::BestEffort {
             return (self.datagram.depth_bytes(), self.datagram.capacity_bytes());
         }
+        let sender = self.stream_sender(class);
+        (sender.depth_bytes(), sender.capacity_bytes())
+    }
+
+    fn stream_depth_capacity(&self, class: MessageClass) -> (usize, usize) {
         let sender = self.stream_sender(class);
         (sender.depth_bytes(), sender.capacity_bytes())
     }
@@ -1054,6 +1068,17 @@ impl SessionSender {
         }
     }
 
+    pub(crate) fn try_send_for_path(
+        &self,
+        path: DeliveryPath,
+        frame: OutboundFrame,
+    ) -> Result<SessionSendOutcome, SessionTrySendError> {
+        match (self, path) {
+            (Self::QuicV2(sender), DeliveryPath::QuicStream) => sender.try_send_stream(frame),
+            _ => self.try_send(frame),
+        }
+    }
+
     pub(crate) fn depth_capacity(
         &self,
         level: ServiceLevel,
@@ -1062,6 +1087,18 @@ impl SessionSender {
         match self {
             Self::Legacy(sender) => (sender.depth_bytes(), sender.capacity_bytes()),
             Self::QuicV2(sender) => sender.depth_capacity(level, class),
+        }
+    }
+
+    pub(crate) fn depth_capacity_for_path(
+        &self,
+        path: DeliveryPath,
+        level: ServiceLevel,
+        class: MessageClass,
+    ) -> (usize, usize) {
+        match (self, path) {
+            (Self::QuicV2(sender), DeliveryPath::QuicStream) => sender.stream_depth_capacity(class),
+            _ => self.depth_capacity(level, class),
         }
     }
 
@@ -1324,6 +1361,9 @@ pub(crate) struct PeerState {
     expired_outbound_drops: ExpiredOutboundDropCounters,
     transport_health_exclusions:
         Mutex<HashMap<(TransportKind, TransportHealthExclusionReason), u64>>,
+    /// KCP is kept out of BestEffort selection after failaway/no-progress
+    /// until the native KCP sampler observes a newer ACK-derived RTT sample.
+    kcp_best_effort_recovery_after_rtt_samples: Mutex<Option<u64>>,
     voice_transport_binding: Mutex<VoiceTransportBinding>,
     outbound_dispatch_notify: Notify,
     /// Set true while a connect attempt is in flight, to prevent duplicate
@@ -1362,6 +1402,7 @@ impl PeerState {
             udp_datagram_mtu_last_probe: Mutex::new(None),
             expired_outbound_drops: ExpiredOutboundDropCounters::default(),
             transport_health_exclusions: Mutex::new(HashMap::new()),
+            kcp_best_effort_recovery_after_rtt_samples: Mutex::new(None),
             voice_transport_binding: Mutex::new(VoiceTransportBinding::default()),
             outbound_dispatch_notify: Notify::new(),
             connecting: AtomicBool::new(false),
@@ -1889,21 +1930,6 @@ impl PeerState {
             .map(|stream| stream.sender.clone())
     }
 
-    /// Obtain the newest live legacy QUIC sender for reliable-stream fallback.
-    pub(crate) fn try_get_quic_v1_stream(&self) -> Option<SessionSender> {
-        let mut streams = self.streams.lock();
-        prune_dead_streams(&mut streams);
-        streams
-            .values()
-            .filter(|stream| {
-                stream.transport() == TransportKind::Quic
-                    && stream.is_alive()
-                    && stream.sender.quic_v2_max_datagram_size().is_none()
-            })
-            .max_by_key(|stream| stream.installed_at())
-            .map(|stream| stream.sender.clone())
-    }
-
     pub fn record_outbound_queue_sample(
         &self,
         class: MessageClass,
@@ -2080,6 +2106,26 @@ impl PeerState {
         let mut counters = self.transport_health_exclusions.lock();
         let counter = counters.entry((transport, reason)).or_insert(0);
         *counter = counter.saturating_add(1);
+    }
+
+    pub(crate) fn require_kcp_best_effort_recovery(&self) {
+        let rtt_samples = self.metrics.rtt_sample_count(TransportKind::Kcp);
+        *self.kcp_best_effort_recovery_after_rtt_samples.lock() = Some(rtt_samples);
+        self.notify_outbound_dispatch();
+    }
+
+    pub(crate) fn kcp_best_effort_recovery_pending(&self) -> bool {
+        let rtt_samples = self.metrics.rtt_sample_count(TransportKind::Kcp);
+        let mut required_after = self.kcp_best_effort_recovery_after_rtt_samples.lock();
+        let Some(baseline) = *required_after else {
+            return false;
+        };
+        if rtt_samples > baseline {
+            *required_after = None;
+            false
+        } else {
+            true
+        }
     }
 
     pub(crate) fn transport_health_exclusion_status(
@@ -2535,6 +2581,44 @@ mod tests {
                 assert_eq!(received.class(), class);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn quic_v2_sender_can_force_best_effort_onto_a_reliable_stream_path() {
+        let (sender, receivers) = QuicV2SessionSender::new(64 * 1024, 64 * 1024, 256 * 1024, 1200);
+        let session = SessionSender::QuicV2(sender);
+        let (_control, mut high, _regular, datagram) = receivers.into_parts();
+
+        session
+            .try_send_for_path(
+                DeliveryPath::QuicStream,
+                OutboundFrame::new(
+                    ServiceLevel::BestEffort,
+                    MessageClass::HighPriority,
+                    Bytes::from_static(b"stream fallback"),
+                ),
+            )
+            .expect("reliable-stream fallback enqueue");
+
+        let (stream_depth, stream_capacity) = session.depth_capacity_for_path(
+            DeliveryPath::QuicStream,
+            ServiceLevel::BestEffort,
+            MessageClass::HighPriority,
+        );
+        let (datagram_depth, datagram_capacity) = session.depth_capacity_for_path(
+            DeliveryPath::QuicDatagram,
+            ServiceLevel::BestEffort,
+            MessageClass::HighPriority,
+        );
+        assert!(stream_depth > 0);
+        assert!(stream_capacity > 0);
+        assert_eq!(datagram_depth, 0);
+        assert!(datagram_capacity > 0);
+
+        let received = high.recv().await.expect("high-priority reliable lane");
+        assert_eq!(received.level(), ServiceLevel::BestEffort);
+        assert_eq!(received.payload().as_ref(), b"stream fallback");
+        assert_eq!(datagram.depth_bytes(), 0);
     }
 
     #[tokio::test]

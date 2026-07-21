@@ -2202,6 +2202,14 @@ impl PeerMetrics {
         self.record_data_health_sample(transport, true);
     }
 
+    pub(crate) fn rtt_sample_count(&self, transport: TransportKind) -> u64 {
+        self.inner
+            .lock()
+            .get(&transport)
+            .map(|entry| entry.samples)
+            .unwrap_or(0)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_kcp_runtime_sample(
         &self,
@@ -2529,6 +2537,7 @@ impl ExpiredOutboundDropStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TransportHealthExclusionReason {
     KcpFailaway,
+    KcpRecoveryPending,
     StaleQueue,
 }
 
@@ -2689,6 +2698,7 @@ impl TransportHealthExclusionReason {
     pub fn name(self) -> &'static str {
         match self {
             Self::KcpFailaway => "kcp_failaway",
+            Self::KcpRecoveryPending => "kcp_recovery_pending",
             Self::StaleQueue => "stale_queue",
         }
     }
