@@ -3154,10 +3154,11 @@ fn delivery_candidates(
         } else {
             DeliveryPath::stream(transport).expect("non-UDP transport must have a stream path")
         };
+        let quic_v2 = sender.quic_v2_max_datagram_size().is_some();
         candidates.push(DeliveryCandidate {
             path,
             sender,
-            quic_v2: false,
+            quic_v2,
         });
     }
 
@@ -3457,9 +3458,11 @@ fn try_dispatch_envelope_with_policy(
             && level != ServiceLevel::BestEffort
             && !allow_regular_backlog
             && options.expires_at().is_none()
+            && !quic_v2
             && sender.depth_capacity_for_path(path, level, class).0 > 0
         {
-            record_outbound_stream_queue_sample(peer, path, class, &sender, level, true);
+            // Legacy streams share one FIFO across classes. Stage one Regular
+            // frame at a time so late Control and HighPriority frames can pass.
             continue;
         }
         if stream_path {
@@ -3992,6 +3995,7 @@ mod tests {
         ActiveStream, QuicV2SessionReceivers, QuicV2SessionSender, TransportPayloadVariant,
     };
     use super::*;
+    use futures_util::FutureExt as _;
 
     #[tokio::test]
     async fn direct_config_rejects_undersized_enabled_quic_datagram_buffers() {
@@ -4250,6 +4254,75 @@ mod tests {
         assert_eq!(
             receivers[1].try_recv().unwrap().payload(),
             &Bytes::from_static(b"ready high")
+        );
+    }
+
+    #[test]
+    fn legacy_regular_staging_deferral_is_not_reported_as_queue_full() {
+        let (peer, mut receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        fill_stream_queue(&peer, TransportKind::Tcp, 300);
+
+        let deferred = try_dispatch_envelope(
+            &peer,
+            OutboundEnvelope::fixed_transport(
+                TransportKind::Tcp,
+                MessageClass::Regular,
+                Bytes::from_static(b"next regular"),
+                SendOptions::default(),
+            ),
+            TransportRoutingPolicy::default(),
+        );
+
+        assert!(
+            deferred.is_err(),
+            "legacy Regular staging should stay shallow"
+        );
+        assert_eq!(receivers[0].try_recv().unwrap().payload().len(), 300);
+        assert!(receivers[0].try_recv().is_err());
+        assert_eq!(
+            peer.outbound_stream_queue_status(TransportKind::Tcp)
+                .unwrap()
+                .full_samples(),
+            0,
+            "a scheduling deferral is not queue exhaustion"
+        );
+    }
+
+    #[test]
+    fn quic_v2_regular_lane_admits_backlog_until_actual_capacity() {
+        let peer = PeerState::new(
+            2,
+            Duration::from_millis(10),
+            Duration::from_secs(60),
+            MetricsTuning::default(),
+            1024 * 1024,
+        );
+        let (_control, _high, mut regular, _datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1400).into_parts();
+        fill_stream_queue(&peer, TransportKind::Quic, 300);
+
+        try_dispatch_envelope(
+            &peer,
+            OutboundEnvelope::fixed_transport(
+                TransportKind::Quic,
+                MessageClass::Regular,
+                Bytes::from_static(b"next regular"),
+                SendOptions::default(),
+            ),
+            TransportRoutingPolicy::default(),
+        )
+        .expect("a partially occupied QUIC v2 Regular lane should remain admissible");
+
+        assert_eq!(regular.try_recv().unwrap().payload().len(), 300);
+        assert_eq!(
+            regular.try_recv().unwrap().payload(),
+            b"next regular".as_slice()
+        );
+        assert_eq!(
+            peer.outbound_stream_queue_status(TransportKind::Quic)
+                .unwrap()
+                .full_samples(),
+            0
         );
     }
 
@@ -6527,6 +6600,53 @@ mod tests {
         assert_eq!(
             recovery_exclusion(SendOptions::default().expire_after(Duration::from_secs(2))),
             None
+        );
+    }
+
+    #[test]
+    fn persistent_kcp_failaway_does_not_wake_its_own_dispatcher() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Kcp]);
+        assert!(
+            peer.wait_for_outbound_dispatch_signal()
+                .now_or_never()
+                .is_some(),
+            "stream installation should signal dispatch"
+        );
+
+        fill_stream_queue(&peer, TransportKind::Kcp, 64 * 1024);
+        peer.metrics()
+            .record_rtt(TransportKind::Kcp, Duration::from_millis(40));
+        let snapshot = peer.metrics().snapshot_per_transport();
+        let selection = TransportSelectionConfig::from(TransportRoutingPolicy::default());
+        let now = snapshot[&TransportKind::Kcp]
+            .last_update()
+            .expect("KCP metric timestamp")
+            + selection.kcp.failaway_with_alternative();
+
+        for _ in 0..3 {
+            assert_eq!(
+                transport_candidate_exclusion_reason(
+                    &peer,
+                    TransportKind::Kcp,
+                    ServiceLevel::BestEffort,
+                    RoutingMetric::ConversationalQuality,
+                    MessageClass::HighPriority,
+                    SendOptions::default(),
+                    &snapshot,
+                    selection,
+                    true,
+                    now,
+                ),
+                Some(TransportHealthExclusionReason::KcpFailaway)
+            );
+        }
+
+        assert!(
+            peer.wait_for_outbound_dispatch_signal()
+                .now_or_never()
+                .is_none(),
+            "persistent failaway selection must not signal its own dispatcher"
         );
     }
 

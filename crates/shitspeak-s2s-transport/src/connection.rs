@@ -2109,9 +2109,31 @@ impl PeerState {
     }
 
     pub(crate) fn require_kcp_best_effort_recovery(&self) {
-        let rtt_samples = self.metrics.rtt_sample_count(TransportKind::Kcp);
-        *self.kcp_best_effort_recovery_after_rtt_samples.lock() = Some(rtt_samples);
-        self.notify_outbound_dispatch();
+        let mut required_after = self.kcp_best_effort_recovery_after_rtt_samples.lock();
+        if required_after.is_none() {
+            *required_after = Some(self.metrics.rtt_sample_count(TransportKind::Kcp));
+        }
+    }
+
+    pub(crate) fn record_native_transport_rtt(&self, transport: TransportKind, rtt: Duration) {
+        self.metrics.record_native_rtt(transport, rtt);
+        if transport != TransportKind::Kcp {
+            return;
+        }
+
+        let rtt_samples = self.metrics.rtt_sample_count(transport);
+        let recovery_completed = {
+            let mut required_after = self.kcp_best_effort_recovery_after_rtt_samples.lock();
+            if required_after.is_some_and(|baseline| rtt_samples > baseline) {
+                *required_after = None;
+                true
+            } else {
+                false
+            }
+        };
+        if recovery_completed {
+            self.notify_outbound_dispatch();
+        }
     }
 
     pub(crate) fn kcp_best_effort_recovery_pending(&self) -> bool {
@@ -2542,6 +2564,7 @@ pub(crate) fn retry_cap_for_last_seen_age(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt as _;
 
     #[tokio::test]
     async fn quic_v2_sender_routes_best_effort_before_message_class() {
@@ -2891,6 +2914,51 @@ mod tests {
             MetricsTuning::default(),
             1024 * 1024,
         )
+    }
+
+    #[test]
+    fn kcp_recovery_arming_does_not_move_an_existing_rtt_baseline() {
+        let peer = peer_for_address_tests();
+        peer.require_kcp_best_effort_recovery();
+        peer.metrics()
+            .record_native_rtt(TransportKind::Kcp, Duration::from_millis(40));
+
+        peer.require_kcp_best_effort_recovery();
+
+        assert!(
+            !peer.kcp_best_effort_recovery_pending(),
+            "re-arming must not replace the original RTT baseline"
+        );
+    }
+
+    #[test]
+    fn kcp_recovery_wakes_dispatch_only_after_ack_progress() {
+        let peer = peer_for_address_tests();
+        peer.require_kcp_best_effort_recovery();
+
+        assert!(
+            peer.wait_for_outbound_dispatch_signal()
+                .now_or_never()
+                .is_none(),
+            "arming recovery must not wake the dispatcher"
+        );
+
+        peer.record_native_transport_rtt(TransportKind::Kcp, Duration::from_millis(40));
+        assert!(
+            peer.wait_for_outbound_dispatch_signal()
+                .now_or_never()
+                .is_some(),
+            "fresh KCP ACK progress should wake the dispatcher"
+        );
+        assert!(!peer.kcp_best_effort_recovery_pending());
+
+        peer.record_native_transport_rtt(TransportKind::Kcp, Duration::from_millis(35));
+        assert!(
+            peer.wait_for_outbound_dispatch_signal()
+                .now_or_never()
+                .is_none(),
+            "RTT sampling without a pending recovery must not wake the dispatcher"
+        );
     }
 
     #[test]

@@ -412,7 +412,7 @@ fn sample_native_transport_metrics(
 ) -> bool {
     let mut kcp_no_progress_close = false;
     if let Some(rtt) = sampler.sample_rtt() {
-        peer.metrics().record_native_rtt(transport, rtt);
+        peer.record_native_transport_rtt(transport, rtt);
     }
     if let Some(sample) = sampler.sample() {
         peer.metrics().record_native_loss_sample(
@@ -1745,11 +1745,16 @@ mod tests {
 
     struct KcpRuntimeTestSampler {
         no_progress_closes: u64,
+        rtt: Option<Duration>,
     }
 
     impl NativeLossSampler for KcpRuntimeTestSampler {
         fn sample(&mut self) -> Option<NativeLossSample> {
             None
+        }
+
+        fn sample_rtt(&mut self) -> Option<Duration> {
+            self.rtt.take()
         }
 
         fn kcp_runtime_sample(&mut self) -> Option<KcpRuntimeSample> {
@@ -2149,6 +2154,7 @@ mod tests {
         let peer = test_peer();
         let mut sampler: BoxedNativeLossSampler = Box::new(KcpRuntimeTestSampler {
             no_progress_closes: 1,
+            rtt: None,
         });
 
         assert!(sample_native_transport_metrics(
@@ -2164,12 +2170,22 @@ mod tests {
         sample_final_native_transport_metrics(&mut sampler, TransportKind::Kcp, &peer);
         assert!(peer.kcp_best_effort_recovery_pending());
 
-        peer.metrics()
-            .record_native_rtt(TransportKind::Kcp, Duration::from_millis(20));
+        let mut replacement_close: BoxedNativeLossSampler = Box::new(KcpRuntimeTestSampler {
+            no_progress_closes: 1,
+            rtt: Some(Duration::from_millis(20)),
+        });
+        sample_final_native_transport_metrics(&mut replacement_close, TransportKind::Kcp, &peer);
+        assert!(
+            peer.kcp_best_effort_recovery_pending(),
+            "final ACK progress must clear the old gate before the close installs a new baseline"
+        );
+
+        peer.record_native_transport_rtt(TransportKind::Kcp, Duration::from_millis(20));
         assert!(!peer.kcp_best_effort_recovery_pending());
 
         let mut ordinary_close: BoxedNativeLossSampler = Box::new(KcpRuntimeTestSampler {
             no_progress_closes: 0,
+            rtt: None,
         });
         sample_final_native_transport_metrics(&mut ordinary_close, TransportKind::Kcp, &peer);
         assert!(!peer.kcp_best_effort_recovery_pending());
