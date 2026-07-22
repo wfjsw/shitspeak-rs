@@ -13,6 +13,7 @@ use crate::protocol::{
     WebGatewayConfig, WebMoqGatewayConfig, WebPermissionDenied, WebServerConfig, WebServerSync,
     WebTransportKind, WebUserRemove, WebUserState, WebVolumeAdjustment, encode_server_event,
 };
+use crate::session::client_is_current;
 use crate::simd;
 use shitspeak_runtime::api::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
@@ -21,6 +22,7 @@ use shitspeak_runtime::api::{
 use shitspeak_runtime::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
 use shitspeak_runtime::client::client_session_identifier::ClientSessionIdentifier;
 use shitspeak_runtime::client::state_log::{ClientStateLogEntry, ClientStateOperation};
+use shitspeak_runtime::client::user_info::Credential;
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{AsyncMessageHandlerExt, Client};
 use shitspeak_runtime::messages::Message;
@@ -444,6 +446,7 @@ impl SignalingContext {
     fn auxiliary_data(&self, session_id: u32) -> AuthenticateAuxiliaryData {
         let _ = (self.peer_addr, self.local_addr);
         AuthenticateAuxiliaryData {
+            auth_session_id: None,
             certificate_hash: None,
             session_id,
             ip_address: canonical_authenticator_ip(self.real_ip),
@@ -517,8 +520,23 @@ where
     send_gateway_config(&mut stream, &context, &mut session).await?;
     loop {
         drain_web_visibility_reloads(&mut stream, &context, &mut session, false).await?;
+        let disconnected_client = session.client.clone();
+        let has_client = disconnected_client.is_some();
         tokio::select! {
             biased;
+
+            _ = async move {
+                if let Some(client) = disconnected_client {
+                    client.disconnected().await;
+                }
+            }, if has_client => {
+                if let Some(peer) = session.peer.as_ref() {
+                    peer.close().await;
+                }
+                write_websocket_frame(&mut stream, WebSocketOpcode::Close, &[]).await?;
+                stream.shutdown().await?;
+                return Ok(());
+            }
 
             visibility_reload = async {
                 match session.visibility_reload_rx.as_mut() {
@@ -811,11 +829,13 @@ fn server_event_from_message(message: Message) -> Option<ServerEvent> {
 }
 
 fn web_user_state(user_state: shitspeak_runtime::mumble_proto::UserState) -> WebUserState {
+    let user_id_cleared = user_state.user_id == Some(u32::MAX);
     WebUserState {
         session: user_state.session,
         actor: user_state.actor,
         name: user_state.name,
-        user_id: user_state.user_id,
+        user_id: user_state.user_id.filter(|user_id| *user_id != u32::MAX),
+        user_id_cleared,
         channel_id: user_state.channel_id,
         mute: user_state.mute,
         deaf: user_state.deaf,
@@ -1230,16 +1250,31 @@ async fn handle_signaling_authenticate(
                 .authenticate(&username, Some(password.as_str()), &auxiliary)
                 .await
             {
-                Ok(result) => {
+                Ok(result) if result.user_id != Some(u32::MAX) => {
                     handle_successful_password_auth(
                         stream,
                         context,
                         session,
                         preallocated,
                         result,
-                        Some(username.as_str()),
+                        Some(Credential::new(username, Some(password))),
                     )
                     .await
+                }
+                Ok(_) => {
+                    if let Some((server, client, _)) = preallocated {
+                        let server_id = client.server_id();
+                        server
+                            .get_clients()
+                            .remove_client_instance_in_server(
+                                &server_id,
+                                client.get_session_id(),
+                                client.client_instance_id(),
+                            )
+                            .await;
+                        session.session_id = DEFAULT_WEB_SESSION_ID;
+                    }
+                    send_authentication_rejection(stream, AuthenticationRejection::RetryLater).await
                 }
                 Err(rejection) => {
                     if let Some((server, client, _)) = preallocated {
@@ -1287,6 +1322,11 @@ async fn handle_signaling_client_command(
         return Ok(());
     };
 
+    if !client_is_current(server, client).await {
+        send_websocket_error(stream, "web client is no longer connected").await?;
+        return Ok(());
+    }
+
     if let ClientCommand::VoiceControl { ptt, target, epoch } = command {
         let Some(peer) = session.peer.as_ref() else {
             send_websocket_error(stream, "webrtc offer required before voice control").await?;
@@ -1302,7 +1342,15 @@ async fn handle_signaling_client_command(
     let Some(message) = control_message_from_command(client, command) else {
         return Ok(());
     };
-    match client.handle_message(server, message).await {
+    let result = tokio::select! {
+        biased;
+        _ = client.disconnected() => {
+            send_websocket_error(stream, "web client is no longer connected").await?;
+            return Ok(());
+        }
+        result = client.handle_message(server, message) => result,
+    };
+    match result {
         Ok(()) => Ok(()),
         Err(error) => {
             client.in_tracing_scope(|| {
@@ -1371,14 +1419,13 @@ async fn handle_successful_password_auth(
         tokio::sync::mpsc::Receiver<Message>,
     )>,
     result: AuthenticateResult,
-    cache_username: Option<&str>,
+    credential: Option<Credential>,
 ) -> io::Result<()> {
     let display_name = result.display_name.clone();
     let mut initial_state_client = None;
     if let Some((server, client, outbound_rx)) = preallocated {
         session.outbound_rx = Some(outbound_rx);
-        crate::session::configure_authenticated_client(&server, &client, result, cache_username)
-            .await;
+        crate::session::configure_authenticated_client(&server, &client, result, credential).await;
         session.session_id = u32::from(client.get_session_id());
         initial_state_client = Some((Arc::clone(&server), Arc::clone(&client)));
         session.client = Some(client);
@@ -1395,8 +1442,7 @@ async fn handle_successful_password_auth(
             )
             .await;
         session.outbound_rx = Some(outbound_rx);
-        crate::session::configure_authenticated_client(server, &client, result, cache_username)
-            .await;
+        crate::session::configure_authenticated_client(server, &client, result, credential).await;
         session.session_id = u32::from(client.get_session_id());
         initial_state_client = Some((Arc::clone(server), Arc::clone(&client)));
         session.client = Some(client);
@@ -2267,7 +2313,9 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use shitspeak_runtime::api::{AuthenticateResult, AuthenticationRejection};
+    use shitspeak_runtime::api::{
+        AuthenticateResult, AuthenticationExpiryAction, AuthenticationRejection,
+    };
     use shitspeak_runtime::localization::Language;
 
     #[test]
@@ -2691,6 +2739,28 @@ mod tests {
         assert_ne!(session, DEFAULT_WEB_SESSION_ID);
         assert_eq!(server.get_clients().local_len().await, 1);
 
+        let authenticated_client = server
+            .get_clients()
+            .get_client(ClientSessionIdentifier::from(session))
+            .await
+            .expect("authenticated web client");
+        {
+            let extended = authenticated_client.user_info_extended().await;
+            let credential = extended.get_credential().as_ref().expect("credential");
+            assert_eq!(credential.username, "alice");
+            assert_eq!(credential.password.as_deref(), Some("secret"));
+        }
+        {
+            let local = authenticated_client.read_local_state();
+            let local = local.as_ref().expect("local state");
+            assert_eq!(local.auth_session_id(), Some("web-auth-session"));
+            assert_eq!(
+                local.authentication_expiry_action(),
+                AuthenticationExpiryAction::Reauth
+            );
+            assert!(local.authenticated_until().is_some());
+        }
+
         let frame = read_server_frame(&mut client).await;
         let WebSocketFrame::Text(text) = frame else {
             panic!("expected text frame");
@@ -2979,6 +3049,13 @@ mod tests {
                 return Err(AuthenticationRejection::WrongPassword);
             }
             Ok(AuthenticateResult {
+                auth_session_id: Some("web-auth-session".to_string()),
+                authenticated_until: Some(
+                    "2099-01-01T00:00:00Z"
+                        .parse()
+                        .expect("valid authentication expiry"),
+                ),
+                authentication_expiry_action: AuthenticationExpiryAction::Reauth,
                 user_id: Some(7),
                 display_name: Some("Alice".to_string()),
                 groups: vec!["web".to_string()],

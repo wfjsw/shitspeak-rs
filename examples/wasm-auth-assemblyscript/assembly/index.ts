@@ -33,13 +33,23 @@ export function dealloc(ptr: i32, _len: i32): void {
 class AuthenticateRequest {
   username: string = "";
   password: string | null = null;
+  auxiliary_data: AuthenticateAuxiliaryData = new AuthenticateAuxiliaryData();
 }
 
+@json
+class AuthenticateAuxiliaryData {
+  @omitnull()
+  auth_session_id: string | null = null;
+}
+
+// String-valued wire enum: "reauth", "kick", or "deregister".
 @json
 class AuthenticateResponse {
   accepted: bool = true;
   @omitnull()
   rejection: string | null = null;
+  @omitnull()
+  auth_session_id: string | null = null;
   // Nullable integer: use JSON.Box so the field serialises as a JSON number
   // when set, or is omitted entirely when null.
   @omitnull()
@@ -57,6 +67,9 @@ class AuthenticateResponse {
   texture_url: string | null = null;
   @omitnull()
   comment_url: string | null = null;
+  @omitnull()
+  authenticated_until: string | null = null;
+  authentication_expiry_action: string = "kick";
 }
 
 @json

@@ -41,12 +41,15 @@ mode = "exec_long_running" # exec_ephemeral, exec_long_running
 long_running_request_mode = "serialized" # serialized, async
 command = "auth-helper"
 args = []
+environment = { AUTH_ENDPOINT = "https://auth.example", AUTH_MODE = "production" }
 working_dir = "auth"
 timeout_ms = 30000
 max_response_bytes = 16777216
 # uid = 1001
 # gid = 1001
 ```
+
+`environment` adds or overrides variables in the helper process environment. Other variables are inherited from the server process, and configured values are passed literally without expansion.
 
 Unix `uid` and `gid` dropping is optional. If the systemd unit is hardened, extra capabilities may be required for child-process user/group changes. See [Deployment](deployment.md).
 
@@ -99,6 +102,7 @@ Successful authentication can provide identity, display name, groups, virtual se
 ```json
 {
   "accepted": true,
+  "auth_session_id": "auth-session-7f3c",
   "user_id": 42,
   "display_name": "Alice",
   "groups": ["admin"],
@@ -106,11 +110,21 @@ Successful authentication can provide identity, display name, groups, virtual se
   "language": "en",
   "max_bandwidth": null,
   "texture_url": null,
-  "comment_url": null
+  "comment_url": null,
+  "authenticated_until": "2026-07-22T20:30:00Z",
+  "authentication_expiry_action": "reauth"
 }
 ```
 
 `max_bandwidth`, when present, overrides the configured `max_bandwidth` value advertised to that authenticated client.
+
+`auth_session_id` is an optional opaque identifier supplied by the authenticator. The server retains it for the connection and includes it as `auxiliary_data.auth_session_id` in later authentication requests for that connection, including expiry-triggered reauthentication.
+
+`authenticated_until` is an optional RFC 3339 timestamp. The deadline and action are connection-local state and are not persisted. Once the deadline has passed, the server applies `authentication_expiry_action` on an idle-reaper pass. The action defaults to `kick` when omitted:
+
+- `reauth` authenticates the user again with the original credential. The current `auth_session_id`, when one exists, is included in the request. The existing authenticated state remains in effect while the request is pending. A failed reauthentication disconnects the user; a successful response refreshes the user's identity, groups, local authentication metadata, and expiry settings.
+- `kick` disconnects the user.
+- `deregister` removes the connection's registered-user identity, reevaluates its ACL access, and disconnects it if it can no longer traverse the root channel. Other session state is retained.
 
 For rejection, return `accepted: false` and a `rejection` value such as `no_such_user`, `invalid_username`, `wrong_password`, or `retry_later`.
 

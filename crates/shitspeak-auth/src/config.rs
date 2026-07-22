@@ -91,10 +91,7 @@ impl ExecAuthenticatorConfig {
         self
     }
 
-    pub fn with_environment<K, V>(
-        mut self,
-        environment: impl IntoIterator<Item = (K, V)>,
-    ) -> Self
+    pub fn with_environment<K, V>(mut self, environment: impl IntoIterator<Item = (K, V)>) -> Self
     where
         K: Into<String>,
         V: Into<String>,

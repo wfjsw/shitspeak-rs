@@ -366,6 +366,7 @@ mode = "exec_long_running" # exec_ephemeral, exec_long_running
 long_running_request_mode = "serialized" # serialized, async
 command = "auth-helper"
 args = ["--config", "auth/config.toml"]
+environment = { AUTH_ENDPOINT = "https://auth.example", AUTH_MODE = "production" }
 working_dir = "auth"
 timeout_ms = 30000
 max_response_bytes = 16777216
@@ -373,7 +374,7 @@ max_response_bytes = 16777216
 # gid = 1001
 ```
 
-Exec authenticators exchange JSON over stdin/stdout. `long_running_request_mode = "serialized"` keeps one request in flight at a time for compatibility. `async` allows multiple in-flight requests and requires each response to echo the request's `request_id`. See [Authentication](authentication.md) for request/response contracts and WASM imports.
+Exec authenticators exchange JSON over stdin/stdout. `environment` adds or overrides variables in the helper process environment; other variables are inherited from the server, and configured values are literal. `long_running_request_mode = "serialized"` keeps one request in flight at a time for compatibility. `async` allows multiple in-flight requests and requires each response to echo the request's `request_id`. See [Authentication](authentication.md) for request/response contracts and WASM imports.
 
 ## Access Control
 

@@ -24,12 +24,17 @@ use tokio::{
 };
 use tokio_rustls::server::TlsStream;
 
+use crate::api::AuthenticationExpiryAction;
 use crate::{
     client::{
-        client_global_state::ClientGlobalState, client_local_state::ClientLocalState,
-        client_session_identifier::ClientSessionIdentifier, client_stats::ClientStats,
-        global_state_guard::GlobalStateWriteGuard, options::ClientOptions,
-        user_info::UserInfoExtended, voice_target::VoiceTarget,
+        client_global_state::ClientGlobalState,
+        client_local_state::{ClientLocalState, ExpiredAuthenticationAction},
+        client_session_identifier::ClientSessionIdentifier,
+        client_stats::ClientStats,
+        global_state_guard::GlobalStateWriteGuard,
+        options::ClientOptions,
+        user_info::UserInfoExtended,
+        voice_target::VoiceTarget,
     },
     client_repository::ClientRepository,
     errors::{ReadProtoMessageError, WriteProtoMessageError},
@@ -1747,6 +1752,58 @@ impl Client {
             Some(state) => state.set_authenticated(value),
             None => panic!("Accessing local state on remote user"),
         }
+    }
+
+    pub fn is_reauthentication_in_progress(&self) -> bool {
+        self.local_state
+            .read()
+            .as_ref()
+            .is_some_and(ClientLocalState::is_reauthentication_in_progress)
+    }
+
+    pub fn set_authentication_expiry(
+        &self,
+        auth_session_id: Option<String>,
+        authenticated_until: Option<DateTime<Utc>>,
+        authentication_expiry_action: AuthenticationExpiryAction,
+    ) {
+        let mut local_state = self.local_state.write();
+        let state = local_state
+            .as_mut()
+            .expect("Accessing authentication expiry on remote user");
+        state.set_authentication_expiry(
+            auth_session_id,
+            authenticated_until,
+            authentication_expiry_action,
+        );
+    }
+
+    pub fn complete_authentication(
+        &self,
+        auth_session_id: Option<String>,
+        authenticated_until: Option<DateTime<Utc>>,
+        authentication_expiry_action: AuthenticationExpiryAction,
+    ) {
+        let mut local_state = self.local_state.write();
+        let state = local_state
+            .as_mut()
+            .expect("Completing authentication on remote user");
+        state.complete_authentication(
+            auth_session_id,
+            authenticated_until,
+            authentication_expiry_action,
+        );
+    }
+
+    pub(crate) fn take_expired_authentication(
+        &self,
+        now: DateTime<Utc>,
+        allow_reauth: bool,
+    ) -> Option<ExpiredAuthenticationAction> {
+        self.local_state
+            .write()
+            .as_mut()
+            .and_then(|state| state.take_expired_authentication(now, allow_reauth))
     }
 
     pub fn language(&self) -> crate::localization::Language {

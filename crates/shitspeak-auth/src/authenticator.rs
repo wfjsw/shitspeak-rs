@@ -2,6 +2,8 @@ use std::net::IpAddr;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use shitspeak_core::ProtocolVersion;
 
 use crate::Language;
@@ -43,6 +45,21 @@ pub struct AuthenticateResult {
     pub texture_url: Option<String>,
     /// Optional URL for the user's comment blob.
     pub comment_url: Option<String>,
+    /// Opaque authentication-session identifier returned by the authenticator.
+    pub auth_session_id: Option<String>,
+    /// Absolute time at which this authentication result expires.
+    pub authenticated_until: Option<DateTime<Utc>>,
+    /// Action to take when `authenticated_until` has passed.
+    pub authentication_expiry_action: AuthenticationExpiryAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthenticationExpiryAction {
+    Reauth,
+    #[default]
+    Kick,
+    Deregister,
 }
 
 pub struct AuthenticateAuxiliaryData {
@@ -55,6 +72,9 @@ pub struct AuthenticateAuxiliaryData {
     pub client_name: Option<String>,
     pub os_name: Option<String>,
     pub os_version: Option<String>,
+    /// Opaque authentication-session identifier from the previous successful
+    /// authentication, when this call is a reauthentication.
+    pub auth_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +120,9 @@ pub trait Authenticator: Send + Sync + 'static {
             max_bandwidth: None,
             texture_url: None,
             comment_url: None,
+            auth_session_id: None,
+            authenticated_until: None,
+            authentication_expiry_action: AuthenticationExpiryAction::default(),
         })
     }
 

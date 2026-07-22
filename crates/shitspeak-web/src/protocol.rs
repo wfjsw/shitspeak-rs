@@ -86,6 +86,8 @@ pub struct WebUserState {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub user_id_cleared: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,6 +124,10 @@ pub struct WebUserState {
     pub listening_channel_remove: Vec<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listening_volume_adjustment: Vec<WebVolumeAdjustment>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -356,6 +362,7 @@ mod tests {
             actor: None,
             name: Some("Alice".to_string()),
             user_id: None,
+            user_id_cleared: false,
             channel_id: Some(0),
             mute: None,
             deaf: None,

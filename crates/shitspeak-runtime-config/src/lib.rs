@@ -2193,6 +2193,7 @@ mod tests {
 
         assert_eq!(cfg.authenticator.backend(), AuthenticatorBackend::Demo);
         assert_eq!(cfg.authenticator.exec().command(), None);
+        assert!(cfg.authenticator.exec().environment().is_empty());
         assert_eq!(cfg.authenticator.wasm().path(), None);
     }
 
@@ -2220,6 +2221,7 @@ mod tests {
                     long_running_request_mode = "async"
                     command = "auth-helper"
                     args = ["--mode", "server"]
+                    environment = { AUTH_ENDPOINT = "https://auth.test", AUTH_MODE = "production" }
                     working_dir = "auth"
                     uid = 1001
                     gid = 1002
@@ -2247,6 +2249,22 @@ mod tests {
             Some(Path::new("auth-helper"))
         );
         assert_eq!(cfg.authenticator.exec().args(), ["--mode", "server"]);
+        assert_eq!(
+            cfg.authenticator
+                .exec()
+                .environment()
+                .get("AUTH_ENDPOINT")
+                .map(String::as_str),
+            Some("https://auth.test")
+        );
+        assert_eq!(
+            cfg.authenticator
+                .exec()
+                .environment()
+                .get("AUTH_MODE")
+                .map(String::as_str),
+            Some("production")
+        );
         assert_eq!(
             cfg.authenticator.exec().working_dir().map(PathBuf::as_path),
             Some(Path::new("auth"))

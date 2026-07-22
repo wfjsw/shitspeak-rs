@@ -675,7 +675,7 @@ impl ClientStateLogEntry {
                     us.name = v.clone();
                 }
                 if let Some(ref v) = delta.user_id {
-                    us.user_id = *v;
+                    us.user_id = Some(v.unwrap_or(u32::MAX));
                 }
                 if let Some(v) = delta.current_channel_id {
                     us.channel_id = Some(v);
@@ -837,6 +837,46 @@ mod tests {
         ] {
             assert!(!delta.affects_voice_routing());
         }
+    }
+
+    #[test]
+    fn cleared_user_id_uses_mumble_wire_sentinel() {
+        let session_id = ClientSessionIdentifier::new(2, 7).unwrap();
+        let entry = ClientStateLogEntry {
+            version: 1,
+            node_id: 2,
+            timestamp: 0,
+            channel_version_dep: None,
+            op: ClientStateOperation::UpdateGlobalState {
+                server_id: "alpha".to_owned(),
+                session_id,
+                client_instance_id: 42,
+                sender_session_id: None,
+                delta: ClientGlobalStateDelta {
+                    user_id: Some(None),
+                    ..Default::default()
+                },
+            },
+        };
+
+        let message = entry
+            .to_message_unchecked()
+            .expect("user-id clear should produce a user-state message");
+        assert!(matches!(
+            message,
+            crate::messages::Message::UserState(user_state)
+                if user_state.user_id == Some(u32::MAX)
+        ));
+        assert!(matches!(
+            entry.op,
+            ClientStateOperation::UpdateGlobalState {
+                delta: ClientGlobalStateDelta {
+                    user_id: Some(None),
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

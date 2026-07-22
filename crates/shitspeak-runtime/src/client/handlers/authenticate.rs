@@ -33,6 +33,17 @@ pub async fn handle_authenticate(
         "Authenticate handler"
     );
 
+    // An expiry-triggered reauthentication owns the credential exchange.
+    // Ignore client Authenticate messages until that bounded backend call
+    // completes so they cannot start a second full login path concurrently.
+    if sender.is_reauthentication_in_progress() {
+        tracing::debug!(
+            session = u32::from(session),
+            "ignoring Authenticate while server reauthentication is in progress"
+        );
+        return Ok(());
+    }
+
     // ── Token-update path ─────────────────────────────────────────────────
     // An already-authenticated client can send Authenticate again to update
     // its access tokens.
@@ -78,6 +89,7 @@ pub async fn handle_authenticate(
     let auth_auxiliary = AuthenticateAuxiliaryData {
         certificate_hash,
         session_id: session_id.into(),
+        auth_session_id: None,
         ip_address,
         tls_ja4: sender.tls_ja4().map(ToOwned::to_owned),
         uses_proxy_protocol: sender.uses_proxy_protocol(),
@@ -157,6 +169,16 @@ pub async fn handle_authenticate(
             .into());
         }
     };
+    if result.user_id == Some(u32::MAX) {
+        return Err(AuthRejection::new_with_language(
+            RejectType::AuthenticatorFail,
+            sender.language(),
+        )
+        .into());
+    }
+    let auth_session_id = result.auth_session_id.clone();
+    let authenticated_until = result.authenticated_until;
+    let authentication_expiry_action = result.authentication_expiry_action;
     sender.set_language(result.language);
     let channel_cache_key =
         crate::user_channel_cache::user_channel_cache_key(result.user_id, Some(username.as_str()));
@@ -321,7 +343,11 @@ pub async fn handle_authenticate(
         }
     }
 
-    sender.set_authenticated(true);
+    sender.complete_authentication(
+        auth_session_id,
+        authenticated_until,
+        authentication_expiry_action,
+    );
 
     // ── Place user in cached/default channel ─────────────────────────────
     {

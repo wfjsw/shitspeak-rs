@@ -3065,6 +3065,27 @@ impl ClientRepository {
         op: ClientStateOperation,
         channel_version_dep: Option<u64>,
     ) -> Option<Arc<ClientStateBroadcastPayload>> {
+        // A client Arc can outlive its repository entry while an async handler
+        // is pending. Reject its eventual state commit atomically under the
+        // repository lock so a reused session cannot receive stale indices or
+        // broadcasts from the previous connection.
+        if let ClientStateOperation::UpdateGlobalState {
+            server_id,
+            session_id,
+            client_instance_id,
+            ..
+        } = &op
+        {
+            let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
+            let is_current_instance = register
+                .local_clients
+                .get(&scoped_id)
+                .is_some_and(|client| client.client_instance_id() == *client_instance_id);
+            if !is_current_instance {
+                return None;
+            }
+        }
+
         // Update channel/listener indices for any state change, before the
         // early-return for unpublished clients (the index is local state,
         // not propagated over the log).
@@ -4642,6 +4663,47 @@ mod tests {
         assert!(
             stale_update.to_message(&repo).await.is_none(),
             "stale UpdateGlobalState with a reused session must not convert to UserState"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_instance_update_does_not_publish_for_reused_session() {
+        let repo = ClientRepository::new(1, 128);
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(8);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30009);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let old = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, old_tx)
+            .await;
+        let session = old.get_session_id();
+        let old_instance = old.client_instance_id();
+        repo.publish_client_in_server("alpha", session).await;
+        repo.remove_client_instance_in_server("alpha", session, old_instance)
+            .await
+            .expect("old client removed");
+
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(8);
+        let new_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30010);
+        let new_client = repo
+            .allocate_web_client_in_server("alpha", new_peer.ip(), new_peer, local, new_tx)
+            .await;
+        assert_eq!(new_client.get_session_id(), session);
+        repo.publish_client_in_server("alpha", session).await;
+        let version_before_stale_update = repo.current_version();
+
+        {
+            let mut state = old.write_global_state(&repo);
+            state.set_display_name(Some("stale identity".to_owned()));
+            state.set_user_id(Some(999));
+        }
+
+        assert_eq!(repo.current_version(), version_before_stale_update);
+        assert_eq!(new_client.display_name_opt(), None);
+        assert_eq!(new_client.get_user_id(), None);
+        assert!(
+            repo.get_log_since(version_before_stale_update)
+                .await
+                .is_empty()
         );
     }
 

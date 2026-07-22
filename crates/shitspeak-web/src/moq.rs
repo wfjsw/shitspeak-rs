@@ -12,8 +12,8 @@ use crate::protocol::{
     encode_server_event,
 };
 use crate::session::{
-    WebSessionContext, WebSessionTransport, apply_control_command, initial_server_events,
-    server_event_from_message,
+    WebSessionContext, WebSessionTransport, apply_control_command, client_is_current,
+    initial_server_events, server_event_from_message,
 };
 use crate::voice::{InboundVoiceMetadata, SsrcAllocator, VoiceTargetKind};
 use shitspeak_runtime::api::Authenticator;
@@ -594,6 +594,15 @@ impl MoqSessionRuntime {
         &mut self,
         command: ClientCommand,
     ) -> Result<Vec<ServerEvent>, String> {
+        if let Some(client) = self.client.as_ref() {
+            let Some(server) = self.context.server() else {
+                return Err("MoQ control command is not wired to this server".to_string());
+            };
+            if !client_is_current(server, client).await {
+                return Err("MoQ client is no longer connected".to_string());
+            }
+        }
+
         match command {
             ClientCommand::Authenticate { auth } => self.authenticate_client(auth).await,
             ClientCommand::VoiceControl { ptt, target, epoch } => {
@@ -625,10 +634,6 @@ impl MoqSessionRuntime {
             }]);
         }
 
-        let cache_username = match &auth {
-            crate::protocol::AuthRequest::Password { username, .. } => Some(username.clone()),
-            crate::protocol::AuthRequest::Sso { .. } => None,
-        };
         let (outbound_tx, outbound_rx) = mpsc::channel::<Message>(256);
         let preallocated = self
             .context
@@ -638,9 +643,9 @@ impl MoqSessionRuntime {
             .as_ref()
             .map(|(_, client)| u32::from(client.get_session_id()))
             .unwrap_or(0);
-        let result = self.context.authenticate(auth_session_id, auth).await;
-        let result = match result {
-            Ok(result) => result,
+        let authenticated = self.context.authenticate(auth_session_id, auth).await;
+        let (result, credential) = match authenticated {
+            Ok(authenticated) => authenticated,
             Err(rejection) => {
                 if let Some((server, client)) = preallocated.as_ref() {
                     let server_id = client.server_id();
@@ -660,13 +665,7 @@ impl MoqSessionRuntime {
             return Err("MoQ authentication is not wired to this server".to_string());
         };
         let display_name = result.display_name.clone();
-        crate::session::configure_authenticated_client(
-            &server,
-            &client,
-            result,
-            cache_username.as_deref(),
-        )
-        .await;
+        crate::session::configure_authenticated_client(&server, &client, result, credential).await;
         let session = u32::from(client.get_session_id());
 
         self.outbound_rx = Some(outbound_rx);
@@ -737,6 +736,12 @@ impl MoqSessionRuntime {
         let Some(client) = self.client.as_ref() else {
             return Err("authentication required before audio".to_string());
         };
+        let Some(server) = self.context.server() else {
+            return Err("MoQ audio is not wired to this server".to_string());
+        };
+        if !client_is_current(server, client).await {
+            return Err("MoQ client is no longer connected".to_string());
+        }
         let Some(epoch) = self.inbound_voice.routable_epoch() else {
             return Ok(());
         };
@@ -828,7 +833,18 @@ impl MoqSessionRuntime {
         let mut background_tick = tokio::time::interval(std::time::Duration::from_millis(25));
         let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
             loop {
+                let disconnected_client = self.client.clone();
+                let has_client = disconnected_client.is_some();
                 tokio::select! {
+                    biased;
+
+                    _ = async move {
+                        if let Some(client) = disconnected_client {
+                            client.disconnected().await;
+                        }
+                    }, if has_client => {
+                        break;
+                    }
                     command = read_next_json_command(&mut control_up) => {
                         let Some(command) = command? else {
                             break;
@@ -1673,7 +1689,8 @@ mod tests {
 
     use crate::protocol::AuthRequest;
     use shitspeak_runtime::api::{
-        AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection,
+        AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationExpiryAction,
+        AuthenticationRejection,
     };
     use shitspeak_runtime::client::ClientTransportKind;
     use shitspeak_runtime::localization::Language;
@@ -1856,6 +1873,22 @@ mod tests {
             .expect("allocated client");
         assert_eq!(client.transport_kind(), ClientTransportKind::Moq);
         assert!(client.is_authenticated());
+        {
+            let extended = client.user_info_extended().await;
+            let credential = extended.get_credential().as_ref().expect("credential");
+            assert_eq!(credential.username, "alice");
+            assert_eq!(credential.password.as_deref(), Some("secret"));
+        }
+        {
+            let local = client.read_local_state();
+            let local = local.as_ref().expect("local state");
+            assert_eq!(local.auth_session_id(), Some("web-auth-session"));
+            assert_eq!(
+                local.authentication_expiry_action(),
+                AuthenticationExpiryAction::Reauth
+            );
+            assert!(local.authenticated_until().is_some());
+        }
         assert!(
             events
                 .iter()
@@ -1906,19 +1939,24 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_audio_waits_for_acknowledged_voice_epoch() {
-        let context = test_session_context_without_server();
+        let server = test_server(TestAuthenticator).await;
+        let context = test_session_context(Arc::clone(&server));
         let mut runtime = MoqSessionRuntime::new(context);
-        let (outbound_tx, _outbound_rx) = mpsc::channel::<Message>(8);
-        let client = Arc::new(Client::new_moq_gateway_in_server(
-            shitspeak_runtime::types::DEFAULT_SERVER_ID.to_string(),
-            ClientSessionIdentifier::new(1, 77).unwrap(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64740),
-            outbound_tx,
-        ));
+        runtime
+            .handle_control_command(ClientCommand::Authenticate {
+                auth: AuthRequest::Password {
+                    username: "alice".to_string(),
+                    password: "secret".to_string(),
+                },
+            })
+            .await
+            .expect("authenticate");
+        let client = runtime
+            .client
+            .as_ref()
+            .cloned()
+            .expect("authenticated client");
         let mut voice_rx = client.take_voice_routing_rx().expect("voice rx");
-        runtime.client = Some(Arc::clone(&client));
 
         runtime
             .handle_inbound_audio_frame(MoqAudioFrame::new(100, Bytes::from_static(b"ignored")))
@@ -1954,19 +1992,24 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_audio_accepts_terminator_after_ptt_off_ack() {
-        let context = test_session_context_without_server();
+        let server = test_server(TestAuthenticator).await;
+        let context = test_session_context(Arc::clone(&server));
         let mut runtime = MoqSessionRuntime::new(context);
-        let (outbound_tx, _outbound_rx) = mpsc::channel::<Message>(8);
-        let client = Arc::new(Client::new_moq_gateway_in_server(
-            shitspeak_runtime::types::DEFAULT_SERVER_ID.to_string(),
-            ClientSessionIdentifier::new(1, 78).unwrap(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64740),
-            outbound_tx,
-        ));
+        runtime
+            .handle_control_command(ClientCommand::Authenticate {
+                auth: AuthRequest::Password {
+                    username: "alice".to_string(),
+                    password: "secret".to_string(),
+                },
+            })
+            .await
+            .expect("authenticate");
+        let client = runtime
+            .client
+            .as_ref()
+            .cloned()
+            .expect("authenticated client");
         let mut voice_rx = client.take_voice_routing_rx().expect("voice rx");
-        runtime.client = Some(Arc::clone(&client));
 
         runtime
             .handle_control_command(ClientCommand::VoiceControl {
@@ -2004,6 +2047,62 @@ mod tests {
             panic!("expected opus payload");
         };
         assert!(opus.is_terminator);
+    }
+
+    #[tokio::test]
+    async fn detached_client_cannot_send_moq_control_or_audio() {
+        let server = test_server(TestAuthenticator).await;
+        let context = test_session_context(Arc::clone(&server));
+        let mut runtime = MoqSessionRuntime::new(context);
+        runtime
+            .handle_control_command(ClientCommand::Authenticate {
+                auth: AuthRequest::Password {
+                    username: "alice".to_string(),
+                    password: "secret".to_string(),
+                },
+            })
+            .await
+            .expect("authenticate");
+        let client = runtime
+            .client
+            .as_ref()
+            .cloned()
+            .expect("authenticated client");
+        let server_id = client.server_id();
+        server
+            .get_clients()
+            .remove_client_instance_in_server(
+                &server_id,
+                client.get_session_id(),
+                client.client_instance_id(),
+            )
+            .await
+            .expect("remove client");
+
+        let control = runtime
+            .handle_control_command(ClientCommand::SetMute { muted: true })
+            .await
+            .expect_err("detached control must fail");
+        assert_eq!(control, "MoQ client is no longer connected");
+
+        let voice_control = runtime
+            .handle_control_command(ClientCommand::VoiceControl {
+                ptt: true,
+                target: VoiceTarget::Normal,
+                epoch: 1,
+            })
+            .await
+            .expect_err("detached voice control must fail");
+        assert_eq!(voice_control, "MoQ client is no longer connected");
+
+        let audio = runtime
+            .handle_inbound_audio_frame(MoqAudioFrame::new(
+                1,
+                Bytes::from_static(b"detached-audio"),
+            ))
+            .await
+            .expect_err("detached audio must fail");
+        assert_eq!(audio, "MoQ client is no longer connected");
     }
 
     #[cfg(feature = "moq")]
@@ -2164,6 +2263,13 @@ mod tests {
                 return Err(AuthenticationRejection::WrongPassword);
             }
             Ok(AuthenticateResult {
+                auth_session_id: Some("web-auth-session".to_string()),
+                authenticated_until: Some(
+                    "2099-01-01T00:00:00Z"
+                        .parse()
+                        .expect("valid authentication expiry"),
+                ),
+                authentication_expiry_action: AuthenticationExpiryAction::Reauth,
                 user_id: Some(7),
                 display_name: Some("Alice".to_string()),
                 groups: vec!["web".to_string()],

@@ -2,14 +2,15 @@ use std::net::IpAddr;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shitspeak_core::ProtocolVersion;
 
 use crate::Language;
 
 use super::{
-    AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, ExternalAuthClaims,
-    canonical_authenticator_ip,
+    AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationExpiryAction,
+    AuthenticationRejection, ExternalAuthClaims, canonical_authenticator_ip,
 };
 
 #[derive(Serialize)]
@@ -121,6 +122,8 @@ pub(crate) struct AuthenticatorJsonAuxiliaryData {
     client_name: Option<String>,
     os_name: Option<String>,
     os_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_session_id: Option<String>,
 }
 
 impl From<&AuthenticateAuxiliaryData> for AuthenticatorJsonAuxiliaryData {
@@ -138,6 +141,7 @@ impl From<&AuthenticateAuxiliaryData> for AuthenticatorJsonAuxiliaryData {
             client_name: value.client_name.clone(),
             os_name: value.os_name.clone(),
             os_version: value.os_version.clone(),
+            auth_session_id: value.auth_session_id.clone(),
         }
     }
 }
@@ -185,6 +189,12 @@ pub(crate) struct AuthenticatorJsonAuthenticateResponse {
     texture_url: Option<String>,
     #[serde(default)]
     comment_url: Option<String>,
+    #[serde(default)]
+    auth_session_id: Option<String>,
+    #[serde(default)]
+    authenticated_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    authentication_expiry_action: AuthenticationExpiryAction,
 }
 
 impl AuthenticatorJsonAuthenticateResponse {
@@ -214,6 +224,9 @@ impl AuthenticatorJsonAuthenticateResponse {
             max_bandwidth: self.max_bandwidth,
             texture_url: self.texture_url,
             comment_url: self.comment_url,
+            auth_session_id: self.auth_session_id,
+            authenticated_until: self.authenticated_until,
+            authentication_expiry_action: self.authentication_expiry_action,
         })
     }
 }
@@ -234,6 +247,9 @@ pub(crate) fn authenticate_result_from_external_claims(
         max_bandwidth: None,
         texture_url: None,
         comment_url: None,
+        auth_session_id: None,
+        authenticated_until: None,
+        authentication_expiry_action: AuthenticationExpiryAction::default(),
     }
 }
 
@@ -276,5 +292,57 @@ mod tests {
         let result = response.into_authenticate_result().unwrap();
         assert_eq!(result.user_id, Some(7));
         assert_eq!(result.display_name.as_deref(), Some("alice"));
+        assert_eq!(
+            result.authentication_expiry_action,
+            AuthenticationExpiryAction::Kick
+        );
+        assert!(result.auth_session_id.is_none());
+        assert!(result.authenticated_until.is_none());
+    }
+
+    #[test]
+    fn authenticate_response_maps_session_expiry_fields() {
+        let response: AuthenticatorJsonAuthenticateResponse = serde_json::from_str(
+            r#"{
+                "auth_session_id":"auth-session-7",
+                "authenticated_until":"2030-01-02T03:04:05Z",
+                "authentication_expiry_action":"reauth"
+            }"#,
+        )
+        .unwrap();
+        let result = response.into_authenticate_result().unwrap();
+
+        assert_eq!(result.auth_session_id.as_deref(), Some("auth-session-7"));
+        assert_eq!(
+            result.authenticated_until,
+            Some("2030-01-02T03:04:05Z".parse().unwrap())
+        );
+        assert_eq!(
+            result.authentication_expiry_action,
+            AuthenticationExpiryAction::Reauth
+        );
+    }
+
+    #[test]
+    fn auxiliary_data_serializes_auth_session_id() {
+        let mut auxiliary = AuthenticateAuxiliaryData {
+            certificate_hash: None,
+            session_id: 7,
+            ip_address: "127.0.0.1".parse().unwrap(),
+            tls_ja4: None,
+            uses_proxy_protocol: false,
+            version: None,
+            client_name: None,
+            os_name: None,
+            os_version: None,
+            auth_session_id: Some("auth-session-7".to_owned()),
+        };
+
+        let json = serde_json::to_value(AuthenticatorJsonAuxiliaryData::from(&auxiliary)).unwrap();
+        assert_eq!(json["auth_session_id"], "auth-session-7");
+
+        auxiliary.auth_session_id = None;
+        let json = serde_json::to_value(AuthenticatorJsonAuxiliaryData::from(&auxiliary)).unwrap();
+        assert!(json.get("auth_session_id").is_none());
     }
 }

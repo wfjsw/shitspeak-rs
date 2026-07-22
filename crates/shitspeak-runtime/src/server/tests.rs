@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use super::*;
 use crate::api::{
-    AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
+    AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationExpiryAction,
+    AuthenticationRejection, Authenticator,
 };
 use crate::channel_handler::{ChannelPermissionShadow, ChannelTreeShadow, SessionChannelShadow};
 use crate::client::{
@@ -25,6 +26,61 @@ use tokio_rustls::TlsConnector;
 
 struct TestAuthenticator;
 
+#[derive(Debug, PartialEq, Eq)]
+struct RecordedAuthentication {
+    username: String,
+    password: Option<String>,
+    auth_session_id: Option<String>,
+}
+
+struct ControlledAuthenticator {
+    calls: tokio::sync::mpsc::UnboundedSender<RecordedAuthentication>,
+    responses: tokio::sync::Mutex<
+        tokio::sync::mpsc::UnboundedReceiver<Result<AuthenticateResult, AuthenticationRejection>>,
+    >,
+}
+
+fn controlled_authenticator() -> (
+    ControlledAuthenticator,
+    tokio::sync::mpsc::UnboundedReceiver<RecordedAuthentication>,
+    tokio::sync::mpsc::UnboundedSender<Result<AuthenticateResult, AuthenticationRejection>>,
+) {
+    let (call_tx, call_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+    (
+        ControlledAuthenticator {
+            calls: call_tx,
+            responses: tokio::sync::Mutex::new(response_rx),
+        },
+        call_rx,
+        response_tx,
+    )
+}
+
+#[async_trait::async_trait]
+impl Authenticator for ControlledAuthenticator {
+    async fn authenticate(
+        &self,
+        username: &str,
+        password: Option<&str>,
+        auxiliary_data: &AuthenticateAuxiliaryData,
+    ) -> Result<AuthenticateResult, AuthenticationRejection> {
+        self.calls
+            .send(RecordedAuthentication {
+                username: username.to_owned(),
+                password: password.map(ToOwned::to_owned),
+                auth_session_id: auxiliary_data.auth_session_id.clone(),
+            })
+            .expect("authentication test call receiver");
+        self.responses
+            .lock()
+            .await
+            .recv()
+            .await
+            .expect("authentication test response")
+    }
+}
+
 fn install_default_provider() {
     static CRYPTO_PROVIDER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     CRYPTO_PROVIDER.get_or_init(|| {
@@ -41,6 +97,9 @@ impl Authenticator for TestAuthenticator {
         _auxiliary_data: &AuthenticateAuxiliaryData,
     ) -> Result<AuthenticateResult, AuthenticationRejection> {
         Ok(AuthenticateResult {
+            auth_session_id: None,
+            authenticated_until: None,
+            authentication_expiry_action: Default::default(),
             user_id: None,
             display_name: Some(username.to_owned()),
             groups: Vec::new(),
@@ -668,7 +727,10 @@ async fn idle_reaper_only_disconnects_local_clients() {
         .await;
 
     server
-        .disconnect_idle_local_clients(chrono::Utc::now() + chrono::Duration::seconds(1), 0)
+        .reap_expired_authentication_and_disconnect_idle_local_clients(
+            chrono::Utc::now() + chrono::Duration::seconds(1),
+            0,
+        )
         .await;
 
     assert!(
@@ -684,6 +746,401 @@ async fn idle_reaper_only_disconnects_local_clients() {
             .get_client_in_server(DEFAULT_SERVER_ID, remote_sid)
             .await
             .is_some()
+    );
+}
+
+async fn authentication_expiry_test_client(server: &Arc<Box<Server>>) -> Arc<Box<Client>> {
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+    let client = server
+        .clients
+        .allocate_web_client_in_server(
+            DEFAULT_SERVER_ID,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:51000".parse().unwrap(),
+            "127.0.0.1:51001".parse().unwrap(),
+            outbound_tx,
+        )
+        .await;
+    client.set_authenticated(true);
+    {
+        let mut state = client.write_global_state(&server.clients);
+        state.set_user_id(Some(7));
+        state.set_display_name(Some("Original Name".to_owned()));
+        state.set_groups(["original-group".to_owned()].into_iter().collect());
+    }
+    {
+        let mut extended = client.user_info_extended().await;
+        extended.set_credential(crate::client::user_info::Credential::new(
+            "original-user".to_owned(),
+            Some("original-password".to_owned()),
+        ));
+    }
+    client
+}
+
+fn set_expiring_authentication(
+    client: &Client,
+    deadline: chrono::DateTime<chrono::Utc>,
+    action: AuthenticationExpiryAction,
+) {
+    client.set_authentication_expiry(
+        Some("previous-auth-session".to_owned()),
+        Some(deadline),
+        action,
+    );
+}
+
+async fn authentication_expiry_reaper(
+    server: &Arc<Box<Server>>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    server
+        .reap_expired_authentication_and_disconnect_idle_local_clients(now, 86_400)
+        .await;
+}
+
+#[tokio::test]
+async fn authentication_expiry_before_deadline_is_ignored() {
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("server");
+    let client = authentication_expiry_test_client(&server).await;
+    let deadline = chrono::Utc::now() + chrono::Duration::minutes(1);
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Kick);
+
+    authentication_expiry_reaper(&server, deadline - chrono::Duration::milliseconds(1)).await;
+
+    assert!(client.is_authenticated());
+    assert_eq!(
+        client
+            .read_local_state()
+            .as_ref()
+            .expect("local state")
+            .authenticated_until(),
+        Some(deadline)
+    );
+    assert!(
+        server
+            .clients
+            .get_client_in_server(DEFAULT_SERVER_ID, client.get_session_id())
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn authentication_expiry_kick_removes_client() {
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("server");
+    let client = authentication_expiry_test_client(&server).await;
+    let session_id = client.get_session_id();
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Kick);
+
+    authentication_expiry_reaper(&server, deadline).await;
+
+    assert!(
+        server
+            .clients
+            .get_client_in_server(DEFAULT_SERVER_ID, session_id)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn authentication_expiry_deregister_only_clears_registration() {
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("server");
+    let client = authentication_expiry_test_client(&server).await;
+    let session_id = client.get_session_id();
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Deregister);
+
+    authentication_expiry_reaper(&server, deadline).await;
+
+    assert_eq!(client.get_user_id(), None);
+    assert_eq!(client.display_name_opt().as_deref(), Some("Original Name"));
+    assert_eq!(
+        client.get_groups_clone(),
+        ["original-group".to_owned()].into_iter().collect()
+    );
+    assert!(client.is_authenticated());
+    assert!(
+        server
+            .clients
+            .get_client_in_server(DEFAULT_SERVER_ID, session_id)
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn authentication_expiry_deregister_kicks_without_root_traverse() {
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("server");
+    server
+        .channels
+        .set_acls(
+            0,
+            true,
+            vec![
+                shitspeak_state::ACL {
+                    user_id: None,
+                    group: Some("all".to_owned()),
+                    apply_here: true,
+                    apply_subs: true,
+                    allow: enumflags2::BitFlags::empty(),
+                    deny: shitspeak_state::ACLPermissions::Traverse.into(),
+                },
+                shitspeak_state::ACL {
+                    user_id: Some(7),
+                    group: None,
+                    apply_here: true,
+                    apply_subs: true,
+                    allow: shitspeak_state::ACLPermissions::Traverse.into(),
+                    deny: enumflags2::BitFlags::empty(),
+                },
+            ],
+        )
+        .await
+        .expect("root ACL");
+    let client = authentication_expiry_test_client(&server).await;
+    let session_id = client.get_session_id();
+    assert!(server.client_has_root_traverse(&client).await);
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Deregister);
+
+    authentication_expiry_reaper(&server, deadline).await;
+
+    assert!(
+        server
+            .clients
+            .get_client_in_server(DEFAULT_SERVER_ID, session_id)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn authentication_expiry_reauth_preserves_state_while_pending_and_applies_success() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let server = Server::new(test_config(Vec::new()), authenticator)
+        .await
+        .expect("server");
+    let client = authentication_expiry_test_client(&server).await;
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    let call = tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication started")
+        .expect("reauthentication call");
+
+    assert_eq!(
+        call,
+        RecordedAuthentication {
+            username: "original-user".to_owned(),
+            password: Some("original-password".to_owned()),
+            auth_session_id: Some("previous-auth-session".to_owned()),
+        }
+    );
+    assert!(client.is_authenticated());
+    assert!(client.is_reauthentication_in_progress());
+    assert_eq!(client.get_user_id(), Some(7));
+    assert_eq!(client.display_name_opt().as_deref(), Some("Original Name"));
+    assert_eq!(
+        client.get_groups_clone(),
+        ["original-group".to_owned()].into_iter().collect()
+    );
+
+    let next_deadline = deadline + chrono::Duration::hours(1);
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("next-auth-session".to_owned()),
+            authenticated_until: Some(next_deadline),
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
+            user_id: Some(42),
+            display_name: Some("Updated Name".to_owned()),
+            groups: vec!["updated-group".to_owned()],
+            is_superuser: false,
+            virtual_server_id: None,
+            language: Language::default(),
+            max_bandwidth: None,
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send successful reauthentication");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let complete = {
+                let local = client.read_local_state();
+                let local = local.as_ref().expect("local state");
+                !local.is_reauthentication_in_progress()
+                    && local.auth_session_id() == Some("next-auth-session")
+            };
+            if complete {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reauthentication completed");
+
+    assert!(client.is_authenticated());
+    assert_eq!(client.get_user_id(), Some(42));
+    assert_eq!(client.display_name_opt().as_deref(), Some("Updated Name"));
+    assert_eq!(
+        client.get_groups_clone(),
+        ["updated-group".to_owned()].into_iter().collect()
+    );
+    let local = client.read_local_state();
+    let local = local.as_ref().expect("local state");
+    assert_eq!(local.auth_session_id(), Some("next-auth-session"));
+    assert_eq!(local.authenticated_until(), Some(next_deadline));
+    assert_eq!(
+        local.authentication_expiry_action(),
+        AuthenticationExpiryAction::Kick
+    );
+}
+
+#[tokio::test]
+async fn authentication_expiry_reauth_rejection_kicks_client() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let server = Server::new(test_config(Vec::new()), authenticator)
+        .await
+        .expect("server");
+    let client = authentication_expiry_test_client(&server).await;
+    let session_id = client.get_session_id();
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication started")
+        .expect("reauthentication call");
+    assert!(client.is_authenticated());
+    responses
+        .send(Err(AuthenticationRejection::WrongPassword))
+        .expect("send rejected reauthentication");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server
+                .clients
+                .get_client_in_server(DEFAULT_SERVER_ID, session_id)
+                .await
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rejected client removed");
+}
+
+#[tokio::test]
+async fn authentication_expiry_reauth_timeout_kicks_client() {
+    let (authenticator, mut calls, _responses) = controlled_authenticator();
+    let mut config = test_config(Vec::new());
+    config.authenticate_timeout_ms = 20;
+    let server = Server::new(config, authenticator).await.expect("server");
+    let client = authentication_expiry_test_client(&server).await;
+    let session_id = client.get_session_id();
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication started")
+        .expect("reauthentication call");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server
+                .clients
+                .get_client_in_server(DEFAULT_SERVER_ID, session_id)
+                .await
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed-out client removed");
+}
+
+#[tokio::test]
+async fn authentication_expiry_reauth_budget_defers_excess_clients() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let mut config = test_config(Vec::new());
+    config.auth_finalization_concurrency = 1;
+    let server = Server::new(config, authenticator).await.expect("server");
+    let first = authentication_expiry_test_client(&server).await;
+    let second = authentication_expiry_test_client(&server).await;
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&first, deadline, AuthenticationExpiryAction::Reauth);
+    set_expiring_authentication(&second, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("first reauthentication started")
+        .expect("first reauthentication call");
+
+    let deferred = [&first, &second]
+        .into_iter()
+        .find(|client| !client.is_reauthentication_in_progress())
+        .expect("one expired reauthentication remains deferred");
+    let local = deferred.read_local_state();
+    let local = local.as_ref().expect("local state");
+    assert!(local.is_authenticated());
+    assert_eq!(local.authenticated_until(), Some(deadline));
+
+    responses
+        .send(Err(AuthenticationRejection::WrongPassword))
+        .expect("release first reauthentication");
+}
+
+#[tokio::test]
+async fn detached_client_waiting_for_reauth_permit_does_not_call_authenticator() {
+    let (authenticator, mut calls, _responses) = controlled_authenticator();
+    let mut config = test_config(Vec::new());
+    config.auth_finalization_concurrency = 1;
+    let server = Server::new(config, authenticator).await.expect("server");
+    let permit = server.auth_finalization_queue.acquire_silent().await;
+    let client = authentication_expiry_test_client(&server).await;
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    server
+        .clients
+        .remove_client_instance_in_server(
+            DEFAULT_SERVER_ID,
+            client.get_session_id(),
+            client.client_instance_id(),
+        )
+        .await;
+    drop(permit);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), calls.recv())
+            .await
+            .is_err(),
+        "detached client unexpectedly reached authenticator"
     );
 }
 

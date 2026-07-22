@@ -148,6 +148,49 @@ impl AuthFinalizationQueue {
         })
     }
 
+    /// Acquire the shared authenticator concurrency permit without writing
+    /// login-queue notices to a client that is already connected.
+    pub(super) async fn acquire_silent(self: &Arc<Self>) -> AuthFinalizationPermit {
+        let ticket = match self.reserve_or_queue() {
+            AuthFinalizationAdmission::Immediate(permit) => {
+                self.wait_for_test_gate_if_needed().await;
+                return AuthFinalizationPermit {
+                    _permit: permit,
+                    queue: Arc::clone(self),
+                    ticket: 0,
+                };
+            }
+            AuthFinalizationAdmission::Queued(ticket) => ticket,
+        };
+
+        let waiter = AuthFinalizationTicket {
+            queue: Arc::clone(self),
+            ticket,
+        };
+        let permit = loop {
+            let waiters_changed = self.waiters_changed.notified();
+            tokio::pin!(waiters_changed);
+
+            if !self.is_front(ticket) {
+                waiters_changed.await;
+                continue;
+            }
+
+            break Arc::clone(&self.semaphore)
+                .acquire_owned()
+                .await
+                .expect("auth finalization semaphore should not be closed");
+        };
+
+        drop(waiter);
+        self.wait_for_test_gate_if_needed().await;
+        AuthFinalizationPermit {
+            _permit: permit,
+            queue: Arc::clone(self),
+            ticket,
+        }
+    }
+
     pub(super) fn reserve_or_queue(self: &Arc<Self>) -> AuthFinalizationAdmission {
         let mut waiters = self.waiters.lock();
         if waiters.is_empty()

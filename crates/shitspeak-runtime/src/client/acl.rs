@@ -362,7 +362,7 @@ pub async fn compute_permissions_for_client(
     client: &Arc<Box<Client>>,
     channel_id: u32,
 ) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
-    compute_permissions_for_client_inner(server, client, channel_id, None).await
+    compute_permissions_for_client_inner(server, client, channel_id, None, None).await
 }
 
 /// Compute permissions as if the client were already in `channel_id`.
@@ -389,7 +389,26 @@ pub(crate) async fn compute_permissions_for_client_with_home_channel(
     channel_id: u32,
     home_channel_id: u32,
 ) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
-    compute_permissions_for_client_inner(server, client, channel_id, Some(home_channel_id)).await
+    compute_permissions_for_client_inner(server, client, channel_id, Some(home_channel_id), None)
+        .await
+}
+
+pub(crate) async fn compute_permissions_for_client_with_identity(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_id: u32,
+    user_id: Option<u32>,
+    groups: HashSet<String>,
+    is_superuser: bool,
+) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
+    compute_permissions_for_client_inner(
+        server,
+        client,
+        channel_id,
+        None,
+        Some((user_id, groups, is_superuser)),
+    )
+    .await
 }
 
 async fn compute_permissions_for_client_inner(
@@ -397,18 +416,22 @@ async fn compute_permissions_for_client_inner(
     client: &Arc<Box<Client>>,
     channel_id: u32,
     home_channel_override: Option<u32>,
+    identity_override: Option<(Option<u32>, HashSet<String>, bool)>,
 ) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
     use shitspeak_state::ACLPermissions;
 
     let session = u32::from(client.get_session_id());
-    let is_superuser = client.is_superuser();
+    let is_superuser = identity_override
+        .as_ref()
+        .map_or_else(|| client.is_superuser(), |(_, _, value)| *value);
     let debug_acl_enter = server.get_debug_acl_enter();
     let explicit_enter_deny_overrides_write = server.get_explicit_enter_deny_overrides_write();
 
     let channels = server.get_channels();
     let (client_acl_subject_generation, client_acl_home_generation) =
         client.get_acl_cache_generations();
-    let use_acl_cache = !is_superuser && home_channel_override.is_none();
+    let use_acl_cache =
+        !is_superuser && home_channel_override.is_none() && identity_override.is_none();
 
     let cached_permissions = if use_acl_cache {
         client.with_server_id(|server_id| {
@@ -454,8 +477,10 @@ async fn compute_permissions_for_client_inner(
     let depends_on_home_channel =
         shitspeak_state::effective_acl_chain_has_home_channel_dependent_group(&channel, &ancestors);
 
-    let user_id = client.get_user_id();
-    let groups = client.get_groups_clone();
+    let (user_id, groups) = match identity_override {
+        Some((user_id, groups, _)) => (user_id, groups),
+        None => (client.get_user_id(), client.get_groups_clone()),
+    };
     let group_refs = BorrowedStrs::<8>::from_strings(&groups);
     let tokens = client.get_tokens_clone();
     let token_refs = BorrowedStrs::<8>::from_strings(&tokens);

@@ -108,6 +108,7 @@ backend = "demo"
 # long_running_request_mode = "serialized" # serialized, async
 # command = "auth-helper"
 # args = []
+# environment = { AUTH_ENDPOINT = "https://auth.example", AUTH_MODE = "production" }
 # working_dir = "auth"
 # uid = 1001
 # gid = 1001

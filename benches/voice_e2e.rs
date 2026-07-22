@@ -189,6 +189,9 @@ impl Authenticator for AuthenticatorAdapter {
             .cloned()
             .ok_or(AuthenticationRejection::NoSuchUser)?;
         Ok(AuthenticateResult {
+            auth_session_id: None,
+            authenticated_until: None,
+            authentication_expiry_action: Default::default(),
             user_id: user.user_id,
             display_name: Some(username.to_owned()),
             groups: user.groups,

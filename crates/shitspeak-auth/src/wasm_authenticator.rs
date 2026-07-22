@@ -119,6 +119,9 @@ impl Authenticator for DemoAuthenticator {
             max_bandwidth: None,
             texture_url: None,
             comment_url: None,
+            auth_session_id: None,
+            authenticated_until: None,
+            authentication_expiry_action: Default::default(),
         })
     }
 }

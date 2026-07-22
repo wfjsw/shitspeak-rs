@@ -82,6 +82,7 @@ impl WebSessionContext {
 
     pub fn auxiliary_data(&self, session_id: u32) -> AuthenticateAuxiliaryData {
         AuthenticateAuxiliaryData {
+            auth_session_id: None,
             certificate_hash: None,
             session_id,
             ip_address: canonical_authenticator_ip(self.real_ip),
@@ -104,7 +105,7 @@ impl WebSessionContext {
         &self,
         session_id: u32,
         auth: AuthRequest,
-    ) -> Result<AuthenticateResult, AuthenticationRejection> {
+    ) -> Result<(AuthenticateResult, Option<Credential>), AuthenticationRejection> {
         let Some(authenticator) = self.authenticator.as_ref() else {
             return Err(AuthenticationRejection::RetryLater);
         };
@@ -117,9 +118,13 @@ impl WebSessionContext {
                     return Err(AuthenticationRejection::RetryLater);
                 }
                 let auxiliary = self.auxiliary_data(session_id);
-                authenticator
+                let result = authenticator
                     .authenticate(&username, Some(password.as_str()), &auxiliary)
-                    .await
+                    .await?;
+                if result.user_id == Some(u32::MAX) {
+                    return Err(AuthenticationRejection::RetryLater);
+                }
+                Ok((result, Some(Credential::new(username, Some(password)))))
             }
             AuthRequest::Sso { token: _ } => Err(AuthenticationRejection::RetryLater),
         }
@@ -130,7 +135,7 @@ impl WebSessionContext {
         result: AuthenticateResult,
         outbound_tx: mpsc::Sender<Message>,
         transport: WebSessionTransport,
-        cache_username: Option<&str>,
+        credential: Option<Credential>,
     ) -> Option<(Arc<Box<Server>>, Arc<Box<Client>>, u32, Option<String>)> {
         let server = Arc::clone(self.server.as_ref()?);
         let client = match transport {
@@ -167,7 +172,7 @@ impl WebSessionContext {
         };
 
         let display_name = result.display_name.clone();
-        configure_authenticated_client(&server, &client, result, cache_username).await;
+        configure_authenticated_client(&server, &client, result, credential).await;
         Some((
             server,
             Arc::clone(&client),
@@ -222,14 +227,11 @@ pub async fn configure_authenticated_client(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     result: AuthenticateResult,
-    cache_username: Option<&str>,
+    credential: Option<Credential>,
 ) {
     client
         .in_tracing_span(configure_authenticated_client_inner(
-            server,
-            client,
-            result,
-            cache_username,
+            server, client, result, credential,
         ))
         .await
 }
@@ -238,12 +240,18 @@ async fn configure_authenticated_client_inner(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     result: AuthenticateResult,
-    cache_username: Option<&str>,
+    credential: Option<Credential>,
 ) {
+    let cache_username = credential
+        .as_ref()
+        .map(|credential| credential.username.clone());
     let channel_cache_key = shitspeak_runtime::user_channel_cache::user_channel_cache_key(
         result.user_id,
-        cache_username,
+        cache_username.as_deref(),
     );
+    let auth_session_id = result.auth_session_id.clone();
+    let authenticated_until = result.authenticated_until;
+    let authentication_expiry_action = result.authentication_expiry_action;
     if let Some(auth_server_id) = result.virtual_server_id.as_deref() {
         let provisional_server_id = client.server_id();
         if auth_server_id != provisional_server_id {
@@ -278,9 +286,9 @@ async fn configure_authenticated_client_inner(
         gs.set_superuser(result.is_superuser);
         gs.set_groups(result.groups.into_iter().collect());
     }
-    if let Some(username) = cache_username {
+    if let Some(credential) = credential {
         let mut ext = client.user_info_extended().await;
-        ext.set_credential(Credential::new(username.to_owned(), None));
+        ext.set_credential(credential);
     }
 
     let server_id = client.server_id();
@@ -341,7 +349,11 @@ async fn configure_authenticated_client_inner(
             }
         }
     }
-    client.set_authenticated(true);
+    client.complete_authentication(
+        auth_session_id,
+        authenticated_until,
+        authentication_expiry_action,
+    );
     server
         .get_clients()
         .publish_client_in_server(&server_id, client.get_session_id())
@@ -351,7 +363,7 @@ async fn configure_authenticated_client_inner(
         session = u32::from(client.get_session_id()),
         user_id = ?client.get_user_id(),
         display_name = ?client.display_name_opt(),
-        cache_username,
+        cache_username = cache_username.as_deref(),
         transport = ?client.transport_kind(),
         "client authenticated"
     );
@@ -422,6 +434,17 @@ pub async fn apply_control_command(
         .map_err(|error| error.to_string())
 }
 
+pub(crate) async fn client_is_current(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+) -> bool {
+    server
+        .get_clients()
+        .get_client_in_server(&client.server_id(), client.get_session_id())
+        .await
+        .is_some_and(|current| Arc::ptr_eq(&current, client))
+}
+
 pub fn server_event_from_message(message: Message) -> Option<ServerEvent> {
     match message {
         Message::UserState(user_state) => Some(ServerEvent::UserState(web_user_state(
@@ -464,11 +487,13 @@ pub fn server_event_from_message(message: Message) -> Option<ServerEvent> {
 }
 
 pub fn web_user_state(user_state: shitspeak_runtime::messages::encoder::UserState) -> WebUserState {
+    let user_id_cleared = user_state.user_id == Some(u32::MAX);
     WebUserState {
         session: user_state.session.map(u32::from),
         actor: user_state.actor.map(u32::from),
         name: user_state.name,
-        user_id: user_state.user_id,
+        user_id: user_state.user_id.filter(|user_id| *user_id != u32::MAX),
+        user_id_cleared,
         channel_id: user_state.channel_id,
         mute: user_state.mute,
         deaf: user_state.deaf,

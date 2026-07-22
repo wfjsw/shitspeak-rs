@@ -245,6 +245,26 @@ fn noop_raw_waker() -> RawWaker {
 struct AuthenticateRequest {
     username: String,
     password: Option<String>,
+    auxiliary_data: AuthenticateAuxiliaryData,
+}
+
+#[derive(Deserialize)]
+struct AuthenticateAuxiliaryData {
+    auth_session_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AuthenticationExpiryAction {
+    Reauth,
+    Kick,
+    Deregister,
+}
+
+impl Default for AuthenticationExpiryAction {
+    fn default() -> Self {
+        Self::Kick
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -252,6 +272,8 @@ struct AuthenticateResponse {
     accepted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     rejection: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_session_id: Option<String>,
     user_id: Option<u32>,
     display_name: Option<String>,
     groups: Vec<String>,
@@ -261,6 +283,10 @@ struct AuthenticateResponse {
     max_bandwidth: Option<u32>,
     texture_url: Option<String>,
     comment_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authenticated_until: Option<String>,
+    #[serde(default)]
+    authentication_expiry_action: AuthenticationExpiryAction,
 }
 
 impl AuthenticateResponse {
@@ -273,6 +299,7 @@ impl AuthenticateResponse {
         Self {
             accepted: true,
             rejection: None,
+            auth_session_id: None,
             user_id,
             display_name: Some(display_name.to_owned()),
             groups,
@@ -286,6 +313,8 @@ impl AuthenticateResponse {
             max_bandwidth: None,
             texture_url: None,
             comment_url: None,
+            authenticated_until: None,
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
         }
     }
 
@@ -293,6 +322,7 @@ impl AuthenticateResponse {
         Self {
             accepted: false,
             rejection: Some(rejection.to_owned()),
+            auth_session_id: None,
             user_id: None,
             display_name: None,
             groups: Vec::new(),
@@ -302,6 +332,8 @@ impl AuthenticateResponse {
             max_bandwidth: None,
             texture_url: None,
             comment_url: None,
+            authenticated_until: None,
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
         }
     }
 }

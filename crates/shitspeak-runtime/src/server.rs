@@ -13,9 +13,11 @@ use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
-use crate::api::{Authenticator, ReloadableAuthenticator};
+use crate::api::{
+    AuthenticateAuxiliaryData, AuthenticateResult, Authenticator, ReloadableAuthenticator,
+};
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
-use crate::client::Client;
+use crate::client::{Client, client_local_state::ExpiredAuthenticationAction};
 use crate::errors::MessageHandlerError;
 use crate::geoip::{GeoIpResolver, IpGeoMetadata};
 use crate::messages::encoder::Version;
@@ -1149,6 +1151,24 @@ impl Server {
         self.udp_socket_for_client_addr(client.get_local_address())
     }
 
+    pub(crate) fn udp_local_addr_for_client_addr(
+        &self,
+        local_addr: SocketAddr,
+    ) -> Option<SocketAddr> {
+        let entrypoints = self.entrypoints.read();
+        let client_port = local_addr.port();
+        let port = if entrypoints.udp_socket_by_port.contains_key(&client_port) {
+            client_port
+        } else {
+            entrypoints.default_port
+        };
+        entrypoints.cached_udp_local_addr(port)
+    }
+
+    pub(crate) fn udp_local_addr_for_client(&self, client: &Client) -> Option<SocketAddr> {
+        self.udp_local_addr_for_client_addr(client.get_local_address())
+    }
+
     fn default_udp_socket(&self) -> Option<Arc<tokio::net::UdpSocket>> {
         self.entrypoints.read().udp_sockets.first().cloned()
     }
@@ -1309,7 +1329,8 @@ impl Server {
             }
 
             let (listener, udp_socket) = bind_entrypoint_socket_pair(address).await?;
-            let port = listener.local_addr()?.port();
+            let local_addr = listener.local_addr()?;
+            let port = local_addr.port();
             if port == default_port {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1338,6 +1359,7 @@ impl Server {
                 udp_ping_status_server_id,
                 Arc::new(listener),
                 udp_socket,
+                local_addr,
                 port,
             ));
         }
@@ -1350,7 +1372,8 @@ impl Server {
                     .udp_ping_status_server_id_by_port
                     .insert(port, udp_ping_status_server_id);
             }
-            for (server_id, udp_ping_status_server_id, listener, udp_socket, port) in &new_bindings
+            for (server_id, udp_ping_status_server_id, listener, udp_socket, local_addr, port) in
+                &new_bindings
             {
                 entrypoints
                     .server_id_by_port
@@ -1361,6 +1384,7 @@ impl Server {
                 entrypoints
                     .udp_socket_by_port
                     .insert(*port, Arc::clone(udp_socket));
+                entrypoints.cache_udp_local_addr(*local_addr);
                 entrypoints.udp_sockets.push(Arc::clone(udp_socket));
                 entrypoints.tcp_listeners.push(ServerTcpListener {
                     listener: Arc::clone(listener),
@@ -1368,7 +1392,9 @@ impl Server {
             }
         }
 
-        for (server_id, _udp_ping_status_server_id, listener, udp_socket, port) in new_bindings {
+        for (server_id, _udp_ping_status_server_id, listener, udp_socket, _local_addr, port) in
+            new_bindings
+        {
             tracing::info!(
                 "config reload: added client entrypoint {} for server_id {}",
                 port,
@@ -1396,53 +1422,320 @@ impl Server {
                 }
 
                 server
-                    .disconnect_idle_local_clients(chrono::Utc::now(), timeout_secs)
+                    .reap_expired_authentication_and_disconnect_idle_local_clients(
+                        chrono::Utc::now(),
+                        timeout_secs,
+                    )
                     .await;
             }
         })
     }
 
-    async fn disconnect_idle_local_clients(
-        &self,
+    async fn reap_expired_authentication_and_disconnect_idle_local_clients(
+        self: &Arc<Box<Self>>,
         now: chrono::DateTime<chrono::Utc>,
         timeout_secs: u64,
     ) {
         let timeout = chrono::Duration::seconds(timeout_secs as i64);
         let clients = self.clients.get_local_clients().await;
+        let mut reauth_budget = self.read_config().auth_finalization_concurrency.max(1);
 
         for client in &clients {
+            if let Some(action) = client.take_expired_authentication(now, reauth_budget > 0) {
+                match action {
+                    ExpiredAuthenticationAction::Reauthenticate { auth_session_id } => {
+                        reauth_budget = reauth_budget.saturating_sub(1);
+                        let server = Arc::clone(self);
+                        let client = Arc::clone(client);
+                        tokio::spawn(async move {
+                            server
+                                .reauthenticate_expired_local_client(client, auth_session_id)
+                                .await;
+                        });
+                    }
+                    ExpiredAuthenticationAction::Kick => {
+                        self.disconnect_local_client(client, "authentication expired")
+                            .await;
+                    }
+                    ExpiredAuthenticationAction::Deregister => {
+                        self.deregister_expired_local_client(client).await;
+                    }
+                }
+            }
+
             if !client.is_authenticated() {
                 continue;
             }
             let last_ping = client.get_last_ping().await;
             if now - last_ping > timeout {
-                let sid = client.get_session_id();
-                let server_id = client.server_id();
-                let old_channel_id = client.get_current_channel_id();
                 tracing::info!(
                     "Disconnecting idle local client {:?} (last ping: {}, timeout: {}s)",
-                    sid,
+                    client.get_session_id(),
                     last_ping,
                     timeout_secs,
                 );
-                self.clients
-                    .remove_client_instance_in_server(&server_id, sid, client.client_instance_id())
-                    .await;
-                if let Err(e) = client.disconnect().await {
-                    tracing::debug!(
-                        error = %e,
-                        session = u32::from(sid),
-                        "failed to disconnect idle client",
-                    );
-                }
-                crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
-                    self,
-                    &server_id,
-                    old_channel_id,
-                )
-                .await;
+                self.disconnect_local_client(client, "idle timeout").await;
             }
         }
+    }
+
+    async fn reauthenticate_expired_local_client(
+        self: &Arc<Box<Self>>,
+        client: Arc<Box<Client>>,
+        auth_session_id: Option<String>,
+    ) {
+        if !self.client_instance_is_current(&client).await {
+            return;
+        }
+        let credential = {
+            let extended = client.user_info_extended().await;
+            extended.get_credential().clone()
+        };
+        let Some(credential) = credential else {
+            self.disconnect_local_client(&client, "reauthentication credential unavailable")
+                .await;
+            return;
+        };
+
+        let auxiliary_data = self.authentication_auxiliary_data(&client, auth_session_id);
+        let permit = self.auth_finalization_queue.acquire_silent().await;
+        if !self.client_instance_is_current(&client).await {
+            return;
+        }
+        let timeout =
+            std::time::Duration::from_millis(self.read_config().authenticate_timeout_ms.max(1));
+        let result = tokio::time::timeout(
+            timeout,
+            permit.authenticator().authenticate(
+                &credential.username,
+                credential.password.as_deref(),
+                &auxiliary_data,
+            ),
+        )
+        .await;
+        drop(permit);
+
+        let Ok(Ok(result)) = result else {
+            self.disconnect_local_client(&client, "reauthentication rejected")
+                .await;
+            return;
+        };
+
+        if !self.client_instance_is_current(&client).await {
+            return;
+        }
+        if !self.authentication_result_has_required_group(&result) {
+            self.disconnect_local_client(&client, "reauthentication lost required group")
+                .await;
+            return;
+        }
+
+        let AuthenticateResult {
+            user_id,
+            display_name,
+            groups,
+            is_superuser,
+            virtual_server_id,
+            language,
+            max_bandwidth,
+            texture_url: _,
+            comment_url: _,
+            auth_session_id,
+            authenticated_until,
+            authentication_expiry_action,
+        } = result;
+        if user_id == Some(u32::MAX) {
+            self.disconnect_local_client(&client, "reauthentication returned reserved user id")
+                .await;
+            return;
+        }
+        let groups: HashSet<String> = groups.into_iter().collect();
+
+        if virtual_server_id
+            .as_deref()
+            .is_some_and(|server_id| server_id != client.server_id())
+        {
+            tracing::warn!(
+                session = u32::from(client.get_session_id()),
+                current_server_id = %client.server_id(),
+                requested_server_id = ?virtual_server_id,
+                "ignoring virtual-server change during reauthentication"
+            );
+        }
+
+        client.set_language(language);
+        client.set_max_bandwidth(max_bandwidth);
+        let root_permissions = crate::client::acl::compute_permissions_for_client_with_identity(
+            self,
+            &client,
+            0,
+            user_id,
+            groups.clone(),
+            is_superuser,
+        )
+        .await;
+        if !root_permissions.contains(shitspeak_state::ACLPermissions::Traverse) {
+            self.disconnect_local_client(&client, "reauthentication lost root traverse")
+                .await;
+            return;
+        }
+        let current_permissions = crate::client::acl::compute_permissions_for_client_with_identity(
+            self,
+            &client,
+            client.get_current_channel_id(),
+            user_id,
+            groups.clone(),
+            is_superuser,
+        )
+        .await;
+        if !self.client_instance_is_current(&client).await {
+            return;
+        }
+        {
+            let mut state = client.write_global_state(&self.clients);
+            state.set_user_id(user_id);
+            state.set_display_name(display_name);
+            state.set_groups(groups);
+            state.set_superuser(is_superuser);
+            state.set_suppress(
+                !current_permissions.contains(shitspeak_state::ACLPermissions::Speak),
+            );
+        }
+
+        client.set_authentication_expiry(
+            auth_session_id,
+            authenticated_until,
+            authentication_expiry_action,
+        );
+        tracing::info!(
+            session = u32::from(client.get_session_id()),
+            user_id = ?client.get_user_id(),
+            display_name = ?client.display_name_opt(),
+            "client reauthenticated after authentication expiry"
+        );
+    }
+
+    fn authentication_auxiliary_data(
+        &self,
+        client: &Client,
+        auth_session_id: Option<String>,
+    ) -> AuthenticateAuxiliaryData {
+        let (client_name, os_name, os_version) = {
+            let local_state = client.read_local_state();
+            let state = local_state
+                .as_ref()
+                .expect("local client missing local state during reauthentication");
+            (
+                state.get_release().map(ToOwned::to_owned),
+                state.get_os_name().map(ToOwned::to_owned),
+                state.get_os_version().map(ToOwned::to_owned),
+            )
+        };
+        AuthenticateAuxiliaryData {
+            certificate_hash: client.get_certificate_hash().map(Bytes::copy_from_slice),
+            session_id: client.get_session_id().into(),
+            ip_address: crate::api::canonical_authenticator_ip(client.get_real_ip_address()),
+            tls_ja4: client.tls_ja4().map(ToOwned::to_owned),
+            uses_proxy_protocol: client.uses_proxy_protocol(),
+            version: client.protocol_version(),
+            client_name,
+            os_name,
+            os_version,
+            auth_session_id,
+        }
+    }
+
+    fn authentication_result_has_required_group(&self, result: &AuthenticateResult) -> bool {
+        let required = self.get_required_groups();
+        required.is_empty()
+            || required
+                .iter()
+                .any(|required| result.groups.iter().any(|group| group == required))
+    }
+
+    async fn deregister_expired_local_client(self: &Arc<Box<Self>>, client: &Arc<Box<Client>>) {
+        if !self.client_instance_is_current(client).await {
+            return;
+        }
+        let groups = client.get_groups_clone();
+        let is_superuser = client.is_superuser();
+        let root_permissions = crate::client::acl::compute_permissions_for_client_with_identity(
+            self,
+            client,
+            0,
+            None,
+            groups.clone(),
+            is_superuser,
+        )
+        .await;
+        if !root_permissions.contains(shitspeak_state::ACLPermissions::Traverse) {
+            self.disconnect_local_client(client, "deregistration lost root traverse")
+                .await;
+            return;
+        }
+        let current_permissions = crate::client::acl::compute_permissions_for_client_with_identity(
+            self,
+            client,
+            client.get_current_channel_id(),
+            None,
+            groups,
+            is_superuser,
+        )
+        .await;
+        let mut state = client.write_global_state(&self.clients);
+        state.set_user_id(None);
+        state.set_suppress(!current_permissions.contains(shitspeak_state::ACLPermissions::Speak));
+    }
+
+    async fn client_has_root_traverse(self: &Arc<Box<Self>>, client: &Arc<Box<Client>>) -> bool {
+        client.is_superuser()
+            || crate::client::acl::compute_permissions_for_client(self, client, 0)
+                .await
+                .contains(shitspeak_state::ACLPermissions::Traverse)
+    }
+
+    async fn client_instance_is_current(&self, client: &Arc<Box<Client>>) -> bool {
+        self.clients
+            .get_client_in_server(&client.server_id(), client.get_session_id())
+            .await
+            .is_some_and(|current| current.client_instance_id() == client.client_instance_id())
+    }
+
+    async fn disconnect_local_client(
+        self: &Arc<Box<Self>>,
+        client: &Arc<Box<Client>>,
+        reason: &'static str,
+    ) {
+        let session_id = client.get_session_id();
+        let server_id = client.server_id();
+        let old_channel_id = client.get_current_channel_id();
+        let removed = self
+            .clients
+            .remove_client_instance_in_server(&server_id, session_id, client.client_instance_id())
+            .await;
+        if removed.is_none() {
+            return;
+        }
+        tracing::info!(
+            session = u32::from(session_id),
+            server_id,
+            reason,
+            "disconnecting local client"
+        );
+        if let Err(error) = client.disconnect().await {
+            tracing::debug!(
+                %error,
+                session = u32::from(session_id),
+                reason,
+                "failed to disconnect local client"
+            );
+        }
+        crate::client::handlers::temp_channel::reap_if_empty_temporary_on_server(
+            self,
+            &server_id,
+            old_channel_id,
+        )
+        .await;
     }
 
     /// Spawn a periodic task that rolls back stale pending channel deletes.
@@ -1550,11 +1843,7 @@ impl Server {
                         self.s2s_manager.update_max_users(new_config.max_users);
                     }
                     if current.authenticator != new_config.authenticator {
-                        tracing::info!(
-                            "config reload: authenticator {:?} -> {:?}",
-                            current.authenticator,
-                            new_config.authenticator
-                        );
+                        tracing::info!("config reload: authenticator configuration changed");
                     }
                     if current.cert_path != new_config.cert_path
                         || current.key_path != new_config.key_path
