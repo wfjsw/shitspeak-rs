@@ -30,6 +30,7 @@ use crate::protocol::{
     ClientCommand, IceConnectionState, ServerEvent, SpeakerAssigned, VoiceSegment, VoiceTarget,
     decode_client_command, encode_server_event,
 };
+use crate::session::client_is_current;
 use crate::voice::{
     InboundVoiceMetadata, RtpFrameNumberMapper, SpeakerAssignment, SsrcAllocator, VoiceTargetKind,
 };
@@ -367,11 +368,19 @@ fn spawn_inbound_audio_task(
     server: Option<Arc<Box<Server>>>,
     client: Option<Arc<Box<Client>>>,
 ) {
-    let (Some(_server), Some(client)) = (server, client) else {
+    let (Some(server), Some(client)) = (server, client) else {
         return;
     };
     tokio::spawn(async move {
-        while let Ok((packet, _)) = track.read_rtp().await {
+        loop {
+            let packet = tokio::select! {
+                biased;
+                _ = client.disconnected() => break,
+                packet = track.read_rtp() => match packet {
+                    Ok((packet, _)) => packet,
+                    Err(_) => break,
+                },
+            };
             let Some(epoch) = voice_metadata.lock().await.routable_epoch() else {
                 continue;
             };
@@ -395,6 +404,9 @@ fn spawn_inbound_audio_task(
                 volume_adjustment: 1.0,
                 format: PacketFormat::Protobuf,
             };
+            if !client_is_current(&server, &client).await {
+                break;
+            }
             client.push_voice_routing(audio);
         }
     });

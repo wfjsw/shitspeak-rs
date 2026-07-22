@@ -2023,10 +2023,7 @@ pub(crate) async fn flush_voice_batch(
                 enqueue_voice_tcp_timed(path, &mut tcp_tally, client, &entry.bytes);
                 continue;
             };
-            let Some(local_addr) = server
-                .udp_socket_for_client(client)
-                .and_then(|socket| socket.local_addr().ok())
-            else {
+            let Some(local_addr) = server.udp_local_addr_for_client(client) else {
                 record_pipeline_stage(path, VoicePipelineStage::RecipientLookup, lookup_started_at);
                 enqueue_voice_tcp_timed(path, &mut tcp_tally, client, &entry.bytes);
                 continue;
@@ -2184,10 +2181,7 @@ pub(crate) async fn flush_voice_batch(
         }
         match client.get_udp_address() {
             Some(addr) => {
-                if let Some(local_addr) = server
-                    .udp_socket_for_client(client)
-                    .and_then(|socket| socket.local_addr().ok())
-                {
+                if let Some(local_addr) = server.udp_local_addr_for_client(client) {
                     record_pipeline_stage(
                         path,
                         VoicePipelineStage::RecipientLookup,

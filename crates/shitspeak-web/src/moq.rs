@@ -616,7 +616,14 @@ impl MoqSessionRuntime {
                 let Some(client) = self.client.as_ref() else {
                     return Err("authentication required before control command".to_string());
                 };
-                match apply_control_command(&server, client, command).await? {
+                let result = tokio::select! {
+                    biased;
+                    _ = client.disconnected() => {
+                        return Err("MoQ client is no longer connected".to_string());
+                    }
+                    result = apply_control_command(&server, client, command) => result?,
+                };
+                match result {
                     Some(event) => Ok(vec![event]),
                     None => Ok(Vec::new()),
                 }
@@ -756,6 +763,9 @@ impl MoqSessionRuntime {
             frame_number: mapped,
             ..frame.into_audio(client.get_session_id(), epoch.target)
         };
+        if !client_is_current(server, client).await {
+            return Err("MoQ client is no longer connected".to_string());
+        }
         client.push_voice_routing(audio);
         Ok(())
     }

@@ -737,3 +737,20 @@ fn web_deny_type_name(deny_type: shitspeak_runtime::messages::encoder::DenyType)
         shitspeak_runtime::messages::encoder::DenyType::UserListenerLimit => "user_listener_limit",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::web_user_state;
+
+    #[test]
+    fn mumble_deregistration_sentinel_becomes_explicit_web_clear() {
+        let user_state = shitspeak_runtime::messages::encoder::UserState {
+            user_id: Some(u32::MAX),
+            ..Default::default()
+        };
+
+        let state = web_user_state(user_state);
+        assert_eq!(state.user_id, None);
+        assert!(state.user_id_cleared);
+    }
+}

@@ -423,6 +423,13 @@ async fn bind_entrypoints_maps_default_and_extra_ports() {
 
     assert_eq!(bindings.tcp_listeners.len(), 2);
     assert_eq!(bindings.udp_sockets.len(), 2);
+    for socket in &bindings.udp_sockets {
+        let local_addr = socket.local_addr().expect("UDP local address");
+        assert_eq!(
+            bindings.cached_udp_local_addr(local_addr.port()),
+            Some(local_addr)
+        );
+    }
     assert!(
         !bindings.server_id_by_port.contains_key(
             &bindings.tcp_listeners[0]
@@ -612,6 +619,11 @@ async fn apply_entrypoint_config_accepts_config_absent_server_id_scope() {
     let server = Server::new(test_config(Vec::new()), TestAuthenticator)
         .await
         .expect("server");
+    let default_udp_addr = server.local_udp_addr().expect("default UDP address");
+    assert_eq!(
+        server.udp_local_addr_for_client_addr(SocketAddr::from(([127, 0, 0, 1], 1))),
+        Some(default_udp_addr)
+    );
     let new_config = test_config(vec![ServerEntrypointConfig {
         server_id: "tenant-from-existing-state".to_owned(),
         listen: Some("127.0.0.1:0".to_owned()),
@@ -637,6 +649,19 @@ async fn apply_entrypoint_config_accepts_config_absent_server_id_scope() {
             .server_id_by_port
             .values()
             .any(|server_id| { server_id == "tenant-from-existing-state" })
+    );
+    let added_port = entrypoints
+        .server_id_by_port
+        .iter()
+        .find_map(|(port, server_id)| (server_id == "tenant-from-existing-state").then_some(*port))
+        .expect("hot-added entrypoint port");
+    let added_addr = entrypoints
+        .cached_udp_local_addr(added_port)
+        .expect("cached hot-added UDP address");
+    drop(entrypoints);
+    assert_eq!(
+        server.udp_local_addr_for_client_addr(SocketAddr::from(([127, 0, 0, 1], added_port))),
+        Some(added_addr)
     );
 }
 

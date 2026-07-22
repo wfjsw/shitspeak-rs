@@ -134,9 +134,21 @@ pub(super) struct EntrypointBindings {
     pub(super) tcp_listeners: Vec<ServerTcpListener>,
     pub(super) udp_sockets: Vec<Arc<tokio::net::UdpSocket>>,
     pub(super) udp_socket_by_port: HashMap<u16, Arc<tokio::net::UdpSocket>>,
+    udp_local_addr_by_port: HashMap<u16, SocketAddr>,
     pub(super) server_id_by_port: HashMap<u16, String>,
     pub(super) udp_ping_status_server_id_by_port: HashMap<u16, String>,
     pub(super) server_id_by_sni: HashMap<String, String>,
+}
+
+impl EntrypointBindings {
+    pub(super) fn cache_udp_local_addr(&mut self, local_addr: SocketAddr) {
+        self.udp_local_addr_by_port
+            .insert(local_addr.port(), local_addr);
+    }
+
+    pub(super) fn cached_udp_local_addr(&self, port: u16) -> Option<SocketAddr> {
+        self.udp_local_addr_by_port.get(&port).copied()
+    }
 }
 
 #[derive(Clone)]
@@ -255,6 +267,7 @@ pub(super) async fn bind_entrypoints(
     let mut tcp_listeners = Vec::new();
     let mut udp_sockets = Vec::new();
     let mut udp_socket_by_port = HashMap::new();
+    let mut udp_local_addr_by_port = HashMap::new();
     let mut server_id_by_port = HashMap::new();
     let mut udp_ping_status_server_id_by_port = HashMap::new();
 
@@ -262,8 +275,10 @@ pub(super) async fn bind_entrypoints(
 
     let listen_address = first_socket_addr(&config.listen)?;
     let (listener, udp_socket) = bind_entrypoint_socket_pair(listen_address).await?;
-    let default_port = listener.local_addr()?.port();
+    let default_local_addr = listener.local_addr()?;
+    let default_port = default_local_addr.port();
     udp_socket_by_port.insert(default_port, Arc::clone(&udp_socket));
+    udp_local_addr_by_port.insert(default_port, default_local_addr);
     udp_sockets.push(udp_socket);
     tcp_listeners.push(ServerTcpListener {
         listener: Arc::new(listener),
@@ -276,7 +291,8 @@ pub(super) async fn bind_entrypoints(
             udp_ping_status_server_id,
         } = spec;
         let (listener, udp_socket) = bind_entrypoint_socket_pair(address).await?;
-        let port = listener.local_addr()?.port();
+        let local_addr = listener.local_addr()?;
+        let port = local_addr.port();
         if port == default_port {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -295,6 +311,7 @@ pub(super) async fn bind_entrypoints(
         }
         udp_ping_status_server_id_by_port.insert(port, udp_ping_status_server_id);
         udp_socket_by_port.insert(port, Arc::clone(&udp_socket));
+        udp_local_addr_by_port.insert(port, local_addr);
         udp_sockets.push(udp_socket);
         tcp_listeners.push(ServerTcpListener {
             listener: Arc::new(listener),
@@ -306,6 +323,7 @@ pub(super) async fn bind_entrypoints(
         tcp_listeners,
         udp_sockets,
         udp_socket_by_port,
+        udp_local_addr_by_port,
         server_id_by_port,
         udp_ping_status_server_id_by_port,
         server_id_by_sni,
