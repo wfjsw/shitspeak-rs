@@ -29,6 +29,7 @@ use super::latest_wins_queue::{
     latest_wins_queue,
 };
 use super::metrics::{
+    DatagramPathHealthReason, DatagramPathHealthSnapshot, DatagramPathHealthState,
     ExpiredOutboundDropCounters, ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage,
     MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics, QueueStatusSnapshot, QueueWatermark,
     TransportHealthExclusionReason, TransportHealthExclusionSnapshot,
@@ -108,6 +109,17 @@ struct VoiceTransportBinding {
         ),
         u64,
     >,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DatagramPathHealthObservation {
+    state: DatagramPathHealthState,
+    reason: DatagramPathHealthReason,
+    effective_loss_ppm: Option<u32>,
+    loss_samples: u64,
+    transitions: u64,
+    changed_at: Instant,
+    observed_at: Instant,
 }
 
 impl VoiceTransportBinding {
@@ -1361,6 +1373,7 @@ pub(crate) struct PeerState {
     expired_outbound_drops: ExpiredOutboundDropCounters,
     transport_health_exclusions:
         Mutex<HashMap<(TransportKind, TransportHealthExclusionReason), u64>>,
+    datagram_path_health: Mutex<HashMap<DeliveryPath, DatagramPathHealthObservation>>,
     /// KCP is kept out of BestEffort selection after failaway/no-progress
     /// until the native KCP sampler observes a newer ACK-derived RTT sample.
     kcp_best_effort_recovery_after_rtt_samples: Mutex<Option<u64>>,
@@ -1402,6 +1415,7 @@ impl PeerState {
             udp_datagram_mtu_last_probe: Mutex::new(None),
             expired_outbound_drops: ExpiredOutboundDropCounters::default(),
             transport_health_exclusions: Mutex::new(HashMap::new()),
+            datagram_path_health: Mutex::new(HashMap::new()),
             kcp_best_effort_recovery_after_rtt_samples: Mutex::new(None),
             voice_transport_binding: Mutex::new(VoiceTransportBinding::default()),
             outbound_dispatch_notify: Notify::new(),
@@ -2106,6 +2120,130 @@ impl PeerState {
         let mut counters = self.transport_health_exclusions.lock();
         let counter = counters.entry((transport, reason)).or_insert(0);
         *counter = counter.saturating_add(1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_datagram_path_health(
+        &self,
+        path: DeliveryPath,
+        effective_loss_ppm: Option<u32>,
+        loss_samples: u64,
+        min_samples: u64,
+        address_failures_blocked: bool,
+        consecutive_probe_losses_blocked: bool,
+        suspect_effective_loss_ppm: u32,
+        recover_effective_loss_ppm: u32,
+        hard_effective_loss_ppm: u32,
+        now: Instant,
+    ) -> DatagramPathHealthState {
+        debug_assert!(path.is_datagram());
+        let mut observations = self.datagram_path_health.lock();
+        let previous = observations.get(&path).copied();
+        let sampled_loss = effective_loss_ppm.filter(|_| loss_samples >= min_samples);
+        let recover_effective_loss_ppm = recover_effective_loss_ppm.min(suspect_effective_loss_ppm);
+
+        let (state, reason) = if address_failures_blocked {
+            (
+                DatagramPathHealthState::Blocked,
+                DatagramPathHealthReason::AddressFailures,
+            )
+        } else if consecutive_probe_losses_blocked {
+            (
+                DatagramPathHealthState::Blocked,
+                DatagramPathHealthReason::ProbeFailures,
+            )
+        } else if sampled_loss.is_some_and(|loss| loss >= hard_effective_loss_ppm) {
+            (
+                DatagramPathHealthState::Blocked,
+                DatagramPathHealthReason::HardLoss,
+            )
+        } else if sampled_loss.is_none() {
+            (
+                DatagramPathHealthState::Probing,
+                DatagramPathHealthReason::InsufficientSamples,
+            )
+        } else if sampled_loss.is_some_and(|loss| loss >= suspect_effective_loss_ppm) {
+            (
+                DatagramPathHealthState::Suspect,
+                DatagramPathHealthReason::MeasuredLoss,
+            )
+        } else if previous.is_some_and(|observation| {
+            matches!(
+                observation.state,
+                DatagramPathHealthState::Suspect | DatagramPathHealthState::Blocked
+            ) && sampled_loss.is_none_or(|loss| loss > recover_effective_loss_ppm)
+        }) {
+            let previous = previous.expect("checked above");
+            (previous.state, previous.reason)
+        } else if sampled_loss.is_some() {
+            let recovered = previous.is_some_and(|observation| {
+                matches!(
+                    observation.state,
+                    DatagramPathHealthState::Suspect | DatagramPathHealthState::Blocked
+                )
+            });
+            (
+                DatagramPathHealthState::Healthy,
+                if recovered {
+                    DatagramPathHealthReason::Recovered
+                } else {
+                    DatagramPathHealthReason::WithinThreshold
+                },
+            )
+        } else {
+            unreachable!("sampled loss handled above")
+        };
+
+        let state_changed = previous.is_none_or(|observation| observation.state != state);
+        let observation = DatagramPathHealthObservation {
+            state,
+            reason,
+            effective_loss_ppm,
+            loss_samples,
+            transitions: previous
+                .map(|observation| {
+                    observation
+                        .transitions
+                        .saturating_add(u64::from(state_changed))
+                })
+                .unwrap_or(0),
+            changed_at: previous
+                .filter(|_| !state_changed)
+                .map(|observation| observation.changed_at)
+                .unwrap_or(now),
+            observed_at: now,
+        };
+        observations.insert(path, observation);
+        state
+    }
+
+    pub(crate) fn datagram_path_health_status(
+        &self,
+        stale_after: Duration,
+    ) -> Vec<DatagramPathHealthSnapshot> {
+        let now = Instant::now();
+        let mut observations = self.datagram_path_health.lock();
+        observations.retain(|_, observation| {
+            now.saturating_duration_since(observation.observed_at) < stale_after
+        });
+        let mut snapshots = observations
+            .iter()
+            .map(|(path, observation)| {
+                DatagramPathHealthSnapshot::new(
+                    self.node_id,
+                    *path,
+                    observation.state,
+                    observation.reason,
+                    observation.effective_loss_ppm,
+                    observation.loss_samples,
+                    observation.transitions,
+                    now.saturating_duration_since(observation.changed_at),
+                    now.saturating_duration_since(observation.observed_at),
+                )
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| snapshot.path());
+        snapshots
     }
 
     pub(crate) fn require_kcp_best_effort_recovery(&self) {

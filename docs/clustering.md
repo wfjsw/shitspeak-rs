@@ -146,6 +146,14 @@ Selection telemetry preserves this logical distinction:
 QUIC RTT, loss, and health remain shared under `TransportKind::Quic`; the path
 label describes delivery semantics, not a separate network link.
 
+BestEffort datagram health also runs as a shadow-only hysteretic observer. Its
+configured thresholds apply to the weighted effective-loss score rather than
+raw packet loss, and its `suspect` state does not affect selection. Status JSON
+and the bounded `shitspeak_s2s_datagram_path_*` Prometheus metrics expose the
+state, reason, score, samples, transitions, state age, and observation age.
+QUIC DATAGRAM uses aggregate physical-QUIC evidence until lane-native loss is
+available.
+
 UDP-family health and viability gates still apply. Unhealthy or unusable
 datagram candidates are excluded, and the QUIC DATAGRAM path is excluded from
 the tier when the encoded frame does not fit its current maximum DATAGRAM

@@ -49,9 +49,10 @@ use super::identity::{
     NodeIdentity, OriginAuthenticationError, OriginSignature, OriginSignatureMetadata,
 };
 use super::metrics::{
-    ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot,
-    MetricsTuning, QueueWatermark, QueueWatermarkReport, TransportHealthExclusionReason,
-    VoiceTransportBindingEventReason, assemble_snapshot, record_delivery_path_selection,
+    DatagramPathHealthState, ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics,
+    MetricsSnapshot, MetricsTuning, QueueWatermark, QueueWatermarkReport,
+    TransportHealthExclusionReason, VoiceTransportBindingEventReason, assemble_snapshot,
+    record_delivery_path_selection,
 };
 use super::service_level::{
     DeliveryPath, MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel,
@@ -1434,10 +1435,16 @@ impl ConnectionManager {
 
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
         let peers = self.inner.iter_peers();
+        let datagram_health_stale_after = self
+            .inner
+            .cfg()
+            .routing_policy()
+            .transport_metric_stale_after();
         let mut entries = Vec::with_capacity(peers.len());
         let mut outbound_queues = Vec::new();
         let mut expired_outbound_drops = Vec::new();
         let mut transport_health_exclusions = Vec::new();
+        let mut datagram_path_health = Vec::new();
         let mut voice_transport_bindings = Vec::new();
         let mut voice_transport_binding_events = Vec::new();
         let mut voice_transport_challengers = Vec::new();
@@ -1446,6 +1453,8 @@ impl ConnectionManager {
             outbound_queues.extend(peer.outbound_queue_status());
             expired_outbound_drops.extend(peer.expired_outbound_drop_status());
             transport_health_exclusions.extend(peer.transport_health_exclusion_status());
+            datagram_path_health
+                .extend(peer.datagram_path_health_status(datagram_health_stale_after));
             voice_transport_bindings.extend(peer.voice_transport_binding_status());
             voice_transport_binding_events.extend(peer.voice_transport_binding_event_status());
             voice_transport_challengers.extend(peer.voice_transport_challenger_status());
@@ -1461,6 +1470,7 @@ impl ConnectionManager {
         });
         transport_health_exclusions
             .sort_by_key(|exclusion| (exclusion.peer(), exclusion.transport(), exclusion.reason()));
+        datagram_path_health.sort_by_key(|health| (health.peer(), health.path()));
         voice_transport_bindings.sort_by_key(|binding| binding.peer());
         voice_transport_binding_events.sort_by_key(|event| {
             (
@@ -1484,6 +1494,7 @@ impl ConnectionManager {
             self.inner.inbound.queue_status(),
             expired_outbound_drops,
             transport_health_exclusions,
+            datagram_path_health,
             voice_transport_bindings,
             voice_transport_binding_events,
             voice_transport_challengers,
@@ -3184,11 +3195,16 @@ fn prefer_best_effort_datagram_paths(
         envelope.options(),
     );
     candidates.retain(|candidate| {
-        !candidate.path.is_datagram()
-            || matches!(
-                udp_family_health(peer, &[candidate.path.transport()], &snapshot, policy),
-                UdpFamilyHealth::Probing | UdpFamilyHealth::Viable
-            )
+        if !candidate.path.is_datagram() {
+            return true;
+        }
+        let physical_health =
+            udp_family_health(peer, &[candidate.path.transport()], &snapshot, policy);
+        observe_best_effort_datagram_path_health(peer, candidate.path, &snapshot, policy, now);
+        matches!(
+            physical_health,
+            UdpFamilyHealth::Probing | UdpFamilyHealth::Viable
+        )
     });
     if expiring_voice {
         candidates.retain(|candidate| {
@@ -3209,6 +3225,47 @@ fn prefer_best_effort_datagram_paths(
                 }
             })
     });
+}
+
+fn observe_best_effort_datagram_path_health(
+    peer: &PeerState,
+    path: DeliveryPath,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    policy: TransportRoutingPolicy,
+    now: Instant,
+) -> DatagramPathHealthState {
+    debug_assert!(path.is_datagram());
+    let transport = path.transport();
+    let link = snapshot.get(&transport);
+    let fresh_link = link.filter(|link| {
+        link.last_update().is_some_and(|last_update| {
+            now.saturating_duration_since(last_update) < policy.transport_metric_stale_after()
+        })
+    });
+    let effective_loss_ppm = fresh_link.map(LinkMetrics::effective_packet_loss_ppm);
+    let loss_samples = fresh_link.map(LinkMetrics::loss_sample_count).unwrap_or(0);
+    let address_failures_blocked = peer.max_consecutive_failures_for_transports(&[transport])
+        >= policy.udp_family_probe_loss_block_count();
+    let consecutive_probe_losses_blocked = fresh_link.is_some_and(|link| {
+        link.consecutive_probe_losses() >= policy.udp_family_probe_loss_block_count()
+    });
+
+    // QUIC DATAGRAM and QUIC streams currently share physical-QUIC loss
+    // samples. Keeping the latch keyed by DeliveryPath prevents that API
+    // limitation from becoming part of the state model when lane-native
+    // health measurements become available.
+    peer.observe_datagram_path_health(
+        path,
+        effective_loss_ppm,
+        loss_samples,
+        policy.udp_family_min_samples(),
+        address_failures_blocked,
+        consecutive_probe_losses_blocked,
+        policy.best_effort_datagram_effective_loss_suspect_ppm(),
+        policy.best_effort_datagram_effective_loss_recover_ppm(),
+        policy.udp_family_block_loss_ppm(),
+        now,
+    )
 }
 
 fn delivery_candidate_tier(candidate: &DeliveryCandidate) -> u8 {
@@ -5371,6 +5428,246 @@ mod tests {
             b"probing-datagram".as_slice()
         );
         assert!(stream_receivers[0].try_recv().is_err());
+    }
+
+    #[test]
+    fn datagram_health_hysteresis_is_delivery_path_specific() {
+        let (peer, _receivers) = peer_with_live_transports(&[]);
+        let now = Instant::now();
+
+        assert_eq!(
+            peer.observe_datagram_path_health(
+                DeliveryPath::UdpDatagram,
+                Some(6_000),
+                32,
+                32,
+                false,
+                false,
+                5_000,
+                2_500,
+                250_000,
+                now,
+            ),
+            DatagramPathHealthState::Suspect
+        );
+        assert_eq!(
+            peer.observe_datagram_path_health(
+                DeliveryPath::QuicDatagram,
+                Some(1_000),
+                32,
+                32,
+                false,
+                false,
+                5_000,
+                2_500,
+                250_000,
+                now,
+            ),
+            DatagramPathHealthState::Healthy
+        );
+        assert_eq!(
+            peer.observe_datagram_path_health(
+                DeliveryPath::UdpDatagram,
+                Some(4_000),
+                64,
+                32,
+                false,
+                false,
+                5_000,
+                2_500,
+                250_000,
+                now + Duration::from_secs(1),
+            ),
+            DatagramPathHealthState::Suspect,
+            "the recovery threshold, not the enter threshold, releases a suspect path"
+        );
+        assert_eq!(
+            peer.observe_datagram_path_health(
+                DeliveryPath::UdpDatagram,
+                Some(2_000),
+                96,
+                32,
+                false,
+                false,
+                5_000,
+                2_500,
+                250_000,
+                now + Duration::from_secs(2),
+            ),
+            DatagramPathHealthState::Healthy
+        );
+
+        let snapshots = peer.datagram_path_health_status(Duration::from_secs(10));
+        let udp = snapshots
+            .iter()
+            .find(|snapshot| snapshot.path() == DeliveryPath::UdpDatagram)
+            .unwrap();
+        let quic = snapshots
+            .iter()
+            .find(|snapshot| snapshot.path() == DeliveryPath::QuicDatagram)
+            .unwrap();
+        assert_eq!(udp.state(), DatagramPathHealthState::Healthy);
+        assert_eq!(udp.transitions(), 1);
+        assert_eq!(quic.state(), DatagramPathHealthState::Healthy);
+        assert_eq!(quic.transitions(), 0);
+    }
+
+    #[test]
+    fn datagram_health_stale_samples_probe_and_removed_paths_are_pruned() {
+        let (peer, _receivers) = peer_with_live_transports(&[]);
+        let now = Instant::now();
+        assert_eq!(
+            peer.observe_datagram_path_health(
+                DeliveryPath::UdpDatagram,
+                Some(6_000),
+                32,
+                32,
+                false,
+                false,
+                5_000,
+                2_500,
+                250_000,
+                now,
+            ),
+            DatagramPathHealthState::Suspect
+        );
+        assert_eq!(
+            peer.observe_datagram_path_health(
+                DeliveryPath::UdpDatagram,
+                None,
+                0,
+                32,
+                false,
+                false,
+                5_000,
+                2_500,
+                250_000,
+                now + Duration::from_secs(1),
+            ),
+            DatagramPathHealthState::Probing
+        );
+        let probing = peer.datagram_path_health_status(Duration::from_secs(10));
+        assert_eq!(
+            probing[0].reason(),
+            super::super::metrics::DatagramPathHealthReason::InsufficientSamples
+        );
+
+        let (removed_peer, _receivers) = peer_with_live_transports(&[]);
+        removed_peer.observe_datagram_path_health(
+            DeliveryPath::QuicDatagram,
+            Some(1_000),
+            32,
+            32,
+            false,
+            false,
+            5_000,
+            2_500,
+            250_000,
+            Instant::now() - Duration::from_secs(2),
+        );
+        assert!(
+            removed_peer
+                .datagram_path_health_status(Duration::from_secs(1))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn datagram_health_distinguishes_address_and_probe_failures() {
+        let (peer, _receivers) = peer_with_live_transports(&[]);
+        let now = Instant::now();
+        peer.observe_datagram_path_health(
+            DeliveryPath::UdpDatagram,
+            None,
+            0,
+            32,
+            true,
+            false,
+            5_000,
+            2_500,
+            250_000,
+            now,
+        );
+        peer.observe_datagram_path_health(
+            DeliveryPath::QuicDatagram,
+            None,
+            0,
+            32,
+            false,
+            true,
+            5_000,
+            2_500,
+            250_000,
+            now,
+        );
+        let snapshots = peer.datagram_path_health_status(Duration::from_secs(10));
+        assert_eq!(
+            snapshots[0].reason(),
+            super::super::metrics::DatagramPathHealthReason::AddressFailures
+        );
+        assert_eq!(
+            snapshots[1].reason(),
+            super::super::metrics::DatagramPathHealthReason::ProbeFailures
+        );
+    }
+
+    #[tokio::test]
+    async fn suspect_datagram_observation_does_not_change_selection() {
+        let (peer, mut stream_receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        let (_control, _high, _regular, mut quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1400).into_parts();
+        peer.metrics()
+            .record_rtt(TransportKind::Tcp, Duration::from_millis(10));
+        peer.metrics()
+            .record_rtt(TransportKind::Quic, Duration::from_millis(100));
+        peer.metrics()
+            .record_native_loss_sample(TransportKind::Quic, 100_000, 1_200);
+
+        try_dispatch_envelope(
+            &peer,
+            expiring_voice(b"shadow-suspect"),
+            TransportRoutingPolicy::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            quic_datagram.recv().await.unwrap().payload(),
+            b"shadow-suspect".as_slice()
+        );
+        assert!(stream_receivers[0].try_recv().is_err());
+        assert_eq!(
+            peer.datagram_path_health_status(Duration::from_secs(10))[0].state(),
+            DatagramPathHealthState::Suspect
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_probe_streak_is_probing_in_shadow_health() {
+        let (peer, mut stream_receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
+        let (_control, _high, _regular, quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1400).into_parts();
+        let policy =
+            TransportRoutingPolicy::default().with_transport_metric_stale_after(Duration::ZERO);
+        peer.metrics()
+            .record_rtt(TransportKind::Tcp, Duration::from_millis(10));
+        for _ in 0..policy.udp_family_probe_loss_block_count() {
+            peer.metrics().record_probe_lost(TransportKind::Quic);
+        }
+
+        try_dispatch_envelope(&peer, expiring_voice(b"stale-probe"), policy).unwrap();
+
+        assert_eq!(
+            stream_receivers[0].try_recv().unwrap().payload(),
+            b"stale-probe".as_slice(),
+            "the existing physical hard gate remains unchanged"
+        );
+        assert_eq!(quic_datagram.depth_bytes(), 0);
+        let observations = peer.datagram_path_health_status(Duration::from_secs(10));
+        assert_eq!(observations[0].state(), DatagramPathHealthState::Probing);
+        assert_eq!(
+            observations[0].reason(),
+            super::super::metrics::DatagramPathHealthReason::InsufficientSamples
+        );
     }
 
     #[test]

@@ -959,6 +959,10 @@ pub struct TransportRoutingPolicy {
     udp_family_block_loss_ppm: u32,
     #[serde(default = "default_udp_family_loss_excess_over_tcp_ppm")]
     udp_family_loss_excess_over_tcp_ppm: u32,
+    #[serde(default = "default_best_effort_datagram_effective_loss_suspect_ppm")]
+    best_effort_datagram_effective_loss_suspect_ppm: u32,
+    #[serde(default = "default_best_effort_datagram_effective_loss_recover_ppm")]
+    best_effort_datagram_effective_loss_recover_ppm: u32,
     #[serde(default = "default_large_rtt_threshold_ms")]
     large_rtt_threshold_ms: u64,
     #[serde(default = "default_lossy_link_threshold_ppm")]
@@ -986,6 +990,10 @@ impl Default for TransportRoutingPolicy {
             udp_family_probe_loss_block_count: default_udp_family_probe_loss_block_count(),
             udp_family_block_loss_ppm: default_udp_family_block_loss_ppm(),
             udp_family_loss_excess_over_tcp_ppm: default_udp_family_loss_excess_over_tcp_ppm(),
+            best_effort_datagram_effective_loss_suspect_ppm:
+                default_best_effort_datagram_effective_loss_suspect_ppm(),
+            best_effort_datagram_effective_loss_recover_ppm:
+                default_best_effort_datagram_effective_loss_recover_ppm(),
             large_rtt_threshold_ms: default_large_rtt_threshold_ms(),
             lossy_link_threshold_ppm: default_lossy_link_threshold_ppm(),
             bulk_payload_threshold_bytes: default_bulk_payload_threshold_bytes(),
@@ -1028,6 +1036,14 @@ impl TransportRoutingPolicy {
 
     pub fn udp_family_loss_excess_over_tcp_ppm(&self) -> u32 {
         self.udp_family_loss_excess_over_tcp_ppm
+    }
+
+    pub fn best_effort_datagram_effective_loss_suspect_ppm(&self) -> u32 {
+        self.best_effort_datagram_effective_loss_suspect_ppm
+    }
+
+    pub fn best_effort_datagram_effective_loss_recover_ppm(&self) -> u32 {
+        self.best_effort_datagram_effective_loss_recover_ppm
     }
 
     pub fn large_rtt_threshold_ms(&self) -> u64 {
@@ -1075,6 +1091,16 @@ impl TransportRoutingPolicy {
 
     pub fn with_udp_family_loss_excess_over_tcp_ppm(mut self, ppm: u32) -> Self {
         self.udp_family_loss_excess_over_tcp_ppm = ppm.min(1_000_000);
+        self
+    }
+
+    pub fn with_best_effort_datagram_effective_loss_suspect_ppm(mut self, ppm: u32) -> Self {
+        self.best_effort_datagram_effective_loss_suspect_ppm = ppm.min(1_000_000);
+        self
+    }
+
+    pub fn with_best_effort_datagram_effective_loss_recover_ppm(mut self, ppm: u32) -> Self {
+        self.best_effort_datagram_effective_loss_recover_ppm = ppm.min(1_000_000);
         self
     }
 
@@ -1135,7 +1161,23 @@ impl TransportRoutingPolicy {
         self
     }
 
-    fn validate_voice_path_stickiness(&self) -> Result<(), String> {
+    fn validate(&self) -> Result<(), String> {
+        if self.best_effort_datagram_effective_loss_suspect_ppm > 1_000_000
+            || self.best_effort_datagram_effective_loss_recover_ppm > 1_000_000
+        {
+            return Err(
+                "s2s.transport BestEffort datagram effective-loss thresholds must not exceed 1000000 ppm"
+                    .into(),
+            );
+        }
+        if self.best_effort_datagram_effective_loss_recover_ppm
+            > self.best_effort_datagram_effective_loss_suspect_ppm
+        {
+            return Err(
+                "s2s.transport.best_effort_datagram_effective_loss_recover_ppm must not exceed best_effort_datagram_effective_loss_suspect_ppm"
+                    .into(),
+            );
+        }
         if self.voice_path_min_hold_ms == 0
             || self.voice_path_challenger_confirm_ms == 0
             || self.voice_path_idle_reset_ms == 0
@@ -1341,7 +1383,7 @@ impl TransportTuning {
 
     /// Apply tunables and load the optional compression dictionary from disk.
     pub fn try_apply(&self, cfg: TransportConfig) -> Result<TransportConfig, String> {
-        self.routing_policy.validate_voice_path_stickiness()?;
+        self.routing_policy.validate()?;
         validate_quic_datagram_buffer(
             "quic_datagram_send_buffer_bytes",
             self.quic_datagram_send_buffer_bytes,
@@ -1496,6 +1538,12 @@ fn default_udp_family_block_loss_ppm() -> u32 {
 }
 fn default_udp_family_loss_excess_over_tcp_ppm() -> u32 {
     50_000
+}
+fn default_best_effort_datagram_effective_loss_suspect_ppm() -> u32 {
+    5_000
+}
+fn default_best_effort_datagram_effective_loss_recover_ppm() -> u32 {
+    2_500
 }
 fn default_large_rtt_threshold_ms() -> u64 {
     100
@@ -1698,6 +1746,14 @@ mod tests {
         assert_eq!(policy.udp_family_probe_loss_block_count(), 3);
         assert_eq!(policy.udp_family_block_loss_ppm(), 250_000);
         assert_eq!(policy.udp_family_loss_excess_over_tcp_ppm(), 50_000);
+        assert_eq!(
+            policy.best_effort_datagram_effective_loss_suspect_ppm(),
+            5_000
+        );
+        assert_eq!(
+            policy.best_effort_datagram_effective_loss_recover_ppm(),
+            2_500
+        );
         assert_eq!(policy.large_rtt_threshold_ms(), 100);
         assert_eq!(policy.lossy_link_threshold_ppm(), 20_000);
         assert_eq!(policy.bulk_payload_threshold_bytes(), 65_536);
@@ -1724,6 +1780,8 @@ mod tests {
             .with_udp_family_probe_loss_block_count(4)
             .with_udp_family_block_loss_ppm(2_000_000)
             .with_udp_family_loss_excess_over_tcp_ppm(70_000)
+            .with_best_effort_datagram_effective_loss_suspect_ppm(12_000)
+            .with_best_effort_datagram_effective_loss_recover_ppm(6_000)
             .with_large_rtt_threshold_ms(80)
             .with_lossy_link_threshold_ppm(30_000)
             .with_bulk_payload_threshold_bytes(32_768)
@@ -1740,6 +1798,14 @@ mod tests {
         assert_eq!(policy.udp_family_probe_loss_block_count(), 4);
         assert_eq!(policy.udp_family_block_loss_ppm(), 1_000_000);
         assert_eq!(policy.udp_family_loss_excess_over_tcp_ppm(), 70_000);
+        assert_eq!(
+            policy.best_effort_datagram_effective_loss_suspect_ppm(),
+            12_000
+        );
+        assert_eq!(
+            policy.best_effort_datagram_effective_loss_recover_ppm(),
+            6_000
+        );
         assert_eq!(policy.large_rtt_threshold_ms(), 80);
         assert_eq!(policy.lossy_link_threshold_ppm(), 30_000);
         assert_eq!(policy.bulk_payload_threshold_bytes(), 32_768);
@@ -1786,6 +1852,8 @@ mod tests {
                     udp_family_probe_loss_block_count = 5
                     udp_family_block_loss_ppm = 200000
                     udp_family_loss_excess_over_tcp_ppm = 40000
+                    best_effort_datagram_effective_loss_suspect_ppm = 9000
+                    best_effort_datagram_effective_loss_recover_ppm = 4000
                     large_rtt_threshold_ms = 120
                     lossy_link_threshold_ppm = 15000
                     bulk_payload_threshold_bytes = 32768
@@ -1812,6 +1880,14 @@ mod tests {
         assert_eq!(policy.udp_family_probe_loss_block_count(), 5);
         assert_eq!(policy.udp_family_block_loss_ppm(), 200_000);
         assert_eq!(policy.udp_family_loss_excess_over_tcp_ppm(), 40_000);
+        assert_eq!(
+            policy.best_effort_datagram_effective_loss_suspect_ppm(),
+            9_000
+        );
+        assert_eq!(
+            policy.best_effort_datagram_effective_loss_recover_ppm(),
+            4_000
+        );
         assert_eq!(policy.large_rtt_threshold_ms(), 120);
         assert_eq!(policy.lossy_link_threshold_ppm(), 15_000);
         assert_eq!(policy.bulk_payload_threshold_bytes(), 32_768);
@@ -1839,6 +1915,23 @@ mod tests {
             "voice_path_idle_reset_ms = 0",
             "voice_path_min_hold_ms = 1000\nvoice_path_idle_reset_ms = 999",
             "voice_path_challenger_confirm_ms = 1000\nvoice_path_idle_reset_ms = 999",
+        ] {
+            let tuning: TransportTuning = ::config::Config::builder()
+                .add_source(::config::File::from_str(source, ::config::FileFormat::Toml))
+                .build()
+                .expect("config builder")
+                .try_deserialize()
+                .expect("transport tuning parses before semantic validation");
+            assert!(tuning.try_apply(base_config()).is_err(), "source: {source}");
+        }
+    }
+
+    #[test]
+    fn transport_tuning_rejects_invalid_datagram_effective_loss_thresholds() {
+        for source in [
+            "best_effort_datagram_effective_loss_suspect_ppm = 1000001",
+            "best_effort_datagram_effective_loss_recover_ppm = 1000001",
+            "best_effort_datagram_effective_loss_suspect_ppm = 4000\nbest_effort_datagram_effective_loss_recover_ppm = 5000",
         ] {
             let tuning: TransportTuning = ::config::Config::builder()
                 .add_source(::config::File::from_str(source, ::config::FileFormat::Toml))

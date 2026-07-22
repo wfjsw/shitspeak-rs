@@ -22,10 +22,11 @@ use crate::application::error::ApplicationError;
 use crate::application::proto::{
     self, VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal, VoiceRepairRequest,
 };
+use crate::application::voice::budget::{ProactiveCreditPermit, ProactiveCreditRequest};
 use crate::application::voice::metrics;
 use crate::application::voice::metrics::{
-    VoiceIngressClass, VoiceProactiveKind, VoiceProactiveResult, VoiceReceiveResult,
-    VoiceRepairResult, VoiceSendMode, VoiceSendResult,
+    RepairDestinationStage, VoiceIngressClass, VoiceProactiveKind, VoiceProactiveResult,
+    VoiceReceiveResult, VoiceRepairResult, VoiceSendMode, VoiceSendResult,
 };
 use crate::application::voice::reorder::{
     self, GapReport, Reorderer, VoiceCopyKind, VoiceRouteHint,
@@ -64,7 +65,6 @@ const TAIL_REPAIR_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const TAIL_REPAIR_INTERVAL: Duration = Duration::from_millis(100);
 const TAIL_REPAIR_FAILURE_BACKOFF_MAX: Duration = Duration::from_millis(800);
 const TAIL_REPAIR_SEND_TIMEOUT_MAX: Duration = Duration::from_millis(100);
-const TAIL_REPAIR_CREDIT_COST_DIVISOR: usize = 2;
 
 /// Decoded inbound voice frame along with the immediate sender (next-hop
 /// peer that delivered the overlay frame, not necessarily the originator).
@@ -392,8 +392,17 @@ struct ProactiveSendWork {
     dst: NodeIdentifier,
     body: Bytes,
     avoid_first_hop: Option<NodeIdentifier>,
-    transport_ttl: Duration,
+    expires_at: Instant,
     _permit: VoiceBytePermit,
+    credit_permit: ProactiveCreditPermit,
+}
+
+struct ProactiveRepairCandidate {
+    dst: NodeIdentifier,
+    avoid_first_hop: Option<NodeIdentifier>,
+    transport_ttl: Duration,
+    benefit_micros: u64,
+    copy_index: usize,
 }
 
 /// Central handle for the voice L3 service.
@@ -501,7 +510,11 @@ impl VoiceService {
         sender_epoch: u64,
         max_users: Arc<AtomicU64>,
     ) -> Arc<Self> {
-        let voice_budget = AdaptiveVoiceBudget::new(max_users.clone());
+        let voice_budget = AdaptiveVoiceBudget::with_repair_reservations(
+            max_users.clone(),
+            cfg.repair_reactive_reserve_pct,
+            cfg.repair_reactive_hard_reserve_pct,
+        );
         publish_proactive_budget(&voice_budget);
         let (primary_inbox_tx, primary_inbox_rx) = mpsc::unbounded_channel::<InboundVoiceWork>();
         let (proactive_inbox_tx, proactive_inbox_rx) =
@@ -533,6 +546,7 @@ impl VoiceService {
             transport.clone(),
             repair_cache.clone(),
             cfg.clone(),
+            voice_budget.clone(),
             shutdown.clone(),
         );
         spawn_dispatch_task(
@@ -693,6 +707,7 @@ impl VoiceService {
         let bytes = envelope.original_body();
         let terminal_route_qualities = self.capture_terminal_route_qualities(is_terminator, &dsts);
         self.cache_original(sender_session, seq, bytes.clone());
+        self.admit_original_repair_credit(bytes.len());
         self.register_terminal_repairs(
             sender_session,
             seq,
@@ -801,6 +816,7 @@ impl VoiceService {
         let bytes = envelope.original_body();
         let terminal_route_qualities = self.capture_terminal_route_qualities(is_terminator, dsts);
         self.cache_original(sender_session, seq, bytes.clone());
+        self.admit_original_repair_credit(bytes.len());
         self.register_terminal_repairs(
             sender_session,
             seq,
@@ -1143,6 +1159,7 @@ impl VoiceService {
         let bytes = envelope.original_body();
         let terminal_route_qualities = self.capture_terminal_route_qualities(is_terminator, &[dst]);
         self.cache_original(sender_session, seq, bytes.clone());
+        self.admit_original_repair_credit(bytes.len());
         self.register_terminal_repairs(
             sender_session,
             seq,
@@ -1225,6 +1242,14 @@ impl VoiceService {
             s2s_seq,
             body,
         ));
+    }
+
+    fn admit_original_repair_credit(&self, original_bytes: usize) {
+        if !self.cfg.repair_enabled {
+            return;
+        }
+        self.voice_budget.mint_proactive_credit(original_bytes);
+        publish_proactive_budget(&self.voice_budget);
     }
 
     fn register_terminal_repairs(
@@ -1319,13 +1344,6 @@ impl VoiceService {
         if !self.cfg.repair_enabled {
             return;
         }
-        let original_body = envelope.original_body();
-        self.cache_original(sender_session, s2s_seq, original_body.clone());
-        // Credit belongs to locally originated ordinary frames only. Received
-        // originals never create proactive work on this node, so minting for
-        // them would violate the source-side 25% traffic ratio.
-        self.voice_budget.mint_proactive_credit(original_body.len());
-        publish_proactive_budget(&self.voice_budget);
         let local_node = self.transport.local_node_id();
         let blocked = dsts
             .iter()
@@ -1356,7 +1374,7 @@ impl VoiceService {
             calculated_route_qualities = aligned;
             &calculated_route_qualities
         };
-        let mut proactive_body: Option<Bytes> = None;
+        let mut candidates = Vec::new();
         for (index, &dst) in dsts.iter().enumerate() {
             if dst == local_node {
                 continue;
@@ -1371,7 +1389,10 @@ impl VoiceService {
             let quality = route_qualities.get(index).copied().flatten();
             let avoid_first_hop = quality.map(|q| q.next_hop());
             let transport_ttl = adaptive_repair_transport_ttl(&self.cfg, quality);
-            let extra_copies = proactive_repair_score_micros(&self.cfg, quality)
+            let Some(benefit_micros) = proactive_repair_score_micros(&self.cfg, quality) else {
+                continue;
+            };
+            let extra_copies = Some(benefit_micros)
                 .map(|score| {
                     proactive_repair_extra_copy_count(
                         self.cfg.repair_max_extra_copies_per_frame.min(2),
@@ -1380,70 +1401,85 @@ impl VoiceService {
                     )
                 })
                 .unwrap_or(0);
-            if extra_copies == 0 {
-                continue;
-            }
-            for _ in 0..extra_copies {
-                // Reserve both the lower-priority queue and its traffic
-                // credit before the marked envelope is encoded. This avoids
-                // the decode/re-encode and allocation cost under saturation.
-                let reserve_bytes = original_body.len().saturating_add(3);
-                let Some(queue_permit) = self.voice_budget.try_reserve_proactive(reserve_bytes)
-                else {
-                    metrics::record_proactive_outcome(
-                        VoiceProactiveKind::Ordinary,
-                        VoiceProactiveResult::QueueBudgetShed,
-                    );
-                    publish_proactive_budget(&self.voice_budget);
-                    continue;
-                };
-                let Some(credit_permit) = self
-                    .voice_budget
-                    .try_reserve_proactive_credit(reserve_bytes)
-                else {
-                    drop(queue_permit);
-                    metrics::record_proactive_outcome(
-                        VoiceProactiveKind::Ordinary,
-                        VoiceProactiveResult::CreditShed,
-                    );
-                    publish_proactive_budget(&self.voice_budget);
-                    continue;
-                };
-                if proactive_body.is_none() {
-                    match envelope.proactive_body() {
-                        Ok(marked) => proactive_body = Some(marked),
-                        Err(error) => {
-                            trace!(%error, "voice proactive repair: mark envelope failed");
-                            return;
-                        }
-                    }
-                }
-                let work = ProactiveSendWork {
-                    sender_session,
+            for copy_index in 0..extra_copies {
+                candidates.push(ProactiveRepairCandidate {
                     dst,
-                    body: proactive_body
-                        .as_ref()
-                        .expect("proactive voice body was initialized")
-                        .clone(),
                     avoid_first_hop,
                     transport_ttl,
-                    _permit: queue_permit,
-                };
-                if self.proactive_send_tx.send(work).is_ok() {
-                    credit_permit.commit();
-                    metrics::record_proactive_outcome(
-                        VoiceProactiveKind::Ordinary,
-                        VoiceProactiveResult::Queued,
-                    );
-                } else {
-                    metrics::record_proactive_outcome(
-                        VoiceProactiveKind::Ordinary,
-                        VoiceProactiveResult::QueueShed,
-                    );
-                }
-                publish_proactive_budget(&self.voice_budget);
+                    benefit_micros,
+                    copy_index,
+                });
             }
         }
+
+        if candidates.is_empty() {
+            self.voice_budget
+                .reserve_proactive_credit_batch(s2s_seq, &[]);
+            publish_proactive_budget(&self.voice_budget);
+            return;
+        }
+        let proactive_body = match envelope.proactive_body() {
+            Ok(marked) => marked,
+            Err(error) => {
+                trace!(%error, "voice proactive repair: mark envelope failed");
+                return;
+            }
+        };
+        let reserve_bytes = proactive_body.len();
+        let requests = candidates
+            .iter()
+            .map(|candidate| {
+                ProactiveCreditRequest::new(
+                    u32::from(candidate.dst),
+                    reserve_bytes,
+                    candidate.benefit_micros,
+                    candidate.copy_index,
+                )
+            })
+            .collect::<Vec<_>>();
+        let credit_grants = self
+            .voice_budget
+            .reserve_proactive_credit_batch(s2s_seq, &requests);
+        for (candidate, credit_permit) in candidates.into_iter().zip(credit_grants) {
+            let Some(credit_permit) = credit_permit else {
+                metrics::record_proactive_outcome(
+                    VoiceProactiveKind::Ordinary,
+                    VoiceProactiveResult::CreditShed,
+                );
+                continue;
+            };
+            let Some(queue_permit) = self.voice_budget.try_reserve_proactive(reserve_bytes) else {
+                drop(credit_permit);
+                metrics::record_proactive_outcome(
+                    VoiceProactiveKind::Ordinary,
+                    VoiceProactiveResult::QueueBudgetShed,
+                );
+                continue;
+            };
+            let work = ProactiveSendWork {
+                sender_session,
+                dst: candidate.dst,
+                body: proactive_body.clone(),
+                avoid_first_hop: candidate.avoid_first_hop,
+                expires_at: Instant::now()
+                    .checked_add(candidate.transport_ttl)
+                    .unwrap_or_else(Instant::now),
+                _permit: queue_permit,
+                credit_permit,
+            };
+            if self.proactive_send_tx.send(work).is_ok() {
+                metrics::record_proactive_outcome(
+                    VoiceProactiveKind::Ordinary,
+                    VoiceProactiveResult::Queued,
+                );
+            } else {
+                metrics::record_proactive_outcome(
+                    VoiceProactiveKind::Ordinary,
+                    VoiceProactiveResult::QueueShed,
+                );
+            }
+        }
+        publish_proactive_budget(&self.voice_budget);
     }
 
     fn capture_terminal_route_qualities(
@@ -1928,6 +1964,16 @@ fn publish_proactive_budget(budget: &AdaptiveVoiceBudget) {
         budget.proactive_credit_balance_bytes(),
         budget.proactive_credit_burst_bytes(),
     );
+    let (proactive, reactive, hard_reserve, borrowed, debt, active_destinations) =
+        budget.repair_allocator_state_bytes();
+    metrics::set_repair_allocator_state(
+        proactive,
+        reactive,
+        hard_reserve,
+        borrowed,
+        debt,
+        active_destinations,
+    );
 }
 
 /// Send proactively-marked alternates outside the foreground voice path.
@@ -1963,10 +2009,25 @@ fn spawn_proactive_worker(
                     dst,
                     body,
                     avoid_first_hop,
-                    transport_ttl,
+                    expires_at,
                     _permit,
+                    credit_permit,
                 } = work;
-                let pressure_token = match pressure.try_start_send(dst, Instant::now()) {
+                let now = Instant::now();
+                let Some(transport_ttl) = expires_at
+                    .checked_duration_since(now)
+                    .filter(|remaining| !remaining.is_zero())
+                else {
+                    metrics::record_proactive_outcome(
+                        VoiceProactiveKind::Ordinary,
+                        VoiceProactiveResult::QueueShed,
+                    );
+                    drop(credit_permit);
+                    drop(_permit);
+                    publish_proactive_budget(&voice_budget);
+                    continue;
+                };
+                let pressure_token = match pressure.try_start_send(dst, now) {
                     Ok(token) => token,
                     Err(_) => {
                         metrics::record_proactive_outcome(
@@ -1974,24 +2035,30 @@ fn spawn_proactive_worker(
                             VoiceProactiveResult::QueueShed,
                         );
                         drop(_permit);
+                        drop(credit_permit);
                         publish_proactive_budget(&voice_budget);
                         continue;
                     }
                 };
                 let send_result = tokio::select! {
+                    biased;
                     _ = shutdown.cancelled() => {
                         pressure.cancel_send(dst, pressure_token);
                         return;
                     },
-                    result = transport.send_proactive_repair_frame(
-                        dst,
-                        body,
-                        avoid_first_hop,
-                        transport_ttl,
-                    ) => result,
+                    result = async {
+                        credit_permit.record_attempt();
+                        transport.send_proactive_repair_frame(
+                            dst,
+                            body,
+                            avoid_first_hop,
+                            transport_ttl,
+                        ).await
+                    } => result,
                 };
                 match send_result {
                     Ok(()) => {
+                        credit_permit.commit();
                         pressure.complete_success(dst, pressure_token);
                         metrics::record_repair(
                             source,
@@ -2005,6 +2072,7 @@ fn spawn_proactive_worker(
                         );
                     }
                     Err(error) => {
+                        drop(credit_permit);
                         pressure.complete_failure(
                             dst,
                             pressure_token,
@@ -2145,6 +2213,14 @@ async fn dispatch_due_tail_repairs(
         let mut pressure_completed = false;
         let mut destination_retry = None;
         for frame in frames {
+            let expired = repairs
+                .lock()
+                .get(&key)
+                .is_none_or(|entry| entry.expires_at <= Instant::now());
+            if expired {
+                repairs.lock().remove(&key);
+                break;
+            }
             let body = match send::mark_proactive_copy(frame.body()) {
                 Ok(body) => body,
                 Err(error) => {
@@ -2165,8 +2241,17 @@ async fn dispatch_due_tail_repairs(
                 publish_proactive_budget(voice_budget);
                 break;
             };
-            let credit_cost = tail_repair_credit_cost(body.len());
-            let Some(credit_permit) = voice_budget.try_reserve_proactive_credit(credit_cost) else {
+            metrics::record_repair_destination_bytes(
+                key.destination,
+                RepairDestinationStage::Requested,
+                body.len(),
+            );
+            let Some(credit_permit) = voice_budget.try_reserve_reactive_credit(body.len()) else {
+                metrics::record_repair_destination_bytes(
+                    key.destination,
+                    RepairDestinationStage::Shed,
+                    body.len(),
+                );
                 drop(queue_permit);
                 pressure.cancel_send(key.destination, pressure_token);
                 pressure_completed = true;
@@ -2177,22 +2262,29 @@ async fn dispatch_due_tail_repairs(
                 publish_proactive_budget(voice_budget);
                 break;
             };
-            // Tail retries share the source-side traffic credit with ordinary
-            // proactive copies, but consume it at half price. Since accepted
-            // primary traffic mints 25% credit, tail-only repair remains
-            // bounded to roughly 50% of primary voice bytes.
-            // Consume credit once the transport attempt begins so a rejection
-            // cannot mint retry traffic.
-            credit_permit.commit();
-            let send_result = tokio::time::timeout(
-                tail_repair_send_timeout(ttl),
-                transport.send_proactive_repair_frame(key.destination, body, avoid_first_hop, ttl),
-            )
+            let body_len = body.len();
+            let send_result = tokio::time::timeout(tail_repair_send_timeout(ttl), async {
+                credit_permit.record_attempt();
+                metrics::record_repair_destination_bytes(
+                    key.destination,
+                    RepairDestinationStage::Attempted,
+                    body_len,
+                );
+                transport
+                    .send_proactive_repair_frame(key.destination, body, avoid_first_hop, ttl)
+                    .await
+            })
             .await;
             drop(queue_permit);
-            publish_proactive_budget(voice_budget);
             match send_result {
                 Ok(Ok(())) => {
+                    credit_permit.commit();
+                    publish_proactive_budget(voice_budget);
+                    metrics::record_repair_destination_bytes(
+                        key.destination,
+                        RepairDestinationStage::Sent,
+                        body_len,
+                    );
                     metrics::record_repair(
                         transport.local_node_id(),
                         key.destination,
@@ -2205,6 +2297,8 @@ async fn dispatch_due_tail_repairs(
                     );
                 }
                 Ok(Err(error)) => {
+                    drop(credit_permit);
+                    publish_proactive_budget(voice_budget);
                     metrics::record_proactive_outcome(
                         VoiceProactiveKind::Tail,
                         VoiceProactiveResult::SendFailed,
@@ -2226,6 +2320,8 @@ async fn dispatch_due_tail_repairs(
                     break;
                 }
                 Err(_) => {
+                    drop(credit_permit);
+                    publish_proactive_budget(voice_budget);
                     metrics::record_proactive_outcome(
                         VoiceProactiveKind::Tail,
                         VoiceProactiveResult::SendFailed,
@@ -2294,10 +2390,6 @@ fn tail_repair_send_timeout(transport_ttl: Duration) -> Duration {
     transport_ttl
         .min(TAIL_REPAIR_SEND_TIMEOUT_MAX)
         .max(Duration::from_millis(1))
-}
-
-fn tail_repair_credit_cost(bytes: usize) -> usize {
-    bytes.div_ceil(TAIL_REPAIR_CREDIT_COST_DIVISOR)
 }
 
 fn spawn_tail_ack(
@@ -2581,6 +2673,7 @@ fn spawn_repair_response_worker(
     transport: Arc<dyn VoiceTransport>,
     repair_cache: Arc<RepairCache>,
     cfg: VoiceConfig,
+    voice_budget: AdaptiveVoiceBudget,
     shutdown: CancellationToken,
 ) {
     let concurrency = std::thread::available_parallelism()
@@ -2595,6 +2688,7 @@ fn spawn_repair_response_worker(
         transport,
         repair_cache,
         cfg,
+        voice_budget,
         shutdown,
         concurrency,
     );
@@ -2605,6 +2699,7 @@ fn spawn_repair_response_worker_with_concurrency(
     transport: Arc<dyn VoiceTransport>,
     repair_cache: Arc<RepairCache>,
     cfg: VoiceConfig,
+    voice_budget: AdaptiveVoiceBudget,
     shutdown: CancellationToken,
     concurrency: usize,
 ) {
@@ -2632,12 +2727,15 @@ fn spawn_repair_response_worker_with_concurrency(
                 state.in_flight_last_seq = Some(work.request.last_seq);
                 let transport = transport.clone();
                 let repair_cache = repair_cache.clone();
+                let voice_budget = voice_budget.clone();
                 let ttl = Duration::from_millis(repair_deadline_transport_ttl_ms(
                     &cfg,
                     cfg.repair_transport_ttl_ms,
                 ));
                 let handle = jobs.spawn(async move {
-                    let admitted = send_repair_response(work, transport, repair_cache, ttl).await;
+                    let admitted =
+                        send_repair_response(work, transport, repair_cache, &voice_budget, ttl)
+                            .await;
                     (key, admitted)
                 });
                 task_keys.insert(handle.id(), key);
@@ -2758,6 +2856,7 @@ async fn send_repair_response(
     work: RepairResponseRequest,
     transport: Arc<dyn VoiceTransport>,
     repair_cache: Arc<RepairCache>,
+    voice_budget: &AdaptiveVoiceBudget,
     ttl: Duration,
 ) -> bool {
     let source = transport.local_node_id();
@@ -2779,21 +2878,39 @@ async fn send_repair_response(
     let mut admitted = true;
     for frame in frames {
         let body = frame.body().clone();
-        let mut result = transport
-            .send_repair_frame(destination, body.clone(), avoid_first_hop, ttl)
+        let mut accepted = send_budgeted_repair_frame(
+            transport.as_ref(),
+            voice_budget,
+            destination,
+            body.clone(),
+            avoid_first_hop,
+            ttl,
+        )
+        .await;
+        if !accepted && avoid_first_hop.is_some() {
+            accepted = send_budgeted_repair_frame(
+                transport.as_ref(),
+                voice_budget,
+                destination,
+                body.clone(),
+                None,
+                ttl,
+            )
             .await;
-        if result.is_err() && avoid_first_hop.is_some() {
-            result = transport
-                .send_repair_frame(destination, body.clone(), None, ttl)
-                .await;
         }
-        if result.is_err() {
+        if !accepted {
             tokio::task::yield_now().await;
-            result = transport
-                .send_repair_frame(destination, body, None, ttl)
-                .await;
+            accepted = send_budgeted_repair_frame(
+                transport.as_ref(),
+                voice_budget,
+                destination,
+                body,
+                None,
+                ttl,
+            )
+            .await;
         }
-        if result.is_err() {
+        if !accepted {
             admitted = false;
             metrics::record_repair(source, destination, VoiceRepairResult::FrameSendFailed, 1);
         } else {
@@ -2802,6 +2919,57 @@ async fn send_repair_response(
         tokio::task::yield_now().await;
     }
     admitted
+}
+
+async fn send_budgeted_repair_frame(
+    transport: &dyn VoiceTransport,
+    voice_budget: &AdaptiveVoiceBudget,
+    destination: NodeIdentifier,
+    body: Bytes,
+    avoid_first_hop: Option<NodeIdentifier>,
+    ttl: Duration,
+) -> bool {
+    metrics::record_repair_destination_bytes(
+        destination,
+        RepairDestinationStage::Requested,
+        body.len(),
+    );
+    let Some(credit_permit) = voice_budget.try_reserve_reactive_credit(body.len()) else {
+        metrics::record_repair_destination_bytes(
+            destination,
+            RepairDestinationStage::Shed,
+            body.len(),
+        );
+        publish_proactive_budget(voice_budget);
+        return false;
+    };
+    let body_len = body.len();
+    credit_permit.record_attempt();
+    metrics::record_repair_destination_bytes(
+        destination,
+        RepairDestinationStage::Attempted,
+        body_len,
+    );
+    match transport
+        .send_repair_frame(destination, body, avoid_first_hop, ttl)
+        .await
+    {
+        Ok(()) => {
+            credit_permit.commit();
+            publish_proactive_budget(voice_budget);
+            metrics::record_repair_destination_bytes(
+                destination,
+                RepairDestinationStage::Sent,
+                body_len,
+            );
+            true
+        }
+        Err(_) => {
+            drop(credit_permit);
+            publish_proactive_budget(voice_budget);
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4005,7 +4173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tail_repairs_charge_half_proactive_credit() {
+    async fn tail_repairs_charge_full_reactive_credit() {
         let transport = FakeVoiceTransport::new(7, vec![2]);
         let repairs: TailRepairState = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let repair_cache = RepairCache::new(Duration::from_secs(10));
@@ -4030,10 +4198,7 @@ mod tests {
 
         let cached = repair_cache.lookup_range(0xABB, 42, 0, 0);
         let marked_body = send::mark_proactive_copy(cached[0].body()).unwrap();
-        let credit_cost = tail_repair_credit_cost(marked_body.len());
-        assert_eq!(credit_cost, marked_body.len().div_ceil(2));
-        assert!(credit_cost < marked_body.len());
-        voice_budget.mint_proactive_credit(credit_cost * 4);
+        voice_budget.mint_proactive_credit(marked_body.len() * 4);
         let retry_at = repairs.lock()[&key].next_retry;
         dispatch_due_tail_repairs(
             &repairs,
@@ -4958,7 +5123,8 @@ mod tests {
     #[tokio::test]
     async fn proactive_worker_preserves_same_key_fifo_and_cross_key_concurrency() {
         let transport = ControlledUnicastTransport::new(false);
-        let budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
+        let budget =
+            AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(5_000)), 0, 0);
         let shutdown = CancellationToken::new();
         let (tx, rx) = mpsc::unbounded_channel();
         spawn_proactive_worker(
@@ -4974,13 +5140,18 @@ mod tests {
             let permit = budget
                 .try_reserve_proactive(body.len())
                 .expect("test proactive work fits byte budget");
+            budget.mint_proactive_credit(body.len().saturating_mul(4));
+            let credit_permit = budget
+                .try_reserve_proactive_credit(body.len())
+                .expect("test proactive work fits repair credit");
             ProactiveSendWork {
                 sender_session,
                 dst,
                 body,
                 avoid_first_hop: None,
-                transport_ttl: Duration::from_secs(1),
+                expires_at: Instant::now() + Duration::from_secs(1),
                 _permit: permit,
+                credit_permit,
             }
         };
         tx.send(work(100, 2, b"a0")).unwrap();
@@ -5035,7 +5206,8 @@ mod tests {
     #[tokio::test]
     async fn proactive_worker_cancellation_releases_hung_send_permit() {
         let transport = ControlledUnicastTransport::new(false);
-        let budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
+        let budget =
+            AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(5_000)), 0, 0);
         let shutdown = CancellationToken::new();
         let (tx, rx) = mpsc::unbounded_channel();
         spawn_proactive_worker(
@@ -5046,16 +5218,22 @@ mod tests {
             shutdown.clone(),
         );
         let body = Bytes::from_static(b"hung");
+        let body_len = body.len();
         let permit = budget
             .try_reserve_proactive(body.len())
             .expect("test proactive work fits byte budget");
+        budget.mint_proactive_credit(body.len().saturating_mul(4));
+        let credit_permit = budget
+            .try_reserve_proactive_credit(body.len())
+            .expect("test proactive work fits repair credit");
         tx.send(ProactiveSendWork {
             sender_session: 100,
             dst: 2,
             body,
             avoid_first_hop: None,
-            transport_ttl: Duration::from_secs(1),
+            expires_at: Instant::now() + Duration::from_secs(1),
             _permit: permit,
+            credit_permit,
         })
         .unwrap();
         tokio::time::timeout(
@@ -5076,12 +5254,75 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(budget.proactive_reserved_bytes(), 0);
+        assert_eq!(budget.proactive_credit_balance_bytes(), body_len);
+    }
+
+    #[tokio::test]
+    async fn queued_proactive_expiry_refunds_credit_before_transport_attempt() {
+        let transport = ControlledUnicastTransport::new(false);
+        let budget =
+            AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(5_000)), 0, 0);
+        let shutdown = CancellationToken::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        spawn_proactive_worker(
+            rx,
+            transport.clone(),
+            budget.clone(),
+            Arc::new(ProactivePressureState::default()),
+            shutdown.clone(),
+        );
+        let work = |body: &'static [u8], expires_at| {
+            let body = Bytes::from_static(body);
+            let queue_permit = budget.try_reserve_proactive(body.len()).unwrap();
+            budget.mint_proactive_credit(body.len() * 4);
+            let credit_permit = budget.try_reserve_proactive_credit(body.len()).unwrap();
+            ProactiveSendWork {
+                sender_session: 100,
+                dst: 2,
+                body,
+                avoid_first_hop: None,
+                expires_at,
+                _permit: queue_permit,
+                credit_permit,
+            }
+        };
+        tx.send(work(b"a", Instant::now() + Duration::from_secs(1)))
+            .unwrap();
+        tx.send(work(b"b", Instant::now() + Duration::from_millis(10)))
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.proactive_entered.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        transport.proactive_release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.proactive_reserved_bytes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(budget.proactive_credit_balance_bytes(), 1);
+        let attempts = transport
+            .inner
+            .calls()
+            .iter()
+            .filter(|call| matches!(call, FakeCall::RepairFrame { .. }))
+            .count();
+        assert_eq!(attempts, 1);
+        shutdown.cancel();
     }
 
     #[tokio::test]
     async fn proactive_backpressure_sheds_already_queued_copies_without_touching_primary_voice() {
         let transport = PressuredProactiveTransport::new();
-        let budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
+        let budget =
+            AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(5_000)), 0, 0);
         let pressure = Arc::new(ProactivePressureState::default());
         let shutdown = CancellationToken::new();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -5098,13 +5339,18 @@ mod tests {
             let permit = budget
                 .try_reserve_proactive(body.len())
                 .expect("regression workload fits proactive byte budget");
+            budget.mint_proactive_credit(body.len().saturating_mul(4));
+            let credit_permit = budget
+                .try_reserve_proactive_credit(body.len())
+                .expect("regression workload fits repair credit");
             tx.send(ProactiveSendWork {
                 sender_session: 100,
                 dst: 2,
                 body,
                 avoid_first_hop: None,
-                transport_ttl: Duration::from_secs(1),
+                expires_at: Instant::now() + Duration::from_secs(1),
                 _permit: permit,
+                credit_permit,
             })
             .unwrap();
         }
@@ -5122,6 +5368,7 @@ mod tests {
             1,
             "one full queue must not cause every queued copy to retry"
         );
+        assert_eq!(budget.proactive_credit_balance_bytes(), 32 * 8);
         assert!(pressure.is_blocked(2, Instant::now()));
 
         transport
@@ -5138,7 +5385,8 @@ mod tests {
     #[tokio::test]
     async fn four_lanes_reserve_one_recovery_probe_for_a_failed_destination() {
         let transport = ControlledUnicastTransport::new(false);
-        let budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
+        let budget =
+            AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(5_000)), 0, 0);
         let pressure = Arc::new(ProactivePressureState::default());
         let failed_at = Instant::now();
         pressure.record_failure(2, failed_at);
@@ -5163,13 +5411,18 @@ mod tests {
             let permit = budget
                 .try_reserve_proactive(body.len())
                 .expect("concurrency regression fits proactive byte budget");
+            budget.mint_proactive_credit(body.len().saturating_mul(4));
+            let credit_permit = budget
+                .try_reserve_proactive_credit(body.len())
+                .expect("concurrency regression fits repair credit");
             ProactiveSendWork {
                 sender_session,
                 dst: 2,
                 body,
                 avoid_first_hop: None,
-                transport_ttl: Duration::from_secs(1),
+                expires_at: Instant::now() + Duration::from_secs(1),
                 _permit: permit,
+                credit_permit,
             }
         };
 
@@ -6197,6 +6450,8 @@ mod tests {
             FakeCall::Unicast { body, .. } => body.clone(),
             other => panic!("expected Unicast, got {other:?}"),
         };
+        svc.voice_budget
+            .mint_proactive_credit(original.len().saturating_mul(3));
         let request = VoiceRepairRequest {
             sender_session: 0xABC,
             sender_epoch: 42,
@@ -6262,6 +6517,8 @@ mod tests {
         )
         .unwrap();
         cache.insert(RepairFrame::new(sender_session, 42, 7, body.clone()));
+        let voice_budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
+        voice_budget.mint_proactive_credit(usize::MAX);
 
         send_repair_response(
             RepairResponseRequest {
@@ -6278,6 +6535,7 @@ mod tests {
             },
             transport,
             cache,
+            &voice_budget,
             Duration::from_millis(100),
         )
         .await;
@@ -6311,11 +6569,14 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(3);
         let shutdown = CancellationToken::new();
+        let voice_budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
+        voice_budget.mint_proactive_credit(usize::MAX);
         spawn_repair_response_worker_with_concurrency(
             rx,
             transport.clone(),
             repair_cache,
             VoiceConfig::default(),
+            voice_budget,
             shutdown.clone(),
             2,
         );
@@ -6390,11 +6651,14 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(16);
         let shutdown = CancellationToken::new();
+        let voice_budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
+        voice_budget.mint_proactive_credit(usize::MAX);
         spawn_repair_response_worker_with_concurrency(
             rx,
             transport.clone(),
             repair_cache,
             VoiceConfig::default(),
+            voice_budget,
             shutdown.clone(),
             2,
         );
@@ -6458,7 +6722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nack_can_replay_exact_original_before_primary_send_completes() {
+    async fn cold_start_nack_waits_for_sufficient_accepted_original_credit() {
         let transport = ControlledUnicastTransport::new(false);
         let svc = VoiceService::new_with_transport(
             transport.clone(),
@@ -6504,6 +6768,20 @@ mod tests {
             remote_playout_delay_ms: None,
             is_distribution_repair: false,
         });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(transport.inner.calls().len(), 1);
+
+        svc.voice_budget
+            .mint_proactive_credit(original.len().saturating_mul(3));
+        svc.repair_inbound_handler().handle(OverlayInboundMessage {
+            from: 3,
+            origin_boot_epoch: 0,
+            level: shitspeak_s2s_transport::ServiceLevel::BestEffort,
+            class: shitspeak_s2s_transport::MessageClass::HighPriority,
+            body: proto::encode_voice_repair_request(&request).unwrap(),
+            remote_playout_delay_ms: None,
+            is_distribution_repair: false,
+        });
         let calls = wait_for_call_count(&transport.inner, 2).await;
         match &calls[1] {
             FakeCall::RepairFrame {
@@ -6520,7 +6798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_primary_send_mints_no_credit_and_queues_no_proactive_copy() {
+    async fn failed_primary_send_retains_admission_credit_but_queues_no_proactive_copy() {
         let transport = ControlledUnicastTransport::new(true);
         transport.inner.set_voice_route_quality(
             2,
@@ -6552,8 +6830,16 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert_eq!(svc.voice_budget.proactive_credit_balance_quarters(), 0);
-        assert_eq!(transport.inner.calls().len(), 1);
+        let calls = transport.inner.calls();
+        assert_eq!(calls.len(), 1);
+        let original_bytes = match &calls[0] {
+            FakeCall::Unicast { body, .. } => body.len(),
+            other => panic!("expected failed original attempt, got {other:?}"),
+        };
+        assert_eq!(
+            svc.voice_budget.proactive_credit_balance_quarters(),
+            original_bytes
+        );
         assert!(transport.inner.route_quality_batches().is_empty());
         assert_eq!(transport.inner.route_quality_scalar_calls(), 0);
     }
@@ -6687,6 +6973,12 @@ mod tests {
         )
         .await
         .unwrap();
+        let original_len = match &transport.calls()[0] {
+            FakeCall::Unicast { body, .. } => body.len(),
+            other => panic!("expected original unicast, got {other:?}"),
+        };
+        svc.voice_budget
+            .mint_proactive_credit(original_len.saturating_mul(3));
         let request = VoiceRepairRequest {
             sender_session: 0xABC,
             sender_epoch: 42,

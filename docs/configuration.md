@@ -510,6 +510,11 @@ udp_family_min_samples = 32
 udp_family_probe_loss_block_count = 3
 udp_family_block_loss_ppm = 250000
 udp_family_loss_excess_over_tcp_ppm = 50000
+# Observe separate BestEffort datagram states using the weighted effective-loss
+# score. QUIC DATAGRAM currently uses the aggregate physical-QUIC score. This
+# is shadow-only and does not exclude suspect paths from routing.
+best_effort_datagram_effective_loss_suspect_ppm = 5000
+best_effort_datagram_effective_loss_recover_ppm = 2500
 large_rtt_threshold_ms = 100
 lossy_link_threshold_ppm = 20000
 bulk_payload_threshold_bytes = 65536
@@ -576,6 +581,10 @@ repair_cache_ms = 1600
 adaptive_jitter_max_delay_ms = 750
 # At most two proactive copies may be requested per frame. The default is one.
 repair_max_extra_copies_per_frame = 1
+# Percentages of the repair-credit cap. Unused reactive entitlement above the
+# hard reserve is borrowable by proactive work.
+repair_reactive_reserve_pct = 30
+repair_reactive_hard_reserve_pct = 10
 
 [s2s.overlay]
 hello_interval_ms = 1000
@@ -678,6 +687,17 @@ distinguishes logical selections with bounded `path` values such as
 metrics remain shared under `TransportKind::Quic`; delivery-path telemetry does
 not model DATAGRAM as a second physical link.
 
+The `best_effort_datagram_effective_loss_*_ppm` thresholds drive a shadow-only
+hysteretic state (`probing`, `healthy`, `suspect`, or `blocked`). They apply to
+the weighted effective-loss score, which combines available probe, native, and
+data-health evidence; they are not raw-loss cutoffs. The recovery threshold
+must not exceed the suspect threshold and both must be at most 1,000,000 ppm.
+These observations never remove a candidate. JSON status exposes current
+state, reason, score, samples, transition count, state age, and observation
+age. Prometheus exposes the same fields under the
+`shitspeak_s2s_datagram_path_*` metric family. QUIC DATAGRAM observations use
+aggregate physical-QUIC evidence until lane-native loss exists.
+
 The preference does not weaken admission checks. Unhealthy or otherwise
 unusable datagram paths are excluded, and the QUIC DATAGRAM path is not a
 candidate when the encoded frame exceeds its current maximum DATAGRAM size.
@@ -718,9 +738,20 @@ that, clamped to `32 KiB..512 KiB`; tracked reorder speakers are
 
 Originals and reactive repairs use the primary lane. Proactive copies use the
 lower-priority lane and are shed before primary traffic when capacity is
-exhausted. Proactive copies retain a ratio budget: accepted original bytes mint
-at most 25% as proactive credits, capped by the dynamic burst. Configure
-`repair_max_extra_copies_per_frame` only in the supported `0..2` range.
+exhausted. An original that is accepted into the voice service and cached for
+repair mints one conserved repair byte for every four encoded original bytes,
+before aggregate transport completion. A later aggregate-send failure does not
+revoke that bounded credit, but it also queues no proactive copies. Proactive
+and reactive payloads both pay their encoded byte size from the same 25% mint,
+which remains capped by the dynamic burst.
+
+`repair_reactive_reserve_pct` (30 by default) is the reactive/tail entitlement
+as a percentage of the total repair mint; the remainder is proactive
+entitlement. Proactive work may borrow unused reactive entitlement, except for
+`repair_reactive_hard_reserve_pct` (10 by default), and stops borrowing when
+reactive demand appears. The hard reserve must not exceed the reactive reserve,
+and neither may exceed 100. Configure `repair_max_extra_copies_per_frame` only
+in the supported `0..2` range.
 
 `strict_bootstrap_retry_interval_ms` gates strict startup and partition-heal
 history-election retries. `strict_steady_state_catchup_interval_ms` controls the
@@ -767,6 +798,43 @@ credit exhaustion from queue pressure. Grafana shows proactive queue and credit
 utilization per node because those limits are enforced locally.
 `shitspeak_s2s_voice_receive_events_total{result="speaker_state_drop"}` reports
 a dynamic speaker-cap admission refusal.
+
+The hierarchical allocator exports conserved credit lifecycle bytes through
+`shitspeak_s2s_voice_repair_credit_bytes_total{stage}`, and proactive versus
+reactive allocation through
+`shitspeak_s2s_voice_repair_allocator_class_bytes_total{class,stage}`. Fair
+allocation is visible through
+`shitspeak_s2s_voice_repair_allocator_destination_bytes_total{peer,stage}`.
+`peer` is the bounded `u16` cluster node identity; session, user, address, and
+channel identifiers are never labels. Current balances, reserve, directional
+debt to each repair class, and active destination count are exported as
+allocator gauges. Borrowing and repayment totals remain class-stage counters.
+Lifecycle counters preserve the ledger's quarter-byte precision, so their
+Prometheus values may have `.25`, `.5`, or `.75` fractional byte components.
+
+The exact ledger invariant, evaluated in quarter-byte units, is
+`minted = available + tentatively_reserved + committed + cap_discarded`.
+`reserved` and `refunded` are transition counters used to derive outstanding
+tentative credit; they are not additional credit sources.
+
+This first allocator phase implements proactive cross-destination fairness:
+first-copy candidates receive a deterministic private/fair-share phase, then
+shared overflow ranks the existing loss/jitter repair score per encoded byte
+with deterministic tie-breaking. The score does not yet model receiver on-time
+probability, alternate-path correlation or diversity, deadline slack, or
+fairness aging; those are phase-two inputs.
+
+Reactive NACK responses and tail attempts now pay exact full-byte credit and
+proactive borrowing cannot consume accrued reactive credit below the hard class
+reserve. They are still dispatched by the existing workers rather than a
+global earliest-deadline-first scheduler, and do not yet have cross-destination
+deficit scheduling. Reactive EDF and destination fairness are explicitly
+deferred to the next phase.
+
+There is deliberately no unminted startup seed. During cold start, the first
+full-frame NACK may therefore be credit-shed until accepted originals have
+accumulated enough repair credit. This preserves the exact 25% payload ceiling
+instead of hiding startup repair bytes outside the ledger.
 
 See [Clustering](clustering.md) for certificate generation, local demos, and S2S operational notes.
 

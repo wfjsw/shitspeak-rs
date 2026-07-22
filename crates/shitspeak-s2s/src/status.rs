@@ -29,6 +29,7 @@ pub(crate) struct TopologySnapshot {
     inbound_queues: Vec<InboundQueueMetric>,
     expired_outbound_drops: Vec<ExpiredOutboundDropMetric>,
     transport_health_exclusions: Vec<TransportHealthExclusionMetric>,
+    datagram_path_health: Vec<DatagramPathHealthMetric>,
     delivery_path_selections: Vec<DeliveryPathSelectionMetric>,
     voice_transport_bindings: Vec<VoiceTransportBindingMetric>,
     voice_transport_binding_events: Vec<VoiceTransportBindingEventMetric>,
@@ -268,6 +269,19 @@ pub(crate) struct TransportHealthExclusionMetric {
     transport: &'static str,
     reason: &'static str,
     exclusions: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct DatagramPathHealthMetric {
+    peer: NodeIdentifier,
+    path: &'static str,
+    state: &'static str,
+    reason: &'static str,
+    effective_loss_ppm: Option<u32>,
+    loss_samples: u64,
+    transitions: u64,
+    state_age_ms: u128,
+    observation_age_ms: u128,
 }
 
 pub fn spawn_status_server(
@@ -663,6 +677,23 @@ pub(crate) fn build_topology_snapshot(
         .collect::<Vec<_>>();
     transport_health_exclusions.sort_by_key(|entry| (entry.peer, entry.transport, entry.reason));
 
+    let mut datagram_path_health = metrics
+        .datagram_path_health()
+        .iter()
+        .map(|entry| DatagramPathHealthMetric {
+            peer: entry.peer(),
+            path: entry.path().name(),
+            state: entry.state().name(),
+            reason: entry.reason().name(),
+            effective_loss_ppm: entry.effective_loss_ppm(),
+            loss_samples: entry.loss_samples(),
+            transitions: entry.transitions(),
+            state_age_ms: entry.state_age().as_millis(),
+            observation_age_ms: entry.observation_age().as_millis(),
+        })
+        .collect::<Vec<_>>();
+    datagram_path_health.sort_by_key(|entry| (entry.peer, entry.path));
+
     let mut voice_transport_bindings = metrics
         .voice_transport_bindings()
         .iter()
@@ -783,6 +814,7 @@ pub(crate) fn build_topology_snapshot(
         inbound_queues,
         expired_outbound_drops,
         transport_health_exclusions,
+        datagram_path_health,
         delivery_path_selections,
         voice_transport_bindings,
         voice_transport_binding_events,
@@ -1046,6 +1078,36 @@ impl<'a> PrometheusWriter<'a> {
             "counter",
         );
         self.header(
+            "shitspeak_s2s_datagram_path_health",
+            "Current shadow health state for each local BestEffort datagram delivery path.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_path_effective_loss_ppm",
+            "Current weighted effective-loss score observed for a datagram delivery path.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_path_loss_samples",
+            "Current effective-loss sample count for a datagram delivery path.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_path_health_transitions",
+            "Shadow datagram health state transitions in the current observation lifetime.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_path_health_state_age_ms",
+            "Age of the current shadow datagram health state.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_path_health_observation_age_ms",
+            "Age of the most recent shadow datagram health observation.",
+            "gauge",
+        );
+        self.header(
             "shitspeak_s2s_delivery_path_selections_total",
             "Local successful S2S dispatch selections by logical delivery path.",
             "counter",
@@ -1305,6 +1367,31 @@ impl<'a> PrometheusWriter<'a> {
             "shitspeak_s2s_voice_proactive_events_total",
             "S2S voice proactive repair outcomes by bounded kind and result.",
             "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_repair_credit_bytes_total",
+            "S2S voice repair credit bytes by bounded lifecycle stage.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_repair_allocator_class_bytes_total",
+            "S2S voice repair allocation bytes by bounded proactive or reactive class and stage.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_repair_allocator_destination_bytes_total",
+            "S2S voice repair allocation bytes by bounded cluster peer and allocation stage.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_repair_allocator_state_bytes",
+            "Current S2S voice hierarchical repair allocator byte state.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_repair_allocator_active_destinations",
+            "Current destinations participating in S2S voice fair repair allocation.",
+            "gauge",
         );
         self.header(
             "shitspeak_s2s_debug_packet_io_bytes_total",
@@ -1898,6 +1985,50 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
                 ("reason", entry.reason),
             ],
             entry.exclusions as f64,
+        ));
+    }
+
+    for entry in &snapshot.datagram_path_health {
+        let source = local_node.clone();
+        let peer = entry.peer.to_string();
+        let labels = vec![
+            ("source", source.as_str()),
+            ("peer", peer.as_str()),
+            ("path", entry.path),
+            ("state", entry.state),
+            ("reason", entry.reason),
+        ];
+        out.push(sample(
+            "shitspeak_s2s_datagram_path_health",
+            labels.clone(),
+            1.0,
+        ));
+        if let Some(loss_ppm) = entry.effective_loss_ppm {
+            out.push(sample(
+                "shitspeak_s2s_datagram_path_effective_loss_ppm",
+                labels.clone(),
+                loss_ppm as f64,
+            ));
+        }
+        out.push(sample(
+            "shitspeak_s2s_datagram_path_loss_samples",
+            labels.clone(),
+            entry.loss_samples as f64,
+        ));
+        out.push(sample(
+            "shitspeak_s2s_datagram_path_health_transitions",
+            labels.clone(),
+            entry.transitions as f64,
+        ));
+        out.push(sample(
+            "shitspeak_s2s_datagram_path_health_state_age_ms",
+            labels.clone(),
+            entry.state_age_ms as f64,
+        ));
+        out.push(sample(
+            "shitspeak_s2s_datagram_path_health_observation_age_ms",
+            labels,
+            entry.observation_age_ms as f64,
         ));
     }
 
@@ -2934,6 +3065,17 @@ mod tests {
                 reason: "kcp_failaway",
                 exclusions: 7,
             }],
+            datagram_path_health: vec![DatagramPathHealthMetric {
+                peer: 2,
+                path: "quic_datagram",
+                state: "suspect",
+                reason: "measured_loss",
+                effective_loss_ppm: Some(6_000),
+                loss_samples: 64,
+                transitions: 3,
+                state_age_ms: 1_250,
+                observation_age_ms: 25,
+            }],
             delivery_path_selections: vec![DeliveryPathSelectionMetric {
                 path: "quic_datagram",
                 selections: 13,
@@ -3010,6 +3152,11 @@ mod tests {
             topology_json["delivery_path_selections"][0]["path"],
             "quic_datagram"
         );
+        assert_eq!(topology_json["datagram_path_health"][0]["state"], "suspect");
+        assert_eq!(
+            topology_json["datagram_path_health"][0]["observation_age_ms"],
+            25
+        );
         assert_eq!(
             topology_json["quic_sessions"][0]["negotiated_protocol"],
             "s2s/2"
@@ -3072,6 +3219,15 @@ mod tests {
             "shitspeak_s2s_transport_health_exclusions_total{source=\"1\",peer=\"2\",transport=\"kcp\",reason=\"kcp_failaway\"} 7"
         ));
         assert!(rendered.contains(
+            "shitspeak_s2s_datagram_path_health{source=\"1\",peer=\"2\",path=\"quic_datagram\",state=\"suspect\",reason=\"measured_loss\"} 1"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_datagram_path_effective_loss_ppm{source=\"1\",peer=\"2\",path=\"quic_datagram\",state=\"suspect\",reason=\"measured_loss\"} 6000"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_datagram_path_health_observation_age_ms{source=\"1\",peer=\"2\",path=\"quic_datagram\",state=\"suspect\",reason=\"measured_loss\"} 25"
+        ));
+        assert!(rendered.contains(
             "shitspeak_s2s_delivery_path_selections_total{source=\"1\",path=\"quic_datagram\"} 13"
         ));
         assert!(rendered.contains(
@@ -3121,6 +3277,20 @@ mod tests {
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_repair_cache_capacity gauge\n"));
         assert!(
             rendered.contains("# TYPE shitspeak_s2s_voice_repair_cache_evictions_total counter\n")
+        );
+        assert!(
+            rendered.contains("# TYPE shitspeak_s2s_voice_repair_credit_bytes_total counter\n")
+        );
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_voice_repair_allocator_class_bytes_total counter\n"
+            )
+        );
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_voice_repair_allocator_destination_bytes_total counter\n"
+        ));
+        assert!(
+            rendered.contains("# TYPE shitspeak_s2s_voice_repair_allocator_state_bytes gauge\n")
         );
         assert!(
             rendered.contains("# TYPE shitspeak_s2s_voice_ingress_admission_drops_total counter\n")

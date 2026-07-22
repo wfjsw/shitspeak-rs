@@ -101,6 +101,7 @@ pub use identity::{
 pub use manager::PeerAddressSnapshot;
 pub use manager::{AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage};
 pub use metrics::{
+    DatagramPathHealthReason, DatagramPathHealthSnapshot, DatagramPathHealthState,
     DeliveryPathSelectionSnapshot, ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage,
     InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot, OutboundQueueStatusSnapshot,
     QueueStatusSnapshot, QuicDatagramDropReason, QuicDatagramDropSnapshot, QuicDeliveryLane,

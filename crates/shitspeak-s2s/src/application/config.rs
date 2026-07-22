@@ -86,6 +86,12 @@ pub struct VoiceConfig {
 
     /// Extra proactive copies allowed per voice frame (0 through 2).
     pub repair_max_extra_copies_per_frame: usize,
+
+    /// Percentage of the repair mint reserved for reactive/tail repair.
+    pub repair_reactive_reserve_pct: u8,
+
+    /// Percentage of the repair mint that proactive work may never borrow.
+    pub repair_reactive_hard_reserve_pct: u8,
 }
 
 impl Default for VoiceConfig {
@@ -112,6 +118,8 @@ impl Default for VoiceConfig {
             repair_full_dup_loss_ppm: default_repair_full_dup_loss_ppm(),
             repair_jitter_start_ms: default_repair_jitter_start_ms(),
             repair_max_extra_copies_per_frame: default_repair_max_extra_copies_per_frame(),
+            repair_reactive_reserve_pct: default_repair_reactive_reserve_pct(),
+            repair_reactive_hard_reserve_pct: default_repair_reactive_hard_reserve_pct(),
         }
     }
 }
@@ -174,6 +182,10 @@ struct VoiceConfigWire {
     repair_jitter_start_ms: u64,
     #[serde(default = "default_repair_max_extra_copies_per_frame")]
     repair_max_extra_copies_per_frame: usize,
+    #[serde(default = "default_repair_reactive_reserve_pct")]
+    repair_reactive_reserve_pct: u8,
+    #[serde(default = "default_repair_reactive_hard_reserve_pct")]
+    repair_reactive_hard_reserve_pct: u8,
 }
 
 impl<'de> Deserialize<'de> for VoiceConfig {
@@ -185,6 +197,16 @@ impl<'de> Deserialize<'de> for VoiceConfig {
         if raw.repair_max_extra_copies_per_frame > 2 {
             return Err(D::Error::custom(
                 "repair_max_extra_copies_per_frame must be between 0 and 2",
+            ));
+        }
+        if raw.repair_reactive_reserve_pct > 100 {
+            return Err(D::Error::custom(
+                "repair_reactive_reserve_pct must be between 0 and 100",
+            ));
+        }
+        if raw.repair_reactive_hard_reserve_pct > raw.repair_reactive_reserve_pct {
+            return Err(D::Error::custom(
+                "repair_reactive_hard_reserve_pct must not exceed repair_reactive_reserve_pct",
             ));
         }
         let _ = (
@@ -219,6 +241,8 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             repair_full_dup_loss_ppm: raw.repair_full_dup_loss_ppm,
             repair_jitter_start_ms: raw.repair_jitter_start_ms,
             repair_max_extra_copies_per_frame: raw.repair_max_extra_copies_per_frame,
+            repair_reactive_reserve_pct: raw.repair_reactive_reserve_pct,
+            repair_reactive_hard_reserve_pct: raw.repair_reactive_hard_reserve_pct,
         })
     }
 }
@@ -310,6 +334,12 @@ fn default_repair_jitter_start_ms() -> u64 {
 fn default_repair_max_extra_copies_per_frame() -> usize {
     1
 }
+fn default_repair_reactive_reserve_pct() -> u8 {
+    30
+}
+fn default_repair_reactive_hard_reserve_pct() -> u8 {
+    10
+}
 
 #[cfg(test)]
 mod tests {
@@ -336,6 +366,8 @@ mod tests {
         assert_eq!(cfg.voice.repair_full_dup_loss_ppm, 30_000);
         assert_eq!(cfg.voice.repair_jitter_start_ms, 40);
         assert_eq!(cfg.voice.repair_max_extra_copies_per_frame, 1);
+        assert_eq!(cfg.voice.repair_reactive_reserve_pct, 30);
+        assert_eq!(cfg.voice.repair_reactive_hard_reserve_pct, 10);
     }
 
     #[test]
@@ -406,5 +438,33 @@ mod tests {
                     .contains("repair_max_extra_copies_per_frame must be between 0 and 2")
             );
         }
+    }
+
+    #[test]
+    fn voice_repair_reserve_percentages_are_validated() {
+        let cfg: ApplicationConfig = serde_json::from_str(
+            r#"{"voice":{"repair_reactive_reserve_pct":40,"repair_reactive_hard_reserve_pct":15}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.voice.repair_reactive_reserve_pct, 40);
+        assert_eq!(cfg.voice.repair_reactive_hard_reserve_pct, 15);
+
+        let error = serde_json::from_str::<ApplicationConfig>(
+            r#"{"voice":{"repair_reactive_reserve_pct":25,"repair_reactive_hard_reserve_pct":26}}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(
+            "repair_reactive_hard_reserve_pct must not exceed repair_reactive_reserve_pct"
+        ));
+
+        let error = serde_json::from_str::<ApplicationConfig>(
+            r#"{"voice":{"repair_reactive_reserve_pct":101}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("repair_reactive_reserve_pct must be between 0 and 100")
+        );
     }
 }

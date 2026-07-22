@@ -220,6 +220,12 @@ udp_family_min_samples = 32
 udp_family_probe_loss_block_count = 3
 udp_family_block_loss_ppm = 250000
 udp_family_loss_excess_over_tcp_ppm = 50000
+# Shadow-only observation of the repair-feasibility boundary for BestEffort
+# datagram delivery paths. These are thresholds for the transport's weighted
+# effective-loss score, not raw packet loss. QUIC DATAGRAM currently uses the
+# aggregate physical-QUIC score. Suspect state never changes path selection.
+best_effort_datagram_effective_loss_suspect_ppm = 5000
+best_effort_datagram_effective_loss_recover_ppm = 2500
 large_rtt_threshold_ms = 100
 lossy_link_threshold_ppm = 20000
 bulk_payload_threshold_bytes = 65536
@@ -289,6 +295,12 @@ reorder_max_buffered_frames = 48
 reorder_max_total_buffer = 4096
 # Proactive copies are limited to 0 through 2 per frame (default: 1).
 # repair_max_extra_copies_per_frame = 1
+# Reactive/tail repair owns 30% of the single 25% repair mint. Proactive work
+# may borrow unused reactive credit above the hard 10% reserve. Both
+# percentages are measured against the dynamic repair-credit cap; hard reserve
+# must not exceed the reactive reserve.
+repair_reactive_reserve_pct = 30
+repair_reactive_hard_reserve_pct = 10
 
 # ── L2 overlay tunables ───────────────────────────────────────────────
 [s2s.overlay]

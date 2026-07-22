@@ -194,6 +194,88 @@ pub(crate) enum VoiceProactiveResult {
     SendFailed,
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum RepairCreditStage {
+    Minted,
+    Reserved,
+    Committed,
+    Refunded,
+    CapDiscarded,
+}
+
+impl RepairCreditStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Minted => "minted",
+            Self::Reserved => "reserved",
+            Self::Committed => "committed",
+            Self::Refunded => "refunded",
+            Self::CapDiscarded => "cap_discarded",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum RepairBudgetClass {
+    Proactive,
+    Reactive,
+}
+
+impl RepairBudgetClass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Proactive => "proactive",
+            Self::Reactive => "reactive",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum RepairClassStage {
+    Granted,
+    Borrowed,
+    Repaid,
+    Attempted,
+    Sent,
+    Shed,
+}
+
+impl RepairClassStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::Borrowed => "borrowed",
+            Self::Repaid => "repaid",
+            Self::Attempted => "attempted",
+            Self::Sent => "sent",
+            Self::Shed => "shed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum RepairDestinationStage {
+    Requested,
+    PrivateGrant,
+    OverflowGrant,
+    Attempted,
+    Sent,
+    Shed,
+}
+
+impl RepairDestinationStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::PrivateGrant => "private_grant",
+            Self::OverflowGrant => "overflow_grant",
+            Self::Attempted => "attempted",
+            Self::Sent => "sent",
+            Self::Shed => "shed",
+        }
+    }
+}
+
 impl VoiceProactiveResult {
     fn label(self) -> &'static str {
         match self {
@@ -286,6 +368,16 @@ struct RepairCacheTelemetry {
 }
 
 #[derive(Debug, Default)]
+struct RepairAllocatorState {
+    proactive_balance_bytes: u64,
+    reactive_balance_bytes: u64,
+    hard_reserve_bytes: u64,
+    debt_to_reactive_bytes: u64,
+    debt_to_proactive_bytes: u64,
+    active_destinations: u64,
+}
+
+#[derive(Debug, Default)]
 struct VoiceAppMetrics {
     sends: HashMap<SendKey, u64>,
     receives: HashMap<ReceiveKey, u64>,
@@ -300,6 +392,10 @@ struct VoiceAppMetrics {
     proactive_budget: ProactiveBudget,
     proactive_outcomes: HashMap<(VoiceProactiveKind, VoiceProactiveResult), u64>,
     repair_cache: RepairCacheTelemetry,
+    repair_credit_quarters: HashMap<RepairCreditStage, u64>,
+    repair_class_bytes: HashMap<(RepairBudgetClass, RepairClassStage), u64>,
+    repair_destination_bytes: HashMap<(NodeIdentifier, RepairDestinationStage), u64>,
+    repair_allocator_state: RepairAllocatorState,
 }
 
 pub(crate) fn record_send(
@@ -421,6 +517,69 @@ pub(crate) fn record_repair_cache_evictions(count: u64) {
     }
     let mut metrics = METRICS.lock().unwrap();
     metrics.repair_cache.evictions = metrics.repair_cache.evictions.saturating_add(count);
+}
+
+pub(crate) fn record_repair_credit_quarters(stage: RepairCreditStage, quarters: usize) {
+    if quarters == 0 {
+        return;
+    }
+    let mut metrics = METRICS.lock().unwrap();
+    let total = metrics.repair_credit_quarters.entry(stage).or_default();
+    *total = total.saturating_add(quarters as u64);
+}
+
+pub(crate) fn record_repair_class_bytes(
+    class: RepairBudgetClass,
+    stage: RepairClassStage,
+    bytes: usize,
+) {
+    if bytes == 0 {
+        return;
+    }
+    let mut metrics = METRICS.lock().unwrap();
+    let total = metrics
+        .repair_class_bytes
+        .entry((class, stage))
+        .or_default();
+    *total = total.saturating_add(bytes as u64);
+}
+
+/// Records per-destination allocator work. `NodeIdentifier` is a bounded u16
+/// cluster identity, unlike session, user, address, or channel identifiers.
+pub(crate) fn record_repair_destination_bytes(
+    peer: NodeIdentifier,
+    stage: RepairDestinationStage,
+    bytes: usize,
+) {
+    if bytes == 0 {
+        return;
+    }
+    let mut metrics = METRICS.lock().unwrap();
+    let total = metrics
+        .repair_destination_bytes
+        .entry((peer, stage))
+        .or_default();
+    *total = total.saturating_add(bytes as u64);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn set_repair_allocator_state(
+    proactive_balance_bytes: usize,
+    reactive_balance_bytes: usize,
+    hard_reserve_bytes: usize,
+    debt_to_reactive_bytes: usize,
+    debt_to_proactive_bytes: usize,
+    active_destinations: usize,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    metrics.repair_allocator_state = RepairAllocatorState {
+        proactive_balance_bytes: proactive_balance_bytes as u64,
+        reactive_balance_bytes: reactive_balance_bytes as u64,
+        hard_reserve_bytes: hard_reserve_bytes as u64,
+        debt_to_reactive_bytes: debt_to_reactive_bytes as u64,
+        debt_to_proactive_bytes: debt_to_proactive_bytes as u64,
+        active_destinations: active_destinations as u64,
+    };
 }
 
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
@@ -566,6 +725,52 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         "shitspeak_s2s_voice_repair_cache_evictions_total",
         Vec::new(),
         metrics.repair_cache.evictions as f64,
+    ));
+    for (stage, quarters) in &metrics.repair_credit_quarters {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_repair_credit_bytes_total",
+            vec![("stage".to_owned(), stage.label().to_owned())],
+            *quarters as f64 / 4.0,
+        ));
+    }
+    for ((class, stage), bytes) in &metrics.repair_class_bytes {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_repair_allocator_class_bytes_total",
+            vec![
+                ("class".to_owned(), class.label().to_owned()),
+                ("stage".to_owned(), stage.label().to_owned()),
+            ],
+            *bytes as f64,
+        ));
+    }
+    for ((peer, stage), bytes) in &metrics.repair_destination_bytes {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_repair_allocator_destination_bytes_total",
+            vec![
+                ("peer".to_owned(), peer.to_string()),
+                ("stage".to_owned(), stage.label().to_owned()),
+            ],
+            *bytes as f64,
+        ));
+    }
+    let allocator = &metrics.repair_allocator_state;
+    for (state, bytes) in [
+        ("proactive_balance", allocator.proactive_balance_bytes),
+        ("reactive_balance", allocator.reactive_balance_bytes),
+        ("hard_reserve", allocator.hard_reserve_bytes),
+        ("debt_to_reactive", allocator.debt_to_reactive_bytes),
+        ("debt_to_proactive", allocator.debt_to_proactive_bytes),
+    ] {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_repair_allocator_state_bytes",
+            vec![("state".to_owned(), state.to_owned())],
+            bytes as f64,
+        ));
+    }
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_repair_allocator_active_destinations",
+        Vec::new(),
+        allocator.active_destinations as f64,
     ));
 
     out
@@ -835,5 +1040,71 @@ mod tests {
         )
         .expect("speaker state drop");
         assert!(drop.value() >= 1.0);
+    }
+
+    #[test]
+    fn repair_allocator_metrics_use_fixed_stage_and_bounded_peer_labels() {
+        record_repair_credit_quarters(RepairCreditStage::Minted, 4_001);
+        record_repair_credit_quarters(RepairCreditStage::Reserved, 2_800);
+        record_repair_credit_quarters(RepairCreditStage::Committed, 2_400);
+        record_repair_credit_quarters(RepairCreditStage::Refunded, 400);
+        record_repair_credit_quarters(RepairCreditStage::CapDiscarded, 800);
+        record_repair_class_bytes(RepairBudgetClass::Proactive, RepairClassStage::Borrowed, 50);
+        record_repair_class_bytes(RepairBudgetClass::Reactive, RepairClassStage::Attempted, 75);
+        record_repair_destination_bytes(3, RepairDestinationStage::Requested, 100);
+        record_repair_destination_bytes(4, RepairDestinationStage::PrivateGrant, 75);
+        record_repair_destination_bytes(15, RepairDestinationStage::OverflowGrant, 50);
+        set_repair_allocator_state(700, 300, 100, 50, 25, 64);
+
+        let minted = find_sample(
+            "shitspeak_s2s_voice_repair_credit_bytes_total",
+            &[("stage", "minted")],
+        )
+        .expect("minted repair credit");
+        assert!(minted.value() >= 1_000.25);
+        assert_no_unbounded_voice_labels(&minted);
+
+        let proactive_borrow = find_sample(
+            "shitspeak_s2s_voice_repair_allocator_class_bytes_total",
+            &[("class", "proactive"), ("stage", "borrowed")],
+        )
+        .expect("proactive borrowing");
+        assert!(proactive_borrow.value() >= 50.0);
+
+        let requested = find_sample(
+            "shitspeak_s2s_voice_repair_allocator_destination_bytes_total",
+            &[("peer", "3"), ("stage", "requested")],
+        )
+        .expect("destination request");
+        assert!(requested.value() >= 100.0);
+        assert_no_unbounded_voice_labels(&requested);
+
+        let hard_reserve = find_sample(
+            "shitspeak_s2s_voice_repair_allocator_state_bytes",
+            &[("state", "hard_reserve")],
+        )
+        .expect("hard reserve state");
+        // Allocator gauges are process-global and asynchronous voice tests
+        // may refresh them concurrently. This test verifies stable bounded
+        // dimensions; exact state transitions are covered by budget tests.
+        assert!(hard_reserve.value() >= 0.0);
+        let debt_to_reactive = find_sample(
+            "shitspeak_s2s_voice_repair_allocator_state_bytes",
+            &[("state", "debt_to_reactive")],
+        )
+        .expect("debt owed to reactive class");
+        assert!(debt_to_reactive.value() >= 0.0);
+        let debt_to_proactive = find_sample(
+            "shitspeak_s2s_voice_repair_allocator_state_bytes",
+            &[("state", "debt_to_proactive")],
+        )
+        .expect("debt owed to proactive class");
+        assert!(debt_to_proactive.value() >= 0.0);
+        let destinations = find_sample(
+            "shitspeak_s2s_voice_repair_allocator_active_destinations",
+            &[],
+        )
+        .expect("active allocator destinations");
+        assert!(destinations.value() >= 0.0);
     }
 }

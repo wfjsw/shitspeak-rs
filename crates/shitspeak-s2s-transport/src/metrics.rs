@@ -149,6 +149,118 @@ pub struct DeliveryPathSelectionSnapshot {
     selections: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DatagramPathHealthState {
+    Probing,
+    Healthy,
+    Suspect,
+    Blocked,
+}
+
+impl DatagramPathHealthState {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Probing => "probing",
+            Self::Healthy => "healthy",
+            Self::Suspect => "suspect",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DatagramPathHealthReason {
+    InsufficientSamples,
+    WithinThreshold,
+    MeasuredLoss,
+    ProbeFailures,
+    AddressFailures,
+    HardLoss,
+    Recovered,
+}
+
+impl DatagramPathHealthReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::InsufficientSamples => "insufficient_samples",
+            Self::WithinThreshold => "within_threshold",
+            Self::MeasuredLoss => "measured_loss",
+            Self::ProbeFailures => "probe_failures",
+            Self::AddressFailures => "address_failures",
+            Self::HardLoss => "hard_loss",
+            Self::Recovered => "recovered",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatagramPathHealthSnapshot {
+    peer: NodeIdentifier,
+    path: DeliveryPath,
+    state: DatagramPathHealthState,
+    reason: DatagramPathHealthReason,
+    effective_loss_ppm: Option<u32>,
+    loss_samples: u64,
+    transitions: u64,
+    state_age: Duration,
+    observation_age: Duration,
+}
+
+impl DatagramPathHealthSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        peer: NodeIdentifier,
+        path: DeliveryPath,
+        state: DatagramPathHealthState,
+        reason: DatagramPathHealthReason,
+        effective_loss_ppm: Option<u32>,
+        loss_samples: u64,
+        transitions: u64,
+        state_age: Duration,
+        observation_age: Duration,
+    ) -> Self {
+        Self {
+            peer,
+            path,
+            state,
+            reason,
+            effective_loss_ppm,
+            loss_samples,
+            transitions,
+            state_age,
+            observation_age,
+        }
+    }
+
+    pub fn peer(self) -> NodeIdentifier {
+        self.peer
+    }
+    pub fn path(self) -> DeliveryPath {
+        self.path
+    }
+    pub fn state(self) -> DatagramPathHealthState {
+        self.state
+    }
+    pub fn reason(self) -> DatagramPathHealthReason {
+        self.reason
+    }
+    pub fn effective_loss_ppm(self) -> Option<u32> {
+        self.effective_loss_ppm
+    }
+    pub fn loss_samples(self) -> u64 {
+        self.loss_samples
+    }
+    pub fn transitions(self) -> u64 {
+        self.transitions
+    }
+    pub fn state_age(self) -> Duration {
+        self.state_age
+    }
+    pub fn observation_age(self) -> Duration {
+        self.observation_age
+    }
+}
+
 impl DeliveryPathSelectionSnapshot {
     pub fn path(self) -> DeliveryPath {
         self.path
@@ -2455,6 +2567,7 @@ pub struct MetricsSnapshot {
     inbound_queues: Vec<InboundQueueStatusSnapshot>,
     expired_outbound_drops: Vec<ExpiredOutboundDropSnapshot>,
     transport_health_exclusions: Vec<TransportHealthExclusionSnapshot>,
+    datagram_path_health: Vec<DatagramPathHealthSnapshot>,
     voice_transport_bindings: Vec<VoiceTransportBindingSnapshot>,
     voice_transport_binding_events: Vec<VoiceTransportBindingEventSnapshot>,
     voice_transport_challengers: Vec<VoiceTransportChallengerSnapshot>,
@@ -2939,6 +3052,10 @@ impl MetricsSnapshot {
         &self.transport_health_exclusions
     }
 
+    pub fn datagram_path_health(&self) -> &[DatagramPathHealthSnapshot] {
+        &self.datagram_path_health
+    }
+
     pub fn voice_transport_bindings(&self) -> &[VoiceTransportBindingSnapshot] {
         &self.voice_transport_bindings
     }
@@ -2959,6 +3076,7 @@ pub fn assemble_snapshot<I>(
     inbound_queues: Vec<InboundQueueStatusSnapshot>,
     expired_outbound_drops: Vec<ExpiredOutboundDropSnapshot>,
     transport_health_exclusions: Vec<TransportHealthExclusionSnapshot>,
+    datagram_path_health: Vec<DatagramPathHealthSnapshot>,
     voice_transport_bindings: Vec<VoiceTransportBindingSnapshot>,
     voice_transport_binding_events: Vec<VoiceTransportBindingEventSnapshot>,
     voice_transport_challengers: Vec<VoiceTransportChallengerSnapshot>,
@@ -2976,6 +3094,7 @@ where
         inbound_queues,
         expired_outbound_drops,
         transport_health_exclusions,
+        datagram_path_health,
         voice_transport_bindings,
         voice_transport_binding_events,
         voice_transport_challengers,
