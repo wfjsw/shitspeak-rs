@@ -2340,7 +2340,8 @@ mod tests {
                 (10, Vec::new()),
             ]),
         );
-        tables.precompute_voice_alternates(1);
+        let alternates = tables.compute_voice_alternates(1);
+        tables.install_voice_alternates(alternates);
         tables
     }
 
@@ -2425,7 +2426,8 @@ mod tests {
                 ),
             ]),
         );
-        tables.precompute_voice_alternates(1);
+        let alternates = tables.compute_voice_alternates(1);
+        tables.install_voice_alternates(alternates);
         inner.routing.store(Arc::new(tables));
         let network = OverlayNetwork {
             inner: Arc::new(inner),

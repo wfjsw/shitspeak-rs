@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
@@ -21,6 +22,8 @@ use super::super::lsdb::LinkStateDb;
 use super::RoutingTables;
 use super::dijkstra;
 use super::dynamic::DynamicSpf;
+
+const VOICE_ALTERNATE_PRECOMPUTE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 pub fn spawn_recomputer(
     lsdb: Arc<LinkStateDb>,
@@ -42,6 +45,7 @@ pub fn spawn_recomputer(
                 &transport,
                 &duplicate_detector,
                 &cfg,
+                &shutdown,
             ))
         } else {
             recompute_now(
@@ -51,6 +55,7 @@ pub fn spawn_recomputer(
                 &transport,
                 &duplicate_detector,
                 &cfg,
+                &shutdown,
             );
             None
         };
@@ -84,7 +89,13 @@ pub fn spawn_recomputer(
                     best_effort = new.for_level(ServiceLevel::BestEffort).len(),
                     "routing dynamically recomputed"
                 );
-                tables.store(Arc::new(new));
+                publish_routing_tables(
+                    &tables,
+                    new,
+                    self_id,
+                    cfg.routing_recompute_debounce(),
+                    &shutdown,
+                );
             } else {
                 recompute_now(
                     &lsdb,
@@ -93,6 +104,7 @@ pub fn spawn_recomputer(
                     &transport,
                     &duplicate_detector,
                     &cfg,
+                    &shutdown,
                 );
                 lsdb.drain_dirty_origins();
             }
@@ -107,6 +119,7 @@ fn recompute_dynamic_full(
     transport: &ConnectionManager,
     duplicate_detector: &DuplicateDetector,
     cfg: &OverlayConfig,
+    shutdown: &CancellationToken,
 ) -> DynamicSpf {
     let engine = DynamicSpf::rebuild_filtered(lsdb, self_id, cfg, |node| {
         !duplicate_detector.is_quarantined(node)
@@ -119,7 +132,13 @@ fn recompute_dynamic_full(
         best_effort = new.for_level(ServiceLevel::BestEffort).len(),
         "routing dynamically rebuilt"
     );
-    tables.store(Arc::new(new));
+    publish_routing_tables(
+        tables,
+        new,
+        self_id,
+        cfg.routing_recompute_debounce(),
+        shutdown,
+    );
     engine
 }
 
@@ -130,6 +149,7 @@ fn recompute_now(
     transport: &ConnectionManager,
     duplicate_detector: &DuplicateDetector,
     cfg: &OverlayConfig,
+    shutdown: &CancellationToken,
 ) {
     let graph = dijkstra::RoutingGraph::from_lsdb_filtered(lsdb, |node| {
         !duplicate_detector.is_quarantined(node)
@@ -143,7 +163,50 @@ fn recompute_now(
         best_effort = new.for_level(ServiceLevel::BestEffort).len(),
         "routing recomputed"
     );
-    tables.store(Arc::new(new));
+    publish_routing_tables(
+        tables,
+        new,
+        self_id,
+        cfg.routing_recompute_debounce(),
+        shutdown,
+    );
+}
+
+fn publish_routing_tables(
+    tables: &Arc<ArcSwap<RoutingTables>>,
+    new: RoutingTables,
+    self_id: NodeIdentifier,
+    alternate_debounce: std::time::Duration,
+    shutdown: &CancellationToken,
+) {
+    let snapshot = Arc::new(new);
+    let generation = snapshot.generation();
+    tables.store(snapshot.clone());
+    let alternate_debounce = alternate_debounce.max(VOICE_ALTERNATE_PRECOMPUTE_DEBOUNCE);
+
+    let tables = tables.clone();
+    let shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(alternate_debounce) => {}
+        }
+        if tables.load().generation() != generation {
+            return;
+        }
+
+        let compute_snapshot = snapshot.clone();
+        let Ok(alternates) =
+            tokio::task::spawn_blocking(move || compute_snapshot.compute_voice_alternates(self_id))
+                .await
+        else {
+            return;
+        };
+
+        if !shutdown.is_cancelled() && tables.load().generation() == generation {
+            snapshot.install_voice_alternates(alternates);
+        }
+    });
 }
 
 fn component_bridge_targets(
@@ -260,6 +323,33 @@ mod tests {
         db
     }
 
+    fn voice_tables() -> RoutingTables {
+        let mut tables = RoutingTables::empty();
+        let edge = dijkstra::EdgeCost {
+            primary: 1,
+            latency_us: 100,
+        };
+        tables.insert_table_with_adjacency(
+            super::super::RoutingMetric::ConversationalQuality,
+            ServiceLevel::BestEffort,
+            HashMap::from([(
+                10,
+                dijkstra::RouteEntry {
+                    next_hop: 2,
+                    cost: 2,
+                    latency_us: 200,
+                },
+            )]),
+            HashMap::from([
+                (1, vec![(2, edge), (3, edge)]),
+                (2, vec![(10, edge)]),
+                (3, vec![(10, edge)]),
+                (10, vec![]),
+            ]),
+        );
+        tables
+    }
+
     #[test]
     fn component_bridge_targets_pick_foreign_component_representatives() {
         let db = build_db(vec![
@@ -285,5 +375,34 @@ mod tests {
 
         let graph = dijkstra::RoutingGraph::from_lsdb(&db);
         assert!(component_bridge_targets(&graph, 1).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_voice_alternates_skip_stale_generations() {
+        let published = Arc::new(ArcSwap::from_pointee(RoutingTables::empty()));
+        let shutdown = CancellationToken::new();
+
+        let stale = voice_tables();
+        let stale_observer = stale.clone();
+        publish_routing_tables(&published, stale, 1, Duration::ZERO, &shutdown);
+
+        let current = voice_tables();
+        let current_observer = current.clone();
+        publish_routing_tables(&published, current, 1, Duration::ZERO, &shutdown);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(VOICE_ALTERNATE_PRECOMPUTE_DEBOUNCE).await;
+        for _ in 0..1000 {
+            if current_observer.has_precomputed_voice_alternate(10, 2) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(stale_observer.voice_alternate_searches(), 0);
+        assert!(!stale_observer.has_precomputed_voice_alternate(10, 2));
+        assert!(current_observer.voice_alternate_searches() > 0);
+        assert!(current_observer.has_precomputed_voice_alternate(10, 2));
+        shutdown.cancel();
     }
 }

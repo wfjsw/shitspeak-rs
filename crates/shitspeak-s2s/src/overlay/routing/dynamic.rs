@@ -115,7 +115,6 @@ impl DynamicSpf {
                 dijkstra::adjacency_for(&self.graph, key.level, key.metric, cfg),
             );
         }
-        out.precompute_voice_alternates(self.self_id);
         out
     }
 

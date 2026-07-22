@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -52,6 +53,14 @@ const MAX_ATTACHMENT_CHUNK_BYTES: usize = 512;
 /// A routed overlay frame records every distinct forwarding hop. Keeping this
 /// finite bounds the outer envelope independently of its service payload.
 pub(crate) const MAX_PATH_TRACE_NODES: usize = 256;
+
+static CONTROL_NO_ROUTE_DROPS: AtomicU64 = AtomicU64::new(0);
+static DATA_NO_ROUTE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+fn sampled_drop_count(counter: &AtomicU64) -> Option<u64> {
+    let count = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    count.is_power_of_two().then_some(count)
+}
 
 fn unix_time_ms() -> u64 {
     SystemTime::now()
@@ -1243,16 +1252,19 @@ async fn send_control_to(
             return Ok(());
         }
         ForwardNextHop::DropNoRoute => {
-            debug!(
-                self_id = %self_id,
-                target = %target,
-                origin = %NodeIdentifier::try_from(control.origin).unwrap_or(0),
-                final_dst = %NodeIdentifier::try_from(control.final_dst).unwrap_or(0),
-                requester = %NodeIdentifier::try_from(control.requester).unwrap_or(0),
-                lane = control.lane_id,
-                path_trace = ?control.path_trace,
-                "dropping overlay control because no route exists"
-            );
+            if let Some(observed_drops) = sampled_drop_count(&CONTROL_NO_ROUTE_DROPS) {
+                debug!(
+                    self_id = %self_id,
+                    target = %target,
+                    origin = %NodeIdentifier::try_from(control.origin).unwrap_or(0),
+                    final_dst = %NodeIdentifier::try_from(control.final_dst).unwrap_or(0),
+                    requester = %NodeIdentifier::try_from(control.requester).unwrap_or(0),
+                    lane = control.lane_id,
+                    path_trace = ?control.path_trace,
+                    observed_drops,
+                    "dropping overlay control because no route exists"
+                );
+            }
             return Ok(());
         }
         ForwardNextHop::DropLoop { next_hop } => {
@@ -1834,16 +1846,19 @@ async fn forward_pb_as(
                 );
             }
             ForwardNextHop::DropNoRoute => {
-                debug!(
-                    self_id = %self_id,
-                    src = %NodeIdentifier::try_from(data.src).unwrap_or(0),
-                    %dst,
-                    ?level,
-                    ?routing_metric,
-                    lane = ?data.lane_id,
-                    path_trace = ?data.path_trace,
-                    "dropping overlay data because no route exists"
-                );
+                if let Some(observed_drops) = sampled_drop_count(&DATA_NO_ROUTE_DROPS) {
+                    debug!(
+                        self_id = %self_id,
+                        src = %NodeIdentifier::try_from(data.src).unwrap_or(0),
+                        %dst,
+                        ?level,
+                        ?routing_metric,
+                        lane = ?data.lane_id,
+                        path_trace = ?data.path_trace,
+                        observed_drops,
+                        "dropping overlay data because no route exists"
+                    );
+                }
             }
             ForwardNextHop::DropLoop { next_hop } => {
                 debug!(
@@ -3124,6 +3139,16 @@ mod tests {
             primary: cost,
             latency_us: cost,
         }
+    }
+
+    #[test]
+    fn no_route_drop_logging_is_exponentially_sampled() {
+        let counter = AtomicU64::new(0);
+        let sampled = (0..9)
+            .filter_map(|_| sampled_drop_count(&counter))
+            .collect::<Vec<_>>();
+
+        assert_eq!(sampled, vec![1, 2, 4, 8]);
     }
 
     #[test]

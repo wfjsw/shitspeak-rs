@@ -9,6 +9,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use arc_swap::ArcSwap;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -40,9 +41,9 @@ pub struct RoutingTables {
     generation: u64,
     tables: HashMap<RoutingTableKey, HashMap<NodeIdentifier, RouteEntry>>,
     adjacency: HashMap<RoutingTableKey, HashMap<NodeIdentifier, Vec<(NodeIdentifier, EdgeCost)>>>,
-    voice_alternates: HashMap<(NodeIdentifier, NodeIdentifier), Option<RouteEntry>>,
+    voice_alternates: Arc<Mutex<HashMap<(NodeIdentifier, NodeIdentifier), Option<RouteEntry>>>>,
     #[cfg(test)]
-    voice_alternate_searches: u64,
+    voice_alternate_searches: Arc<AtomicU64>,
     transit_disabled: HashSet<NodeIdentifier>,
 }
 
@@ -62,9 +63,9 @@ impl Default for RoutingTables {
             generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
             tables,
             adjacency,
-            voice_alternates: HashMap::new(),
+            voice_alternates: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
-            voice_alternate_searches: 0,
+            voice_alternate_searches: Arc::new(AtomicU64::new(0)),
             transit_disabled: HashSet::new(),
         }
     }
@@ -93,7 +94,6 @@ impl RoutingTables {
                 out.insert_table_with_adjacency(metric, level, table, adjacency);
             }
         }
-        out.precompute_voice_alternates(self_id);
         out
     }
 
@@ -127,7 +127,10 @@ impl RoutingTables {
             .collect();
     }
 
-    pub(crate) fn precompute_voice_alternates(&mut self, self_id: NodeIdentifier) {
+    pub(crate) fn compute_voice_alternates(
+        &self,
+        self_id: NodeIdentifier,
+    ) -> HashMap<(NodeIdentifier, NodeIdentifier), Option<RouteEntry>> {
         let metric = RoutingMetric::ConversationalQuality;
         let level = ServiceLevel::BestEffort;
         let mut by_primary_hop: HashMap<NodeIdentifier, Vec<NodeIdentifier>> = HashMap::new();
@@ -138,17 +141,12 @@ impl RoutingTables {
             }
         }
 
-        self.voice_alternates.clear();
-        #[cfg(test)]
-        {
-            self.voice_alternate_searches = 0;
-        }
+        let mut voice_alternates = HashMap::new();
         for destination in destinations {
             let Some(primary) = self.lookup_with_metric(destination, level, metric) else {
                 continue;
             };
-            self.voice_alternates
-                .insert((destination, primary.next_hop), None);
+            voice_alternates.insert((destination, primary.next_hop), None);
             by_primary_hop
                 .entry(primary.next_hop)
                 .or_default()
@@ -158,14 +156,12 @@ impl RoutingTables {
         for key in Self::metric_lookup_keys(metric, level).iter().flatten() {
             for (&primary_hop, destinations) in &by_primary_hop {
                 #[cfg(test)]
-                {
-                    self.voice_alternate_searches += 1;
-                }
+                self.voice_alternate_searches
+                    .fetch_add(1, Ordering::Relaxed);
                 let alternates = self.routes_avoiding_first_hop_for_key(self_id, key, primary_hop);
                 for destination in destinations {
                     let cache_key = (*destination, primary_hop);
-                    if self
-                        .voice_alternates
+                    if voice_alternates
                         .get(&cache_key)
                         .is_some_and(Option::is_some)
                     {
@@ -173,11 +169,19 @@ impl RoutingTables {
                     }
                     if let Some(alternate) = alternates.get(destination) {
                         debug_assert_ne!(alternate.next_hop, primary_hop);
-                        self.voice_alternates.insert(cache_key, Some(*alternate));
+                        voice_alternates.insert(cache_key, Some(*alternate));
                     }
                 }
             }
         }
+        voice_alternates
+    }
+
+    pub(crate) fn install_voice_alternates(
+        &self,
+        voice_alternates: HashMap<(NodeIdentifier, NodeIdentifier), Option<RouteEntry>>,
+    ) {
+        *self.voice_alternates.lock() = voice_alternates;
     }
 
     pub(crate) fn precomputed_voice_alternate(
@@ -186,6 +190,7 @@ impl RoutingTables {
         primary_next_hop: NodeIdentifier,
     ) -> Option<RouteEntry> {
         self.voice_alternates
+            .lock()
             .get(&(destination, primary_next_hop))
             .copied()
             .flatten()
@@ -198,12 +203,13 @@ impl RoutingTables {
         primary_next_hop: NodeIdentifier,
     ) -> bool {
         self.voice_alternates
+            .lock()
             .contains_key(&(destination, primary_next_hop))
     }
 
     #[cfg(test)]
     pub(crate) fn voice_alternate_searches(&self) -> u64 {
-        self.voice_alternate_searches
+        self.voice_alternate_searches.load(Ordering::Relaxed)
     }
 
     pub fn for_level(&self, level: ServiceLevel) -> &HashMap<NodeIdentifier, RouteEntry> {
@@ -829,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_alternates_are_precomputed_with_negative_entries() {
+    fn voice_alternates_can_be_computed_off_snapshot_with_negative_entries() {
         let mut tables = RoutingTables::empty();
         let edge = EdgeCost {
             primary: 1,
@@ -865,8 +871,13 @@ mod tests {
             ]),
         );
 
-        tables.precompute_voice_alternates(1);
+        assert_eq!(tables.voice_alternate_searches(), 0);
+        assert!(!tables.has_precomputed_voice_alternate(10, 2));
+        let alternates = tables.compute_voice_alternates(1);
         let searches = tables.voice_alternate_searches();
+        assert!(searches > 0);
+        assert!(!tables.has_precomputed_voice_alternate(10, 2));
+        tables.install_voice_alternates(alternates);
         let expected = tables.lookup_avoiding_first_hop_with_metric(
             1,
             10,
@@ -883,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_alternate_precompute_preserves_service_level_fallback() {
+    fn deferred_voice_alternate_preserves_service_level_fallback() {
         let mut tables = RoutingTables::empty();
         let edge = EdgeCost {
             primary: 1,
@@ -908,7 +919,6 @@ mod tests {
             ]),
         );
 
-        tables.precompute_voice_alternates(1);
         let expected = tables.lookup_avoiding_first_hop_with_metric(
             1,
             10,
@@ -917,13 +927,15 @@ mod tests {
             &HashSet::new(),
             2,
         );
+        let alternates = tables.compute_voice_alternates(1);
+        tables.install_voice_alternates(alternates);
 
         assert_eq!(tables.precomputed_voice_alternate(10, 2), expected);
         assert_eq!(expected.expect("reliable fallback alternate").next_hop, 3);
     }
 
     #[test]
-    fn voice_alternate_precompute_does_not_transit_disabled_nodes() {
+    fn deferred_voice_alternate_does_not_transit_disabled_nodes() {
         let mut tables = RoutingTables::empty();
         let edge = EdgeCost {
             primary: 1,
@@ -959,8 +971,8 @@ mod tests {
             ]),
         );
         tables.transit_disabled.insert(4);
-
-        tables.precompute_voice_alternates(1);
+        let alternates = tables.compute_voice_alternates(1);
+        tables.install_voice_alternates(alternates);
 
         assert_eq!(
             tables
