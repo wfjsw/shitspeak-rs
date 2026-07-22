@@ -172,6 +172,7 @@ struct ExecAuthenticatorInner {
     mode: ExecAuthenticatorMode,
     command: PathBuf,
     args: Vec<String>,
+    environment: HashMap<String, String>,
     working_dir: Option<PathBuf>,
     uid: Option<u32>,
     gid: Option<u32>,
@@ -204,6 +205,7 @@ impl ExecAuthenticatorInner {
             mode,
             command,
             args: config.args().to_vec(),
+            environment: config.environment().clone(),
             working_dir: config.working_dir().cloned(),
             uid: config.uid(),
             gid: config.gid(),
@@ -558,6 +560,7 @@ impl ExecAuthenticatorInner {
         let mut command = Command::new(&self.command);
         command
             .args(&self.args)
+            .envs(&self.environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

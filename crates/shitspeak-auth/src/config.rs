@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -47,6 +48,8 @@ pub struct ExecAuthenticatorConfig {
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
+    environment: HashMap<String, String>,
+    #[serde(default)]
     working_dir: Option<PathBuf>,
     #[serde(default)]
     uid: Option<u32>,
@@ -65,6 +68,7 @@ impl Default for ExecAuthenticatorConfig {
             long_running_request_mode: ExecLongRunningRequestMode::default(),
             command: None,
             args: Vec::new(),
+            environment: HashMap::new(),
             working_dir: None,
             uid: None,
             gid: None,
@@ -84,6 +88,21 @@ impl ExecAuthenticatorConfig {
 
     pub fn with_args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_environment<K, V>(
+        mut self,
+        environment: impl IntoIterator<Item = (K, V)>,
+    ) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.environment = environment
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
         self
     }
 
@@ -136,6 +155,10 @@ impl ExecAuthenticatorConfig {
 
     pub fn args(&self) -> &[String] {
         &self.args
+    }
+
+    pub fn environment(&self) -> &HashMap<String, String> {
+        &self.environment
     }
 
     pub fn working_dir(&self) -> Option<&PathBuf> {
