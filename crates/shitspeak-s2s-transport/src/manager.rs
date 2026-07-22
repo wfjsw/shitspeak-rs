@@ -49,10 +49,10 @@ use super::identity::{
     NodeIdentity, OriginAuthenticationError, OriginSignature, OriginSignatureMetadata,
 };
 use super::metrics::{
-    DatagramPathHealthState, ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics,
-    MetricsSnapshot, MetricsTuning, QueueWatermark, QueueWatermarkReport,
-    TransportHealthExclusionReason, VoiceTransportBindingEventReason, assemble_snapshot,
-    record_delivery_path_selection,
+    DatagramPathEvidenceEvent, DatagramPathHealthState, ExpiredOutboundDropStage,
+    InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot, MetricsTuning, QueueWatermark,
+    QueueWatermarkReport, TransportHealthExclusionReason, VoiceTransportBindingEventReason,
+    assemble_snapshot, record_delivery_path_selection,
 };
 use super::service_level::{
     DeliveryPath, MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel,
@@ -1643,7 +1643,8 @@ impl ConnectionManager {
 
     /// Return the metrics used to select the best currently live transport
     /// for `node`. Selection and the returned value are derived from the same
-    /// immutable per-peer snapshot.
+    /// immutable per-peer snapshot. This observation does not record health
+    /// exclusions or change transport recovery gates.
     pub fn selected_live_transport_metrics(
         &self,
         node: NodeIdentifier,
@@ -1652,7 +1653,7 @@ impl ConnectionManager {
     ) -> Option<(TransportKind, LinkMetrics)> {
         let peer = self.inner.get_peer(node)?;
         let snapshot = peer.metrics().snapshot_per_transport();
-        let selected = pick_transports_with_snapshot(
+        let selected = observe_transports_with_snapshot(
             &peer,
             level,
             routing_metric,
@@ -1788,6 +1789,55 @@ fn pick_transports_with_snapshot(
     selection: impl Into<TransportSelectionConfig>,
     snapshot: &HashMap<TransportKind, LinkMetrics>,
 ) -> Vec<TransportKind> {
+    rank_transports_with_snapshot(
+        peer,
+        level,
+        routing_metric,
+        class,
+        options,
+        payload_len,
+        selection,
+        snapshot,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_transports_with_snapshot(
+    peer: &PeerState,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    options: SendOptions,
+    payload_len: usize,
+    selection: impl Into<TransportSelectionConfig>,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+) -> Vec<TransportKind> {
+    rank_transports_with_snapshot(
+        peer,
+        level,
+        routing_metric,
+        class,
+        options,
+        payload_len,
+        selection,
+        snapshot,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rank_transports_with_snapshot(
+    peer: &PeerState,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    options: SendOptions,
+    payload_len: usize,
+    selection: impl Into<TransportSelectionConfig>,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    record_health_effects: bool,
+) -> Vec<TransportKind> {
     let selection = selection.into();
     let now = Instant::now();
     let mut candidates: Vec<TransportKind> = peer
@@ -1803,19 +1853,37 @@ fn pick_transports_with_snapshot(
             && transport_is_viable_alternative(peer, transport, snapshot, selection.routing, now)
     });
     candidates.retain(|transport| {
-        if let Some(reason) = transport_candidate_exclusion_reason(
-            peer,
-            *transport,
-            level,
-            routing_metric,
-            class,
-            options,
-            snapshot,
-            selection,
-            has_viable_kcp_alternative,
-            now,
-        ) {
-            peer.record_transport_health_exclusion(*transport, reason);
+        let reason = if record_health_effects {
+            transport_candidate_exclusion_reason(
+                peer,
+                *transport,
+                level,
+                routing_metric,
+                class,
+                options,
+                snapshot,
+                selection,
+                has_viable_kcp_alternative,
+                now,
+            )
+        } else {
+            transport_candidate_exclusion_reason_read_only(
+                peer,
+                *transport,
+                level,
+                routing_metric,
+                class,
+                options,
+                snapshot,
+                selection,
+                has_viable_kcp_alternative,
+                now,
+            )
+        };
+        if let Some(reason) = reason {
+            if record_health_effects {
+                peer.record_transport_health_exclusion(*transport, reason);
+            }
             false
         } else {
             true
@@ -1960,6 +2028,37 @@ fn transport_candidate_exclusion_reason(
     has_viable_kcp_alternative: bool,
     now: Instant,
 ) -> Option<TransportHealthExclusionReason> {
+    let reason = transport_candidate_exclusion_reason_read_only(
+        peer,
+        transport,
+        level,
+        routing_metric,
+        class,
+        options,
+        snapshot,
+        selection,
+        has_viable_kcp_alternative,
+        now,
+    );
+    if reason == Some(TransportHealthExclusionReason::KcpFailaway) {
+        peer.require_kcp_best_effort_recovery();
+    }
+    reason
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transport_candidate_exclusion_reason_read_only(
+    peer: &PeerState,
+    transport: TransportKind,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    options: SendOptions,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    selection: TransportSelectionConfig,
+    has_viable_kcp_alternative: bool,
+    now: Instant,
+) -> Option<TransportHealthExclusionReason> {
     if kcp_should_fail_away(
         peer,
         transport,
@@ -1968,7 +2067,6 @@ fn transport_candidate_exclusion_reason(
         has_viable_kcp_alternative,
         now,
     ) {
-        peer.require_kcp_best_effort_recovery();
         return Some(TransportHealthExclusionReason::KcpFailaway);
     }
     if transport == TransportKind::Kcp
@@ -3144,6 +3242,11 @@ fn delivery_candidates(
                         quic_v2: true,
                     });
                 } else {
+                    record_quic_datagram_evidence(
+                        peer,
+                        &sender,
+                        DatagramPathEvidenceEvent::TooLarge,
+                    );
                     no_fit_quic_sender = Some(sender);
                 }
             }
@@ -3235,6 +3338,21 @@ fn observe_best_effort_datagram_path_health(
     now: Instant,
 ) -> DatagramPathHealthState {
     debug_assert!(path.is_datagram());
+    if path == DeliveryPath::QuicDatagram {
+        let evidence = peer
+            .metrics()
+            .datagram_path_evidence_snapshots_at(path, now);
+        return peer.observe_quic_datagram_path_health(
+            &evidence,
+            policy.udp_family_min_samples(),
+            policy.best_effort_quic_datagram_health_suspect_ppm(),
+            policy.best_effort_quic_datagram_health_recover_ppm(),
+            policy.best_effort_datagram_suspect_bad_windows(),
+            policy.best_effort_datagram_recover_healthy(),
+            policy.transport_metric_stale_after(),
+            now,
+        );
+    }
     let transport = path.transport();
     let link = snapshot.get(&transport);
     let fresh_link = link.filter(|link| {
@@ -3250,10 +3368,6 @@ fn observe_best_effort_datagram_path_health(
         link.consecutive_probe_losses() >= policy.udp_family_probe_loss_block_count()
     });
 
-    // QUIC DATAGRAM and QUIC streams currently share physical-QUIC loss
-    // samples. Keeping the latch keyed by DeliveryPath prevents that API
-    // limitation from becoming part of the state model when lane-native
-    // health measurements become available.
     peer.observe_datagram_path_health(
         path,
         effective_loss_ppm,
@@ -3502,6 +3616,7 @@ fn try_dispatch_envelope_with_policy(
         if quic_v2_datagram {
             for sidecar in variant.sidecars() {
                 record_datagram_enqueue_result(
+                    peer,
                     &sender,
                     sender.try_send_for_path(
                         path,
@@ -3530,12 +3645,26 @@ fn try_dispatch_envelope_with_policy(
                 if outcome.dropped_expired() {
                     return Ok(());
                 }
+                if quic_v2_datagram {
+                    record_quic_datagram_evidence(
+                        peer,
+                        &sender,
+                        DatagramPathEvidenceEvent::EnqueueAccepted,
+                    );
+                }
                 if outcome.evicted_items() > 0 {
                     for _ in 0..outcome.evicted_items() {
                         sender.record_quic_datagram_drop();
                         super::metrics::record_quic_datagram_drop(
                             super::metrics::QuicDatagramDropReason::AppQueueEvicted,
                         );
+                        if quic_v2_datagram {
+                            record_quic_datagram_evidence(
+                                peer,
+                                &sender,
+                                DatagramPathEvidenceEvent::Pressure,
+                            );
+                        }
                     }
                 }
                 for sidecar in variant.sidecars().iter().filter(|_| !quic_v2_datagram) {
@@ -3585,6 +3714,11 @@ fn try_dispatch_envelope_with_policy(
                     datagram_enqueue_failed = true;
                 }
                 if quic_v2_datagram {
+                    record_quic_datagram_evidence(
+                        peer,
+                        &sender,
+                        DatagramPathEvidenceEvent::TooLarge,
+                    );
                     sender.record_quic_datagram_drop();
                     super::metrics::record_quic_datagram_drop(
                         super::metrics::QuicDatagramDropReason::TooLarge,
@@ -3601,6 +3735,13 @@ fn try_dispatch_envelope_with_policy(
                 if path.is_datagram() {
                     datagram_enqueue_failed = true;
                 }
+                if quic_v2_datagram {
+                    record_quic_datagram_evidence(
+                        peer,
+                        &sender,
+                        DatagramPathEvidenceEvent::EnqueueRejected,
+                    );
+                }
                 if stream_path {
                     record_outbound_stream_queue_sample(peer, path, class, &sender, level, true);
                 }
@@ -3611,6 +3752,13 @@ fn try_dispatch_envelope_with_policy(
             Err(SessionTrySendError::Closed) => {
                 if path.is_datagram() {
                     datagram_enqueue_failed = true;
+                }
+                if quic_v2_datagram {
+                    record_quic_datagram_evidence(
+                        peer,
+                        &sender,
+                        DatagramPathEvidenceEvent::EnqueueRejected,
+                    );
                 }
                 if voice_decision.is_some_and(|decision| decision.incumbent() == Some(transport)) {
                     incumbent_failure = Some(VoiceTransportBindingEventReason::StreamClosed);
@@ -3642,26 +3790,53 @@ fn try_dispatch_envelope_with_policy(
 }
 
 fn record_datagram_enqueue_result(
+    peer: &PeerState,
     sender: &SessionSender,
     result: Result<super::connection::SessionSendOutcome, SessionTrySendError>,
 ) {
     match result {
         Ok(outcome) => {
+            if !outcome.dropped_expired() {
+                record_quic_datagram_evidence(
+                    peer,
+                    sender,
+                    DatagramPathEvidenceEvent::EnqueueAccepted,
+                );
+            }
             for _ in 0..outcome.evicted_items() {
                 sender.record_quic_datagram_drop();
                 super::metrics::record_quic_datagram_drop(
                     super::metrics::QuicDatagramDropReason::AppQueueEvicted,
                 );
+                record_quic_datagram_evidence(peer, sender, DatagramPathEvidenceEvent::Pressure);
             }
         }
         Err(SessionTrySendError::TooLarge) => {
+            record_quic_datagram_evidence(peer, sender, DatagramPathEvidenceEvent::TooLarge);
             sender.record_quic_datagram_drop();
             super::metrics::record_quic_datagram_drop(
                 super::metrics::QuicDatagramDropReason::TooLarge,
             );
         }
-        Err(SessionTrySendError::Closed) | Err(SessionTrySendError::Full) => {}
+        Err(SessionTrySendError::Closed) | Err(SessionTrySendError::Full) => {
+            record_quic_datagram_evidence(peer, sender, DatagramPathEvidenceEvent::EnqueueRejected);
+        }
     }
+}
+
+fn record_quic_datagram_evidence(
+    peer: &PeerState,
+    sender: &SessionSender,
+    event: DatagramPathEvidenceEvent,
+) {
+    let Some(session) = sender.quic_v2_datagram_evidence_session() else {
+        return;
+    };
+    peer.metrics().record_datagram_path_evidence_for_session(
+        DeliveryPath::QuicDatagram,
+        session,
+        event,
+    );
 }
 
 fn quic_datagram_variant_fits(
@@ -5043,6 +5218,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_live_transport_metrics_does_not_mutate_kcp_failaway_state() {
+        let (transport, _receivers) = ConnectionManager::test_with_live_streams(
+            1,
+            2,
+            &[TransportKind::Tcp, TransportKind::Kcp],
+        );
+        let peer = transport.inner.get_peer(2).expect("peer");
+        transport.record_peer_rtt(2, TransportKind::Tcp, Duration::from_millis(40));
+        fill_stream_queue(&peer, TransportKind::Kcp, 64 * 1024);
+        age_zero_wire_metric(&peer, TransportKind::Kcp, Duration::from_millis(275));
+        let exclusions_before = peer.transport_health_exclusion_status();
+
+        let (selected, _) = transport
+            .selected_live_transport_metrics(
+                2,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            )
+            .expect("healthy TCP observation");
+
+        assert_eq!(selected, TransportKind::Tcp);
+        assert!(!peer.kcp_best_effort_recovery_pending());
+        assert_eq!(peer.transport_health_exclusion_status(), exclusions_before);
+
+        assert_eq!(
+            pick_transports(
+                &peer,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+                MessageClass::HighPriority,
+                SendOptions::default(),
+                0,
+                TransportRoutingPolicy::default(),
+            ),
+            vec![TransportKind::Tcp],
+            "the fixture must exercise a real active KCP failaway",
+        );
+        assert!(peer.kcp_best_effort_recovery_pending());
+        assert!(
+            peer.transport_health_exclusion_status()
+                .iter()
+                .any(|entry| {
+                    entry.transport() == TransportKind::Kcp
+                        && entry.reason() == TransportHealthExclusionReason::KcpFailaway
+                })
+        );
+    }
+
+    #[tokio::test]
     async fn global_metrics_snapshot_captures_each_peer_once() {
         let (transport, _receivers) =
             ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
@@ -5620,15 +5844,36 @@ mod tests {
             .record_rtt(TransportKind::Tcp, Duration::from_millis(10));
         peer.metrics()
             .record_rtt(TransportKind::Quic, Duration::from_millis(100));
-        peer.metrics()
-            .record_native_loss_sample(TransportKind::Quic, 100_000, 1_200);
+        let policy = TransportRoutingPolicy::default();
+        let start = Instant::now();
+        for window in 0..policy.best_effort_datagram_suspect_bad_windows() {
+            let event_at = start + Duration::from_secs(u64::from(window) * 2);
+            for _ in 0..policy.udp_family_min_samples() {
+                peer.metrics().record_datagram_path_evidence_at(
+                    DeliveryPath::QuicDatagram,
+                    DatagramPathEvidenceEvent::OutcomeFailure,
+                    event_at,
+                );
+            }
+            let now = event_at + Duration::from_millis(1_100);
+            let snapshot = peer.metrics().snapshot_per_transport();
+            let observed = observe_best_effort_datagram_path_health(
+                &peer,
+                DeliveryPath::QuicDatagram,
+                &snapshot,
+                policy,
+                now,
+            );
+            let expected = if window + 1 >= policy.best_effort_datagram_suspect_bad_windows() {
+                DatagramPathHealthState::Suspect
+            } else {
+                DatagramPathHealthState::Probing
+            };
+            let health = peer.datagram_path_health_status(Duration::from_secs(10));
+            assert_eq!(observed, expected, "window {window}, health={health:?}");
+        }
 
-        try_dispatch_envelope(
-            &peer,
-            expiring_voice(b"shadow-suspect"),
-            TransportRoutingPolicy::default(),
-        )
-        .unwrap();
+        try_dispatch_envelope(&peer, expiring_voice(b"shadow-suspect"), policy).unwrap();
 
         assert_eq!(
             quic_datagram.recv().await.unwrap().payload(),
@@ -5638,6 +5883,27 @@ mod tests {
         assert_eq!(
             peer.datagram_path_health_status(Duration::from_secs(10))[0].state(),
             DatagramPathHealthState::Suspect
+        );
+    }
+
+    #[test]
+    fn quic_datagram_shadow_observer_ignores_aggregate_quic_stream_loss() {
+        let (peer, _receivers) = peer_with_live_transports(&[]);
+        let policy = TransportRoutingPolicy::default();
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics()
+                .record_native_loss_sample(TransportKind::Quic, 1_000_000, 1_200);
+        }
+        let snapshot = peer.metrics().snapshot_per_transport();
+        assert_eq!(
+            observe_best_effort_datagram_path_health(
+                &peer,
+                DeliveryPath::QuicDatagram,
+                &snapshot,
+                policy,
+                Instant::now(),
+            ),
+            DatagramPathHealthState::Probing
         );
     }
 

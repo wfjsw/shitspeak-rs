@@ -826,7 +826,14 @@ mod tests {
     #[test]
     fn default_quality_batch_preserves_alignment_and_scalar_fallback_behavior() {
         let quality_two =
-            VoiceRouteQuality::new(2, shitspeak_s2s_transport::TransportKind::Tcp, 10, 20, 30);
+            VoiceRouteQuality::new(2, shitspeak_s2s_transport::TransportKind::Tcp, 10, 20, 30)
+                .with_alternate_route_quality(
+                    3,
+                    40,
+                    shitspeak_s2s_transport::TransportKind::Udp,
+                    50,
+                    60,
+                );
         let quality_four =
             VoiceRouteQuality::new(4, shitspeak_s2s_transport::TransportKind::Udp, 40, 50, 60);
         let transport = ScalarOnlyVoiceTransport {
@@ -844,6 +851,14 @@ mod tests {
             ],
         );
         assert_eq!(*transport.quality_calls.lock().unwrap(), vec![2, 3, 2, 4]);
+        assert_eq!(quality_two.alternate_next_hop(), Some(3));
+        assert_eq!(quality_two.alternate_path_latency_us(), Some(40));
+        assert_eq!(
+            quality_two.alternate_transport(),
+            Some(shitspeak_s2s_transport::TransportKind::Udp)
+        );
+        assert_eq!(quality_two.alternate_loss_ppm(), Some(50));
+        assert_eq!(quality_two.alternate_jitter_us(), Some(60));
     }
 
     #[test]

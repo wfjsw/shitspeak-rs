@@ -2,7 +2,7 @@
 //! a sliding bandwidth meter. Aggregated per `(node, ServiceLevel)` so callers
 //! can score path quality among co-existing transports.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -111,6 +111,7 @@ const TRANSPORT_IO_BATCH_SIZE_BUCKETS: [(&str, u64); 8] = [
     ("33_64", 64),
     ("65_plus", u64::MAX),
 ];
+const DATAGRAM_PATH_EVIDENCE_WINDOW: Duration = Duration::from_secs(1);
 
 static TRANSPORT_IO: LazyLock<StdMutex<TransportIoMetrics>> =
     LazyLock::new(|| StdMutex::new(TransportIoMetrics::default()));
@@ -175,6 +176,7 @@ pub enum DatagramPathHealthReason {
     MeasuredLoss,
     ProbeFailures,
     AddressFailures,
+    LaneOutcomeFailures,
     HardLoss,
     Recovered,
 }
@@ -187,6 +189,7 @@ impl DatagramPathHealthReason {
             Self::MeasuredLoss => "measured_loss",
             Self::ProbeFailures => "probe_failures",
             Self::AddressFailures => "address_failures",
+            Self::LaneOutcomeFailures => "lane_outcome_failures",
             Self::HardLoss => "hard_loss",
             Self::Recovered => "recovered",
         }
@@ -200,10 +203,27 @@ pub struct DatagramPathHealthSnapshot {
     state: DatagramPathHealthState,
     reason: DatagramPathHealthReason,
     effective_loss_ppm: Option<u32>,
+    path_health_score_ppm: Option<u32>,
     loss_samples: u64,
     transitions: u64,
     state_age: Duration,
     observation_age: Duration,
+    scored_generation: Option<u64>,
+    diagnostic_generation: Option<u64>,
+    diagnostic_observation_age: Option<Duration>,
+    sample_confidence_ppm: u32,
+    enqueue_accepted: u64,
+    enqueue_rejected: u64,
+    too_large: u64,
+    pressure: u64,
+    outcome_successes: u64,
+    outcome_failures: u64,
+    ingress_validated: u64,
+    ingress_rejected: u64,
+    ingress_read_failures: u64,
+    consecutive_bad_windows: u32,
+    recovery_healthy_age: Duration,
+    recovery_required: bool,
 }
 
 impl DatagramPathHealthSnapshot {
@@ -214,10 +234,27 @@ impl DatagramPathHealthSnapshot {
         state: DatagramPathHealthState,
         reason: DatagramPathHealthReason,
         effective_loss_ppm: Option<u32>,
+        path_health_score_ppm: Option<u32>,
         loss_samples: u64,
         transitions: u64,
         state_age: Duration,
         observation_age: Duration,
+        scored_generation: Option<u64>,
+        diagnostic_generation: Option<u64>,
+        diagnostic_observation_age: Option<Duration>,
+        sample_confidence_ppm: u32,
+        enqueue_accepted: u64,
+        enqueue_rejected: u64,
+        too_large: u64,
+        pressure: u64,
+        outcome_successes: u64,
+        outcome_failures: u64,
+        ingress_validated: u64,
+        ingress_rejected: u64,
+        ingress_read_failures: u64,
+        consecutive_bad_windows: u32,
+        recovery_healthy_age: Duration,
+        recovery_required: bool,
     ) -> Self {
         Self {
             peer,
@@ -225,10 +262,27 @@ impl DatagramPathHealthSnapshot {
             state,
             reason,
             effective_loss_ppm,
+            path_health_score_ppm,
             loss_samples,
             transitions,
             state_age,
             observation_age,
+            scored_generation,
+            diagnostic_generation,
+            diagnostic_observation_age,
+            sample_confidence_ppm,
+            enqueue_accepted,
+            enqueue_rejected,
+            too_large,
+            pressure,
+            outcome_successes,
+            outcome_failures,
+            ingress_validated,
+            ingress_rejected,
+            ingress_read_failures,
+            consecutive_bad_windows,
+            recovery_healthy_age,
+            recovery_required,
         }
     }
 
@@ -247,6 +301,9 @@ impl DatagramPathHealthSnapshot {
     pub fn effective_loss_ppm(self) -> Option<u32> {
         self.effective_loss_ppm
     }
+    pub fn path_health_score_ppm(self) -> Option<u32> {
+        self.path_health_score_ppm
+    }
     pub fn loss_samples(self) -> u64 {
         self.loss_samples
     }
@@ -258,6 +315,179 @@ impl DatagramPathHealthSnapshot {
     }
     pub fn observation_age(self) -> Duration {
         self.observation_age
+    }
+    pub fn scored_generation(self) -> Option<u64> {
+        self.scored_generation
+    }
+    pub fn diagnostic_generation(self) -> Option<u64> {
+        self.diagnostic_generation
+    }
+    pub fn diagnostic_observation_age(self) -> Option<Duration> {
+        self.diagnostic_observation_age
+    }
+    pub fn sample_confidence_ppm(self) -> u32 {
+        self.sample_confidence_ppm
+    }
+    pub fn enqueue_accepted(self) -> u64 {
+        self.enqueue_accepted
+    }
+    pub fn enqueue_rejected(self) -> u64 {
+        self.enqueue_rejected
+    }
+    pub fn too_large(self) -> u64 {
+        self.too_large
+    }
+    pub fn pressure(self) -> u64 {
+        self.pressure
+    }
+    pub fn outcome_successes(self) -> u64 {
+        self.outcome_successes
+    }
+    pub fn outcome_failures(self) -> u64 {
+        self.outcome_failures
+    }
+    pub fn ingress_validated(self) -> u64 {
+        self.ingress_validated
+    }
+    pub fn ingress_rejected(self) -> u64 {
+        self.ingress_rejected
+    }
+    pub fn ingress_read_failures(self) -> u64 {
+        self.ingress_read_failures
+    }
+    pub fn consecutive_bad_windows(self) -> u32 {
+        self.consecutive_bad_windows
+    }
+    pub fn recovery_healthy_age(self) -> Duration {
+        self.recovery_healthy_age
+    }
+    pub fn recovery_required(self) -> bool {
+        self.recovery_required
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatagramPathEvidenceEvent {
+    EnqueueAccepted,
+    EnqueueRejected,
+    TooLarge,
+    Pressure,
+    OutcomeSuccess,
+    OutcomeFailure,
+    IngressValidated,
+    IngressRejected,
+    IngressReadFailure,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DatagramPathEvidenceSnapshot {
+    generation: u64,
+    enqueue_accepted: u64,
+    enqueue_rejected: u64,
+    too_large: u64,
+    pressure: u64,
+    outcome_successes: u64,
+    outcome_failures: u64,
+    ingress_validated: u64,
+    ingress_rejected: u64,
+    ingress_read_failures: u64,
+    completed_at: Option<Instant>,
+}
+
+impl DatagramPathEvidenceSnapshot {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        generation: u64,
+        outcome_successes: u64,
+        outcome_failures: u64,
+        completed_at: Instant,
+    ) -> Self {
+        Self {
+            generation,
+            outcome_successes,
+            outcome_failures,
+            completed_at: Some(completed_at),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostic_for_test(
+        generation: u64,
+        too_large: u64,
+        pressure: u64,
+        ingress_validated: u64,
+        completed_at: Instant,
+    ) -> Self {
+        Self {
+            generation,
+            too_large,
+            pressure,
+            ingress_validated,
+            completed_at: Some(completed_at),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+    pub(crate) fn samples(self) -> u64 {
+        self.enqueue_accepted
+            .saturating_add(self.enqueue_rejected)
+            .max(self.outcome_successes.saturating_add(self.outcome_failures))
+    }
+    pub(crate) fn failure_ppm(self) -> u32 {
+        let enqueue_ppm = loss_ppm(
+            self.enqueue_rejected,
+            self.enqueue_accepted.saturating_add(self.enqueue_rejected),
+        );
+        let outcome_ppm = loss_ppm(
+            self.outcome_failures,
+            self.outcome_successes.saturating_add(self.outcome_failures),
+        );
+        enqueue_ppm.max(outcome_ppm)
+    }
+    pub(crate) fn health_score_ppm(self) -> u32 {
+        self.failure_ppm()
+    }
+    pub(crate) fn enqueue_accepted(self) -> u64 {
+        self.enqueue_accepted
+    }
+    pub(crate) fn enqueue_rejected(self) -> u64 {
+        self.enqueue_rejected
+    }
+    pub(crate) fn too_large(self) -> u64 {
+        self.too_large
+    }
+    pub(crate) fn pressure(self) -> u64 {
+        self.pressure
+    }
+    pub(crate) fn outcome_successes(self) -> u64 {
+        self.outcome_successes
+    }
+    pub(crate) fn outcome_failures(self) -> u64 {
+        self.outcome_failures
+    }
+    pub(crate) fn ingress_validated(self) -> u64 {
+        self.ingress_validated
+    }
+    pub(crate) fn ingress_rejected(self) -> u64 {
+        self.ingress_rejected
+    }
+    pub(crate) fn ingress_read_failures(self) -> u64 {
+        self.ingress_read_failures
+    }
+    pub(crate) fn completed_at(self) -> Option<Instant> {
+        self.completed_at
+    }
+
+    pub(crate) fn has_diagnostics(self) -> bool {
+        self.too_large > 0
+            || self.pressure > 0
+            || self.ingress_validated > 0
+            || self.ingress_rejected > 0
+            || self.ingress_read_failures > 0
     }
 }
 
@@ -2150,10 +2380,128 @@ fn update_loss_ewma(ewma_ppm: &mut f64, samples: &mut u64, sample_ppm: u32, alph
     *samples = (*samples).saturating_add(1);
 }
 
+#[derive(Debug)]
+struct DatagramPathEvidenceInner {
+    window_start: Instant,
+    window: Duration,
+    generation: u64,
+    session_epoch: u64,
+    current: DatagramPathEvidenceSnapshot,
+    completed: VecDeque<DatagramPathEvidenceSnapshot>,
+    last_event_at: Option<Instant>,
+}
+
+impl DatagramPathEvidenceInner {
+    fn new(window: Duration) -> Self {
+        Self {
+            window_start: Instant::now(),
+            window,
+            generation: 0,
+            session_epoch: 0,
+            current: DatagramPathEvidenceSnapshot::default(),
+            completed: VecDeque::new(),
+            last_event_at: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn record(&mut self, event: DatagramPathEvidenceEvent, now: Instant) {
+        if self.session_epoch == 0 {
+            self.reset_session(now);
+        }
+        self.record_for_session(self.session_epoch, event, now);
+    }
+
+    fn record_for_session(
+        &mut self,
+        session_epoch: u64,
+        event: DatagramPathEvidenceEvent,
+        now: Instant,
+    ) {
+        if session_epoch == 0 || session_epoch != self.session_epoch {
+            return;
+        }
+        self.roll_at(now);
+        self.last_event_at = Some(now);
+        match event {
+            DatagramPathEvidenceEvent::EnqueueAccepted => {
+                self.current.enqueue_accepted = self.current.enqueue_accepted.saturating_add(1);
+            }
+            DatagramPathEvidenceEvent::EnqueueRejected => {
+                self.current.enqueue_rejected = self.current.enqueue_rejected.saturating_add(1);
+            }
+            DatagramPathEvidenceEvent::TooLarge => {
+                self.current.too_large = self.current.too_large.saturating_add(1);
+            }
+            DatagramPathEvidenceEvent::Pressure => {
+                self.current.pressure = self.current.pressure.saturating_add(1);
+            }
+            DatagramPathEvidenceEvent::OutcomeSuccess => {
+                self.current.outcome_successes = self.current.outcome_successes.saturating_add(1);
+            }
+            DatagramPathEvidenceEvent::OutcomeFailure => {
+                self.current.outcome_failures = self.current.outcome_failures.saturating_add(1);
+            }
+            DatagramPathEvidenceEvent::IngressValidated => {
+                self.current.ingress_validated = self.current.ingress_validated.saturating_add(1);
+            }
+            DatagramPathEvidenceEvent::IngressRejected => {
+                self.current.ingress_rejected = self.current.ingress_rejected.saturating_add(1);
+            }
+            DatagramPathEvidenceEvent::IngressReadFailure => {
+                self.current.ingress_read_failures =
+                    self.current.ingress_read_failures.saturating_add(1);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot_at(&mut self, now: Instant) -> Option<DatagramPathEvidenceSnapshot> {
+        self.roll_at(now);
+        self.completed.back().copied()
+    }
+
+    fn snapshots_at(&mut self, now: Instant) -> Vec<DatagramPathEvidenceSnapshot> {
+        const MAX_COMPLETED_WINDOWS: usize = 64;
+        self.roll_at(now);
+        while self.completed.len() > MAX_COMPLETED_WINDOWS {
+            self.completed.pop_front();
+        }
+        self.completed.iter().copied().collect()
+    }
+
+    fn reset_session(&mut self, now: Instant) -> u64 {
+        self.session_epoch = self.session_epoch.saturating_add(1).max(1);
+        self.generation = self.generation.saturating_add(1);
+        self.window_start = now;
+        self.current = DatagramPathEvidenceSnapshot::default();
+        self.completed.clear();
+        self.last_event_at = None;
+        self.session_epoch
+    }
+
+    fn roll_at(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.window_start) < self.window {
+            return;
+        }
+        let has_observations = self.current.samples() > 0 || self.current.has_diagnostics();
+        if has_observations {
+            self.generation = self.generation.saturating_add(1);
+            self.current.generation = self.generation;
+            self.current.completed_at = self.last_event_at;
+            self.completed.push_back(self.current);
+            self.current = DatagramPathEvidenceSnapshot::default();
+            self.last_event_at = None;
+        }
+        self.window_start = now;
+    }
+}
+
 /// Per-`(transport, service-level)` metrics for a single peer.
 #[derive(Debug)]
 pub struct PeerMetrics {
     inner: Mutex<HashMap<TransportKind, LinkInner>>,
+    datagram_evidence: Mutex<HashMap<DeliveryPath, DatagramPathEvidenceInner>>,
     window: Duration,
     tuning: MetricsTuning,
     #[cfg(test)]
@@ -2164,11 +2512,64 @@ impl PeerMetrics {
     pub fn new(window: Duration, tuning: MetricsTuning) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            datagram_evidence: Mutex::new(HashMap::new()),
             window,
             tuning,
             #[cfg(test)]
             snapshot_count: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn record_datagram_path_evidence_for_session(
+        &self,
+        path: DeliveryPath,
+        session_epoch: u64,
+        event: DatagramPathEvidenceEvent,
+    ) {
+        debug_assert!(path.is_datagram());
+        self.datagram_evidence
+            .lock()
+            .entry(path)
+            .or_insert_with(|| DatagramPathEvidenceInner::new(DATAGRAM_PATH_EVIDENCE_WINDOW))
+            .record_for_session(session_epoch, event, Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_datagram_path_evidence_at(
+        &self,
+        path: DeliveryPath,
+        event: DatagramPathEvidenceEvent,
+        now: Instant,
+    ) {
+        let mut evidence = self.datagram_evidence.lock();
+        let evidence = evidence
+            .entry(path)
+            .or_insert_with(|| DatagramPathEvidenceInner::new(DATAGRAM_PATH_EVIDENCE_WINDOW));
+        if evidence.session_epoch == 0 {
+            evidence.reset_session(now);
+        }
+        evidence.record_for_session(evidence.session_epoch, event, now);
+    }
+
+    pub(crate) fn datagram_path_evidence_snapshots_at(
+        &self,
+        path: DeliveryPath,
+        now: Instant,
+    ) -> Vec<DatagramPathEvidenceSnapshot> {
+        self.datagram_evidence
+            .lock()
+            .get_mut(&path)
+            .map(|evidence| evidence.snapshots_at(now))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn reset_datagram_path_evidence(&self, path: DeliveryPath) -> u64 {
+        let now = Instant::now();
+        let mut evidence = self.datagram_evidence.lock();
+        evidence
+            .entry(path)
+            .or_insert_with(|| DatagramPathEvidenceInner::new(DATAGRAM_PATH_EVIDENCE_WINDOW))
+            .reset_session(now)
     }
 
     pub fn record_rtt(&self, transport: TransportKind, rtt: Duration) {
@@ -3104,6 +3505,138 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn datagram_evidence_keeps_enqueue_and_writer_denominators_separate() {
+        let now = Instant::now();
+        let mut evidence = DatagramPathEvidenceInner::new(Duration::from_secs(1));
+        for _ in 0..9 {
+            evidence.record(DatagramPathEvidenceEvent::EnqueueAccepted, now);
+        }
+        evidence.record(DatagramPathEvidenceEvent::EnqueueRejected, now);
+        for _ in 0..99 {
+            evidence.record(DatagramPathEvidenceEvent::OutcomeSuccess, now);
+        }
+        evidence.record(DatagramPathEvidenceEvent::OutcomeFailure, now);
+
+        let snapshot = evidence.snapshot_at(now + Duration::from_secs(2)).unwrap();
+        assert_eq!(snapshot.failure_ppm(), 100_000);
+        assert_eq!(snapshot.samples(), 100);
+    }
+
+    #[test]
+    fn pressure_too_large_and_ingress_are_diagnostic_only() {
+        let now = Instant::now();
+        let mut evidence = DatagramPathEvidenceInner::new(Duration::from_secs(1));
+        evidence.record(DatagramPathEvidenceEvent::EnqueueAccepted, now);
+        evidence.record(DatagramPathEvidenceEvent::OutcomeSuccess, now);
+        evidence.record(DatagramPathEvidenceEvent::Pressure, now);
+        evidence.record(DatagramPathEvidenceEvent::TooLarge, now);
+        evidence.record(DatagramPathEvidenceEvent::IngressValidated, now);
+        evidence.record(DatagramPathEvidenceEvent::IngressRejected, now);
+
+        let snapshot = evidence.snapshot_at(now + Duration::from_secs(2)).unwrap();
+        assert_eq!(snapshot.health_score_ppm(), 0);
+        assert_eq!(snapshot.samples(), 1);
+        assert_eq!(snapshot.pressure(), 1);
+        assert_eq!(snapshot.too_large(), 1);
+        assert_eq!(snapshot.ingress_validated(), 1);
+        assert_eq!(snapshot.ingress_rejected(), 1);
+    }
+
+    #[test]
+    fn datagram_evidence_snapshot_reads_do_not_refresh_completion_time() {
+        let now = Instant::now();
+        let mut evidence = DatagramPathEvidenceInner::new(Duration::from_secs(1));
+        evidence.record(DatagramPathEvidenceEvent::OutcomeSuccess, now);
+        let first = evidence.snapshot_at(now + Duration::from_secs(2)).unwrap();
+        let second = evidence.snapshot_at(now + Duration::from_secs(30)).unwrap();
+
+        assert_eq!(first.generation(), second.generation());
+        assert_eq!(first.completed_at(), Some(now));
+        assert_eq!(second.completed_at(), Some(now));
+    }
+
+    #[test]
+    fn datagram_evidence_session_reset_isolated_and_generation_is_monotonic() {
+        let start = Instant::now();
+        let mut evidence = DatagramPathEvidenceInner::new(Duration::from_secs(1));
+        let old_session = evidence.reset_session(start);
+        evidence.record_for_session(
+            old_session,
+            DatagramPathEvidenceEvent::OutcomeFailure,
+            start,
+        );
+        let old = evidence
+            .snapshot_at(start + Duration::from_secs(2))
+            .unwrap();
+        let new_session = evidence.reset_session(start + Duration::from_secs(3));
+        assert!(
+            evidence
+                .snapshot_at(start + Duration::from_secs(3))
+                .is_none()
+        );
+        // A queued outcome from the old live task must not enter the new
+        // session's current window.
+        evidence.record_for_session(
+            old_session,
+            DatagramPathEvidenceEvent::OutcomeFailure,
+            start + Duration::from_secs(3),
+        );
+        evidence.record_for_session(
+            new_session,
+            DatagramPathEvidenceEvent::OutcomeSuccess,
+            start + Duration::from_secs(3),
+        );
+        let new = evidence
+            .snapshot_at(start + Duration::from_secs(5))
+            .unwrap();
+        assert!(new.generation() > old.generation());
+        assert_eq!(new.outcome_successes(), 1);
+        assert_eq!(new.outcome_failures(), 0);
+    }
+
+    #[test]
+    fn datagram_evidence_is_isolated_by_peer_and_delivery_path() {
+        let first = PeerMetrics::new(Duration::ZERO, MetricsTuning::default());
+        let second = PeerMetrics::new(Duration::ZERO, MetricsTuning::default());
+        let start = Instant::now();
+        first.record_datagram_path_evidence_at(
+            DeliveryPath::QuicDatagram,
+            DatagramPathEvidenceEvent::OutcomeFailure,
+            start,
+        );
+        first.record_datagram_path_evidence_at(
+            DeliveryPath::UdpDatagram,
+            DatagramPathEvidenceEvent::OutcomeSuccess,
+            start,
+        );
+        // Each per-path evidence window is created lazily during the record
+        // call, just after `start`, so advance beyond one full window.
+        let now = start + DATAGRAM_PATH_EVIDENCE_WINDOW.saturating_mul(2);
+
+        assert_eq!(
+            first
+                .datagram_path_evidence_snapshots_at(DeliveryPath::QuicDatagram, now)
+                .last()
+                .unwrap()
+                .outcome_failures(),
+            1
+        );
+        assert_eq!(
+            first
+                .datagram_path_evidence_snapshots_at(DeliveryPath::UdpDatagram, now)
+                .last()
+                .unwrap()
+                .outcome_successes(),
+            1
+        );
+        assert!(
+            second
+                .datagram_path_evidence_snapshots_at(DeliveryPath::QuicDatagram, now)
+                .is_empty()
+        );
+    }
 
     #[test]
     fn delivery_path_selection_metrics_keep_quic_datagram_and_stream_distinct() {

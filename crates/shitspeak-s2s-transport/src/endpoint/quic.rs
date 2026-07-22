@@ -26,13 +26,13 @@ use super::super::frame::{FrameType, build_frame, encode_frame_to_bytes};
 use super::super::identity::parse_peer_cn;
 use super::super::manager::ManagerInner;
 use super::super::metrics::{
-    QuicDatagramDropReason, QuicDeliveryLane, QuicProtocolErrorReason, QuicProtocolResult,
-    QuicProtocolStage, QuicProtocolVersion as MetricQuicProtocolVersion, TransportIoDirection,
-    record_quic_datagram_drop, record_quic_lane_delivery, record_quic_protocol_error,
-    record_quic_protocol_event,
+    DatagramPathEvidenceEvent, QuicDatagramDropReason, QuicDeliveryLane, QuicProtocolErrorReason,
+    QuicProtocolResult, QuicProtocolStage, QuicProtocolVersion as MetricQuicProtocolVersion,
+    TransportIoDirection, record_quic_datagram_drop, record_quic_lane_delivery,
+    record_quic_protocol_error, record_quic_protocol_event,
 };
 use super::super::native_stats;
-use super::super::service_level::{MessageClass, ServiceLevel, TransportKind};
+use super::super::service_level::{DeliveryPath, MessageClass, ServiceLevel, TransportKind};
 use super::super::stream_io::{
     StreamLanePolicy, StreamPumpConfig, spawn_stream_lane_pump, stream_handoff_lane_bytes,
 };
@@ -800,6 +800,11 @@ async fn install_quic_v2_session(
         conn.close(QUIC_CLOSE_LOCAL_SHUTDOWN.into(), b"duplicate session");
         return Ok(());
     }
+    let datagram_evidence_session = peer
+        .metrics()
+        .reset_datagram_path_evidence(DeliveryPath::QuicDatagram);
+    sender.set_datagram_evidence_session(datagram_evidence_session);
+    peer.reset_datagram_path_health(DeliveryPath::QuicDatagram);
 
     let close_code = Arc::new(AtomicU32::new(QUIC_CLOSE_REQUIRED_LANE_FAILED));
     let cfg = StreamPumpConfig::new(
@@ -932,6 +937,11 @@ async fn run_quic_datagram_sender(
             out.payload().clone(),
         );
         if frame.encoded_len() > inner.cfg().max_frame_bytes() {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::TooLarge,
+            );
             record_session_datagram_drop(&session_sender, QuicDatagramDropReason::TooLarge);
             continue;
         }
@@ -958,16 +968,31 @@ async fn run_quic_datagram_sender(
             continue;
         }
         if encoded.len() > inner.cfg().max_frame_bytes() {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::TooLarge,
+            );
             record_session_datagram_drop(&session_sender, QuicDatagramDropReason::TooLarge);
             continue;
         }
         let max_datagram_size = conn.max_datagram_size().unwrap_or(0);
         session_sender.set_max_datagram_size(max_datagram_size);
         if encoded.len() > max_datagram_size {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::TooLarge,
+            );
             record_session_datagram_drop(&session_sender, QuicDatagramDropReason::TooLarge);
             continue;
         }
         if conn.datagram_send_buffer_space() < encoded.len() {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::Pressure,
+            );
             record_session_datagram_drop(
                 &session_sender,
                 QuicDatagramDropReason::QuinnBufferPressure,
@@ -979,6 +1004,11 @@ async fn run_quic_datagram_sender(
         }
         match conn.send_datagram(encoded.clone()) {
             Ok(()) => {
+                record_session_datagram_evidence(
+                    &peer,
+                    &session_sender,
+                    DatagramPathEvidenceEvent::OutcomeSuccess,
+                );
                 session_sender.record_datagram_queued();
                 peer.metrics()
                     .record_payload_sent(TransportKind::Quic, original_payload_len);
@@ -997,9 +1027,19 @@ async fn run_quic_datagram_sender(
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             Err(quinn::SendDatagramError::TooLarge) => {
+                record_session_datagram_evidence(
+                    &peer,
+                    &session_sender,
+                    DatagramPathEvidenceEvent::TooLarge,
+                );
                 record_session_datagram_drop(&session_sender, QuicDatagramDropReason::TooLarge);
             }
             Err(quinn::SendDatagramError::UnsupportedByPeer) => {
+                record_session_datagram_evidence(
+                    &peer,
+                    &session_sender,
+                    DatagramPathEvidenceEvent::OutcomeFailure,
+                );
                 record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Unsupported);
                 peer.metrics()
                     .record_data_health_failure(TransportKind::Quic);
@@ -1007,6 +1047,11 @@ async fn run_quic_datagram_sender(
                 return;
             }
             Err(quinn::SendDatagramError::Disabled) => {
+                record_session_datagram_evidence(
+                    &peer,
+                    &session_sender,
+                    DatagramPathEvidenceEvent::OutcomeFailure,
+                );
                 record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Disabled);
                 peer.metrics()
                     .record_data_health_failure(TransportKind::Quic);
@@ -1014,6 +1059,11 @@ async fn run_quic_datagram_sender(
                 return;
             }
             Err(quinn::SendDatagramError::ConnectionLost(_)) => {
+                record_session_datagram_evidence(
+                    &peer,
+                    &session_sender,
+                    DatagramPathEvidenceEvent::OutcomeFailure,
+                );
                 record_session_datagram_drop(
                     &session_sender,
                     QuicDatagramDropReason::ConnectionLost,
@@ -1038,18 +1088,38 @@ async fn run_quic_datagram_receiver(
             result = conn.read_datagram() => match result {
                 Ok(encoded) => encoded,
                 Err(_) => {
+                    record_session_datagram_evidence(
+                        &peer,
+                        &session_sender,
+                        DatagramPathEvidenceEvent::IngressReadFailure,
+                    );
                     closed.cancel();
                     return;
                 }
             },
         };
         if encoded.len() > inner.cfg().max_frame_bytes() {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::TooLarge,
+            );
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::IngressRejected,
+            );
             record_session_datagram_drop(&session_sender, QuicDatagramDropReason::TooLarge);
             continue;
         }
         let mut frame = match super::super::s2s_transport_proto::Frame::decode(encoded.as_ref()) {
             Ok(frame) => frame,
             Err(_) => {
+                record_session_datagram_evidence(
+                    &peer,
+                    &session_sender,
+                    DatagramPathEvidenceEvent::IngressRejected,
+                );
                 record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Decode);
                 continue;
             }
@@ -1064,25 +1134,50 @@ async fn run_quic_datagram_receiver(
             .ok()
             .map(MessageClass::from);
         if !valid_type {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::IngressRejected,
+            );
             record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Validation);
             continue;
         }
         if class.is_none() {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::IngressRejected,
+            );
             record_quic_protocol_error(QuicProtocolErrorReason::ClassMismatch);
             record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Validation);
             continue;
         }
         if !valid_level {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::IngressRejected,
+            );
             record_quic_protocol_error(QuicProtocolErrorReason::ServiceMismatch);
             record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Validation);
             continue;
         }
         if !valid_source {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::IngressRejected,
+            );
             record_quic_protocol_error(QuicProtocolErrorReason::SourceMismatch);
             record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Validation);
             continue;
         }
         if !valid_destination {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::IngressRejected,
+            );
             record_quic_protocol_error(QuicProtocolErrorReason::DestinationMismatch);
             record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Validation);
             continue;
@@ -1094,14 +1189,34 @@ async fn run_quic_datagram_receiver(
         )
         .is_err()
         {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::IngressRejected,
+            );
             record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Validation);
             continue;
         }
         if frame.encoded_len() > inner.cfg().max_frame_bytes() {
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::TooLarge,
+            );
+            record_session_datagram_evidence(
+                &peer,
+                &session_sender,
+                DatagramPathEvidenceEvent::IngressRejected,
+            );
             record_session_datagram_drop(&session_sender, QuicDatagramDropReason::TooLarge);
             continue;
         }
         let class = class.expect("validated above");
+        record_session_datagram_evidence(
+            &peer,
+            &session_sender,
+            DatagramPathEvidenceEvent::IngressValidated,
+        );
         session_sender.record_datagram_received();
         peer.metrics()
             .record_payload_recv(TransportKind::Quic, frame.payload.len());
@@ -1132,6 +1247,18 @@ fn record_session_datagram_drop(
 ) {
     session_sender.record_datagram_drop();
     record_quic_datagram_drop(reason);
+}
+
+fn record_session_datagram_evidence(
+    peer: &PeerState,
+    session_sender: &QuicV2SessionSender,
+    event: DatagramPathEvidenceEvent,
+) {
+    peer.metrics().record_datagram_path_evidence_for_session(
+        DeliveryPath::QuicDatagram,
+        session_sender.datagram_evidence_session(),
+        event,
+    );
 }
 
 fn quic_now_us() -> u64 {

@@ -146,13 +146,25 @@ Selection telemetry preserves this logical distinction:
 QUIC RTT, loss, and health remain shared under `TransportKind::Quic`; the path
 label describes delivery semantics, not a separate network link.
 
-BestEffort datagram health also runs as a shadow-only hysteretic observer. Its
-configured thresholds apply to the weighted effective-loss score rather than
-raw packet loss, and its `suspect` state does not affect selection. Status JSON
-and the bounded `shitspeak_s2s_datagram_path_*` Prometheus metrics expose the
-state, reason, score, samples, transitions, state age, and observation age.
-QUIC DATAGRAM uses aggregate physical-QUIC evidence until lane-native loss is
-available.
+BestEffort datagram health also runs as a shadow-only hysteretic observer, and
+its `suspect` state does not affect selection. Raw UDP uses weighted effective
+loss. QUIC DATAGRAM instead uses peer/path-local app-queue rejection and writer
+failure. Quinn buffer pressure, too-large events, and ingress validation remain
+separate diagnostic counters. No DATAGRAM ACK, on-time delivery, or end-to-end
+packet-loss signal exists. Aggregate QUIC stream RTT/loss does not drive this
+local score, and the observer does not affect routing or KCP behavior.
+
+QUIC DATAGRAM uses fixed one-second evidence windows with bounded 64-window
+replay. It requires two or three distinct completed bad windows (three by
+default) before entering `suspect`, and new completed healthy windows spanning
+10--30 seconds before recovery. Re-reading one window cannot advance either
+gate. Stale evidence returns the observer to `probing` without clearing the
+recovery latch; replacing the session starts a tokenized evidence generation,
+and late outcomes from the replaced session are ignored. Status keeps the last
+scored generation separate from newer diagnostic-only generations. JSON and
+bounded `shitspeak_s2s_datagram_path_*` Prometheus gauges expose state, reason,
+score, confidence, window counters, pending temporal progress, transitions,
+and freshness.
 
 UDP-family health and viability gates still apply. Unhealthy or unusable
 datagram candidates are excluded, and the QUIC DATAGRAM path is excluded from
@@ -197,6 +209,56 @@ both buffers nonzero for operational v2 sessions. A peer that supports only
 `s2s/1` can still negotiate the legacy protocol normally.
 
 When `s2s.persistence_dir` is configured, the latest learned adaptive compression dictionary is cached below that directory and renegotiated with peers after restart.
+
+## Voice Repair Allocation
+
+Voice repair uses one conserved global currency: each encoded original byte
+mints one quarter-byte of repair credit only after the aggregate primary send is
+accepted. A failed primary send mints nothing. Proactive copies, NACK responses,
+tail attempts, and their retries all pay their encoded payload size from that
+ledger. The proactive/reactive entitlements, protected reactive reserve, and
+borrowing rules partition this credit; none of them creates a second mint.
+
+Proactive first copies receive a small deterministic destination-fair phase.
+Shared overflow then ranks candidates by marginal utility per byte, combining
+measured alternate loss and on-time probability, terminator value, a
+first-hop/transport diversity proxy, deadline urgency, diminishing returns for
+another copy, and fairness aging. Copy demand remains under the existing
+UDP-only loss/jitter policy; scoring does not generate QUIC-DATAGRAM copies and
+only allocates the conserved budget among candidates that policy generated.
+Continuously waiting overflow gains 3.125% priority per allocator round, capped
+at 1.5 times after 16 rounds, without minting credit. The batch uses pre-send
+route-quality and deadline snapshots plus deterministic tie-breaking, so
+destination iteration order does not decide who receives credit. Diversity and
+on-time arrival remain estimates: a different first hop does not prove
+downstream independence, and no repair delivery ACK is available to this
+allocator.
+
+Reactive permits are scheduled per encoded frame. Each destination is ordered
+by earliest deadline, while deterministic byte-deficit round robin shares
+service across destinations and a per-destination epoch cap defers excess retry
+traffic. Temporary credit exhaustion parks rather than sheds live work, and
+only a delivered permit advances fairness/retry accounting. NACKs carry the
+requester's remaining actionable-gap time as a relative duration; the responder
+bounds it locally and applies it to permit waiting and send attempts. This
+requires no synchronized clock, but it also cannot subtract request-path transit
+time and therefore does not guarantee receiver-side on-time delivery.
+Aggregate scheduler metrics expose queued items/bytes, active destinations,
+oldest wait, maximum starvation rounds, and bounded grant/wait/defer/expiry/
+cancellation/shutdown events without per-request label cardinality.
+
+NACK ranges and tail suffixes advance one frame at a time. The current frame
+from every ready key enters the shared allocator before transport concurrency
+is applied, then a successful frame requeues the next sequence behind other
+ready work. Deferred retries and temporarily unaffordable large frames are
+skipped while eligible fresh or smaller same-destination work is considered.
+Actual transport sends remain bounded and same-destination repair sends remain
+serialized.
+
+Tail repair uses protected reactive credit, primary sender admission, and a
+separate sender pressure lane. It remains proactive-marked at the receiver,
+because no later frame exists to open a reorder gap for a lost terminator. Tail
+is consequently not yet a fully isolated reactive receiver path.
 
 ## Status Page And Metrics
 

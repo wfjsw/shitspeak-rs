@@ -181,6 +181,16 @@ pub struct VoiceRouteQuality {
     path_latency_us: u64,
     loss_ppm: u32,
     jitter_us: u64,
+    alternate: Option<VoiceRouteAlternative>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VoiceRouteAlternative {
+    next_hop: NodeIdentifier,
+    path_latency_us: u64,
+    transport: Option<TransportKind>,
+    loss_ppm: Option<u32>,
+    jitter_us: Option<u64>,
 }
 
 impl VoiceRouteQuality {
@@ -197,7 +207,49 @@ impl VoiceRouteQuality {
             path_latency_us,
             loss_ppm,
             jitter_us,
+            alternate: None,
         }
+    }
+
+    /// Attach a loop-free route whose first hop differs from the selected
+    /// route when that direct peer has no eligible live transport metrics.
+    pub fn with_alternate_route(mut self, next_hop: NodeIdentifier, path_latency_us: u64) -> Self {
+        assert_ne!(
+            next_hop, self.next_hop,
+            "alternate first hop must differ from the primary first hop"
+        );
+        self.alternate = Some(VoiceRouteAlternative {
+            next_hop,
+            path_latency_us,
+            transport: None,
+            loss_ppm: None,
+            jitter_us: None,
+        });
+        self
+    }
+
+    /// Attach a loop-free alternate route and the selected direct-link
+    /// transport quality captured for its first hop.
+    pub fn with_alternate_route_quality(
+        mut self,
+        next_hop: NodeIdentifier,
+        path_latency_us: u64,
+        transport: TransportKind,
+        loss_ppm: u32,
+        jitter_us: u64,
+    ) -> Self {
+        assert_ne!(
+            next_hop, self.next_hop,
+            "alternate first hop must differ from the primary first hop"
+        );
+        self.alternate = Some(VoiceRouteAlternative {
+            next_hop,
+            path_latency_us,
+            transport: Some(transport),
+            loss_ppm: Some(loss_ppm),
+            jitter_us: Some(jitter_us),
+        });
+        self
     }
 
     pub fn next_hop(self) -> NodeIdentifier {
@@ -218,6 +270,30 @@ impl VoiceRouteQuality {
 
     pub fn jitter_us(self) -> u64 {
         self.jitter_us
+    }
+
+    pub fn has_alternate_first_hop(self) -> bool {
+        self.alternate.is_some()
+    }
+
+    pub fn alternate_next_hop(self) -> Option<NodeIdentifier> {
+        self.alternate.map(|alternate| alternate.next_hop)
+    }
+
+    pub fn alternate_path_latency_us(self) -> Option<u64> {
+        self.alternate.map(|alternate| alternate.path_latency_us)
+    }
+
+    pub fn alternate_transport(self) -> Option<TransportKind> {
+        self.alternate.and_then(|alternate| alternate.transport)
+    }
+
+    pub fn alternate_loss_ppm(self) -> Option<u32> {
+        self.alternate.and_then(|alternate| alternate.loss_ppm)
+    }
+
+    pub fn alternate_jitter_us(self) -> Option<u64> {
+        self.alternate.and_then(|alternate| alternate.jitter_us)
     }
 }
 
@@ -2053,38 +2129,27 @@ impl OverlayNetwork {
     }
 
     pub fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
-        let level = ServiceLevel::BestEffort;
-        let routing_metric = RoutingMetric::ConversationalQuality;
-        let entry = self
-            .inner
-            .routing
-            .load()
-            .lookup_with_metric(dst, level, routing_metric)?;
-        let next_hop = entry.next_hop;
-        let (transport, link) =
-            self.selected_voice_transport_metrics(next_hop, level, routing_metric)?;
-        Some(VoiceRouteQuality::new(
-            next_hop,
-            transport,
-            entry.latency_us,
-            link.effective_packet_loss_ppm(),
-            link.jitter_us().max(0.0) as u64,
-        ))
+        self.voice_route_qualities(&[dst])
+            .into_iter()
+            .next()
+            .flatten()
     }
 
-    /// Return destination-aligned voice route qualities while snapshotting a
-    /// direct peer at most once. Multiple routed destinations commonly share
-    /// one next hop, especially for source-rooted voice distribution.
+    /// Return destination-aligned voice route qualities from one immutable
+    /// routing-table snapshot while snapshotting a direct peer at most once.
+    /// Multiple routed destinations commonly share next hops, especially for
+    /// source-rooted voice distribution. Each result also records the best
+    /// loop-free route that avoids its selected first hop when one exists.
     pub fn voice_route_qualities(&self, dsts: &[NodeIdentifier]) -> Vec<Option<VoiceRouteQuality>> {
         let level = ServiceLevel::BestEffort;
         let routing_metric = RoutingMetric::ConversationalQuality;
-        let routing = self.inner.routing.load();
+        let routing = self.inner.routing.load_full();
         let routes = dsts
             .iter()
             .map(|&dst| {
-                routing
-                    .lookup_with_metric(dst, level, routing_metric)
-                    .map(|entry| (entry.next_hop, entry.latency_us))
+                let primary = routing.lookup_with_metric(dst, level, routing_metric)?;
+                let alternate = routing.precomputed_voice_alternate(dst, primary.next_hop);
+                Some((primary, alternate))
             })
             .collect::<Vec<_>>();
         let mut next_hop_metrics = HashMap::new();
@@ -2092,18 +2157,45 @@ impl OverlayNetwork {
         routes
             .into_iter()
             .map(|route| {
-                let (next_hop, path_latency_us) = route?;
-                let selected = next_hop_metrics.entry(next_hop).or_insert_with(|| {
-                    self.selected_voice_transport_metrics(next_hop, level, routing_metric)
+                let (primary, alternate) = route?;
+                let selected = next_hop_metrics.entry(primary.next_hop).or_insert_with(|| {
+                    self.selected_voice_transport_metrics(primary.next_hop, level, routing_metric)
                 });
                 let (transport, link) = selected.as_ref()?;
-                Some(VoiceRouteQuality::new(
-                    next_hop,
+                let mut quality = VoiceRouteQuality::new(
+                    primary.next_hop,
                     *transport,
-                    path_latency_us,
+                    primary.latency_us,
                     link.effective_packet_loss_ppm(),
                     link.jitter_us().max(0.0) as u64,
-                ))
+                );
+
+                if let Some(alternate) = alternate {
+                    let alternate_selected = next_hop_metrics
+                        .entry(alternate.next_hop)
+                        .or_insert_with(|| {
+                            self.selected_voice_transport_metrics(
+                                alternate.next_hop,
+                                level,
+                                routing_metric,
+                            )
+                        });
+                    if let Some((alternate_transport, alternate_link)) = alternate_selected.as_ref()
+                    {
+                        quality = quality.with_alternate_route_quality(
+                            alternate.next_hop,
+                            alternate.latency_us,
+                            *alternate_transport,
+                            alternate_link.effective_packet_loss_ppm(),
+                            alternate_link.jitter_us().max(0.0) as u64,
+                        );
+                    } else {
+                        quality =
+                            quality.with_alternate_route(alternate.next_hop, alternate.latency_us);
+                    }
+                }
+
+                Some(quality)
             })
             .collect()
     }
@@ -2184,8 +2276,73 @@ impl OverlayNetwork {
 mod tests {
     use super::*;
     use crate::overlay::routing::RoutingTables;
+    use crate::overlay::routing::dijkstra::EdgeCost;
 
     const TEST_MAX_FRAME_BYTES: usize = 64 * 1024;
+
+    fn voice_tables_with_alternate(
+        alternate_next_hop: NodeIdentifier,
+        alternate_first_latency_us: u64,
+        alternate_second_latency_us: u64,
+    ) -> RoutingTables {
+        let mut tables = RoutingTables::empty();
+        tables.insert_table_with_adjacency(
+            RoutingMetric::ConversationalQuality,
+            ServiceLevel::BestEffort,
+            HashMap::from([(
+                10,
+                RouteEntry {
+                    next_hop: 2,
+                    cost: 2,
+                    latency_us: 300,
+                },
+            )]),
+            HashMap::from([
+                (
+                    1,
+                    vec![
+                        (
+                            2,
+                            EdgeCost {
+                                primary: 1,
+                                latency_us: 100,
+                            },
+                        ),
+                        (
+                            alternate_next_hop,
+                            EdgeCost {
+                                primary: 4,
+                                latency_us: alternate_first_latency_us,
+                            },
+                        ),
+                    ],
+                ),
+                (
+                    2,
+                    vec![(
+                        10,
+                        EdgeCost {
+                            primary: 1,
+                            latency_us: 200,
+                        },
+                    )],
+                ),
+                (
+                    alternate_next_hop,
+                    vec![(
+                        10,
+                        EdgeCost {
+                            primary: 4,
+                            latency_us: alternate_second_latency_us,
+                        },
+                    )],
+                ),
+                (10, Vec::new()),
+            ]),
+        );
+        tables.precompute_voice_alternates(1);
+        tables
+    }
 
     #[test]
     fn strict_unicast_frame_budget_fits_with_the_maximum_path_trace() {
@@ -2268,6 +2425,7 @@ mod tests {
                 ),
             ]),
         );
+        tables.precompute_voice_alternates(1);
         inner.routing.store(Arc::new(tables));
         let network = OverlayNetwork {
             inner: Arc::new(inner),
@@ -2290,10 +2448,102 @@ mod tests {
         assert!(qualities[4].is_none());
         assert!(qualities[5].is_none());
         assert!(qualities[6].is_none());
+        let routing = network.inner.routing.load();
+        assert!(routing.has_precomputed_voice_alternate(10, 2));
+        assert!(routing.has_precomputed_voice_alternate(13, 4));
         assert_eq!(
             *network.voice_route_quality_selections.lock(),
             HashMap::from([(2, 1), (3, 1), (4, 1)]),
             "shared next hops and missing-peer None results must be cached within the batch",
+        );
+    }
+
+    #[test]
+    fn voice_route_quality_rejects_same_hop_alternates() {
+        let quality = VoiceRouteQuality::new(2, TransportKind::Udp, 10, 20, 30);
+
+        assert!(
+            std::panic::catch_unwind(|| quality.with_alternate_route(2, 40)).is_err(),
+            "a topology-only alternate must use another first hop",
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                quality.with_alternate_route_quality(2, 40, TransportKind::Tcp, 50, 60)
+            })
+            .is_err(),
+            "a measured alternate must use another first hop",
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_route_qualities_include_loop_free_alternate_from_the_same_batch() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let _alternate_rx = transport.test_install_live_stream(3, TransportKind::Tcp);
+        transport.record_peer_rtt(2, TransportKind::Tcp, Duration::from_millis(17));
+        transport.record_peer_rtt(3, TransportKind::Tcp, Duration::from_millis(29));
+
+        let inner = runtime::OverlayInner::new(
+            transport,
+            OverlayConfig::new(Vec::new()),
+            Arc::new(AtomicU64::new(0)),
+            ReplicationServices::ALL,
+            ApplicationServices::ALL,
+            None,
+            Vec::new(),
+        );
+        let tables = voice_tables_with_alternate(3, 400, 500);
+        let first_generation = tables.generation();
+        let first_generation_searches = tables.voice_alternate_searches();
+        assert!(first_generation_searches > 0);
+        inner.routing.store(Arc::new(tables));
+        let network = OverlayNetwork {
+            inner: Arc::new(inner),
+            voice_route_quality_selections: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        };
+
+        let qualities = network.voice_route_qualities(&[10, 10]);
+
+        let quality = qualities[0].expect("primary route quality");
+        assert_eq!(qualities[1], Some(quality));
+        assert_eq!((quality.next_hop(), quality.path_latency_us()), (2, 300));
+        assert!(quality.has_alternate_first_hop());
+        assert_eq!(quality.alternate_next_hop(), Some(3));
+        assert_eq!(quality.alternate_path_latency_us(), Some(900));
+        assert_eq!(quality.alternate_transport(), Some(TransportKind::Tcp));
+        assert_eq!(quality.alternate_loss_ppm(), Some(0));
+        assert_eq!(quality.alternate_jitter_us(), Some(0));
+        assert_eq!(
+            network.voice_route_qualities(&[10]),
+            vec![Some(quality)],
+            "a later batch must reuse the generation-scoped alternate route",
+        );
+        assert_eq!(
+            network.inner.routing.load().voice_alternate_searches(),
+            first_generation_searches,
+            "voice batches must not perform alternate path searches",
+        );
+        let replacement_tables = voice_tables_with_alternate(4, 600, 700);
+        let replacement_generation = replacement_tables.generation();
+        let replacement_searches = replacement_tables.voice_alternate_searches();
+        assert_ne!(replacement_generation, first_generation);
+        network.inner.routing.store(Arc::new(replacement_tables));
+        let replacement = network
+            .voice_route_quality(10)
+            .expect("replacement quality");
+        assert_eq!(replacement.alternate_next_hop(), Some(4));
+        assert_eq!(replacement.alternate_path_latency_us(), Some(1_300));
+        assert_eq!(replacement.alternate_transport(), None);
+        assert_eq!(replacement.alternate_loss_ppm(), None);
+        assert_eq!(replacement.alternate_jitter_us(), None);
+        let routing = network.inner.routing.load();
+        assert_eq!(routing.generation(), replacement_generation);
+        assert_eq!(routing.voice_alternate_searches(), replacement_searches);
+        assert!(routing.has_precomputed_voice_alternate(10, 2));
+        assert_eq!(
+            *network.voice_route_quality_selections.lock(),
+            HashMap::from([(2, 3), (3, 2), (4, 1)]),
+            "direct peers must be selected at most once within each batch",
         );
     }
 }

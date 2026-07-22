@@ -29,13 +29,13 @@ use super::latest_wins_queue::{
     latest_wins_queue,
 };
 use super::metrics::{
-    DatagramPathHealthReason, DatagramPathHealthSnapshot, DatagramPathHealthState,
-    ExpiredOutboundDropCounters, ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage,
-    MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics, QueueStatusSnapshot, QueueWatermark,
-    TransportHealthExclusionReason, TransportHealthExclusionSnapshot,
-    VoiceTransportBindingEventReason, VoiceTransportBindingEventSnapshot,
-    VoiceTransportBindingSnapshot, VoiceTransportChallengerOutcome,
-    VoiceTransportChallengerSnapshot,
+    DatagramPathEvidenceSnapshot, DatagramPathHealthReason, DatagramPathHealthSnapshot,
+    DatagramPathHealthState, ExpiredOutboundDropCounters, ExpiredOutboundDropSnapshot,
+    ExpiredOutboundDropStage, MetricsTuning, OutboundQueueStatusSnapshot, PeerMetrics,
+    QueueStatusSnapshot, QueueWatermark, TransportHealthExclusionReason,
+    TransportHealthExclusionSnapshot, VoiceTransportBindingEventReason,
+    VoiceTransportBindingEventSnapshot, VoiceTransportBindingSnapshot,
+    VoiceTransportChallengerOutcome, VoiceTransportChallengerSnapshot,
 };
 use super::service_level::{
     DeliveryPath, MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind,
@@ -116,10 +116,29 @@ struct DatagramPathHealthObservation {
     state: DatagramPathHealthState,
     reason: DatagramPathHealthReason,
     effective_loss_ppm: Option<u32>,
+    path_health_score_ppm: Option<u32>,
     loss_samples: u64,
     transitions: u64,
     changed_at: Instant,
     observed_at: Instant,
+    last_evidence_generation: Option<u64>,
+    last_scored_generation: Option<u64>,
+    last_diagnostic_generation: Option<u64>,
+    diagnostic_observed_at: Option<Instant>,
+    consecutive_bad_windows: u32,
+    healthy_since: Option<Instant>,
+    recovery_healthy_span: Duration,
+    recovery_required: bool,
+    sample_confidence_ppm: u32,
+    enqueue_accepted: u64,
+    enqueue_rejected: u64,
+    too_large: u64,
+    pressure: u64,
+    outcome_successes: u64,
+    outcome_failures: u64,
+    ingress_validated: u64,
+    ingress_rejected: u64,
+    ingress_read_failures: u64,
 }
 
 impl VoiceTransportBinding {
@@ -826,6 +845,7 @@ pub(crate) struct QuicV2SessionSender {
 }
 
 struct QuicV2RuntimeState {
+    datagram_evidence_session: AtomicU64,
     max_datagram_size: AtomicUsize,
     datagram_send_buffer_bytes: usize,
     datagram_receive_buffer_bytes: usize,
@@ -901,6 +921,7 @@ impl QuicV2SessionSender {
                 regular,
                 datagram,
                 runtime: Arc::new(QuicV2RuntimeState {
+                    datagram_evidence_session: AtomicU64::new(0),
                     max_datagram_size: AtomicUsize::new(max_datagram_size),
                     datagram_send_buffer_bytes: datagram_bytes,
                     datagram_receive_buffer_bytes,
@@ -1008,6 +1029,18 @@ impl QuicV2SessionSender {
             .store(bytes, Ordering::Relaxed);
     }
 
+    pub(crate) fn set_datagram_evidence_session(&self, session: u64) {
+        self.runtime
+            .datagram_evidence_session
+            .store(session, Ordering::Release);
+    }
+
+    pub(crate) fn datagram_evidence_session(&self) -> u64 {
+        self.runtime
+            .datagram_evidence_session
+            .load(Ordering::Acquire)
+    }
+
     pub(crate) fn max_datagram_size(&self) -> usize {
         self.runtime
             .max_datagram_size
@@ -1064,6 +1097,13 @@ impl QuicV2SessionReceivers {
 }
 
 impl SessionSender {
+    pub(crate) fn quic_v2_datagram_evidence_session(&self) -> Option<u64> {
+        match self {
+            Self::QuicV2(sender) => Some(sender.datagram_evidence_session()),
+            Self::Legacy(_) => None,
+        }
+    }
+
     pub(crate) fn try_send(
         &self,
         frame: OutboundFrame,
@@ -2199,6 +2239,7 @@ impl PeerState {
             state,
             reason,
             effective_loss_ppm,
+            path_health_score_ppm: None,
             loss_samples,
             transitions: previous
                 .map(|observation| {
@@ -2212,8 +2253,233 @@ impl PeerState {
                 .map(|observation| observation.changed_at)
                 .unwrap_or(now),
             observed_at: now,
+            last_evidence_generation: previous
+                .and_then(|observation| observation.last_evidence_generation),
+            last_scored_generation: previous
+                .and_then(|observation| observation.last_scored_generation),
+            last_diagnostic_generation: previous
+                .and_then(|observation| observation.last_diagnostic_generation),
+            diagnostic_observed_at: previous
+                .and_then(|observation| observation.diagnostic_observed_at),
+            consecutive_bad_windows: previous
+                .map(|observation| observation.consecutive_bad_windows)
+                .unwrap_or(0),
+            healthy_since: previous.and_then(|observation| observation.healthy_since),
+            recovery_healthy_span: previous
+                .map(|observation| observation.recovery_healthy_span)
+                .unwrap_or(Duration::ZERO),
+            recovery_required: previous.is_some_and(|observation| observation.recovery_required),
+            sample_confidence_ppm: if min_samples == 0 {
+                1_000_000
+            } else {
+                loss_samples
+                    .saturating_mul(1_000_000)
+                    .saturating_div(min_samples)
+                    .min(1_000_000) as u32
+            },
+            enqueue_accepted: 0,
+            enqueue_rejected: 0,
+            too_large: 0,
+            pressure: 0,
+            outcome_successes: 0,
+            outcome_failures: 0,
+            ingress_validated: 0,
+            ingress_rejected: 0,
+            ingress_read_failures: 0,
         };
         observations.insert(path, observation);
+        state
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_quic_datagram_path_health(
+        &self,
+        evidence: &[DatagramPathEvidenceSnapshot],
+        min_samples: u64,
+        suspect_score_ppm: u32,
+        recover_score_ppm: u32,
+        suspect_bad_windows: u32,
+        recover_healthy_for: Duration,
+        stale_after: Duration,
+        now: Instant,
+    ) -> DatagramPathHealthState {
+        let path = DeliveryPath::QuicDatagram;
+        let mut observations = self.datagram_path_health.lock();
+        let previous = observations.get(&path).copied();
+        let fresh = evidence
+            .iter()
+            .copied()
+            .filter(|evidence| {
+                evidence.completed_at().is_some_and(|completed_at| {
+                    now.saturating_duration_since(completed_at) < stale_after
+                })
+            })
+            .collect::<Vec<_>>();
+        if fresh.is_empty() {
+            let state = DatagramPathHealthState::Probing;
+            let state_changed = previous.is_none_or(|observation| observation.state != state);
+            let previous = previous.unwrap_or(DatagramPathHealthObservation {
+                state,
+                reason: DatagramPathHealthReason::InsufficientSamples,
+                effective_loss_ppm: None,
+                path_health_score_ppm: None,
+                loss_samples: 0,
+                transitions: 0,
+                changed_at: now,
+                observed_at: now,
+                last_evidence_generation: None,
+                last_scored_generation: None,
+                last_diagnostic_generation: None,
+                diagnostic_observed_at: None,
+                consecutive_bad_windows: 0,
+                healthy_since: None,
+                recovery_healthy_span: Duration::ZERO,
+                recovery_required: false,
+                sample_confidence_ppm: 0,
+                enqueue_accepted: 0,
+                enqueue_rejected: 0,
+                too_large: 0,
+                pressure: 0,
+                outcome_successes: 0,
+                outcome_failures: 0,
+                ingress_validated: 0,
+                ingress_rejected: 0,
+                ingress_read_failures: 0,
+            });
+            observations.insert(
+                path,
+                DatagramPathHealthObservation {
+                    state,
+                    reason: DatagramPathHealthReason::InsufficientSamples,
+                    transitions: previous
+                        .transitions
+                        .saturating_add(u64::from(state_changed)),
+                    changed_at: if state_changed {
+                        now
+                    } else {
+                        previous.changed_at
+                    },
+                    consecutive_bad_windows: 0,
+                    healthy_since: None,
+                    recovery_healthy_span: Duration::ZERO,
+                    sample_confidence_ppm: 0,
+                    ..previous
+                },
+            );
+            return state;
+        }
+        let mut current = previous.unwrap_or(DatagramPathHealthObservation {
+            state: DatagramPathHealthState::Probing,
+            reason: DatagramPathHealthReason::InsufficientSamples,
+            effective_loss_ppm: None,
+            path_health_score_ppm: None,
+            loss_samples: 0,
+            transitions: 0,
+            changed_at: now,
+            observed_at: now,
+            last_evidence_generation: None,
+            last_scored_generation: None,
+            last_diagnostic_generation: None,
+            diagnostic_observed_at: None,
+            consecutive_bad_windows: 0,
+            healthy_since: None,
+            recovery_healthy_span: Duration::ZERO,
+            recovery_required: false,
+            sample_confidence_ppm: 0,
+            enqueue_accepted: 0,
+            enqueue_rejected: 0,
+            too_large: 0,
+            pressure: 0,
+            outcome_successes: 0,
+            outcome_failures: 0,
+            ingress_validated: 0,
+            ingress_rejected: 0,
+            ingress_read_failures: 0,
+        });
+        let last_generation = current.last_evidence_generation.unwrap_or(0);
+        for evidence in fresh
+            .into_iter()
+            .filter(|evidence| evidence.generation() > last_generation)
+        {
+            let completed_at = evidence.completed_at().unwrap_or(now);
+            let samples = evidence.samples();
+            current.last_evidence_generation = Some(evidence.generation());
+
+            if evidence.has_diagnostics() {
+                current.last_diagnostic_generation = Some(evidence.generation());
+                current.diagnostic_observed_at = Some(completed_at);
+                current.too_large = evidence.too_large();
+                current.pressure = evidence.pressure();
+                current.ingress_validated = evidence.ingress_validated();
+                current.ingress_rejected = evidence.ingress_rejected();
+                current.ingress_read_failures = evidence.ingress_read_failures();
+            }
+
+            // Diagnostic-only windows update telemetry without changing any
+            // pending entry/recovery progress.
+            if samples == 0 {
+                continue;
+            }
+            current.observed_at = completed_at;
+            current.last_scored_generation = Some(evidence.generation());
+            current.enqueue_accepted = evidence.enqueue_accepted();
+            current.enqueue_rejected = evidence.enqueue_rejected();
+            current.outcome_successes = evidence.outcome_successes();
+            current.outcome_failures = evidence.outcome_failures();
+            let confidence_ppm = if min_samples == 0 {
+                1_000_000
+            } else {
+                samples
+                    .saturating_mul(1_000_000)
+                    .saturating_div(min_samples)
+                    .min(1_000_000) as u32
+            };
+            let score_ppm = evidence.health_score_ppm();
+            let old_state = current.state;
+            current.loss_samples = samples;
+            current.sample_confidence_ppm = confidence_ppm;
+            current.path_health_score_ppm = Some(score_ppm);
+
+            if samples < min_samples {
+                current.reason = DatagramPathHealthReason::InsufficientSamples;
+            } else if score_ppm >= suspect_score_ppm {
+                current.consecutive_bad_windows = current.consecutive_bad_windows.saturating_add(1);
+                current.healthy_since = None;
+                current.recovery_healthy_span = Duration::ZERO;
+                current.reason = DatagramPathHealthReason::LaneOutcomeFailures;
+                if current.consecutive_bad_windows >= suspect_bad_windows {
+                    current.state = DatagramPathHealthState::Suspect;
+                    current.recovery_required = true;
+                }
+            } else if score_ppm <= recover_score_ppm {
+                current.consecutive_bad_windows = 0;
+                if current.recovery_required {
+                    let since = current.healthy_since.get_or_insert(completed_at);
+                    current.recovery_healthy_span = completed_at.saturating_duration_since(*since);
+                    if current.recovery_healthy_span >= recover_healthy_for {
+                        current.state = DatagramPathHealthState::Healthy;
+                        current.reason = DatagramPathHealthReason::Recovered;
+                        current.healthy_since = None;
+                        current.recovery_required = false;
+                    }
+                } else {
+                    current.state = DatagramPathHealthState::Healthy;
+                    current.reason = DatagramPathHealthReason::WithinThreshold;
+                    current.healthy_since = None;
+                    current.recovery_healthy_span = Duration::ZERO;
+                }
+            } else {
+                current.consecutive_bad_windows = 0;
+                current.healthy_since = None;
+                current.recovery_healthy_span = Duration::ZERO;
+            }
+            if current.state != old_state {
+                current.transitions = current.transitions.saturating_add(1);
+                current.changed_at = completed_at;
+            }
+        }
+        let state = current.state;
+        observations.insert(path, current);
         state
     }
 
@@ -2222,12 +2488,17 @@ impl PeerState {
         stale_after: Duration,
     ) -> Vec<DatagramPathHealthSnapshot> {
         let now = Instant::now();
-        let mut observations = self.datagram_path_health.lock();
-        observations.retain(|_, observation| {
-            now.saturating_duration_since(observation.observed_at) < stale_after
-        });
+        let observations = self.datagram_path_health.lock();
         let mut snapshots = observations
             .iter()
+            .filter(|(_, observation)| {
+                now.saturating_duration_since(observation.observed_at) < stale_after
+                    || observation
+                        .diagnostic_observed_at
+                        .is_some_and(|observed_at| {
+                            now.saturating_duration_since(observed_at) < stale_after
+                        })
+            })
             .map(|(path, observation)| {
                 DatagramPathHealthSnapshot::new(
                     self.node_id,
@@ -2235,15 +2506,38 @@ impl PeerState {
                     observation.state,
                     observation.reason,
                     observation.effective_loss_ppm,
+                    observation.path_health_score_ppm,
                     observation.loss_samples,
                     observation.transitions,
                     now.saturating_duration_since(observation.changed_at),
                     now.saturating_duration_since(observation.observed_at),
+                    observation.last_scored_generation,
+                    observation.last_diagnostic_generation,
+                    observation
+                        .diagnostic_observed_at
+                        .map(|observed_at| now.saturating_duration_since(observed_at)),
+                    observation.sample_confidence_ppm,
+                    observation.enqueue_accepted,
+                    observation.enqueue_rejected,
+                    observation.too_large,
+                    observation.pressure,
+                    observation.outcome_successes,
+                    observation.outcome_failures,
+                    observation.ingress_validated,
+                    observation.ingress_rejected,
+                    observation.ingress_read_failures,
+                    observation.consecutive_bad_windows,
+                    observation.recovery_healthy_span,
+                    observation.recovery_required,
                 )
             })
             .collect::<Vec<_>>();
         snapshots.sort_by_key(|snapshot| snapshot.path());
         snapshots
+    }
+
+    pub(crate) fn reset_datagram_path_health(&self, path: DeliveryPath) {
+        self.datagram_path_health.lock().remove(&path);
     }
 
     pub(crate) fn require_kcp_best_effort_recovery(&self) {
@@ -3052,6 +3346,335 @@ mod tests {
             MetricsTuning::default(),
             1024 * 1024,
         )
+    }
+
+    fn observe_quic_test_window(
+        peer: &PeerState,
+        generation: u64,
+        successes: u64,
+        failures: u64,
+        completed_at: Instant,
+        bad_windows: u32,
+        now: Instant,
+    ) -> DatagramPathHealthState {
+        let evidence =
+            DatagramPathEvidenceSnapshot::for_test(generation, successes, failures, completed_at);
+        peer.observe_quic_datagram_path_health(
+            std::slice::from_ref(&evidence),
+            1,
+            100_000,
+            10_000,
+            bad_windows,
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            now,
+        )
+    }
+
+    #[test]
+    fn quic_datagram_suspect_requires_distinct_completed_bad_windows() {
+        let peer = peer_for_address_tests();
+        let start = Instant::now();
+        assert_eq!(
+            observe_quic_test_window(&peer, 1, 0, 1, start, 3, start),
+            DatagramPathHealthState::Probing
+        );
+        assert_eq!(
+            observe_quic_test_window(&peer, 1, 0, 1, start, 3, start + Duration::from_secs(1),),
+            DatagramPathHealthState::Probing
+        );
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                2,
+                0,
+                1,
+                start + Duration::from_secs(1),
+                3,
+                start + Duration::from_secs(1),
+            ),
+            DatagramPathHealthState::Probing
+        );
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                3,
+                0,
+                1,
+                start + Duration::from_secs(2),
+                3,
+                start + Duration::from_secs(2),
+            ),
+            DatagramPathHealthState::Suspect
+        );
+        let snapshot = peer.datagram_path_health_status(Duration::from_secs(60))[0];
+        assert_eq!(snapshot.consecutive_bad_windows(), 3);
+    }
+
+    #[test]
+    fn quic_datagram_suspect_accepts_two_window_configuration() {
+        let peer = peer_for_address_tests();
+        let start = Instant::now();
+        assert_eq!(
+            observe_quic_test_window(&peer, 1, 0, 1, start, 2, start),
+            DatagramPathHealthState::Probing
+        );
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                2,
+                0,
+                1,
+                start + Duration::from_secs(1),
+                2,
+                start + Duration::from_secs(1),
+            ),
+            DatagramPathHealthState::Suspect
+        );
+    }
+
+    #[test]
+    fn quic_datagram_recovery_needs_new_healthy_windows_spanning_duration() {
+        let peer = peer_for_address_tests();
+        let start = Instant::now();
+        assert_eq!(
+            observe_quic_test_window(&peer, 1, 0, 1, start, 2, start),
+            DatagramPathHealthState::Probing
+        );
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                2,
+                0,
+                1,
+                start + Duration::from_secs(1),
+                2,
+                start + Duration::from_secs(1),
+            ),
+            DatagramPathHealthState::Suspect
+        );
+        let snapshot = peer.datagram_path_health_status(Duration::from_secs(60))[0];
+        assert_eq!(snapshot.recovery_healthy_age(), Duration::ZERO);
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                3,
+                1,
+                0,
+                start + Duration::from_secs(2),
+                2,
+                start + Duration::from_secs(2),
+            ),
+            DatagramPathHealthState::Suspect
+        );
+        // Re-reading one completed generation cannot satisfy the time gate.
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                3,
+                1,
+                0,
+                start + Duration::from_secs(2),
+                2,
+                start + Duration::from_secs(20),
+            ),
+            DatagramPathHealthState::Suspect
+        );
+        let snapshot = peer.datagram_path_health_status(Duration::from_secs(60))[0];
+        assert_eq!(snapshot.recovery_healthy_age(), Duration::ZERO);
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                4,
+                1,
+                0,
+                start + Duration::from_secs(11),
+                2,
+                start + Duration::from_secs(11),
+            ),
+            DatagramPathHealthState::Suspect
+        );
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                5,
+                1,
+                0,
+                start + Duration::from_secs(12),
+                2,
+                start + Duration::from_secs(12),
+            ),
+            DatagramPathHealthState::Healthy
+        );
+    }
+
+    #[test]
+    fn quic_datagram_midband_and_stale_evidence_reset_pending_progress() {
+        let peer = peer_for_address_tests();
+        let start = Instant::now();
+        assert_eq!(
+            observe_quic_test_window(&peer, 1, 0, 1, start, 3, start),
+            DatagramPathHealthState::Probing
+        );
+        // Five percent is between the one and ten percent thresholds.
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                2,
+                95,
+                5,
+                start + Duration::from_secs(1),
+                3,
+                start + Duration::from_secs(1),
+            ),
+            DatagramPathHealthState::Probing
+        );
+        let snapshot = peer.datagram_path_health_status(Duration::from_secs(60))[0];
+        assert_eq!(snapshot.consecutive_bad_windows(), 0);
+
+        assert_eq!(
+            peer.observe_quic_datagram_path_health(
+                &[],
+                1,
+                100_000,
+                10_000,
+                3,
+                Duration::from_secs(10),
+                Duration::from_secs(60),
+                start + Duration::from_secs(2),
+            ),
+            DatagramPathHealthState::Probing
+        );
+        let snapshot = peer.datagram_path_health_status(Duration::from_secs(60))[0];
+        assert_eq!(snapshot.consecutive_bad_windows(), 0);
+        assert_eq!(snapshot.recovery_healthy_age(), Duration::ZERO);
+    }
+
+    #[test]
+    fn quic_datagram_replays_all_unobserved_windows_in_order() {
+        let peer = peer_for_address_tests();
+        let start = Instant::now();
+        let windows = [
+            DatagramPathEvidenceSnapshot::for_test(1, 0, 1, start),
+            DatagramPathEvidenceSnapshot::for_test(2, 0, 1, start + Duration::from_secs(1)),
+            DatagramPathEvidenceSnapshot::for_test(3, 0, 1, start + Duration::from_secs(2)),
+        ];
+        assert_eq!(
+            peer.observe_quic_datagram_path_health(
+                &windows,
+                1,
+                100_000,
+                10_000,
+                3,
+                Duration::from_secs(10),
+                Duration::from_secs(60),
+                start + Duration::from_secs(2),
+            ),
+            DatagramPathHealthState::Suspect
+        );
+    }
+
+    #[test]
+    fn quic_datagram_diagnostic_only_window_preserves_suspect_state() {
+        let peer = peer_for_address_tests();
+        let start = Instant::now();
+        observe_quic_test_window(&peer, 1, 0, 1, start, 2, start);
+        observe_quic_test_window(
+            &peer,
+            2,
+            0,
+            1,
+            start + Duration::from_secs(1),
+            2,
+            start + Duration::from_secs(1),
+        );
+        let diagnostic = DatagramPathEvidenceSnapshot::diagnostic_for_test(
+            3,
+            2,
+            4,
+            6,
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(
+            peer.observe_quic_datagram_path_health(
+                std::slice::from_ref(&diagnostic),
+                1,
+                100_000,
+                10_000,
+                2,
+                Duration::from_secs(10),
+                Duration::from_secs(60),
+                start + Duration::from_secs(2),
+            ),
+            DatagramPathHealthState::Suspect
+        );
+        let snapshot = peer.datagram_path_health_status(Duration::from_secs(60))[0];
+        assert!(snapshot.recovery_required());
+        assert_eq!(snapshot.consecutive_bad_windows(), 2);
+        assert_eq!(snapshot.scored_generation(), Some(2));
+        assert_eq!(snapshot.diagnostic_generation(), Some(3));
+        assert_eq!(snapshot.loss_samples(), 1);
+        assert_eq!(snapshot.outcome_failures(), 1);
+        assert_eq!(snapshot.too_large(), 2);
+        assert_eq!(snapshot.pressure(), 4);
+        assert_eq!(snapshot.ingress_validated(), 6);
+    }
+
+    #[test]
+    fn stale_status_scrape_cannot_bypass_quic_datagram_recovery() {
+        let peer = peer_for_address_tests();
+        let start = Instant::now();
+        observe_quic_test_window(&peer, 1, 0, 1, start, 2, start);
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                2,
+                0,
+                1,
+                start + Duration::from_secs(1),
+                2,
+                start + Duration::from_secs(1),
+            ),
+            DatagramPathHealthState::Suspect
+        );
+        assert_eq!(
+            peer.observe_quic_datagram_path_health(
+                &[],
+                1,
+                100_000,
+                10_000,
+                2,
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+                start + Duration::from_secs(3),
+            ),
+            DatagramPathHealthState::Probing
+        );
+        assert!(peer.datagram_path_health_status(Duration::ZERO).is_empty());
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                3,
+                1,
+                0,
+                start + Duration::from_secs(4),
+                2,
+                start + Duration::from_secs(4),
+            ),
+            DatagramPathHealthState::Probing
+        );
+        assert_eq!(
+            observe_quic_test_window(
+                &peer,
+                4,
+                1,
+                0,
+                start + Duration::from_secs(14),
+                2,
+                start + Duration::from_secs(14),
+            ),
+            DatagramPathHealthState::Healthy
+        );
     }
 
     #[test]

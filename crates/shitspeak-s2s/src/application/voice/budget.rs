@@ -4,12 +4,14 @@
 //! constrains later admission without evicting work which is already queued.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use shitspeak_core::NodeIdentifier;
+use tokio::sync::{Notify, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use super::metrics::{
     self, RepairBudgetClass, RepairClassStage, RepairCreditStage, RepairDestinationStage,
@@ -25,6 +27,10 @@ const PROACTIVE_BURST_MAX_BYTES: usize = 128 * 1024;
 const CREDIT_QUARTERS_PER_BYTE: usize = 4;
 const DESTINATION_PRIVATE_POOL_PCT: u8 = 25;
 const REACTIVE_DEMAND_HOLD: Duration = Duration::from_secs(1);
+const REACTIVE_SCHEDULER_QUANTUM_BYTES: usize = 1_200;
+const REACTIVE_RETRY_EPOCH: Duration = Duration::from_millis(100);
+const REACTIVE_RETRY_SHARE_PCT: usize = 50;
+const REACTIVE_SCHEDULER_RECEIVE_BATCH: usize = 256;
 #[cfg(test)]
 const DEFAULT_REACTIVE_RESERVE_PCT: u8 = 30;
 #[cfg(test)]
@@ -41,6 +47,8 @@ pub(crate) struct AdaptiveVoiceBudget {
     primary: Arc<ByteBudget>,
     proactive: Arc<ByteBudget>,
     repair_credit: Arc<RepairCreditBucket>,
+    reactive_scheduler: Arc<OnceLock<ReactiveCreditScheduler>>,
+    reactive_scheduler_shutdown: CancellationToken,
 }
 
 impl AdaptiveVoiceBudget {
@@ -68,7 +76,10 @@ impl AdaptiveVoiceBudget {
                 reactive_reserve_pct,
                 reactive_hard_reserve_pct,
                 state: Mutex::new(RepairCreditState::default()),
+                credit_available: Notify::new(),
             }),
+            reactive_scheduler: Arc::new(OnceLock::new()),
+            reactive_scheduler_shutdown: CancellationToken::new(),
             max_users,
         }
     }
@@ -113,7 +124,7 @@ impl AdaptiveVoiceBudget {
     /// Reserve a batch of ordinary proactive repair opportunities in a
     /// permutation-independent order. One first copy per destination forms
     /// the private/fair-share phase; remaining copies compete in the shared
-    /// overflow phase by benefit per encoded byte.
+    /// overflow phase by marginal utility per encoded byte.
     pub(crate) fn reserve_proactive_credit_batch(
         &self,
         frame_sequence: u64,
@@ -125,6 +136,7 @@ impl AdaptiveVoiceBudget {
 
     /// Reserve reactive repair payload credit. Reactive work consumes its
     /// entitlement first and may use otherwise idle proactive credit.
+    #[cfg(test)]
     pub(crate) fn try_reserve_reactive_credit(
         &self,
         bytes: usize,
@@ -134,6 +146,32 @@ impl AdaptiveVoiceBudget {
             RepairCreditClass::Reactive,
             RepairCreditSource::Reactive,
         )
+    }
+
+    pub(crate) async fn reserve_reactive_credit_scheduled(
+        &self,
+        destination: u32,
+        bytes: usize,
+        deadline: Instant,
+        retry: bool,
+    ) -> Option<ProactiveCreditPermit> {
+        let scheduler = self.reactive_scheduler.get_or_init(|| {
+            ReactiveCreditScheduler::spawn(
+                self.repair_credit.clone(),
+                self.reactive_scheduler_shutdown.clone(),
+            )
+        });
+        scheduler.reserve(destination, bytes, deadline, retry).await
+    }
+
+    pub(crate) fn link_reactive_scheduler_shutdown(&self, shutdown: CancellationToken) {
+        let scheduler_shutdown = self.reactive_scheduler_shutdown.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => scheduler_shutdown.cancel(),
+                _ = scheduler_shutdown.cancelled() => {}
+            }
+        });
     }
 
     /// Current primary ingress ceiling in bytes.
@@ -230,6 +268,7 @@ pub(crate) struct ProactiveCreditPermit {
     source: RepairCreditSource,
     destination: Option<u32>,
     private_round: u64,
+    borrow_id: Option<u64>,
     committed: bool,
 }
 
@@ -332,7 +371,7 @@ pub(crate) enum RepairCreditSource {
 pub(crate) struct ProactiveCreditRequest {
     destination: u32,
     bytes: usize,
-    benefit_micros: u64,
+    marginal_utility_micros: u64,
     copy_index: usize,
 }
 
@@ -340,14 +379,386 @@ impl ProactiveCreditRequest {
     pub(crate) fn new(
         destination: u32,
         bytes: usize,
-        benefit_micros: u64,
+        marginal_utility_micros: u64,
         copy_index: usize,
     ) -> Self {
         Self {
             destination,
             bytes,
-            benefit_micros,
+            marginal_utility_micros,
             copy_index,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReactiveCreditScheduler {
+    tx: mpsc::UnboundedSender<ReactiveScheduleRequest>,
+    next_request_id: Arc<AtomicU64>,
+}
+
+struct ReactiveScheduleRequest {
+    id: u64,
+    destination: u32,
+    bytes: usize,
+    deadline: Instant,
+    enqueued_at: Instant,
+    retry: bool,
+    response: oneshot::Sender<Option<ProactiveCreditPermit>>,
+}
+
+#[derive(Default)]
+struct ReactiveDestinationQueue {
+    deficit_bytes: usize,
+    pending: Vec<ReactiveScheduleRequest>,
+}
+
+struct ReactiveScheduleState {
+    destinations: HashMap<u32, ReactiveDestinationQueue>,
+    retry_epoch_started: Instant,
+    retry_bytes: HashMap<u32, usize>,
+    service_clock: u64,
+    last_service: HashMap<u32, u64>,
+}
+
+impl ReactiveScheduleState {
+    fn new() -> Self {
+        Self {
+            destinations: HashMap::new(),
+            retry_epoch_started: Instant::now(),
+            retry_bytes: HashMap::new(),
+            service_clock: 0,
+            last_service: HashMap::new(),
+        }
+    }
+
+    fn enqueue(&mut self, request: ReactiveScheduleRequest) {
+        let destination = request.destination;
+        let queue = self.destinations.entry(destination).or_default();
+        let position = queue
+            .pending
+            .partition_point(|pending| pending.deadline <= request.deadline);
+        queue.pending.insert(position, request);
+    }
+
+    fn reset_retry_epoch_if_due(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.retry_epoch_started) >= REACTIVE_RETRY_EPOCH {
+            self.retry_epoch_started = now;
+            self.retry_bytes.clear();
+        }
+    }
+
+    fn pop_next(
+        &mut self,
+        retry_cap_bytes: usize,
+        now: Instant,
+        credit_blocked: &HashSet<u64>,
+    ) -> Option<ReactiveScheduleRequest> {
+        self.reset_retry_epoch_if_due(now);
+        self.remove_expired(now);
+        let mut destinations = self.destinations.keys().copied().collect::<Vec<_>>();
+        destinations.sort_unstable_by_key(|destination| {
+            (
+                self.last_service.get(destination).copied().unwrap_or(0),
+                *destination,
+            )
+        });
+        if destinations.is_empty() {
+            return None;
+        }
+        let largest_quanta = self
+            .destinations
+            .iter()
+            .filter_map(|(destination, queue)| {
+                let retry_used = self.retry_bytes.get(destination).copied().unwrap_or(0);
+                queue.pending.iter().find(|request| {
+                    !credit_blocked.contains(&request.id)
+                        && (!request.retry
+                            || retry_used.saturating_add(request.bytes) <= retry_cap_bytes)
+                })
+            })
+            .map(|request| request.bytes.div_ceil(REACTIVE_SCHEDULER_QUANTUM_BYTES))
+            .max()
+            .unwrap_or(1);
+        for _ in 0..largest_quanta.max(1) {
+            for &destination in &destinations {
+                let Some(queue) = self.destinations.get_mut(&destination) else {
+                    continue;
+                };
+                let retry_used = self.retry_bytes.get(&destination).copied().unwrap_or(0);
+                let Some(eligible_index) = queue.pending.iter().position(|request| {
+                    !credit_blocked.contains(&request.id)
+                        && (!request.retry
+                            || retry_used.saturating_add(request.bytes) <= retry_cap_bytes)
+                }) else {
+                    metrics::record_reactive_scheduler_event(
+                        metrics::ReactiveSchedulerEvent::RetryDeferred,
+                    );
+                    continue;
+                };
+                let eligible_bytes = queue.pending[eligible_index].bytes;
+                queue.deficit_bytes = queue
+                    .deficit_bytes
+                    .saturating_add(REACTIVE_SCHEDULER_QUANTUM_BYTES);
+                if eligible_bytes <= queue.deficit_bytes {
+                    let request = queue.pending.remove(eligible_index);
+                    // The deficit and service clock are charged only after an
+                    // actual permit reaches the requester. A credit miss is
+                    // requeued without consuming its fair turn.
+                    return Some(request);
+                }
+            }
+        }
+        None
+    }
+
+    fn record_grant(&mut self, destination: u32, bytes: usize, retry: bool) {
+        if let Some(queue) = self.destinations.get_mut(&destination) {
+            queue.deficit_bytes = queue.deficit_bytes.saturating_sub(bytes);
+            if queue.pending.is_empty() {
+                self.destinations.remove(&destination);
+            }
+        }
+        if retry {
+            let used = self.retry_bytes.entry(destination).or_default();
+            *used = used.saturating_add(bytes);
+        }
+        self.service_clock = self.service_clock.wrapping_add(1).max(1);
+        self.last_service.insert(destination, self.service_clock);
+    }
+
+    fn discard_selected(&mut self, destination: u32) {
+        if self
+            .destinations
+            .get(&destination)
+            .is_some_and(|queue| queue.pending.is_empty())
+        {
+            self.destinations.remove(&destination);
+        }
+    }
+
+    fn requeue(&mut self, request: ReactiveScheduleRequest) {
+        self.enqueue(request);
+    }
+
+    fn remove_expired(&mut self, now: Instant) {
+        let destinations = self.destinations.keys().copied().collect::<Vec<_>>();
+        for destination in destinations {
+            let Some(queue) = self.destinations.get_mut(&destination) else {
+                continue;
+            };
+            while queue
+                .pending
+                .first()
+                .is_some_and(|request| request.deadline <= now)
+            {
+                let expired = queue.pending.remove(0);
+                metrics::record_reactive_scheduler_event(
+                    metrics::ReactiveSchedulerEvent::DeadlineExpired,
+                );
+                let _ = expired.response.send(None);
+            }
+            if queue.pending.is_empty() {
+                self.destinations.remove(&destination);
+                self.retry_bytes.remove(&destination);
+            }
+        }
+    }
+
+    fn active_destinations(&self) -> usize {
+        self.destinations.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.destinations.is_empty()
+    }
+
+    fn retry_epoch_deadline(&self) -> Instant {
+        self.retry_epoch_started + REACTIVE_RETRY_EPOCH
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.destinations
+            .values()
+            .filter_map(|queue| queue.pending.first().map(|request| request.deadline))
+            .min()
+    }
+
+    fn publish_metrics(&self, now: Instant) {
+        let queued_items = self
+            .destinations
+            .values()
+            .map(|queue| queue.pending.len())
+            .sum();
+        let queued_encoded_bytes = self
+            .destinations
+            .values()
+            .flat_map(|queue| &queue.pending)
+            .map(|request| request.bytes)
+            .fold(0usize, usize::saturating_add);
+        let oldest_wait = self
+            .destinations
+            .values()
+            .flat_map(|queue| &queue.pending)
+            .map(|request| now.saturating_duration_since(request.enqueued_at))
+            .max();
+        let max_starvation_rounds = self
+            .destinations
+            .keys()
+            .map(|destination| {
+                self.service_clock
+                    .saturating_sub(self.last_service.get(destination).copied().unwrap_or(0))
+                    .min(usize::MAX as u64) as usize
+            })
+            .max()
+            .unwrap_or(0);
+        metrics::set_reactive_scheduler_state(
+            queued_items,
+            queued_encoded_bytes,
+            self.active_destinations(),
+            oldest_wait,
+            max_starvation_rounds,
+        );
+    }
+}
+
+impl ReactiveCreditScheduler {
+    fn spawn(repair_credit: Arc<RepairCreditBucket>, shutdown: CancellationToken) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ReactiveScheduleRequest>();
+        tokio::spawn(async move {
+            let mut state = ReactiveScheduleState::new();
+            loop {
+                if state.is_empty() {
+                    let request = tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        request = rx.recv() => request,
+                    };
+                    let Some(request) = request else {
+                        break;
+                    };
+                    state.enqueue(request);
+                }
+                tokio::task::yield_now().await;
+                for _ in 0..REACTIVE_SCHEDULER_RECEIVE_BATCH {
+                    let Ok(request) = rx.try_recv() else {
+                        break;
+                    };
+                    state.enqueue(request);
+                }
+                let mut credit_blocked = HashSet::new();
+                loop {
+                    let retry_cap =
+                        repair_credit.reactive_retry_cap_bytes(state.active_destinations());
+                    let Some(request) = state.pop_next(retry_cap, Instant::now(), &credit_blocked)
+                    else {
+                        break;
+                    };
+                    let destination = request.destination;
+                    let bytes = request.bytes;
+                    let retry = request.retry;
+                    if request.response.is_closed() {
+                        metrics::record_reactive_scheduler_event(
+                            metrics::ReactiveSchedulerEvent::Cancelled,
+                        );
+                        state.discard_selected(destination);
+                        continue;
+                    }
+                    let mut permit = repair_credit.try_reserve_waiting_reactive(bytes);
+                    if let Some(permit) = permit.as_mut() {
+                        permit.destination = Some(destination);
+                    }
+                    match permit {
+                        Some(permit) => match request.response.send(Some(permit)) {
+                            Ok(()) => {
+                                state.record_grant(destination, bytes, retry);
+                                metrics::record_reactive_scheduler_event(
+                                    metrics::ReactiveSchedulerEvent::Granted,
+                                );
+                            }
+                            Err(permit) => {
+                                drop(permit);
+                                metrics::record_reactive_scheduler_event(
+                                    metrics::ReactiveSchedulerEvent::Cancelled,
+                                );
+                                state.discard_selected(destination);
+                            }
+                        },
+                        None => {
+                            metrics::record_reactive_scheduler_event(
+                                metrics::ReactiveSchedulerEvent::CreditWait,
+                            );
+                            credit_blocked.insert(request.id);
+                            state.requeue(request);
+                        }
+                    }
+                }
+                if state.is_empty() {
+                    state.publish_metrics(Instant::now());
+                    continue;
+                }
+                state.publish_metrics(Instant::now());
+                let retry_deadline = state.retry_epoch_deadline();
+                let work_deadline = state.next_deadline().unwrap_or(retry_deadline);
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    request = rx.recv() => match request {
+                        Some(request) => state.enqueue(request),
+                        None => break,
+                    },
+                    _ = repair_credit.credit_available.notified() => {}
+                    _ = tokio::time::sleep_until(retry_deadline.into()) => {
+                        state.reset_retry_epoch_if_due(Instant::now());
+                    }
+                    _ = tokio::time::sleep_until(work_deadline.into()) => {
+                        state.remove_expired(Instant::now());
+                    }
+                }
+            }
+            for queue in state.destinations.into_values() {
+                for request in queue.pending {
+                    metrics::record_reactive_scheduler_event(
+                        metrics::ReactiveSchedulerEvent::Shutdown,
+                    );
+                    let _ = request.response.send(None);
+                }
+            }
+            metrics::set_reactive_scheduler_state(0, 0, 0, None, 0);
+        });
+        Self {
+            tx,
+            next_request_id: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    async fn reserve(
+        &self,
+        destination: u32,
+        bytes: usize,
+        deadline: Instant,
+        retry: bool,
+    ) -> Option<ProactiveCreditPermit> {
+        if deadline <= Instant::now() {
+            return None;
+        }
+        let (response, rx) = oneshot::channel();
+        let id = self
+            .next_request_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        self.tx
+            .send(ReactiveScheduleRequest {
+                id,
+                destination,
+                bytes,
+                deadline,
+                enqueued_at: Instant::now(),
+                retry,
+                response,
+            })
+            .ok()?;
+        match tokio::time::timeout_at(deadline.into(), rx).await {
+            Ok(Ok(permit)) => permit,
+            _ => None,
         }
     }
 }
@@ -358,6 +769,8 @@ struct RepairCreditState {
     reactive_quarters: usize,
     borrowed_reactive_quarters: usize,
     borrowed_proactive_quarters: usize,
+    next_borrow_id: u64,
+    tentative_borrows: HashMap<u64, TentativeBorrow>,
     reactive_mint_remainder: usize,
     reactive_reservations: usize,
     reactive_demand_until: Option<Instant>,
@@ -367,7 +780,27 @@ struct RepairCreditState {
     cap_discarded_quarters: usize,
     private_round: u64,
     last_private_grant: HashMap<u32, u64>,
+    overflow_fairness: HashMap<u32, OverflowFairness>,
     active_destinations: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OverflowFairness {
+    last_active_round: u64,
+    last_committed_service_round: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BorrowDirection {
+    ToReactive,
+    ToProactive,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TentativeBorrow {
+    direction: BorrowDirection,
+    original_quarters: usize,
+    remaining_quarters: usize,
 }
 
 #[cfg(test)]
@@ -403,6 +836,7 @@ struct RepairCreditBucket {
     reactive_reserve_pct: u8,
     reactive_hard_reserve_pct: u8,
     state: Mutex<RepairCreditState>,
+    credit_available: Notify,
 }
 
 impl RepairCreditBucket {
@@ -415,10 +849,11 @@ impl RepairCreditBucket {
         state.gross_minted_quarters = state
             .gross_minted_quarters
             .saturating_add(accepted_primary_bytes);
-        let before = state
+        let before_available = state
             .proactive_quarters
             .saturating_add(state.reactive_quarters);
-        let admitted = accepted_primary_bytes.min(cap.saturating_sub(before));
+        let occupied = before_available.saturating_add(state.tentative_quarters);
+        let admitted = accepted_primary_bytes.min(cap.saturating_sub(occupied));
         state.cap_discarded_quarters = state
             .cap_discarded_quarters
             .saturating_add(accepted_primary_bytes - admitted);
@@ -437,7 +872,7 @@ impl RepairCreditBucket {
         let mut reactive_share = desired_reactive_share;
         let mut proactive_share = admitted - desired_reactive_share;
         let effective_hard_reserve = percentage(
-            before.saturating_add(admitted),
+            before_available.saturating_add(admitted),
             self.reactive_hard_reserve_pct,
         );
         let hard_need = effective_hard_reserve.saturating_sub(state.reactive_quarters);
@@ -450,7 +885,7 @@ impl RepairCreditBucket {
         let repay_reactive = proactive_share
             .min(state.borrowed_reactive_quarters)
             .min(reactive_room.saturating_sub(reactive_share.min(reactive_room)));
-        state.borrowed_reactive_quarters -= repay_reactive;
+        repay_borrow(&mut state, BorrowDirection::ToReactive, repay_reactive);
         metrics::record_repair_class_bytes(
             RepairBudgetClass::Reactive,
             RepairClassStage::Repaid,
@@ -461,7 +896,7 @@ impl RepairCreditBucket {
         let repay_proactive = reactive_share
             .saturating_sub(protected_reactive_share)
             .min(state.borrowed_proactive_quarters);
-        state.borrowed_proactive_quarters -= repay_proactive;
+        repay_borrow(&mut state, BorrowDirection::ToProactive, repay_proactive);
         metrics::record_repair_class_bytes(
             RepairBudgetClass::Proactive,
             RepairClassStage::Repaid,
@@ -478,9 +913,14 @@ impl RepairCreditBucket {
             .saturating_add(repay_proactive)
             .saturating_add(reactive_share.saturating_sub(reactive_room));
         assert_credit_conserved(&state);
+        drop(state);
+        if admitted > 0 {
+            self.credit_available.notify_one();
+        }
         admitted
     }
 
+    #[cfg(test)]
     fn try_reserve(
         self: &Arc<Self>,
         bytes: usize,
@@ -496,6 +936,32 @@ impl RepairCreditBucket {
             metrics::record_repair_class_bytes(metric_class(class), RepairClassStage::Shed, bytes);
         }
         permit
+    }
+
+    fn try_reserve_waiting_reactive(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Option<ProactiveCreditPermit> {
+        let reserved_quarters = bytes.checked_mul(CREDIT_QUARTERS_PER_BYTE)?;
+        let cap = self.capacity_quarters();
+        let mut state = self.state.lock();
+        self.trim_to_capacity(&mut state, cap);
+        self.reserve_locked(
+            &mut state,
+            reserved_quarters,
+            RepairCreditClass::Reactive,
+            RepairCreditSource::Reactive,
+        )
+    }
+
+    fn reactive_retry_cap_bytes(&self, active_destinations: usize) -> usize {
+        let reactive_capacity = percentage(self.capacity_quarters(), self.reactive_reserve_pct)
+            / CREDIT_QUARTERS_PER_BYTE;
+        percentage(
+            reactive_capacity / active_destinations.max(1),
+            REACTIVE_RETRY_SHARE_PCT as u8,
+        )
+        .max(REACTIVE_SCHEDULER_QUANTUM_BYTES)
     }
 
     fn reserve_proactive_batch(
@@ -582,19 +1048,30 @@ impl RepairCreditBucket {
             .enumerate()
             .filter_map(|(index, _)| grants[index].is_none().then_some(index))
             .collect::<Vec<_>>();
+        let overflow_destinations = overflow
+            .iter()
+            .map(|&index| requests[index].destination)
+            .collect::<HashSet<_>>();
+        state.overflow_fairness.retain(|destination, fairness| {
+            overflow_destinations.contains(destination)
+                && fairness.last_active_round.wrapping_add(1) == round
+        });
+        for &destination in &overflow_destinations {
+            state
+                .overflow_fairness
+                .entry(destination)
+                .and_modify(|fairness| fairness.last_active_round = round)
+                .or_insert(OverflowFairness {
+                    last_active_round: round,
+                    last_committed_service_round: round,
+                });
+        }
         overflow.sort_unstable_by(|&left, &right| {
             let left = requests[left];
             let right = requests[right];
-            right
-                .benefit_micros
-                .saturating_mul(left.bytes as u64)
-                .cmp(&left.benefit_micros.saturating_mul(right.bytes as u64))
-                .then_with(|| {
-                    fairness_hash(frame_sequence, left.destination)
-                        .cmp(&fairness_hash(frame_sequence, right.destination))
-                })
-                .then_with(|| left.destination.cmp(&right.destination))
-                .then_with(|| left.copy_index.cmp(&right.copy_index))
+            let left_age = overflow_waiting_rounds(&state, left.destination, round);
+            let right_age = overflow_waiting_rounds(&state, right.destination, round);
+            compare_overflow_requests(left, right, left_age, right_age, frame_sequence)
         });
         for index in overflow {
             let request = requests[index];
@@ -609,6 +1086,7 @@ impl RepairCreditBucket {
             );
             if let Some(permit) = grants[index].as_mut() {
                 permit.destination = Some(request.destination);
+                permit.private_round = round;
             }
         }
         for (request, grant) in requests.iter().zip(&grants) {
@@ -676,6 +1154,15 @@ impl RepairCreditBucket {
         if class == RepairCreditClass::Reactive {
             state.reactive_reservations = state.reactive_reservations.saturating_add(1);
         }
+        let borrow_id = match class {
+            RepairCreditClass::Proactive if reactive_quarters > 0 => Some(
+                register_tentative_borrow(state, BorrowDirection::ToReactive, reactive_quarters),
+            ),
+            RepairCreditClass::Reactive if proactive_quarters > 0 => Some(
+                register_tentative_borrow(state, BorrowDirection::ToProactive, proactive_quarters),
+            ),
+            RepairCreditClass::Proactive | RepairCreditClass::Reactive => None,
+        };
         metrics::record_repair_credit_quarters(RepairCreditStage::Reserved, reserved_quarters);
         metrics::record_repair_class_bytes(
             metric_class(class),
@@ -705,6 +1192,7 @@ impl RepairCreditBucket {
             source,
             destination: None,
             private_round: 0,
+            borrow_id,
             committed: false,
         })
     }
@@ -718,6 +1206,7 @@ impl RepairCreditBucket {
 
     fn commit(&self, permit: &ProactiveCreditPermit) {
         let mut state = self.state.lock();
+        let service_round = state.private_round;
         state.tentative_quarters = state
             .tentative_quarters
             .saturating_sub(permit.reserved_quarters);
@@ -735,28 +1224,21 @@ impl RepairCreditBucket {
         );
         if permit.class == RepairCreditClass::Reactive {
             state.reactive_reservations = state.reactive_reservations.saturating_sub(1);
-            let net = permit
-                .proactive_quarters
-                .min(state.borrowed_reactive_quarters);
-            state.borrowed_reactive_quarters -= net;
-            state.borrowed_proactive_quarters = state
-                .borrowed_proactive_quarters
-                .saturating_add(permit.proactive_quarters - net);
-        } else if permit.reactive_quarters > 0 {
-            let net = permit
-                .reactive_quarters
-                .min(state.borrowed_proactive_quarters);
-            state.borrowed_proactive_quarters -= net;
-            state.borrowed_reactive_quarters = state
-                .borrowed_reactive_quarters
-                .saturating_add(permit.reactive_quarters - net);
+        }
+        if let Some(borrow_id) = permit.borrow_id {
+            state.tentative_borrows.remove(&borrow_id);
         }
         if permit.source == RepairCreditSource::DestinationPrivate
             && let Some(destination) = permit.destination
         {
-            state
-                .last_private_grant
-                .insert(destination, permit.private_round);
+            state.last_private_grant.insert(destination, service_round);
+        }
+        if permit.class == RepairCreditClass::Proactive
+            && let Some(destination) = permit.destination
+            && let Some(fairness) = state.overflow_fairness.get_mut(&destination)
+        {
+            fairness.last_committed_service_round =
+                fairness.last_committed_service_round.max(service_round);
         }
         if let Some(destination) = permit.destination {
             if let Some(destination) = node_identifier(destination) {
@@ -784,18 +1266,42 @@ impl RepairCreditBucket {
         if permit.class == RepairCreditClass::Reactive {
             state.reactive_reservations = state.reactive_reservations.saturating_sub(1);
         }
-        let room = cap.saturating_sub(
-            state
-                .proactive_quarters
-                .saturating_add(state.reactive_quarters),
-        );
-        let reactive = permit.reactive_quarters.min(room);
+        let mut proactive_refund = permit.proactive_quarters;
+        let mut reactive_refund = permit.reactive_quarters;
+        if let Some(borrow_id) = permit.borrow_id
+            && let Some(borrow) = state.tentative_borrows.remove(&borrow_id)
+        {
+            let repaid = borrow
+                .original_quarters
+                .saturating_sub(borrow.remaining_quarters);
+            match borrow.direction {
+                BorrowDirection::ToReactive => {
+                    state.borrowed_reactive_quarters = state
+                        .borrowed_reactive_quarters
+                        .saturating_sub(borrow.remaining_quarters);
+                    proactive_refund = proactive_refund.saturating_add(repaid);
+                    reactive_refund = borrow.remaining_quarters;
+                }
+                BorrowDirection::ToProactive => {
+                    state.borrowed_proactive_quarters = state
+                        .borrowed_proactive_quarters
+                        .saturating_sub(borrow.remaining_quarters);
+                    reactive_refund = reactive_refund.saturating_add(repaid);
+                    proactive_refund = borrow.remaining_quarters;
+                }
+            }
+        }
+        let occupied = state
+            .proactive_quarters
+            .saturating_add(state.reactive_quarters)
+            .saturating_add(state.tentative_quarters);
+        let room = cap.saturating_sub(occupied);
+        let reactive = reactive_refund.min(room);
         state.reactive_quarters = state.reactive_quarters.saturating_add(reactive);
         let room = room - reactive;
-        state.proactive_quarters = state
-            .proactive_quarters
-            .saturating_add(permit.proactive_quarters.min(room));
-        let refunded = reactive.saturating_add(permit.proactive_quarters.min(room));
+        let proactive = proactive_refund.min(room);
+        state.proactive_quarters = state.proactive_quarters.saturating_add(proactive);
+        let refunded = reactive.saturating_add(proactive);
         state.cap_discarded_quarters = state
             .cap_discarded_quarters
             .saturating_add(permit.reserved_quarters.saturating_sub(refunded));
@@ -804,6 +1310,10 @@ impl RepairCreditBucket {
             permit.reserved_quarters.saturating_sub(refunded),
         );
         assert_credit_conserved(&state);
+        drop(state);
+        if refunded > 0 {
+            self.credit_available.notify_one();
+        }
     }
 
     fn balance_bytes(&self) -> usize {
@@ -857,21 +1367,97 @@ impl RepairCreditBucket {
     }
 
     fn trim_to_capacity(&self, state: &mut RepairCreditState, cap: usize) {
-        let total = state
+        let available = state
             .proactive_quarters
             .saturating_add(state.reactive_quarters);
-        let mut excess = total.saturating_sub(cap);
+        // Tentative permits are already promised to queued work and cannot be
+        // evicted when the live burst cap shrinks. They still occupy capacity,
+        // so trim all available credit before allowing mint above that cap.
+        let allowed_available = cap.saturating_sub(state.tentative_quarters);
+        let mut excess = available.saturating_sub(allowed_available);
         state.cap_discarded_quarters = state.cap_discarded_quarters.saturating_add(excess);
         metrics::record_repair_credit_quarters(RepairCreditStage::CapDiscarded, excess);
         let trim = excess.min(state.proactive_quarters);
         state.proactive_quarters -= trim;
         excess -= trim;
         state.reactive_quarters = state.reactive_quarters.saturating_sub(excess);
-        state.borrowed_reactive_quarters = state
-            .borrowed_reactive_quarters
-            .min(percentage(cap, self.reactive_reserve_pct));
-        state.borrowed_proactive_quarters = state.borrowed_proactive_quarters.min(cap);
         assert_credit_conserved(state);
+    }
+}
+
+fn register_tentative_borrow(
+    state: &mut RepairCreditState,
+    direction: BorrowDirection,
+    quarters: usize,
+) -> u64 {
+    let mut borrow_id = state.next_borrow_id.wrapping_add(1).max(1);
+    while state.tentative_borrows.contains_key(&borrow_id) {
+        borrow_id = borrow_id.wrapping_add(1).max(1);
+    }
+    state.next_borrow_id = borrow_id;
+    state.tentative_borrows.insert(
+        borrow_id,
+        TentativeBorrow {
+            direction,
+            original_quarters: quarters,
+            remaining_quarters: quarters,
+        },
+    );
+    match direction {
+        BorrowDirection::ToReactive => {
+            state.borrowed_reactive_quarters =
+                state.borrowed_reactive_quarters.saturating_add(quarters);
+        }
+        BorrowDirection::ToProactive => {
+            state.borrowed_proactive_quarters =
+                state.borrowed_proactive_quarters.saturating_add(quarters);
+        }
+    }
+    borrow_id
+}
+
+fn repay_borrow(state: &mut RepairCreditState, direction: BorrowDirection, quarters: usize) {
+    let aggregate = match direction {
+        BorrowDirection::ToReactive => state.borrowed_reactive_quarters,
+        BorrowDirection::ToProactive => state.borrowed_proactive_quarters,
+    };
+    let repaid = quarters.min(aggregate);
+    if repaid == 0 {
+        return;
+    }
+    let tentative_total = state
+        .tentative_borrows
+        .values()
+        .filter(|borrow| borrow.direction == direction)
+        .map(|borrow| borrow.remaining_quarters)
+        .fold(0usize, usize::saturating_add);
+    let committed = aggregate.saturating_sub(tentative_total);
+    let mut tentative_repayment = repaid.saturating_sub(committed);
+    if tentative_repayment > 0 {
+        let mut borrow_ids = state
+            .tentative_borrows
+            .iter()
+            .filter_map(|(borrow_id, borrow)| {
+                (borrow.direction == direction && borrow.remaining_quarters > 0)
+                    .then_some(*borrow_id)
+            })
+            .collect::<Vec<_>>();
+        borrow_ids.sort_unstable();
+        for borrow_id in borrow_ids {
+            let Some(borrow) = state.tentative_borrows.get_mut(&borrow_id) else {
+                continue;
+            };
+            let applied = tentative_repayment.min(borrow.remaining_quarters);
+            borrow.remaining_quarters -= applied;
+            tentative_repayment -= applied;
+            if tentative_repayment == 0 {
+                break;
+            }
+        }
+    }
+    match direction {
+        BorrowDirection::ToReactive => state.borrowed_reactive_quarters -= repaid,
+        BorrowDirection::ToProactive => state.borrowed_proactive_quarters -= repaid,
     }
 }
 
@@ -897,6 +1483,41 @@ fn fairness_hash(sequence: u64, destination: u32) -> u64 {
     value = value.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     value ^= value >> 27;
     value.wrapping_mul(0x94D0_49BB_1331_11EB) ^ (value >> 31)
+}
+
+fn overflow_waiting_rounds(state: &RepairCreditState, destination: u32, round: u64) -> u64 {
+    state
+        .overflow_fairness
+        .get(&destination)
+        .map(|fairness| {
+            round
+                .saturating_sub(fairness.last_committed_service_round)
+                .min(16)
+        })
+        .unwrap_or(0)
+}
+
+fn compare_overflow_requests(
+    left: ProactiveCreditRequest,
+    right: ProactiveCreditRequest,
+    left_age: u64,
+    right_age: u64,
+    frame_sequence: u64,
+) -> std::cmp::Ordering {
+    u128::from(right.marginal_utility_micros)
+        .saturating_mul(u128::from(32 + right_age.min(16)))
+        .saturating_mul(left.bytes as u128)
+        .cmp(
+            &u128::from(left.marginal_utility_micros)
+                .saturating_mul(u128::from(32 + left_age.min(16)))
+                .saturating_mul(right.bytes as u128),
+        )
+        .then_with(|| {
+            fairness_hash(frame_sequence, left.destination)
+                .cmp(&fairness_hash(frame_sequence, right.destination))
+        })
+        .then_with(|| left.destination.cmp(&right.destination))
+        .then_with(|| left.copy_index.cmp(&right.copy_index))
 }
 
 fn metric_class(class: RepairCreditClass) -> RepairBudgetClass {
@@ -930,16 +1551,196 @@ fn proactive_credit_burst(users: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
-    use super::{AdaptiveVoiceBudget, MIN_ADMISSION_BYTES, ProactiveCreditRequest, percentage};
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        AdaptiveVoiceBudget, MIN_ADMISSION_BYTES, ProactiveCreditRequest, REACTIVE_RETRY_EPOCH,
+        ReactiveScheduleRequest, ReactiveScheduleState, compare_overflow_requests, percentage,
+    };
 
     fn budget(users: u64) -> (Arc<AtomicU64>, AdaptiveVoiceBudget) {
         let users = Arc::new(AtomicU64::new(users));
         let budget = AdaptiveVoiceBudget::new(users.clone());
         (users, budget)
+    }
+
+    fn reactive_request(
+        destination: u32,
+        bytes: usize,
+        deadline: Instant,
+        retry: bool,
+    ) -> (
+        ReactiveScheduleRequest,
+        oneshot::Receiver<Option<super::ProactiveCreditPermit>>,
+    ) {
+        let (response, receiver) = oneshot::channel();
+        static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+        (
+            ReactiveScheduleRequest {
+                id: NEXT_REQUEST_ID
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1),
+                destination,
+                bytes,
+                deadline,
+                enqueued_at: Instant::now(),
+                retry,
+                response,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn reactive_scheduler_uses_edf_within_a_destination() {
+        let now = Instant::now();
+        let mut state = ReactiveScheduleState::new();
+        let (later, _later_rx) = reactive_request(3, 100, now + Duration::from_secs(2), false);
+        let (earlier, _earlier_rx) = reactive_request(3, 100, now + Duration::from_secs(1), false);
+        state.enqueue(later);
+        state.enqueue(earlier);
+
+        let selected = state
+            .pop_next(1_200, now, &HashSet::new())
+            .expect("earliest request");
+        assert_eq!(selected.deadline, now + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn reactive_scheduler_drr_is_input_order_independent_and_eventually_fair() {
+        fn sequence(order: &[u32]) -> Vec<u32> {
+            let now = Instant::now();
+            let mut state = ReactiveScheduleState::new();
+            let mut receivers = Vec::new();
+            for &destination in order {
+                let (request, receiver) =
+                    reactive_request(destination, 600, now + Duration::from_secs(10), false);
+                state.enqueue(request);
+                receivers.push(receiver);
+            }
+            let mut granted = Vec::new();
+            while !state.is_empty() {
+                let request = state
+                    .pop_next(1_200, now, &HashSet::new())
+                    .expect("schedulable request");
+                granted.push(request.destination);
+                state.record_grant(request.destination, request.bytes, request.retry);
+            }
+            drop(receivers);
+            granted
+        }
+
+        let forward = sequence(&[3, 3, 4, 15]);
+        let reversed = sequence(&[15, 4, 3, 3]);
+        assert_eq!(forward, reversed);
+        assert_eq!(forward, vec![3, 4, 15, 3]);
+    }
+
+    #[test]
+    fn reactive_scheduler_accumulates_deficit_for_large_frames() {
+        let now = Instant::now();
+        let mut state = ReactiveScheduleState::new();
+        let (request, _receiver) = reactive_request(3, 3_001, now + Duration::from_secs(1), false);
+        state.enqueue(request);
+        let selected = state
+            .pop_next(1_200, now, &HashSet::new())
+            .expect("large request must accumulate enough deficit");
+        assert_eq!(selected.bytes, 3_001);
+    }
+
+    #[test]
+    fn retry_cap_defers_retry_without_blocking_fresh_work() {
+        let now = Instant::now();
+        let mut state = ReactiveScheduleState::new();
+        let (first_retry, _first_rx) =
+            reactive_request(3, 1_000, now + Duration::from_secs(1), true);
+        let (second_retry, _second_rx) =
+            reactive_request(3, 1_000, now + Duration::from_secs(2), true);
+        let (fresh, _fresh_rx) = reactive_request(3, 100, now + Duration::from_secs(3), false);
+        state.enqueue(first_retry);
+        state.enqueue(second_retry);
+        state.enqueue(fresh);
+
+        let first = state.pop_next(1_200, now, &HashSet::new()).unwrap();
+        assert!(first.retry);
+        state.record_grant(first.destination, first.bytes, first.retry);
+        let uncapped = state.pop_next(1_200, now, &HashSet::new()).unwrap();
+        assert!(!uncapped.retry, "fresh work must bypass a capped retry");
+        state.record_grant(uncapped.destination, uncapped.bytes, uncapped.retry);
+        assert!(state.pop_next(1_200, now, &HashSet::new()).is_none());
+
+        let next_epoch = state.retry_epoch_started + REACTIVE_RETRY_EPOCH;
+        let deferred = state
+            .pop_next(1_200, next_epoch, &HashSet::new())
+            .expect("retry becomes eligible in the next epoch");
+        assert!(deferred.retry);
+    }
+
+    #[tokio::test]
+    async fn reactive_scheduler_waits_for_mint_and_charges_exact_bytes() {
+        let (_, budget) = budget(100);
+        let waiter = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                budget
+                    .reserve_reactive_credit_scheduled(
+                        3,
+                        100,
+                        Instant::now() + Duration::from_secs(1),
+                        false,
+                    )
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        budget.mint_proactive_credit(400);
+        let permit = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("mint should wake pending reactive work");
+        assert_eq!(permit.reserved_quarters(), 400);
+        permit.commit();
+        let snapshot = budget.repair_credit_snapshot();
+        assert_eq!(snapshot.committed_quarters, 400);
+        snapshot.assert_conserved();
+    }
+
+    #[tokio::test]
+    async fn reactive_scheduler_shutdown_releases_waiters_without_credit() {
+        let (_, budget) = budget(100);
+        let shutdown = CancellationToken::new();
+        budget.link_reactive_scheduler_shutdown(shutdown.clone());
+        let waiter = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                budget
+                    .reserve_reactive_credit_scheduled(
+                        3,
+                        100,
+                        Instant::now() + Duration::from_secs(30),
+                        false,
+                    )
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+        let permit = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("shutdown must release reactive waiter")
+            .unwrap();
+        assert!(permit.is_none());
+        let snapshot = budget.repair_credit_snapshot();
+        assert_eq!(snapshot.tentative_quarters, 0);
+        snapshot.assert_conserved();
     }
 
     #[test]
@@ -1086,6 +1887,81 @@ mod tests {
     }
 
     #[test]
+    fn tentative_credit_occupies_burst_capacity_during_mint_and_refund() {
+        let allocator =
+            AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(100)), 0, 0);
+        let cap = allocator.proactive_credit_burst_bytes() * 4;
+        assert_eq!(allocator.mint_proactive_credit(usize::MAX), cap);
+        let permit = allocator.try_reserve_proactive_credit(100).unwrap();
+        let reserved = permit.reserved_quarters();
+        assert_eq!(allocator.mint_proactive_credit(reserved), 0);
+        let held = allocator.repair_credit_snapshot();
+        assert_eq!(held.available_quarters + held.tentative_quarters, cap);
+        held.assert_conserved();
+
+        drop(permit);
+        let refunded = allocator.repair_credit_snapshot();
+        assert_eq!(refunded.available_quarters, cap);
+        assert_eq!(refunded.tentative_quarters, 0);
+        refunded.assert_conserved();
+    }
+
+    #[test]
+    fn tentative_borrow_is_repaid_before_commit_without_recreating_debt() {
+        let allocator =
+            AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(100)), 30, 0);
+        allocator.mint_proactive_credit(400);
+        let permit = allocator.try_reserve_proactive_credit(80).unwrap();
+        assert_eq!(
+            allocator.repair_credit_snapshot().debt_to_reactive_quarters,
+            40
+        );
+        allocator.mint_proactive_credit(40);
+        assert_eq!(
+            allocator.repair_credit_snapshot().debt_to_reactive_quarters,
+            12
+        );
+        permit.commit();
+        let committed = allocator.repair_credit_snapshot();
+        assert_eq!(committed.debt_to_reactive_quarters, 12);
+        committed.assert_conserved();
+    }
+
+    #[test]
+    fn refund_after_tentative_debt_repayment_restores_control_class_balances() {
+        fn allocator() -> AdaptiveVoiceBudget {
+            AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(100)), 30, 0)
+        }
+
+        let control = allocator();
+        control.mint_proactive_credit(400);
+        control.mint_proactive_credit(40);
+        let expected = control.repair_credit_snapshot();
+
+        let proactive = allocator();
+        proactive.mint_proactive_credit(400);
+        let permit = proactive.try_reserve_proactive_credit(80).unwrap();
+        proactive.mint_proactive_credit(40);
+        drop(permit);
+        let refunded = proactive.repair_credit_snapshot();
+        assert_eq!(refunded.proactive_quarters, expected.proactive_quarters);
+        assert_eq!(refunded.reactive_quarters, expected.reactive_quarters);
+        assert_eq!(refunded.debt_to_reactive_quarters, 0);
+        refunded.assert_conserved();
+
+        let reactive = allocator();
+        reactive.mint_proactive_credit(400);
+        let permit = reactive.try_reserve_reactive_credit(40).unwrap();
+        reactive.mint_proactive_credit(40);
+        drop(permit);
+        let refunded = reactive.repair_credit_snapshot();
+        assert_eq!(refunded.proactive_quarters, expected.proactive_quarters);
+        assert_eq!(refunded.reactive_quarters, expected.reactive_quarters);
+        assert_eq!(refunded.debt_to_proactive_quarters, 0);
+        refunded.assert_conserved();
+    }
+
+    #[test]
     fn private_fairness_is_permutation_invariant_and_rotates_low_credit() {
         fn zero_reserve_budget() -> AdaptiveVoiceBudget {
             AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(100)), 0, 0)
@@ -1123,12 +1999,45 @@ mod tests {
             *counts.entry(permit.destination.unwrap()).or_default() += 1;
             permit.commit();
         }
+
         assert_eq!(counts.len(), 3);
         assert!(counts.values().all(|count| *count >= 9));
     }
 
+    #[tokio::test]
+    async fn unaffordable_reactive_request_does_not_block_smaller_same_destination_work() {
+        let (_, budget) = budget(100);
+        budget.mint_proactive_credit(80);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let large = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                budget
+                    .reserve_reactive_credit_scheduled(3, 30, deadline, false)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        let small = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                budget
+                    .reserve_reactive_credit_scheduled(3, 20, deadline, false)
+                    .await
+            }
+        });
+        let permit = tokio::time::timeout(Duration::from_millis(250), small)
+            .await
+            .expect("smaller request must bypass unaffordable work")
+            .unwrap()
+            .expect("smaller request should receive available credit");
+        assert_eq!(permit.reserved_quarters(), 80);
+        permit.commit();
+        large.abort();
+    }
+
     #[test]
-    fn capped_private_phase_leaves_work_conserving_benefit_ranked_overflow() {
+    fn capped_private_phase_leaves_work_conserving_utility_ranked_overflow() {
         let make_budget =
             || AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(100)), 0, 0);
         let requests = [
@@ -1171,6 +2080,132 @@ mod tests {
                 .iter()
                 .any(|(destination, _)| *destination == best_remaining_first)
         );
+    }
+
+    #[test]
+    fn overflow_aging_eventually_serves_a_continuously_waiting_destination() {
+        let budget =
+            AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(100)), 0, 0);
+        let requests = [
+            ProactiveCreditRequest::new(3, 1, 100, 1),
+            ProactiveCreditRequest::new(4, 1, 140, 1),
+        ];
+        let mut served_low = None;
+        for sequence in 0..17 {
+            budget.mint_proactive_credit(4);
+            let grants = budget.reserve_proactive_credit_batch(sequence, &requests);
+            let permit = grants.into_iter().flatten().next().unwrap();
+            if permit.destination == Some(3) {
+                served_low = Some(sequence);
+            }
+            permit.commit();
+            if served_low.is_some() {
+                break;
+            }
+        }
+        assert!(served_low.is_some_and(|round| round <= 16));
+    }
+
+    #[test]
+    fn overflow_aging_is_permutation_invariant_and_inactivity_discards_age() {
+        let make_budget =
+            || AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(100)), 0, 0);
+        let ordered = [
+            ProactiveCreditRequest::new(3, 1, 100, 1),
+            ProactiveCreditRequest::new(4, 1, 140, 1),
+        ];
+        let reversed = [ordered[1], ordered[0]];
+        let first = make_budget();
+        let second = make_budget();
+        for sequence in 0..12 {
+            for (budget, requests) in [(&first, ordered.as_slice()), (&second, reversed.as_slice())]
+            {
+                budget.mint_proactive_credit(4);
+                let permit = budget
+                    .reserve_proactive_credit_batch(sequence, requests)
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .unwrap();
+                assert_eq!(permit.destination, Some(4));
+                permit.commit();
+            }
+        }
+
+        for budget in [&first, &second] {
+            budget.mint_proactive_credit(4);
+            budget
+                .reserve_proactive_credit_batch(12, &ordered[1..])
+                .into_iter()
+                .flatten()
+                .next()
+                .unwrap()
+                .commit();
+        }
+        first.mint_proactive_credit(4);
+        second.mint_proactive_credit(4);
+        let first_winner = first
+            .reserve_proactive_credit_batch(13, &ordered)
+            .into_iter()
+            .flatten()
+            .next()
+            .unwrap();
+        let second_winner = second
+            .reserve_proactive_credit_batch(13, &reversed)
+            .into_iter()
+            .flatten()
+            .next()
+            .unwrap();
+        assert_eq!(first_winner.destination, Some(4));
+        assert_eq!(second_winner.destination, Some(4));
+    }
+
+    #[test]
+    fn overflow_ratio_comparison_uses_u128_and_copy_index_ties() {
+        let left = ProactiveCreditRequest::new(3, u32::MAX as usize - 1, u64::MAX - 1, 1);
+        let right = ProactiveCreditRequest::new(3, u32::MAX as usize, u64::MAX, 2);
+        let forward = compare_overflow_requests(left, right, 16, 16, 7);
+        let reverse = compare_overflow_requests(right, left, 16, 16, 7);
+        assert!(forward.is_lt());
+        assert_eq!(forward, reverse.reverse());
+
+        let first_copy = ProactiveCreditRequest::new(3, 1, 100, 0);
+        let second_copy = ProactiveCreditRequest::new(3, 1, 100, 1);
+        assert!(compare_overflow_requests(first_copy, second_copy, 0, 0, 7).is_lt());
+    }
+
+    #[test]
+    fn delayed_commits_reset_overflow_service_to_current_allocator_round() {
+        let budget =
+            AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(100)), 0, 0);
+        let request = [ProactiveCreditRequest::new(3, 1, 100, 1)];
+        budget.mint_proactive_credit(4);
+        let older = budget
+            .reserve_proactive_credit_batch(1, &request)
+            .into_iter()
+            .next()
+            .flatten()
+            .unwrap();
+        budget.mint_proactive_credit(4);
+        let newer = budget
+            .reserve_proactive_credit_batch(2, &request)
+            .into_iter()
+            .next()
+            .flatten()
+            .unwrap();
+        budget.mint_proactive_credit(4);
+        let current = budget
+            .reserve_proactive_credit_batch(3, &request)
+            .into_iter()
+            .next()
+            .flatten()
+            .unwrap();
+        newer.commit();
+        older.commit();
+        let state = budget.repair_credit.state.lock();
+        assert_eq!(state.overflow_fairness[&3].last_committed_service_round, 3);
+        drop(state);
+        drop(current);
     }
 
     #[test]

@@ -510,11 +510,16 @@ udp_family_min_samples = 32
 udp_family_probe_loss_block_count = 3
 udp_family_block_loss_ppm = 250000
 udp_family_loss_excess_over_tcp_ppm = 50000
-# Observe separate BestEffort datagram states using the weighted effective-loss
-# score. QUIC DATAGRAM currently uses the aggregate physical-QUIC score. This
-# is shadow-only and does not exclude suspect paths from routing.
+# Observe separate BestEffort datagram states. Raw UDP uses weighted effective
+# loss. QUIC DATAGRAM uses path-local enqueue rejection and writer-failure
+# evidence; pressure, too-large, and ingress counters are diagnostic only.
+# This is shadow-only and does not affect routing or KCP.
 best_effort_datagram_effective_loss_suspect_ppm = 5000
 best_effort_datagram_effective_loss_recover_ppm = 2500
+best_effort_quic_datagram_health_suspect_ppm = 100000
+best_effort_quic_datagram_health_recover_ppm = 10000
+best_effort_datagram_suspect_bad_windows = 3
+best_effort_datagram_recover_healthy_ms = 10000
 large_rtt_threshold_ms = 100
 lossy_link_threshold_ppm = 20000
 bulk_payload_threshold_bytes = 65536
@@ -575,14 +580,19 @@ tree_delivery_enabled = true
 repair_enabled = true
 transport_ttl_ms = 750
 repair_transport_ttl_ms = 750
-# Defaults to repair_transport_ttl_ms when omitted.
+# Transport TTL for the NACK itself; defaults to repair_transport_ttl_ms. The
+# payload separately carries the requester's remaining actionable gap time as
+# a relative response deadline.
 repair_request_ttl_ms = 750
 repair_cache_ms = 1600
 adaptive_jitter_max_delay_ms = 750
 # At most two proactive copies may be requested per frame. The default is one.
+# This caps demand; conserved-credit overflow is ranked separately by marginal
+# on-time utility and destination fairness.
 repair_max_extra_copies_per_frame = 1
 # Percentages of the repair-credit cap. Unused reactive entitlement above the
-# hard reserve is borrowable by proactive work.
+# hard reserve is borrowable by proactive work. NACK and tail frames share a
+# deadline-aware, byte-fair reactive scheduler; these are not separate mints.
 repair_reactive_reserve_pct = 30
 repair_reactive_hard_reserve_pct = 10
 
@@ -687,16 +697,28 @@ distinguishes logical selections with bounded `path` values such as
 metrics remain shared under `TransportKind::Quic`; delivery-path telemetry does
 not model DATAGRAM as a second physical link.
 
-The `best_effort_datagram_effective_loss_*_ppm` thresholds drive a shadow-only
-hysteretic state (`probing`, `healthy`, `suspect`, or `blocked`). They apply to
-the weighted effective-loss score, which combines available probe, native, and
-data-health evidence; they are not raw-loss cutoffs. The recovery threshold
-must not exceed the suspect threshold and both must be at most 1,000,000 ppm.
-These observations never remove a candidate. JSON status exposes current
-state, reason, score, samples, transition count, state age, and observation
-age. Prometheus exposes the same fields under the
-`shitspeak_s2s_datagram_path_*` metric family. QUIC DATAGRAM observations use
-aggregate physical-QUIC evidence until lane-native loss exists.
+BestEffort datagram health is a shadow-only hysteretic state (`probing`,
+`healthy`, `suspect`, or `blocked`) and never removes a candidate. Raw UDP uses
+the `best_effort_datagram_effective_loss_*_ppm` weighted effective-loss
+thresholds, not raw-loss cutoffs. QUIC DATAGRAM instead uses path-local app
+queue rejection and writer failure. Quinn buffer pressure, too-large events,
+and ingress validation remain separate diagnostic counters. No DATAGRAM ACK,
+on-time delivery, or end-to-end packet-loss signal exists. Aggregate QUIC
+stream RTT/loss does not drive the QUIC DATAGRAM state, and the observer does
+not affect routing or KCP behavior.
+
+QUIC DATAGRAM requires `best_effort_datagram_suspect_bad_windows` distinct
+completed one-second bad windows before entering `suspect`; up to 64 completed
+windows are replayed in order. Recovery requires new completed healthy windows
+spanning `best_effort_datagram_recover_healthy_ms`. Repeated reads of one window
+do not advance either gate. Stale evidence returns the observer to `probing`
+without clearing the recovery latch. Session replacement starts a tokenized
+evidence generation and ignores late outcomes from the replaced session.
+Status reports the last scored generation separately from newer
+diagnostic-only generations. JSON status and bounded
+`shitspeak_s2s_datagram_path_*` Prometheus gauges expose state, reason, score,
+confidence, window counters, pending temporal progress, transitions, and
+freshness.
 
 The preference does not weaken admission checks. Unhealthy or otherwise
 unusable datagram paths are excluded, and the QUIC DATAGRAM path is not a
@@ -738,12 +760,11 @@ that, clamped to `32 KiB..512 KiB`; tracked reorder speakers are
 
 Originals and reactive repairs use the primary lane. Proactive copies use the
 lower-priority lane and are shed before primary traffic when capacity is
-exhausted. An original that is accepted into the voice service and cached for
-repair mints one conserved repair byte for every four encoded original bytes,
-before aggregate transport completion. A later aggregate-send failure does not
-revoke that bounded credit, but it also queues no proactive copies. Proactive
-and reactive payloads both pay their encoded byte size from the same 25% mint,
-which remains capped by the dynamic burst.
+exhausted. An original mints one conserved repair byte for every four encoded
+original bytes only after the aggregate primary transport accepts the send. A
+failed primary send mints no credit and queues no proactive or tail repair.
+Proactive and reactive payloads both pay their encoded byte size from the same
+25% mint, which remains capped by the dynamic burst.
 
 `repair_reactive_reserve_pct` (30 by default) is the reactive/tail entitlement
 as a percentage of the total repair mint; the remainder is proactive
@@ -812,24 +833,91 @@ allocator gauges. Borrowing and repayment totals remain class-stage counters.
 Lifecycle counters preserve the ledger's quarter-byte precision, so their
 Prometheus values may have `.25`, `.5`, or `.75` fractional byte components.
 
+Reactive scheduler observability uses the bounded counter
+`shitspeak_s2s_voice_reactive_scheduler_events_total{event}`, where `event` is
+one of `granted`, `credit_wait`, `retry_deferred`, `deadline_expired`,
+`cancelled`, or `shutdown`. Unlabeled gauges report aggregate
+`shitspeak_s2s_voice_reactive_scheduler_queued_items`,
+`shitspeak_s2s_voice_reactive_scheduler_queued_encoded_bytes`,
+`shitspeak_s2s_voice_reactive_scheduler_active_destinations`,
+`shitspeak_s2s_voice_reactive_scheduler_oldest_wait_microseconds`, and
+`shitspeak_s2s_voice_reactive_scheduler_max_starvation_rounds`. They expose
+bounded allocator health without adding session, request, or destination labels.
+
 The exact ledger invariant, evaluated in quarter-byte units, is
 `minted = available + tentatively_reserved + committed + cap_discarded`.
 `reserved` and `refunded` are transition counters used to derive outstanding
 tentative credit; they are not additional credit sources.
 
-This first allocator phase implements proactive cross-destination fairness:
-first-copy candidates receive a deterministic private/fair-share phase, then
-shared overflow ranks the existing loss/jitter repair score per encoded byte
-with deterministic tie-breaking. The score does not yet model receiver on-time
-probability, alternate-path correlation or diversity, deadline slack, or
-fairness aging; those are phase-two inputs.
+Proactive allocation has two deterministic phases. The existing UDP-only
+primary loss/jitter thresholds and deterministic sampling generate copy demand;
+utility ranking does not create new demand or generate QUIC-DATAGRAM copies.
+One first-copy candidate per destination receives the
+private/fair-share phase. Remaining candidates compete for shared overflow by
+marginal utility per encoded byte. A candidate needs a measured alternate with
+a distinct first hop and enough remaining deadline. Its estimated repair
+probability multiplies `1 - alternate_loss` by an on-time estimate that rises
+from zero at the alternate latency to one at latency plus three times jitter.
+The remaining factors are a 1.25 terminator value, a 0.75 same-transport or 1.0
+different-transport diversity proxy, deadline urgency from 1.0 through 1.5,
+strong diminishing returns for the second copy, and bounded fairness aging;
+later copies have zero utility. Zero-utility candidates are discarded before
+body encoding or credit reservation.
 
-Reactive NACK responses and tail attempts now pay exact full-byte credit and
-proactive borrowing cannot consume accrued reactive credit below the hard class
-reserve. They are still dispatched by the existing workers rather than a
-global earliest-deadline-first scheduler, and do not yet have cross-destination
-deficit scheduling. Reactive EDF and destination fairness are explicitly
-deferred to the next phase.
+One route-quality batch and deadline origin are captured before the primary
+send. Continuously waiting overflow receives 3.125% aging per allocator round,
+capped at 1.5 times after 16 rounds; service resets the age, and an inactive
+destination returns unaged. Deterministic frame-sequence/destination/copy
+tie-breaking makes input iteration order irrelevant. These values rank a
+conserved budget; they never mint additional credit and instantaneous credit
+balance is not a path-quality input.
+
+The proactive utility is deliberately a proxy. First-hop and transport
+differences cannot prove that two routes are independent farther downstream,
+and the route-quality snapshot cannot observe the receiver's actual arrival
+time. The alternate's measured latency, loss, and jitter estimate on-time
+benefit; they are not delivery acknowledgements. A second copy can therefore
+still traverse correlated underlay even though its marginal utility is lower.
+
+Reactive NACK responses and tail attempts pay exact full-byte credit and enter
+one per-frame scheduler before receiving a tentative permit. Frames are EDF
+within each destination. Across destinations, byte-deficit round robin uses a
+1200-byte quantum and orders peers by least-recent actual grant, then node ID,
+so a stream of small frames cannot monopolize service merely by producing more
+requests. Retry traffic is bounded per destination in each 100 ms epoch to half
+of that destination's active share of reactive capacity, with a one-quantum
+minimum. Over-cap retries defer rather than being shed. Temporary credit
+exhaustion parks work until mint, refund, a new request, the next retry epoch,
+or its absolute local deadline. Only an actual permit advances service and
+retry accounting. Expired work receives no permit; transport timeout,
+rejection, or cancellation refunds tentative credit, and every retry must
+obtain a new permit. This is destination-fair EDF, not global EDF across all
+peers.
+
+NACK ranges and tail suffixes advance one frame at a time. The current frame
+from every ready key reaches the shared permit scheduler before transport
+concurrency is applied; a successful frame then requeues the next sequence
+behind other ready work. Retry-cap deferral and an unaffordable large request
+do not hide eligible fresh or smaller work for the same destination. Actual
+transport attempts remain bounded, with at most one repair send per destination
+in flight.
+
+A repair requester writes its remaining local actionable-gap window into the
+NACK as a relative duration. On receipt, the responder creates a local deadline
+bounded by its configured repair transport/cache lifetime, merges overlapping
+requests using the earliest such deadline, and applies the deadline to each
+frame and transport attempt. This avoids shared-clock assumptions, but time
+spent carrying the request over the network is not subtracted from the encoded
+duration. The deadline is therefore a bounded scheduling hint, not proof that a
+repair will reach the receiver before playout.
+
+Tail repair has protected reactive credit, primary sender admission, separate
+sender pressure state, and bounded concurrent dispatch. It intentionally stays
+proactive-marked on the wire: a healthy reorder stream rejects ordinary
+reactive repair when no gap has been observed, while a tail terminator has no
+later packet that could reveal its loss. Consequently tail repair is not yet a
+fully isolated reactive receiver lane even though its sender-side scheduling
+and accounting are reactive.
 
 There is deliberately no unminted startup seed. During cold start, the first
 full-frame NACK may therefore be credit-shed until accepted originals have

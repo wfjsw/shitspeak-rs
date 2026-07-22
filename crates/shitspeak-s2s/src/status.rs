@@ -278,10 +278,27 @@ pub(crate) struct DatagramPathHealthMetric {
     state: &'static str,
     reason: &'static str,
     effective_loss_ppm: Option<u32>,
+    path_health_score_ppm: Option<u32>,
     loss_samples: u64,
+    sample_confidence_ppm: u32,
+    enqueue_accepted: u64,
+    enqueue_rejected: u64,
+    too_large: u64,
+    pressure: u64,
+    outcome_successes: u64,
+    outcome_failures: u64,
+    ingress_validated: u64,
+    ingress_rejected: u64,
+    ingress_read_failures: u64,
+    consecutive_bad_windows: u32,
+    recovery_healthy_age_ms: u128,
+    recovery_required: bool,
     transitions: u64,
     state_age_ms: u128,
+    scored_generation: Option<u64>,
+    diagnostic_generation: Option<u64>,
     observation_age_ms: u128,
+    diagnostic_observation_age_ms: Option<u128>,
 }
 
 pub fn spawn_status_server(
@@ -686,10 +703,29 @@ pub(crate) fn build_topology_snapshot(
             state: entry.state().name(),
             reason: entry.reason().name(),
             effective_loss_ppm: entry.effective_loss_ppm(),
+            path_health_score_ppm: entry.path_health_score_ppm(),
             loss_samples: entry.loss_samples(),
+            sample_confidence_ppm: entry.sample_confidence_ppm(),
+            enqueue_accepted: entry.enqueue_accepted(),
+            enqueue_rejected: entry.enqueue_rejected(),
+            too_large: entry.too_large(),
+            pressure: entry.pressure(),
+            outcome_successes: entry.outcome_successes(),
+            outcome_failures: entry.outcome_failures(),
+            ingress_validated: entry.ingress_validated(),
+            ingress_rejected: entry.ingress_rejected(),
+            ingress_read_failures: entry.ingress_read_failures(),
+            consecutive_bad_windows: entry.consecutive_bad_windows(),
+            recovery_healthy_age_ms: entry.recovery_healthy_age().as_millis(),
+            recovery_required: entry.recovery_required(),
             transitions: entry.transitions(),
             state_age_ms: entry.state_age().as_millis(),
+            scored_generation: entry.scored_generation(),
+            diagnostic_generation: entry.diagnostic_generation(),
             observation_age_ms: entry.observation_age().as_millis(),
+            diagnostic_observation_age_ms: entry
+                .diagnostic_observation_age()
+                .map(|age| age.as_millis()),
         })
         .collect::<Vec<_>>();
     datagram_path_health.sort_by_key(|entry| (entry.peer, entry.path));
@@ -1088,8 +1124,77 @@ impl<'a> PrometheusWriter<'a> {
             "gauge",
         );
         self.header(
+            "shitspeak_s2s_datagram_path_health_score_ppm",
+            "Current local admission and writer-outcome failure score for a datagram delivery path.",
+            "gauge",
+        );
+        self.header(
             "shitspeak_s2s_datagram_path_loss_samples",
             "Current effective-loss sample count for a datagram delivery path.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_path_sample_confidence_ppm",
+            "Confidence of the current datagram delivery-path health window.",
+            "gauge",
+        );
+        for (name, help) in [
+            (
+                "enqueue_accepted",
+                "App-queue admissions in the current completed window.",
+            ),
+            (
+                "enqueue_rejected",
+                "App-queue rejections in the current completed window.",
+            ),
+            (
+                "too_large",
+                "Too-large or no-fit observations in the current completed window.",
+            ),
+            (
+                "pressure",
+                "App or Quinn queue-pressure observations in the current completed window.",
+            ),
+            (
+                "outcome_successes",
+                "Quinn DATAGRAM writer acceptances in the current completed window.",
+            ),
+            (
+                "outcome_failures",
+                "Quinn DATAGRAM writer failures in the current completed window.",
+            ),
+            (
+                "ingress_validated",
+                "Validated QUIC DATAGRAM ingress frames in the current completed window.",
+            ),
+            (
+                "ingress_rejected",
+                "Rejected QUIC DATAGRAM ingress frames in the current completed window.",
+            ),
+            (
+                "ingress_read_failures",
+                "QUIC DATAGRAM ingress read failures in the current completed window.",
+            ),
+        ] {
+            self.header(
+                &format!("shitspeak_s2s_datagram_path_{name}"),
+                help,
+                "gauge",
+            );
+        }
+        self.header(
+            "shitspeak_s2s_datagram_path_consecutive_bad_windows",
+            "Consecutive completed bad windows pending shadow suspect entry.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_path_recovery_healthy_age_ms",
+            "Span of distinct completed healthy windows pending shadow recovery.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_path_recovery_required",
+            "Whether the datagram path must complete temporal recovery before becoming healthy.",
             "gauge",
         );
         self.header(
@@ -1104,7 +1209,22 @@ impl<'a> PrometheusWriter<'a> {
         );
         self.header(
             "shitspeak_s2s_datagram_path_health_observation_age_ms",
-            "Age of the most recent shadow datagram health observation.",
+            "Age of the most recent scored shadow datagram health observation.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_path_scored_generation",
+            "Generation of the most recent scored QUIC DATAGRAM evidence window.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_path_diagnostic_generation",
+            "Generation of the most recent diagnostic QUIC DATAGRAM evidence window.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_path_diagnostic_observation_age_ms",
+            "Age of the most recent diagnostic QUIC DATAGRAM evidence window.",
             "gauge",
         );
         self.header(
@@ -1391,6 +1511,36 @@ impl<'a> PrometheusWriter<'a> {
         self.header(
             "shitspeak_s2s_voice_repair_allocator_active_destinations",
             "Current destinations participating in S2S voice fair repair allocation.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_reactive_scheduler_events_total",
+            "S2S voice reactive repair scheduler outcomes by bounded event.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_reactive_scheduler_queued_items",
+            "Current S2S voice reactive repair items waiting for scheduling.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_reactive_scheduler_queued_encoded_bytes",
+            "Current encoded bytes in S2S voice reactive repair items waiting for scheduling.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_reactive_scheduler_active_destinations",
+            "Current destinations represented in the S2S voice reactive repair queue.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_reactive_scheduler_oldest_wait_microseconds",
+            "Age in microseconds of the oldest queued S2S voice reactive repair item.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_reactive_scheduler_max_starvation_rounds",
+            "Current maximum scheduler starvation rounds across queued S2S voice reactive destinations.",
             "gauge",
         );
         self.header(
@@ -2010,10 +2160,54 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
                 loss_ppm as f64,
             ));
         }
+        if let Some(score_ppm) = entry.path_health_score_ppm {
+            out.push(sample(
+                "shitspeak_s2s_datagram_path_health_score_ppm",
+                labels.clone(),
+                score_ppm as f64,
+            ));
+        }
         out.push(sample(
             "shitspeak_s2s_datagram_path_loss_samples",
             labels.clone(),
             entry.loss_samples as f64,
+        ));
+        out.push(sample(
+            "shitspeak_s2s_datagram_path_sample_confidence_ppm",
+            labels.clone(),
+            entry.sample_confidence_ppm as f64,
+        ));
+        for (name, value) in [
+            ("enqueue_accepted", entry.enqueue_accepted),
+            ("enqueue_rejected", entry.enqueue_rejected),
+            ("too_large", entry.too_large),
+            ("pressure", entry.pressure),
+            ("outcome_successes", entry.outcome_successes),
+            ("outcome_failures", entry.outcome_failures),
+            ("ingress_validated", entry.ingress_validated),
+            ("ingress_rejected", entry.ingress_rejected),
+            ("ingress_read_failures", entry.ingress_read_failures),
+        ] {
+            out.push(sample(
+                &format!("shitspeak_s2s_datagram_path_{name}"),
+                labels.clone(),
+                value as f64,
+            ));
+        }
+        out.push(sample(
+            "shitspeak_s2s_datagram_path_consecutive_bad_windows",
+            labels.clone(),
+            entry.consecutive_bad_windows as f64,
+        ));
+        out.push(sample(
+            "shitspeak_s2s_datagram_path_recovery_healthy_age_ms",
+            labels.clone(),
+            entry.recovery_healthy_age_ms as f64,
+        ));
+        out.push(sample(
+            "shitspeak_s2s_datagram_path_recovery_required",
+            labels.clone(),
+            if entry.recovery_required { 1.0 } else { 0.0 },
         ));
         out.push(sample(
             "shitspeak_s2s_datagram_path_health_transitions",
@@ -2025,11 +2219,32 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
             labels.clone(),
             entry.state_age_ms as f64,
         ));
+        if let Some(generation) = entry.scored_generation {
+            out.push(sample(
+                "shitspeak_s2s_datagram_path_scored_generation",
+                labels.clone(),
+                generation as f64,
+            ));
+        }
+        if let Some(generation) = entry.diagnostic_generation {
+            out.push(sample(
+                "shitspeak_s2s_datagram_path_diagnostic_generation",
+                labels.clone(),
+                generation as f64,
+            ));
+        }
         out.push(sample(
             "shitspeak_s2s_datagram_path_health_observation_age_ms",
-            labels,
+            labels.clone(),
             entry.observation_age_ms as f64,
         ));
+        if let Some(age_ms) = entry.diagnostic_observation_age_ms {
+            out.push(sample(
+                "shitspeak_s2s_datagram_path_diagnostic_observation_age_ms",
+                labels,
+                age_ms as f64,
+            ));
+        }
     }
 
     for entry in &snapshot.voice_transport_bindings {
@@ -3071,10 +3286,27 @@ mod tests {
                 state: "suspect",
                 reason: "measured_loss",
                 effective_loss_ppm: Some(6_000),
+                path_health_score_ppm: Some(125_000),
                 loss_samples: 64,
+                sample_confidence_ppm: 1_000_000,
+                enqueue_accepted: 60,
+                enqueue_rejected: 4,
+                too_large: 2,
+                pressure: 3,
+                outcome_successes: 61,
+                outcome_failures: 3,
+                ingress_validated: 12,
+                ingress_rejected: 1,
+                ingress_read_failures: 0,
+                consecutive_bad_windows: 3,
+                recovery_healthy_age_ms: 0,
+                recovery_required: true,
                 transitions: 3,
                 state_age_ms: 1_250,
+                scored_generation: Some(7),
+                diagnostic_generation: Some(8),
                 observation_age_ms: 25,
+                diagnostic_observation_age_ms: Some(10),
             }],
             delivery_path_selections: vec![DeliveryPathSelectionMetric {
                 path: "quic_datagram",
@@ -3158,6 +3390,31 @@ mod tests {
             25
         );
         assert_eq!(
+            topology_json["datagram_path_health"][0]["path_health_score_ppm"],
+            125_000
+        );
+        assert_eq!(
+            topology_json["datagram_path_health"][0]["sample_confidence_ppm"],
+            1_000_000
+        );
+        assert_eq!(topology_json["datagram_path_health"][0]["pressure"], 3);
+        assert_eq!(
+            topology_json["datagram_path_health"][0]["scored_generation"],
+            7
+        );
+        assert_eq!(
+            topology_json["datagram_path_health"][0]["diagnostic_generation"],
+            8
+        );
+        assert_eq!(
+            topology_json["datagram_path_health"][0]["diagnostic_observation_age_ms"],
+            10
+        );
+        assert_eq!(
+            topology_json["datagram_path_health"][0]["recovery_required"],
+            true
+        );
+        assert_eq!(
             topology_json["quic_sessions"][0]["negotiated_protocol"],
             "s2s/2"
         );
@@ -3228,6 +3485,21 @@ mod tests {
             "shitspeak_s2s_datagram_path_health_observation_age_ms{source=\"1\",peer=\"2\",path=\"quic_datagram\",state=\"suspect\",reason=\"measured_loss\"} 25"
         ));
         assert!(rendered.contains(
+            "shitspeak_s2s_datagram_path_scored_generation{source=\"1\",peer=\"2\",path=\"quic_datagram\",state=\"suspect\",reason=\"measured_loss\"} 7"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_datagram_path_diagnostic_generation{source=\"1\",peer=\"2\",path=\"quic_datagram\",state=\"suspect\",reason=\"measured_loss\"} 8"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_datagram_path_health_score_ppm{source=\"1\",peer=\"2\",path=\"quic_datagram\",state=\"suspect\",reason=\"measured_loss\"} 125000"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_datagram_path_pressure{source=\"1\",peer=\"2\",path=\"quic_datagram\",state=\"suspect\",reason=\"measured_loss\"} 3"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_datagram_path_recovery_required{source=\"1\",peer=\"2\",path=\"quic_datagram\",state=\"suspect\",reason=\"measured_loss\"} 1"
+        ));
+        assert!(rendered.contains(
             "shitspeak_s2s_delivery_path_selections_total{source=\"1\",path=\"quic_datagram\"} 13"
         ));
         assert!(rendered.contains(
@@ -3292,6 +3564,27 @@ mod tests {
         assert!(
             rendered.contains("# TYPE shitspeak_s2s_voice_repair_allocator_state_bytes gauge\n")
         );
+        assert!(
+            rendered
+                .contains("# TYPE shitspeak_s2s_voice_reactive_scheduler_events_total counter\n")
+        );
+        assert!(
+            rendered.contains("# TYPE shitspeak_s2s_voice_reactive_scheduler_queued_items gauge\n")
+        );
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_voice_reactive_scheduler_queued_encoded_bytes gauge\n"
+        ));
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_voice_reactive_scheduler_active_destinations gauge\n"
+            )
+        );
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_voice_reactive_scheduler_oldest_wait_microseconds gauge\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_voice_reactive_scheduler_max_starvation_rounds gauge\n"
+        ));
         assert!(
             rendered.contains("# TYPE shitspeak_s2s_voice_ingress_admission_drops_total counter\n")
         );

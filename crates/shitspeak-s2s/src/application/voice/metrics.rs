@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use shitspeak_core::NodeIdentifier;
 
@@ -263,6 +263,33 @@ pub(crate) enum RepairDestinationStage {
     Shed,
 }
 
+/// Bounded outcomes emitted by the reactive repair scheduler.
+///
+/// Keep this label set independent of peers, requests, and retry numbers so
+/// scheduler pressure remains safe to export from large clusters.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum ReactiveSchedulerEvent {
+    Granted,
+    CreditWait,
+    RetryDeferred,
+    DeadlineExpired,
+    Cancelled,
+    Shutdown,
+}
+
+impl ReactiveSchedulerEvent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::CreditWait => "credit_wait",
+            Self::RetryDeferred => "retry_deferred",
+            Self::DeadlineExpired => "deadline_expired",
+            Self::Cancelled => "cancelled",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
 impl RepairDestinationStage {
     fn label(self) -> &'static str {
         match self {
@@ -378,6 +405,15 @@ struct RepairAllocatorState {
 }
 
 #[derive(Debug, Default)]
+struct ReactiveSchedulerState {
+    queued_items: u64,
+    queued_encoded_bytes: u64,
+    active_destinations: u64,
+    oldest_wait_microseconds: u64,
+    max_starvation_rounds: u64,
+}
+
+#[derive(Debug, Default)]
 struct VoiceAppMetrics {
     sends: HashMap<SendKey, u64>,
     receives: HashMap<ReceiveKey, u64>,
@@ -396,6 +432,8 @@ struct VoiceAppMetrics {
     repair_class_bytes: HashMap<(RepairBudgetClass, RepairClassStage), u64>,
     repair_destination_bytes: HashMap<(NodeIdentifier, RepairDestinationStage), u64>,
     repair_allocator_state: RepairAllocatorState,
+    reactive_scheduler_events: HashMap<ReactiveSchedulerEvent, u64>,
+    reactive_scheduler_state: ReactiveSchedulerState,
 }
 
 pub(crate) fn record_send(
@@ -579,6 +617,34 @@ pub(crate) fn set_repair_allocator_state(
         debt_to_reactive_bytes: debt_to_reactive_bytes as u64,
         debt_to_proactive_bytes: debt_to_proactive_bytes as u64,
         active_destinations: active_destinations as u64,
+    };
+}
+
+pub(crate) fn record_reactive_scheduler_event(event: ReactiveSchedulerEvent) {
+    let mut metrics = METRICS.lock().unwrap();
+    let total = metrics.reactive_scheduler_events.entry(event).or_default();
+    *total = total.saturating_add(1);
+}
+
+/// Replaces the aggregate reactive scheduler gauges with one consistent
+/// snapshot. An empty queue should pass `None` for `oldest_wait`.
+pub(crate) fn set_reactive_scheduler_state(
+    queued_items: usize,
+    queued_encoded_bytes: usize,
+    active_destinations: usize,
+    oldest_wait: Option<Duration>,
+    max_starvation_rounds: usize,
+) {
+    let oldest_wait_microseconds = oldest_wait
+        .map(|wait| u64::try_from(wait.as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or_default();
+    let mut metrics = METRICS.lock().unwrap();
+    metrics.reactive_scheduler_state = ReactiveSchedulerState {
+        queued_items: queued_items as u64,
+        queued_encoded_bytes: queued_encoded_bytes as u64,
+        active_destinations: active_destinations as u64,
+        oldest_wait_microseconds,
+        max_starvation_rounds: max_starvation_rounds as u64,
     };
 }
 
@@ -772,6 +838,38 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         Vec::new(),
         allocator.active_destinations as f64,
     ));
+    for (event, count) in &metrics.reactive_scheduler_events {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_reactive_scheduler_events_total",
+            vec![("event".to_owned(), event.label().to_owned())],
+            *count as f64,
+        ));
+    }
+    let reactive = &metrics.reactive_scheduler_state;
+    for (name, value) in [
+        (
+            "shitspeak_s2s_voice_reactive_scheduler_queued_items",
+            reactive.queued_items,
+        ),
+        (
+            "shitspeak_s2s_voice_reactive_scheduler_queued_encoded_bytes",
+            reactive.queued_encoded_bytes,
+        ),
+        (
+            "shitspeak_s2s_voice_reactive_scheduler_active_destinations",
+            reactive.active_destinations,
+        ),
+        (
+            "shitspeak_s2s_voice_reactive_scheduler_oldest_wait_microseconds",
+            reactive.oldest_wait_microseconds,
+        ),
+        (
+            "shitspeak_s2s_voice_reactive_scheduler_max_starvation_rounds",
+            reactive.max_starvation_rounds,
+        ),
+    ] {
+        out.push(PrometheusSample::new(name, Vec::new(), value as f64));
+    }
 
     out
 }
@@ -1106,5 +1204,50 @@ mod tests {
         )
         .expect("active allocator destinations");
         assert!(destinations.value() >= 0.0);
+    }
+
+    #[test]
+    fn reactive_scheduler_metrics_use_fixed_event_labels_and_aggregate_gauges() {
+        for event in [
+            ReactiveSchedulerEvent::Granted,
+            ReactiveSchedulerEvent::CreditWait,
+            ReactiveSchedulerEvent::RetryDeferred,
+            ReactiveSchedulerEvent::DeadlineExpired,
+            ReactiveSchedulerEvent::Cancelled,
+            ReactiveSchedulerEvent::Shutdown,
+        ] {
+            record_reactive_scheduler_event(event);
+        }
+        set_reactive_scheduler_state(7, 4_096, 3, Some(Duration::from_micros(2_500)), 4);
+
+        for event in [
+            "granted",
+            "credit_wait",
+            "retry_deferred",
+            "deadline_expired",
+            "cancelled",
+            "shutdown",
+        ] {
+            let sample = find_sample(
+                "shitspeak_s2s_voice_reactive_scheduler_events_total",
+                &[("event", event)],
+            )
+            .expect("reactive scheduler event");
+            assert!(sample.value() >= 1.0);
+            assert_eq!(sample.labels(), &[("event".to_owned(), event.to_owned())]);
+            assert_no_unbounded_voice_labels(&sample);
+        }
+
+        for name in [
+            "shitspeak_s2s_voice_reactive_scheduler_queued_items",
+            "shitspeak_s2s_voice_reactive_scheduler_queued_encoded_bytes",
+            "shitspeak_s2s_voice_reactive_scheduler_active_destinations",
+            "shitspeak_s2s_voice_reactive_scheduler_oldest_wait_microseconds",
+            "shitspeak_s2s_voice_reactive_scheduler_max_starvation_rounds",
+        ] {
+            let sample = find_sample(name, &[]).expect("reactive scheduler gauge");
+            assert!(sample.value() >= 0.0);
+            assert!(sample.labels().is_empty());
+        }
     }
 }

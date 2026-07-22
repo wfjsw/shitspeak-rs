@@ -963,6 +963,14 @@ pub struct TransportRoutingPolicy {
     best_effort_datagram_effective_loss_suspect_ppm: u32,
     #[serde(default = "default_best_effort_datagram_effective_loss_recover_ppm")]
     best_effort_datagram_effective_loss_recover_ppm: u32,
+    #[serde(default = "default_best_effort_quic_datagram_health_suspect_ppm")]
+    best_effort_quic_datagram_health_suspect_ppm: u32,
+    #[serde(default = "default_best_effort_quic_datagram_health_recover_ppm")]
+    best_effort_quic_datagram_health_recover_ppm: u32,
+    #[serde(default = "default_best_effort_datagram_suspect_bad_windows")]
+    best_effort_datagram_suspect_bad_windows: u32,
+    #[serde(default = "default_best_effort_datagram_recover_healthy_ms")]
+    best_effort_datagram_recover_healthy_ms: u64,
     #[serde(default = "default_large_rtt_threshold_ms")]
     large_rtt_threshold_ms: u64,
     #[serde(default = "default_lossy_link_threshold_ppm")]
@@ -994,6 +1002,14 @@ impl Default for TransportRoutingPolicy {
                 default_best_effort_datagram_effective_loss_suspect_ppm(),
             best_effort_datagram_effective_loss_recover_ppm:
                 default_best_effort_datagram_effective_loss_recover_ppm(),
+            best_effort_quic_datagram_health_suspect_ppm:
+                default_best_effort_quic_datagram_health_suspect_ppm(),
+            best_effort_quic_datagram_health_recover_ppm:
+                default_best_effort_quic_datagram_health_recover_ppm(),
+            best_effort_datagram_suspect_bad_windows:
+                default_best_effort_datagram_suspect_bad_windows(),
+            best_effort_datagram_recover_healthy_ms:
+                default_best_effort_datagram_recover_healthy_ms(),
             large_rtt_threshold_ms: default_large_rtt_threshold_ms(),
             lossy_link_threshold_ppm: default_lossy_link_threshold_ppm(),
             bulk_payload_threshold_bytes: default_bulk_payload_threshold_bytes(),
@@ -1044,6 +1060,22 @@ impl TransportRoutingPolicy {
 
     pub fn best_effort_datagram_effective_loss_recover_ppm(&self) -> u32 {
         self.best_effort_datagram_effective_loss_recover_ppm
+    }
+
+    pub fn best_effort_quic_datagram_health_suspect_ppm(&self) -> u32 {
+        self.best_effort_quic_datagram_health_suspect_ppm
+    }
+
+    pub fn best_effort_quic_datagram_health_recover_ppm(&self) -> u32 {
+        self.best_effort_quic_datagram_health_recover_ppm
+    }
+
+    pub fn best_effort_datagram_suspect_bad_windows(&self) -> u32 {
+        self.best_effort_datagram_suspect_bad_windows
+    }
+
+    pub fn best_effort_datagram_recover_healthy(&self) -> Duration {
+        Duration::from_millis(self.best_effort_datagram_recover_healthy_ms)
     }
 
     pub fn large_rtt_threshold_ms(&self) -> u64 {
@@ -1101,6 +1133,27 @@ impl TransportRoutingPolicy {
 
     pub fn with_best_effort_datagram_effective_loss_recover_ppm(mut self, ppm: u32) -> Self {
         self.best_effort_datagram_effective_loss_recover_ppm = ppm.min(1_000_000);
+        self
+    }
+
+    pub fn with_best_effort_quic_datagram_health_suspect_ppm(mut self, ppm: u32) -> Self {
+        self.best_effort_quic_datagram_health_suspect_ppm = ppm.min(1_000_000);
+        self
+    }
+
+    pub fn with_best_effort_quic_datagram_health_recover_ppm(mut self, ppm: u32) -> Self {
+        self.best_effort_quic_datagram_health_recover_ppm = ppm.min(1_000_000);
+        self
+    }
+
+    pub fn with_best_effort_datagram_suspect_bad_windows(mut self, windows: u32) -> Self {
+        self.best_effort_datagram_suspect_bad_windows = windows;
+        self
+    }
+
+    pub fn with_best_effort_datagram_recover_healthy(mut self, duration: Duration) -> Self {
+        self.best_effort_datagram_recover_healthy_ms =
+            duration.as_millis().min(u128::from(u64::MAX)) as u64;
         self
     }
 
@@ -1175,6 +1228,33 @@ impl TransportRoutingPolicy {
         {
             return Err(
                 "s2s.transport.best_effort_datagram_effective_loss_recover_ppm must not exceed best_effort_datagram_effective_loss_suspect_ppm"
+                    .into(),
+            );
+        }
+        if self.best_effort_quic_datagram_health_suspect_ppm > 1_000_000
+            || self.best_effort_quic_datagram_health_recover_ppm > 1_000_000
+        {
+            return Err(
+                "s2s.transport QUIC DATAGRAM local-health thresholds must not exceed 1000000 ppm"
+                    .into(),
+            );
+        }
+        if self.best_effort_quic_datagram_health_recover_ppm
+            > self.best_effort_quic_datagram_health_suspect_ppm
+        {
+            return Err(
+                "s2s.transport.best_effort_quic_datagram_health_recover_ppm must not exceed best_effort_quic_datagram_health_suspect_ppm"
+                    .into(),
+            );
+        }
+        if !(2..=3).contains(&self.best_effort_datagram_suspect_bad_windows) {
+            return Err(
+                "s2s.transport.best_effort_datagram_suspect_bad_windows must be 2 or 3".into(),
+            );
+        }
+        if !(10_000..=30_000).contains(&self.best_effort_datagram_recover_healthy_ms) {
+            return Err(
+                "s2s.transport.best_effort_datagram_recover_healthy_ms must be between 10000 and 30000"
                     .into(),
             );
         }
@@ -1545,6 +1625,18 @@ fn default_best_effort_datagram_effective_loss_suspect_ppm() -> u32 {
 fn default_best_effort_datagram_effective_loss_recover_ppm() -> u32 {
     2_500
 }
+fn default_best_effort_quic_datagram_health_suspect_ppm() -> u32 {
+    100_000
+}
+fn default_best_effort_quic_datagram_health_recover_ppm() -> u32 {
+    10_000
+}
+fn default_best_effort_datagram_suspect_bad_windows() -> u32 {
+    3
+}
+fn default_best_effort_datagram_recover_healthy_ms() -> u64 {
+    10_000
+}
 fn default_large_rtt_threshold_ms() -> u64 {
     100
 }
@@ -1754,6 +1846,19 @@ mod tests {
             policy.best_effort_datagram_effective_loss_recover_ppm(),
             2_500
         );
+        assert_eq!(
+            policy.best_effort_quic_datagram_health_suspect_ppm(),
+            100_000
+        );
+        assert_eq!(
+            policy.best_effort_quic_datagram_health_recover_ppm(),
+            10_000
+        );
+        assert_eq!(policy.best_effort_datagram_suspect_bad_windows(), 3);
+        assert_eq!(
+            policy.best_effort_datagram_recover_healthy(),
+            Duration::from_secs(10)
+        );
         assert_eq!(policy.large_rtt_threshold_ms(), 100);
         assert_eq!(policy.lossy_link_threshold_ppm(), 20_000);
         assert_eq!(policy.bulk_payload_threshold_bytes(), 65_536);
@@ -1782,6 +1887,10 @@ mod tests {
             .with_udp_family_loss_excess_over_tcp_ppm(70_000)
             .with_best_effort_datagram_effective_loss_suspect_ppm(12_000)
             .with_best_effort_datagram_effective_loss_recover_ppm(6_000)
+            .with_best_effort_quic_datagram_health_suspect_ppm(150_000)
+            .with_best_effort_quic_datagram_health_recover_ppm(20_000)
+            .with_best_effort_datagram_suspect_bad_windows(2)
+            .with_best_effort_datagram_recover_healthy(Duration::from_secs(20))
             .with_large_rtt_threshold_ms(80)
             .with_lossy_link_threshold_ppm(30_000)
             .with_bulk_payload_threshold_bytes(32_768)
@@ -1805,6 +1914,19 @@ mod tests {
         assert_eq!(
             policy.best_effort_datagram_effective_loss_recover_ppm(),
             6_000
+        );
+        assert_eq!(
+            policy.best_effort_quic_datagram_health_suspect_ppm(),
+            150_000
+        );
+        assert_eq!(
+            policy.best_effort_quic_datagram_health_recover_ppm(),
+            20_000
+        );
+        assert_eq!(policy.best_effort_datagram_suspect_bad_windows(), 2);
+        assert_eq!(
+            policy.best_effort_datagram_recover_healthy(),
+            Duration::from_secs(20)
         );
         assert_eq!(policy.large_rtt_threshold_ms(), 80);
         assert_eq!(policy.lossy_link_threshold_ppm(), 30_000);
@@ -1854,6 +1976,10 @@ mod tests {
                     udp_family_loss_excess_over_tcp_ppm = 40000
                     best_effort_datagram_effective_loss_suspect_ppm = 9000
                     best_effort_datagram_effective_loss_recover_ppm = 4000
+                    best_effort_quic_datagram_health_suspect_ppm = 120000
+                    best_effort_quic_datagram_health_recover_ppm = 12000
+                    best_effort_datagram_suspect_bad_windows = 2
+                    best_effort_datagram_recover_healthy_ms = 15000
                     large_rtt_threshold_ms = 120
                     lossy_link_threshold_ppm = 15000
                     bulk_payload_threshold_bytes = 32768
@@ -1887,6 +2013,19 @@ mod tests {
         assert_eq!(
             policy.best_effort_datagram_effective_loss_recover_ppm(),
             4_000
+        );
+        assert_eq!(
+            policy.best_effort_quic_datagram_health_suspect_ppm(),
+            120_000
+        );
+        assert_eq!(
+            policy.best_effort_quic_datagram_health_recover_ppm(),
+            12_000
+        );
+        assert_eq!(policy.best_effort_datagram_suspect_bad_windows(), 2);
+        assert_eq!(
+            policy.best_effort_datagram_recover_healthy(),
+            Duration::from_secs(15)
         );
         assert_eq!(policy.large_rtt_threshold_ms(), 120);
         assert_eq!(policy.lossy_link_threshold_ppm(), 15_000);
@@ -1932,6 +2071,27 @@ mod tests {
             "best_effort_datagram_effective_loss_suspect_ppm = 1000001",
             "best_effort_datagram_effective_loss_recover_ppm = 1000001",
             "best_effort_datagram_effective_loss_suspect_ppm = 4000\nbest_effort_datagram_effective_loss_recover_ppm = 5000",
+        ] {
+            let tuning: TransportTuning = ::config::Config::builder()
+                .add_source(::config::File::from_str(source, ::config::FileFormat::Toml))
+                .build()
+                .expect("config builder")
+                .try_deserialize()
+                .expect("transport tuning parses before semantic validation");
+            assert!(tuning.try_apply(base_config()).is_err(), "source: {source}");
+        }
+    }
+
+    #[test]
+    fn transport_tuning_rejects_invalid_quic_datagram_health_gates() {
+        for source in [
+            "best_effort_quic_datagram_health_suspect_ppm = 1000001",
+            "best_effort_quic_datagram_health_recover_ppm = 1000001",
+            "best_effort_quic_datagram_health_suspect_ppm = 10000\nbest_effort_quic_datagram_health_recover_ppm = 10001",
+            "best_effort_datagram_suspect_bad_windows = 1",
+            "best_effort_datagram_suspect_bad_windows = 4",
+            "best_effort_datagram_recover_healthy_ms = 9999",
+            "best_effort_datagram_recover_healthy_ms = 30001",
         ] {
             let tuning: TransportTuning = ::config::Config::builder()
                 .add_source(::config::File::from_str(source, ::config::FileFormat::Toml))
