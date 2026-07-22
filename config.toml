@@ -53,8 +53,18 @@ udp_ping_user_count_scope = "cluster"
 # baseline = max_users * 16 packets, burst = 5x baseline, hard cap = max_users * 128 packets.
 udp_channel_size = 2048
 
+# Voice latency and UDP send-backpressure budgets (milliseconds).
+# These values hot-reload. Higher age limits reduce drops during short stalls
+# but allow older audio and make workers process more backlog.
+[voice]
+max_udp_packet_age_ms = 250
+max_routing_queue_age_ms = 250
+# Linux sendmmsg WouldBlock retry budget; 0 fails fast. Ignored on non-Linux.
+udp_send_retry_budget_ms = 2
+
 # Voice fan-out dispatch policy. The default calibrates separate profiles for
-# payloads up to and above 512 bytes before the server starts listening.
+# payloads up to and including 512 bytes and above 512 bytes before the server
+# starts listening. Dispatch changes require a restart.
 [voice.dispatch]
 mode = "startup_calibrated" # startup_calibrated, sequential, fixed
 # Fixed mode uses these values instead of benchmarking at startup.

@@ -217,12 +217,60 @@ udp_channel_size = 2048
 
 `udp_ping_user_count_scope` controls whether UDP ping responses report clusterwide users/max users or only users/max users on this node.
 
-## Voice Dispatch Calibration
+## Voice
+
+The `[voice]` table controls when delayed voice work is discarded and how long
+Linux UDP batch sends may wait through transient socket backpressure. These
+settings are latency and load-shedding controls; they do not resize queues or
+act as a jitter buffer.
+
+```toml
+[voice]
+max_udp_packet_age_ms = 250
+max_routing_queue_age_ms = 250
+udp_send_retry_budget_ms = 2
+```
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `max_udp_packet_age_ms` | `250` ms | Maximum time a native UDP packet may wait in the UDP processing queue before decode and decrypt. Older packets are dropped at the `udp_packet` stage. |
+| `max_routing_queue_age_ms` | `250` ms | Maximum accepted age for decoded audio in the per-sender routing queue and the local-fanout queue. The local-fanout check uses accumulated routing, resolution, and fanout-queue age. |
+| `udp_send_retry_budget_ms` | `2` ms | On Linux, maximum elapsed time a UDP `sendmmsg` batch may spend retrying `WouldBlock`. `0` fails fast. This setting is ignored by the non-Linux per-datagram send path. |
+
+The age limits are checked when workers dequeue an item. Increasing a limit
+can reduce stale-drop counts during short stalls, but it permits older audio to
+continue through the pipeline and makes workers spend time on a backlog instead
+of newer packets. Decreasing a limit sheds load sooner at the cost of more
+audible gaps. A value of `0` effectively rejects work that experiences any
+measurable queue delay.
+
+`max_routing_queue_age_ms` is shared by two stages. A packet can pass the
+routing-queue check and still be discarded later if recipient resolution plus
+local-fanout waiting pushes its accumulated age over the same limit. Queue
+capacity can therefore remain available while stale drops occur.
+
+`max_udp_packet_age_ms` applies only to native UDP ingress, not TCP-tunneled
+voice. `max_routing_queue_age_ms` applies to decoded local-client voice from
+either ingress transport; S2S frames use their separate S2S voice pipeline.
+
+Increasing `udp_send_retry_budget_ms` can ride through brief socket send
+pressure, but the affected voice flush waits for the retry and can add pressure
+to upstream queues. Keep it small relative to both age limits.
+
+The three `[voice]` values above are read from the hot-reloaded configuration.
+Changes under `[voice.dispatch]` require a restart because the dispatch plan is
+resolved once during startup.
+
+Use `shitspeak_voice_stale_drops_total{stage="udp_packet"}` and
+`shitspeak_voice_stale_drops_total{stage=~"routing_queue|local_fanout_queue"}`
+to observe the age limits. UDP retry exhaustion is reported by
+`shitspeak_voice_udp_send_events_total{result="retry_budget_exhausted"}`.
+
+### Dispatch Calibration
 
 The server calibrates UDP voice encryption fan-out before it starts accepting
 connections. It chooses independent Rayon thresholds and recipient-run sizes
-for payloads up to 512 bytes and payloads above 512 bytes. Calibration is
-startup-only; changing this section takes effect after restart.
+for payloads up to and including 512 bytes and payloads above 512 bytes.
 
 ```toml
 [voice.dispatch]
@@ -235,9 +283,18 @@ large_payload_rayon_threshold = 512
 large_payload_rayon_min_len = 256
 ```
 
+`startup_calibrated` benchmarks sequential and Rayon encryption at startup and
+selects both profiles. If Rayon has fewer than two workers, the server selects
+sequential dispatch; if calibration fails, it logs a warning and uses a
+conservative fallback.
+
 `sequential` disables Rayon voice fan-out. `fixed` is an operational override
-for controlled experiments or recovery. The minimum length is a recipient run,
-not a per-packet task; it must be positive and cannot exceed its threshold.
+for controlled experiments or recovery. In fixed mode, each
+`*_rayon_threshold` is the recipient count at which Rayon dispatch begins, and
+each `*_rayon_min_len` is the minimum recipient run assigned as parallel work,
+not a per-packet task. All four values must be at least `1`, and a minimum run
+length cannot exceed its corresponding threshold. The four numeric settings
+are ignored outside fixed mode.
 
 ## Timeouts
 
