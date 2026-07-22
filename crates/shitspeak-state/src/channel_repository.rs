@@ -1027,7 +1027,10 @@ pub struct ChannelRepository {
     /// Bumped whenever channel state can change effective ACL results.
     channel_acl_generation: AtomicU64,
     /// Per-channel ACL generations for targeted channel cache eviction.
-    channel_acl_generations: ParkingRwLock<HashMap<(String, u32), u64>>,
+    /// Per-server, per-channel ACL generations. Nesting by server lets the
+    /// permission hot path borrow `&str` directly instead of allocating a new
+    /// `String` for every cache validation.
+    channel_acl_generations: ParkingRwLock<HashMap<String, HashMap<u32, u64>>>,
     /// Cached effective permissions:
     /// (server_id, session_id_u64, client_instance_id, channel_id) -> entry.
     /// Lock-free concurrent cache using scc::HashCache.
@@ -1436,7 +1439,8 @@ impl ChannelRepository {
             .wrapping_add(
                 self.channel_acl_generations
                     .read()
-                    .get(&(server_id.to_owned(), channel_id))
+                    .get(server_id)
+                    .and_then(|generations| generations.get(&channel_id))
                     .copied()
                     .unwrap_or(0),
             )
@@ -1455,9 +1459,10 @@ impl ChannelRepository {
             return;
         }
         let mut generations = self.channel_acl_generations.write();
+        let generations = generations.entry(server_id.to_owned()).or_default();
         for channel_id in channel_ids {
             generations
-                .entry((server_id.to_owned(), *channel_id))
+                .entry(*channel_id)
                 .and_modify(|generation| *generation = generation.wrapping_add(1))
                 .or_insert(1);
         }

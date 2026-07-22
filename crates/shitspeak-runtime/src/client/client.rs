@@ -55,6 +55,33 @@ const GRACEFUL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// shifts left by 16), so bit 0 is free to use as a "set" marker.
 const PROTOCOL_VERSION_SET_BIT: u64 = 1;
 
+#[derive(Clone, Copy)]
+struct ClientCachedAclPermissions {
+    channel_acl_generation: u64,
+    client_acl_subject_generation: u64,
+    client_acl_home_generation: u64,
+    depends_on_home_channel: bool,
+    explicit_enter_deny_overrides_write: bool,
+    permissions: enumflags2::BitFlags<shitspeak_state::ACLPermissions>,
+}
+
+impl ClientCachedAclPermissions {
+    fn hit_for(
+        self,
+        channel_acl_generation: u64,
+        client_acl_subject_generation: u64,
+        client_acl_home_generation: u64,
+        explicit_enter_deny_overrides_write: bool,
+    ) -> Option<(enumflags2::BitFlags<shitspeak_state::ACLPermissions>, bool)> {
+        (self.channel_acl_generation == channel_acl_generation
+            && self.client_acl_subject_generation == client_acl_subject_generation
+            && (!self.depends_on_home_channel
+                || self.client_acl_home_generation == client_acl_home_generation)
+            && self.explicit_enter_deny_overrides_write == explicit_enter_deny_overrides_write)
+            .then_some((self.permissions, self.depends_on_home_channel))
+    }
+}
+
 fn proto_message_write_chunk_end(messages: &[Message], start: usize) -> usize {
     let mut bytes = 0usize;
     let mut end = start;
@@ -293,6 +320,10 @@ pub struct Client {
 
     local_state: ParkingRwLock<Option<ClientLocalState>>,
     global_state: ParkingRwLock<ClientGlobalState>,
+    /// Effective permissions owned by this client instance. The map grows to
+    /// the channels this connection actually touches and is dropped with the
+    /// client, so reconnect churn cannot leave stale global cache entries.
+    acl_permission_cache: scc::HashMap<u32, ClientCachedAclPermissions>,
     crypt_state: ParkingMutex<Option<CryptState>>,
     voice_targets: ParkingMutex<HashMap<u32, VoiceTarget>>,
     voice_routing_tx: Option<mpsc::Sender<VoiceRoutingPayload>>,
@@ -481,6 +512,7 @@ impl Client {
             options: RwLock::new(ClientOptions::default()),
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
+            acl_permission_cache: scc::HashMap::new(),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
             voice_routing_tx: Some(voice_routing_tx),
@@ -643,6 +675,7 @@ impl Client {
             options: RwLock::new(ClientOptions::default()),
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
+            acl_permission_cache: scc::HashMap::new(),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
             voice_routing_tx: Some(voice_routing_tx),
@@ -724,6 +757,7 @@ impl Client {
             options: RwLock::new(ClientOptions::default()),
             local_state: ParkingRwLock::new(None),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
+            acl_permission_cache: scc::HashMap::new(),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
             voice_routing_tx: None,
@@ -881,13 +915,20 @@ impl Client {
         self.server_id.read().clone()
     }
 
+    pub(crate) fn with_server_id<R>(&self, read: impl FnOnce(&str) -> R) -> R {
+        let server_id = self.server_id.read();
+        read(&server_id)
+    }
+
     pub fn set_server_id(&self, server_id: String) {
         *self.server_id.write() = server_id;
+        self.acl_permission_cache.clear_sync();
     }
 
     pub fn set_scoped_identity(&self, server_id: String, session_id: ClientSessionIdentifier) {
         *self.server_id.write() = server_id;
         *self.session_id.write() = session_id;
+        self.acl_permission_cache.clear_sync();
         self.record_tracing_span_session();
     }
 
@@ -954,6 +995,48 @@ impl Client {
 
     pub fn get_acl_cache_generations(&self) -> (u64, u64) {
         self.global_state.read().get_acl_cache_generations()
+    }
+
+    pub(crate) fn get_cached_acl_permissions(
+        &self,
+        channel_id: u32,
+        channel_acl_generation: u64,
+        client_acl_subject_generation: u64,
+        client_acl_home_generation: u64,
+        explicit_enter_deny_overrides_write: bool,
+    ) -> Option<(enumflags2::BitFlags<shitspeak_state::ACLPermissions>, bool)> {
+        self.acl_permission_cache
+            .read_sync(&channel_id, |_, entry| {
+                entry.hit_for(
+                    channel_acl_generation,
+                    client_acl_subject_generation,
+                    client_acl_home_generation,
+                    explicit_enter_deny_overrides_write,
+                )
+            })
+            .flatten()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cache_acl_permissions(
+        &self,
+        channel_id: u32,
+        channel_acl_generation: u64,
+        client_acl_subject_generation: u64,
+        client_acl_home_generation: u64,
+        depends_on_home_channel: bool,
+        explicit_enter_deny_overrides_write: bool,
+        permissions: enumflags2::BitFlags<shitspeak_state::ACLPermissions>,
+    ) {
+        let entry = ClientCachedAclPermissions {
+            channel_acl_generation,
+            client_acl_subject_generation,
+            client_acl_home_generation,
+            depends_on_home_channel,
+            explicit_enter_deny_overrides_write,
+            permissions,
+        };
+        self.acl_permission_cache.upsert_sync(channel_id, entry);
     }
 
     // pub fn get_display_name(&self) -> Option<String> {
@@ -1921,6 +2004,48 @@ mod tests {
         assert!(!*client.disconnect_rx.borrow());
         client.request_disconnect();
         assert!(*client.disconnect_rx.borrow());
+    }
+
+    #[test]
+    fn client_acl_cache_grows_with_touched_channels_and_validates_generations() {
+        let client = Client::new_remote_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
+            ClientSessionIdentifier::from(0x0002_0001),
+            Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            None,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            None,
+            Utc::now(),
+            7,
+        );
+        let permissions: enumflags2::BitFlags<shitspeak_state::ACLPermissions> =
+            shitspeak_state::ACLPermissions::Enter.into();
+
+        // This intentionally exceeds scc::HashCache's default global limit of
+        // 256 entries. The per-client map retains the connection's full
+        // working set without competing with other clients.
+        for channel_id in 0..1024 {
+            client.cache_acl_permissions(channel_id, 3, 5, 7, false, false, permissions);
+        }
+        for channel_id in 0..1024 {
+            assert_eq!(
+                client.get_cached_acl_permissions(channel_id, 3, 5, 99, false),
+                Some((permissions, false))
+            );
+        }
+
+        assert!(
+            client
+                .get_cached_acl_permissions(0, 3, 6, 7, false)
+                .is_none()
+        );
+        client.set_server_id("other-server".to_owned());
+        assert!(
+            client
+                .get_cached_acl_permissions(0, 3, 5, 7, false)
+                .is_none()
+        );
     }
 
     fn ping(timestamp: u64) -> Message {

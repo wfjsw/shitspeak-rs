@@ -1865,40 +1865,30 @@ async fn acl_cache_home_move_only_invalidates_home_dependent_entries() {
     let _ = cached_permissions(&server, &bob, 201).await;
 
     let server_id = client.server_id();
-    let session_id = u64::from(u32::from(client.get_session_id()));
-    let client_instance_id = client.client_instance_id();
     let static_channel_generation = channels.channel_acl_generation_for_channel(&server_id, 200);
     let home_channel_generation = channels.channel_acl_generation_for_channel(&server_id, 201);
     let (subject_generation, old_home_generation) = client.get_acl_cache_generations();
 
     assert!(
-        channels
-            .get_cached_permissions_in_server_with_generations(
-                &server_id,
-                session_id,
-                client_instance_id,
+        client
+            .get_cached_acl_permissions(
                 200,
                 static_channel_generation,
                 subject_generation,
                 old_home_generation,
                 false,
             )
-            .await
             .is_some()
     );
     assert!(
-        channels
-            .get_cached_permissions_in_server_with_generations(
-                &server_id,
-                session_id,
-                client_instance_id,
+        client
+            .get_cached_acl_permissions(
                 201,
                 home_channel_generation,
                 subject_generation,
                 old_home_generation,
                 false,
             )
-            .await
             .is_some()
     );
 
@@ -1912,33 +1902,25 @@ async fn acl_cache_home_move_only_invalidates_home_dependent_entries() {
     assert_ne!(new_home_generation, old_home_generation);
 
     assert!(
-        channels
-            .get_cached_permissions_in_server_with_generations(
-                &server_id,
-                session_id,
-                client_instance_id,
+        client
+            .get_cached_acl_permissions(
                 200,
                 static_channel_generation,
                 same_subject_generation,
                 new_home_generation,
                 false,
             )
-            .await
             .is_some()
     );
     assert!(
-        channels
-            .get_cached_permissions_in_server_with_generations(
-                &server_id,
-                session_id,
-                client_instance_id,
+        client
+            .get_cached_acl_permissions(
                 201,
                 home_channel_generation,
                 same_subject_generation,
                 new_home_generation,
                 false,
             )
-            .await
             .is_none()
     );
 
@@ -1948,18 +1930,14 @@ async fn acl_cache_home_move_only_invalidates_home_dependent_entries() {
     let (new_subject_generation, current_home_generation) = client.get_acl_cache_generations();
     assert_ne!(new_subject_generation, same_subject_generation);
     assert!(
-        channels
-            .get_cached_permissions_in_server_with_generations(
-                &server_id,
-                session_id,
-                client_instance_id,
+        client
+            .get_cached_acl_permissions(
                 200,
                 static_channel_generation,
                 new_subject_generation,
                 current_home_generation,
                 false,
             )
-            .await
             .is_none()
     );
 }
@@ -3462,6 +3440,73 @@ async fn channel_state_initial_sync_includes_permission_info_when_enabled() {
         .expect("private permission info");
     assert_eq!(private.is_enter_restricted, Some(true));
     assert_eq!(private.can_enter, Some(false));
+}
+
+#[tokio::test]
+async fn initial_permission_info_is_embedded_without_a_deferred_duplicate_sweep() {
+    let server = spawn_test_server(TestServerOpts {
+        auth_finalization_concurrency: 1,
+        send_permission_info: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    // A non-trivial tree exercises the ACL work that used to run again in a
+    // detached full-channel refresh after the initial snapshot.
+    let last_channel_id = 96;
+    for channel_id in 1..=last_channel_id {
+        server
+            .server
+            .get_channels()
+            .create_channel(Channel::new(
+                channel_id,
+                format!("channel-{channel_id}"),
+                channel_id as i32,
+                0,
+                Some(0),
+            ))
+            .await
+            .unwrap();
+    }
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let initial_matches: Vec<_> = bob
+        .initial_channel_states
+        .iter()
+        .filter(|state| state.channel_id == Some(last_channel_id))
+        .collect();
+    assert_eq!(
+        initial_matches.len(),
+        1,
+        "the final channel should occur exactly once before ServerSync"
+    );
+    let initial = initial_matches[0];
+    assert_eq!(initial.name.as_deref(), Some("channel-96"));
+    assert!(
+        initial.is_enter_restricted.is_some() && initial.can_enter.is_some(),
+        "permission info should be embedded in the initial full ChannelState"
+    );
+
+    let duplicate = bob
+        .recv_until(
+            |message| {
+                matches!(message, Message::ChannelState(state)
+                    if state.channel_id == Some(last_channel_id)
+                        && (state.is_enter_restricted.is_some() || state.can_enter.is_some()))
+            },
+            Duration::from_millis(250),
+        )
+        .await;
+    assert!(
+        duplicate.is_none(),
+        "permission-bearing channel state should not be resent after ServerSync"
+    );
 }
 
 #[tokio::test]

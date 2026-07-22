@@ -374,46 +374,37 @@ fn evaluate_channel_acl(
     let mut permissions = default_permissions();
     let mut enter_explicitly_denied = false;
     let target_id = channel.id;
-    let chain = effective_acl_chain(channel, ancestors);
-    let target_ancestor_ids: Vec<u32> = ancestors.iter().map(|ancestor| ancestor.id).collect();
-    let evaluation_channel = ChannelHierarchy::new(target_id, &target_ancestor_ids);
-    let chain_ancestor_ids: Vec<u32> = chain.iter().rev().map(|ch| ch.id).collect();
-    let chain_len = chain.len();
+    let evaluation_channel = ChannelHierarchy::from_channels(target_id, ancestors);
+    let inherited_len = effective_inherited_len(channel, ancestors);
+    let target_acl_channel =
+        ChannelHierarchy::from_channels(target_id, &ancestors[..inherited_len]);
 
-    for (index, ch) in chain.iter().enumerate() {
-        let is_target_channel = ch.id == target_id;
-        let acl_ancestor_ids = &chain_ancestor_ids[chain_len - index..];
-        let acl_channel = ChannelHierarchy::new(ch.id, acl_ancestor_ids);
-
-        for acl in &ch.acls {
-            let applies = if is_target_channel {
-                acl.apply_here
-            } else {
-                acl.apply_subs
-            };
-            if !applies {
-                continue;
-            }
-
-            let matches = if let Some(uid) = acl.user_id {
-                user_id.is_some_and(|u| u as i32 == uid)
-            } else {
-                acl.match_group(evaluation_channel, Some(acl_channel), &[], client)
-            };
-            if !matches {
-                continue;
-            }
-
-            permissions.insert(acl.allow);
-            if acl.allow.contains(ACLPermissions::Enter) {
-                enter_explicitly_denied = false;
-            }
-            permissions.remove(acl.deny);
-            if acl.deny.contains(ACLPermissions::Enter) {
-                enter_explicitly_denied = true;
-            }
-        }
+    for index in (0..inherited_len).rev() {
+        let acl_channel = ChannelHierarchy::from_channels(
+            ancestors[index].id,
+            &ancestors[index + 1..inherited_len],
+        );
+        apply_permission_acl_entries(
+            &ancestors[index].acls,
+            ancestors[index].id == target_id,
+            evaluation_channel,
+            acl_channel,
+            user_id,
+            client,
+            &mut permissions,
+            &mut enter_explicitly_denied,
+        );
     }
+    apply_permission_acl_entries(
+        &channel.acls,
+        true,
+        evaluation_channel,
+        target_acl_channel,
+        user_id,
+        client,
+        &mut permissions,
+        &mut enter_explicitly_denied,
+    );
 
     if !permissions.contains(ACLPermissions::Traverse)
         && !permissions.contains(ACLPermissions::Write)
@@ -438,39 +429,71 @@ fn evaluate_channel_acl(
     permissions
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_permission_acl_entries(
+    acls: &[ACL],
+    apply_here: bool,
+    evaluation_channel: ChannelHierarchy<'_>,
+    acl_channel: ChannelHierarchy<'_>,
+    user_id: Option<u32>,
+    client: &ClientMembershipQuery,
+    permissions: &mut BitFlags<ACLPermissions>,
+    enter_explicitly_denied: &mut bool,
+) {
+    for acl in acls {
+        let applies = if apply_here {
+            acl.apply_here
+        } else {
+            acl.apply_subs
+        };
+        if !applies {
+            continue;
+        }
+
+        let matches = if let Some(uid) = acl.user_id {
+            user_id.is_some_and(|user_id| user_id as i32 == uid)
+        } else {
+            acl.match_group(evaluation_channel, Some(acl_channel), &[], client)
+        };
+        if !matches {
+            continue;
+        }
+
+        permissions.insert(acl.allow);
+        if acl.allow.contains(ACLPermissions::Enter) {
+            *enter_explicitly_denied = false;
+        }
+        permissions.remove(acl.deny);
+        if acl.deny.contains(ACLPermissions::Enter) {
+            *enter_explicitly_denied = true;
+        }
+    }
+}
+
 /// Check each actual ancestor as its own ACL target. This keeps a local
 /// `apply_here` Traverse deny as a hard path barrier without preventing the
 /// destination from overriding an inherited `apply_subs` deny.
 ///
-/// Only Traverse and Write participate in the path gate. Reusing one ID stack
-/// avoids recursively evaluating every permission and rebuilding hierarchy
+/// Only Traverse and Write participate in the path gate. Borrowed channel
+/// slices avoid recursively evaluating every permission or rebuilding ID
 /// vectors for each ancestor.
 fn ancestor_path_allows_traverse(
     ancestors: &[crate::Channel],
     user_id: Option<u32>,
     client: &ClientMembershipQuery,
 ) -> bool {
-    let ancestor_ids: Vec<u32> = ancestors.iter().map(|ancestor| ancestor.id).collect();
-
     (0..ancestors.len()).rev().all(|index| {
-        channel_allows_path_traverse(
-            &ancestors[index],
-            &ancestors[index + 1..],
-            &ancestor_ids[index + 1..],
-            user_id,
-            client,
-        )
+        channel_allows_path_traverse(&ancestors[index], &ancestors[index + 1..], user_id, client)
     })
 }
 
 fn channel_allows_path_traverse(
     channel: &crate::Channel,
     ancestors: &[crate::Channel],
-    ancestor_ids: &[u32],
     user_id: Option<u32>,
     client: &ClientMembershipQuery,
 ) -> bool {
-    let evaluation_channel = ChannelHierarchy::new(channel.id, ancestor_ids);
+    let evaluation_channel = ChannelHierarchy::from_channels(channel.id, ancestors);
     let mut traverse = true;
     let mut write = false;
     let inherited_len = if channel.inherit_acl {
@@ -483,7 +506,8 @@ fn channel_allows_path_traverse(
     };
 
     for index in (0..inherited_len).rev() {
-        let acl_channel = ChannelHierarchy::new(ancestors[index].id, &ancestor_ids[index + 1..]);
+        let acl_channel =
+            ChannelHierarchy::from_channels(ancestors[index].id, &ancestors[index + 1..]);
         apply_path_acl_entries(
             &ancestors[index].acls,
             false,
@@ -551,24 +575,15 @@ fn apply_path_acl_entries(
     }
 }
 
-fn effective_acl_chain<'a>(
-    channel: &'a crate::Channel,
-    ancestors: &'a [crate::Channel],
-) -> Vec<&'a crate::Channel> {
-    let mut inherited: Vec<&crate::Channel> = Vec::new();
-    for ancestor in ancestors.iter().rev() {
-        inherited.push(ancestor);
-        if !ancestor.inherit_acl {
-            inherited.clear();
-            inherited.push(ancestor);
-        }
+fn effective_inherited_len(channel: &crate::Channel, ancestors: &[crate::Channel]) -> usize {
+    if !channel.inherit_acl {
+        return 0;
     }
 
-    if !channel.inherit_acl {
-        inherited.clear();
-    }
-    inherited.push(channel);
-    inherited
+    ancestors
+        .iter()
+        .position(|ancestor| !ancestor.inherit_acl)
+        .map_or(ancestors.len(), |index| index + 1)
 }
 
 fn any_applicable_effective_acl(
@@ -577,19 +592,17 @@ fn any_applicable_effective_acl(
     mut predicate: impl FnMut(&ACL, ChannelHierarchy<'_>, ChannelHierarchy<'_>) -> bool,
 ) -> bool {
     let target_id = channel.id;
-    let chain = effective_acl_chain(channel, ancestors);
-    let target_ancestor_ids: Vec<u32> = ancestors.iter().map(|ancestor| ancestor.id).collect();
-    let evaluation_channel = ChannelHierarchy::new(target_id, &target_ancestor_ids);
-    let chain_ancestor_ids: Vec<u32> = chain.iter().rev().map(|ch| ch.id).collect();
-    let chain_len = chain.len();
+    let evaluation_channel = ChannelHierarchy::from_channels(target_id, ancestors);
+    let inherited_len = effective_inherited_len(channel, ancestors);
+    let target_acl_channel =
+        ChannelHierarchy::from_channels(target_id, &ancestors[..inherited_len]);
 
-    for (index, ch) in chain.iter().enumerate() {
-        let is_target_channel = ch.id == target_id;
-        let acl_ancestor_ids = &chain_ancestor_ids[chain_len - index..];
-        let acl_channel = ChannelHierarchy::new(ch.id, acl_ancestor_ids);
-
+    for index in (0..inherited_len).rev() {
+        let ch = &ancestors[index];
+        let acl_channel =
+            ChannelHierarchy::from_channels(ch.id, &ancestors[index + 1..inherited_len]);
         for acl in &ch.acls {
-            let applies = if is_target_channel {
+            let applies = if ch.id == target_id {
                 acl.apply_here
             } else {
                 acl.apply_subs
@@ -597,6 +610,12 @@ fn any_applicable_effective_acl(
             if applies && predicate(acl, evaluation_channel, acl_channel) {
                 return true;
             }
+        }
+    }
+
+    for acl in &channel.acls {
+        if acl.apply_here && predicate(acl, evaluation_channel, target_acl_channel) {
+            return true;
         }
     }
 
@@ -844,6 +863,47 @@ mod tests {
         let client = membership(0, &[]);
 
         assert!(evaluate_permission(&child, &[parent, root], Some(1), &client).is_empty());
+    }
+
+    #[test]
+    fn effective_chain_keeps_root_to_target_order_after_inheritance_cutoff() {
+        let mut root = Channel::new(0, "Excluded root", 0, 0, None);
+        root.acls = vec![scoped_acl(
+            None,
+            Some("all"),
+            false,
+            true,
+            BitFlags::empty(),
+            ACLPermissions::Whisper.into(),
+        )];
+
+        let mut boundary = Channel::new(1, "Boundary", 0, 0, Some(0));
+        boundary.inherit_acl = false;
+        boundary.acls = vec![scoped_acl(
+            None,
+            Some("all"),
+            false,
+            true,
+            BitFlags::empty(),
+            ACLPermissions::Speak.into(),
+        )];
+
+        let mut parent = Channel::new(2, "Parent", 0, 0, Some(1));
+        parent.acls = vec![scoped_acl(
+            None,
+            Some("all"),
+            false,
+            true,
+            ACLPermissions::Speak.into(),
+            BitFlags::empty(),
+        )];
+
+        let child = Channel::new(3, "Child", 0, 0, Some(2));
+        let client = membership(0, &[]);
+        let permissions = evaluate_permission(&child, &[parent, boundary, root], Some(1), &client);
+
+        assert!(permissions.contains(ACLPermissions::Speak));
+        assert!(permissions.contains(ACLPermissions::Whisper));
     }
 
     #[test]

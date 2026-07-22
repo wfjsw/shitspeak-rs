@@ -5,8 +5,7 @@ use bytes::Bytes;
 use crate::{
     api::{AuthenticateAuxiliaryData, AuthenticationRejection, canonical_authenticator_ip},
     channel_handler::{
-        ChannelTreeShadow, SessionChannelShadow, build_channel_permission_info_refresh_messages,
-        build_visible_channel_snapshot_messages,
+        ChannelTreeShadow, SessionChannelShadow, build_visible_channel_snapshot_messages,
     },
     client::{Client, user_info::Credential},
     errors::{AuthRejection, MessageHandlerError},
@@ -436,7 +435,7 @@ pub async fn handle_authenticate(
             sender,
             &all_channels,
             &mut channel_tree_shadow,
-            false,
+            server.get_send_permission_info(),
         )
         .await
         {
@@ -582,8 +581,6 @@ pub async fn handle_authenticate(
         }
     }
 
-    spawn_permission_info_refresh(server, sender);
-
     drop(auth_permit);
 
     // The AddClient log entry (emitted by allocate_local_client) will drive
@@ -591,28 +588,4 @@ pub async fn handle_authenticate(
     // No need to broadcast manually here.
 
     Ok(())
-}
-
-fn spawn_permission_info_refresh(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>) {
-    if !server.get_send_permission_info() {
-        return;
-    }
-
-    let server = Arc::clone(server);
-    let sender = Arc::clone(sender);
-    tokio::spawn(async move {
-        let permission_refresh =
-            build_channel_permission_info_refresh_messages(&server, &sender, server.get_channels())
-                .await;
-        if permission_refresh.is_empty() {
-            return;
-        }
-        if let Err(error) = sender.write_proto_message_batch(&permission_refresh).await {
-            tracing::debug!(
-                session = u32::from(sender.get_session_id()),
-                %error,
-                "failed to send deferred channel permission info refresh"
-            );
-        }
-    });
 }

@@ -4,12 +4,61 @@
 //! effective permissions for a given client on a given channel by walking
 //! the ACL chain.  It is used by message handlers and the TCP loop.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use crate::client::Client;
 use crate::server::Server;
 
 use shitspeak_state::{ACL, ACLPermissions, AclViewerScope, Channel, ChannelTreeSnapshot};
+
+/// Borrowed string storage that avoids a heap allocation for ordinary ACL
+/// subjects, which generally have only a handful of groups and tokens.
+struct BorrowedStrs<'a, const INLINE: usize> {
+    inline: [&'a str; INLINE],
+    inline_len: usize,
+    overflow: Option<Vec<&'a str>>,
+}
+
+impl<'a, const INLINE: usize> BorrowedStrs<'a, INLINE> {
+    fn from_strings(values: impl IntoIterator<Item = &'a String>) -> Self {
+        let mut values = values.into_iter();
+        let mut inline = [""; INLINE];
+        let mut inline_len = 0;
+
+        while inline_len < INLINE {
+            let Some(value) = values.next() else {
+                return Self {
+                    inline,
+                    inline_len,
+                    overflow: None,
+                };
+            };
+            inline[inline_len] = value.as_str();
+            inline_len += 1;
+        }
+
+        let overflow = values.next().map(|first_overflow| {
+            let (remaining, _) = values.size_hint();
+            let mut overflow = Vec::with_capacity(INLINE + 1 + remaining);
+            overflow.extend_from_slice(&inline);
+            overflow.push(first_overflow.as_str());
+            overflow.extend(values.map(String::as_str));
+            overflow
+        });
+
+        Self {
+            inline,
+            inline_len,
+            overflow,
+        }
+    }
+
+    fn as_slice(&self) -> &[&'a str] {
+        self.overflow
+            .as_deref()
+            .unwrap_or(&self.inline[..self.inline_len])
+    }
+}
 
 /// The ACL portion of one channel before an operation changed it.
 ///
@@ -48,8 +97,8 @@ pub(crate) struct ClientAclEvaluationContext {
     snapshot: Arc<ChannelTreeSnapshot>,
     session: u32,
     user_id: Option<u32>,
-    groups: Vec<String>,
-    tokens: Vec<String>,
+    groups: HashSet<String>,
+    tokens: HashSet<String>,
     certificate_hash: Option<Vec<u8>>,
     verified: bool,
     real_ip_address: std::net::IpAddr,
@@ -82,8 +131,8 @@ impl ClientAclEvaluationContext {
             snapshot,
             session: u32::from(client.get_session_id()),
             user_id: client.get_user_id(),
-            groups: client.get_groups_clone().into_iter().collect(),
-            tokens: client.get_tokens_clone().into_iter().collect(),
+            groups: client.get_groups_clone(),
+            tokens: client.get_tokens_clone(),
             certificate_hash: client.get_certificate_hash().map(<[u8]>::to_vec),
             verified: client.is_verified(),
             real_ip_address,
@@ -196,12 +245,12 @@ impl ClientAclEvaluationContext {
             })
             .collect::<Vec<_>>();
 
-        let group_refs = self.groups.iter().map(String::as_str).collect::<Vec<_>>();
-        let token_refs = self.tokens.iter().map(String::as_str).collect::<Vec<_>>();
+        let group_refs = BorrowedStrs::<8>::from_strings(&self.groups);
+        let token_refs = BorrowedStrs::<8>::from_strings(&self.tokens);
         let membership = shitspeak_state::ClientMembershipQuery::new(
-            &group_refs,
+            group_refs.as_slice(),
             self.user_id.is_some(),
-            &token_refs,
+            token_refs.as_slice(),
             self.certificate_hash.as_deref(),
             self.verified,
             Some(self.real_ip_address),
@@ -357,48 +406,44 @@ async fn compute_permissions_for_client_inner(
     let explicit_enter_deny_overrides_write = server.get_explicit_enter_deny_overrides_write();
 
     let channels = server.get_channels();
-    let server_id = client.server_id();
     let (client_acl_subject_generation, client_acl_home_generation) =
         client.get_acl_cache_generations();
-    let channel_acl_generation =
-        channels.channel_acl_generation_for_channel(&server_id, channel_id);
-    let cache_session = u64::from(session);
-    let cache_client_instance = client.client_instance_id();
     let use_acl_cache = !is_superuser && home_channel_override.is_none();
 
-    if use_acl_cache
-        && let Some(cache_hit) = channels
-            .get_cached_permissions_in_server_with_generations(
-                &server_id,
-                cache_session,
-                cache_client_instance,
+    let cached_permissions = if use_acl_cache {
+        client.with_server_id(|server_id| {
+            let channel_acl_generation =
+                channels.channel_acl_generation_for_channel(server_id, channel_id);
+            let (permissions, depends_on_home_channel) = client.get_cached_acl_permissions(
                 channel_id,
                 channel_acl_generation,
                 client_acl_subject_generation,
                 client_acl_home_generation,
                 explicit_enter_deny_overrides_write,
-            )
-            .await
-    {
-        let (current_subject_generation, current_home_generation) =
-            client.get_acl_cache_generations();
-        if channels.channel_acl_generation_for_channel(&server_id, channel_id)
-            == channel_acl_generation
-            && current_subject_generation == client_acl_subject_generation
-            && (!cache_hit.depends_on_home_channel()
-                || current_home_generation == client_acl_home_generation)
-        {
-            let permissions = cache_hit.permissions();
-            tracing::trace!(
-                session,
-                channel_id,
-                permissions = ?permissions,
-                "ACL cache hit"
-            );
-            return permissions;
-        }
+            )?;
+            let (current_subject_generation, current_home_generation) =
+                client.get_acl_cache_generations();
+            (channels.channel_acl_generation_for_channel(server_id, channel_id)
+                == channel_acl_generation
+                && current_subject_generation == client_acl_subject_generation
+                && (!depends_on_home_channel
+                    || current_home_generation == client_acl_home_generation))
+                .then_some(permissions)
+        })
+    } else {
+        None
+    };
+    if let Some(permissions) = cached_permissions {
+        tracing::trace!(
+            session,
+            channel_id,
+            permissions = ?permissions,
+            "ACL cache hit"
+        );
+        return permissions;
     }
 
+    let server_id = client.server_id();
     let (channel_acl_generation, channel, ancestors) = channels
         .get_channel_with_ancestors_for_acl_in_server(&server_id, channel_id)
         .await;
@@ -410,10 +455,10 @@ async fn compute_permissions_for_client_inner(
         shitspeak_state::effective_acl_chain_has_home_channel_dependent_group(&channel, &ancestors);
 
     let user_id = client.get_user_id();
-    let groups: Vec<String> = client.get_groups_clone().into_iter().collect();
-    let group_refs: Vec<&str> = groups.iter().map(|s| s.as_str()).collect();
-    let tokens: Vec<String> = client.get_tokens_clone().into_iter().collect();
-    let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+    let groups = client.get_groups_clone();
+    let group_refs = BorrowedStrs::<8>::from_strings(&groups);
+    let tokens = client.get_tokens_clone();
+    let token_refs = BorrowedStrs::<8>::from_strings(&tokens);
     let home_channel_id = home_channel_override.unwrap_or_else(|| client.get_current_channel_id());
     let home_ancestors: Vec<u32> = if home_channel_id == channel_id {
         ancestors.iter().map(|ancestor| ancestor.id).collect()
@@ -433,9 +478,9 @@ async fn compute_permissions_for_client_inner(
     let ip_geo_country = ip_geo.as_ref().and_then(|geo| geo.country_code());
 
     let membership = shitspeak_state::ClientMembershipQuery::new(
-        &group_refs,
+        group_refs.as_slice(),
         user_id.is_some(),
-        &token_refs,
+        token_refs.as_slice(),
         client.get_certificate_hash(),
         client.is_verified(),
         Some(client.get_real_ip_address()),
@@ -448,8 +493,8 @@ async fn compute_permissions_for_client_inner(
         channel_id,
         user_id,
         authenticated = membership.authenticated(),
-        groups = ?group_refs,
-        tokens = ?token_refs,
+        groups = ?group_refs.as_slice(),
+        tokens = ?token_refs.as_slice(),
         home_channel_id,
         home_channel_override,
         ancestors = ancestors.len(),
@@ -480,27 +525,28 @@ async fn compute_permissions_for_client_inner(
         "Computed ACL permissions"
     );
 
-    let (current_subject_generation, current_home_generation) = client.get_acl_cache_generations();
-    if use_acl_cache
-        && channels.channel_acl_generation_for_channel(&server_id, channel_id)
-            == channel_acl_generation
-        && current_subject_generation == client_acl_subject_generation
-        && (!depends_on_home_channel || current_home_generation == client_acl_home_generation)
-    {
-        channels
-            .cache_permissions_in_server_with_generations(
-                &server_id,
-                cache_session,
-                cache_client_instance,
-                channel_id,
-                channel_acl_generation,
-                client_acl_subject_generation,
-                client_acl_home_generation,
-                depends_on_home_channel,
-                explicit_enter_deny_overrides_write,
-                permissions,
-            )
-            .await;
+    if use_acl_cache {
+        client.with_server_id(|current_server_id| {
+            let (current_subject_generation, current_home_generation) =
+                client.get_acl_cache_generations();
+            if current_server_id == server_id
+                && channels.channel_acl_generation_for_channel(current_server_id, channel_id)
+                    == channel_acl_generation
+                && current_subject_generation == client_acl_subject_generation
+                && (!depends_on_home_channel
+                    || current_home_generation == client_acl_home_generation)
+            {
+                client.cache_acl_permissions(
+                    channel_id,
+                    channel_acl_generation,
+                    client_acl_subject_generation,
+                    client_acl_home_generation,
+                    depends_on_home_channel,
+                    explicit_enter_deny_overrides_write,
+                    permissions,
+                );
+            }
+        });
     }
 
     permissions
@@ -508,7 +554,7 @@ async fn compute_permissions_for_client_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelAclOverride, elevate_superuser_permissions};
+    use super::{BorrowedStrs, ChannelAclOverride, elevate_superuser_permissions};
     use shitspeak_state::{ACL, ACLPermissions, Channel};
 
     #[test]
@@ -549,5 +595,20 @@ mod tests {
         assert_eq!(overridden.max_users, channel.max_users);
         assert!(!overridden.inherit_acl);
         assert_eq!(overridden.acls, vec![old_acl]);
+    }
+
+    #[test]
+    fn borrowed_strings_stay_inline_until_capacity_is_exceeded() {
+        let values = ["one".to_owned(), "two".to_owned()];
+        let refs = BorrowedStrs::<2>::from_strings(&values);
+
+        assert!(refs.overflow.is_none());
+        assert_eq!(refs.as_slice(), ["one", "two"]);
+
+        let values = ["one".to_owned(), "two".to_owned(), "three".to_owned()];
+        let refs = BorrowedStrs::<2>::from_strings(&values);
+
+        assert!(refs.overflow.is_some());
+        assert_eq!(refs.as_slice(), ["one", "two", "three"]);
     }
 }

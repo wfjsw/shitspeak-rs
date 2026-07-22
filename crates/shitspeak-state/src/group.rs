@@ -1,51 +1,87 @@
 use std::{net::IpAddr, str::FromStr};
 
-use bytes::Bytes;
-
 use cidr::AnyIpCidr;
+
+use crate::Channel;
+
+#[derive(Clone, Copy)]
+enum HierarchyAncestors<'a> {
+    Ids(&'a [u32]),
+    Channels(&'a [Channel]),
+}
 
 #[derive(Clone, Copy)]
 pub struct ChannelHierarchy<'a> {
     current_channel_id: u32,
-    ancestors: &'a [u32],
+    ancestors: HierarchyAncestors<'a>,
 }
 
 impl<'a> ChannelHierarchy<'a> {
     pub fn new(current_channel_id: u32, ancestors: &'a [u32]) -> Self {
         Self {
             current_channel_id,
-            ancestors,
+            ancestors: HierarchyAncestors::Ids(ancestors),
+        }
+    }
+
+    pub(crate) fn from_channels(current_channel_id: u32, ancestors: &'a [Channel]) -> Self {
+        Self {
+            current_channel_id,
+            ancestors: HierarchyAncestors::Channels(ancestors),
+        }
+    }
+
+    fn ancestor_len(&self) -> usize {
+        match self.ancestors {
+            HierarchyAncestors::Ids(ancestors) => ancestors.len(),
+            HierarchyAncestors::Channels(ancestors) => ancestors.len(),
         }
     }
 
     fn root_to_current_len(&self) -> usize {
-        self.ancestors.len() + 1
+        self.ancestor_len() + 1
     }
 
     fn root_to_current_position(&self, channel_id: u32) -> Option<usize> {
-        self.ancestors
-            .iter()
-            .rev()
-            .position(|id| *id == channel_id)
-            .or_else(|| (self.current_channel_id == channel_id).then_some(self.ancestors.len()))
+        let position = match self.ancestors {
+            HierarchyAncestors::Ids(ancestors) => {
+                ancestors.iter().rev().position(|id| *id == channel_id)
+            }
+            HierarchyAncestors::Channels(ancestors) => ancestors
+                .iter()
+                .rev()
+                .position(|channel| channel.id == channel_id),
+        };
+        position.or_else(|| (self.current_channel_id == channel_id).then_some(self.ancestor_len()))
     }
 
     fn root_to_current_channel_at(&self, index: usize) -> Option<u32> {
-        if index == self.ancestors.len() {
+        let ancestor_len = self.ancestor_len();
+        if index == ancestor_len {
             return Some(self.current_channel_id);
         }
 
-        if index >= self.ancestors.len() {
+        if index >= ancestor_len {
             return None;
         }
 
-        self.ancestors
-            .get(self.ancestors.len() - index - 1)
-            .copied()
+        let ancestor_index = ancestor_len - index - 1;
+        match self.ancestors {
+            HierarchyAncestors::Ids(ancestors) => ancestors.get(ancestor_index).copied(),
+            HierarchyAncestors::Channels(ancestors) => {
+                ancestors.get(ancestor_index).map(|channel| channel.id)
+            }
+        }
     }
 
     fn contains_channel(&self, channel_id: u32) -> bool {
-        self.current_channel_id == channel_id || self.ancestors.contains(&channel_id)
+        self.current_channel_id == channel_id
+            || match self.ancestors {
+                HierarchyAncestors::Ids(ancestors) => ancestors.contains(&channel_id),
+                HierarchyAncestors::Channels(ancestors) => {
+                    ancestors.iter().any(|channel| channel.id == channel_id)
+                }
+            }
     }
 }
 
@@ -67,7 +103,7 @@ enum MatchType<'a> {
     All,
     Authenticated,
     HasVerifiedCertificateChain,
-    CertificateHash(Bytes),
+    CertificateHash(&'a str),
     InChannel,
     OutOfChannel,
     Subtree(SubtreeMatch),
@@ -153,7 +189,7 @@ pub fn is_member_in_group(
         Some(MatchType::Authenticated) => client.authenticated,
         Some(MatchType::HasVerifiedCertificateChain) => client.has_verified_cert_chain,
         Some(MatchType::CertificateHash(expected_hash)) => match client.cert_hash {
-            Some(actual_hash) => actual_hash == expected_hash.as_ref(),
+            Some(actual_hash) => hex_matches_bytes(expected_hash, actual_hash),
             None => false,
         },
         Some(MatchType::InChannel) => {
@@ -256,13 +292,7 @@ fn evaluate_group_string_match_type(group: &str) -> (Option<MatchType<'_>>, bool
 
             // Client certificate hash
             Some('$') => {
-                // Client certificate hash
-                let expected_certificate_hash = hex::decode(&group_name_slice[1..]);
-
-                break match expected_certificate_hash {
-                    Ok(hash) => Some(MatchType::CertificateHash(Bytes::from(hash))),
-                    Err(_) => None,
-                };
+                break Some(MatchType::CertificateHash(&group_name_slice[1..]));
             }
 
             // IP Database Mask
@@ -321,6 +351,35 @@ fn evaluate_group_string_match_type(group: &str) -> (Option<MatchType<'_>>, bool
         }
     };
     (match_type, invert, use_target_channel)
+}
+
+fn hex_matches_bytes(encoded: &str, bytes: &[u8]) -> bool {
+    if encoded.len() != bytes.len() * 2 {
+        return false;
+    }
+
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .zip(bytes)
+        .all(|(digits, expected)| {
+            let Some(high) = hex_nibble(digits[0]) else {
+                return false;
+            };
+            let Some(low) = hex_nibble(digits[1]) else {
+                return false;
+            };
+            (high << 4) | low == *expected
+        })
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 pub fn group_depends_on_home_channel(group: &str) -> bool {
@@ -502,5 +561,47 @@ mod tests {
         assert!(is_member_in_group("%@15169", home, None, &[], &client));
         assert!(!is_member_in_group("%#GB", home, None, &[], &client));
         assert!(!is_member_in_group("%@13335", home, None, &[], &client));
+    }
+
+    #[test]
+    fn channel_backed_hierarchy_matches_id_backed_hierarchy() {
+        let home_ancestors = [3, 1, 0];
+        let evaluation_ancestors = [1, 0];
+        let channels = [
+            Channel::new(1, "Parent", 0, 0, Some(0)),
+            Channel::new(0, "Root", 0, 0, None),
+        ];
+        let home = ChannelHierarchy::new(4, &home_ancestors);
+        let id_backed = ChannelHierarchy::new(2, &evaluation_ancestors);
+        let channel_backed = ChannelHierarchy::from_channels(2, &channels);
+        let client = membership(home);
+
+        for group in ["sub", "sub,-1,0", "~sub,-1,1,2", "!sub,0,0,0"] {
+            assert_eq!(
+                is_member_in_group(group, id_backed, Some(id_backed), &[], &client),
+                is_member_in_group(group, channel_backed, Some(channel_backed), &[], &client,),
+                "hierarchy representations differ for {group}",
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_hash_matching_preserves_hex_decode_semantics() {
+        let home = ChannelHierarchy::new(0, &[]);
+        let certificate_hash = [0xde, 0xad, 0xbe, 0xef];
+        let client =
+            ClientMembershipQuery::new(&[], true, &[], Some(&certificate_hash), false, None);
+
+        assert!(is_member_in_group("$deadbeef", home, None, &[], &client));
+        assert!(is_member_in_group("$DEADBEEF", home, None, &[], &client));
+        assert!(!is_member_in_group("$deadbeee", home, None, &[], &client));
+        assert!(!is_member_in_group("$deadbee", home, None, &[], &client));
+        assert!(!is_member_in_group("$deadbeeg", home, None, &[], &client));
+        assert!(is_member_in_group("!$deadbeeg", home, None, &[], &client));
+
+        let empty_hash = [];
+        let empty_client =
+            ClientMembershipQuery::new(&[], true, &[], Some(&empty_hash), false, None);
+        assert!(is_member_in_group("$", home, None, &[], &empty_client));
     }
 }
