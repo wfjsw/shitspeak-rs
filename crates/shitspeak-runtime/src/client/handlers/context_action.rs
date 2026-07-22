@@ -31,6 +31,10 @@ pub async fn handle_context_action(
 
     let actor_session = u32::from(sender.get_session_id());
 
+    if crate::toggle_superuser_visibility::handle(server, sender, &msg).await {
+        return Ok(());
+    }
+
     let payload = ContextActionPayload {
         action: msg.action.clone(),
         actor_session,

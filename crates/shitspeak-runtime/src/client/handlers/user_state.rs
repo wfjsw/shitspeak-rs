@@ -502,9 +502,7 @@ pub async fn handle_user_state(
                 channel_id: requested_channel_change,
                 mute: msg.mute,
                 deaf: msg.deaf,
-                suppress: post_move_destination_perms
-                    .map(|perms| !perms.contains(ACLPermissions::Speak))
-                    .or(msg.suppress),
+                suppress: msg.suppress,
                 priority_speaker: msg.priority_speaker,
                 listening_channel_add: msg.listening_channel_add.clone(),
                 listening_channel_remove: msg.listening_channel_remove.clone(),
@@ -548,6 +546,7 @@ pub async fn handle_user_state(
     };
     let mut cache_last_channel_id = None;
     let mut cache_listening_channel_ids = None;
+    let hidden_before = target.is_hidden_from_regular_users();
     let can_receive_voice;
     {
         let mut gs = target.write_global_state_as(repo, Some(sender_id), channel_version_dep);
@@ -569,6 +568,7 @@ pub async fn handle_user_state(
                 }
 
                 if gs.is_suppressed() && !mute {
+                    gs.set_hidden_from_regular_users(false);
                     gs.set_suppress(false);
                 }
             }
@@ -582,6 +582,9 @@ pub async fn handle_user_state(
                 }
             }
             if let Some(suppress) = msg.suppress {
+                if !suppress {
+                    gs.set_hidden_from_regular_users(false);
+                }
                 if gs.is_suppressed() != suppress {
                     gs.set_suppress(suppress);
                 }
@@ -669,6 +672,9 @@ pub async fn handle_user_state(
         }
     }
     target.set_can_receive_voice(can_receive_voice);
+    if hidden_before != target.is_hidden_from_regular_users() {
+        crate::toggle_superuser_visibility::refresh_context_menu(server, &target).await;
+    }
 
     if let Some(cache_key) = channel_cache_key.as_deref() {
         if let Some(channel_id) = cache_last_channel_id {

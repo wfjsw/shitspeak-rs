@@ -1562,6 +1562,11 @@ pub async fn route_voice(server: &Arc<Box<Server>>, sender: &Arc<Box<Client>>, a
     route_voice_inner(server, sender, audio, Duration::ZERO, None).await;
 }
 
+fn client_voice_blocked(client: &Arc<Box<Client>>) -> bool {
+    let state = client.read_global_state();
+    state.is_muted() || state.is_suppressed() || state.is_self_muted()
+}
+
 async fn route_voice_inner(
     server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
@@ -1727,6 +1732,12 @@ async fn route_voice_inner(
     );
     super::metrics::record_route_scope(VoiceRouteSource::Local, voice_intent_scope(&intent));
 
+    // Resolution can await repository and ACL work. Recheck immediately
+    // before either delivery path so a newly applied suppression wins.
+    if client_voice_blocked(sender) {
+        return;
+    }
+
     if send_s2s && has_authorized_s2s_target {
         let encode_started_at = Instant::now();
         let payload = encode_s2s_voice_payload(audio);
@@ -1857,6 +1868,9 @@ async fn route_decoded_s2s_voice_frame(
         .get_clients()
         .get_client_in_server(&server_id, sender_id)
         .await;
+    if replicated_sender.as_ref().is_some_and(client_voice_blocked) {
+        return;
+    }
     if server.get_hide_users_without_traverse() && replicated_sender.is_none() {
         tracing::trace!(
             from = from_immediate,
@@ -1891,6 +1905,10 @@ async fn route_decoded_s2s_voice_frame(
         audio_context_from_target_kind(frame.target_kind),
     )
     .await;
+
+    if replicated_sender.as_ref().is_some_and(client_voice_blocked) {
+        return;
+    }
 
     tracing::trace!(
         from = from_immediate,
@@ -2442,6 +2460,9 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
                     &work.generation,
                     Some((latest_sender.client_instance_id(), &latest_generation)),
                 ) {
+                    continue;
+                }
+                if client_voice_blocked(&latest_sender) {
                     continue;
                 }
                 flush_voice_batch(&fanout_server, &work.audio, &targets).await;

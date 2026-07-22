@@ -126,19 +126,19 @@ For every `BestEffort` route, raw UDP and the DATAGRAM delivery path on an
 eligible `s2s/2` QUIC session form one preferred datagram tier when the
 complete frame fits. The requested routing metric chooses between eligible raw
 UDP and QUIC DATAGRAM paths, giving them equal tier priority. Eligible datagram
-paths stay ahead of TCP, KCP, and QUIC reliable streams. Reliable fallback is
-used only when datagrams are unavailable, do not fit the frame, or have
-degraded or blocked health. Probing and viable datagram paths remain eligible;
-lack of samples alone does not force reliable fallback. Within that fallback,
-current queue pressure and the requested routing metric choose between QUIC
-streams and TCP.
+paths stay ahead of TCP, KCP, and legacy `s2s/1` QUIC streams. Reliable
+fallback is used only when datagrams are unavailable, do not fit the frame, or
+have degraded or blocked health. Probing and viable datagram paths remain
+eligible; lack of samples alone does not force reliable fallback. Strict
+`s2s/2` streams never carry BestEffort; TCP and KCP provide compatible reliable
+fallback when no legacy QUIC stream is available.
 
 QUIC DATAGRAM is a delivery path on the existing QUIC session, not a separate
 physical `TransportKind`; it shares that connection's network path, congestion
-controller, and capacity. For BestEffort, QUIC stream delivery remains an
-explicit reliable fallback alongside TCP and KCP. An item is sent on a reliable
-lane only after routing selects that delivery path; DATAGRAM enqueue failure
-does not silently convert it to a reliable lane.
+controller, and capacity. For BestEffort, only a legacy `s2s/1` QUIC stream is
+eligible as a QUIC reliable fallback alongside TCP and KCP. An item is sent on
+a reliable lane only after routing selects that delivery path; DATAGRAM enqueue
+failure does not silently convert it to a reliable lane.
 
 Selection telemetry preserves this logical distinction:
 `shitspeak_s2s_delivery_path_selections_total{path="quic_datagram"}` and

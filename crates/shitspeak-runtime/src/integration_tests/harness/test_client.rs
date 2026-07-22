@@ -26,8 +26,8 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::integration_tests::harness::TestServer;
 use crate::messages::encoder::{
-    Authenticate, ChanAcl, ChannelRemove, ClientType, RequestBlob, UserRemove, UserState, Version,
-    VoiceTarget,
+    Authenticate, ChanAcl, ChannelRemove, ClientType, ContextAction, RequestBlob, UserRemove,
+    UserState, Version, VoiceTarget,
 };
 use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
 use crate::protocol_version::ProtocolVersion;
@@ -267,6 +267,7 @@ pub struct TestClient {
     pub user_id: Option<u32>,
     pub initial_channel_states: Vec<crate::mumble_proto::ChannelState>,
     pub initial_user_states: Vec<crate::mumble_proto::UserState>,
+    pub initial_context_actions: Vec<crate::mumble_proto::ContextActionModify>,
     pub welcome_text: Option<String>,
     pub max_bandwidth: Option<u32>,
     pub initial_permissions: Option<u64>,
@@ -418,6 +419,7 @@ impl TestClient {
                 user_id: None,
                 initial_channel_states: Vec::new(),
                 initial_user_states: Vec::new(),
+                initial_context_actions: Vec::new(),
                 welcome_text: None,
                 max_bandwidth: None,
                 initial_permissions: None,
@@ -490,6 +492,9 @@ impl TestClient {
                         }
                         Message::ChannelState(cs) => client.initial_channel_states.push(cs),
                         Message::UserState(us) => client.initial_user_states.push(us),
+                        Message::ContextActionModify(modify) => {
+                            client.initial_context_actions.push(modify)
+                        }
                         Message::ServerConfig(_) => {}
                         Message::CodecVersion(_) => {}
                         Message::Reject(r) => return Err(ConnectError::Rejected(r)),
@@ -636,6 +641,17 @@ impl TestClient {
         self.send(us.into()).await;
     }
 
+    pub async fn trigger_context_action(&self, action: &str) {
+        self.send(
+            ContextAction {
+                action: action.to_owned(),
+                ..Default::default()
+            }
+            .into(),
+        )
+        .await;
+    }
+
     pub async fn set_self_deaf(&self, deaf: bool) {
         let mut us = UserState::default();
         us.session = Some(self.server_session);
@@ -692,6 +708,13 @@ impl TestClient {
         let mut us = UserState::default();
         us.session = Some(ClientSessionIdentifier::from(target_session));
         us.deaf = Some(deaf);
+        self.send(us.into()).await;
+    }
+
+    pub async fn suppress_other(&self, target_session: u32, suppress: bool) {
+        let mut us = UserState::default();
+        us.session = Some(ClientSessionIdentifier::from(target_session));
+        us.suppress = Some(suppress);
         self.send(us.into()).await;
     }
 

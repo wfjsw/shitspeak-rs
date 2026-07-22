@@ -14,6 +14,7 @@ pub struct ClientGlobalState {
     mute: bool,
     deaf: bool,
     suppress: bool,
+    hidden_from_regular_users: bool,
     self_mute: bool,
     self_deaf: bool,
     priority_speaker: bool,
@@ -58,6 +59,7 @@ impl ClientGlobalState {
             mute: false,
             deaf: false,
             suppress: false,
+            hidden_from_regular_users: false,
             self_mute: false,
             self_deaf: false,
             priority_speaker: false,
@@ -260,12 +262,31 @@ impl ClientGlobalState {
         self.suppress
     }
     pub fn set_suppress(&mut self, v: bool) {
+        let v = v || self.hidden_from_regular_users;
         if self.suppress == v {
             return;
         }
         self.suppress = v;
         if self.delta_recording {
             self.pending_delta.suppress = Some(v);
+        }
+    }
+
+    pub fn is_hidden_from_regular_users(&self) -> bool {
+        self.hidden_from_regular_users
+    }
+
+    pub fn set_hidden_from_regular_users(&mut self, hidden: bool) {
+        let hidden = hidden && self.is_superuser;
+        if self.hidden_from_regular_users == hidden {
+            return;
+        }
+        self.hidden_from_regular_users = hidden;
+        if self.delta_recording {
+            self.pending_delta.hidden_from_regular_users = Some(hidden);
+        }
+        if hidden {
+            self.set_suppress(true);
         }
     }
 
@@ -411,6 +432,9 @@ impl ClientGlobalState {
             return;
         }
         self.is_superuser = value;
+        if !value {
+            self.set_hidden_from_regular_users(false);
+        }
         self.bump_acl_subject_generation();
         if self.delta_recording {
             self.pending_delta.is_superuser = Some(value);
@@ -548,5 +572,36 @@ mod tests {
 
         assert_eq!(state.get_acl_generation(), 0);
         assert_eq!(state.get_acl_cache_generations(), (0, 0));
+    }
+
+    #[test]
+    fn hidden_superuser_remains_suppressed_across_acl_updates() {
+        let mut state = ClientGlobalState::new();
+        state.set_superuser(true);
+        state.set_hidden_from_regular_users(true);
+
+        assert!(state.is_hidden_from_regular_users());
+        assert!(state.is_suppressed());
+
+        state.set_suppress(false);
+        assert!(
+            state.is_suppressed(),
+            "ACL allow must not override the action"
+        );
+
+        state.set_hidden_from_regular_users(false);
+        state.set_suppress(false);
+        assert!(!state.is_suppressed());
+    }
+
+    #[test]
+    fn losing_superuser_status_disables_hidden_mode() {
+        let mut state = ClientGlobalState::new();
+        state.set_superuser(true);
+        state.set_hidden_from_regular_users(true);
+
+        state.set_superuser(false);
+
+        assert!(!state.is_hidden_from_regular_users());
     }
 }

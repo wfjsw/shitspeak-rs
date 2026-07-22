@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock, Weak};
 
 use bytes::{Bytes, BytesMut};
@@ -190,6 +191,7 @@ pub struct Server {
     geoip_resolver: ParkingRwLock<Arc<GeoIpResolver>>,
     shutdown_tx: tokio::sync::watch::Sender<()>,
     visibility_reload_tx: broadcast::Sender<()>,
+    visibility_generation: AtomicU64,
     client_projection_pool: std::sync::OnceLock<client_projection_pool::ClientProjectionPool>,
 }
 
@@ -330,13 +332,18 @@ impl Server {
             bans,
             codec_info: Mutex::new(CodecInfo::default()),
             config: Arc::clone(&config),
-            context_actions: Arc::new(crate::context_action::ContextActionRegistry::new()),
+            context_actions: Arc::new(
+                crate::context_action::ContextActionRegistry::with_reserved_actions([
+                    crate::toggle_superuser_visibility::ACTION_ID,
+                ]),
+            ),
             s2s_manager,
             geoip_resolver: ParkingRwLock::new(Arc::new(GeoIpResolver::new(
                 config.read().expect("Config RwLock poisoned").geoip.clone(),
             ))),
             shutdown_tx,
             visibility_reload_tx,
+            visibility_generation: AtomicU64::new(0),
             client_projection_pool: std::sync::OnceLock::new(),
         }));
 
@@ -405,6 +412,10 @@ impl Server {
     /// either hide flag changes during a config reload.
     pub fn subscribe_visibility_reload(&self) -> broadcast::Receiver<()> {
         self.visibility_reload_tx.subscribe()
+    }
+
+    pub(crate) fn visibility_generation(&self) -> u64 {
+        self.visibility_generation.load(Ordering::SeqCst)
     }
 
     pub(crate) fn client_projection_pool(&self) -> &client_projection_pool::ClientProjectionPool {
@@ -1591,6 +1602,7 @@ impl Server {
         if !self.client_instance_is_current(&client).await {
             return;
         }
+        let was_superuser = client.is_superuser();
         {
             let mut state = client.write_global_state(&self.clients);
             state.set_user_id(user_id);
@@ -1600,6 +1612,9 @@ impl Server {
             state.set_suppress(
                 !current_permissions.contains(shitspeak_state::ACLPermissions::Speak),
             );
+        }
+        if was_superuser != client.is_superuser() {
+            crate::toggle_superuser_visibility::refresh_context_menu(self, &client).await;
         }
 
         client.set_authentication_expiry(
@@ -2044,6 +2059,7 @@ impl Server {
                     self.channels.invalidate_all_acl_cache().await;
                 }
                 if visibility_reload {
+                    self.visibility_generation.fetch_add(1, Ordering::SeqCst);
                     let _ = self.visibility_reload_tx.send(());
                 }
                 self.auth_finalization_queue

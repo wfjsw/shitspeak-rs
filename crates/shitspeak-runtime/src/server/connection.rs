@@ -124,7 +124,7 @@ pub(super) async fn activate_client_subscriptions(
     channel_tree_shadow.clear();
     channel_permission_shadow.clear();
     if let Some(baseline) = post_auth_baseline {
-        let (staged_session_shadow, staged_channel_tree_shadow, staged_user_visibility) =
+        let (staged_session_shadow, staged_channel_tree_shadow, staged_user_visibility, _) =
             baseline.into_parts();
         session_channel_shadow.clear();
         session_channel_shadow.extend(staged_session_shadow);
@@ -150,7 +150,7 @@ pub(super) async fn activate_client_subscriptions(
         } else {
             channel_tree_shadow.extend(channels.into_iter().map(|channel| channel.id));
         }
-        if server.get_hide_users_without_traverse() {
+        if crate::client::visibility::user_filtering_enabled(server, client) {
             crate::client::visibility::initialize(
                 server,
                 client,
@@ -245,6 +245,7 @@ pub(super) async fn activate_client_projection(
             let mut channel_tree_shadow = ChannelTreeShadow::default();
             let mut session_channel_shadow = SessionChannelShadow::new();
             let mut user_visibility = UserVisibilityState::default();
+            let visibility_generation = server.visibility_generation();
             if server.get_hide_channels_without_traverse() {
                 for channel in &channels {
                     if crate::channel_handler::can_view_channel_with_ancestors(
@@ -258,7 +259,7 @@ pub(super) async fn activate_client_projection(
             } else {
                 channel_tree_shadow.extend(channels.iter().map(|channel| channel.id));
             }
-            if server.get_hide_users_without_traverse() {
+            if crate::client::visibility::user_filtering_enabled(server, client) {
                 crate::client::visibility::initialize(
                     server,
                     client,
@@ -279,6 +280,7 @@ pub(super) async fn activate_client_projection(
                     session_channel_shadow,
                     channel_tree_shadow,
                     user_visibility,
+                    visibility_generation,
                 ),
                 snapshot_versions,
                 snapshot_channel_version,

@@ -2967,6 +2967,17 @@ async fn apply_user_state_patch(
         None
     };
     let mut cache_listening_channel_ids = None;
+    let hidden_before = target.is_hidden_from_regular_users();
+    let post_move_destination_perms = if let Some(channel_id) = patch.channel_id {
+        Some(
+            crate::client::acl::compute_permissions_for_client_as_if_in_channel(
+                server, &target, channel_id,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     let can_receive_voice;
     {
         let mut gs =
@@ -2980,6 +2991,7 @@ async fn apply_user_state_patch(
                 }
             }
             if gs.is_suppressed() && !mute {
+                gs.set_hidden_from_regular_users(false);
                 gs.set_suppress(false);
             }
         }
@@ -3000,9 +3012,15 @@ async fn apply_user_state_patch(
             gs.set_current_channel_id(channel_id);
         }
         if let Some(suppress) = patch.suppress {
+            if !suppress {
+                gs.set_hidden_from_regular_users(false);
+            }
             if gs.is_suppressed() != suppress {
                 gs.set_suppress(suppress);
             }
+        }
+        if let Some(destination_perms) = post_move_destination_perms {
+            gs.set_suppress(!destination_perms.contains(shitspeak_state::ACLPermissions::Speak));
         }
         for channel_id in &patch.listening_channel_add {
             gs.listen_channel(*channel_id);
@@ -3021,6 +3039,9 @@ async fn apply_user_state_patch(
         can_receive_voice = gs.can_receive_voice();
     }
     target.set_can_receive_voice(can_receive_voice);
+    if hidden_before != target.is_hidden_from_regular_users() {
+        crate::toggle_superuser_visibility::refresh_context_menu(server, &target).await;
+    }
 
     if let Some(cache_key) = channel_cache_key.as_deref() {
         if let Some(channel_id) = patch.channel_id {
@@ -3849,7 +3870,9 @@ fn sanitize_update_client_channels(
         .is_some_and(|channel_id| !valid_channels.contains(&channel_id))
     {
         delta.current_channel_id = None;
-        delta.suppress = None;
+        if !(delta.hidden_from_regular_users == Some(false) && delta.suppress == Some(false)) {
+            delta.suppress = None;
+        }
     }
     retain_valid_channel_delta(delta, valid_channels);
 }
@@ -4070,6 +4093,22 @@ mod tests {
 
         assert!(timeout > s2s_replications::ReplicationConfig::default().propose_ttl());
         assert_eq!(timeout, Duration::from_millis(10_200));
+    }
+
+    #[test]
+    fn invalid_remote_move_preserves_explicit_hidden_mode_unsuppress() {
+        let mut delta = ClientGlobalStateDelta {
+            current_channel_id: Some(99),
+            suppress: Some(false),
+            hidden_from_regular_users: Some(false),
+            ..Default::default()
+        };
+
+        sanitize_update_client_channels(&mut delta, &HashSet::from([0]));
+
+        assert_eq!(delta.current_channel_id, None);
+        assert_eq!(delta.hidden_from_regular_users, Some(false));
+        assert_eq!(delta.suppress, Some(false));
     }
 
     #[test]

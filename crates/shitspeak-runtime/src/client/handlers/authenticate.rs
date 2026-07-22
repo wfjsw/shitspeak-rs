@@ -432,6 +432,7 @@ pub async fn handle_authenticate(
     // This matches the Mumble server's auth-complete sequence after the
     // connection-level UDP crypto has already been established.
 
+    let visibility_generation = server.visibility_generation();
     let (all_clients, all_versions, client_state_rx) = server
         .get_clients()
         .published_snapshot_with_versions_and_subscription_in_server(&server_id)
@@ -531,7 +532,18 @@ pub async fn handle_authenticate(
         session_channel_shadow,
         channel_tree_shadow,
         user_visibility,
+        visibility_generation,
     ));
+
+    for action in server.context_actions().build_modify_list().await {
+        push_burst(action.into());
+    }
+    if sender.is_superuser() {
+        push_burst(
+            crate::toggle_superuser_visibility::action(sender.is_hidden_from_regular_users())
+                .into(),
+        );
+    }
 
     // 4. ServerSync
     {

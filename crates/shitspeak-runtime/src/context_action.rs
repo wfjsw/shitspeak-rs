@@ -15,7 +15,12 @@
 //! list is reconstructed and re-sent to every connected client so that
 //! ordering is preserved.
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+};
 
 use parking_lot::RwLock;
 
@@ -149,14 +154,24 @@ pub struct ContextActionRegistry {
     definitions: RwLock<Vec<ContextActionDef>>,
     /// Handlers keyed by action name.
     handlers: RwLock<HashMap<String, ActionHandler>>,
+    /// Identifiers owned by built-in actions and unavailable to extensions.
+    reserved_actions: HashSet<String>,
 }
 
 impl ContextActionRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
+        Self::with_reserved_actions(std::iter::empty::<String>())
+    }
+
+    /// Create an empty registry with identifiers reserved for built-in actions.
+    pub fn with_reserved_actions(
+        reserved_actions: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         Self {
             definitions: RwLock::new(Vec::new()),
             handlers: RwLock::new(HashMap::new()),
+            reserved_actions: reserved_actions.into_iter().map(Into::into).collect(),
         }
     }
 
@@ -174,6 +189,10 @@ impl ContextActionRegistry {
         callback: OneShotCallback,
     ) {
         let action = action.into();
+        if self.reserved_actions.contains(&action) {
+            tracing::warn!(action, "ignoring registration for reserved context action");
+            return;
+        }
         let def = ContextActionDef {
             action: action.clone(),
             context,
@@ -203,6 +222,10 @@ impl ContextActionRegistry {
         callback: ToggleCallback,
     ) {
         let action = action.into();
+        if self.reserved_actions.contains(&action) {
+            tracing::warn!(action, "ignoring registration for reserved context action");
+            return;
+        }
         let def = ContextActionDef {
             action: action.clone(),
             context,
@@ -264,6 +287,54 @@ impl ContextActionRegistry {
         }
 
         out
+    }
+
+    /// Build the registered actions that appear in one menu context while
+    /// preserving their registration order.
+    pub async fn build_modify_list_for_context(
+        &self,
+        target_context: Context,
+    ) -> Vec<ContextActionModify> {
+        self.build_modify_list()
+            .await
+            .into_iter()
+            .filter(|modify| {
+                modify
+                    .context
+                    .is_some_and(|value| value & target_context.0 != 0)
+            })
+            .collect()
+    }
+
+    /// Remove every action in one context and add them back in their original
+    /// order, optionally followed by a caller-owned action.
+    pub async fn rebuild_context_with_tail(
+        &self,
+        target_context: Context,
+        tail_action_name: &str,
+        tail_action: Option<ContextActionModify>,
+    ) -> Vec<ContextActionModify> {
+        let mut additions = self.build_modify_list_for_context(target_context).await;
+        let mut modifications = additions
+            .iter()
+            .map(|addition| ContextActionModify {
+                action: addition.action.clone(),
+                text: None,
+                context: addition.context,
+                operation: Some(Operation::Remove as i32),
+            })
+            .collect::<Vec<_>>();
+        modifications.push(ContextActionModify {
+            action: tail_action_name.to_owned(),
+            text: None,
+            context: Some(target_context.0),
+            operation: Some(Operation::Remove as i32),
+        });
+        if let Some(tail_action) = tail_action {
+            additions.push(tail_action);
+        }
+        modifications.extend(additions);
+        modifications
     }
 
     // ── Dispatch ─────────────────────────────────────────────────────
@@ -367,6 +438,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_action_identifier_cannot_be_registered() {
+        let registry = ContextActionRegistry::with_reserved_actions(["reserved"]);
+        registry
+            .register_one_shot("reserved", Context::SERVER, "Reserved", noop_one_shot())
+            .await;
+
+        assert!(registry.build_modify_list().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_toggle_state_reflected_in_label() {
         let registry = ContextActionRegistry::new();
         registry
@@ -388,6 +469,51 @@ mod tests {
         registry.set_toggle_state("deafen", true).await;
         let list = registry.build_modify_list().await;
         assert_eq!(list[0].text.as_deref(), Some("Undeafen User"));
+    }
+
+    #[tokio::test]
+    async fn context_rebuild_removes_all_entries_then_restores_order() {
+        let registry = ContextActionRegistry::new();
+        registry
+            .register_one_shot("first", Context::SERVER, "First", noop_one_shot())
+            .await;
+        registry
+            .register_one_shot("channel", Context::CHANNEL, "Channel", noop_one_shot())
+            .await;
+        registry
+            .register_one_shot("second", Context::SERVER, "Second", noop_one_shot())
+            .await;
+
+        let rebuilt = registry
+            .rebuild_context_with_tail(
+                Context::SERVER,
+                "tail",
+                Some(ContextActionModify {
+                    action: "tail".to_owned(),
+                    text: Some("Tail".to_owned()),
+                    context: Some(context::SERVER),
+                    operation: Some(Operation::Add as i32),
+                }),
+            )
+            .await;
+        let actions = rebuilt
+            .iter()
+            .map(|modify| modify.action.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec!["first", "second", "tail", "first", "second", "tail",]
+        );
+        assert!(
+            rebuilt[..3]
+                .iter()
+                .all(|modify| modify.operation == Some(Operation::Remove as i32))
+        );
+        assert!(
+            rebuilt[3..]
+                .iter()
+                .all(|modify| modify.operation == Some(Operation::Add as i32))
+        );
     }
 
     #[tokio::test]

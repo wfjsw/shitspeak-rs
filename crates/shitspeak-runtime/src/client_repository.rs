@@ -4940,9 +4940,6 @@ pub(crate) fn apply_delta_to_global_state(
     if let Some(v) = delta.deaf {
         gs.set_deaf(v);
     }
-    if let Some(v) = delta.suppress {
-        gs.set_suppress(v);
-    }
     if let Some(v) = delta.self_mute {
         gs.set_self_mute(v);
     }
@@ -4999,6 +4996,12 @@ pub(crate) fn apply_delta_to_global_state(
     }
     if let Some(v) = delta.is_superuser {
         gs.set_superuser(v);
+    }
+    if let Some(v) = delta.hidden_from_regular_users {
+        gs.set_hidden_from_regular_users(v);
+    }
+    if let Some(v) = delta.suppress {
+        gs.set_suppress(v);
     }
     if let Some(ref v) = delta.tokens {
         gs.set_tokens(v.clone());

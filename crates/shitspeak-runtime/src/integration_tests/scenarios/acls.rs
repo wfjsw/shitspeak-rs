@@ -1195,6 +1195,86 @@ async fn traverse_visibility_reconciles_acl_changes() {
 }
 
 #[tokio::test]
+async fn live_acl_changes_do_not_hide_users_when_visibility_filtering_is_disabled() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_superuser("carol", None, Some(3), vec!["admin".into()]);
+
+    server
+        .server
+        .get_channels()
+        .create_channel(Channel::new(
+            83,
+            "Visible ACL Flip".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    bob.move_to_channel(83).await;
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(bob.session_id) && state.channel_id == Some(83))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees bob before the ACL update");
+    alice.drain_now().await;
+
+    carol
+        .set_acls(
+            83,
+            vec![ChanAcl {
+                apply_here: true,
+                apply_subs: false,
+                inherited: false,
+                user_id: None,
+                group: Some("all".to_owned()),
+                grant: 0,
+                deny: ACLPermissions::Traverse as u32,
+            }],
+            true,
+        )
+        .await;
+
+    assert!(
+        alice
+            .recv_until(
+                |message| {
+                    matches!(message, Message::UserRemove(remove)
+                        if remove.session == bob.session_id)
+                },
+                Duration::from_millis(300),
+            )
+            .await
+            .is_none(),
+        "Traverse ACL changes must not hide users when filtering is disabled"
+    );
+}
+
+#[tokio::test]
 async fn traverse_visibility_retains_viewer_self_and_channel_after_losing_traverse() {
     let server = spawn_test_server(TestServerOpts {
         hide_users_without_traverse: true,

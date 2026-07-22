@@ -109,6 +109,121 @@ async fn superuser_can_unsuppress_other() {
     );
 }
 
+#[tokio::test]
+async fn moderator_unsuppress_disables_hidden_superuser_mode() {
+    use crate::toggle_superuser_visibility::{ACTION_ID, HIDE_LABEL};
+
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_superuser("carol", None, Some(2), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(3), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    bob.drain_now().await;
+    alice.drain_now().await;
+
+    alice.trigger_context_action(ACTION_ID).await;
+    bob.recv_until(
+        |message| {
+            matches!(message, Message::UserRemove(remove)
+                if remove.session == alice.session_id)
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("Alice should become hidden");
+
+    carol.suppress_other(alice.session_id, false).await;
+    bob.recv_until(
+        |message| {
+            matches!(message, Message::UserState(state)
+                if state.session == Some(alice.session_id)
+                    && state.name.is_some()
+                    && state.channel_id.is_some())
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("moderator unsuppress should reveal Alice");
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::ContextActionModify(modify)
+                    if modify.action == ACTION_ID
+                        && modify.text.as_deref() == Some(HIDE_LABEL))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("moderator unsuppress should reset Alice's action label");
+
+    let live_alice = server
+        .server
+        .get_clients()
+        .get_client(alice.server_session)
+        .await
+        .expect("live Alice");
+    let state = live_alice.read_global_state();
+    assert!(!state.is_hidden_from_regular_users());
+    assert!(!state.is_suppressed());
+    drop(state);
+
+    bob.drain_now().await;
+    alice.drain_now().await;
+    alice.trigger_context_action(ACTION_ID).await;
+    bob.recv_until(
+        |message| {
+            matches!(message, Message::UserRemove(remove)
+                if remove.session == alice.session_id)
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("Alice should become hidden again");
+
+    carol.mute_other(alice.session_id, false).await;
+    bob.recv_until(
+        |message| {
+            matches!(message, Message::UserState(state)
+                if state.session == Some(alice.session_id)
+                    && state.name.is_some()
+                    && state.channel_id.is_some())
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("moderator mute=false should also reveal Alice");
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::ContextActionModify(modify)
+                    if modify.action == ACTION_ID
+                        && modify.text.as_deref() == Some(HIDE_LABEL))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("mute=false should reset Alice's action label");
+
+    let state = live_alice.read_global_state();
+    assert!(!state.is_hidden_from_regular_users());
+    assert!(!state.is_suppressed());
+}
+
 /// Checks that a moderator kick removes the target from the server.
 /// Expected: Alice receives `UserRemove` for Bob's session. This comes from
 /// Mumble's kick path in `D:\mumble\src\murmur\Messages.cpp::msgUserRemove`

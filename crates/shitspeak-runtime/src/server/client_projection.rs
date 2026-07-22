@@ -53,6 +53,7 @@ pub(crate) struct ClientProjectionState {
     last_channel_version: u64,
     replay_client_log: bool,
     replay_channel_log: bool,
+    baseline_visibility_generation: Option<u64>,
 }
 
 impl ClientProjectionState {
@@ -65,8 +66,9 @@ impl ClientProjectionState {
         last_client_versions: HashMap<u16, u64>,
         last_channel_version: u64,
     ) -> Self {
-        let (session_channel_shadow, channel_tree_shadow, user_visibility) = baseline.into_parts();
-        Self::new(
+        let (session_channel_shadow, channel_tree_shadow, user_visibility, visibility_generation) =
+            baseline.into_parts();
+        let mut state = Self::new(
             server,
             client,
             channel_tree_shadow,
@@ -74,7 +76,9 @@ impl ClientProjectionState {
             user_visibility,
             last_client_versions,
             last_channel_version,
-        )
+        );
+        state.baseline_visibility_generation = visibility_generation;
+        state
     }
 
     pub(crate) fn new(
@@ -97,6 +101,7 @@ impl ClientProjectionState {
             last_channel_version,
             replay_client_log: false,
             replay_channel_log: false,
+            baseline_visibility_generation: None,
         }
     }
 
@@ -666,20 +671,22 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
         let mut outbound = Vec::new();
         self.resynchronize(&mut outbound).await?;
         let server = self.server()?;
-        let messages = crate::client::visibility::visibility_config_reload_messages(
-            &server,
-            &self.client,
-            &mut self.user_visibility,
-            &mut self.channel_tree_shadow,
-            &mut self.session_channel_shadow,
-        )
-        .await;
-        outbound.extend(
-            crate::channel_handler::suppress_known_projected_permission_messages(
-                messages,
-                &mut self.channel_permission_shadow,
-            ),
-        );
+        if self.baseline_visibility_generation != Some(server.visibility_generation()) {
+            let messages = crate::client::visibility::visibility_config_reload_messages(
+                &server,
+                &self.client,
+                &mut self.user_visibility,
+                &mut self.channel_tree_shadow,
+                &mut self.session_channel_shadow,
+            )
+            .await;
+            outbound.extend(
+                crate::channel_handler::suppress_known_projected_permission_messages(
+                    messages,
+                    &mut self.channel_permission_shadow,
+                ),
+            );
+        }
         Ok((!outbound.is_empty()).then(|| OwnedMessageBatch::new(outbound)))
     }
 

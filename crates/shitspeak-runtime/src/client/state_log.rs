@@ -96,6 +96,9 @@ pub struct ClientGlobalStateDelta {
     pub is_superuser: Option<bool>,
     pub tokens: Option<HashSet<String>>,
     pub display_name: Option<Option<String>>,
+
+    // Append new replicated fields to preserve positional MessagePack compatibility.
+    pub hidden_from_regular_users: Option<bool>,
 }
 
 impl ClientGlobalStateDelta {
@@ -109,6 +112,7 @@ impl ClientGlobalStateDelta {
             mute: Some(state.is_muted()),
             deaf: Some(state.is_deafened()),
             suppress: Some(state.is_suppressed()),
+            hidden_from_regular_users: Some(state.is_hidden_from_regular_users()),
             self_mute: Some(state.is_self_muted()),
             self_deaf: Some(state.is_self_deafened()),
             priority_speaker: Some(state.is_priority_speaker()),
@@ -135,6 +139,7 @@ impl ClientGlobalStateDelta {
             || self.mute.is_some()
             || self.deaf.is_some()
             || self.suppress.is_some()
+            || self.hidden_from_regular_users.is_some()
             || self.self_mute.is_some()
             || self.self_deaf.is_some()
             || self.priority_speaker.is_some()
@@ -165,6 +170,7 @@ impl ClientGlobalStateDelta {
             || self.listening_channel_add.is_some()
             || self.listening_channel_remove.is_some()
             || self.deaf.is_some()
+            || self.hidden_from_regular_users.is_some()
             || self.self_deaf.is_some()
             || self.user_id.is_some()
             || self.groups.is_some()
@@ -799,6 +805,10 @@ mod tests {
             },
             ClientGlobalStateDelta {
                 self_deaf: Some(true),
+                ..Default::default()
+            },
+            ClientGlobalStateDelta {
+                hidden_from_regular_users: Some(true),
                 ..Default::default()
             },
             ClientGlobalStateDelta {

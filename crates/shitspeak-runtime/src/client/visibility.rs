@@ -833,14 +833,17 @@ async fn can_view_user_with_home(
     target: &Arc<Box<Client>>,
     effective_home_channel_id: Option<u32>,
 ) -> bool {
-    if !server.get_hide_users_without_traverse() {
-        return true;
-    }
     if viewer.get_session_id() == target.get_session_id() {
         return true;
     }
     if !target.is_authenticated() {
         return false;
+    }
+    if superuser_hidden_from_viewer(viewer, target) {
+        return false;
+    }
+    if !server.get_hide_users_without_traverse() {
+        return true;
     }
     let perms = match effective_home_channel_id {
         Some(home_channel_id) => {
@@ -862,6 +865,14 @@ async fn can_view_user_with_home(
         }
     };
     perms.contains(ACLPermissions::Traverse)
+}
+
+fn superuser_hidden_from_viewer(viewer: &Arc<Box<Client>>, target: &Arc<Box<Client>>) -> bool {
+    target.is_superuser() && target.is_hidden_from_regular_users() && !viewer.is_superuser()
+}
+
+pub(crate) fn user_filtering_enabled(server: &Arc<Box<Server>>, viewer: &Arc<Box<Client>>) -> bool {
+    server.get_hide_users_without_traverse() || !viewer.is_superuser()
 }
 
 async fn can_project_user(
@@ -1013,6 +1024,7 @@ pub fn user_state_projection_is_viewer_independent(
 ) -> bool {
     (!viewer.is_superuser() || !server.get_show_node_id_for_superusers())
         && !server.get_hide_users_without_traverse()
+        && viewer.is_superuser()
         && server.get_certificate_hash_privacy().is_none()
 }
 
@@ -1025,7 +1037,7 @@ pub async fn initialize(
     visibility.clear();
     channel_shadow.clear();
     let server_id = viewer.server_id();
-    if server.get_hide_users_without_traverse() {
+    if user_filtering_enabled(server, viewer) {
         visibility.ensure_registered_for_server(server, &server_id);
     }
     for target in server
@@ -1048,7 +1060,7 @@ pub async fn initialize(
     }
 }
 
-/// Reconcile a live session after either visibility flag changes in a config
+/// Reconcile a live session after a visibility setting changes in a config
 /// reload. The transport loops own their shadows, so this builds one ordered
 /// transition for each session instead of asking clients to reconnect.
 ///
@@ -1062,13 +1074,13 @@ pub async fn visibility_config_reload_messages(
     session_channel_shadow: &mut SessionChannelShadow,
 ) -> Vec<Message> {
     let server_id = viewer.server_id();
-    let hide_users_without_traverse = server.get_hide_users_without_traverse();
+    let user_filtering_enabled = user_filtering_enabled(server, viewer);
     let hiding_users_before = visibility.registered_viewer_id(&server_id).is_some();
     // A channel-only toggle can change which users/listeners qualify because
     // user visibility is evaluated against the target's current channel.
     // Rebuild the user projection whenever filtering is active; config reloads
     // are infrequent, so this avoids leaving stale users online.
-    let users_mode_changed = hide_users_without_traverse || hiding_users_before;
+    let users_mode_changed = user_filtering_enabled || hiding_users_before;
 
     let old_sessions = session_channel_shadow
         .iter()
@@ -1239,7 +1251,7 @@ pub async fn visibility_config_reload_messages(
 
     if users_mode_changed {
         visibility.clear();
-        if !hide_users_without_traverse {
+        if !user_filtering_enabled {
             // Stop indexing this viewer once user filtering is disabled.
             visibility.registration.take();
         } else {
@@ -1252,7 +1264,7 @@ pub async fn visibility_config_reload_messages(
             let listener_channels = listener_channels_by_session
                 .remove(&session)
                 .unwrap_or_else(|| target.get_listening_channel_ids());
-            if hide_users_without_traverse {
+            if user_filtering_enabled {
                 visibility.insert(
                     session,
                     target.get_current_channel_id(),
@@ -1285,26 +1297,27 @@ async fn project_message_at_home(
     message: &Message,
     effective_home_channel_id: Option<u32>,
 ) -> Vec<Message> {
-    if server.get_hide_users_without_traverse() {
+    let user_filtering_enabled = user_filtering_enabled(server, viewer);
+    if user_filtering_enabled {
         visibility.ensure_registered_for_server(server, &viewer.server_id());
     }
     match message {
         Message::UserState(user_state) => {
             let Ok(user_state) = UserState::try_from(user_state.clone()) else {
-                return if server.get_hide_users_without_traverse() {
+                return if user_filtering_enabled {
                     Vec::new()
                 } else {
                     vec![message.clone()]
                 };
             };
             let Some(session) = user_state.session else {
-                return if server.get_hide_users_without_traverse() {
+                return if user_filtering_enabled {
                     Vec::new()
                 } else {
                     vec![message.clone()]
                 };
             };
-            if server.get_hide_users_without_traverse() {
+            if user_filtering_enabled {
                 project_user_state(
                     server,
                     viewer,
@@ -1321,7 +1334,7 @@ async fn project_message_at_home(
             }
         }
         Message::UserRemove(user_remove) => {
-            if !server.get_hide_users_without_traverse() {
+            if !user_filtering_enabled {
                 return vec![message.clone()];
             }
             let session = ClientSessionIdentifier::from(user_remove.session);
@@ -1483,20 +1496,27 @@ async fn visibility_refresh_messages_with_home(
     channel_shadow: Option<&SessionChannelShadow>,
 ) -> Vec<Message> {
     let hide_users_without_traverse = server.get_hide_users_without_traverse();
+    let user_filtering_enabled = user_filtering_enabled(server, viewer);
+    let was_filtering_users = visibility
+        .registered_viewer_id(&viewer.server_id())
+        .is_some();
+    let transitioning_to_unfiltered = !user_filtering_enabled && was_filtering_users;
     let include_user_state_names = scope.include_user_state_names;
-    if scope.is_empty() || (!hide_users_without_traverse && !include_user_state_names) {
+    if scope.is_empty()
+        || (!user_filtering_enabled && !transitioning_to_unfiltered && !include_user_state_names)
+    {
         return Vec::new();
     }
 
     let server_id = viewer.server_id();
-    if hide_users_without_traverse {
+    if user_filtering_enabled {
         visibility.ensure_registered_for_server(server, &server_id);
     }
     let mut sessions = std::mem::take(&mut scope.sessions);
     if scope.include_known_users {
-        if hide_users_without_traverse {
+        if user_filtering_enabled {
             sessions.extend(visibility.known_session_ids());
-        } else if include_user_state_names {
+        } else if transitioning_to_unfiltered || include_user_state_names {
             sessions.extend(
                 server
                     .get_clients()
@@ -1522,7 +1542,7 @@ async fn visibility_refresh_messages_with_home(
     }
 
     if !channels.is_empty() {
-        if hide_users_without_traverse {
+        if user_filtering_enabled {
             sessions.extend(visibility.known_session_ids_in_channels(&channels));
         }
         sessions.extend(
@@ -1570,7 +1590,7 @@ async fn visibility_refresh_messages_with_home(
             .await
         {
             Some(target) if target.is_authenticated() => {
-                if hide_users_without_traverse {
+                if user_filtering_enabled {
                     messages.extend(
                         refresh_target_visibility(
                             server,
@@ -1586,18 +1606,30 @@ async fn visibility_refresh_messages_with_home(
                         )
                         .await,
                     );
-                } else if include_user_state_names
-                    && let Some(message) =
-                        user_state_name_refresh_for_viewer(server, viewer, &target)
-                {
-                    messages.push(message);
+                } else {
+                    if transitioning_to_unfiltered && visibility.get(session).is_none() {
+                        messages.push(
+                            build_visible_user_state(server, viewer, &target)
+                                .await
+                                .into(),
+                        );
+                    } else if include_user_state_names
+                        && let Some(message) =
+                            user_state_name_refresh_for_viewer(server, viewer, &target)
+                    {
+                        messages.push(message);
+                    }
                 }
             }
-            _ if hide_users_without_traverse && visibility.remove(session) => {
+            _ if user_filtering_enabled && visibility.remove(session) => {
                 messages.push(hidden_user_remove(session));
             }
             _ => {}
         }
+    }
+    if transitioning_to_unfiltered {
+        visibility.clear();
+        visibility.registration.take();
     }
     messages
 }
@@ -2092,8 +2124,10 @@ async fn refresh_target_visibility(
         .unwrap_or_else(|| target.get_current_channel_id());
     let visible = if viewer.get_session_id() == target.get_session_id() {
         true
+    } else if superuser_hidden_from_viewer(viewer, target) {
+        false
     } else if let Some(context) = acl_context {
-        context.can_view_channel(target_channel_id)
+        (!server.get_hide_users_without_traverse() || context.can_view_channel(target_channel_id))
             && (!server.get_hide_channels_without_traverse()
                 || context.can_view_channel_with_ancestors(target_channel_id))
     } else {

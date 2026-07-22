@@ -60,6 +60,7 @@ pub mod register;
 pub mod s2s;
 pub mod server;
 pub mod tls_fingerprint;
+pub(crate) mod toggle_superuser_visibility;
 pub mod types;
 pub mod user_channel_cache;
 pub mod utils;

@@ -892,6 +892,7 @@ pub(crate) enum SessionTrySendError {
     Full,
     Closed,
     TooLarge,
+    UnsupportedPath,
 }
 
 impl QuicV2SessionSender {
@@ -1126,6 +1127,11 @@ impl SessionSender {
         frame: OutboundFrame,
     ) -> Result<SessionSendOutcome, SessionTrySendError> {
         match (self, path) {
+            (Self::QuicV2(_), DeliveryPath::QuicStream)
+                if frame.level() == ServiceLevel::BestEffort =>
+            {
+                Err(SessionTrySendError::UnsupportedPath)
+            }
             (Self::QuicV2(sender), DeliveryPath::QuicStream) => sender.try_send_stream(frame),
             _ => self.try_send(frame),
         }
@@ -1979,6 +1985,23 @@ impl PeerState {
                 stream.transport() == TransportKind::Quic
                     && stream.is_alive()
                     && stream.sender.quic_v2_max_datagram_size().is_some()
+            })
+            .max_by_key(|stream| stream.installed_at())
+            .map(|stream| stream.sender.clone())
+    }
+
+    /// Obtain the newest live legacy QUIC sender. BestEffort may use the
+    /// single reliable stream negotiated by s2s/1, but strict s2s/2 class
+    /// streams accept only reliable service levels.
+    pub(crate) fn try_get_legacy_quic_stream(&self) -> Option<SessionSender> {
+        let mut streams = self.streams.lock();
+        prune_dead_streams(&mut streams);
+        streams
+            .values()
+            .filter(|stream| {
+                stream.transport() == TransportKind::Quic
+                    && stream.is_alive()
+                    && stream.sender.quic_v2_max_datagram_size().is_none()
             })
             .max_by_key(|stream| stream.installed_at())
             .map(|stream| stream.sender.clone())
@@ -3038,22 +3061,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn quic_v2_sender_can_force_best_effort_onto_a_reliable_stream_path() {
+    #[test]
+    fn quic_v2_sender_rejects_best_effort_on_a_reliable_stream_path() {
         let (sender, receivers) = QuicV2SessionSender::new(64 * 1024, 64 * 1024, 256 * 1024, 1200);
         let session = SessionSender::QuicV2(sender);
         let (_control, mut high, _regular, datagram) = receivers.into_parts();
 
-        session
-            .try_send_for_path(
-                DeliveryPath::QuicStream,
-                OutboundFrame::new(
-                    ServiceLevel::BestEffort,
-                    MessageClass::HighPriority,
-                    Bytes::from_static(b"stream fallback"),
-                ),
-            )
-            .expect("reliable-stream fallback enqueue");
+        let result = session.try_send_for_path(
+            DeliveryPath::QuicStream,
+            OutboundFrame::new(
+                ServiceLevel::BestEffort,
+                MessageClass::HighPriority,
+                Bytes::from_static(b"stream fallback"),
+            ),
+        );
 
         let (stream_depth, stream_capacity) = session.depth_capacity_for_path(
             DeliveryPath::QuicStream,
@@ -3065,14 +3086,12 @@ mod tests {
             ServiceLevel::BestEffort,
             MessageClass::HighPriority,
         );
-        assert!(stream_depth > 0);
+        assert!(matches!(result, Err(SessionTrySendError::UnsupportedPath)));
+        assert_eq!(stream_depth, 0);
         assert!(stream_capacity > 0);
         assert_eq!(datagram_depth, 0);
         assert!(datagram_capacity > 0);
-
-        let received = high.recv().await.expect("high-priority reliable lane");
-        assert_eq!(received.level(), ServiceLevel::BestEffort);
-        assert_eq!(received.payload().as_ref(), b"stream fallback");
+        assert!(high.try_recv().is_err());
         assert_eq!(datagram.depth_bytes(), 0);
     }
 

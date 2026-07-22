@@ -610,7 +610,8 @@ impl ConnectionManager {
     }
 
     /// Check whether an identity-encoded data payload fits as one frame on a
-    /// selected transport. Stream transports have no datagram ceiling.
+    /// selected transport. Strict QUIC v2 carries BestEffort only as a
+    /// DATAGRAM; a legacy QUIC stream remains an eligible fallback.
     pub fn payload_fits_transport(
         &self,
         node: NodeIdentifier,
@@ -642,7 +643,7 @@ impl ConnectionManager {
                 peer.try_get_quic_v2_stream()
                     .and_then(|sender| sender.quic_v2_max_datagram_size())
                     .is_some_and(|max_datagram_size| encoded_len <= max_datagram_size)
-                    || peer.try_get_stream(TransportKind::Quic).is_some()
+                    || peer.try_get_legacy_quic_stream().is_some()
             }
             TransportKind::Udp => self
                 .udp_datagram_len(node, level, class, payload.len())
@@ -1285,25 +1286,20 @@ impl ConnectionManager {
                 return true;
             }
             if *transport == TransportKind::Quic && level == ServiceLevel::BestEffort {
-                let stream_fits = peer
-                    .try_get_stream(TransportKind::Quic)
-                    .is_some_and(|sender| {
-                        let variant = payloads.variant_for_session(
-                            TransportKind::Quic,
-                            sender.quic_v2_max_datagram_size().is_some(),
-                        );
-                        std::iter::once(variant.primary())
-                            .chain(variant.sidecars().iter())
-                            .all(|payload| {
-                                self.payload_fits_transport(
-                                    node,
-                                    TransportKind::Quic,
-                                    level,
-                                    class,
-                                    payload,
-                                )
-                            })
-                    });
+                let stream_fits = peer.try_get_legacy_quic_stream().is_some_and(|_| {
+                    let variant = payloads.variant_for_session(TransportKind::Quic, false);
+                    std::iter::once(variant.primary())
+                        .chain(variant.sidecars().iter())
+                        .all(|payload| {
+                            self.payload_fits_transport(
+                                node,
+                                TransportKind::Quic,
+                                level,
+                                class,
+                                payload,
+                            )
+                        })
+                });
                 let datagram_fits = peer.try_get_quic_v2_stream().is_some_and(|sender| {
                     let variant = payloads.variant_for_session(TransportKind::Quic, true);
                     sender
@@ -3250,10 +3246,13 @@ fn delivery_candidates(
                     no_fit_quic_sender = Some(sender);
                 }
             }
-            if let Some(sender) = peer.try_get_stream(TransportKind::Quic) {
+            // Strict s2s/2 class streams reject BestEffort. Retain the
+            // historical s2s/1 single-stream fallback, but never enqueue a
+            // BestEffort frame on an s2s/2 reliable lane.
+            if let Some(sender) = peer.try_get_legacy_quic_stream() {
                 candidates.push(DeliveryCandidate {
                     path: DeliveryPath::QuicStream,
-                    quic_v2: sender.quic_v2_max_datagram_size().is_some(),
+                    quic_v2: false,
                     sender,
                 });
             }
@@ -3584,8 +3583,7 @@ fn try_dispatch_envelope_with_policy(
         }
         let sender_still_available = delivery_candidates
             .iter()
-            .any(|candidate| candidate.path.transport() == incumbent)
-            || (incumbent == TransportKind::Quic && no_fit_quic_sender.is_some());
+            .any(|candidate| candidate.path.transport() == incumbent);
         (!sender_still_available).then_some(VoiceTransportBindingEventReason::TransportUnavailable)
     });
     for candidate in delivery_candidates {
@@ -3764,6 +3762,12 @@ fn try_dispatch_envelope_with_policy(
                     incumbent_failure = Some(VoiceTransportBindingEventReason::StreamClosed);
                 }
             }
+            Err(SessionTrySendError::UnsupportedPath) => {
+                debug_assert!(
+                    path == DeliveryPath::QuicStream && level == ServiceLevel::BestEffort,
+                    "only strict QUIC v2 BestEffort stream delivery is unsupported"
+                );
+            }
         }
     }
 
@@ -3821,6 +3825,9 @@ fn record_datagram_enqueue_result(
         Err(SessionTrySendError::Closed) | Err(SessionTrySendError::Full) => {
             record_quic_datagram_evidence(peer, sender, DatagramPathEvidenceEvent::EnqueueRejected);
         }
+        // This helper only submits QUIC DATAGRAM paths. Keep the impossible
+        // sender-side stream rejection exhaustive without altering evidence.
+        Err(SessionTrySendError::UnsupportedPath) => {}
     }
 }
 
@@ -6065,7 +6072,6 @@ mod tests {
                 DeliveryPath::UdpDatagram,
                 DeliveryPath::QuicDatagram,
                 DeliveryPath::TcpStream,
-                DeliveryPath::QuicStream,
             ]
         );
         drop(quic_receivers);
@@ -6139,14 +6145,17 @@ mod tests {
     #[tokio::test]
     async fn oversized_quic_datagram_falls_back_to_legacy_quic_stream() {
         let (peer, _receivers) = peer_with_live_transports(&[]);
-        let (_control, _high, _regular, quic_datagram) =
-            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200).into_parts();
+        // Install legacy first so the newer v2 session would mask it through
+        // the generic transport lookup. The legacy-only lookup must still
+        // find the compatible fallback.
         let mut legacy_quic = install_test_stream_at(
             &peer,
             TransportKind::Quic,
             1024 * 1024,
             Some(socket("127.0.0.2:64741")),
         );
+        let (_control, _high, _regular, quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200).into_parts();
 
         let envelope = OutboundEnvelope::routed(
             ServiceLevel::BestEffort,
@@ -6161,8 +6170,8 @@ mod tests {
         assert_eq!(quic_datagram.depth_bytes(), 0);
     }
 
-    #[tokio::test]
-    async fn oversized_quic_datagram_falls_back_to_quic_v2_reliable_stream() {
+    #[test]
+    fn oversized_quic_datagram_never_uses_quic_v2_reliable_stream() {
         let (peer, _receivers) = peer_with_live_transports(&[]);
         let (_control, mut high, _regular, quic_datagram) =
             install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200).into_parts();
@@ -6176,7 +6185,7 @@ mod tests {
         );
         try_dispatch_envelope(&peer, envelope, TransportRoutingPolicy::default()).unwrap();
 
-        assert_eq!(high.recv().await.unwrap().payload().len(), 1200);
+        assert!(high.try_recv().is_err());
         assert_eq!(quic_datagram.depth_bytes(), 0);
     }
 
@@ -6490,21 +6499,10 @@ mod tests {
     }
 
     #[test]
-    fn deadline_impossible_quic_v2_stream_falls_through_to_kcp() {
+    fn blocked_quic_v2_datagram_falls_through_to_kcp() {
         let (peer, mut kcp_receiver) = peer_with_live_transports(&[TransportKind::Kcp]);
         let (_control, mut quic_high, _regular, quic_datagram) =
             install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200).into_parts();
-        let quic_sender = peer.try_get_quic_v2_stream().expect("QUIC v2 sender");
-        quic_sender
-            .try_send_for_path(
-                DeliveryPath::QuicStream,
-                OutboundFrame::new(
-                    ServiceLevel::BestEffort,
-                    MessageClass::HighPriority,
-                    Bytes::from(vec![b'q'; 64 * 1024]),
-                ),
-            )
-            .expect("QUIC reliable-lane backlog");
         for _ in 0..TransportRoutingPolicy::default().udp_family_probe_loss_block_count() {
             peer.metrics().record_probe_lost(TransportKind::Quic);
         }
@@ -6522,7 +6520,6 @@ mod tests {
             kcp_receiver[0].try_recv().unwrap().payload(),
             b"kcp-after-quic".as_slice()
         );
-        assert_eq!(quic_high.try_recv().unwrap().payload().len(), 64 * 1024);
         assert!(quic_high.try_recv().is_err());
         assert_eq!(quic_datagram.depth_bytes(), 0);
     }
@@ -6592,14 +6589,14 @@ mod tests {
     async fn public_send_preflight_preserves_oversized_legacy_quic_fallback() {
         let (manager, _receivers) = ConnectionManager::test_with_live_streams(1, 2, &[]);
         let peer = manager.inner.get_peer(2).expect("test peer");
-        let (_control, _high, _regular, quic_datagram) =
-            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200).into_parts();
         let mut legacy_quic = install_test_stream_at(
             &peer,
             TransportKind::Quic,
             1024 * 1024,
             Some(socket("127.0.0.2:64741")),
         );
+        let (_control, _high, _regular, quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200).into_parts();
 
         manager
             .try_send_with_options(
@@ -6618,6 +6615,31 @@ mod tests {
             .expect("legacy QUIC fallback should not be rejected by preflight")
             .expect("legacy QUIC receiver");
         assert_eq!(forwarded.payload().len(), 1200);
+        assert_eq!(quic_datagram.depth_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn public_send_preflight_rejects_oversized_best_effort_with_only_quic_v2() {
+        let (manager, _receivers) = ConnectionManager::test_with_live_streams(1, 2, &[]);
+        let peer = manager.inner.get_peer(2).expect("test peer");
+        let (_control, _high, _regular, quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200).into_parts();
+
+        let result = manager
+            .try_send_with_options(
+                2,
+                ServiceLevel::BestEffort,
+                Some(RoutingMetric::ConversationalQuality),
+                MessageClass::HighPriority,
+                Bytes::from(vec![b'x'; 1200]),
+                SendOptions::default(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SendError::NoSuitableTransport { node: 2 })
+        ));
         assert_eq!(quic_datagram.depth_bytes(), 0);
     }
 
@@ -7785,6 +7807,36 @@ mod tests {
                 .expect("udp length"),
             transport.udp_datagram_mtu_for(2)
         );
+    }
+
+    #[tokio::test]
+    async fn quic_best_effort_payload_preflight_requires_datagram_fit_or_legacy_stream() {
+        let (manager, _receivers) = ConnectionManager::test_with_live_streams(1, 2, &[]);
+        let peer = manager.inner.get_peer(2).expect("test peer");
+        let _v2 = install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200);
+        let payload = vec![0; 1200];
+
+        assert!(!manager.payload_fits_transport(
+            2,
+            TransportKind::Quic,
+            ServiceLevel::BestEffort,
+            MessageClass::HighPriority,
+            &payload,
+        ));
+
+        let _legacy = install_test_stream_at(
+            &peer,
+            TransportKind::Quic,
+            1024 * 1024,
+            Some(socket("127.0.0.2:64741")),
+        );
+        assert!(manager.payload_fits_transport(
+            2,
+            TransportKind::Quic,
+            ServiceLevel::BestEffort,
+            MessageClass::HighPriority,
+            &payload,
+        ));
     }
 
     #[tokio::test]

@@ -644,6 +644,219 @@ async fn auth_concurrent_clients_see_each_other() {
     assert_peer_seen_exactly_once(&bob, alice.session_id, "Bob", "Alice").await;
 }
 
+#[tokio::test]
+async fn superuser_visibility_action_is_private_and_toggles_presence() {
+    use crate::context_action::{Context, Operation, context as action_context};
+    use crate::toggle_superuser_visibility::{ACTION_ID, HIDE_LABEL, SHOW_LABEL};
+
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(2), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_superuser("carol", None, Some(3), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("dave", None, Some(4), vec![]);
+    server
+        .server
+        .context_actions()
+        .register_one_shot(
+            "existing.server.action",
+            Context::SERVER,
+            "Existing action",
+            Arc::new(|_| Box::pin(async {})),
+        )
+        .await;
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    assert_eq!(
+        bob.initial_context_actions
+            .iter()
+            .map(|action| action.action.as_str())
+            .collect::<Vec<_>>(),
+        vec!["existing.server.action"],
+        "regular users receive registered actions but not the reserved superuser action"
+    );
+    bob.trigger_context_action(ACTION_ID).await;
+    let live_bob = server
+        .server
+        .get_clients()
+        .get_client(bob.server_session)
+        .await
+        .expect("live Bob");
+    assert!(!live_bob.is_hidden_from_regular_users());
+    assert!(!live_bob.read_global_state().is_suppressed());
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let action = alice
+        .initial_context_actions
+        .iter()
+        .find(|modify| modify.action == ACTION_ID)
+        .expect("superuser visibility action");
+    assert_eq!(
+        alice
+            .initial_context_actions
+            .iter()
+            .map(|action| action.action.as_str())
+            .collect::<Vec<_>>(),
+        vec!["existing.server.action", ACTION_ID],
+        "the reserved action follows existing server-context actions"
+    );
+    assert_eq!(action.context, Some(action_context::SERVER));
+    assert_eq!(action.text.as_deref(), Some(HIDE_LABEL));
+
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+    bob.drain_now().await;
+    alice.drain_now().await;
+    carol.drain_now().await;
+
+    alice.trigger_context_action(ACTION_ID).await;
+    for (expected_action, expected_operation, expected_text) in [
+        ("existing.server.action", Operation::Remove, None),
+        (ACTION_ID, Operation::Remove, None),
+        (
+            "existing.server.action",
+            Operation::Add,
+            Some("Existing action"),
+        ),
+        (ACTION_ID, Operation::Add, Some(SHOW_LABEL)),
+    ] {
+        alice
+            .recv_until(
+                |message| {
+                    matches!(message, Message::ContextActionModify(modify)
+                        if modify.action == expected_action
+                            && modify.operation == Some(expected_operation as i32)
+                            && modify.text.as_deref() == expected_text)
+                },
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("server-context actions should be rebuilt in order");
+    }
+    bob.recv_until(
+        |message| {
+            matches!(message, Message::UserRemove(remove)
+                if remove.session == alice.session_id)
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("regular user should lose the hidden superuser");
+    carol
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(alice.session_id)
+                        && state.suppress == Some(true))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("another superuser should retain moderation visibility");
+    assert!(
+        carol
+            .recv_until(
+                |message| {
+                    matches!(message, Message::ContextActionModify(modify)
+                        if modify.action == ACTION_ID)
+                },
+                Duration::from_millis(150),
+            )
+            .await
+            .is_none(),
+        "Alice's toggle label must not be broadcast to Carol"
+    );
+
+    let dave = TestClient::connect_and_authenticate(&server, "dave", None)
+        .await
+        .expect("dave");
+    assert!(
+        dave.initial_user_states
+            .iter()
+            .all(|state| state.session != Some(alice.session_id)),
+        "late regular users must not receive a hidden superuser in initial state"
+    );
+
+    alice.trigger_context_action(ACTION_ID).await;
+    bob.recv_until(
+        |message| {
+            matches!(message, Message::UserState(state)
+                if is_join_snapshot_for_session(state, alice.session_id))
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("disabling the action should reveal a full superuser state");
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::ContextActionModify(modify)
+                    if modify.action == ACTION_ID
+                        && modify.text.as_deref() == Some(HIDE_LABEL))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("disabling the action should restore its label");
+    let live_alice = server
+        .server
+        .get_clients()
+        .get_client(alice.server_session)
+        .await
+        .expect("live Alice");
+    assert!(!live_alice.is_hidden_from_regular_users());
+    assert!(!live_alice.read_global_state().is_suppressed());
+}
+
+#[tokio::test]
+async fn self_mute_does_not_hide_superuser_without_visibility_action() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    alice.set_self_mute(true).await;
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(alice.session_id)
+                        && state.self_mute == Some(true))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice self-mute applied");
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    assert!(
+        bob.initial_user_states
+            .iter()
+            .any(|state| state.session == Some(alice.session_id)),
+        "self-mute alone must not hide a superuser"
+    );
+}
+
 async fn assert_peer_seen_exactly_once(
     viewer: &TestClient,
     peer_session_id: u32,
@@ -682,7 +895,7 @@ async fn assert_peer_seen_exactly_once(
         .await;
     assert!(
         duplicate.is_none(),
-        "{viewer_name} should not receive duplicate {peer_name} UserState during concurrent auth"
+        "{viewer_name} should not receive duplicate {peer_name} UserState during concurrent auth: {duplicate:?}"
     );
     assert_eq!(
         seen, 1,

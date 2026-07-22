@@ -132,6 +132,7 @@ pub(crate) struct PostAuthBaseline {
     session_channel_shadow: crate::channel_handler::SessionChannelShadow,
     channel_tree_shadow: crate::channel_handler::ChannelTreeShadow,
     user_visibility: crate::client::visibility::UserVisibilityState,
+    visibility_generation: Option<u64>,
 }
 
 impl PostAuthBaseline {
@@ -143,6 +144,7 @@ impl PostAuthBaseline {
             session_channel_shadow,
             channel_tree_shadow,
             user_visibility: crate::client::visibility::UserVisibilityState::default(),
+            visibility_generation: None,
         }
     }
 
@@ -150,11 +152,13 @@ impl PostAuthBaseline {
         session_channel_shadow: crate::channel_handler::SessionChannelShadow,
         channel_tree_shadow: crate::channel_handler::ChannelTreeShadow,
         user_visibility: crate::client::visibility::UserVisibilityState,
+        visibility_generation: u64,
     ) -> Self {
         Self {
             session_channel_shadow,
             channel_tree_shadow,
             user_visibility,
+            visibility_generation: Some(visibility_generation),
         }
     }
 
@@ -164,11 +168,13 @@ impl PostAuthBaseline {
         crate::channel_handler::SessionChannelShadow,
         crate::channel_handler::ChannelTreeShadow,
         crate::client::visibility::UserVisibilityState,
+        Option<u64>,
     ) {
         (
             self.session_channel_shadow,
             self.channel_tree_shadow,
             self.user_visibility,
+            self.visibility_generation,
         )
     }
 }
@@ -1744,6 +1750,10 @@ impl Client {
     ///
     pub fn is_superuser(&self) -> bool {
         self.global_state.read().is_superuser()
+    }
+
+    pub(crate) fn is_hidden_from_regular_users(&self) -> bool {
+        self.global_state.read().is_hidden_from_regular_users()
     }
 
     pub fn set_authenticated(&self, value: bool) {

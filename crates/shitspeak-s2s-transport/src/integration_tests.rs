@@ -126,6 +126,72 @@ async fn quic_v2_maps_reliable_classes_and_best_effort_datagrams() {
 }
 
 #[tokio::test]
+async fn oversized_best_effort_uses_tcp_without_closing_quic_v2() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[47, 48]);
+    let quic_port_a = pick_free_udp_port().await;
+    let quic_port_b = pick_free_udp_port().await;
+    let tcp_port_a = pick_free_port().await;
+    let tcp_port_b = pick_free_port().await;
+    let cfg_a =
+        config_with_quic(&pki, 0, loopback(quic_port_a)).with_tcp_listen(loopback(tcp_port_a));
+    let cfg_b =
+        config_with_quic(&pki, 1, loopback(quic_port_b)).with_tcp_listen(loopback(tcp_port_b));
+
+    let (mgr_b, mut inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
+    let (mgr_a, _inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
+    mgr_a
+        .add_address(
+            48,
+            PeerAddress::new(loopback(quic_port_b), TransportKind::Quic),
+        )
+        .await;
+    mgr_a
+        .add_address(
+            48,
+            PeerAddress::new(loopback(tcp_port_b), TransportKind::Tcp),
+        )
+        .await;
+    wait_for_link(&mgr_a, 48, TransportKind::Quic).await;
+    wait_for_link(&mgr_a, 48, TransportKind::Tcp).await;
+    wait_for_link(&mgr_b, 47, TransportKind::Quic).await;
+
+    // This is larger than a QUIC DATAGRAM but well below the configured frame
+    // limit. Strict s2s/2 streams must not carry BestEffort, so TCP is the
+    // compatible reliable fallback while the QUIC session stays healthy.
+    let payload = Bytes::from(vec![b'v'; 4 * 1024]);
+    mgr_a
+        .send(
+            48,
+            ServiceLevel::BestEffort,
+            None,
+            MessageClass::HighPriority,
+            payload.clone(),
+        )
+        .await
+        .unwrap();
+
+    let received = timeout(Duration::from_secs(2), inbound_b.high_priority().recv())
+        .await
+        .expect("TCP fallback receive timeout")
+        .expect("inbound queue closed");
+    assert_eq!(received.from(), 47);
+    assert_eq!(received.transport(), TransportKind::Tcp);
+    // Legacy stream transports expose their physical service level on the
+    // transport envelope. OverlayData inside the payload retains the
+    // application's BestEffort contract.
+    assert_eq!(received.level(), ServiceLevel::Reliable);
+    assert_eq!(received.class(), MessageClass::HighPriority);
+    assert_eq!(received.payload(), &payload);
+    assert!(mgr_a.has_live_transport_kind(48, TransportKind::Quic));
+    assert!(mgr_b.has_live_transport_kind(47, TransportKind::Quic));
+
+    mgr_a.shutdown().await;
+    mgr_b.shutdown().await;
+}
+
+#[tokio::test]
 async fn quic_v1_fallback_keeps_best_effort_on_legacy_stream() {
     let _guard = s2s_network_test_guard().await;
     install_provider_once();
