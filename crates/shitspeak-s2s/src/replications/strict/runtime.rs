@@ -5489,8 +5489,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 }
 
                 let now = Instant::now();
-                let use_broadcast =
-                    initial_send || now.duration_since(last_broadcast_at) >= broadcast_interval;
+                let was_initial_send = initial_send;
+                let use_broadcast = !was_initial_send
+                    && now.duration_since(last_broadcast_at) >= broadcast_interval;
                 if use_broadcast {
                     last_broadcast_at = now;
                 }
@@ -5503,7 +5504,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                             runtime.net.as_ref(),
                             ack.coord_node as NodeIdentifier,
                             &runtime.topic,
-                            body,
+                            body.clone(),
                         ) => result,
                     }
                 } else {
@@ -5512,9 +5513,24 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                         result = runtime.net.send_redundant_unicast(
                             ack.coord_node as NodeIdentifier,
                             &runtime.topic,
-                            body,
+                            body.clone(),
                         ) => result,
                     }
+                };
+                let result = if was_initial_send && result.is_err() {
+                    last_broadcast_at = Instant::now();
+                    let targeted_error = result.expect_err("checked above");
+                    tokio::select! {
+                        _ = runtime.shutdown.cancelled() => break,
+                        result = runtime.net.send_broadcast(&runtime.topic, body) => {
+                            match result {
+                                Ok(()) => Ok(()),
+                                Err(_) => Err(targeted_error),
+                            }
+                        }
+                    }
+                } else {
+                    result
                 };
                 if let Err(error) = result {
                     trace!(%error, "retry strict propose-ack failed");
@@ -8938,23 +8954,7 @@ async fn send_terminal_fanout(
     if dsts.is_empty() {
         return Ok(());
     }
-    let multicast = net
-        .send_redundant_multicast(dsts, topic, body.clone())
-        .await;
-    let mut direct_succeeded = false;
-    for dst in dsts.iter().copied() {
-        if net
-            .send_redundant_unicast(dst, topic, body.clone())
-            .await
-            .is_ok()
-        {
-            direct_succeeded = true;
-        }
-    }
-    match (multicast, direct_succeeded) {
-        (Ok(()), _) | (Err(_), true) => Ok(()),
-        (Err(error), false) => Err(error),
-    }
+    net.send_redundant_multicast(dsts, topic, body).await
 }
 
 async fn send_terminal_fanout_with_broadcast(
@@ -8963,11 +8963,12 @@ async fn send_terminal_fanout_with_broadcast(
     topic: &str,
     body: StrictBody,
 ) -> Result<(), ReplicationError> {
-    let targeted = send_terminal_fanout(net, dsts, topic, body.clone()).await;
-    let broadcast = net.send_broadcast(topic, body).await;
-    match (targeted, broadcast) {
-        (Ok(()), Ok(())) | (Ok(()), Err(_)) | (Err(_), Ok(())) => Ok(()),
-        (Err(error), Err(_)) => Err(error),
+    match send_terminal_fanout(net, dsts, topic, body.clone()).await {
+        Ok(()) => Ok(()),
+        Err(targeted_error) => match net.send_broadcast(topic, body).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(targeted_error),
+        },
     }
 }
 
@@ -15098,6 +15099,74 @@ mod tests {
                 } if prepare.op_id_hi == op_id.0 && prepare.op_id_lo == op_id.1
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn healthy_terminal_fanout_uses_one_redundant_multicast() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        let body = StrictBody::Decision(StrictDecision {
+            resolver_node: 1,
+            ballot: NORMAL_ACCEPT_BALLOT,
+            coord_node: 1,
+            op_id_hi: make_op_id(1, 1, 134).0,
+            op_id_lo: make_op_id(1, 1, 134).1,
+            outcome: Some(StrictDecisionOutcome::Abort(StrictDecisionAbort {})),
+            src_clock: 1,
+            resolver_boot_epoch: 1,
+            frozen_targets: vec![StrictFrozenTarget {
+                node: 1,
+                boot_epoch: 1,
+            }],
+        });
+
+        send_terminal_fanout_with_broadcast(net.as_ref(), &[2, 3], "channels", body.clone())
+            .await
+            .unwrap();
+
+        let captures = net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        assert!(matches!(
+            &captures[0],
+            CapturedFrame::StrictMulticast {
+                dsts,
+                body: captured,
+                ..
+            } if dsts == &[2, 3] && captured == &body
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_fanout_broadcasts_when_redundant_multicast_fails() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_fail_strict_multicasts(true);
+        let body = StrictBody::Decision(StrictDecision {
+            resolver_node: 1,
+            ballot: NORMAL_ACCEPT_BALLOT,
+            coord_node: 1,
+            op_id_hi: make_op_id(1, 1, 135).0,
+            op_id_lo: make_op_id(1, 1, 135).1,
+            outcome: Some(StrictDecisionOutcome::Abort(StrictDecisionAbort {})),
+            src_clock: 1,
+            resolver_boot_epoch: 1,
+            frozen_targets: vec![StrictFrozenTarget {
+                node: 1,
+                boot_epoch: 1,
+            }],
+        });
+
+        send_terminal_fanout_with_broadcast(net.as_ref(), &[2, 3], "channels", body.clone())
+            .await
+            .unwrap();
+
+        let captures = net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        assert!(matches!(
+            &captures[0],
+            CapturedFrame::StrictBroadcast {
+                body: captured,
+                ..
+            } if captured == &body
+        ));
     }
 
     #[tokio::test]

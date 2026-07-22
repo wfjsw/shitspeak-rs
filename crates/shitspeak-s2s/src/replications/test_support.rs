@@ -70,6 +70,7 @@ pub struct MockNet {
     routes: Mutex<Option<std::collections::HashSet<(ServiceLevel, NodeIdentifier)>>>,
     live_routes: Mutex<Option<std::collections::HashSet<(ServiceLevel, NodeIdentifier)>>>,
     strict_unicast_failures: Mutex<std::collections::HashSet<NodeIdentifier>>,
+    strict_multicast_failures: AtomicBool,
     owner_unicast_failures: Mutex<std::collections::HashSet<NodeIdentifier>>,
     pub captured: Mutex<Vec<CapturedFrame>>,
     pub edge_rtts: Mutex<Vec<Duration>>,
@@ -91,6 +92,7 @@ impl MockNet {
             routes: Mutex::new(None),
             live_routes: Mutex::new(None),
             strict_unicast_failures: Mutex::new(Default::default()),
+            strict_multicast_failures: AtomicBool::new(false),
             owner_unicast_failures: Mutex::new(Default::default()),
             captured: Mutex::new(Vec::new()),
             edge_rtts: Mutex::new(Vec::new()),
@@ -131,6 +133,11 @@ impl MockNet {
 
     pub fn fail_strict_unicasts_to(&self, dsts: impl IntoIterator<Item = NodeIdentifier>) {
         *self.strict_unicast_failures.lock() = dsts.into_iter().collect();
+    }
+
+    pub fn set_fail_strict_multicasts(&self, fail: bool) {
+        self.strict_multicast_failures
+            .store(fail, Ordering::Relaxed);
     }
 
     pub fn fail_owner_unicasts_to(&self, dsts: impl IntoIterator<Item = NodeIdentifier>) {
@@ -234,6 +241,11 @@ impl StrictNet for MockNet {
         topic: &str,
         body: StrictBody,
     ) -> Result<(), ReplicationError> {
+        if self.strict_multicast_failures.load(Ordering::Relaxed) {
+            return Err(ReplicationError::Malformed(
+                "injected strict multicast failure",
+            ));
+        }
         self.captured.lock().push(CapturedFrame::StrictMulticast {
             dsts: dsts.to_vec(),
             topic: topic.to_owned(),
@@ -1017,6 +1029,7 @@ mod e2e_tests {
     /// a StrictProposeAck back to the coord via send_unicast.
     #[tokio::test]
     async fn strict_recv_propose_emits_ack() {
+        let op_id = make_op_id(1, 1, 1);
         let net = MockNet::new(2, vec![1, 2]);
         net.set_strict_replication_protocol_version(
             crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
@@ -1031,7 +1044,9 @@ mod e2e_tests {
             "channels".into(),
             net.clone() as Arc<dyn StrictNet>,
             CancellationToken::new(),
-            default_cfg(),
+            Arc::new(
+                ReplicationConfig::default().with_delivery_tick_interval(Duration::from_secs(5)),
+            ),
         );
         // No start(): only the detached ACK effect needs one scheduler turn.
 
@@ -1039,8 +1054,8 @@ mod e2e_tests {
             1,
             super::super::proto::StrictProposeV1 {
                 coord_node: 1,
-                op_id_hi: make_op_id(1, 1, 1).0,
-                op_id_lo: make_op_id(1, 1, 1).1,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
                 ts_propose: 50,
                 op_msgpack: Bytes::from(rmp_serde::to_vec(&7u64).unwrap()),
                 src_clock: 50,
@@ -1061,20 +1076,28 @@ mod e2e_tests {
         tokio::task::yield_now().await;
 
         let caps = net.captures();
-        let targeted_ack = caps
+        let matching_acks = caps
             .iter()
-            .find(|frame| {
+            .filter(|frame| {
+                let body = match frame {
+                    CapturedFrame::StrictUnicast { body, .. }
+                    | CapturedFrame::StrictMulticast { body, .. }
+                    | CapturedFrame::StrictBroadcast { body, .. } => body,
+                    _ => return false,
+                };
                 matches!(
-                    frame,
-                    CapturedFrame::StrictUnicast {
-                        dst: 1,
-                        body: StrictBody::ProposeAck(_),
-                        ..
-                    }
+                    body,
+                    StrictBody::ProposeAck(ack)
+                        if (ack.op_id_hi, ack.op_id_lo) == op_id
                 )
             })
-            .expect("targeted propose ack must be emitted");
-        match targeted_ack {
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching_acks.len(),
+            1,
+            "the initial propose ack must use one targeted send"
+        );
+        match matching_acks[0] {
             CapturedFrame::StrictUnicast { dst, body, .. } => {
                 assert_eq!(*dst, 1);
                 match body {
@@ -1087,6 +1110,74 @@ mod e2e_tests {
             }
             f => panic!("expected unicast ack, got {:?}", f),
         }
+    }
+
+    #[tokio::test]
+    async fn strict_recv_propose_broadcasts_ack_when_initial_unicast_fails() {
+        let op_id = make_op_id(1, 1, 2);
+        let net = MockNet::new(2, vec![1, 2]);
+        net.set_strict_replication_protocol_version(
+            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+        );
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 100);
+        net.fail_strict_unicasts_to([1]);
+        let shutdown = CancellationToken::new();
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            2,
+            100,
+            "channels".into(),
+            net.clone() as Arc<dyn StrictNet>,
+            shutdown.clone(),
+            Arc::new(
+                ReplicationConfig::default().with_delivery_tick_interval(Duration::from_secs(5)),
+            ),
+        );
+
+        rt.recv_propose_v1(
+            1,
+            super::super::proto::StrictProposeV1 {
+                coord_node: 1,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                ts_propose: 50,
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&7u64).unwrap()),
+                src_clock: 50,
+                protocol_version: crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+                frozen_targets: vec![
+                    super::super::proto::StrictFrozenTarget {
+                        node: 1,
+                        boot_epoch: 1,
+                    },
+                    super::super::proto::StrictFrozenTarget {
+                        node: 2,
+                        boot_epoch: 100,
+                    },
+                ],
+            },
+        )
+        .await;
+        tokio::task::yield_now().await;
+
+        let matching_broadcasts = net
+            .captures()
+            .into_iter()
+            .filter(|frame| {
+                matches!(
+                    frame,
+                    CapturedFrame::StrictBroadcast {
+                        body: StrictBody::ProposeAck(ack),
+                        ..
+                    } if (ack.op_id_hi, ack.op_id_lo) == op_id
+                )
+            })
+            .count();
+        shutdown.cancel();
+        assert_eq!(
+            matching_broadcasts, 1,
+            "a failed initial targeted ACK must fall back to broadcast"
+        );
     }
 
     #[tokio::test]
