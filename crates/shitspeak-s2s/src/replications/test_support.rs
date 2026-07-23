@@ -1417,6 +1417,7 @@ mod e2e_tests {
         );
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
+        net.set_route_rtt(3, Duration::from_millis(100));
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo,
@@ -1461,11 +1462,11 @@ mod e2e_tests {
                 if captures.iter().any(|capture| {
                     matches!(
                         capture,
-                        CapturedFrame::StrictMulticast {
-                            dsts,
+                        CapturedFrame::StrictUnicast {
+                            dst: 3,
                             body: StrictBody::Propose(_) | StrictBody::ProposeV1(_),
                             ..
-                        } if dsts == &[3]
+                        }
                     )
                 }) {
                     break;
