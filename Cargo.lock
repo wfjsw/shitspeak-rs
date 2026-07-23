@@ -4605,6 +4605,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "shitspeak-auth",
  "shitspeak-runtime",
  "shitspeak-runtime-config",
  "shitspeak-state",

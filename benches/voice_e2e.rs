@@ -15,19 +15,19 @@ use rustls::{ClientConfig, RootCertStore};
 use shitspeak_auth::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
 };
-use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;
 use shitspeak_client_crypto::CryptState;
-use shitspeak_runtime_config::{Config, S2sConfig, UdpPingUserCountScope};
-use shitspeak_rs::constants::PROTOBUF_INTRODUCED_VERSION;
 use shitspeak_messages::messages::encoder::{
     Audio as AudioWire, AudioHeader, AudioTarget, Authenticate, ClientType, Version,
 };
 use shitspeak_messages::messages::{Message, ReadMessageExt, WriteMessageExt};
+use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;
+use shitspeak_rs::constants::PROTOBUF_INTRODUCED_VERSION;
 use shitspeak_rs::protocol_version::ProtocolVersion;
 use shitspeak_rs::server::Server;
 use shitspeak_rs::voice::codec::{
     Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat,
 };
+use shitspeak_runtime_config::{Config, S2sConfig, UdpPingUserCountScope};
 use tempfile::TempDir;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpStream, UdpSocket};

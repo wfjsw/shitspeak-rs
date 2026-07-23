@@ -18,7 +18,6 @@ use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
 use crate::client::{Client, client_local_state::ExpiredAuthenticationAction};
 use crate::errors::MessageHandlerError;
 use crate::geoip::{GeoIpResolver, IpGeoMetadata};
-use shitspeak_messages::messages::encoder::Version;
 use crate::user_channel_cache::UserChannelCache;
 use crate::voice::dispatch_tuning::VoiceDispatchPlan;
 use crate::{
@@ -31,6 +30,7 @@ use crate::{
 use shitspeak_auth::{
     AuthenticateAuxiliaryData, AuthenticateResult, Authenticator, ReloadableAuthenticator,
 };
+use shitspeak_messages::messages::encoder::Version;
 use shitspeak_runtime_config::{CertificateHashProtection, Config, UdpPingUserCountScope};
 use shitspeak_state::{
     ChannelOp, ChannelRepoTuning, ChannelRepository, ChannelRepositoryObserver, ChannelRootConfig,
@@ -2047,18 +2047,18 @@ impl Server {
                     if current.privacy.certificate_hash_protection()
                         != new_config.privacy.certificate_hash_protection()
                     {
+                        visibility_reload = true;
                         tracing::info!(
                             "config reload: privacy.protect_certificate_hashes {} -> {}",
                             current.privacy.certificate_hash_protection(),
                             new_config.privacy.certificate_hash_protection()
                         );
                     }
-                    if current.privacy.certificate_hash_secret().is_some()
-                        != new_config.privacy.certificate_hash_secret().is_some()
+                    if current.privacy.certificate_hash_secret()
+                        != new_config.privacy.certificate_hash_secret()
                     {
-                        tracing::info!(
-                            "config reload: privacy.certificate_hash_secret presence changed"
-                        );
+                        visibility_reload = true;
+                        tracing::info!("config reload: privacy.certificate_hash_secret changed");
                     }
                     if current.server_entrypoints != new_config.server_entrypoints {
                         tracing::info!("config reload: server_entrypoints changed");

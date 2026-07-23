@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde::{Deserialize, de::DeserializeOwned};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader,
+};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time;

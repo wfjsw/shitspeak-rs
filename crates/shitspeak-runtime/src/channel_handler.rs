@@ -1305,7 +1305,9 @@ async fn prepare_channel_visibility_refresh_inner(
     let removals = removed_channel_ids
         .iter()
         .copied()
-        .map(|channel_id| shitspeak_messages::messages::encoder::ChannelRemove { channel_id }.into())
+        .map(|channel_id| {
+            shitspeak_messages::messages::encoder::ChannelRemove { channel_id }.into()
+        })
         .collect::<Vec<_>>();
 
     ChannelVisibilityRefresh {
@@ -1736,7 +1738,8 @@ pub async fn apply_permission_info_to_channel_state(
             {
                 let (is_enter_restricted, perms) =
                     permission_info_for_channel(server, client, ch_id).await;
-                let encoder_cs: shitspeak_messages::messages::encoder::ChannelState = cs_proto.clone().into();
+                let encoder_cs: shitspeak_messages::messages::encoder::ChannelState =
+                    cs_proto.clone().into();
                 return Some(
                     encoder_cs
                         .with_permission_info(is_enter_restricted, perms)

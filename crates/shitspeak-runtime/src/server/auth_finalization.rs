@@ -8,9 +8,9 @@ use parking_lot::Mutex;
 use crate::client::Client;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::errors::MessageHandlerError;
+use shitspeak_auth::{Authenticator, ReloadableAuthenticator};
 use shitspeak_messages::messages::Message;
 use shitspeak_messages::messages::encoder::TextMessage;
-use shitspeak_auth::{Authenticator, ReloadableAuthenticator};
 use shitspeak_runtime_config::Config;
 
 use super::auth_tasks::{BackgroundTaskExecutor, ScheduledAuthenticator};

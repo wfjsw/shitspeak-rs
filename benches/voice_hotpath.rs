@@ -18,8 +18,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use rayon::prelude::*;
 
 use shitspeak_client_crypto::CryptState;
-use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;
 use shitspeak_messages::messages::encoder::{AudioContext, AudioTarget};
+use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;
 use shitspeak_rs::voice::codec::{
     Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat,
 };

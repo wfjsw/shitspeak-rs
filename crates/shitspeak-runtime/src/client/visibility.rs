@@ -6,8 +6,6 @@ use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
 use crate::client::Client;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
-use shitspeak_messages::messages::Message;
-use shitspeak_messages::messages::encoder::{UserRemove, UserState};
 use crate::server::Server;
 use parking_lot::RwLock as ParkingRwLock;
 use shitspeak_state::ACLPermissions;

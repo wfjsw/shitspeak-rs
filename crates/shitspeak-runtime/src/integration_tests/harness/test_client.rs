@@ -25,15 +25,15 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::integration_tests::harness::TestServer;
+use crate::protocol_version::ProtocolVersion;
+use crate::voice::codec::{Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat};
+use crate::voice::ping::PingRequest;
+use shitspeak_client_crypto::CryptState;
 use shitspeak_messages::messages::encoder::{
     Authenticate, ChanAcl, ChannelRemove, ClientType, ContextAction, RequestBlob, UserRemove,
     UserState, Version, VoiceTarget,
 };
 use shitspeak_messages::messages::{Message, ReadMessageExt, WriteMessageExt};
-use crate::protocol_version::ProtocolVersion;
-use crate::voice::codec::{Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat};
-use crate::voice::ping::PingRequest;
-use shitspeak_client_crypto::CryptState;
 
 /// Build a Mumble-legacy client→server Opus voice packet.
 ///
@@ -53,8 +53,8 @@ fn encode_legacy_client_voice(target: u32, frame_number: u64, opus: &[u8]) -> By
 /// official client does. Type byte 0x00 prefixes the encoded `MumbleUDP.Audio`.
 /// `sender_session` is omitted (server fills it from the authenticated session).
 fn encode_protobuf_client_voice(target: u32, frame_number: u64, opus: &[u8]) -> Bytes {
-    use shitspeak_messages::messages::encoder::{Audio as AudioWire, AudioHeader, AudioTarget};
     use prost::Message as _;
+    use shitspeak_messages::messages::encoder::{Audio as AudioWire, AudioHeader, AudioTarget};
     let wire = AudioWire {
         header: Some(AudioHeader::Target(AudioTarget::from(target))),
         sender_session: 0,
@@ -199,8 +199,8 @@ fn encode_protobuf_client_voice_ex(
     is_terminator: bool,
     positional: Option<[f32; 3]>,
 ) -> Bytes {
-    use shitspeak_messages::messages::encoder::{Audio as AudioWire, AudioHeader, AudioTarget};
     use prost::Message as _;
+    use shitspeak_messages::messages::encoder::{Audio as AudioWire, AudioHeader, AudioTarget};
     let wire = AudioWire {
         header: Some(AudioHeader::Target(AudioTarget::from(target))),
         sender_session: 0,

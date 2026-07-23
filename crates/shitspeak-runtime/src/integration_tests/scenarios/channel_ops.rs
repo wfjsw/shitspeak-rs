@@ -5,9 +5,9 @@ use std::time::Duration;
 use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow, replay_channel_log_gap};
 use crate::client::visibility::UserVisibilityState;
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
+use crate::types::DEFAULT_SERVER_ID;
 use shitspeak_messages::messages::Message;
 use shitspeak_messages::messages::encoder::{ChannelState, DenyType};
-use crate::types::DEFAULT_SERVER_ID;
 use shitspeak_state::Channel;
 use shitspeak_state::{ACL, ACLPermissions};
 

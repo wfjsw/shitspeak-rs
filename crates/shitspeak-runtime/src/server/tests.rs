@@ -9,8 +9,6 @@ use crate::client::{
     Client, client_session_identifier::ClientSessionIdentifier, visibility::UserVisibilityState,
 };
 use crate::localization::Language;
-use shitspeak_messages::messages::Message;
-use shitspeak_messages::messages::encoder::TextMessage;
 use crate::types::DEFAULT_SERVER_ID;
 use crate::voice::codec::PacketFormat;
 use crate::voice::ping::PingRequest;
@@ -19,6 +17,8 @@ use shitspeak_auth::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationExpiryAction,
     AuthenticationRejection, Authenticator,
 };
+use shitspeak_messages::messages::Message;
+use shitspeak_messages::messages::encoder::TextMessage;
 use shitspeak_runtime_config::{
     AuthenticatorConfig, Config, ServerEntrypointConfig, UdpPingUserCountScope,
 };

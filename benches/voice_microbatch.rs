@@ -20,9 +20,9 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use rayon::prelude::*;
 use std::{hint::black_box, net::SocketAddr};
 
-use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;
 use shitspeak_client_crypto::CryptState;
 use shitspeak_messages::messages::encoder::AudioContext;
+use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;
 use shitspeak_rs::voice::codec::{Audio, IncomingUdpPacket, PacketFormat};
 use shitspeak_rs::voice::udp_batch::DatagramBatch;
 
