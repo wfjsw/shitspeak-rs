@@ -24,7 +24,6 @@ use tokio::{
 };
 use tokio_rustls::server::TlsStream;
 
-use crate::api::AuthenticationExpiryAction;
 use crate::{
     client::{
         client_global_state::ClientGlobalState,
@@ -43,6 +42,7 @@ use crate::{
     types::{DEFAULT_SERVER_ID, ScopedSessionId},
     voice::VoiceRoutingPayload,
 };
+use shitspeak_auth::AuthenticationExpiryAction;
 
 const VOICE_ROUTING_QUEUE_CAPACITY: usize = 1024;
 const VOICE_TCP_QUEUE_CAPACITY: usize = 2048;

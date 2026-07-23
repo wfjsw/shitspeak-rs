@@ -114,6 +114,7 @@ pub struct ReplicationManager {
 pub struct StrictTopicRuntimeParts {
     self_id: NodeIdentifier,
     self_epoch: u64,
+    membership: Vec<MemberIncarnation>,
     net: Arc<dyn StrictNet>,
     shutdown: CancellationToken,
     cfg: Arc<ReplicationConfig>,
@@ -139,7 +140,7 @@ impl StrictTopicRuntimeParts {
         topic: String,
         repo: Arc<R>,
     ) -> Arc<StrictRuntime<R>> {
-        StrictRuntime::new(
+        let runtime = StrictRuntime::new(
             repo,
             self.self_id,
             self.self_epoch,
@@ -147,7 +148,9 @@ impl StrictTopicRuntimeParts {
             self.net.clone(),
             self.shutdown.child_token(),
             self.cfg.clone(),
-        )
+        );
+        runtime.seed_membership_snapshot(self.membership.iter().copied());
+        runtime
     }
 }
 
@@ -320,7 +323,7 @@ impl ReplicationManager {
         let strict_participant_capability = StrictParticipantCapability::new(
             legacy_services.strict(),
             initial_durable_state_ready,
-            protocol::STRICT_PROTOCOL_VERSION,
+            protocol::STRICT_PROTOCOL_VERSION_CURRENT,
             move |participant_version| {
                 let replication_capabilities = protocol::ReplicationProtocolCapabilities::new(
                     legacy_services.strict(),
@@ -351,10 +354,12 @@ impl ReplicationManager {
         let blob_topics: Arc<SccMap<String, Arc<dyn ErasedBlobRuntime>>> = Arc::new(SccMap::new());
         let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
         let shutdown = CancellationToken::new();
+        let cfg = Arc::new(cfg);
 
         let strict_net: Arc<dyn StrictNet> = Arc::new(OverlayStrictNet::new(
             overlay.clone(),
             strict_participant_capability.clone(),
+            cfg.as_ref(),
         ));
         let owner_net: Arc<dyn OwnerNet> = Arc::new(OverlayOwnerNet {
             overlay: overlay.clone(),
@@ -363,7 +368,6 @@ impl ReplicationManager {
             overlay: overlay.clone(),
         });
 
-        let cfg = Arc::new(cfg);
         let inner = Arc::new(ManagerInner {
             overlay: overlay.clone(),
             self_id,
@@ -493,6 +497,9 @@ impl ReplicationManager {
         StrictTopicRuntimeParts {
             self_id: self.inner.self_id,
             self_epoch: self.inner.self_epoch,
+            membership: current_membership_view(&self.inner.overlay)
+                .into_values()
+                .collect(),
             net: self.inner.strict_net.clone(),
             shutdown: self.inner.shutdown.clone(),
             cfg: self.inner.cfg.clone(),
@@ -752,7 +759,7 @@ impl ManagerInner {
     ) -> bool {
         registry.activation_completed
             && self.strict_participant_capability.protocol_version()
-                >= protocol::STRICT_PROTOCOL_VERSION
+                >= protocol::STRICT_PROTOCOL_VERSION_CURRENT
     }
 
     fn refresh_strict_capability_activation_locked(
@@ -1288,6 +1295,9 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
                                         let parts = StrictTopicRuntimeParts {
                                             self_id: inner.self_id,
                                             self_epoch: inner.self_epoch,
+                                            membership: current_membership_view(&inner.overlay)
+                                                .into_values()
+                                                .collect(),
                                             net: inner.strict_net.clone(),
                                             shutdown: inner.shutdown.clone(),
                                             cfg: inner.cfg.clone(),

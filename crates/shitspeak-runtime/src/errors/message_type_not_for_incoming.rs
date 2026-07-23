@@ -1,4 +1,4 @@
-use crate::messages::Message;
+use shitspeak_messages::messages::Message;
 
 #[derive(Debug)]
 pub struct MessageTypeNotForIncoming {

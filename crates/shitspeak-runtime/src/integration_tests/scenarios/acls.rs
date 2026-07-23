@@ -7,8 +7,8 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
-use crate::messages::Message;
-use crate::messages::encoder::{
+use shitspeak_messages::messages::Message;
+use shitspeak_messages::messages::encoder::{
     Authenticate, CLIENT_PERMISSION_CACHE_BIT, ChanAcl, ClientType, PluginDataTransmission,
     TextMessage, UserState, UserStats, VoiceTarget,
 };
@@ -864,7 +864,7 @@ async fn traverse_visibility_hidden_users_are_missing_from_targeted_surfaces() {
 
     bob.set_voice_target(VoiceTarget {
         id: Some(1),
-        targets: vec![crate::mumble_proto::voice_target::Target {
+        targets: vec![shitspeak_proto::mumble_proto::voice_target::Target {
             session: vec![alice.session_id],
             channel_id: None,
             group: None,
@@ -1044,7 +1044,7 @@ async fn traverse_visibility_filters_hidden_channel_requests() {
 
     alice
         .send(
-            crate::messages::encoder::PermissionQuery {
+            shitspeak_messages::messages::encoder::PermissionQuery {
                 channel_id: Some(86),
                 permissions: None,
                 flush: None,
@@ -1065,7 +1065,7 @@ async fn traverse_visibility_filters_hidden_channel_requests() {
 
     alice
         .send(
-            crate::messages::encoder::RequestBlob {
+            shitspeak_messages::messages::encoder::RequestBlob {
                 session_texture: Vec::new(),
                 session_comment: Vec::new(),
                 channel_description: vec![86],
@@ -2360,7 +2360,7 @@ async fn permission_query_reports_evaluated_bits() {
         .expect("bob");
 
     bob.send(
-        crate::messages::encoder::PermissionQuery {
+        shitspeak_messages::messages::encoder::PermissionQuery {
             channel_id: Some(62),
             permissions: None,
             flush: None,
@@ -2398,7 +2398,7 @@ async fn permission_query_marks_empty_permissions_cached() {
         .expect("bob");
 
     bob.send(
-        crate::messages::encoder::PermissionQuery {
+        shitspeak_messages::messages::encoder::PermissionQuery {
             channel_id: Some(63),
             permissions: None,
             flush: None,
@@ -3633,7 +3633,7 @@ async fn channel_state_permission_info_includes_inherited_restrictions() {
 async fn channel_permission_info(
     client: &TestClient,
     channel_id: u32,
-) -> Option<crate::mumble_proto::ChannelState> {
+) -> Option<shitspeak_proto::mumble_proto::ChannelState> {
     if let Some(channel) = client
         .initial_channel_states
         .iter()

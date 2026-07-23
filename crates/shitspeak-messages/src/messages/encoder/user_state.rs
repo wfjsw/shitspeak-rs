@@ -1,10 +1,8 @@
 use bytes::Bytes;
 use core::option::Option;
+use shitspeak_core::ClientSessionIdentifier;
 
-use crate::{
-    client::client_session_identifier::ClientSessionIdentifier,
-    messages::{Message, errors::UserStateProtocolError},
-};
+use crate::messages::{Message, errors::UserStateProtocolError};
 
 #[derive(Debug, Clone, Default)]
 pub struct VolumeAdjustment {
@@ -12,9 +10,9 @@ pub struct VolumeAdjustment {
     pub volume_adjustment: f32,
 }
 
-impl TryFrom<crate::mumble_proto::user_state::VolumeAdjustment> for VolumeAdjustment {
+impl TryFrom<shitspeak_proto::mumble_proto::user_state::VolumeAdjustment> for VolumeAdjustment {
     fn try_from(
-        proto: crate::mumble_proto::user_state::VolumeAdjustment,
+        proto: shitspeak_proto::mumble_proto::user_state::VolumeAdjustment,
     ) -> Result<Self, Self::Error> {
         Ok(Self {
             listening_channel: proto
@@ -56,8 +54,8 @@ pub struct UserState {
     pub listening_volume_adjustment: Vec<VolumeAdjustment>,
 }
 
-impl TryFrom<crate::mumble_proto::UserState> for UserState {
-    fn try_from(proto: crate::mumble_proto::UserState) -> Result<Self, Self::Error> {
+impl TryFrom<shitspeak_proto::mumble_proto::UserState> for UserState {
+    fn try_from(proto: shitspeak_proto::mumble_proto::UserState) -> Result<Self, Self::Error> {
         Ok(Self {
             session: proto.session.map(ClientSessionIdentifier::from),
             actor: proto.actor.map(ClientSessionIdentifier::from),
@@ -92,9 +90,9 @@ impl TryFrom<crate::mumble_proto::UserState> for UserState {
     type Error = UserStateProtocolError;
 }
 
-impl From<UserState> for crate::mumble_proto::UserState {
+impl From<UserState> for shitspeak_proto::mumble_proto::UserState {
     fn from(user_state: UserState) -> Self {
-        crate::mumble_proto::UserState {
+        shitspeak_proto::mumble_proto::UserState {
             session: user_state.session.map(u32::from),
             actor: user_state.actor.map(u32::from),
             name: user_state.name,
@@ -120,10 +118,12 @@ impl From<UserState> for crate::mumble_proto::UserState {
             listening_volume_adjustment: user_state
                 .listening_volume_adjustment
                 .into_iter()
-                .map(|va| crate::mumble_proto::user_state::VolumeAdjustment {
-                    listening_channel: Some(va.listening_channel),
-                    volume_adjustment: Some(va.volume_adjustment),
-                })
+                .map(
+                    |va| shitspeak_proto::mumble_proto::user_state::VolumeAdjustment {
+                        listening_channel: Some(va.listening_channel),
+                        volume_adjustment: Some(va.volume_adjustment),
+                    },
+                )
                 .collect(),
         }
     }

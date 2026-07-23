@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::context_action::{Context, Operation, context};
-use crate::messages::encoder::{ContextAction, ContextActionModify};
+use shitspeak_messages::messages::encoder::{ContextAction, ContextActionModify};
 
 pub(crate) const ACTION_ID: &str = "shitspeak.toggle_superuser_visibility";
 pub(crate) const HIDE_LABEL: &str = "Hide me";
@@ -85,7 +85,7 @@ pub(crate) async fn refresh_context_menu(
     let messages = modifications
         .into_iter()
         .map(Into::into)
-        .collect::<Vec<crate::messages::Message>>();
+        .collect::<Vec<shitspeak_messages::messages::Message>>();
     if let Err(error) = client.write_proto_message_batch(&messages).await {
         tracing::debug!(
             error = %error,

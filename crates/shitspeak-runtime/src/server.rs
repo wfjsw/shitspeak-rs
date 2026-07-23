@@ -9,19 +9,16 @@ use bytes::{Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock as ParkingRwLock};
 
 use cidr::AnyIpCidr;
-use prost::{EncodeError, Message as _};
+use prost::EncodeError;
 use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
-use crate::api::{
-    AuthenticateAuxiliaryData, AuthenticateResult, Authenticator, ReloadableAuthenticator,
-};
 use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
 use crate::client::{Client, client_local_state::ExpiredAuthenticationAction};
 use crate::errors::MessageHandlerError;
 use crate::geoip::{GeoIpResolver, IpGeoMetadata};
-use crate::messages::encoder::Version;
+use shitspeak_messages::messages::encoder::Version;
 use crate::user_channel_cache::UserChannelCache;
 use crate::voice::dispatch_tuning::VoiceDispatchPlan;
 use crate::{
@@ -30,6 +27,9 @@ use crate::{
     constants::MTU,
     s2s::S2SManager,
     types::{NodeIdentifier, default_server_id},
+};
+use shitspeak_auth::{
+    AuthenticateAuxiliaryData, AuthenticateResult, Authenticator, ReloadableAuthenticator,
 };
 use shitspeak_runtime_config::{CertificateHashProtection, Config, UdpPingUserCountScope};
 use shitspeak_state::{
@@ -823,7 +823,7 @@ impl Server {
     fn spawn_udp_process(
         server: Arc<Box<Self>>,
         mut rx: tokio::sync::mpsc::Receiver<UdpPacket>,
-        ping_enabled: bool,
+        _ping_enabled: bool,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -1670,7 +1670,7 @@ impl Server {
         AuthenticateAuxiliaryData {
             certificate_hash: client.get_certificate_hash().map(Bytes::copy_from_slice),
             session_id: client.get_session_id().into(),
-            ip_address: crate::api::canonical_authenticator_ip(client.get_real_ip_address()),
+            ip_address: shitspeak_auth::canonical_authenticator_ip(client.get_real_ip_address()),
             tls_ja4: client.tls_ja4().map(ToOwned::to_owned),
             uses_proxy_protocol: client.uses_proxy_protocol(),
             version: client.protocol_version(),
@@ -2524,9 +2524,9 @@ impl Server {
     pub async fn recheck_codec_versions(self: &Arc<Box<Self>>) {
         let all_clients = self.clients.get_all_clients().await;
 
-        let mut alpha_count = 0usize;
-        let mut beta_count = 0usize;
-        let mut prefer_alpha_count = 0usize;
+        let alpha_count = 0usize;
+        let beta_count = 0usize;
+        let prefer_alpha_count = 0usize;
         let mut opus_count = 0usize;
         let total = all_clients.len();
 
@@ -2561,7 +2561,7 @@ impl Server {
                 let prefer_alpha = codec.prefer_alpha_codec();
                 let opus = codec.opus();
                 // codec lock released here — block scope ends
-                crate::messages::encoder::CodecVersion {
+                shitspeak_messages::messages::encoder::CodecVersion {
                     alpha,
                     beta,
                     prefer_alpha,

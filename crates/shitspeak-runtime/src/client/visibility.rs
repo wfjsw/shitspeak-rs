@@ -6,8 +6,8 @@ use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
 use crate::client::Client;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
-use crate::messages::Message;
-use crate::messages::encoder::{UserRemove, UserState};
+use shitspeak_messages::messages::Message;
+use shitspeak_messages::messages::encoder::{UserRemove, UserState};
 use crate::server::Server;
 use parking_lot::RwLock as ParkingRwLock;
 use shitspeak_state::ACLPermissions;
@@ -1226,7 +1226,7 @@ pub async fn visibility_config_reload_messages(
     for channel_id in &removed_channel_ids {
         channel_tree_shadow.remove(channel_id);
         messages.push(
-            crate::messages::encoder::ChannelRemove {
+            shitspeak_messages::messages::encoder::ChannelRemove {
                 channel_id: *channel_id,
             }
             .into(),

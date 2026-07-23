@@ -4,21 +4,21 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use super::*;
-use crate::api::{
-    AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationExpiryAction,
-    AuthenticationRejection, Authenticator,
-};
 use crate::channel_handler::{ChannelPermissionShadow, ChannelTreeShadow, SessionChannelShadow};
 use crate::client::{
     Client, client_session_identifier::ClientSessionIdentifier, visibility::UserVisibilityState,
 };
 use crate::localization::Language;
-use crate::messages::encoder::TextMessage;
-use crate::messages::{Message, WriteMessageExt};
+use shitspeak_messages::messages::Message;
+use shitspeak_messages::messages::encoder::TextMessage;
 use crate::types::DEFAULT_SERVER_ID;
 use crate::voice::codec::PacketFormat;
 use crate::voice::ping::PingRequest;
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject as _};
+use shitspeak_auth::{
+    AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationExpiryAction,
+    AuthenticationRejection, Authenticator,
+};
 use shitspeak_runtime_config::{
     AuthenticatorConfig, Config, ServerEntrypointConfig, UdpPingUserCountScope,
 };

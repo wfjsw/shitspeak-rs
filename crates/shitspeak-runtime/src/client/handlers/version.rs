@@ -5,7 +5,7 @@ use crate::{
 };
 
 pub async fn handle_version(
-    server: &Arc<Box<Server>>,
+    _server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
     msg: Version,
 ) -> Result<(), MessageHandlerError> {

@@ -10,11 +10,11 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::api::{
-    AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
-};
 use crate::localization::Language;
 use crate::protocol_version::ProtocolVersion;
+use shitspeak_auth::{
+    AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
+};
 
 #[derive(Debug, Clone)]
 struct ScriptedUser {

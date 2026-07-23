@@ -19,7 +19,7 @@ pub enum RejectType {
 
 // Compile-time check: ensure our enum values match the proto.
 const _: () = {
-    use crate::mumble_proto::reject::RejectType as ProtoRejectType;
+    use shitspeak_proto::mumble_proto::reject::RejectType as ProtoRejectType;
     assert!(RejectType::None as i32 == ProtoRejectType::None as i32);
     assert!(RejectType::WrongVersion as i32 == ProtoRejectType::WrongVersion as i32);
     assert!(RejectType::InvalidUsername as i32 == ProtoRejectType::InvalidUsername as i32);

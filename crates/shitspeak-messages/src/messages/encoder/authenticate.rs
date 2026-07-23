@@ -34,8 +34,8 @@ pub struct Authenticate {
     pub client_type: ClientType,
 }
 
-impl From<crate::mumble_proto::Authenticate> for Authenticate {
-    fn from(proto: crate::mumble_proto::Authenticate) -> Self {
+impl From<shitspeak_proto::mumble_proto::Authenticate> for Authenticate {
+    fn from(proto: shitspeak_proto::mumble_proto::Authenticate) -> Self {
         Self {
             username: proto.username,
             password: proto.password,
@@ -64,9 +64,9 @@ impl Default for Authenticate {
     }
 }
 
-impl From<Authenticate> for crate::mumble_proto::Authenticate {
+impl From<Authenticate> for shitspeak_proto::mumble_proto::Authenticate {
     fn from(authenticate: Authenticate) -> Self {
-        crate::mumble_proto::Authenticate {
+        shitspeak_proto::mumble_proto::Authenticate {
             username: authenticate.username,
             password: authenticate.password,
             tokens: authenticate.tokens,

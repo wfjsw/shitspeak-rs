@@ -7,8 +7,8 @@ pub struct SuggestConfig {
     pub push_to_talk: Option<bool>,
 }
 
-impl From<crate::mumble_proto::SuggestConfig> for SuggestConfig {
-    fn from(proto: crate::mumble_proto::SuggestConfig) -> Self {
+impl From<shitspeak_proto::mumble_proto::SuggestConfig> for SuggestConfig {
+    fn from(proto: shitspeak_proto::mumble_proto::SuggestConfig) -> Self {
         Self {
             version: proto.version_v1,
             positional: proto.positional,
@@ -17,9 +17,9 @@ impl From<crate::mumble_proto::SuggestConfig> for SuggestConfig {
     }
 }
 
-impl From<SuggestConfig> for crate::mumble_proto::SuggestConfig {
+impl From<SuggestConfig> for shitspeak_proto::mumble_proto::SuggestConfig {
     fn from(config: SuggestConfig) -> Self {
-        crate::mumble_proto::SuggestConfig {
+        shitspeak_proto::mumble_proto::SuggestConfig {
             version_v1: config.version,
             version_v2: config.version.map(u64::from),
             positional: config.positional,

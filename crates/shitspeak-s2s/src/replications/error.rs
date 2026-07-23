@@ -33,4 +33,11 @@ pub enum ReplicationError {
     NotOwner { owner: NodeIdentifier },
     #[error("malformed wire frame: {0}")]
     Malformed(&'static str),
+    #[error(
+        "strict bulk frame ({encoded_bytes} bytes) exceeds the per-next-hop in-flight limit ({max_bytes} bytes)"
+    )]
+    StrictBulkFrameTooLarge {
+        encoded_bytes: usize,
+        max_bytes: usize,
+    },
 }

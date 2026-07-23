@@ -13,14 +13,17 @@ use shitspeak_proto::s2s_replication_proto as pb;
 pub use pb::{
     BlobChunk, BlobChunkReq, BlobFind, BlobMessage, BlobOffer, CatchupOp, OwnerCatchupReq,
     OwnerCatchupResp, OwnerMessage, OwnerOp, ReplicationMessage, StrictAccept, StrictAcceptAck,
-    StrictAcceptedValue, StrictCatchupReq, StrictCatchupResp, StrictClockTick, StrictCommit,
-    StrictDecision, StrictDecisionAbort, StrictDecisionCommit, StrictFrozenTarget, StrictMessage,
+    StrictAcceptedValue, StrictCatchupReason, StrictCatchupReq, StrictCatchupResp,
+    StrictClockProbeReq, StrictClockProbeResp, StrictClockTick, StrictCommit, StrictDecision,
+    StrictDecisionAbort, StrictDecisionCommit, StrictFrozenTarget, StrictHistoryProbeReq,
+    StrictHistoryProbeResp, StrictHistoryTransferReq, StrictHistoryTransferResp, StrictMessage,
     StrictOriginAuth, StrictPendingValue, StrictPropose, StrictProposeAck, StrictProposeV1,
     StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq, StrictResolutionAck,
-    StrictResolutionHint, StrictResolutionPrepare, StrictTerminalState,
-    blob_message::Body as BlobBody, owner_message::Body as OwnerBody,
-    replication_message::Body as ReplBody, strict_decision::Outcome as StrictDecisionOutcome,
-    strict_message::Body as StrictBody,
+    StrictResolutionHint, StrictResolutionPrepare, StrictTerminalCut, StrictTerminalDelta,
+    StrictTerminalPageKind, StrictTerminalState, StrictTerminalSyncAck, StrictTerminalSyncPage,
+    StrictTerminalSyncReq, StrictTerminalSyncStatus, blob_message::Body as BlobBody,
+    owner_message::Body as OwnerBody, replication_message::Body as ReplBody,
+    strict_decision::Outcome as StrictDecisionOutcome, strict_message::Body as StrictBody,
     strict_resolution_ack::Observed as StrictResolutionObserved,
     strict_terminal_state::Outcome as StrictTerminalOutcome,
 };
@@ -636,12 +639,160 @@ mod tests {
                 src_clock: 64,
                 resolver_boot_epoch: 24,
                 frozen_targets: frozen_targets.clone(),
+                source_journal_id: Bytes::new(),
+                source_terminal_generation: 0,
+                source_previous_chain_digest: Bytes::new(),
+                source_chain_digest: Bytes::new(),
+                source_terminal_set_digest: Bytes::new(),
             }))
         else {
             panic!("not v2 decision");
         };
         assert_eq!(decision.resolver_boot_epoch, 24);
         assert_eq!(decision.frozen_targets, frozen_targets);
+    }
+
+    #[test]
+    fn roundtrip_strict_v3_repair_bodies_and_decision_cut() {
+        let base_cut = StrictTerminalCut {
+            journal_id: Bytes::from_static(b"journal-lineage"),
+            generation: 40,
+            chain_digest: Bytes::from_static(b"chain-40"),
+            terminal_set_digest: Bytes::from_static(b"set-40"),
+        };
+        let target_cut = StrictTerminalCut {
+            generation: 41,
+            chain_digest: Bytes::from_static(b"chain-41"),
+            terminal_set_digest: Bytes::from_static(b"set-41"),
+            ..base_cut.clone()
+        };
+        let terminal_state = StrictTerminalState {
+            coord_node: 7,
+            op_id_hi: 0xAA,
+            op_id_lo: 0xBB,
+            ballot: 19,
+            outcome: Some(StrictTerminalOutcome::Abort(StrictDecisionAbort {})),
+            resolver_node: 7,
+            resolver_boot_epoch: 24,
+            frozen_targets: vec![StrictFrozenTarget {
+                node: 7,
+                boot_epoch: 24,
+            }],
+        };
+
+        let bodies = vec![
+            StrictBody::ClockProbeReq(StrictClockProbeReq {
+                src_node: 3,
+                expected_responder_boot_epoch: 24,
+                request_nonce: 101,
+                reason: StrictCatchupReason::DeliveryWatermark as i32,
+            }),
+            StrictBody::ClockProbeResp(StrictClockProbeResp {
+                responder_node: 7,
+                expected_requester_boot_epoch: 18,
+                request_nonce: 101,
+                src_clock: 900,
+                reason: StrictCatchupReason::DeliveryWatermark as i32,
+            }),
+            StrictBody::HistoryProbeReq(StrictHistoryProbeReq {
+                src_node: 3,
+                expected_responder_boot_epoch: 24,
+                request_nonce: 102,
+                reason: StrictCatchupReason::HistoryElection as i32,
+            }),
+            StrictBody::HistoryProbeResp(StrictHistoryProbeResp {
+                responder_node: 7,
+                expected_requester_boot_epoch: 18,
+                request_nonce: 102,
+                repository_version: 55,
+                history_freshness: 123,
+                runtime_started_at: 24,
+                history_node: 7,
+                terminal_cut: Some(target_cut.clone()),
+                reason: StrictCatchupReason::HistoryElection as i32,
+            }),
+            StrictBody::TerminalSyncReq(StrictTerminalSyncReq {
+                src_node: 3,
+                expected_responder_boot_epoch: 24,
+                reason: 4,
+                known_source_cut: Some(base_cut.clone()),
+                requester_terminal_set_digest: base_cut.terminal_set_digest.clone(),
+                transfer_id: 0,
+                request_nonce: 103,
+                expected_cursor: 41,
+            }),
+            StrictBody::TerminalSyncPage(StrictTerminalSyncPage {
+                responder_node: 7,
+                expected_requester_boot_epoch: 18,
+                transfer_id: 88,
+                request_nonce: 103,
+                status: 1,
+                kind: 1,
+                base_cut: Some(base_cut.clone()),
+                target_cut: Some(target_cut.clone()),
+                cursor: 41,
+                next_cursor: 42,
+                image_digest: Bytes::from_static(b"image"),
+                checkpoint_states: Vec::new(),
+                deltas: vec![StrictTerminalDelta {
+                    generation: 41,
+                    state: Some(terminal_state),
+                    previous_chain_digest: base_cut.chain_digest.clone(),
+                    chain_digest: target_cut.chain_digest.clone(),
+                }],
+                has_more: false,
+            }),
+            StrictBody::TerminalSyncAck(StrictTerminalSyncAck {
+                src_node: 3,
+                expected_responder_boot_epoch: 24,
+                transfer_id: 88,
+                request_nonce: 103,
+                target_cut: Some(target_cut.clone()),
+            }),
+        ];
+
+        for body in bodies {
+            assert_eq!(roundtrip_strict_body(body.clone()), body);
+        }
+        assert_eq!(
+            StrictCatchupReason::try_from(4).unwrap().as_str_name(),
+            "STRICT_CATCHUP_REASON_TERMINAL_FENCE"
+        );
+        assert_eq!(
+            StrictTerminalSyncStatus::try_from(1).unwrap().as_str_name(),
+            "STRICT_TERMINAL_SYNC_STATUS_OK"
+        );
+        assert_eq!(
+            StrictTerminalPageKind::try_from(1).unwrap().as_str_name(),
+            "STRICT_TERMINAL_PAGE_KIND_DELTA"
+        );
+
+        let StrictBody::Decision(decision) =
+            roundtrip_strict_body(StrictBody::Decision(StrictDecision {
+                resolver_node: 7,
+                ballot: 19,
+                coord_node: 7,
+                op_id_hi: 0xAA,
+                op_id_lo: 0xBB,
+                outcome: Some(StrictDecisionOutcome::Abort(StrictDecisionAbort {})),
+                src_clock: 901,
+                resolver_boot_epoch: 24,
+                frozen_targets: Vec::new(),
+                source_journal_id: target_cut.journal_id.clone(),
+                source_terminal_generation: target_cut.generation,
+                source_previous_chain_digest: base_cut.chain_digest,
+                source_chain_digest: target_cut.chain_digest.clone(),
+                source_terminal_set_digest: target_cut.terminal_set_digest.clone(),
+            }))
+        else {
+            panic!("not v3 decision");
+        };
+        assert_eq!(decision.source_terminal_generation, 41);
+        assert_eq!(decision.source_chain_digest, target_cut.chain_digest);
+        assert_eq!(
+            decision.source_terminal_set_digest,
+            target_cut.terminal_set_digest
+        );
     }
 
     #[test]
@@ -723,6 +874,7 @@ mod tests {
                 terminal_decision_generation: 7,
                 snapshot_transfer_id: 0,
                 snapshot_chunk_cursor: 0,
+                history_transfer: None,
             }),
         );
         let bytes = encode(&req).unwrap();
@@ -811,6 +963,7 @@ mod tests {
                 snapshot_sha256: Bytes::new(),
                 snapshot_has_more: false,
                 snapshot_transfer_rejected: false,
+                history_transfer: None,
             }),
         );
         let bytes = encode(&resp).unwrap();
@@ -1149,6 +1302,11 @@ mod tests {
                 src_clock: 67,
                 resolver_boot_epoch: 0,
                 frozen_targets: vec![],
+                source_journal_id: Bytes::new(),
+                source_terminal_generation: 0,
+                source_previous_chain_digest: Bytes::new(),
+                source_chain_digest: Bytes::new(),
+                source_terminal_set_digest: Bytes::new(),
             }))
         else {
             panic!("not strict commit decision");
@@ -1171,6 +1329,11 @@ mod tests {
                 src_clock: 68,
                 resolver_boot_epoch: 0,
                 frozen_targets: vec![],
+                source_journal_id: Bytes::new(),
+                source_terminal_generation: 0,
+                source_previous_chain_digest: Bytes::new(),
+                source_chain_digest: Bytes::new(),
+                source_terminal_set_digest: Bytes::new(),
             }))
         else {
             panic!("not strict abort decision");

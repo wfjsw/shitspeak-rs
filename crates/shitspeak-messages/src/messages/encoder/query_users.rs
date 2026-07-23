@@ -6,8 +6,8 @@ pub struct QueryUsers {
     pub names: Vec<String>,
 }
 
-impl From<crate::mumble_proto::QueryUsers> for QueryUsers {
-    fn from(proto: crate::mumble_proto::QueryUsers) -> Self {
+impl From<shitspeak_proto::mumble_proto::QueryUsers> for QueryUsers {
+    fn from(proto: shitspeak_proto::mumble_proto::QueryUsers) -> Self {
         Self {
             ids: proto.ids,
             names: proto.names,
@@ -15,9 +15,9 @@ impl From<crate::mumble_proto::QueryUsers> for QueryUsers {
     }
 }
 
-impl From<QueryUsers> for crate::mumble_proto::QueryUsers {
+impl From<QueryUsers> for shitspeak_proto::mumble_proto::QueryUsers {
     fn from(value: QueryUsers) -> Self {
-        crate::mumble_proto::QueryUsers {
+        shitspeak_proto::mumble_proto::QueryUsers {
             ids: value.ids,
             names: value.names,
         }

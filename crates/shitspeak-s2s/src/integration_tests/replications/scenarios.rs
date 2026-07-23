@@ -14,6 +14,7 @@ use tokio::time::timeout;
 
 use crate::overlay::{OverlayNetwork, STRICT_REPLICATION_PROTOCOL_VERSION, SeedPeer};
 use crate::replications::proto::{self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG};
+use crate::replications::protocol::STRICT_PROTOCOL_VERSION_CURRENT;
 use crate::replications::strict::{
     HistoryMetadata, LogSlice, StrictCommitApplyOutcome, StrictLogEntry, StrictLogMetadata,
     StrictSnapshotError,
@@ -433,7 +434,7 @@ async fn strict_three_node_convergence() {
     cluster.shutdown().await;
 }
 
-/// Verifies that strict-v2 capability activation is derived from repository
+/// Verifies that the current strict participant capability is derived from repository
 /// registration, rather than an application-maintained capability manifest.
 /// A later capable topic must preserve the already-advertised cumulative
 /// protocol floor and remain usable for strict replication.
@@ -457,7 +458,7 @@ async fn strict_capability_activation_is_automatic_and_floor_stable() {
                 .all(|manager| manager.strict_capability_activation_ready())
                 && strict_protocol_floors(&cluster)
                     .iter()
-                    .all(|(_, version)| *version == STRICT_REPLICATION_PROTOCOL_VERSION)
+                    .all(|(_, version)| *version == STRICT_PROTOCOL_VERSION_CURRENT)
         })
         .await,
         "automatic first-topic registration did not activate the cumulative strict protocol floor: floors={:?}",
@@ -479,7 +480,7 @@ async fn strict_capability_activation_is_automatic_and_floor_stable() {
                 .all(|manager| manager.strict_capability_activation_ready())
                 && strict_protocol_floors(&cluster)
                     .iter()
-                    .all(|(_, version)| *version == STRICT_REPLICATION_PROTOCOL_VERSION)
+                    .all(|(_, version)| *version == STRICT_PROTOCOL_VERSION_CURRENT)
         })
         .await,
         "later capable topic lowered the cumulative strict protocol floor: floors={:?}",
@@ -693,10 +694,10 @@ async fn strict_rejoining_peer_does_not_pin_buffered_delivery() {
                 .all(|manager| manager.strict_capability_activation_ready())
                 && strict_protocol_floors(&cluster)
                     .iter()
-                    .all(|(_, version)| *version == STRICT_REPLICATION_PROTOCOL_VERSION)
+                    .all(|(_, version)| *version == STRICT_PROTOCOL_VERSION_CURRENT)
         })
         .await,
-        "strict v2 capability did not converge before the rejoin scenario: floors={:?}",
+        "current strict participant capability did not converge before the rejoin scenario: floors={:?}",
         strict_protocol_floors(&cluster)
     );
 
@@ -923,9 +924,9 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
         .unwrap();
     assert!(
         wait_until(Duration::from_secs(8), || {
-            new_manager.strict_protocol_version() >= STRICT_REPLICATION_PROTOCOL_VERSION
+            new_manager.strict_protocol_version() >= STRICT_PROTOCOL_VERSION_CURRENT
                 && cluster.managers.iter().all(|manager| {
-                    manager.strict_protocol_version() >= STRICT_REPLICATION_PROTOCOL_VERSION
+                    manager.strict_protocol_version() >= STRICT_PROTOCOL_VERSION_CURRENT
                 })
         })
         .await,
@@ -1589,7 +1590,7 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
                 .all(|manager| manager.strict_capability_activation_ready())
                 && strict_protocol_floors(&cluster)
                     .iter()
-                    .all(|(_, version)| *version == STRICT_REPLICATION_PROTOCOL_VERSION)
+                    .all(|(_, version)| *version == STRICT_PROTOCOL_VERSION_CURRENT)
         })
         .await,
         "automatic strict capability activation did not converge before hostile-link injection: floors={:?}",
@@ -1675,10 +1676,10 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
                     .all(|manager| manager.strict_capability_activation_ready())
                     && strict_protocol_floors(&cluster)
                         .iter()
-                        .all(|(_, version)| *version == STRICT_REPLICATION_PROTOCOL_VERSION)
+                        .all(|(_, version)| *version == STRICT_PROTOCOL_VERSION_CURRENT)
             })
             .await,
-            "strict capability floor did not remain v2 while hostile links were failing: round={round}, blocked_pairs={blocked_pairs:?}, floors={:?}",
+            "strict participant capability floor did not remain current while hostile links were failing: round={round}, blocked_pairs={blocked_pairs:?}, floors={:?}",
             strict_protocol_floors(&cluster),
         );
 

@@ -55,7 +55,15 @@ pub enum MessageType {
     StrictPropose,
     StrictAck,
     StrictCommit,
+    /// Legacy v2 catchup and recovery traffic.
     StrictCatchup,
+    StrictClockProbeReq,
+    StrictClockProbeResp,
+    StrictHistoryProbeReq,
+    StrictHistoryProbeResp,
+    StrictTerminalSyncReq,
+    StrictTerminalSyncPage,
+    StrictTerminalSyncAck,
     /// Compatibility name retained for existing scenarios.
     StrictProposeAck,
 }
@@ -94,32 +102,35 @@ impl MessageType {
                         if let Some(crate::replications::proto::ReplBody::Strict(strict)) =
                             repl.body
                         {
-                            return match strict.body? {
-                                crate::replications::proto::StrictBody::Propose(_)
-                                | crate::replications::proto::StrictBody::ProposeV1(_) => {
-                                    Some(MessageType::StrictPropose)
-                                }
-                                crate::replications::proto::StrictBody::ProposeAck(_) => {
-                                    Some(MessageType::StrictAck)
-                                }
-                                crate::replications::proto::StrictBody::Commit(_)
-                                | crate::replications::proto::StrictBody::RecoveryCommit(_) => {
-                                    Some(MessageType::StrictCommit)
-                                }
-                                crate::replications::proto::StrictBody::CatchupReq(_)
-                                | crate::replications::proto::StrictBody::CatchupResp(_)
-                                | crate::replications::proto::StrictBody::RecoveryReq(_)
-                                | crate::replications::proto::StrictBody::RecoveryAck(_) => {
-                                    Some(MessageType::StrictCatchup)
-                                }
-                                _ => Some(MessageType::Data),
-                            };
+                            return strict.body.as_ref().map(classify_strict_body);
                         }
                     }
                 }
                 MessageType::Data
             }
         })
+    }
+}
+
+fn classify_strict_body(body: &crate::replications::proto::StrictBody) -> MessageType {
+    use crate::replications::proto::StrictBody;
+
+    match body {
+        StrictBody::Propose(_) | StrictBody::ProposeV1(_) => MessageType::StrictPropose,
+        StrictBody::ProposeAck(_) => MessageType::StrictAck,
+        StrictBody::Commit(_) | StrictBody::RecoveryCommit(_) => MessageType::StrictCommit,
+        StrictBody::CatchupReq(_)
+        | StrictBody::CatchupResp(_)
+        | StrictBody::RecoveryReq(_)
+        | StrictBody::RecoveryAck(_) => MessageType::StrictCatchup,
+        StrictBody::ClockProbeReq(_) => MessageType::StrictClockProbeReq,
+        StrictBody::ClockProbeResp(_) => MessageType::StrictClockProbeResp,
+        StrictBody::HistoryProbeReq(_) => MessageType::StrictHistoryProbeReq,
+        StrictBody::HistoryProbeResp(_) => MessageType::StrictHistoryProbeResp,
+        StrictBody::TerminalSyncReq(_) => MessageType::StrictTerminalSyncReq,
+        StrictBody::TerminalSyncPage(_) => MessageType::StrictTerminalSyncPage,
+        StrictBody::TerminalSyncAck(_) => MessageType::StrictTerminalSyncAck,
+        _ => MessageType::Data,
     }
 }
 
@@ -664,7 +675,50 @@ fn spawn_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replications::proto::{
+        StrictBody, StrictClockProbeReq, StrictClockProbeResp, StrictHistoryProbeReq,
+        StrictHistoryProbeResp, StrictTerminalSyncAck, StrictTerminalSyncPage,
+        StrictTerminalSyncReq,
+    };
     use shitspeak_s2s_transport::TransportKind;
+
+    #[test]
+    fn classifies_v3_strict_repair_bodies_independently() {
+        let cases = [
+            (
+                StrictBody::ClockProbeReq(StrictClockProbeReq::default()),
+                MessageType::StrictClockProbeReq,
+            ),
+            (
+                StrictBody::ClockProbeResp(StrictClockProbeResp::default()),
+                MessageType::StrictClockProbeResp,
+            ),
+            (
+                StrictBody::HistoryProbeReq(StrictHistoryProbeReq::default()),
+                MessageType::StrictHistoryProbeReq,
+            ),
+            (
+                StrictBody::HistoryProbeResp(StrictHistoryProbeResp::default()),
+                MessageType::StrictHistoryProbeResp,
+            ),
+            (
+                StrictBody::TerminalSyncReq(StrictTerminalSyncReq::default()),
+                MessageType::StrictTerminalSyncReq,
+            ),
+            (
+                StrictBody::TerminalSyncPage(StrictTerminalSyncPage::default()),
+                MessageType::StrictTerminalSyncPage,
+            ),
+            (
+                StrictBody::TerminalSyncAck(StrictTerminalSyncAck::default()),
+                MessageType::StrictTerminalSyncAck,
+            ),
+        ];
+
+        for (body, expected) in cases {
+            assert_eq!(classify_strict_body(&body), expected);
+        }
+    }
 
     #[test]
     fn selector_normalizes_legacy_strict_ack_name() {

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::{
-    api::{AuthenticateAuxiliaryData, AuthenticationRejection, canonical_authenticator_ip},
     channel_handler::{
         ChannelTreeShadow, SessionChannelShadow, build_visible_channel_snapshot_messages,
     },
@@ -11,10 +10,13 @@ use crate::{
     errors::{AuthRejection, MessageHandlerError},
     localization::{TextKey, text},
     messages::{
-        Message, WriteMessageExt,
-        encoder::{Authenticate, ChannelState, CodecVersion, RejectType, ServerConfig, ServerSync},
+        Message,
+        encoder::{Authenticate, CodecVersion, RejectType, ServerConfig, ServerSync},
     },
     server::Server,
+};
+use shitspeak_auth::{
+    AuthenticateAuxiliaryData, AuthenticationRejection, canonical_authenticator_ip,
 };
 
 const AUTH_FINALIZATION_YIELD_EVERY: usize = 64;
@@ -130,7 +132,7 @@ pub async fn handle_authenticate(
 
         let crypt = sender.crypt_state();
         let state = crypt.as_ref().expect("crypt state just created");
-        crate::messages::encoder::CryptSetup::new(
+        shitspeak_messages::messages::encoder::CryptSetup::new(
             state.key().map(Bytes::copy_from_slice),
             Some(Bytes::copy_from_slice(state.decrypt_iv())),
             Some(Bytes::copy_from_slice(state.encrypt_iv())),

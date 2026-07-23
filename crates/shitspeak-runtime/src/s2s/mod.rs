@@ -44,9 +44,7 @@ use shitspeak_s2s::application::proto::{
     ModerationCommand, ModerationEnvelope, PluginDataEnvelope, TextMessageEnvelope,
     UserRemovePatch, UserStatePatch, UserStatsReply, VoiceFrame, VoiceIntent,
 };
-use shitspeak_s2s::application::voice::{
-    AudioSink, RecipientIndex, RecipientIndexSnapshot, RecipientIndexUpdate,
-};
+use shitspeak_s2s::application::voice::{AudioSink, RecipientIndex, RecipientIndexUpdate};
 use shitspeak_s2s::overlay as s2s_overlay;
 use shitspeak_s2s::overlay::OverlayNetwork;
 use shitspeak_s2s::replications as s2s_replications;
@@ -837,7 +835,7 @@ impl S2SManager {
             Err(e) => (None, Some(e)),
         };
 
-        let mut state = S2SRuntimeState::default();
+        let state = S2SRuntimeState::default();
         #[cfg(feature = "pre-release-workload")]
         if pre_release_workload::enabled() {
             let local_node = config.s2s.local_node_id().unwrap_or_default();
@@ -1133,7 +1131,7 @@ impl S2SManager {
         match handle.propose_with_accepted(operation).await {
             Ok(mut proposal) => {
                 if let Some(accepted) = accepted {
-                    if let Some(mut accepted_rx) = proposal.take_accepted_receiver() {
+                    if let Some(accepted_rx) = proposal.take_accepted_receiver() {
                         let accepted_started_at = started_at;
                         let accepted_server_id = server_id.to_owned();
                         tokio::spawn(async move {
@@ -2596,7 +2594,7 @@ fn spawn_client_replication_proposal_worker(
 async fn run_native_gateway(
     server: Weak<Box<Server>>,
     rx: S2SNativeGatewayRx,
-    mut shutdown: watch::Receiver<()>,
+    shutdown: watch::Receiver<()>,
 ) {
     let S2SNativeGatewayRx {
         control,
@@ -2801,8 +2799,8 @@ async fn deliver_plugin_data_to_local_recipients(
                     continue;
                 }
             }
-            let message: crate::messages::Message =
-                crate::messages::encoder::PluginDataTransmission {
+            let message: shitspeak_messages::messages::Message =
+                shitspeak_messages::messages::encoder::PluginDataTransmission {
                     sender_session: Some(envelope.sender_session),
                     receiver_sessions: vec![receiver],
                     data: Some(envelope.data.clone()),
@@ -2861,7 +2859,7 @@ async fn deliver_text_message_to_local_recipients(
                 continue;
             }
         }
-        let message: crate::messages::Message = crate::messages::encoder::TextMessage {
+        let message: shitspeak_messages::messages::Message = shitspeak_messages::messages::encoder::TextMessage {
             actor: Some(envelope.sender_session),
             session: envelope.session.clone(),
             channel_id: envelope.channel_id.clone(),
@@ -3134,7 +3132,7 @@ async fn apply_user_remove_patch(
         } else {
             None
         };
-    let remove_notice: crate::messages::Message = crate::messages::encoder::UserRemove {
+    let remove_notice: shitspeak_messages::messages::Message = shitspeak_messages::messages::encoder::UserRemove {
         session: u32::from(target_id),
         actor: actor_for_target,
         reason: patch.reason.clone(),
@@ -4082,7 +4080,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::messages::Message;
     use shitspeak_state::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig};
 
     #[test]

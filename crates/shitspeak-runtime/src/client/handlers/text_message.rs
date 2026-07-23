@@ -6,7 +6,7 @@ use crate::{
     client::Client,
     client::client_session_identifier::ClientSessionIdentifier,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt, encoder::TextMessage},
+    messages::{Message, encoder::TextMessage},
     server::Server,
 };
 use shitspeak_s2s::application::proto::TextMessageEnvelope;
@@ -56,7 +56,7 @@ pub async fn handle_text_message(
                 .await;
         if !perms.contains(ACLPermissions::TextMessage) {
             return Err(MessageHandlerError::PermissionDenied(
-                crate::messages::encoder::PermissionDenied::for_permission(
+                shitspeak_messages::messages::encoder::PermissionDenied::for_permission(
                     sender_session,
                     Some(target_channel),
                     ACLPermissions::TextMessage,
@@ -74,7 +74,7 @@ pub async fn handle_text_message(
                 .await;
         if !perms.contains(ACLPermissions::TextMessage) {
             return Err(MessageHandlerError::PermissionDenied(
-                crate::messages::encoder::PermissionDenied::for_permission(
+                shitspeak_messages::messages::encoder::PermissionDenied::for_permission(
                     sender_session,
                     Some(target_channel),
                     ACLPermissions::TextMessage,
@@ -92,7 +92,7 @@ pub async fn handle_text_message(
                 .await;
         if !root_perms.contains(ACLPermissions::TextMessage) {
             return Err(MessageHandlerError::PermissionDenied(
-                crate::messages::encoder::PermissionDenied::for_permission(
+                shitspeak_messages::messages::encoder::PermissionDenied::for_permission(
                     sender_session,
                     Some(root_channel_id),
                     ACLPermissions::TextMessage,

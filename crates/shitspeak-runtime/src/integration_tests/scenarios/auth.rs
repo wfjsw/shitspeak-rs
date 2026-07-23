@@ -5,8 +5,8 @@ use crate::integration_tests::harness::{
     ManualNativeClient, TestClient, TestServerOpts, spawn_test_server,
 };
 use crate::localization::Language;
-use crate::messages::encoder::{Authenticate, ClientType, ContextActionModify, Ping, RejectType};
-use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
+use shitspeak_messages::messages::encoder::{Authenticate, ClientType, ContextActionModify, Ping, RejectType};
+use shitspeak_messages::messages::{Message, ReadMessageExt, WriteMessageExt};
 use crate::voice::codec::IncomingUdpPacket;
 use bytes::BytesMut;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
@@ -128,7 +128,7 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
         Some(Message::Version(_))
     ));
     let alice_handshake = [
-        crate::messages::encoder::Version {
+        shitspeak_messages::messages::encoder::Version {
             version: Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)),
             release: Some("test-client".into()),
             os: Some("test".into()),
@@ -161,7 +161,7 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
     ));
 
     let handshake = [
-        crate::messages::encoder::Version {
+        shitspeak_messages::messages::encoder::Version {
             version: Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)),
             release: Some("test-client".into()),
             os: Some("test".into()),
@@ -286,7 +286,7 @@ async fn auth_pre_sync_udp_tunnel_messages_are_dropped_instead_of_queued() {
     ));
 
     let mut messages = vec![
-        crate::messages::encoder::Version {
+        shitspeak_messages::messages::encoder::Version {
             version: Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)),
             release: Some("test-client".into()),
             os: Some("test".into()),
@@ -339,7 +339,7 @@ async fn auth_pre_sync_udp_tunnel_messages_are_dropped_instead_of_queued() {
     );
 }
 
-fn crypt_state_from_setup(crypt_setup: crate::mumble_proto::CryptSetup) -> CryptState {
+fn crypt_state_from_setup(crypt_setup: shitspeak_proto::mumble_proto::CryptSetup) -> CryptState {
     let key = crypt_setup.key.expect("CryptSetup includes key");
     let client_nonce = crypt_setup
         .client_nonce
@@ -474,7 +474,7 @@ async fn native_client_must_authenticate_before_timeout() {
     let version = tls.read_proto_message().await.expect("server Version");
     assert!(matches!(version, Message::Version(_)));
     tls.write_proto_message(
-        &crate::messages::encoder::Version {
+        &shitspeak_messages::messages::encoder::Version {
             version: Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)),
             release: Some("test-client".into()),
             os: Some("test".into()),
@@ -907,7 +907,10 @@ async fn assert_peer_seen_exactly_once(
     );
 }
 
-fn is_join_snapshot_for_session(state: &crate::mumble_proto::UserState, session_id: u32) -> bool {
+fn is_join_snapshot_for_session(
+    state: &shitspeak_proto::mumble_proto::UserState,
+    session_id: u32,
+) -> bool {
     state.session == Some(session_id) && state.name.is_some() && state.channel_id.is_some()
 }
 
@@ -1154,7 +1157,7 @@ async fn auth_wrong_password_closes_connection_after_reject() {
     ));
 
     let handshake = [
-        crate::messages::encoder::Version {
+        shitspeak_messages::messages::encoder::Version {
             version: Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)),
             release: Some("test-client".into()),
             os: Some("test".into()),

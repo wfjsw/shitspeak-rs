@@ -1246,7 +1246,7 @@ async fn prepare_channel_visibility_refresh_inner(
     ));
     close_visible_channel_ancestors(&candidate_channels, &mut visible_channel_ids);
 
-    let mut removed_channel_ids = channel_tree_shadow
+    let removed_channel_ids = channel_tree_shadow
         .channel_ids()
         .iter()
         .filter(|channel_id| {
@@ -1293,7 +1293,7 @@ async fn prepare_channel_visibility_refresh_inner(
         additions.push(state.into());
         if let Some(context) = acl_context {
             additions.push(
-                crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                     channel.id,
                     context.evaluate(channel.id).bits(),
                 )
@@ -1305,7 +1305,7 @@ async fn prepare_channel_visibility_refresh_inner(
     let removals = removed_channel_ids
         .iter()
         .copied()
-        .map(|channel_id| crate::messages::encoder::ChannelRemove { channel_id }.into())
+        .map(|channel_id| shitspeak_messages::messages::encoder::ChannelRemove { channel_id }.into())
         .collect::<Vec<_>>();
 
     ChannelVisibilityRefresh {
@@ -1393,7 +1393,7 @@ async fn client_log_permission_refresh_messages(
             )
             .await;
             messages.push(
-                crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                     channel.id,
                     permissions.bits(),
                 )
@@ -1723,10 +1723,10 @@ async fn permission_info_for_channel_with_home(
 pub async fn apply_permission_info_to_channel_state(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    cs_proto: &crate::messages::Message,
+    cs_proto: &shitspeak_messages::messages::Message,
     channels: &Arc<ChannelRepository>,
-) -> Option<crate::messages::Message> {
-    if let crate::messages::Message::ChannelState(cs_proto) = cs_proto {
+) -> Option<shitspeak_messages::messages::Message> {
+    if let shitspeak_messages::messages::Message::ChannelState(cs_proto) = cs_proto {
         if let Some(ch_id) = cs_proto.channel_id {
             let server_id = client.server_id();
             if channels
@@ -1736,7 +1736,7 @@ pub async fn apply_permission_info_to_channel_state(
             {
                 let (is_enter_restricted, perms) =
                     permission_info_for_channel(server, client, ch_id).await;
-                let encoder_cs: crate::messages::encoder::ChannelState = cs_proto.clone().into();
+                let encoder_cs: shitspeak_messages::messages::encoder::ChannelState = cs_proto.clone().into();
                 return Some(
                     encoder_cs
                         .with_permission_info(is_enter_restricted, perms)
@@ -1758,7 +1758,7 @@ pub async fn convert_channel_operation_to_messages(
     client: &Arc<Box<Client>>,
     op: &ChannelOperation,
     channels: &Arc<ChannelRepository>,
-) -> Vec<crate::messages::Message> {
+) -> Vec<shitspeak_messages::messages::Message> {
     convert_channel_operation_to_messages_with_shadow(server, client, op, channels, None).await
 }
 
@@ -1771,7 +1771,7 @@ pub async fn convert_channel_operation_to_messages_with_shadow(
     op: &ChannelOperation,
     channels: &Arc<ChannelRepository>,
     session_channel_shadow: Option<&mut SessionChannelShadow>,
-) -> Vec<crate::messages::Message> {
+) -> Vec<shitspeak_messages::messages::Message> {
     convert_channel_operation_to_messages_with_shadows(
         server,
         client,
@@ -1790,7 +1790,7 @@ pub(crate) async fn convert_channel_operation_to_messages_with_shadows(
     channels: &Arc<ChannelRepository>,
     session_channel_shadow: Option<&mut SessionChannelShadow>,
     permission_shadow: Option<&ChannelPermissionShadow>,
-) -> Vec<crate::messages::Message> {
+) -> Vec<shitspeak_messages::messages::Message> {
     convert_channel_operation_to_messages_with_acl_context(
         server,
         client,
@@ -1808,10 +1808,10 @@ pub async fn convert_channel_operation_to_messages_with_acl_context(
     client: &Arc<Box<Client>>,
     op: &ChannelOperation,
     channels: &Arc<ChannelRepository>,
-    mut session_channel_shadow: Option<&mut SessionChannelShadow>,
+    session_channel_shadow: Option<&mut SessionChannelShadow>,
     _permission_shadow: Option<&ChannelPermissionShadow>,
     acl_context: Option<&ClientAclOperationContext>,
-) -> Vec<crate::messages::Message> {
+) -> Vec<shitspeak_messages::messages::Message> {
     convert_channel_operation_to_messages_with_acl_context_options(
         server,
         client,
@@ -1832,7 +1832,7 @@ pub async fn convert_channel_operation_to_messages_with_acl_context_options(
     mut session_channel_shadow: Option<&mut SessionChannelShadow>,
     acl_context: Option<&ClientAclOperationContext>,
     emit_permission_queries: bool,
-) -> Vec<crate::messages::Message> {
+) -> Vec<shitspeak_messages::messages::Message> {
     let mut messages = Vec::new();
     let mut permission_info_messages = Vec::new();
     let send_permission_info = server.read_config().send_permission_info;
@@ -1947,7 +1947,7 @@ pub async fn convert_channel_operation_to_messages_with_acl_context_options(
             }
             for channel_id in removed {
                 messages.push(
-                    crate::messages::encoder::ChannelRemove {
+                    shitspeak_messages::messages::encoder::ChannelRemove {
                         channel_id: *channel_id,
                     }
                     .into(),
@@ -2153,7 +2153,7 @@ fn synthetic_user_move(
     }
     shadow.insert(session, target_channel);
     Some(
-        crate::messages::encoder::UserState {
+        shitspeak_messages::messages::encoder::UserState {
             session: Some(session),
             actor: None,
             channel_id: Some(target_channel),
@@ -2465,7 +2465,7 @@ async fn replay_channel_snapshot(
     outbound.extend(visibility_messages);
 
     for channel_id in removed {
-        let message = crate::messages::encoder::ChannelRemove { channel_id }.into();
+        let message = shitspeak_messages::messages::encoder::ChannelRemove { channel_id }.into();
         if let Some(shadow) = permission_shadow.as_deref_mut() {
             shadow.sync_message(&message);
         }
@@ -2582,7 +2582,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use crate::client::client_session_identifier::ClientSessionIdentifier;
-    use crate::messages::{Message, encoder};
+    use shitspeak_messages::messages::{Message, encoder};
     use shitspeak_state::{ACL, ACLPermissions, Channel, ChannelHierarchy};
 
     use super::{
@@ -3274,7 +3274,7 @@ async fn build_precise_acl_permission_refresh_messages_from_context(
         let permission_changed = new_permissions != old_permissions;
         if permission_changed && permission_query_ids.contains(&channel_id) {
             permission_queries.push(
-                crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+                shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                     channel_id,
                     new_permissions.bits(),
                 )
@@ -3351,7 +3351,7 @@ async fn build_channel_permission_refresh_messages_for_channel_ids(
             )
         };
         permission_queries.push(
-            crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+            shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                 channel.id,
                 permissions.bits(),
             )
@@ -3428,7 +3428,7 @@ pub async fn build_enter_permission_query_refresh_messages(
         )
         .await;
         messages.push(
-            crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+            shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                 channel_id,
                 permissions.bits(),
             )
@@ -3524,7 +3524,7 @@ async fn build_scoped_permission_info_refresh_messages_for_channels(
             permission_info_for_channel_with_home(server, client, channel.id, home_channel_id)
                 .await;
         messages.push(
-            crate::messages::encoder::PermissionQuery::refresh_channel_permissions(
+            shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                 channel.id,
                 perms.bits(),
             )

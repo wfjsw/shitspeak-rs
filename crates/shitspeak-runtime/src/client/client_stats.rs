@@ -1,4 +1,4 @@
-use crate::messages::encoder::Ping;
+use shitspeak_messages::messages::encoder::Ping;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ClientStats {

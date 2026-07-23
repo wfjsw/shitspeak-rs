@@ -8,8 +8,8 @@ pub struct UserRemove {
     pub ban: Option<bool>,
 }
 
-impl From<crate::mumble_proto::UserRemove> for UserRemove {
-    fn from(proto: crate::mumble_proto::UserRemove) -> Self {
+impl From<shitspeak_proto::mumble_proto::UserRemove> for UserRemove {
+    fn from(proto: shitspeak_proto::mumble_proto::UserRemove) -> Self {
         Self {
             session: proto.session,
             actor: proto.actor,
@@ -19,9 +19,9 @@ impl From<crate::mumble_proto::UserRemove> for UserRemove {
     }
 }
 
-impl From<UserRemove> for crate::mumble_proto::UserRemove {
+impl From<UserRemove> for shitspeak_proto::mumble_proto::UserRemove {
     fn from(user_remove: UserRemove) -> Self {
-        crate::mumble_proto::UserRemove {
+        shitspeak_proto::mumble_proto::UserRemove {
             session: user_remove.session,
             actor: user_remove.actor,
             reason: user_remove.reason,

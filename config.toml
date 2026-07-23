@@ -425,6 +425,12 @@ strict_max_snapshot_transfer_bytes = 67108864
 strict_bootstrap_retry_interval_ms = 500
 # Periodic strict steady-state log catchup interval after history election.
 strict_steady_state_catchup_interval_ms = 5000
+# Per-next-hop strict bulk pacing. Byte budgets are shared by all topics and
+# logical destinations whose current route uses the same first hop.
+strict_bulk_max_in_flight_bytes_per_next_hop = 262144
+strict_bulk_rate_bytes_per_second_per_next_hop = 1048576
+strict_bulk_retry_max_delay_ms = 5000
+strict_bulk_retry_jitter_pct = 25
 # Pending propose entries are GC'd after this period. Must be longer
 # than `propose_ttl_ms` so a proposer's caller-visible timeout fires
 # before the remote-side state evaporates.

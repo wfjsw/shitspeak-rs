@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt, encoder::QueryUsers},
+    messages::{Message, encoder::QueryUsers},
     server::Server,
 };
 

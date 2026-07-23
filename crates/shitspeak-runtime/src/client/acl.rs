@@ -418,9 +418,7 @@ async fn compute_permissions_for_client_inner(
     channel_id: u32,
     home_channel_override: Option<u32>,
     identity_override: Option<(Option<u32>, HashSet<String>, bool)>,
-) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
-    use shitspeak_state::ACLPermissions;
-
+) -> enumflags2::BitFlags<ACLPermissions> {
     let session = u32::from(client.get_session_id());
     let is_superuser = identity_override
         .as_ref()

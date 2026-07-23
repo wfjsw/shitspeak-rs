@@ -54,9 +54,9 @@ impl std::fmt::Display for AuthRejection {
 
 impl std::error::Error for AuthRejection {}
 
-impl Into<crate::messages::encoder::Reject> for AuthRejection {
-    fn into(self) -> crate::messages::encoder::Reject {
-        crate::messages::encoder::Reject {
+impl Into<shitspeak_messages::messages::encoder::Reject> for AuthRejection {
+    fn into(self) -> shitspeak_messages::messages::encoder::Reject {
+        shitspeak_messages::messages::encoder::Reject {
             r#type: Some(self.rejection_type),
             reason: self.reason.map(Cow::into_owned),
         }

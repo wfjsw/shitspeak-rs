@@ -4,6 +4,10 @@ use std::time::Duration;
 
 use crate::status::PrometheusSample;
 
+#[cfg(test)]
+use super::proto::StrictTerminalSyncStatus;
+use super::proto::{StrictCatchupReason, StrictTerminalPageKind};
+
 #[derive(Clone, Copy)]
 pub(crate) enum CatchupMode {
     Strict,
@@ -22,6 +26,315 @@ impl CatchupMode {
         match self {
             Self::Strict => "strict",
             Self::Owner => "owner",
+        }
+    }
+}
+
+/// Bounded initiating reasons for replication catchup work.
+///
+/// Never replace these labels with topic, peer, transfer, or operation data:
+/// those values are deliberately excluded from the Prometheus surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CatchupReason {
+    HistoryElection,
+    Admission,
+    SteadyState,
+    TerminalFence,
+    DeliveryWatermark,
+    PeerBehind,
+    RepositoryGap,
+    LegacyV2,
+    OwnerAntiEntropy,
+}
+
+impl CatchupReason {
+    fn index(self) -> usize {
+        match self {
+            Self::HistoryElection => 0,
+            Self::Admission => 1,
+            Self::SteadyState => 2,
+            Self::TerminalFence => 3,
+            Self::DeliveryWatermark => 4,
+            Self::PeerBehind => 5,
+            Self::RepositoryGap => 6,
+            Self::LegacyV2 => 7,
+            Self::OwnerAntiEntropy => 8,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::HistoryElection => "history_election",
+            Self::Admission => "admission",
+            Self::SteadyState => "steady_state",
+            Self::TerminalFence => "terminal_fence",
+            Self::DeliveryWatermark => "delivery_watermark",
+            Self::PeerBehind => "peer_behind",
+            Self::RepositoryGap => "repository_gap",
+            Self::LegacyV2 => "legacy_v2",
+            Self::OwnerAntiEntropy => "owner_anti_entropy",
+        }
+    }
+
+    /// Converts an authenticated v3 wire reason into its bounded metric
+    /// dimension. An unspecified or unknown value is rejected instead of
+    /// being folded into an unrelated reason and hiding malformed traffic.
+    pub(crate) fn from_v3_wire(reason: i32) -> Option<Self> {
+        match StrictCatchupReason::try_from(reason).ok()? {
+            StrictCatchupReason::Unspecified => None,
+            StrictCatchupReason::HistoryElection => Some(Self::HistoryElection),
+            StrictCatchupReason::Admission => Some(Self::Admission),
+            StrictCatchupReason::SteadyState => Some(Self::SteadyState),
+            StrictCatchupReason::TerminalFence => Some(Self::TerminalFence),
+            StrictCatchupReason::DeliveryWatermark => Some(Self::DeliveryWatermark),
+            StrictCatchupReason::PeerBehind => Some(Self::PeerBehind),
+            StrictCatchupReason::RepositoryGap => Some(Self::RepositoryGap),
+            StrictCatchupReason::LegacyV2 => Some(Self::LegacyV2),
+            StrictCatchupReason::OwnerAntiEntropy => Some(Self::OwnerAntiEntropy),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CatchupPhase {
+    Metadata,
+    TerminalDelta,
+    TerminalCheckpoint,
+    LogDelta,
+    Snapshot,
+    FinalAck,
+}
+
+impl CatchupPhase {
+    fn index(self) -> usize {
+        match self {
+            Self::Metadata => 0,
+            Self::TerminalDelta => 1,
+            Self::TerminalCheckpoint => 2,
+            Self::LogDelta => 3,
+            Self::Snapshot => 4,
+            Self::FinalAck => 5,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::TerminalDelta => "terminal_delta",
+            Self::TerminalCheckpoint => "terminal_checkpoint",
+            Self::LogDelta => "log_delta",
+            Self::Snapshot => "snapshot",
+            Self::FinalAck => "final_ack",
+        }
+    }
+
+    /// Classifies the operation-bearing portion of a terminal-sync page.
+    /// Status-only pages and manifests remain metadata and final ACKs are
+    /// recorded explicitly by their send call site.
+    pub(crate) fn from_terminal_page_kind(kind: i32) -> Option<Self> {
+        match StrictTerminalPageKind::try_from(kind).ok()? {
+            StrictTerminalPageKind::Unspecified => None,
+            StrictTerminalPageKind::Delta => Some(Self::TerminalDelta),
+            StrictTerminalPageKind::Checkpoint => Some(Self::TerminalCheckpoint),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictCatchupSessionOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+    Expired,
+    IncarnationMismatch,
+    ResourceLimit,
+}
+
+impl StrictCatchupSessionOutcome {
+    fn index(self) -> usize {
+        match self {
+            Self::Completed => 0,
+            Self::Failed => 1,
+            Self::Cancelled => 2,
+            Self::Expired => 3,
+            Self::IncarnationMismatch => 4,
+            Self::ResourceLimit => 5,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::IncarnationMismatch => "incarnation_mismatch",
+            Self::ResourceLimit => "resource_limit",
+        }
+    }
+
+    #[cfg(test)]
+    /// Maps terminal-sync protocol completion statuses to the bounded
+    /// session outcome set. Successful `OK` pages are not completions until
+    /// their fixed target is ACKed, so callers must record those separately.
+    pub(crate) fn from_terminal_status(status: i32) -> Option<Self> {
+        match StrictTerminalSyncStatus::try_from(status).ok()? {
+            StrictTerminalSyncStatus::Unspecified | StrictTerminalSyncStatus::Ok => None,
+            StrictTerminalSyncStatus::UpToDate => Some(Self::Completed),
+            StrictTerminalSyncStatus::TransferExpired => Some(Self::Expired),
+            StrictTerminalSyncStatus::CursorMismatch => Some(Self::Failed),
+            StrictTerminalSyncStatus::IncarnationMismatch => Some(Self::IncarnationMismatch),
+            StrictTerminalSyncStatus::ResourceLimit => Some(Self::ResourceLimit),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictCatchupSessionEvent {
+    Coalesced,
+    DirtyRefresh,
+    Restart,
+    FinalAck,
+}
+
+impl StrictCatchupSessionEvent {
+    fn index(self) -> usize {
+        match self {
+            Self::Coalesced => 0,
+            Self::DirtyRefresh => 1,
+            Self::Restart => 2,
+            Self::FinalAck => 3,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Coalesced => "coalesced",
+            Self::DirtyRefresh => "dirty_refresh",
+            Self::Restart => "restart",
+            Self::FinalAck => "final_ack",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictCatchupLane {
+    Control,
+    Bulk,
+}
+
+impl StrictCatchupLane {
+    fn index(self) -> usize {
+        match self {
+            Self::Control => 0,
+            Self::Bulk => 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Bulk => "bulk",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictCatchupSendOutcome {
+    Enqueued,
+    Backpressured,
+    RetryEnqueued,
+    Exhausted,
+    Rejected,
+}
+
+impl StrictCatchupSendOutcome {
+    fn index(self) -> usize {
+        match self {
+            Self::Enqueued => 0,
+            Self::Backpressured => 1,
+            Self::RetryEnqueued => 2,
+            Self::Exhausted => 3,
+            Self::Rejected => 4,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Enqueued => "enqueued",
+            Self::Backpressured => "backpressured",
+            Self::RetryEnqueued => "retry_enqueued",
+            Self::Exhausted => "exhausted",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictCatchupDuplicateOutcome {
+    Suppressed,
+    CachedReplay,
+}
+
+impl StrictCatchupDuplicateOutcome {
+    fn index(self) -> usize {
+        match self {
+            Self::Suppressed => 0,
+            Self::CachedReplay => 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Suppressed => "suppressed",
+            Self::CachedReplay => "cached_replay",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictCatchupBackpressureEvent {
+    Backpressured,
+    Retry,
+    ExhaustedRetry,
+}
+
+impl StrictCatchupBackpressureEvent {
+    fn index(self) -> usize {
+        match self {
+            Self::Backpressured => 0,
+            Self::Retry => 1,
+            Self::ExhaustedRetry => 2,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Backpressured => "backpressured",
+            Self::Retry => "retry",
+            Self::ExhaustedRetry => "exhausted_retry",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictCatchupThrottleReason {
+    NextHopBytes,
+    Backoff,
+}
+
+impl StrictCatchupThrottleReason {
+    fn index(self) -> usize {
+        match self {
+            Self::NextHopBytes => 0,
+            Self::Backoff => 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NextHopBytes => "next_hop_bytes",
+            Self::Backoff => "backoff",
         }
     }
 }
@@ -133,6 +446,87 @@ impl ReplicationPipelineStage {
 }
 
 const CATCHUP_MODE_COUNT: usize = 2;
+const CATCHUP_REASON_COUNT: usize = 9;
+const CATCHUP_PHASE_COUNT: usize = 6;
+const CATCHUP_LOGICAL_METRIC_COUNT: usize =
+    CATCHUP_MODE_COUNT * CATCHUP_REASON_COUNT * CATCHUP_PHASE_COUNT;
+const STRICT_CATCHUP_SESSION_OUTCOME_COUNT: usize = 6;
+const STRICT_CATCHUP_SESSION_EVENT_COUNT: usize = 4;
+const STRICT_CATCHUP_LANE_COUNT: usize = 2;
+const STRICT_CATCHUP_SEND_OUTCOME_COUNT: usize = 5;
+const STRICT_CATCHUP_SEND_METRIC_COUNT: usize = CATCHUP_REASON_COUNT
+    * CATCHUP_PHASE_COUNT
+    * STRICT_CATCHUP_LANE_COUNT
+    * STRICT_CATCHUP_SEND_OUTCOME_COUNT;
+const STRICT_CATCHUP_DUPLICATE_OUTCOME_COUNT: usize = 2;
+const STRICT_CATCHUP_BACKPRESSURE_EVENT_COUNT: usize = 3;
+const STRICT_CATCHUP_BACKPRESSURE_METRIC_COUNT: usize =
+    CATCHUP_REASON_COUNT * CATCHUP_PHASE_COUNT * STRICT_CATCHUP_BACKPRESSURE_EVENT_COUNT;
+// Only expose throttle causes backed by an actual admission decision. Peer
+// coalescing is reported as a session event, and there is currently no global
+// session limiter; publishing either as a zero-valued throttle would imply a
+// control that does not exist.
+const STRICT_CATCHUP_THROTTLE_REASON_COUNT: usize = 2;
+const CATCHUP_REASONS: [CatchupReason; CATCHUP_REASON_COUNT] = [
+    CatchupReason::HistoryElection,
+    CatchupReason::Admission,
+    CatchupReason::SteadyState,
+    CatchupReason::TerminalFence,
+    CatchupReason::DeliveryWatermark,
+    CatchupReason::PeerBehind,
+    CatchupReason::RepositoryGap,
+    CatchupReason::LegacyV2,
+    CatchupReason::OwnerAntiEntropy,
+];
+const CATCHUP_PHASES: [CatchupPhase; CATCHUP_PHASE_COUNT] = [
+    CatchupPhase::Metadata,
+    CatchupPhase::TerminalDelta,
+    CatchupPhase::TerminalCheckpoint,
+    CatchupPhase::LogDelta,
+    CatchupPhase::Snapshot,
+    CatchupPhase::FinalAck,
+];
+const STRICT_CATCHUP_SESSION_OUTCOMES: [StrictCatchupSessionOutcome;
+    STRICT_CATCHUP_SESSION_OUTCOME_COUNT] = [
+    StrictCatchupSessionOutcome::Completed,
+    StrictCatchupSessionOutcome::Failed,
+    StrictCatchupSessionOutcome::Cancelled,
+    StrictCatchupSessionOutcome::Expired,
+    StrictCatchupSessionOutcome::IncarnationMismatch,
+    StrictCatchupSessionOutcome::ResourceLimit,
+];
+const ALL_STRICT_CATCHUP_SESSION_EVENTS: [StrictCatchupSessionEvent;
+    STRICT_CATCHUP_SESSION_EVENT_COUNT] = [
+    StrictCatchupSessionEvent::Coalesced,
+    StrictCatchupSessionEvent::DirtyRefresh,
+    StrictCatchupSessionEvent::Restart,
+    StrictCatchupSessionEvent::FinalAck,
+];
+const STRICT_CATCHUP_LANES: [StrictCatchupLane; STRICT_CATCHUP_LANE_COUNT] =
+    [StrictCatchupLane::Control, StrictCatchupLane::Bulk];
+const STRICT_CATCHUP_SEND_OUTCOMES: [StrictCatchupSendOutcome; STRICT_CATCHUP_SEND_OUTCOME_COUNT] = [
+    StrictCatchupSendOutcome::Enqueued,
+    StrictCatchupSendOutcome::Backpressured,
+    StrictCatchupSendOutcome::RetryEnqueued,
+    StrictCatchupSendOutcome::Exhausted,
+    StrictCatchupSendOutcome::Rejected,
+];
+const STRICT_CATCHUP_DUPLICATE_OUTCOMES: [StrictCatchupDuplicateOutcome;
+    STRICT_CATCHUP_DUPLICATE_OUTCOME_COUNT] = [
+    StrictCatchupDuplicateOutcome::Suppressed,
+    StrictCatchupDuplicateOutcome::CachedReplay,
+];
+const ALL_STRICT_CATCHUP_BACKPRESSURE_EVENTS: [StrictCatchupBackpressureEvent;
+    STRICT_CATCHUP_BACKPRESSURE_EVENT_COUNT] = [
+    StrictCatchupBackpressureEvent::Backpressured,
+    StrictCatchupBackpressureEvent::Retry,
+    StrictCatchupBackpressureEvent::ExhaustedRetry,
+];
+const STRICT_CATCHUP_THROTTLE_REASONS: [StrictCatchupThrottleReason;
+    STRICT_CATCHUP_THROTTLE_REASON_COUNT] = [
+    StrictCatchupThrottleReason::NextHopBytes,
+    StrictCatchupThrottleReason::Backoff,
+];
 const REPLICATION_PIPELINE_KIND_COUNT: usize = 4;
 const REPLICATION_PIPELINE_STAGE_COUNT: usize = 12;
 const STRICT_RESOLUTION_OUTCOME_COUNT: usize = 2;
@@ -166,17 +560,41 @@ const CLIENT_QUEUE_BUCKETS_US: [(&str, u64); 7] = [
     ("gt_5000000", u64::MAX),
 ];
 
-static CATCHUP_REQUESTS: [AtomicU64; CATCHUP_MODE_COUNT] =
-    [const { AtomicU64::new(0) }; CATCHUP_MODE_COUNT];
-static CATCHUP_RESPONSES: [AtomicU64; CATCHUP_MODE_COUNT] =
-    [const { AtomicU64::new(0) }; CATCHUP_MODE_COUNT];
-static CATCHUP_RESPONSE_OPS: [AtomicU64; CATCHUP_MODE_COUNT] =
-    [const { AtomicU64::new(0) }; CATCHUP_MODE_COUNT];
-static CATCHUP_RESPONSE_BYTES: [AtomicU64; CATCHUP_MODE_COUNT] =
-    [const { AtomicU64::new(0) }; CATCHUP_MODE_COUNT];
-static CATCHUP_SUPPRESSED: [AtomicU64; CATCHUP_MODE_COUNT] =
-    [const { AtomicU64::new(0) }; CATCHUP_MODE_COUNT];
+static CATCHUP_REQUESTS: [AtomicU64; CATCHUP_LOGICAL_METRIC_COUNT] =
+    [const { AtomicU64::new(0) }; CATCHUP_LOGICAL_METRIC_COUNT];
+static CATCHUP_RESPONSES: [AtomicU64; CATCHUP_LOGICAL_METRIC_COUNT] =
+    [const { AtomicU64::new(0) }; CATCHUP_LOGICAL_METRIC_COUNT];
+static CATCHUP_RESPONSE_OPS: [AtomicU64; CATCHUP_LOGICAL_METRIC_COUNT] =
+    [const { AtomicU64::new(0) }; CATCHUP_LOGICAL_METRIC_COUNT];
+static CATCHUP_RESPONSE_BYTES: [AtomicU64; CATCHUP_LOGICAL_METRIC_COUNT] =
+    [const { AtomicU64::new(0) }; CATCHUP_LOGICAL_METRIC_COUNT];
+static CATCHUP_SUPPRESSED: [AtomicU64; CATCHUP_LOGICAL_METRIC_COUNT] =
+    [const { AtomicU64::new(0) }; CATCHUP_LOGICAL_METRIC_COUNT];
 static CATCHUP_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+static STRICT_CATCHUP_SESSION_STARTS: [AtomicU64; CATCHUP_REASON_COUNT] =
+    [const { AtomicU64::new(0) }; CATCHUP_REASON_COUNT];
+static STRICT_CATCHUP_SESSION_COMPLETIONS: [AtomicU64;
+    CATCHUP_REASON_COUNT * STRICT_CATCHUP_SESSION_OUTCOME_COUNT] =
+    [const { AtomicU64::new(0) }; CATCHUP_REASON_COUNT * STRICT_CATCHUP_SESSION_OUTCOME_COUNT];
+static STRICT_CATCHUP_SESSION_ACTIVE: [AtomicUsize; CATCHUP_REASON_COUNT] =
+    [const { AtomicUsize::new(0) }; CATCHUP_REASON_COUNT];
+static STRICT_CATCHUP_SESSION_EVENTS: [AtomicU64;
+    CATCHUP_REASON_COUNT * STRICT_CATCHUP_SESSION_EVENT_COUNT] =
+    [const { AtomicU64::new(0) }; CATCHUP_REASON_COUNT * STRICT_CATCHUP_SESSION_EVENT_COUNT];
+static STRICT_CATCHUP_SEND_ATTEMPTS: [AtomicU64; STRICT_CATCHUP_SEND_METRIC_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_CATCHUP_SEND_METRIC_COUNT];
+static STRICT_CATCHUP_SEND_BYTES: [AtomicU64; STRICT_CATCHUP_SEND_METRIC_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_CATCHUP_SEND_METRIC_COUNT];
+static STRICT_CATCHUP_DUPLICATES: [AtomicU64; STRICT_CATCHUP_DUPLICATE_OUTCOME_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_CATCHUP_DUPLICATE_OUTCOME_COUNT];
+static STRICT_CATCHUP_BACKPRESSURE_EVENTS: [AtomicU64; STRICT_CATCHUP_BACKPRESSURE_METRIC_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_CATCHUP_BACKPRESSURE_METRIC_COUNT];
+static STRICT_CATCHUP_BACKOFF_DELAY_MS: [AtomicU64; CATCHUP_REASON_COUNT * CATCHUP_PHASE_COUNT] =
+    [const { AtomicU64::new(0) }; CATCHUP_REASON_COUNT * CATCHUP_PHASE_COUNT];
+static STRICT_CATCHUP_BULK_IN_FLIGHT_BYTES: AtomicUsize = AtomicUsize::new(0);
+static STRICT_CATCHUP_THROTTLED: [AtomicU64; STRICT_CATCHUP_THROTTLE_REASON_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_CATCHUP_THROTTLE_REASON_COUNT];
 
 static REPLICATION_PIPELINE_STAGE_EVENTS: [[AtomicU64; REPLICATION_PIPELINE_STAGE_COUNT];
     REPLICATION_PIPELINE_KIND_COUNT] =
@@ -287,19 +705,107 @@ fn observe_bucket(buckets: &[AtomicU64], definitions: &[(&str, u64)], value: u64
     }
 }
 
+fn catchup_logical_index(mode: CatchupMode, reason: CatchupReason, phase: CatchupPhase) -> usize {
+    (mode.index() * CATCHUP_REASON_COUNT + reason.index()) * CATCHUP_PHASE_COUNT + phase.index()
+}
+
+fn strict_session_completion_index(
+    reason: CatchupReason,
+    outcome: StrictCatchupSessionOutcome,
+) -> usize {
+    reason.index() * STRICT_CATCHUP_SESSION_OUTCOME_COUNT + outcome.index()
+}
+
+fn strict_session_event_index(reason: CatchupReason, event: StrictCatchupSessionEvent) -> usize {
+    reason.index() * STRICT_CATCHUP_SESSION_EVENT_COUNT + event.index()
+}
+
+fn strict_send_index(
+    reason: CatchupReason,
+    phase: CatchupPhase,
+    lane: StrictCatchupLane,
+    outcome: StrictCatchupSendOutcome,
+) -> usize {
+    (((reason.index() * CATCHUP_PHASE_COUNT + phase.index()) * STRICT_CATCHUP_LANE_COUNT
+        + lane.index())
+        * STRICT_CATCHUP_SEND_OUTCOME_COUNT)
+        + outcome.index()
+}
+
+fn strict_backpressure_index(
+    reason: CatchupReason,
+    phase: CatchupPhase,
+    event: StrictCatchupBackpressureEvent,
+) -> usize {
+    (reason.index() * CATCHUP_PHASE_COUNT + phase.index()) * STRICT_CATCHUP_BACKPRESSURE_EVENT_COUNT
+        + event.index()
+}
+
+fn strict_backoff_index(reason: CatchupReason, phase: CatchupPhase) -> usize {
+    reason.index() * CATCHUP_PHASE_COUNT + phase.index()
+}
+
+fn legacy_reason(mode: CatchupMode) -> CatchupReason {
+    match mode {
+        CatchupMode::Strict => CatchupReason::LegacyV2,
+        CatchupMode::Owner => CatchupReason::OwnerAntiEntropy,
+    }
+}
+
 pub(crate) fn record_catchup_request(mode: CatchupMode) {
-    increment(&CATCHUP_REQUESTS[mode.index()], 1);
+    record_catchup_request_detail(mode, legacy_reason(mode), CatchupPhase::Metadata);
 }
 
 pub(crate) fn record_catchup_response(mode: CatchupMode, ops: usize, bytes: usize) {
-    let index = mode.index();
+    record_catchup_response_detail(
+        mode,
+        legacy_reason(mode),
+        CatchupPhase::LogDelta,
+        ops,
+        bytes,
+    );
+}
+
+pub(crate) fn record_catchup_request_detail(
+    mode: CatchupMode,
+    reason: CatchupReason,
+    phase: CatchupPhase,
+) {
+    increment(
+        &CATCHUP_REQUESTS[catchup_logical_index(mode, reason, phase)],
+        1,
+    );
+}
+
+/// Records logical response work. Retries and redundant route copies belong in
+/// [`record_strict_catchup_send_attempt`] so transport amplification remains
+/// distinct from the data required to converge.
+pub(crate) fn record_catchup_response_detail(
+    mode: CatchupMode,
+    reason: CatchupReason,
+    phase: CatchupPhase,
+    ops: usize,
+    bytes: usize,
+) {
+    let index = catchup_logical_index(mode, reason, phase);
     increment(&CATCHUP_RESPONSES[index], 1);
     increment(&CATCHUP_RESPONSE_OPS[index], ops as u64);
     increment(&CATCHUP_RESPONSE_BYTES[index], bytes as u64);
 }
 
 pub(crate) fn record_catchup_suppressed(mode: CatchupMode) {
-    increment(&CATCHUP_SUPPRESSED[mode.index()], 1);
+    record_catchup_suppressed_detail(mode, legacy_reason(mode), CatchupPhase::Metadata);
+}
+
+pub(crate) fn record_catchup_suppressed_detail(
+    mode: CatchupMode,
+    reason: CatchupReason,
+    phase: CatchupPhase,
+) {
+    increment(
+        &CATCHUP_SUPPRESSED[catchup_logical_index(mode, reason, phase)],
+        1,
+    );
 }
 
 pub(crate) fn record_catchup_active_delta(delta: isize) {
@@ -311,6 +817,92 @@ pub(crate) fn record_catchup_active_delta(delta: isize) {
             Some(current.saturating_sub(decrement))
         });
     }
+}
+
+pub(crate) fn record_strict_catchup_session_start(reason: CatchupReason) {
+    increment(&STRICT_CATCHUP_SESSION_STARTS[reason.index()], 1);
+    STRICT_CATCHUP_SESSION_ACTIVE[reason.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_strict_catchup_session_completion(
+    reason: CatchupReason,
+    outcome: StrictCatchupSessionOutcome,
+) {
+    increment(
+        &STRICT_CATCHUP_SESSION_COMPLETIONS[strict_session_completion_index(reason, outcome)],
+        1,
+    );
+    let active = &STRICT_CATCHUP_SESSION_ACTIVE[reason.index()];
+    let _ = active.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(1))
+    });
+}
+
+pub(crate) fn record_strict_catchup_session_event(
+    reason: CatchupReason,
+    event: StrictCatchupSessionEvent,
+) {
+    increment(
+        &STRICT_CATCHUP_SESSION_EVENTS[strict_session_event_index(reason, event)],
+        1,
+    );
+}
+
+/// Records each physical enqueue attempt, including redundant route copies and
+/// retries. `bytes` is the exact encoded frame size attempted on that lane.
+pub(crate) fn record_strict_catchup_send_attempt(
+    reason: CatchupReason,
+    phase: CatchupPhase,
+    lane: StrictCatchupLane,
+    outcome: StrictCatchupSendOutcome,
+    bytes: usize,
+) {
+    let index = strict_send_index(reason, phase, lane, outcome);
+    increment(&STRICT_CATCHUP_SEND_ATTEMPTS[index], 1);
+    increment(&STRICT_CATCHUP_SEND_BYTES[index], bytes as u64);
+}
+
+pub(crate) fn record_strict_catchup_duplicate(outcome: StrictCatchupDuplicateOutcome) {
+    increment(&STRICT_CATCHUP_DUPLICATES[outcome.index()], 1);
+}
+
+pub(crate) fn record_strict_catchup_backpressure(
+    reason: CatchupReason,
+    phase: CatchupPhase,
+    event: StrictCatchupBackpressureEvent,
+    backoff: Duration,
+) {
+    increment(
+        &STRICT_CATCHUP_BACKPRESSURE_EVENTS[strict_backpressure_index(reason, phase, event)],
+        1,
+    );
+    let delay_ms = backoff.as_millis().min(u64::MAX as u128) as u64;
+    increment(
+        &STRICT_CATCHUP_BACKOFF_DELAY_MS[strict_backoff_index(reason, phase)],
+        delay_ms,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn set_strict_catchup_bulk_in_flight_bytes(bytes: usize) {
+    STRICT_CATCHUP_BULK_IN_FLIGHT_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn record_strict_catchup_bulk_in_flight_bytes_delta(delta: isize) {
+    if delta >= 0 {
+        STRICT_CATCHUP_BULK_IN_FLIGHT_BYTES.fetch_add(delta as usize, Ordering::Relaxed);
+    } else {
+        let decrement = delta.unsigned_abs();
+        let _ = STRICT_CATCHUP_BULK_IN_FLIGHT_BYTES.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(decrement)),
+        );
+    }
+}
+
+pub(crate) fn record_strict_catchup_throttled(reason: StrictCatchupThrottleReason) {
+    increment(&STRICT_CATCHUP_THROTTLED[reason.index()], 1);
 }
 
 pub(crate) fn record_pipeline_stage(
@@ -429,33 +1021,53 @@ fn strict_admission_metric_samples(
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
     let mut samples = Vec::new();
     for mode in [CatchupMode::Strict, CatchupMode::Owner] {
-        let labels = vec![("mode".to_owned(), mode.label().to_owned())];
-        let index = mode.index();
-        samples.push(PrometheusSample::new(
-            "shitspeak_s2s_replication_catchup_requests_total",
-            labels.clone(),
-            CATCHUP_REQUESTS[index].load(Ordering::Relaxed) as f64,
-        ));
-        samples.push(PrometheusSample::new(
-            "shitspeak_s2s_replication_catchup_responses_total",
-            labels.clone(),
-            CATCHUP_RESPONSES[index].load(Ordering::Relaxed) as f64,
-        ));
-        samples.push(PrometheusSample::new(
-            "shitspeak_s2s_replication_catchup_response_ops_total",
-            labels.clone(),
-            CATCHUP_RESPONSE_OPS[index].load(Ordering::Relaxed) as f64,
-        ));
-        samples.push(PrometheusSample::new(
-            "shitspeak_s2s_replication_catchup_response_bytes_total",
-            labels.clone(),
-            CATCHUP_RESPONSE_BYTES[index].load(Ordering::Relaxed) as f64,
-        ));
-        samples.push(PrometheusSample::new(
-            "shitspeak_s2s_replication_catchup_suppressed_total",
-            labels,
-            CATCHUP_SUPPRESSED[index].load(Ordering::Relaxed) as f64,
-        ));
+        for reason in CATCHUP_REASONS {
+            for phase in CATCHUP_PHASES {
+                let labels = vec![
+                    ("mode".to_owned(), mode.label().to_owned()),
+                    ("reason".to_owned(), reason.label().to_owned()),
+                    ("phase".to_owned(), phase.label().to_owned()),
+                ];
+                let index = catchup_logical_index(mode, reason, phase);
+                let requests = CATCHUP_REQUESTS[index].load(Ordering::Relaxed);
+                let responses = CATCHUP_RESPONSES[index].load(Ordering::Relaxed);
+                let ops = CATCHUP_RESPONSE_OPS[index].load(Ordering::Relaxed);
+                let bytes = CATCHUP_RESPONSE_BYTES[index].load(Ordering::Relaxed);
+                let suppressed = CATCHUP_SUPPRESSED[index].load(Ordering::Relaxed);
+                let is_default_reason = reason == legacy_reason(mode);
+                if requests > 0 || (is_default_reason && phase == CatchupPhase::Metadata) {
+                    samples.push(PrometheusSample::new(
+                        "shitspeak_s2s_replication_catchup_requests_total",
+                        labels.clone(),
+                        requests as f64,
+                    ));
+                }
+                if responses > 0 || (is_default_reason && phase == CatchupPhase::LogDelta) {
+                    samples.push(PrometheusSample::new(
+                        "shitspeak_s2s_replication_catchup_responses_total",
+                        labels.clone(),
+                        responses as f64,
+                    ));
+                    samples.push(PrometheusSample::new(
+                        "shitspeak_s2s_replication_catchup_response_ops_total",
+                        labels.clone(),
+                        ops as f64,
+                    ));
+                    samples.push(PrometheusSample::new(
+                        "shitspeak_s2s_replication_catchup_response_bytes_total",
+                        labels.clone(),
+                        bytes as f64,
+                    ));
+                }
+                if suppressed > 0 || (is_default_reason && phase == CatchupPhase::Metadata) {
+                    samples.push(PrometheusSample::new(
+                        "shitspeak_s2s_replication_catchup_suppressed_total",
+                        labels,
+                        suppressed as f64,
+                    ));
+                }
+            }
+        }
     }
 
     samples.push(PrometheusSample::new(
@@ -463,6 +1075,7 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         Vec::new(),
         CATCHUP_ACTIVE.load(Ordering::Relaxed) as f64,
     ));
+    samples.extend(strict_catchup_v3_metric_samples());
     for kind in REPLICATION_PIPELINE_KINDS {
         for stage in REPLICATION_PIPELINE_STAGES {
             let kind_index = kind.index();
@@ -538,6 +1151,137 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
     samples
 }
 
+fn strict_catchup_v3_metric_samples() -> Vec<PrometheusSample> {
+    let mut samples = Vec::new();
+
+    for reason in CATCHUP_REASONS {
+        let reason_labels = vec![("reason".to_owned(), reason.label().to_owned())];
+        let starts = STRICT_CATCHUP_SESSION_STARTS[reason.index()].load(Ordering::Relaxed);
+        if starts > 0 {
+            samples.push(PrometheusSample::new(
+                "shitspeak_s2s_strict_replication_catchup_session_starts_total",
+                reason_labels.clone(),
+                starts as f64,
+            ));
+        }
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_catchup_sessions_active",
+            reason_labels.clone(),
+            STRICT_CATCHUP_SESSION_ACTIVE[reason.index()].load(Ordering::Relaxed) as f64,
+        ));
+
+        for outcome in STRICT_CATCHUP_SESSION_OUTCOMES {
+            let value = STRICT_CATCHUP_SESSION_COMPLETIONS
+                [strict_session_completion_index(reason, outcome)]
+            .load(Ordering::Relaxed);
+            if value > 0 {
+                samples.push(PrometheusSample::new(
+                    "shitspeak_s2s_strict_replication_catchup_session_completions_total",
+                    vec![
+                        ("reason".to_owned(), reason.label().to_owned()),
+                        ("outcome".to_owned(), outcome.label().to_owned()),
+                    ],
+                    value as f64,
+                ));
+            }
+        }
+        for event in ALL_STRICT_CATCHUP_SESSION_EVENTS {
+            let value = STRICT_CATCHUP_SESSION_EVENTS[strict_session_event_index(reason, event)]
+                .load(Ordering::Relaxed);
+            if value > 0 {
+                samples.push(PrometheusSample::new(
+                    "shitspeak_s2s_strict_replication_catchup_session_events_total",
+                    vec![
+                        ("reason".to_owned(), reason.label().to_owned()),
+                        ("event".to_owned(), event.label().to_owned()),
+                    ],
+                    value as f64,
+                ));
+            }
+        }
+
+        for phase in CATCHUP_PHASES {
+            for lane in STRICT_CATCHUP_LANES {
+                for outcome in STRICT_CATCHUP_SEND_OUTCOMES {
+                    let index = strict_send_index(reason, phase, lane, outcome);
+                    let attempts = STRICT_CATCHUP_SEND_ATTEMPTS[index].load(Ordering::Relaxed);
+                    let bytes = STRICT_CATCHUP_SEND_BYTES[index].load(Ordering::Relaxed);
+                    if attempts == 0 && bytes == 0 {
+                        continue;
+                    }
+                    let labels = vec![
+                        ("reason".to_owned(), reason.label().to_owned()),
+                        ("phase".to_owned(), phase.label().to_owned()),
+                        ("lane".to_owned(), lane.label().to_owned()),
+                        ("outcome".to_owned(), outcome.label().to_owned()),
+                    ];
+                    samples.push(PrometheusSample::new(
+                        "shitspeak_s2s_strict_replication_catchup_send_attempts_total",
+                        labels.clone(),
+                        attempts as f64,
+                    ));
+                    samples.push(PrometheusSample::new(
+                        "shitspeak_s2s_strict_replication_catchup_send_bytes_total",
+                        labels,
+                        bytes as f64,
+                    ));
+                }
+            }
+
+            for event in ALL_STRICT_CATCHUP_BACKPRESSURE_EVENTS {
+                let value = STRICT_CATCHUP_BACKPRESSURE_EVENTS
+                    [strict_backpressure_index(reason, phase, event)]
+                .load(Ordering::Relaxed);
+                if value > 0 {
+                    samples.push(PrometheusSample::new(
+                        "shitspeak_s2s_strict_replication_catchup_backpressure_events_total",
+                        vec![
+                            ("reason".to_owned(), reason.label().to_owned()),
+                            ("phase".to_owned(), phase.label().to_owned()),
+                            ("event".to_owned(), event.label().to_owned()),
+                        ],
+                        value as f64,
+                    ));
+                }
+            }
+            let backoff_ms = STRICT_CATCHUP_BACKOFF_DELAY_MS[strict_backoff_index(reason, phase)]
+                .load(Ordering::Relaxed);
+            if backoff_ms > 0 {
+                samples.push(PrometheusSample::new(
+                    "shitspeak_s2s_strict_replication_catchup_backoff_delay_ms_total",
+                    vec![
+                        ("reason".to_owned(), reason.label().to_owned()),
+                        ("phase".to_owned(), phase.label().to_owned()),
+                    ],
+                    backoff_ms as f64,
+                ));
+            }
+        }
+    }
+
+    for outcome in STRICT_CATCHUP_DUPLICATE_OUTCOMES {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_catchup_duplicate_pages_total",
+            vec![("outcome".to_owned(), outcome.label().to_owned())],
+            STRICT_CATCHUP_DUPLICATES[outcome.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_catchup_bulk_in_flight_bytes",
+        Vec::new(),
+        STRICT_CATCHUP_BULK_IN_FLIGHT_BYTES.load(Ordering::Relaxed) as f64,
+    ));
+    for reason in STRICT_CATCHUP_THROTTLE_REASONS {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_catchup_throttled_total",
+            vec![("reason".to_owned(), reason.label().to_owned())],
+            STRICT_CATCHUP_THROTTLED[reason.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+
+    samples
+}
+
 fn strict_protocol_metric_samples(
     cluster_protocol_version: u32,
     terminal_resolution_ready: bool,
@@ -582,6 +1326,182 @@ fn strict_protocol_metric_samples(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v3_wire_dimensions_map_only_to_bounded_metric_values() {
+        let protocol_reasons = [
+            StrictCatchupReason::HistoryElection,
+            StrictCatchupReason::Admission,
+            StrictCatchupReason::SteadyState,
+            StrictCatchupReason::TerminalFence,
+            StrictCatchupReason::DeliveryWatermark,
+            StrictCatchupReason::PeerBehind,
+            StrictCatchupReason::RepositoryGap,
+            StrictCatchupReason::LegacyV2,
+            StrictCatchupReason::OwnerAntiEntropy,
+        ];
+        let mapped_reasons = protocol_reasons.map(|reason| {
+            CatchupReason::from_v3_wire(reason as i32)
+                .expect("every declared v3 reason needs a bounded metric label")
+        });
+        assert_eq!(mapped_reasons, CATCHUP_REASONS);
+        assert_eq!(
+            CatchupReason::from_v3_wire(StrictCatchupReason::Unspecified as i32),
+            None
+        );
+        assert_eq!(CatchupReason::from_v3_wire(i32::MAX), None);
+
+        assert_eq!(
+            CatchupPhase::from_terminal_page_kind(StrictTerminalPageKind::Delta as i32),
+            Some(CatchupPhase::TerminalDelta)
+        );
+        assert_eq!(
+            CatchupPhase::from_terminal_page_kind(StrictTerminalPageKind::Checkpoint as i32),
+            Some(CatchupPhase::TerminalCheckpoint)
+        );
+        assert_eq!(
+            CatchupPhase::from_terminal_page_kind(StrictTerminalPageKind::Unspecified as i32),
+            None
+        );
+        assert_eq!(CatchupPhase::from_terminal_page_kind(i32::MAX), None);
+
+        assert_eq!(
+            StrictCatchupSessionOutcome::from_terminal_status(
+                StrictTerminalSyncStatus::UpToDate as i32,
+            ),
+            Some(StrictCatchupSessionOutcome::Completed)
+        );
+        assert_eq!(
+            StrictCatchupSessionOutcome::from_terminal_status(
+                StrictTerminalSyncStatus::TransferExpired as i32,
+            ),
+            Some(StrictCatchupSessionOutcome::Expired)
+        );
+        assert_eq!(
+            StrictCatchupSessionOutcome::from_terminal_status(
+                StrictTerminalSyncStatus::CursorMismatch as i32,
+            ),
+            Some(StrictCatchupSessionOutcome::Failed)
+        );
+        assert_eq!(
+            StrictCatchupSessionOutcome::from_terminal_status(
+                StrictTerminalSyncStatus::IncarnationMismatch as i32,
+            ),
+            Some(StrictCatchupSessionOutcome::IncarnationMismatch)
+        );
+        assert_eq!(
+            StrictCatchupSessionOutcome::from_terminal_status(
+                StrictTerminalSyncStatus::ResourceLimit as i32,
+            ),
+            Some(StrictCatchupSessionOutcome::ResourceLimit)
+        );
+        for incomplete in [
+            StrictTerminalSyncStatus::Unspecified,
+            StrictTerminalSyncStatus::Ok,
+        ] {
+            assert_eq!(
+                StrictCatchupSessionOutcome::from_terminal_status(incomplete as i32),
+                None
+            );
+        }
+        assert_eq!(
+            StrictCatchupSessionOutcome::from_terminal_status(i32::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn strict_catchup_v3_metrics_use_only_bounded_labels_and_split_logical_from_physical() {
+        record_catchup_request_detail(
+            CatchupMode::Strict,
+            CatchupReason::TerminalFence,
+            CatchupPhase::Metadata,
+        );
+        record_catchup_response_detail(
+            CatchupMode::Strict,
+            CatchupReason::TerminalFence,
+            CatchupPhase::TerminalDelta,
+            3,
+            777,
+        );
+        record_strict_catchup_session_start(CatchupReason::Admission);
+        record_strict_catchup_session_event(
+            CatchupReason::Admission,
+            StrictCatchupSessionEvent::Coalesced,
+        );
+        record_strict_catchup_session_completion(
+            CatchupReason::Admission,
+            StrictCatchupSessionOutcome::ResourceLimit,
+        );
+        record_strict_catchup_send_attempt(
+            CatchupReason::TerminalFence,
+            CatchupPhase::TerminalDelta,
+            StrictCatchupLane::Bulk,
+            StrictCatchupSendOutcome::RetryEnqueued,
+            1_024,
+        );
+        record_strict_catchup_duplicate(StrictCatchupDuplicateOutcome::CachedReplay);
+        record_strict_catchup_backpressure(
+            CatchupReason::PeerBehind,
+            CatchupPhase::Snapshot,
+            StrictCatchupBackpressureEvent::Retry,
+            Duration::from_millis(250),
+        );
+        set_strict_catchup_bulk_in_flight_bytes(4_096);
+        record_strict_catchup_throttled(StrictCatchupThrottleReason::NextHopBytes);
+
+        let samples = prometheus_samples();
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_replication_catchup_response_bytes_total"
+                && sample.labels()
+                    == [
+                        ("mode".to_owned(), "strict".to_owned()),
+                        ("reason".to_owned(), "terminal_fence".to_owned()),
+                        ("phase".to_owned(), "terminal_delta".to_owned()),
+                    ]
+                && sample.value() >= 777.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_catchup_send_bytes_total"
+                && sample.labels()
+                    == [
+                        ("reason".to_owned(), "terminal_fence".to_owned()),
+                        ("phase".to_owned(), "terminal_delta".to_owned()),
+                        ("lane".to_owned(), "bulk".to_owned()),
+                        ("outcome".to_owned(), "retry_enqueued".to_owned()),
+                    ]
+                && sample.value() >= 1_024.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_catchup_session_completions_total"
+                && sample.labels()
+                    == [
+                        ("reason".to_owned(), "admission".to_owned()),
+                        ("outcome".to_owned(), "resource_limit".to_owned()),
+                    ]
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_catchup_backoff_delay_ms_total"
+                && sample.value() >= 250.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_catchup_bulk_in_flight_bytes"
+                && sample.value() == 4_096.0
+        }));
+
+        let allowed_labels = ["mode", "reason", "phase", "lane", "outcome", "event"];
+        for sample in samples.iter().filter(|sample| {
+            sample.name().contains("strict_replication_catchup")
+                || sample.name().contains("replication_catchup_")
+        }) {
+            assert!(
+                sample
+                    .labels()
+                    .iter()
+                    .all(|(label, _)| allowed_labels.contains(&label.as_str()))
+            );
+        }
+    }
 
     #[test]
     fn strict_protocol_metrics_expose_readiness_and_terminal_outcomes() {

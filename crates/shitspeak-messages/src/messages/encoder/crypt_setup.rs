@@ -8,8 +8,8 @@ pub struct CryptSetup {
     server_nonce: Option<Bytes>,
 }
 
-impl From<crate::mumble_proto::CryptSetup> for CryptSetup {
-    fn from(proto: crate::mumble_proto::CryptSetup) -> Self {
+impl From<shitspeak_proto::mumble_proto::CryptSetup> for CryptSetup {
+    fn from(proto: shitspeak_proto::mumble_proto::CryptSetup) -> Self {
         Self {
             key: proto.key.map(Bytes::from),
             client_nonce: proto.client_nonce.map(Bytes::from),
@@ -40,9 +40,9 @@ impl CryptSetup {
     }
 }
 
-impl From<CryptSetup> for crate::mumble_proto::CryptSetup {
+impl From<CryptSetup> for shitspeak_proto::mumble_proto::CryptSetup {
     fn from(crypt_setup: CryptSetup) -> Self {
-        crate::mumble_proto::CryptSetup {
+        shitspeak_proto::mumble_proto::CryptSetup {
             key: crypt_setup.key.map(Vec::from),
             client_nonce: crypt_setup.client_nonce.map(Vec::from),
             server_nonce: crypt_setup.server_nonce.map(Vec::from),

@@ -5,10 +5,10 @@ use bytes::{Bytes, BytesMut};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use prost::Message as _;
 
-use shitspeak_rs::s2s_application_proto as app_pb;
-use shitspeak_rs::s2s_overlay_proto as overlay_pb;
-use shitspeak_rs::s2s_replication_proto as repl_pb;
-use shitspeak_rs::s2s_transport_proto as transport_pb;
+use shitspeak_proto::s2s_application_proto as app_pb;
+use shitspeak_proto::s2s_overlay_proto as overlay_pb;
+use shitspeak_proto::s2s_replication_proto as repl_pb;
+use shitspeak_proto::s2s_transport_proto as transport_pb;
 
 const MIN_BYTES: usize = 1024;
 const MIN_SAVINGS_PERCENT: usize = 10;

@@ -8,15 +8,15 @@ pub struct UserStats {
     pub session: Option<u32>,
     pub stats_only: Option<bool>,
     pub certificates: Vec<CertificateDer<'static>>,
-    pub from_client: Option<crate::mumble_proto::user_stats::Stats>,
-    pub from_server: Option<crate::mumble_proto::user_stats::Stats>,
+    pub from_client: Option<shitspeak_proto::mumble_proto::user_stats::Stats>,
+    pub from_server: Option<shitspeak_proto::mumble_proto::user_stats::Stats>,
     pub udp_packets: Option<u32>,
     pub tcp_packets: Option<u32>,
     pub udp_ping_avg: Option<f32>,
     pub udp_ping_var: Option<f32>,
     pub tcp_ping_avg: Option<f32>,
     pub tcp_ping_var: Option<f32>,
-    pub version: Option<crate::mumble_proto::Version>,
+    pub version: Option<shitspeak_proto::mumble_proto::Version>,
     pub celt_versions: Vec<i32>,
     pub address: Option<IpAddr>,
     pub bandwidth: Option<u32>,
@@ -26,8 +26,8 @@ pub struct UserStats {
     pub opus: Option<bool>,
 }
 
-impl From<crate::mumble_proto::UserStats> for UserStats {
-    fn from(proto: crate::mumble_proto::UserStats) -> Self {
+impl From<shitspeak_proto::mumble_proto::UserStats> for UserStats {
+    fn from(proto: shitspeak_proto::mumble_proto::UserStats) -> Self {
         Self {
             session: proto.session,
             stats_only: proto.stats_only,
@@ -58,9 +58,9 @@ impl From<crate::mumble_proto::UserStats> for UserStats {
     }
 }
 
-impl From<UserStats> for crate::mumble_proto::UserStats {
+impl From<UserStats> for shitspeak_proto::mumble_proto::UserStats {
     fn from(user_stats: UserStats) -> Self {
-        crate::mumble_proto::UserStats {
+        shitspeak_proto::mumble_proto::UserStats {
             session: user_stats.session,
             stats_only: user_stats.stats_only,
             certificates: user_stats

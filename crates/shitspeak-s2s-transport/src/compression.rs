@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 use tokio::io::AsyncWriteExt;
 use zstd::dict::{DecoderDictionary, EncoderDictionary};
 
-use crate::s2s_transport_proto as pb;
+use shitspeak_proto::s2s_transport_proto as pb;
 
 const DEFAULT_COMPRESSION_MIN_BYTES: usize = 1024;
 const DEFAULT_COMPRESSION_MIN_SAVINGS_PERCENT: u8 = 10;

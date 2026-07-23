@@ -10,8 +10,8 @@ pub struct PluginDataTransmission {
     pub data_id: Option<String>,
 }
 
-impl From<crate::mumble_proto::PluginDataTransmission> for PluginDataTransmission {
-    fn from(proto: crate::mumble_proto::PluginDataTransmission) -> Self {
+impl From<shitspeak_proto::mumble_proto::PluginDataTransmission> for PluginDataTransmission {
+    fn from(proto: shitspeak_proto::mumble_proto::PluginDataTransmission) -> Self {
         Self {
             sender_session: proto.sender_session,
             receiver_sessions: proto.receiver_sessions,
@@ -21,9 +21,9 @@ impl From<crate::mumble_proto::PluginDataTransmission> for PluginDataTransmissio
     }
 }
 
-impl From<PluginDataTransmission> for crate::mumble_proto::PluginDataTransmission {
+impl From<PluginDataTransmission> for shitspeak_proto::mumble_proto::PluginDataTransmission {
     fn from(value: PluginDataTransmission) -> Self {
-        crate::mumble_proto::PluginDataTransmission {
+        shitspeak_proto::mumble_proto::PluginDataTransmission {
             sender_session: value.sender_session,
             receiver_sessions: value.receiver_sessions,
             data: value.data,

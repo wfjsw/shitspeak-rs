@@ -25,7 +25,7 @@ use crate::{
         },
     },
     constants::MAX_LOCAL_SESSION_ID,
-    types::{DEFAULT_SERVER_ID, ScopedChannelId, ScopedSessionId, default_server_id},
+    types::{DEFAULT_SERVER_ID, ScopedChannelId, ScopedSessionId},
 };
 
 const MAX_CLIENT_ORIGIN_SNAPSHOT_ENTRIES: usize = 1_000_000;
@@ -740,7 +740,7 @@ impl ClientRepository {
         real_ip_address: IpAddr,
         tcp_address: SocketAddr,
         local_address: SocketAddr,
-        outbound_tx: tokio::sync::mpsc::Sender<crate::messages::Message>,
+        outbound_tx: tokio::sync::mpsc::Sender<shitspeak_messages::messages::Message>,
     ) -> Arc<Box<Client>> {
         self.allocate_web_client_in_server(
             DEFAULT_SERVER_ID,
@@ -758,7 +758,7 @@ impl ClientRepository {
         real_ip_address: IpAddr,
         tcp_address: SocketAddr,
         local_address: SocketAddr,
-        outbound_tx: tokio::sync::mpsc::Sender<crate::messages::Message>,
+        outbound_tx: tokio::sync::mpsc::Sender<shitspeak_messages::messages::Message>,
     ) -> Arc<Box<Client>> {
         let server_id = server_id.into();
         let mut register = self.register.write().await;
@@ -810,7 +810,7 @@ impl ClientRepository {
         real_ip_address: IpAddr,
         tcp_address: SocketAddr,
         local_address: SocketAddr,
-        outbound_tx: tokio::sync::mpsc::Sender<crate::messages::Message>,
+        outbound_tx: tokio::sync::mpsc::Sender<shitspeak_messages::messages::Message>,
     ) -> Arc<Box<Client>> {
         let server_id = server_id.into();
         let mut register = self.register.write().await;
@@ -1401,7 +1401,7 @@ impl ClientRepository {
     // ── Broadcast helpers ─────────────────────────────────────────────────
 
     /// Send `message` to every connected client.
-    pub async fn broadcast_all(&self, message: &crate::messages::Message) {
+    pub async fn broadcast_all(&self, message: &shitspeak_messages::messages::Message) {
         self.broadcast_all_in_server(DEFAULT_SERVER_ID, message)
             .await;
     }
@@ -1409,7 +1409,7 @@ impl ClientRepository {
     pub async fn broadcast_all_in_server(
         &self,
         server_id: &str,
-        message: &crate::messages::Message,
+        message: &shitspeak_messages::messages::Message,
     ) {
         let clients: Vec<_> = {
             let register = self.register.read().await;
@@ -1431,7 +1431,7 @@ impl ClientRepository {
     pub async fn broadcast_except(
         &self,
         exclude: ClientSessionIdentifier,
-        message: &crate::messages::Message,
+        message: &shitspeak_messages::messages::Message,
     ) {
         self.broadcast_except_in_server(DEFAULT_SERVER_ID, exclude, message)
             .await;
@@ -1441,7 +1441,7 @@ impl ClientRepository {
         &self,
         server_id: &str,
         exclude: ClientSessionIdentifier,
-        message: &crate::messages::Message,
+        message: &shitspeak_messages::messages::Message,
     ) {
         let exclude_key = ScopedSessionId::new(server_id.to_owned(), exclude);
         let clients: Vec<_> = {
@@ -1466,7 +1466,7 @@ impl ClientRepository {
     pub async fn broadcast_batch_except(
         &self,
         exclude: ClientSessionIdentifier,
-        messages: &[crate::messages::Message],
+        messages: &[shitspeak_messages::messages::Message],
     ) {
         self.broadcast_batch_except_in_server(DEFAULT_SERVER_ID, exclude, messages)
             .await;
@@ -1476,7 +1476,7 @@ impl ClientRepository {
         &self,
         server_id: &str,
         exclude: ClientSessionIdentifier,
-        messages: &[crate::messages::Message],
+        messages: &[shitspeak_messages::messages::Message],
     ) {
         let exclude_key = ScopedSessionId::new(server_id.to_owned(), exclude);
         let clients: Vec<_> = {
@@ -2306,7 +2306,7 @@ impl ClientRepository {
     pub async fn replay_since(
         &self,
         last_seen: &HashMap<u16, u64>,
-    ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
+    ) -> Result<(Vec<shitspeak_messages::messages::Message>, HashMap<u16, u64>), ()> {
         self.replay_since_in_server(DEFAULT_SERVER_ID, last_seen)
             .await
     }
@@ -2315,7 +2315,7 @@ impl ClientRepository {
         &self,
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
-    ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
+    ) -> Result<(Vec<shitspeak_messages::messages::Message>, HashMap<u16, u64>), ()> {
         self.replay_since_in_server_filtered(server_id, last_seen, None)
             .await
     }
@@ -2326,7 +2326,7 @@ impl ClientRepository {
         last_seen: &HashMap<u16, u64>,
         viewer_session_id: ClientSessionIdentifier,
         viewer_client_instance_id: ClientInstanceId,
-    ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
+    ) -> Result<(Vec<shitspeak_messages::messages::Message>, HashMap<u16, u64>), ()> {
         self.replay_since_in_server_filtered(
             server_id,
             last_seen,
@@ -2367,7 +2367,7 @@ impl ClientRepository {
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
         viewer: Option<(ClientSessionIdentifier, ClientInstanceId)>,
-    ) -> Result<(Vec<crate::messages::Message>, HashMap<u16, u64>), ()> {
+    ) -> Result<(Vec<shitspeak_messages::messages::Message>, HashMap<u16, u64>), ()> {
         let entries = self
             .replay_entries_since_in_server(server_id, last_seen)
             .await?;
@@ -2473,7 +2473,7 @@ impl ClientRepository {
     pub async fn send_to(
         &self,
         id: ClientSessionIdentifier,
-        message: &crate::messages::Message,
+        message: &shitspeak_messages::messages::Message,
     ) -> bool {
         self.send_to_in_server(DEFAULT_SERVER_ID, id, message).await
     }
@@ -2482,7 +2482,7 @@ impl ClientRepository {
         &self,
         server_id: &str,
         id: ClientSessionIdentifier,
-        message: &crate::messages::Message,
+        message: &shitspeak_messages::messages::Message,
     ) -> bool {
         let client = self.get_client_in_server(server_id, id).await;
         match client {
@@ -3168,7 +3168,7 @@ mod tests {
         time::Duration,
     };
 
-    use crate::messages::{Message, encoder::TextMessage};
+    use shitspeak_messages::messages::{Message, encoder::TextMessage};
     use chrono::Utc;
 
     use super::*;
@@ -4582,7 +4582,7 @@ mod tests {
             messages.iter().all(|message| {
                 !matches!(
                     message,
-                    crate::messages::Message::UserState(state)
+                    shitspeak_messages::messages::Message::UserState(state)
                         if state.session == Some(u32::from(session))
                             && matches!(
                                 (state.name.as_deref(), state.user_id),
@@ -4612,7 +4612,7 @@ mod tests {
                 entry_messages.iter().all(|message| {
                     !matches!(
                         message,
-                        crate::messages::Message::UserState(state)
+                        shitspeak_messages::messages::Message::UserState(state)
                             if state.session == Some(u32::from(session))
                                 && matches!(
                                     (state.name.as_deref(), state.user_id),

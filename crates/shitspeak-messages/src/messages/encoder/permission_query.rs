@@ -44,8 +44,8 @@ pub fn mark_client_permissions_cached(permissions: u32) -> u32 {
     permissions | CLIENT_PERMISSION_CACHE_BIT
 }
 
-impl From<crate::mumble_proto::PermissionQuery> for PermissionQuery {
-    fn from(proto: crate::mumble_proto::PermissionQuery) -> Self {
+impl From<shitspeak_proto::mumble_proto::PermissionQuery> for PermissionQuery {
+    fn from(proto: shitspeak_proto::mumble_proto::PermissionQuery) -> Self {
         Self {
             channel_id: proto.channel_id,
             permissions: proto.permissions,
@@ -54,9 +54,9 @@ impl From<crate::mumble_proto::PermissionQuery> for PermissionQuery {
     }
 }
 
-impl From<PermissionQuery> for crate::mumble_proto::PermissionQuery {
+impl From<PermissionQuery> for shitspeak_proto::mumble_proto::PermissionQuery {
     fn from(value: PermissionQuery) -> Self {
-        crate::mumble_proto::PermissionQuery {
+        shitspeak_proto::mumble_proto::PermissionQuery {
             channel_id: value.channel_id,
             permissions: value.permissions,
             flush: value.flush,

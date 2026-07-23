@@ -31,8 +31,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
-use crate::s2s_transport_proto as pb;
 use crate::types::NodeIdentifier;
+use shitspeak_proto::s2s_transport_proto as pb;
 
 use super::super::adaptive_queue::{
     AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender,

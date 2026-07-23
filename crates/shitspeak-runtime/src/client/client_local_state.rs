@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
-use crate::api::AuthenticationExpiryAction;
 use crate::localization::Language;
+use shitspeak_auth::AuthenticationExpiryAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExpiredAuthenticationAction {
@@ -217,7 +217,7 @@ mod tests {
     use chrono::{TimeZone as _, Utc};
 
     use super::{ClientLocalState, ExpiredAuthenticationAction};
-    use crate::api::AuthenticationExpiryAction;
+    use shitspeak_auth::AuthenticationExpiryAction;
 
     fn deadline() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0)

@@ -3,11 +3,11 @@ use crate::messages::Message;
 #[derive(Debug, Clone, Default)]
 pub struct VoiceTarget {
     pub id: Option<u32>,
-    pub targets: Vec<crate::mumble_proto::voice_target::Target>,
+    pub targets: Vec<shitspeak_proto::mumble_proto::voice_target::Target>,
 }
 
-impl From<crate::mumble_proto::VoiceTarget> for VoiceTarget {
-    fn from(proto: crate::mumble_proto::VoiceTarget) -> Self {
+impl From<shitspeak_proto::mumble_proto::VoiceTarget> for VoiceTarget {
+    fn from(proto: shitspeak_proto::mumble_proto::VoiceTarget) -> Self {
         Self {
             id: proto.id,
             targets: proto.targets,
@@ -15,9 +15,9 @@ impl From<crate::mumble_proto::VoiceTarget> for VoiceTarget {
     }
 }
 
-impl From<VoiceTarget> for crate::mumble_proto::VoiceTarget {
+impl From<VoiceTarget> for shitspeak_proto::mumble_proto::VoiceTarget {
     fn from(voice_target: VoiceTarget) -> Self {
-        crate::mumble_proto::VoiceTarget {
+        shitspeak_proto::mumble_proto::VoiceTarget {
             id: voice_target.id,
             targets: voice_target.targets,
         }

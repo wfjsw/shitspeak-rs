@@ -288,7 +288,7 @@ mod simd {
 
     #[inline]
     #[target_feature(enable = "sse2")]
-    unsafe fn xor128(left: __m128i, right: __m128i) -> __m128i {
+    fn xor128(left: __m128i, right: __m128i) -> __m128i {
         _mm_xor_si128(left, right)
     }
 
@@ -306,13 +306,13 @@ mod simd {
 
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn xor256(left: __m256i, right: __m256i) -> __m256i {
+    fn xor256(left: __m256i, right: __m256i) -> __m256i {
         _mm256_xor_si256(left, right)
     }
 
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn reduce256(value: __m256i) -> __m128i {
+    fn reduce256(value: __m256i) -> __m128i {
         let low = _mm256_castsi256_si128(value);
         let high = _mm256_extracti128_si256::<1>(value);
         _mm_xor_si128(low, high)
@@ -442,7 +442,7 @@ mod simd {
         checksum: &mut [u8; BLOCK_SIZE],
     ) {
         let delta_ptr = deltas.as_ptr().cast::<u8>();
-        let mut checksum_value = unsafe { _mm256_setzero_si256() };
+        let mut checksum_value = _mm256_setzero_si256();
         let mut offset = 0;
         while offset + 32 <= dest.len() {
             let value = xor256(unsafe { load256(dest.as_ptr().add(offset)) }, unsafe {
@@ -454,7 +454,7 @@ mod simd {
             });
             offset += 32;
         }
-        let folded = unsafe { reduce256(checksum_value) };
+        let folded = reduce256(checksum_value);
         let current = unsafe { load128(checksum.as_ptr()) };
         unsafe { store128(checksum.as_mut_ptr(), xor128(current, folded)) };
         if dest.len() - offset >= BLOCK_SIZE {
@@ -511,7 +511,7 @@ mod simd {
         checksum: &mut [u8; BLOCK_SIZE],
     ) {
         let delta_ptr = deltas.as_ptr().cast::<u8>();
-        let mut checksum_value = unsafe { _mm256_setzero_si256() };
+        let mut checksum_value = _mm256_setzero_si256();
         let mut offset = 0;
         while offset + 32 <= dest.len() {
             let value = xor256(unsafe { load256(src.as_ptr().add(offset)) }, unsafe {
@@ -521,7 +521,7 @@ mod simd {
             checksum_value = xor256(checksum_value, value);
             offset += 32;
         }
-        let folded = unsafe { reduce256(checksum_value) };
+        let folded = reduce256(checksum_value);
         let current = unsafe { load128(checksum.as_ptr()) };
         unsafe { store128(checksum.as_mut_ptr(), xor128(current, folded)) };
         if dest.len() - offset >= BLOCK_SIZE {
@@ -563,7 +563,7 @@ mod simd {
 
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn xor_fold_avx2(checksum: &mut [u8; BLOCK_SIZE], data: &[u8]) {
-        let mut checksum_value = unsafe { _mm256_setzero_si256() };
+        let mut checksum_value = _mm256_setzero_si256();
         let mut offset = 0;
         while offset + 32 <= data.len() {
             checksum_value = xor256(checksum_value, unsafe {
@@ -571,7 +571,7 @@ mod simd {
             });
             offset += 32;
         }
-        let folded = unsafe { reduce256(checksum_value) };
+        let folded = reduce256(checksum_value);
         let current = unsafe { load128(checksum.as_ptr()) };
         unsafe { store128(checksum.as_mut_ptr(), xor128(current, folded)) };
         if data.len() - offset >= BLOCK_SIZE {

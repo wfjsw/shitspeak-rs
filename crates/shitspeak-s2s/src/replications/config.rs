@@ -51,6 +51,15 @@ pub struct ReplicationConfig {
     strict_bootstrap_retry_interval: Duration,
     /// Minimum interval between steady-state catchup probes after bootstrap.
     strict_steady_state_catchup_interval: Duration,
+    /// Maximum encoded bulk bytes awaiting acknowledgement through one
+    /// transport next hop across all strict topics and logical destinations.
+    strict_bulk_max_in_flight_bytes_per_next_hop: usize,
+    /// Sustained strict bulk-send rate allowed through one transport next hop.
+    strict_bulk_rate_bytes_per_second_per_next_hop: u64,
+    /// Maximum delay between retries of a strict bulk page after backpressure.
+    strict_bulk_retry_max_delay: Duration,
+    /// Symmetric percentage jitter applied to strict bulk retry delays.
+    strict_bulk_retry_jitter_pct: u32,
     /// Pending propose entries are GC'd after this period. Must be longer
     /// than `propose_ttl` so a proposer's caller-visible timeout fires
     /// before the remote-side state evaporates.
@@ -114,6 +123,10 @@ impl Default for ReplicationConfig {
             strict_max_snapshot_transfer_bytes: 64 * 1024 * 1024,
             strict_bootstrap_retry_interval: Duration::from_millis(500),
             strict_steady_state_catchup_interval: Duration::from_secs(5),
+            strict_bulk_max_in_flight_bytes_per_next_hop: 256 * 1024,
+            strict_bulk_rate_bytes_per_second_per_next_hop: 1024 * 1024,
+            strict_bulk_retry_max_delay: Duration::from_secs(5),
+            strict_bulk_retry_jitter_pct: 25,
             pending_propose_ttl: Duration::from_secs(20),
             recovery_ttl: Duration::from_secs(10),
             owner_catchup_timeout: Duration::from_secs(5),
@@ -170,6 +183,18 @@ impl ReplicationConfig {
     }
     pub fn strict_steady_state_catchup_interval(&self) -> Duration {
         self.strict_steady_state_catchup_interval
+    }
+    pub fn strict_bulk_max_in_flight_bytes_per_next_hop(&self) -> usize {
+        self.strict_bulk_max_in_flight_bytes_per_next_hop
+    }
+    pub fn strict_bulk_rate_bytes_per_second_per_next_hop(&self) -> u64 {
+        self.strict_bulk_rate_bytes_per_second_per_next_hop
+    }
+    pub fn strict_bulk_retry_max_delay(&self) -> Duration {
+        self.strict_bulk_retry_max_delay
+    }
+    pub fn strict_bulk_retry_jitter_pct(&self) -> u32 {
+        self.strict_bulk_retry_jitter_pct
     }
     pub fn pending_propose_ttl(&self) -> Duration {
         self.pending_propose_ttl
@@ -273,6 +298,22 @@ impl ReplicationConfig {
     }
     pub fn with_strict_steady_state_catchup_interval(mut self, d: Duration) -> Self {
         self.strict_steady_state_catchup_interval = d;
+        self
+    }
+    pub fn with_strict_bulk_max_in_flight_bytes_per_next_hop(mut self, n: usize) -> Self {
+        self.strict_bulk_max_in_flight_bytes_per_next_hop = n.max(1);
+        self
+    }
+    pub fn with_strict_bulk_rate_bytes_per_second_per_next_hop(mut self, n: u64) -> Self {
+        self.strict_bulk_rate_bytes_per_second_per_next_hop = n.max(1);
+        self
+    }
+    pub fn with_strict_bulk_retry_max_delay(mut self, d: Duration) -> Self {
+        self.strict_bulk_retry_max_delay = d;
+        self
+    }
+    pub fn with_strict_bulk_retry_jitter_pct(mut self, pct: u32) -> Self {
+        self.strict_bulk_retry_jitter_pct = pct.min(100);
         self
     }
     pub fn with_pending_propose_ttl(mut self, d: Duration) -> Self {
@@ -442,6 +483,14 @@ pub struct ReplicationTuning {
     pub strict_bootstrap_retry_interval_ms: u64,
     #[serde(default = "default_strict_steady_state_catchup_interval_ms")]
     pub strict_steady_state_catchup_interval_ms: u64,
+    #[serde(default = "default_strict_bulk_max_in_flight_bytes_per_next_hop")]
+    pub strict_bulk_max_in_flight_bytes_per_next_hop: usize,
+    #[serde(default = "default_strict_bulk_rate_bytes_per_second_per_next_hop")]
+    pub strict_bulk_rate_bytes_per_second_per_next_hop: u64,
+    #[serde(default = "default_strict_bulk_retry_max_delay_ms")]
+    pub strict_bulk_retry_max_delay_ms: u64,
+    #[serde(default = "default_strict_bulk_retry_jitter_pct")]
+    pub strict_bulk_retry_jitter_pct: u32,
     #[serde(default = "default_pending_propose_ttl_ms")]
     pub pending_propose_ttl_ms: u64,
     #[serde(default = "default_recovery_ttl_ms")]
@@ -493,6 +542,12 @@ impl Default for ReplicationTuning {
             strict_bootstrap_retry_interval_ms: default_strict_bootstrap_retry_interval_ms(),
             strict_steady_state_catchup_interval_ms:
                 default_strict_steady_state_catchup_interval_ms(),
+            strict_bulk_max_in_flight_bytes_per_next_hop:
+                default_strict_bulk_max_in_flight_bytes_per_next_hop(),
+            strict_bulk_rate_bytes_per_second_per_next_hop:
+                default_strict_bulk_rate_bytes_per_second_per_next_hop(),
+            strict_bulk_retry_max_delay_ms: default_strict_bulk_retry_max_delay_ms(),
+            strict_bulk_retry_jitter_pct: default_strict_bulk_retry_jitter_pct(),
             pending_propose_ttl_ms: default_pending_propose_ttl_ms(),
             recovery_ttl_ms: default_recovery_ttl_ms(),
             owner_catchup_timeout_ms: default_owner_catchup_timeout_ms(),
@@ -532,6 +587,16 @@ impl From<ReplicationTuning> for ReplicationConfig {
             .with_strict_steady_state_catchup_interval(Duration::from_millis(
                 t.strict_steady_state_catchup_interval_ms,
             ))
+            .with_strict_bulk_max_in_flight_bytes_per_next_hop(
+                t.strict_bulk_max_in_flight_bytes_per_next_hop,
+            )
+            .with_strict_bulk_rate_bytes_per_second_per_next_hop(
+                t.strict_bulk_rate_bytes_per_second_per_next_hop,
+            )
+            .with_strict_bulk_retry_max_delay(Duration::from_millis(
+                t.strict_bulk_retry_max_delay_ms,
+            ))
+            .with_strict_bulk_retry_jitter_pct(t.strict_bulk_retry_jitter_pct)
             .with_pending_propose_ttl(Duration::from_millis(t.pending_propose_ttl_ms))
             .with_recovery_ttl(Duration::from_millis(t.recovery_ttl_ms))
             .with_owner_catchup_timeout(Duration::from_millis(t.owner_catchup_timeout_ms))
@@ -586,6 +651,18 @@ fn default_strict_bootstrap_retry_interval_ms() -> u64 {
 }
 fn default_strict_steady_state_catchup_interval_ms() -> u64 {
     5_000
+}
+fn default_strict_bulk_max_in_flight_bytes_per_next_hop() -> usize {
+    256 * 1024
+}
+fn default_strict_bulk_rate_bytes_per_second_per_next_hop() -> u64 {
+    1024 * 1024
+}
+fn default_strict_bulk_retry_max_delay_ms() -> u64 {
+    5_000
+}
+fn default_strict_bulk_retry_jitter_pct() -> u32 {
+    25
 }
 fn default_pending_propose_ttl_ms() -> u64 {
     20_000
@@ -642,6 +719,43 @@ fn default_bulk_max_in_flight_per_peer() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_bulk_pacing_defaults_and_tuning_conversion_match() {
+        let defaults = ReplicationConfig::default();
+        assert_eq!(
+            defaults.strict_bulk_max_in_flight_bytes_per_next_hop(),
+            262_144
+        );
+        assert_eq!(
+            defaults.strict_bulk_rate_bytes_per_second_per_next_hop(),
+            1_048_576
+        );
+        assert_eq!(
+            defaults.strict_bulk_retry_max_delay(),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(defaults.strict_bulk_retry_jitter_pct(), 25);
+        assert_eq!(defaults.bulk_retry_delay(), Duration::from_millis(250));
+
+        let tuned = ReplicationConfig::from(ReplicationTuning {
+            strict_bulk_max_in_flight_bytes_per_next_hop: 65_536,
+            strict_bulk_rate_bytes_per_second_per_next_hop: 131_072,
+            strict_bulk_retry_max_delay_ms: 2_000,
+            strict_bulk_retry_jitter_pct: 10,
+            ..ReplicationTuning::default()
+        });
+        assert_eq!(tuned.strict_bulk_max_in_flight_bytes_per_next_hop(), 65_536);
+        assert_eq!(
+            tuned.strict_bulk_rate_bytes_per_second_per_next_hop(),
+            131_072
+        );
+        assert_eq!(
+            tuned.strict_bulk_retry_max_delay(),
+            Duration::from_millis(2_000)
+        );
+        assert_eq!(tuned.strict_bulk_retry_jitter_pct(), 10);
+    }
 
     #[test]
     fn catchup_limiter_enforces_per_peer_and_total_limits() {

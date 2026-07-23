@@ -8,8 +8,8 @@ pub struct CodecVersion {
     pub opus: Option<bool>,
 }
 
-impl From<crate::mumble_proto::CodecVersion> for CodecVersion {
-    fn from(proto: crate::mumble_proto::CodecVersion) -> Self {
+impl From<shitspeak_proto::mumble_proto::CodecVersion> for CodecVersion {
+    fn from(proto: shitspeak_proto::mumble_proto::CodecVersion) -> Self {
         Self {
             alpha: proto.alpha,
             beta: proto.beta,
@@ -30,9 +30,9 @@ impl Default for CodecVersion {
     }
 }
 
-impl From<CodecVersion> for crate::mumble_proto::CodecVersion {
+impl From<CodecVersion> for shitspeak_proto::mumble_proto::CodecVersion {
     fn from(codec_version: CodecVersion) -> Self {
-        crate::mumble_proto::CodecVersion {
+        shitspeak_proto::mumble_proto::CodecVersion {
             alpha: codec_version.alpha,
             beta: codec_version.beta,
             prefer_alpha: codec_version.prefer_alpha,

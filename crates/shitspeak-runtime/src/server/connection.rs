@@ -15,21 +15,14 @@ use crate::channel_handler::{
 use crate::client::{
     AsyncMessageHandlerExt, Client, ClientInstanceId, ClientOutboundMessage,
     client_session_identifier::ClientSessionIdentifier,
-    state_log::{
-        ClientGlobalStateDelta, ClientStateBroadcastPayload, ClientStateLogEntry,
-        ClientStateOperation,
-    },
+    state_log::{ClientStateBroadcastPayload, ClientStateLogEntry, ClientStateOperation},
     visibility::UserVisibilityState,
 };
-use crate::errors::{
-    HandleIncomingConnectionError, MessageHandlerError, ReadProtoMessageError,
-    WriteProtoMessageError,
-};
-use crate::messages::encoder::Version;
-use crate::messages::{Message, WriteMessageExt};
+use crate::errors::{HandleIncomingConnectionError, MessageHandlerError, WriteProtoMessageError};
+use shitspeak_messages::messages::encoder::Version;
+use shitspeak_messages::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::consume_proxy_protocol_connection_info;
 use crate::types::default_server_id;
-use crate::utils::{recv_mpsc_optional, recv_optional};
 use shitspeak_state::{ChannelOp, ChannelOperation};
 
 use super::Server;
@@ -98,7 +91,7 @@ fn map_channel_replay_error(error: ChannelReplayError) -> HandleIncomingConnecti
 pub(super) async fn activate_client_subscriptions(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    client_session_id: ClientSessionIdentifier,
+    _client_session_id: ClientSessionIdentifier,
     client_log_rx: &mut Option<ClientLogReceiver>,
     channel_log_rx: &mut Option<ChannelLogReceiver>,
     channel_tree_shadow: &mut ChannelTreeShadow,
@@ -990,7 +983,7 @@ async fn append_client_log_broadcast_messages(
                 let sessions =
                     take_origin_sessions_from_shadow(session_channel_shadow, entry.node_id);
                 for session in sessions {
-                    let removal: Message = crate::messages::encoder::UserRemove {
+                    let removal: Message = shitspeak_messages::messages::encoder::UserRemove {
                         session: u32::from(session),
                         actor: None,
                         reason: None,
@@ -1627,6 +1620,7 @@ mod client_snapshot_boundary_tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::*;
+    use crate::client::state_log::ClientGlobalStateDelta;
     use crate::client_repository::ClientRepository;
 
     #[test]

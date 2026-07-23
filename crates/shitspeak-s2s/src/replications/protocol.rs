@@ -15,7 +15,12 @@ use super::proto::REPLICATION_SERVICE_TAG;
 use crate::upper_layer_capabilities::{CapabilityEnvelopeError, UpperLayerCapabilityEnvelope};
 
 const REPLICATION_CAPABILITIES_FORMAT_VERSION: u32 = 1;
-pub(crate) const STRICT_PROTOCOL_VERSION: u32 = 2;
+/// Frozen-target proposals and durable terminal decisions.
+pub(crate) const STRICT_PROTOCOL_VERSION_V2: u32 = 2;
+/// Pairwise correlated probes and terminal delta synchronization.
+pub(crate) const STRICT_PROTOCOL_VERSION_V3: u32 = 3;
+/// Maximum strict participant capability advertised by this binary.
+pub(crate) const STRICT_PROTOCOL_VERSION_CURRENT: u32 = STRICT_PROTOCOL_VERSION_V3;
 
 /// Replication service participation advertised by one upper-layer endpoint.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -319,6 +324,13 @@ mod tests {
         version: u32,
     ) -> ReplicationProtocolCapabilities {
         ReplicationProtocolCapabilities::new(strict, content, owner, version)
+    }
+
+    #[test]
+    fn current_participant_capability_does_not_change_v2_proposal_version() {
+        assert_eq!(STRICT_PROTOCOL_VERSION_V2, 2);
+        assert_eq!(STRICT_PROTOCOL_VERSION_V3, 3);
+        assert_eq!(STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V3);
     }
 
     #[test]

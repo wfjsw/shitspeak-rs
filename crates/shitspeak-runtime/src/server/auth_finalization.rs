@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use crate::api::{Authenticator, ReloadableAuthenticator};
 use crate::client::Client;
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::errors::MessageHandlerError;
-use crate::messages::encoder::TextMessage;
-use crate::messages::{Message, WriteMessageExt};
+use shitspeak_messages::messages::Message;
+use shitspeak_messages::messages::encoder::TextMessage;
+use shitspeak_auth::{Authenticator, ReloadableAuthenticator};
 use shitspeak_runtime_config::Config;
 
 use super::auth_tasks::{BackgroundTaskExecutor, ScheduledAuthenticator};

@@ -8,7 +8,7 @@ use crate::protocol::{
     AuthRequest, ClientCommand, ServerEvent, WebChannelState, WebCodecVersion, WebPermissionDenied,
     WebServerConfig, WebServerSync, WebUserRemove, WebUserState, WebVolumeAdjustment,
 };
-use shitspeak_runtime::api::{
+use shitspeak_auth::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
     canonical_authenticator_ip,
 };

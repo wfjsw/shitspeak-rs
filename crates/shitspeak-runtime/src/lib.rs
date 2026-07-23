@@ -1,39 +1,3 @@
-#![allow(warnings)]
-#![allow(
-    dead_code,
-    unused_variables,
-    unused_imports,
-    unused_must_use,
-    unused_assignments
-)]
-
-pub mod mumble_proto {
-    pub use shitspeak_proto::mumble_proto::*;
-}
-
-pub mod mumble_udp {
-    pub use shitspeak_proto::mumble_udp::*;
-}
-
-pub mod s2s_transport_proto {
-    pub use shitspeak_proto::s2s_transport_proto::*;
-}
-
-pub mod s2s_overlay_proto {
-    pub use shitspeak_proto::s2s_overlay_proto::*;
-}
-
-pub mod s2s_replication_proto {
-    pub use shitspeak_proto::s2s_replication_proto::*;
-}
-
-pub mod s2s_application_proto {
-    pub use shitspeak_proto::s2s_application_proto::*;
-}
-
-pub mod api {
-    pub use shitspeak_auth::*;
-}
 pub mod blob_store;
 pub mod channel_handler;
 pub mod client;
@@ -72,7 +36,8 @@ mod integration_tests;
 pub async fn run_server_with_extensions(
     extensions: server::ServerExtensions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::{api::ReloadableAuthenticator, server::Server};
+    use crate::server::Server;
+    use shitspeak_auth::ReloadableAuthenticator;
     use shitspeak_runtime_config::Config;
 
     rustls::crypto::aws_lc_rs::default_provider()

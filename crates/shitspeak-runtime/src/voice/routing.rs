@@ -18,7 +18,6 @@ use super::metrics::{
     VoicePipelineStage, VoiceRouteCacheLayer, VoiceRouteKind, VoiceRouteScope, VoiceRouteSource,
     VoiceSchedulerStage, VoiceUdpSendResult,
 };
-use super::routing_queue::VoiceRoutingPayload;
 use super::udp_batch::{self, DatagramBatch};
 use crate::{
     client::{
@@ -2534,7 +2533,7 @@ pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
                 let Some(client) = weak_client.upgrade() else {
                     break;
                 };
-                let message = crate::messages::Message::UDPTunnel(raw);
+                let message = shitspeak_messages::messages::Message::UDPTunnel(raw);
                 if let Err(e) = client.write_proto_message(&message).await {
                     tracing::trace!(
                         session = u32::from(client.get_session_id()),

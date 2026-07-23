@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
-use crate::messages::Message;
+use shitspeak_messages::messages::Message;
 use shitspeak_state::{ACL, ACLPermissions, Channel};
 
 /// Checks that a user's own channel move is broadcast to other clients.

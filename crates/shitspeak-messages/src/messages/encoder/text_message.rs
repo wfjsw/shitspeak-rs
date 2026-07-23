@@ -9,8 +9,8 @@ pub struct TextMessage {
     pub message: String,
 }
 
-impl From<crate::mumble_proto::TextMessage> for TextMessage {
-    fn from(proto: crate::mumble_proto::TextMessage) -> Self {
+impl From<shitspeak_proto::mumble_proto::TextMessage> for TextMessage {
+    fn from(proto: shitspeak_proto::mumble_proto::TextMessage) -> Self {
         Self {
             actor: proto.actor,
             session: proto.session,
@@ -21,9 +21,9 @@ impl From<crate::mumble_proto::TextMessage> for TextMessage {
     }
 }
 
-impl From<TextMessage> for crate::mumble_proto::TextMessage {
+impl From<TextMessage> for shitspeak_proto::mumble_proto::TextMessage {
     fn from(message: TextMessage) -> Self {
-        crate::mumble_proto::TextMessage {
+        shitspeak_proto::mumble_proto::TextMessage {
             actor: message.actor,
             session: message.session,
             channel_id: message.channel_id,

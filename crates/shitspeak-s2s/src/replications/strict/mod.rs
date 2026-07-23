@@ -5,10 +5,18 @@
 //! `StrictReplicable` trait, `StrictHandle` (caller-facing), and
 //! shared types.
 
+pub(crate) mod bulk_pacing;
 pub mod catchup;
+pub(crate) mod history_v3;
 pub mod propose;
+pub(crate) mod retry_v3;
 pub mod runtime;
+pub(crate) mod session_reducer;
+pub(crate) mod sync_v3;
 pub(crate) mod terminal_journal;
+
+#[cfg(test)]
+mod sync_v3_tests;
 
 use std::sync::Arc;
 

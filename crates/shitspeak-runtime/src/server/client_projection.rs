@@ -19,7 +19,7 @@ use crate::client::state_log::{
 use crate::client::visibility::UserVisibilityState;
 use crate::client::{Client, ClientInstanceId, OwnedMessageBatch, PostAuthBaseline};
 use crate::errors::HandleIncomingConnectionError;
-use crate::messages::Message;
+use shitspeak_messages::messages::Message;
 
 use super::Server;
 use super::sharded_subscriber::{DeliverResult, LagAction, ShardedSubscriber};
@@ -453,7 +453,7 @@ impl ClientProjectionState {
             .sync_messages(visibility_messages.iter());
         outbound.extend(visibility_messages);
         for channel_id in removed {
-            let message = crate::messages::encoder::ChannelRemove { channel_id }.into();
+            let message = shitspeak_messages::messages::encoder::ChannelRemove { channel_id }.into();
             self.channel_permission_shadow.sync_message(&message);
             outbound.push(message);
         }
@@ -477,7 +477,7 @@ impl ClientProjectionState {
                     );
                     let server_id = self.client.server_id();
                     for session in sessions {
-                        let removal: Message = crate::messages::encoder::UserRemove {
+                        let removal: Message = shitspeak_messages::messages::encoder::UserRemove {
                             session: u32::from(session),
                             actor: None,
                             reason: None,
@@ -841,7 +841,7 @@ mod tests {
     use crate::client_repository::ClientRepository;
 
     fn ping(timestamp: u64) -> Message {
-        crate::messages::encoder::Ping::default_from_timestamp(timestamp).into()
+        shitspeak_messages::messages::encoder::Ping::default_from_timestamp(timestamp).into()
     }
 
     fn projection_for_delivery(client: Arc<Box<Client>>) -> ClientProjectionState {

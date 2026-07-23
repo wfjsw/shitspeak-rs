@@ -150,6 +150,7 @@ mod scalar {
         (new_hi, new_lo)
     }
 
+    #[cfg(test)]
     pub fn double(d: &mut [u8; 16]) {
         let hi = u64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
         let lo = u64::from_be_bytes([d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]]);
@@ -226,26 +227,30 @@ mod simd {
     /// byte-reversed, not every step.
     #[target_feature(enable = "sse2,ssse3")]
     pub unsafe fn fill_chain(chain: &mut [[u8; 16]], count: usize) {
-        let rev = reverse_mask();
-        let seed = _mm_loadu_si128(chain[0].as_ptr() as *const __m128i);
+        // SAFETY: the caller dispatches only after detecting SSE2 and SSSE3;
+        // the array references provide valid 16-byte addresses for unaligned loads/stores.
+        let rev = unsafe { reverse_mask() };
+        let seed = unsafe { _mm_loadu_si128(chain[0].as_ptr() as *const __m128i) };
         let mut v = _mm_shuffle_epi8(seed, rev);
         for i in 1..=count {
-            v = double_le(v);
+            v = unsafe { double_le(v) };
             let be = _mm_shuffle_epi8(v, rev);
-            _mm_storeu_si128(chain[i].as_mut_ptr() as *mut __m128i, be);
+            unsafe { _mm_storeu_si128(chain[i].as_mut_ptr() as *mut __m128i, be) };
         }
     }
 
     /// `triple(d) = double(d) XOR d`, computed in one fused pass.
     #[target_feature(enable = "sse2,ssse3")]
     pub unsafe fn triple(d: &mut [u8; 16]) {
-        let rev = reverse_mask();
-        let v = _mm_loadu_si128(d.as_ptr() as *const __m128i);
+        // SAFETY: the caller dispatches only after detecting SSE2 and SSSE3;
+        // `d` provides a valid 16-byte address for unaligned loads/stores.
+        let rev = unsafe { reverse_mask() };
+        let v = unsafe { _mm_loadu_si128(d.as_ptr() as *const __m128i) };
         let le = _mm_shuffle_epi8(v, rev);
-        let doubled = double_le(le);
+        let doubled = unsafe { double_le(le) };
         let tripled = _mm_xor_si128(doubled, le);
         let be = _mm_shuffle_epi8(tripled, rev);
-        _mm_storeu_si128(d.as_mut_ptr() as *mut __m128i, be);
+        unsafe { _mm_storeu_si128(d.as_mut_ptr() as *mut __m128i, be) };
     }
 }
 

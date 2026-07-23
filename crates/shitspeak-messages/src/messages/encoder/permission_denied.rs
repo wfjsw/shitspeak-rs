@@ -26,7 +26,7 @@ pub enum DenyType {
 // Compile-time check: ensure our enum values match the proto.
 // If these constants change in the proto, this will fail to compile.
 const _: () = {
-    use crate::mumble_proto::permission_denied::DenyType as ProtoDenyType;
+    use shitspeak_proto::mumble_proto::permission_denied::DenyType as ProtoDenyType;
     assert!(DenyType::Text as i32 == ProtoDenyType::Text as i32);
     assert!(DenyType::Permission as i32 == ProtoDenyType::Permission as i32);
     assert!(DenyType::SuperUser as i32 == ProtoDenyType::SuperUser as i32);
@@ -58,7 +58,7 @@ impl PermissionDenied {
     pub fn for_permission(
         session: u32,
         channel_id: Option<u32>,
-        perm: crate::acl::ACLPermissions,
+        perm: shitspeak_core::ACLPermissions,
     ) -> Self {
         Self {
             r#type: DenyType::Permission,
@@ -97,8 +97,8 @@ impl DenyType {
     }
 }
 
-impl From<crate::mumble_proto::PermissionDenied> for PermissionDenied {
-    fn from(proto: crate::mumble_proto::PermissionDenied) -> Self {
+impl From<shitspeak_proto::mumble_proto::PermissionDenied> for PermissionDenied {
+    fn from(proto: shitspeak_proto::mumble_proto::PermissionDenied) -> Self {
         Self {
             r#type: proto.r#type.map_or(DenyType::Text, DenyType::from_proto),
             session: proto.session.unwrap_or(0),
@@ -123,9 +123,9 @@ impl Default for PermissionDenied {
     }
 }
 
-impl From<PermissionDenied> for crate::mumble_proto::PermissionDenied {
+impl From<PermissionDenied> for shitspeak_proto::mumble_proto::PermissionDenied {
     fn from(value: PermissionDenied) -> Self {
-        crate::mumble_proto::PermissionDenied {
+        shitspeak_proto::mumble_proto::PermissionDenied {
             r#type: Some(value.r#type as i32),
             session: Some(value.session),
             channel_id: value.channel_id,

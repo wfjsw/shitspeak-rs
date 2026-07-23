@@ -7,7 +7,7 @@ use prost::Message as _;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt, encoder::UserStats},
+    messages::{Message, encoder::UserStats},
     server::Server,
     types::NodeIdentifier,
 };
@@ -65,7 +65,7 @@ pub async fn handle_user_stats(
                 .await;
                 if !target_channel_perms.contains(shitspeak_state::ACLPermissions::Enter) {
                     return Err(MessageHandlerError::PermissionDenied(
-                        crate::messages::encoder::PermissionDenied::for_permission(
+                        shitspeak_messages::messages::encoder::PermissionDenied::for_permission(
                             sender_raw,
                             Some(target_channel),
                             shitspeak_state::ACLPermissions::Enter,
@@ -90,17 +90,18 @@ pub async fn handle_user_stats(
             .await;
         match reply {
             Ok(r) if r.found && !r.payload.is_empty() => {
-                let proto = match crate::mumble_proto::UserStats::decode(r.payload.as_ref()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            target = target_session_raw,
-                            "user_stats: owner returned undecodable payload",
-                        );
-                        return Ok(());
-                    }
-                };
+                let proto =
+                    match shitspeak_proto::mumble_proto::UserStats::decode(r.payload.as_ref()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                target = target_session_raw,
+                                "user_stats: owner returned undecodable payload",
+                            );
+                            return Ok(());
+                        }
+                    };
                 let mut user_stats: UserStats = proto.into();
                 apply_user_stats_privacy(&mut user_stats, sender_is_superuser);
                 let outbound: Message = user_stats.into();
@@ -160,7 +161,7 @@ async fn build_user_stats_payload(
     let (from_client, from_server) = udp_network_stats(target);
 
     let version = target.protocol_version().map(|v| {
-        crate::messages::encoder::Version {
+        shitspeak_messages::messages::encoder::Version {
             version: Some(v),
             release: include_sensitive_fields
                 .then(|| local.and_then(|l| l.get_release().map(|s| s.to_owned())))
@@ -205,8 +206,8 @@ async fn build_user_stats_payload(
 fn udp_network_stats(
     target: &Arc<Box<Client>>,
 ) -> (
-    Option<crate::mumble_proto::user_stats::Stats>,
-    Option<crate::mumble_proto::user_stats::Stats>,
+    Option<shitspeak_proto::mumble_proto::user_stats::Stats>,
+    Option<shitspeak_proto::mumble_proto::user_stats::Stats>,
 ) {
     let crypt_state = target.crypt_state();
     crypt_state
@@ -222,8 +223,8 @@ fn udp_network_stats(
 
 fn packet_stats_to_proto(
     (good, late, lost, resync): (u32, u32, u32, u32),
-) -> crate::mumble_proto::user_stats::Stats {
-    crate::mumble_proto::user_stats::Stats {
+) -> shitspeak_proto::mumble_proto::user_stats::Stats {
+    shitspeak_proto::mumble_proto::user_stats::Stats {
         good: Some(good),
         late: Some(late),
         lost: Some(lost),
@@ -350,7 +351,7 @@ impl UserStatsResponder for ServerUserStatsResponder {
             }
         }
         let user_stats = build_user_stats_payload(&target, stats_only, actor_is_superuser).await;
-        let proto: crate::mumble_proto::UserStats = user_stats.into();
+        let proto: shitspeak_proto::mumble_proto::UserStats = user_stats.into();
         let mut buf = BytesMut::with_capacity(proto.encoded_len());
         if let Err(e) = proto.encode(&mut buf) {
             tracing::warn!(error=%e, "user_stats: failed to encode reply payload");

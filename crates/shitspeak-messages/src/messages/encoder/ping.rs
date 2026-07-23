@@ -16,8 +16,8 @@ pub struct Ping {
     pub tcp_ping_var: Option<f32>,
 }
 
-impl TryFrom<crate::mumble_proto::Ping> for Ping {
-    fn try_from(proto: crate::mumble_proto::Ping) -> Result<Self, PingProtocolError> {
+impl TryFrom<shitspeak_proto::mumble_proto::Ping> for Ping {
+    fn try_from(proto: shitspeak_proto::mumble_proto::Ping) -> Result<Self, PingProtocolError> {
         Ok(Self {
             timestamp: proto.timestamp.ok_or(PingProtocolError::MissingTimestamp)?,
             good: proto.good.unwrap_or(0),
@@ -50,7 +50,7 @@ impl Ping {
         }
     }
 
-    pub fn default_from_message(message: &crate::mumble_proto::Ping) -> Self {
+    pub fn default_from_message(message: &shitspeak_proto::mumble_proto::Ping) -> Self {
         Self {
             timestamp: message.timestamp.unwrap_or(0),
             ..Self::default()
@@ -58,9 +58,9 @@ impl Ping {
     }
 }
 
-impl From<Ping> for crate::mumble_proto::Ping {
+impl From<Ping> for shitspeak_proto::mumble_proto::Ping {
     fn from(value: Ping) -> Self {
-        crate::mumble_proto::Ping {
+        shitspeak_proto::mumble_proto::Ping {
             timestamp: Some(value.timestamp),
             good: Some(value.good),
             late: Some(value.late),

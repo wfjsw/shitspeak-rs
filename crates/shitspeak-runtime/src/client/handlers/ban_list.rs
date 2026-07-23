@@ -6,7 +6,7 @@ use shitspeak_state::{BanEntry, BanOp};
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt, encoder::BanList},
+    messages::{Message, encoder::BanList},
     server::Server,
 };
 
@@ -31,7 +31,7 @@ pub async fn handle_ban_list(
     let root_perms = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
     if !root_perms.contains(shitspeak_state::ACLPermissions::Ban) {
         return Err(MessageHandlerError::PermissionDenied(
-            crate::messages::encoder::PermissionDenied::for_permission(
+            shitspeak_messages::messages::encoder::PermissionDenied::for_permission(
                 u32::from(sender.get_session_id()),
                 Some(0),
                 shitspeak_state::ACLPermissions::Ban,
@@ -42,9 +42,9 @@ pub async fn handle_ban_list(
     if msg.query.unwrap_or(false) {
         // Query mode: return current ban list
         let active = server.get_bans().get_active_bans().await;
-        let bans: Vec<crate::mumble_proto::ban_list::BanEntry> = active
+        let bans: Vec<shitspeak_proto::mumble_proto::ban_list::BanEntry> = active
             .into_iter()
-            .map(|b| crate::mumble_proto::ban_list::BanEntry {
+            .map(|b| shitspeak_proto::mumble_proto::ban_list::BanEntry {
                 address: b.address.to_string().into_bytes(),
                 mask: b.mask as u32,
                 name: b.name.clone(),

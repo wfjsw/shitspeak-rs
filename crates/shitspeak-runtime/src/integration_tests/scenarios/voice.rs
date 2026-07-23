@@ -27,14 +27,14 @@ use crate::constants::PROTOBUF_INTRODUCED_VERSION;
 use crate::integration_tests::harness::{
     TestClient, TestServer, TestServerOpts, spawn_test_server, test_client::ConnectError,
 };
-use crate::messages::Message;
-use crate::messages::encoder::{AudioTarget, ChanAcl, Ping, UserState, VoiceTarget};
-use crate::mumble_proto::voice_target::Target as VoiceTargetEntry;
+use shitspeak_messages::messages::Message;
+use shitspeak_messages::messages::encoder::{AudioTarget, ChanAcl, Ping, UserState, VoiceTarget};
 use crate::protocol_version::ProtocolVersion;
 use crate::voice::codec::{AudioPayload, PacketFormat};
 use crate::voice::metrics::{
     VoiceRouteKind, VoiceRouteSource, route_metric_snapshot, route_resolution_metric_snapshot,
 };
+use shitspeak_proto::mumble_proto::voice_target::Target as VoiceTargetEntry;
 use shitspeak_state::ACLPermissions;
 use shitspeak_state::Channel;
 

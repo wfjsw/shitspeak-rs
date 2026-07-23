@@ -1,5 +1,3 @@
-use crate::protocol_version::ProtocolVersion;
-
 pub use shitspeak_core::constants::{
     APP_PROTO_VER, MAX_LOCAL_SESSION_ID, MAX_NODE_ID, MTU, PROTOBUF_INTRODUCED_VERSION,
 };

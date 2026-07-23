@@ -7,8 +7,8 @@ pub struct ContextAction {
     pub action: String,
 }
 
-impl From<crate::mumble_proto::ContextAction> for ContextAction {
-    fn from(proto: crate::mumble_proto::ContextAction) -> Self {
+impl From<shitspeak_proto::mumble_proto::ContextAction> for ContextAction {
+    fn from(proto: shitspeak_proto::mumble_proto::ContextAction) -> Self {
         Self {
             session: proto.session,
             channel_id: proto.channel_id,
@@ -17,9 +17,9 @@ impl From<crate::mumble_proto::ContextAction> for ContextAction {
     }
 }
 
-impl From<ContextAction> for crate::mumble_proto::ContextAction {
+impl From<ContextAction> for shitspeak_proto::mumble_proto::ContextAction {
     fn from(context_action: ContextAction) -> Self {
-        crate::mumble_proto::ContextAction {
+        shitspeak_proto::mumble_proto::ContextAction {
             session: context_action.session,
             channel_id: context_action.channel_id,
             action: context_action.action,

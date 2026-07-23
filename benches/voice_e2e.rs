@@ -12,17 +12,17 @@ use prost::Message as _;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject as _};
 use rustls::{ClientConfig, RootCertStore};
-use shitspeak_rs::api::{
+use shitspeak_auth::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
 };
 use shitspeak_rs::client::client_session_identifier::ClientSessionIdentifier;
-use shitspeak_rs::client::crypt::CryptState;
-use shitspeak_rs::config::{Config, S2sConfig, UdpPingUserCountScope};
+use shitspeak_client_crypto::CryptState;
+use shitspeak_runtime_config::{Config, S2sConfig, UdpPingUserCountScope};
 use shitspeak_rs::constants::PROTOBUF_INTRODUCED_VERSION;
-use shitspeak_rs::messages::encoder::{
+use shitspeak_messages::messages::encoder::{
     Audio as AudioWire, AudioHeader, AudioTarget, Authenticate, ClientType, Version,
 };
-use shitspeak_rs::messages::{Message, ReadMessageExt, WriteMessageExt};
+use shitspeak_messages::messages::{Message, ReadMessageExt, WriteMessageExt};
 use shitspeak_rs::protocol_version::ProtocolVersion;
 use shitspeak_rs::server::Server;
 use shitspeak_rs::voice::codec::{
@@ -284,9 +284,9 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
         allowed_proxies: Vec::new(),
         min_client_version: 0,
         max_users: 128,
-        authenticator: shitspeak_rs::config::AuthenticatorConfig::default(),
-        observability: shitspeak_rs::config::ObservabilityConfig::default(),
-        geoip: shitspeak_rs::config::GeoIpConfig::default(),
+        authenticator: shitspeak_runtime_config::AuthenticatorConfig::default(),
+        observability: shitspeak_runtime_config::ObservabilityConfig::default(),
+        geoip: shitspeak_runtime_config::GeoIpConfig::default(),
         welcome_text: None,
         max_bandwidth: 72_000,
         allow_html: true,
@@ -311,10 +311,10 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
         required_groups: Vec::new(),
         send_permission_info: false,
         hide_users_without_traverse: false,
-        acl: shitspeak_rs::config::AclConfig::default(),
-        privacy: shitspeak_rs::config::PrivacyConfig::default(),
+        acl: shitspeak_runtime_config::AclConfig::default(),
+        privacy: shitspeak_runtime_config::PrivacyConfig::default(),
         s2s: S2sConfig::default(),
-        web: shitspeak_rs::config::WebConfig::default(),
+        web: shitspeak_runtime_config::WebConfig::default(),
     }
 }
 
@@ -886,7 +886,7 @@ fn encode_protobuf_client_voice(target: u32, frame_number: u64, opus: &[u8]) -> 
         volume_adjustment: 0.0,
         is_terminator: false,
     };
-    let proto: shitspeak_rs::mumble_udp::Audio = wire.into();
+    let proto: shitspeak_proto::mumble_udp::Audio = wire.into();
     let mut buf = BytesMut::with_capacity(1 + proto.encoded_len());
     buf.put_u8(0x00);
     proto.encode(&mut buf).expect("encode protobuf audio");

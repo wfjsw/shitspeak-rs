@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use prost::Message as _;
 
-use crate::mumble_proto::*;
+use shitspeak_proto::mumble_proto::*;
 
 use message_macro::MessageConversion;
 
@@ -75,13 +75,14 @@ mod tests {
 
     #[test]
     fn plugin_data_transmission_uses_mumble_wire_tag_26() {
-        let message =
-            Message::PluginDataTransmission(crate::mumble_proto::PluginDataTransmission {
+        let message = Message::PluginDataTransmission(
+            shitspeak_proto::mumble_proto::PluginDataTransmission {
                 sender_session: Some(7),
                 receiver_sessions: vec![8, 9],
                 data: Some(Bytes::from_static(b"plugin-payload")),
                 data_id: Some("example.plugin".to_string()),
-            });
+            },
+        );
 
         assert_eq!(message.proto_tag(), 26);
         let decoded = Message::from_proto(26, message.to_proto_vec().unwrap()).unwrap();

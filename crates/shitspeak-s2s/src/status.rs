@@ -1560,33 +1560,88 @@ impl<'a> PrometheusWriter<'a> {
         );
         self.header(
             "shitspeak_s2s_replication_catchup_requests_total",
-            "S2S replication catchup requests sent by mode.",
+            "Logical S2S replication catchup requests sent by mode, initiating reason, and phase.",
             "counter",
         );
         self.header(
             "shitspeak_s2s_replication_catchup_responses_total",
-            "S2S replication catchup responses built by mode.",
+            "Logical S2S replication catchup responses built by mode, initiating reason, and phase.",
             "counter",
         );
         self.header(
             "shitspeak_s2s_replication_catchup_response_ops_total",
-            "S2S replication catchup operations encoded by mode.",
+            "Logical S2S replication catchup records encoded by mode, initiating reason, and phase.",
             "counter",
         );
         self.header(
             "shitspeak_s2s_replication_catchup_response_bytes_total",
-            "S2S replication catchup response payload bytes encoded by mode.",
+            "Logical S2S replication catchup response bytes encoded by mode, initiating reason, and phase.",
             "counter",
         );
         self.header(
             "shitspeak_s2s_replication_catchup_suppressed_total",
-            "S2S replication catchup responses suppressed by local limiter.",
+            "S2S replication catchup work suppressed by mode, initiating reason, and phase.",
             "counter",
         );
         self.header(
             "shitspeak_s2s_replication_catchup_active",
             "S2S replication catchup responses currently active.",
             "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_catchup_session_starts_total",
+            "Strict replication catchup sessions started by bounded initiating reason.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_catchup_session_completions_total",
+            "Strict replication catchup sessions completed by bounded initiating reason and outcome.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_catchup_sessions_active",
+            "Current strict replication catchup sessions by bounded initiating reason.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_catchup_session_events_total",
+            "Strict replication catchup session coalescing, refresh, restart, and final-ack events.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_catchup_send_attempts_total",
+            "Physical strict replication catchup send attempts by reason, phase, lane, and outcome, including retries and redundant copies.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_catchup_send_bytes_total",
+            "Exact encoded bytes in physical strict replication catchup send attempts by reason, phase, lane, and outcome.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_catchup_duplicate_pages_total",
+            "Strict replication catchup duplicate pages by suppression or cached-replay outcome.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_catchup_backpressure_events_total",
+            "Strict replication catchup backpressure, retry, and exhausted-retry events by reason and phase.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_catchup_backoff_delay_ms_total",
+            "Accumulated strict replication catchup backoff delay in milliseconds by reason and phase.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_catchup_bulk_in_flight_bytes",
+            "Current strict replication catchup bulk bytes reserved in flight.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_catchup_throttled_total",
+            "Strict replication catchup work throttled by bounded resource reason.",
+            "counter",
         );
         // CPU_ATTRIBUTION_PROMQL s2s_replication_pipeline:
         // topk(20, sum by (kind, stage) (
@@ -3614,6 +3669,52 @@ mod tests {
                 "# TYPE shitspeak_s2s_strict_replication_admission_highest_barrier gauge\n"
             )
         );
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_catchup_session_starts_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_catchup_session_completions_total counter\n"
+        ));
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_strict_replication_catchup_sessions_active gauge\n"
+            )
+        );
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_catchup_session_events_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_catchup_send_attempts_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_catchup_send_bytes_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_catchup_duplicate_pages_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_catchup_backpressure_events_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_catchup_backoff_delay_ms_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_catchup_bulk_in_flight_bytes gauge\n"
+        ));
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_strict_replication_catchup_throttled_total counter\n"
+            )
+        );
+        assert!(rendered.contains(
+            "shitspeak_s2s_replication_catchup_requests_total{mode=\"strict\",reason=\"legacy_v2\",phase=\"metadata\"}"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_strict_replication_catchup_sessions_active{reason=\"delivery_watermark\"}"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_strict_replication_catchup_duplicate_pages_total{outcome=\"cached_replay\"}"
+        ));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_deadline_wakes_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_proactive_events_total counter\n"));
     }

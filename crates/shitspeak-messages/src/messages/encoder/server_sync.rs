@@ -5,11 +5,11 @@ pub struct ServerSync {
     pub session: Option<u32>,
     pub max_bandwidth: Option<u32>,
     pub welcome_text: Option<String>,
-    pub permissions: Option<enumflags2::BitFlags<crate::acl::ACLPermissions>>,
+    pub permissions: Option<enumflags2::BitFlags<shitspeak_core::ACLPermissions>>,
 }
 
-impl From<crate::mumble_proto::ServerSync> for ServerSync {
-    fn from(proto: crate::mumble_proto::ServerSync) -> Self {
+impl From<shitspeak_proto::mumble_proto::ServerSync> for ServerSync {
+    fn from(proto: shitspeak_proto::mumble_proto::ServerSync) -> Self {
         Self {
             session: proto.session,
             max_bandwidth: proto.max_bandwidth,
@@ -21,9 +21,9 @@ impl From<crate::mumble_proto::ServerSync> for ServerSync {
     }
 }
 
-impl From<ServerSync> for crate::mumble_proto::ServerSync {
+impl From<ServerSync> for shitspeak_proto::mumble_proto::ServerSync {
     fn from(value: ServerSync) -> Self {
-        crate::mumble_proto::ServerSync {
+        shitspeak_proto::mumble_proto::ServerSync {
             session: value.session,
             max_bandwidth: value.max_bandwidth,
             welcome_text: value.welcome_text,

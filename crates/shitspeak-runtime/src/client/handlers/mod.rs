@@ -22,8 +22,6 @@ mod voice_target;
 
 use std::sync::Arc;
 
-use prost::Message as _;
-
 use acl::handle_acl;
 use authenticate::handle_authenticate;
 use ban_list::handle_ban_list;
@@ -62,8 +60,8 @@ fn channel_op_propose_failed(
             "Channel operation failed because the S2S commit could not complete; please try again"
                 .to_owned()
         });
-    MessageHandlerError::PermissionDenied(crate::messages::encoder::PermissionDenied {
-        r#type: crate::messages::encoder::DenyType::Permission,
+    MessageHandlerError::PermissionDenied(shitspeak_messages::messages::encoder::PermissionDenied {
+        r#type: shitspeak_messages::messages::encoder::DenyType::Permission,
         session,
         channel_id,
         reason: Some(reason.into()),
@@ -439,27 +437,24 @@ async fn handle_message_inner(
     // back to the client immediately; all other errors propagate.
     match result {
         Err(MessageHandlerError::ProtocolViolation(reason)) => {
-            use crate::messages::WriteMessageExt;
             tracing::warn!(session, reason = %reason, "Protocol violation");
             let reject = crate::errors::AuthRejection::new_with_language(
-                crate::messages::encoder::RejectType::None,
+                shitspeak_messages::messages::encoder::RejectType::None,
                 client.language(),
             );
-            let reject_msg: crate::messages::encoder::Reject = reject.clone().into();
-            let msg = crate::messages::Message::Reject(reject_msg.into());
+            let reject_msg: shitspeak_messages::messages::encoder::Reject = reject.clone().into();
+            let msg = shitspeak_messages::messages::Message::Reject(reject_msg.into());
             client.write_proto_message_direct(&msg).await?;
             Err(MessageHandlerError::AuthRejection(reject))
         }
         Err(MessageHandlerError::AuthRejection(reject)) => {
-            use crate::messages::WriteMessageExt;
-            let reject_msg: crate::messages::encoder::Reject =
+            let reject_msg: shitspeak_messages::messages::encoder::Reject =
                 reject.clone().localized(client.language()).into();
-            let msg = crate::messages::Message::Reject(reject_msg.into());
+            let msg = shitspeak_messages::messages::Message::Reject(reject_msg.into());
             client.write_proto_message_direct(&msg).await?;
             Err(MessageHandlerError::AuthRejection(reject))
         }
         Err(MessageHandlerError::PermissionDenied(mut deny)) => {
-            use crate::messages::WriteMessageExt;
             if deny.reason.is_none() {
                 deny.reason = Some(crate::localization::permission_denied_reason(
                     client.language(),
@@ -476,7 +471,7 @@ async fn handle_message_inner(
                 reason = ?deny.reason,
                 "Permission denied"
             );
-            let msg: crate::messages::Message = deny.into();
+            let msg: shitspeak_messages::messages::Message = deny.into();
             client.write_proto_message(&msg).await?;
             Ok(())
         }

@@ -1,13 +1,15 @@
 //! Strict-mode catchup: chunked snapshot + log replay over `OverlayData`.
 //!
-//! Ordinary history paging is stateless on the server side: each request
-//! carries `since_version` plus a continuation `chunk_token`; the server returns up to
+//! Legacy history paging is stateless on the server side: each request carries
+//! `since_version` plus a continuation `chunk_token`; the server returns up to
 //! [`crate::replications::ReplicationConfig::strict_max_catchup_ops`]
 //! ops with `has_more` set when more are available. The client iterates by
 //! re-issuing requests with the returned `next_chunk_token` until
 //! `has_more = false`. V2 snapshots are deliberately different: a responder
 //! pins one immutable image per peer/transfer and the receiver assembles
-//! authenticated, in-order byte chunks before installing it.
+//! authenticated, in-order byte chunks before installing it. V3 history pages
+//! are correlated and retained through their continuation or final ACK so a
+//! lost response can be replayed without branching the cursor chain.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -19,12 +21,38 @@ use prost::Message as _;
 use tracing::{trace, warn};
 
 use super::super::error::ReplicationError;
-use super::super::metrics::{self, CatchupMode, ReplicationPipelineKind, ReplicationPipelineStage};
-use super::super::proto::{CatchupOp, StrictBody, StrictCatchupReq, StrictCatchupResp};
+use super::super::metrics::{
+    self, CatchupMode, CatchupPhase, CatchupReason, ReplicationPipelineKind,
+    ReplicationPipelineStage, StrictCatchupDuplicateOutcome, StrictCatchupSessionEvent,
+    StrictCatchupSessionOutcome,
+};
+use super::super::proto::{
+    CatchupOp, StrictBody, StrictCatchupReason, StrictCatchupReq, StrictCatchupResp,
+    StrictClockProbeReq, StrictClockProbeResp, StrictHistoryProbeReq, StrictHistoryProbeResp,
+    StrictHistoryTransferResp, StrictTerminalDelta, StrictTerminalPageKind, StrictTerminalSyncAck,
+    StrictTerminalSyncPage, StrictTerminalSyncReq, StrictTerminalSyncStatus,
+};
+use super::history_v3::HistoryServerRequest;
 use super::runtime::{
-    HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryProbeResponseOutcome, HistoryRank,
+    BulkPageIdentity, HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryProbeResponseOutcome, HistoryRank,
     HistorySnapshotResponseOutcome, STRICT_PROTOCOL_VERSION_V2, SnapshotReceiveTransfer,
-    SnapshotTransfer, StrictRuntime, TerminalCommitProof, terminal_identity_from_wire,
+    SnapshotTransfer, StrictRuntime, TerminalCommitProof, TerminalDecisionIdentity, node_from_u32,
+    replication_bulk_backpressure, terminal_identity_from_wire, validate_v3_metadata_control,
+};
+use super::session_reducer::{
+    Cursor as SessionCursor, CursorKind as SessionCursorKind, Effect as SessionEffect,
+    Event as SessionEvent, InboundArbitration as SessionInboundArbitration,
+    PeerEpoch as SessionPeerEpoch, Status as SessionStatus, SyncKind as SessionSyncKind,
+    TransferId as SessionTransferId, Trigger as SessionTrigger,
+    TriggerOrigin as SessionTriggerOrigin, WireIdentity as SessionWireIdentity,
+    WireNonce as SessionWireNonce,
+};
+use super::sync_v3::{
+    InboundTerminalSyncDisposition, PeerIncarnation, ResponderSession, cut_from_wire,
+    cut_to_reducer, cut_to_wire, source_cut_covers,
+};
+use super::terminal_journal::{
+    CommitCandidate, TerminalCut, TerminalDecision as JournalTerminalDecision, TerminalJournal,
 };
 use super::{HistoryMetadata, LogSlice, StrictLogMetadata, StrictReplicable, StrictSnapshotError};
 use shitspeak_core::NodeIdentifier;
@@ -33,6 +61,146 @@ use shitspeak_s2s_transport::ServiceLevel;
 /// Opt out of terminal-fence transfer for steady-state probes. Startup and
 /// membership-heal catchup begin at zero and paginate the stable journal.
 pub(crate) const TERMINAL_STATE_CURSOR_SKIP: u64 = u64::MAX;
+
+fn history_transfer_response<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    req: &StrictCatchupReq,
+) -> Option<StrictHistoryTransferResp> {
+    let transfer = req.history_transfer.as_ref()?;
+    let requester = node_from_u32(req.src_node)?;
+    Some(StrictHistoryTransferResp {
+        expected_requester_boot_epoch: rt.net.member_boot_epoch(requester)?,
+        transfer_id: transfer.transfer_id,
+        request_nonce: transfer.request_nonce,
+        cursor: transfer.expected_cursor,
+        target_version: transfer.target_version,
+    })
+}
+
+fn v3_history_reason(req: &StrictCatchupReq) -> Option<CatchupReason> {
+    CatchupReason::from_v3_wire(req.history_transfer.as_ref()?.reason)
+}
+
+fn v3_history_request_phase(req: &StrictCatchupReq) -> CatchupPhase {
+    if req
+        .history_transfer
+        .as_ref()
+        .is_some_and(|transfer| transfer.final_ack)
+    {
+        CatchupPhase::FinalAck
+    } else if req.force_snapshot || req.snapshot_transfer_id != 0 {
+        CatchupPhase::Snapshot
+    } else {
+        CatchupPhase::LogDelta
+    }
+}
+
+fn v3_history_response_phase(response: &StrictCatchupResp) -> CatchupPhase {
+    if response.too_old_use_snapshot
+        || response.snapshot_transfer_id != 0
+        || !response.snapshot_msgpack.is_empty()
+    {
+        CatchupPhase::Snapshot
+    } else {
+        CatchupPhase::LogDelta
+    }
+}
+
+async fn send_v3_history_request<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    dst: NodeIdentifier,
+    req: StrictCatchupReq,
+) -> Result<(), ReplicationError> {
+    let reason = v3_history_reason(&req).ok_or(ReplicationError::Malformed(
+        "v3 history request lacks a bounded reason",
+    ))?;
+    let transfer = req
+        .history_transfer
+        .as_ref()
+        .ok_or(ReplicationError::Malformed(
+            "v3 history request lacks transfer correlation",
+        ))?;
+    let phase = if transfer.final_ack {
+        CatchupPhase::FinalAck
+    } else {
+        v3_history_request_phase(&req)
+    };
+    let epoch = rt
+        .net
+        .member_boot_epoch(dst)
+        .ok_or(ReplicationError::Malformed(
+            "v3 history request destination has no active incarnation",
+        ))?;
+    let peer = PeerIncarnation::new(dst, epoch);
+    if transfer.final_ack {
+        rt.v3_retries.lock().register_history_final_ack(
+            peer,
+            req.clone(),
+            rt.cfg.bulk_retry_delay(),
+            rt.cfg.pending_propose_ttl(),
+            rt.cfg.strict_bulk_retry_jitter_pct(),
+            v3_retry_salt(rt.self_id, &rt.topic),
+        );
+    } else {
+        rt.v3_retries.lock().register_history_request(
+            peer,
+            req.clone(),
+            rt.cfg.bulk_retry_delay(),
+            rt.cfg.pending_propose_ttl(),
+            rt.cfg.strict_bulk_retry_jitter_pct(),
+            v3_retry_salt(rt.self_id, &rt.topic),
+        );
+    }
+    metrics::record_catchup_request_detail(CatchupMode::Strict, reason, phase);
+    rt.net
+        .send_redundant_catchup_unicast(dst, &rt.topic, StrictBody::CatchupReq(req), reason, phase)
+        .await
+}
+
+async fn send_v3_history_response<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    dst: NodeIdentifier,
+    req: &StrictCatchupReq,
+    response: StrictCatchupResp,
+) -> Result<(), ReplicationError> {
+    let reason = v3_history_reason(req).ok_or(ReplicationError::Malformed(
+        "v3 history response lacks a bounded reason",
+    ))?;
+    let phase = v3_history_response_phase(&response);
+    let records = response.ops.len();
+    let encoded_len = encoded_response_len(rt, &response)?;
+    if encoded_len > rt.strict_catchup_response_budget() {
+        return Err(ReplicationError::Malformed(
+            "v3 history response exceeds configured encoded response budget",
+        ));
+    }
+    if let (Some(epoch), Some(transfer)) =
+        (rt.net.member_boot_epoch(dst), req.history_transfer.as_ref())
+    {
+        rt.v3_history.lock().cache_server_response(
+            PeerIncarnation::new(dst, epoch),
+            transfer,
+            response.clone(),
+        );
+    }
+    metrics::record_catchup_response_detail(
+        CatchupMode::Strict,
+        reason,
+        phase,
+        records,
+        encoded_len,
+    );
+    rt.net
+        .send_bulk_catchup_unicast(
+            dst,
+            &rt.topic,
+            StrictBody::CatchupResp(response),
+            rt.cfg.bulk_retry_delay(),
+            reason,
+            phase,
+        )
+        .await
+}
 
 fn encoded_response_len<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
@@ -117,6 +285,13 @@ fn history_response_encoded_len<R: StrictReplicable>(
         snapshot_sha256: Bytes::new(),
         snapshot_has_more: false,
         snapshot_transfer_rejected: false,
+        history_transfer: Some(StrictHistoryTransferResp {
+            expected_requester_boot_epoch: u64::MAX,
+            transfer_id: u64::MAX,
+            request_nonce: u64::MAX,
+            cursor: u64::MAX,
+            target_version: u64::MAX,
+        }),
     };
     if v2_origin_proof {
         v2_encoded_response_len(rt, &response)
@@ -405,6 +580,7 @@ fn snapshot_chunk_response<R: StrictReplicable>(
             snapshot_sha256: transfer.snapshot_sha256.clone(),
             snapshot_has_more: next < total,
             snapshot_transfer_rejected: false,
+            history_transfer: history_transfer_response(rt, req),
         })
     };
 
@@ -461,8 +637,15 @@ async fn send_snapshot_transfer_rejected<R: StrictReplicable>(
         snapshot_sha256: Bytes::new(),
         snapshot_has_more: false,
         snapshot_transfer_rejected: true,
+        history_transfer: history_transfer_response(rt, req),
     };
-    send_v2_response(rt, from, response).await;
+    if req.history_transfer.is_some() {
+        if let Err(error) = send_v3_history_response(rt, from, req, response).await {
+            warn!(from, %error, "strict v3 snapshot rejection send failed");
+        }
+    } else {
+        send_v2_response(rt, from, response).await;
+    }
 }
 
 async fn respond_with_snapshot_transfer<R: StrictReplicable>(
@@ -480,6 +663,15 @@ async fn respond_with_snapshot_transfer<R: StrictReplicable>(
                 return;
             }
         };
+    if req
+        .history_transfer
+        .as_ref()
+        .is_some_and(|correlation| correlation.target_version != transfer.version)
+    {
+        rt.snapshot_transfers.lock().remove(&from);
+        send_snapshot_transfer_rejected(rt, from, req, terminal_decision_generation).await;
+        return;
+    }
     // If a terminal decision landed after the image capture, the peer must
     // re-page the new fence cut before it receives any image that could
     // include the decision's repository delivery.
@@ -502,13 +694,19 @@ async fn respond_with_snapshot_transfer<R: StrictReplicable>(
         return;
     };
     let response_bytes = response.snapshot_msgpack.len();
-    metrics::record_catchup_response(CatchupMode::Strict, 0, response_bytes);
     metrics::record_pipeline_stage(
         ReplicationPipelineKind::Strict,
         ReplicationPipelineStage::CatchupBuild,
         build_started_at.elapsed(),
     );
-    send_v2_response(rt, from, response).await;
+    if req.history_transfer.is_some() {
+        if let Err(error) = send_v3_history_response(rt, from, req, response).await {
+            warn!(from, %error, "strict v3 snapshot page send failed");
+        }
+    } else {
+        metrics::record_catchup_response(CatchupMode::Strict, 0, response_bytes);
+        send_v2_response(rt, from, response).await;
+    }
 }
 
 /// Build and send a `StrictCatchupResp` answering `req`.
@@ -517,6 +715,77 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     from: NodeIdentifier,
     req: StrictCatchupReq,
 ) {
+    let mut history_replay = None;
+    let mut history_server_peer = None;
+    let correlated_v3_history = match req.history_transfer.as_ref() {
+        Some(transfer) => {
+            let valid_reason = StrictCatchupReason::try_from(transfer.reason)
+                .ok()
+                .is_some_and(|reason| {
+                    !matches!(
+                        reason,
+                        StrictCatchupReason::TerminalFence
+                            | StrictCatchupReason::DeliveryWatermark
+                            | StrictCatchupReason::Unspecified
+                    )
+                });
+            if !rt.v3_repair_supported_by(from)
+                || transfer.expected_responder_boot_epoch != rt.boot_epoch
+                || transfer.transfer_id == 0
+                || transfer.request_nonce == 0
+                || transfer.acknowledged_request_nonce == transfer.request_nonce
+                || transfer.target_version < req.since_version
+                || transfer.target_version > rt.repo.current_version()
+                || !valid_reason
+            {
+                return;
+            }
+            let Some(epoch) = rt.net.member_boot_epoch(from) else {
+                return;
+            };
+            let peer = PeerIncarnation::new(from, epoch);
+            if transfer.final_ack {
+                if rt
+                    .v3_history
+                    .lock()
+                    .acknowledge_server_final(peer, transfer)
+                {
+                    rt.net.acknowledge_bulk_unicast(
+                        from,
+                        &rt.topic,
+                        BulkPageIdentity::history(
+                            transfer.transfer_id,
+                            transfer.acknowledged_request_nonce,
+                        ),
+                    );
+                }
+                return;
+            }
+            if rt.v3_sync.lock().has_periodic_work(peer) {
+                return;
+            }
+            match rt.v3_history.lock().begin_server_request(
+                peer,
+                transfer,
+                rt.cfg.pending_propose_ttl(),
+            ) {
+                HistoryServerRequest::Build => history_server_peer = Some(peer),
+                HistoryServerRequest::Replay(response) => {
+                    metrics::record_strict_catchup_duplicate(
+                        StrictCatchupDuplicateOutcome::CachedReplay,
+                    );
+                    history_replay = Some(response);
+                }
+                HistoryServerRequest::Suppress | HistoryServerRequest::Reject => return,
+            }
+            true
+        }
+        None => false,
+    };
+    if let Some(response) = history_replay {
+        let _ = send_v3_history_response(rt, from, &req, response).await;
+        return;
+    }
     // Every admission/history probe needs a fresh directed clock proof. A
     // requester that already remembers the responder's terminal generation
     // legitimately starts at SKIP and must not lose the clock half of the
@@ -526,8 +795,33 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         .cfg
         .try_begin_catchup(CatchupMode::Strict, &rt.topic, from)
     else {
+        if let (Some(peer), Some(transfer)) = (history_server_peer, req.history_transfer.as_ref()) {
+            rt.v3_history.lock().abandon_server_request(peer, transfer);
+        }
         return;
     };
+    // V3 history continuations echo the exact response nonce whose physical
+    // first-hop reservation is now durable. Legacy v2 can only correlate by
+    // its advancing cursor and therefore retains its single legacy slot.
+    if let Some(transfer) = req.history_transfer.as_ref() {
+        if transfer.acknowledged_request_nonce != 0 {
+            rt.net.acknowledge_bulk_unicast(
+                from,
+                &rt.topic,
+                BulkPageIdentity::history(
+                    transfer.transfer_id,
+                    transfer.acknowledged_request_nonce,
+                ),
+            );
+        }
+    } else if req.chunk_token > req.since_version
+        || (req.terminal_state_cursor != 0
+            && req.terminal_state_cursor != TERMINAL_STATE_CURSOR_SKIP)
+        || (req.snapshot_transfer_id != 0 && req.snapshot_chunk_cursor != 0)
+    {
+        rt.net
+            .acknowledge_bulk_unicast(from, &rt.topic, BulkPageIdentity::Legacy);
+    }
     if !rt.terminal_storage_ready() {
         warn!(
             from,
@@ -558,6 +852,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
             terminal_decision_generation: 0,
             snapshot_transfer_id: 0,
             snapshot_chunk_cursor: 0,
+            history_transfer: None,
         };
         metrics::record_catchup_request(CatchupMode::Strict);
         if let Err(error) = rt
@@ -609,7 +904,8 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     // repository-version cursor so a long-lived journal cannot inflate every
     // catchup response beyond the transport frame cap.
     let current_terminal_decision_generation = rt.terminal_decision_generation();
-    let must_restart_terminal_sync = v2_terminal_catchup
+    let must_restart_terminal_sync = !correlated_v3_history
+        && v2_terminal_catchup
         && req.terminal_state_cursor == TERMINAL_STATE_CURSOR_SKIP
         && req.terminal_decision_generation != current_terminal_decision_generation;
     if must_restart_terminal_sync {
@@ -620,7 +916,8 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     // history image built below. It comes from the same journal snapshot as
     // the terminal page, rather than from a later independent journal read.
     let mut terminal_decision_generation = current_terminal_decision_generation;
-    let terminal_state_cursor = if v2_terminal_catchup
+    let terminal_state_cursor = if !correlated_v3_history
+        && v2_terminal_catchup
         && (req.terminal_state_cursor != TERMINAL_STATE_CURSOR_SKIP || must_restart_terminal_sync)
     {
         let terminal_cursor = if must_restart_terminal_sync {
@@ -686,6 +983,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
                 snapshot_sha256: Bytes::new(),
                 snapshot_has_more: false,
                 snapshot_transfer_rejected: false,
+                history_transfer: history_transfer_response(rt, &req),
             };
             metrics::record_pipeline_stage(
                 ReplicationPipelineKind::Strict,
@@ -731,6 +1029,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
             snapshot_sha256: Bytes::new(),
             snapshot_has_more: false,
             snapshot_transfer_rejected: false,
+            history_transfer: history_transfer_response(rt, &req),
         };
         metrics::record_pipeline_stage(
             ReplicationPipelineKind::Strict,
@@ -891,7 +1190,14 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     let mut response_bytes = snapshot_msgpack.len();
     let mut next_chunk_token = effective_since;
     let mut has_more = false;
+    let fixed_target_version = req
+        .history_transfer
+        .as_ref()
+        .map(|transfer| transfer.target_version);
     for (v, entry) in &effective_ops {
+        if fixed_target_version.is_some_and(|target| *v > target) {
+            break;
+        }
         if catchup_ops.len() >= max_ops {
             has_more = true;
             break;
@@ -1032,10 +1338,12 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     }
     if !has_more
         && next_chunk_token
-            < effective_ops
-                .last()
-                .map(|(version, _)| *version)
-                .unwrap_or(effective_since)
+            < fixed_target_version.unwrap_or_else(|| {
+                effective_ops
+                    .last()
+                    .map(|(version, _)| *version)
+                    .unwrap_or(effective_since)
+            })
     {
         has_more = true;
     }
@@ -1045,7 +1353,8 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     // terminal pagination from the new durable cut first. The generation was
     // captured with the terminal page (or verified from the request's echoed
     // completed cut), so an abort committed in the gap cannot be missed.
-    if terminal_state_cursor == TERMINAL_STATE_CURSOR_SKIP
+    if !correlated_v3_history
+        && terminal_state_cursor == TERMINAL_STATE_CURSOR_SKIP
         && terminal_decision_generation != rt.terminal_decision_generation()
     {
         if !v2_terminal_catchup {
@@ -1111,6 +1420,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
             snapshot_sha256: Bytes::new(),
             snapshot_has_more: false,
             snapshot_transfer_rejected: false,
+            history_transfer: history_transfer_response(rt, &req),
         };
         metrics::record_pipeline_stage(
             ReplicationPipelineKind::Strict,
@@ -1121,7 +1431,6 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         send_v2_response(rt, from, resp).await;
         return;
     }
-    metrics::record_catchup_response(CatchupMode::Strict, catchup_ops.len(), response_bytes);
     metrics::record_pipeline_stage(
         ReplicationPipelineKind::Strict,
         ReplicationPipelineStage::CatchupBuild,
@@ -1167,10 +1476,18 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         snapshot_sha256: Bytes::new(),
         snapshot_has_more: false,
         snapshot_transfer_rejected: false,
+        history_transfer: history_transfer_response(rt, &req),
     };
-    if v2_terminal_catchup {
+    let response_records = resp.ops.len();
+    if correlated_v3_history {
+        if let Err(error) = send_v3_history_response(rt, from, &req, resp).await {
+            warn!(from, %error, "strict v3 repository history response send failed");
+        }
+    } else if v2_terminal_catchup {
+        metrics::record_catchup_response(CatchupMode::Strict, response_records, response_bytes);
         send_v2_response(rt, from, resp).await;
     } else {
+        metrics::record_catchup_response(CatchupMode::Strict, response_records, response_bytes);
         send_response(rt, from, resp).await;
     }
 }
@@ -1190,6 +1507,7 @@ async fn install_snapshot_candidate<R: StrictReplicable>(
     snapshot_version: u64,
     snapshot_msgpack: Bytes,
     apply_started_at: Instant,
+    correlated_peer: Option<PeerIncarnation>,
 ) {
     let local_rank = HistoryRank::local(rt);
     // This state transition rechecks bootstrap and delivery fences while the
@@ -1203,6 +1521,9 @@ async fn install_snapshot_candidate<R: StrictReplicable>(
         snapshot_msgpack,
     );
     let HistorySnapshotResponseOutcome::Install(winner) = outcome else {
+        if let Some(peer) = correlated_peer {
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+        }
         return;
     };
     // Delivery can begin after the state transition, so retain the explicit
@@ -1212,6 +1533,9 @@ async fn install_snapshot_candidate<R: StrictReplicable>(
             from,
             "strict snapshot install deferred while terminal delivery is in flight"
         );
+        if let Some(peer) = correlated_peer {
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+        }
         rearm_history_election(rt);
         return;
     }
@@ -1221,6 +1545,9 @@ async fn install_snapshot_candidate<R: StrictReplicable>(
             from,
             "strict snapshot install deferred while terminal delivery started"
         );
+        if let Some(peer) = correlated_peer {
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+        }
         rearm_history_election(rt);
         return;
     }
@@ -1237,9 +1564,12 @@ async fn install_snapshot_candidate<R: StrictReplicable>(
     match install_result {
         Ok(()) => {
             rt.state.lock().finish_history_election();
-            request_history_after_snapshot(rt, from, installed_version).await;
+            request_history_after_snapshot(rt, from, installed_version, correlated_peer).await;
         }
         Err(error) => {
+            if let Some(peer) = correlated_peer {
+                finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+            }
             if snapshot_error_withdraws_repository_capability(rt, &error) {
                 warn!(
                     from,
@@ -1266,11 +1596,23 @@ async fn request_history_after_snapshot<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     from: NodeIdentifier,
     snapshot_version: u64,
+    correlated_peer: Option<PeerIncarnation>,
 ) {
     if from == rt.self_id
         || !rt.net.has_route(from, ServiceLevel::Reliable)
         || !v2_snapshot_transfer_supported(rt, from)
     {
+        if let Some(peer) = correlated_peer {
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+        }
+        return;
+    }
+    let history_transfer = correlated_peer.and_then(|peer| {
+        rt.v3_history
+            .lock()
+            .continue_transfer(peer, snapshot_version)
+    });
+    if correlated_peer.is_some() && history_transfer.is_none() {
         return;
     }
     let req = StrictCatchupReq {
@@ -1283,13 +1625,17 @@ async fn request_history_after_snapshot<R: StrictReplicable>(
         terminal_decision_generation: rt.remembered_terminal_decision_generation(from),
         snapshot_transfer_id: 0,
         snapshot_chunk_cursor: 0,
+        history_transfer,
     };
-    metrics::record_catchup_request(CatchupMode::Strict);
-    if let Err(error) = rt
-        .net
-        .send_unicast(from, &rt.topic, StrictBody::CatchupReq(req))
-        .await
-    {
+    let result = if correlated_peer.is_some() {
+        send_v3_history_request(rt, from, req).await
+    } else {
+        metrics::record_catchup_request(CatchupMode::Strict);
+        rt.net
+            .send_unicast(from, &rt.topic, StrictBody::CatchupReq(req))
+            .await
+    };
+    if let Err(error) = result {
         warn!(from, error = %error, "strict post-snapshot history catchup send failed");
     }
 }
@@ -1495,12 +1841,21 @@ async fn request_next_snapshot_chunk<R: StrictReplicable>(
     snapshot_version: u64,
     next_cursor: u64,
     terminal_decision_generation: u64,
+    correlated_peer: Option<PeerIncarnation>,
 ) {
     if from == rt.self_id
         || !rt.net.has_route(from, ServiceLevel::Reliable)
         || !v2_snapshot_transfer_supported(rt, from)
     {
+        if let Some(peer) = correlated_peer {
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+        }
         rearm_history_election(rt);
+        return;
+    }
+    let history_transfer =
+        correlated_peer.and_then(|peer| rt.v3_history.lock().continue_transfer(peer, next_cursor));
+    if correlated_peer.is_some() && history_transfer.is_none() {
         return;
     }
     let req = StrictCatchupReq {
@@ -1513,15 +1868,21 @@ async fn request_next_snapshot_chunk<R: StrictReplicable>(
         terminal_decision_generation,
         snapshot_transfer_id: transfer_id,
         snapshot_chunk_cursor: next_cursor,
+        history_transfer,
     };
-    metrics::record_catchup_request(CatchupMode::Strict);
-    if let Err(error) = rt
-        .net
-        .send_unicast(from, &rt.topic, StrictBody::CatchupReq(req))
-        .await
-    {
+    let result = if correlated_peer.is_some() {
+        send_v3_history_request(rt, from, req).await
+    } else {
+        metrics::record_catchup_request(CatchupMode::Strict);
+        rt.net
+            .send_unicast(from, &rt.topic, StrictBody::CatchupReq(req))
+            .await
+    };
+    if let Err(error) = result {
         warn!(from, error = %error, "strict v2 snapshot chunk continuation send failed");
-        rearm_history_election(rt);
+        if correlated_peer.is_none() {
+            rearm_history_election(rt);
+        }
     }
 }
 
@@ -1531,8 +1892,12 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
     resp: &StrictCatchupResp,
     remote_rank: HistoryRank,
     apply_started_at: Instant,
+    correlated_peer: Option<PeerIncarnation>,
 ) {
     if resp.snapshot_transfer_rejected {
+        if let Some(peer) = correlated_peer {
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+        }
         rt.snapshot_receivers.lock().remove(&from);
         warn!(
             from,
@@ -1555,6 +1920,7 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
                 snapshot_version,
                 next_cursor,
                 terminal_decision_generation,
+                correlated_peer,
             )
             .await;
         }
@@ -1565,6 +1931,9 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
             snapshot_sha256: expected_sha256,
         } => {
             if snapshot_sha256(&snapshot_msgpack) != expected_sha256 {
+                if let Some(peer) = correlated_peer {
+                    finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+                }
                 warn!(
                     from,
                     "strict v2 snapshot transfer SHA-256 verification failed"
@@ -1579,6 +1948,7 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
                 snapshot_version,
                 Bytes::from(snapshot_msgpack),
                 apply_started_at,
+                correlated_peer,
             )
             .await;
         }
@@ -1591,6 +1961,9 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
             );
         }
         SnapshotReceiveOutcome::Restart => {
+            if let Some(peer) = correlated_peer {
+                finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+            }
             rt.snapshot_receivers.lock().remove(&from);
             warn!(
                 from,
@@ -1611,6 +1984,30 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     resp: StrictCatchupResp,
 ) -> Option<HistoryMetadata> {
     let apply_started_at = std::time::Instant::now();
+    let v3_peer = rt
+        .net
+        .member_boot_epoch(from)
+        .filter(|_| rt.v3_repair_supported_by(from))
+        .map(|epoch| PeerIncarnation::new(from, epoch));
+    let correlated_v3_history = match (&resp.history_transfer, v3_peer) {
+        (Some(transfer), Some(peer)) => {
+            if !rt
+                .v3_history
+                .lock()
+                .claim_response(peer, transfer, rt.boot_epoch)
+            {
+                metrics::record_strict_catchup_duplicate(StrictCatchupDuplicateOutcome::Suppressed);
+                return None;
+            }
+            rt.v3_retries
+                .lock()
+                .complete_history_request(peer, transfer.request_nonce);
+            Some(peer)
+        }
+        (Some(_), _) => return None,
+        (None, Some(peer)) if rt.v3_history.lock().expects_response(peer) => return None,
+        (None, _) => None,
+    };
     let Some(remote_node) = super::runtime::node_from_u32(resp.history_node) else {
         warn!(
             node = resp.history_node,
@@ -1676,6 +2073,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                 terminal_decision_generation: rt.remembered_terminal_decision_generation(from),
                 snapshot_transfer_id: 0,
                 snapshot_chunk_cursor: 0,
+                history_transfer: None,
             };
             metrics::record_catchup_request(CatchupMode::Strict);
             let _ = rt
@@ -1702,7 +2100,15 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         node_id: remote_node,
     };
     if resp.snapshot_transfer_rejected || resp.snapshot_transfer_id != 0 {
-        apply_snapshot_transfer_response(rt, from, &resp, remote_rank, apply_started_at).await;
+        apply_snapshot_transfer_response(
+            rt,
+            from,
+            &resp,
+            remote_rank,
+            apply_started_at,
+            correlated_v3_history,
+        )
+        .await;
         return None;
     }
     if resp.snapshot_chunk_cursor != 0
@@ -1724,6 +2130,18 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     let metadata_only_response =
         !resp.too_old_use_snapshot && resp.snapshot_msgpack.is_empty() && resp.ops.is_empty();
     if metadata_only_response {
+        if let Some(peer) = correlated_v3_history {
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Completed).await;
+            if resp.request_force_snapshot {
+                rt.state.lock().finish_history_election();
+            }
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Strict,
+                ReplicationPipelineStage::CatchupApply,
+                apply_started_at.elapsed(),
+            );
+            return None;
+        }
         // Admission evidence is narrower than a generally processable empty
         // catch-up page. Require the canonical final history-probe shape so
         // contradictory pagination, terminal, or snapshot flags cannot be
@@ -1819,6 +2237,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             resp.snapshot_version,
             resp.snapshot_msgpack,
             apply_started_at,
+            correlated_v3_history,
         )
         .await;
         return None;
@@ -1834,6 +2253,12 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     }
 
     if resp.ops.is_empty() {
+        if let Some(peer) = correlated_v3_history {
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Completed).await;
+            if resp.request_force_snapshot {
+                rt.state.lock().finish_history_election();
+            }
+        }
         metrics::record_pipeline_stage(
             ReplicationPipelineKind::Strict,
             ReplicationPipelineStage::CatchupApply,
@@ -1983,6 +2408,14 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             );
             return None;
         }
+        let history_transfer = correlated_v3_history.and_then(|peer| {
+            rt.v3_history
+                .lock()
+                .continue_transfer(peer, resp.next_chunk_token)
+        });
+        if correlated_v3_history.is_some() && history_transfer.is_none() {
+            return None;
+        }
         let req = StrictCatchupReq {
             src_node: rt.self_id as u32,
             since_version: resp.next_chunk_token,
@@ -1993,12 +2426,22 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             terminal_decision_generation: rt.remembered_terminal_decision_generation(from),
             snapshot_transfer_id: 0,
             snapshot_chunk_cursor: 0,
+            history_transfer,
         };
-        metrics::record_catchup_request(CatchupMode::Strict);
-        let _ = rt
-            .net
-            .send_unicast(from, &rt.topic, StrictBody::CatchupReq(req))
-            .await;
+        if correlated_v3_history.is_some() {
+            let _ = send_v3_history_request(rt, from, req).await;
+        } else {
+            metrics::record_catchup_request(CatchupMode::Strict);
+            let _ = rt
+                .net
+                .send_unicast(from, &rt.topic, StrictBody::CatchupReq(req))
+                .await;
+        }
+    } else if let Some(peer) = correlated_v3_history {
+        finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Completed).await;
+        if resp.request_force_snapshot {
+            rt.state.lock().finish_history_election();
+        }
     }
     metrics::record_pipeline_stage(
         ReplicationPipelineKind::Strict,
@@ -2006,6 +2449,2402 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         apply_started_at.elapsed(),
     );
     None
+}
+
+// ---------- Pairwise repair v3 ----------
+
+/// Send bounded v3 metadata on the route-diverse control lane. Validation is
+/// deliberately performed before invoking the transport so alternate/test
+/// implementations cannot observe or enqueue an oversized control frame.
+pub(super) async fn send_v3_metadata_control<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    dst: NodeIdentifier,
+    body: StrictBody,
+    reason: CatchupReason,
+    phase: CatchupPhase,
+) -> Result<(), ReplicationError> {
+    send_v3_metadata_control_inner(rt, dst, body, reason, phase, true).await
+}
+
+/// Enqueue an already-existing logical control message. Retry callers use
+/// this path so only the physical attempt counters grow when the same nonce
+/// or final-ACK identity is retransmitted.
+async fn retry_v3_metadata_control<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    dst: NodeIdentifier,
+    body: StrictBody,
+    reason: CatchupReason,
+    phase: CatchupPhase,
+) -> Result<(), ReplicationError> {
+    send_v3_metadata_control_inner(rt, dst, body, reason, phase, false).await
+}
+
+async fn send_v3_metadata_control_inner<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    dst: NodeIdentifier,
+    body: StrictBody,
+    reason: CatchupReason,
+    phase: CatchupPhase,
+    record_logical: bool,
+) -> Result<(), ReplicationError> {
+    let encoded_len = match validate_v3_metadata_control(rt.net.as_ref(), &rt.topic, &body) {
+        Ok(encoded_len) => encoded_len,
+        Err(error) => {
+            warn!(dst, topic = %rt.topic, %error, "rejecting strict v3 control frame");
+            return Err(error);
+        }
+    };
+    match (record_logical, &body) {
+        (
+            true,
+            StrictBody::ClockProbeReq(_)
+            | StrictBody::HistoryProbeReq(_)
+            | StrictBody::TerminalSyncReq(_),
+        ) => {
+            metrics::record_catchup_request_detail(CatchupMode::Strict, reason, phase);
+        }
+        (
+            true,
+            StrictBody::ClockProbeResp(_)
+            | StrictBody::HistoryProbeResp(_)
+            | StrictBody::TerminalSyncAck(_),
+        ) => {
+            metrics::record_catchup_response_detail(
+                CatchupMode::Strict,
+                reason,
+                phase,
+                0,
+                encoded_len,
+            );
+        }
+        _ => {}
+    }
+    rt.net
+        .send_redundant_catchup_unicast(dst, &rt.topic, body, reason, phase)
+        .await
+}
+
+fn v3_peer<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    node: NodeIdentifier,
+    boot_epoch: u64,
+) -> Option<PeerIncarnation> {
+    (rt.v3_repair_supported_by(node) && rt.net.member_boot_epoch(node) == Some(boot_epoch))
+        .then_some(PeerIncarnation::new(node, boot_epoch))
+}
+
+pub(super) async fn request_v3_clock_probe<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    dst: NodeIdentifier,
+    reason: StrictCatchupReason,
+) {
+    let Some(epoch) = rt.net.member_boot_epoch(dst) else {
+        return;
+    };
+    if !rt.v3_repair_supported_by(dst) {
+        return;
+    }
+    let Some(nonce) = rt.v3_sync.lock().record_clock_nonce(
+        PeerIncarnation::new(dst, epoch),
+        rt.cfg.pending_propose_ttl(),
+    ) else {
+        return;
+    };
+    let peer = PeerIncarnation::new(dst, epoch);
+    let result = send_v3_metadata_control(
+        rt,
+        dst,
+        StrictBody::ClockProbeReq(StrictClockProbeReq {
+            src_node: rt.self_id as u32,
+            expected_responder_boot_epoch: epoch,
+            request_nonce: nonce,
+            reason: reason as i32,
+        }),
+        CatchupReason::from_v3_wire(reason as i32).unwrap_or(CatchupReason::DeliveryWatermark),
+        CatchupPhase::Metadata,
+    )
+    .await;
+    if result.is_err() {
+        rt.v3_sync.lock().cancel_clock_nonce(peer, nonce);
+    }
+}
+
+pub(super) async fn recv_v3_clock_probe_req<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    from: NodeIdentifier,
+    epoch: u64,
+    req: StrictClockProbeReq,
+) {
+    let Some(reason) = CatchupReason::from_v3_wire(req.reason) else {
+        return;
+    };
+    if v3_peer(rt, from, epoch).is_none()
+        || node_from_u32(req.src_node) != Some(from)
+        || req.expected_responder_boot_epoch != rt.boot_epoch
+        || req.request_nonce == 0
+    {
+        return;
+    }
+    let _ = send_v3_metadata_control(
+        rt,
+        from,
+        StrictBody::ClockProbeResp(StrictClockProbeResp {
+            responder_node: rt.self_id as u32,
+            expected_requester_boot_epoch: epoch,
+            request_nonce: req.request_nonce,
+            src_clock: rt.advance_v3_clock_probe(),
+            reason: req.reason,
+        }),
+        reason,
+        CatchupPhase::Metadata,
+    )
+    .await;
+}
+
+pub(super) fn recv_v3_clock_probe_resp<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    from: NodeIdentifier,
+    epoch: u64,
+    resp: StrictClockProbeResp,
+) {
+    let Some(peer) = v3_peer(rt, from, epoch) else {
+        return;
+    };
+    if node_from_u32(resp.responder_node) != Some(from)
+        || resp.expected_requester_boot_epoch != rt.boot_epoch
+        || CatchupReason::from_v3_wire(resp.reason).is_none()
+        || !rt
+            .v3_sync
+            .lock()
+            .accept_clock_nonce(peer, resp.request_nonce)
+    {
+        return;
+    }
+    rt.accept_v3_clock_probe(from, epoch, resp.src_clock);
+}
+
+pub(super) async fn request_v3_history_probe<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    dst: NodeIdentifier,
+    reason: StrictCatchupReason,
+) {
+    let Some(epoch) = rt.net.member_boot_epoch(dst) else {
+        return;
+    };
+    if !rt.v3_repair_supported_by(dst) {
+        return;
+    }
+    let Some(nonce) = rt.v3_sync.lock().record_history_nonce(
+        PeerIncarnation::new(dst, epoch),
+        reason as i32,
+        rt.cfg.pending_propose_ttl(),
+    ) else {
+        return;
+    };
+    let peer = PeerIncarnation::new(dst, epoch);
+    let result = send_v3_metadata_control(
+        rt,
+        dst,
+        StrictBody::HistoryProbeReq(StrictHistoryProbeReq {
+            src_node: rt.self_id as u32,
+            expected_responder_boot_epoch: epoch,
+            request_nonce: nonce,
+            reason: reason as i32,
+        }),
+        CatchupReason::from_v3_wire(reason as i32).unwrap_or(CatchupReason::HistoryElection),
+        CatchupPhase::Metadata,
+    )
+    .await;
+    if result.is_err() {
+        rt.v3_sync.lock().cancel_history_nonce(peer, nonce);
+    }
+}
+
+pub(super) async fn recv_v3_history_probe_req<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    from: NodeIdentifier,
+    epoch: u64,
+    req: StrictHistoryProbeReq,
+) {
+    let Some(metric_reason) = CatchupReason::from_v3_wire(req.reason) else {
+        return;
+    };
+    if v3_peer(rt, from, epoch).is_none()
+        || node_from_u32(req.src_node) != Some(from)
+        || req.expected_responder_boot_epoch != rt.boot_epoch
+        || req.request_nonce == 0
+    {
+        return;
+    }
+    let rank = rt.v3_history_rank();
+    let cut = cut_to_wire(rt.terminal_journal.lock().terminal_cut());
+    let _ = send_v3_metadata_control(
+        rt,
+        from,
+        StrictBody::HistoryProbeResp(StrictHistoryProbeResp {
+            responder_node: rt.self_id as u32,
+            expected_requester_boot_epoch: epoch,
+            request_nonce: req.request_nonce,
+            repository_version: rank.version,
+            history_freshness: rank.freshness,
+            runtime_started_at: rank.runtime_started_at,
+            history_node: rank.node_id as u32,
+            terminal_cut: Some(cut),
+            reason: req.reason,
+        }),
+        metric_reason,
+        CatchupPhase::Metadata,
+    )
+    .await;
+}
+
+pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    from: NodeIdentifier,
+    epoch: u64,
+    resp: StrictHistoryProbeResp,
+) {
+    let Some(peer) = v3_peer(rt, from, epoch) else {
+        return;
+    };
+    let valid_cut = resp.terminal_cut.as_ref().and_then(cut_from_wire);
+    if node_from_u32(resp.responder_node) != Some(from)
+        || node_from_u32(resp.history_node) != Some(from)
+        || resp.expected_requester_boot_epoch != rt.boot_epoch
+        || valid_cut.is_none()
+    {
+        return;
+    }
+    let Some(accepted_probe) = rt
+        .v3_sync
+        .lock()
+        .accept_history_nonce(peer, resp.request_nonce)
+    else {
+        return;
+    };
+    let effective_reason = accepted_probe.reason();
+    let Some(mut reason) = StrictCatchupReason::try_from(effective_reason).ok() else {
+        return;
+    };
+    if CatchupReason::from_v3_wire(effective_reason).is_none() {
+        return;
+    }
+    // Admission may reuse a nonce that startup election promoted while the
+    // response was in flight. If that election has already closed, feeding
+    // the delayed response back into its collector only drops the proof. In
+    // particular, a divergent terminal cut then never starts the correlated
+    // terminal sync that admission requires. Treat the still-authenticated
+    // response as admission metadata; a later election attempt will allocate
+    // its own correlated probe if one is still requested.
+    let delayed_election_admission = if reason == StrictCatchupReason::HistoryElection {
+        let state = rt.state.lock();
+        !state.history_election_blocks_steady_state()
+            && state.peer_incarnation_awaits_history_proof(from, epoch)
+    } else {
+        false
+    };
+    if delayed_election_admission {
+        reason = StrictCatchupReason::Admission;
+    }
+    let rank = HistoryRank {
+        version: resp.repository_version,
+        freshness: resp.history_freshness,
+        runtime_started_at: resp.runtime_started_at,
+        node_id: from,
+    };
+    let response_cut = valid_cut.expect("validated terminal cut");
+    if reason == StrictCatchupReason::HistoryElection && accepted_probe.admission_pending() {
+        // Admission and election metadata share one nonce, but not one data
+        // transfer. Preserve the admission evidence until the election has
+        // completely stood down; repository history remains sourced only
+        // from the elected candidate.
+        rt.v3_history
+            .lock()
+            .defer_admission(peer, rank, response_cut);
+    }
+    if reason == StrictCatchupReason::HistoryElection {
+        // Startup election and admission often overlap. Metadata from an
+        // election candidate is also a valid admission proof only when its
+        // terminal fence is already known complete locally. A divergent cut
+        // remains metadata-only until the elected source is synchronized.
+        let response_terminal_equal = response_cut.terminal_set_digest()
+            == rt
+                .terminal_journal
+                .lock()
+                .terminal_cut()
+                .terminal_set_digest();
+        let response_source_known = rt
+            .v3_sync
+            .lock()
+            .known_source_cut(peer)
+            .is_some_and(|known| source_cut_covers(known, response_cut));
+        if response_terminal_equal || response_source_known {
+            rt.accept_v3_history_metadata(from, epoch, rank);
+        }
+    }
+    let (source_peer, rank, source_cut) = if reason == StrictCatchupReason::HistoryElection {
+        let Some(selected) = rt.record_v3_history_election_rank(peer, rank, response_cut) else {
+            return;
+        };
+        (selected.peer(), selected.rank(), selected.source_cut())
+    } else {
+        (peer, rank, response_cut)
+    };
+    if v3_peer(rt, source_peer.node(), source_peer.boot_epoch()).is_none() {
+        if reason == StrictCatchupReason::HistoryElection {
+            rt.state.lock().request_history_election();
+        }
+        return;
+    }
+    let source_node = source_peer.node();
+    let source_epoch = source_peer.boot_epoch();
+    let terminal_equal = source_cut.terminal_set_digest()
+        == rt
+            .terminal_journal
+            .lock()
+            .terminal_cut()
+            .terminal_set_digest();
+    let source_already_known = rt
+        .v3_sync
+        .lock()
+        .known_source_cut(source_peer)
+        .is_some_and(|known| source_cut_covers(known, source_cut));
+    // Generation zero is a complete proof that this source has no terminal
+    // fences. A requester with additional local fences must not checkpoint
+    // an empty, demonstrably-behind source merely because the set digests
+    // differ.
+    let source_satisfied = terminal_equal || source_already_known || source_cut.generation() == 0;
+    let history_needed = rank.version > rt.repo.current_version();
+    if source_satisfied {
+        rt.v3_sync
+            .lock()
+            .remember_source_cut(source_peer, source_cut);
+        if history_needed {
+            rt.v3_history
+                .lock()
+                .defer_until_terminal(source_peer, rank, source_cut, reason);
+            start_v3_repository_after_terminal(rt, source_peer, None).await;
+            return;
+        }
+        rt.accept_v3_history_metadata(source_node, source_epoch, rank);
+        if reason == StrictCatchupReason::HistoryElection {
+            rt.state.lock().finish_history_election();
+        }
+        return;
+    }
+    rt.v3_history
+        .lock()
+        .defer_until_terminal(source_peer, rank, source_cut, reason);
+    request_v3_terminal_sync_toward(rt, source_node, reason, Some(source_cut)).await;
+}
+
+/// Resume admission evidence that shared a promoted history-election nonce.
+/// This is called by the admission cadence only after the election is neither
+/// requested nor active. At that point it follows the ordinary admission
+/// sequence: validate the peer's terminal cut, then pull repository history
+/// only when the retained rank proves that this node is behind.
+pub(super) async fn resume_deferred_v3_admissions<R: StrictReplicable>(rt: &StrictRuntime<R>) {
+    if rt.state.lock().history_election_blocks_steady_state() {
+        return;
+    }
+    let deferred = rt.v3_history.lock().take_deferred_admissions();
+    for (index, candidate) in deferred.iter().copied().enumerate() {
+        if rt.state.lock().history_election_blocks_steady_state() {
+            let mut history = rt.v3_history.lock();
+            for pending in deferred[index..].iter().copied() {
+                history.defer_admission(pending.peer(), pending.rank(), pending.source_cut());
+            }
+            return;
+        }
+        let peer = candidate.peer();
+        if v3_peer(rt, peer.node(), peer.boot_epoch()).is_none() {
+            continue;
+        }
+        let (awaits_local_cut, awaits_history_proof) = {
+            let state = rt.state.lock();
+            (
+                state.peer_incarnation_awaits_local_admission_cut(peer.node(), peer.boot_epoch()),
+                state.peer_incarnation_awaits_history_proof(peer.node(), peer.boot_epoch()),
+            )
+        };
+        if awaits_local_cut {
+            rt.v3_history
+                .lock()
+                .defer_admission(peer, candidate.rank(), candidate.source_cut());
+            continue;
+        }
+        if !awaits_history_proof {
+            // The incarnation was removed, was already admitted, or already
+            // has its history proof. In each case this retained response is
+            // stale and must not start another synchronization session.
+            continue;
+        }
+        let rank = candidate.rank();
+        let source_cut = candidate.source_cut();
+        let terminal_equal = source_cut.terminal_set_digest()
+            == rt
+                .terminal_journal
+                .lock()
+                .terminal_cut()
+                .terminal_set_digest();
+        let source_known = rt
+            .v3_sync
+            .lock()
+            .known_source_cut(peer)
+            .is_some_and(|known| source_cut_covers(known, source_cut));
+        let terminal_satisfied = terminal_equal || source_known || source_cut.generation() == 0;
+        let history_needed = rank.version > rt.repo.current_version();
+        if terminal_satisfied {
+            rt.v3_sync.lock().remember_source_cut(peer, source_cut);
+            if history_needed {
+                rt.v3_history.lock().defer_until_terminal(
+                    peer,
+                    rank,
+                    source_cut,
+                    StrictCatchupReason::Admission,
+                );
+                start_v3_repository_after_terminal(rt, peer, None).await;
+                continue;
+            }
+            rt.accept_v3_history_metadata(peer.node(), peer.boot_epoch(), rank);
+            continue;
+        }
+        rt.v3_history.lock().defer_until_terminal(
+            peer,
+            rank,
+            source_cut,
+            StrictCatchupReason::Admission,
+        );
+        request_v3_terminal_sync_toward(
+            rt,
+            peer.node(),
+            StrictCatchupReason::Admission,
+            Some(source_cut),
+        )
+        .await;
+    }
+}
+
+async fn start_v3_repository_after_terminal<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    peer: PeerIncarnation,
+    inherited_metric_reason: Option<StrictCatchupReason>,
+) -> bool {
+    let Some(intent) = rt.v3_history.lock().take_after_terminal(peer) else {
+        return false;
+    };
+    let rank = intent.rank();
+    let reason = intent.reason();
+    let source_cut = intent.source_cut();
+    if !rt
+        .v3_sync
+        .lock()
+        .known_source_cut(peer)
+        .is_some_and(|known| source_cut_covers(known, source_cut))
+    {
+        // Repository history may only begin after the exact metadata source
+        // cut has been validated. Preserve the intent for a subsequent
+        // correlated sync rather than consuming it on unrelated progress.
+        rt.v3_history
+            .lock()
+            .defer_until_terminal(peer, rank, source_cut, reason);
+        return false;
+    }
+    rt.accept_v3_history_metadata(peer.node(), peer.boot_epoch(), rank);
+    if matches!(
+        reason,
+        StrictCatchupReason::TerminalFence | StrictCatchupReason::DeliveryWatermark
+    ) || rank.version <= rt.repo.current_version()
+    {
+        if reason == StrictCatchupReason::HistoryElection {
+            rt.state.lock().finish_history_election();
+        }
+        return false;
+    }
+    let force_snapshot = reason == StrictCatchupReason::HistoryElection;
+    let cursor = if force_snapshot {
+        0
+    } else {
+        rt.repo.current_version()
+    };
+    let Some(transfer) = rt.v3_history.lock().begin_transfer(
+        peer,
+        rank.version,
+        cursor,
+        reason,
+        rt.cfg.pending_propose_ttl(),
+        inherited_metric_reason.is_some(),
+        inherited_metric_reason.unwrap_or(reason),
+    ) else {
+        return false;
+    };
+    if inherited_metric_reason.is_none() {
+        let metric_reason =
+            CatchupReason::from_v3_wire(reason as i32).unwrap_or(CatchupReason::RepositoryGap);
+        metrics::record_strict_catchup_session_start(metric_reason);
+    }
+    let req = StrictCatchupReq {
+        src_node: rt.self_id as u32,
+        since_version: rt.repo.current_version(),
+        chunk_token: if force_snapshot {
+            HISTORY_ELECTION_SNAPSHOT_TOKEN
+        } else {
+            cursor
+        },
+        force_snapshot,
+        history_probe_only: false,
+        terminal_state_cursor: TERMINAL_STATE_CURSOR_SKIP,
+        terminal_decision_generation: 0,
+        snapshot_transfer_id: 0,
+        snapshot_chunk_cursor: 0,
+        history_transfer: Some(transfer),
+    };
+    if let Err(error) = send_v3_history_request(rt, peer.node(), req).await {
+        warn!(peer = peer.node(), %error, "strict v3 history request enqueue failed; retry retained");
+    }
+    true
+}
+
+async fn finish_v3_history_transfer<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    peer: PeerIncarnation,
+    outcome: StrictCatchupSessionOutcome,
+) {
+    let (mut finished, deferred) = {
+        let mut history = rt.v3_history.lock();
+        (
+            history.finish_transfer(peer, rt.self_id),
+            history.take_deferred_terminal_sync(peer),
+        )
+    };
+    rt.v3_retries.lock().cancel_history_request(peer);
+    let metric_reason = finished.as_ref().map(|finished| {
+        CatchupReason::from_v3_wire(finished.metric_reason() as i32)
+            .unwrap_or(CatchupReason::RepositoryGap)
+    });
+    if let Some(reason) = metric_reason {
+        metrics::record_strict_catchup_session_completion(reason, outcome);
+    }
+    let final_ack = (outcome == StrictCatchupSessionOutcome::Completed)
+        .then(|| {
+            finished
+                .as_mut()
+                .and_then(|finished| finished.take_final_ack())
+        })
+        .flatten();
+    if let Some(ack) = final_ack {
+        if let Some(reason) = metric_reason {
+            metrics::record_strict_catchup_session_event(
+                reason,
+                StrictCatchupSessionEvent::FinalAck,
+            );
+        }
+        let _ = send_v3_history_request(rt, peer.node(), ack).await;
+    }
+    if let Some(reason) = deferred {
+        // Box the deferred edge because a failed history start can finish the
+        // history transfer and immediately resume a coalesced terminal sync.
+        Box::pin(request_v3_terminal_sync_toward(
+            rt,
+            peer.node(),
+            reason,
+            None,
+        ))
+        .await;
+    }
+}
+
+pub(super) async fn request_v3_terminal_sync<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    dst: NodeIdentifier,
+    reason: StrictCatchupReason,
+) {
+    request_v3_terminal_sync_toward(rt, dst, reason, None).await;
+}
+
+fn terminal_session_wire(
+    epoch: u64,
+    transfer_id: u64,
+    nonce: u64,
+    cursor: u64,
+) -> Option<SessionWireIdentity> {
+    Some(SessionWireIdentity::new(
+        SessionPeerEpoch::new(epoch),
+        SessionTransferId::new(transfer_id),
+        SessionWireNonce::new(nonce)?,
+        SessionCursor::new(SessionCursorKind::TerminalGeneration, cursor),
+    ))
+}
+
+fn terminal_start_wire(effects: &[SessionEffect]) -> Option<SessionWireIdentity> {
+    effects.iter().find_map(|effect| match effect {
+        SessionEffect::StartSession {
+            kind: SessionSyncKind::Terminal,
+            wire,
+        } => Some(*wire),
+        _ => None,
+    })
+}
+
+fn terminal_effect_wire<F>(effects: &[SessionEffect], predicate: F) -> Option<SessionWireIdentity>
+where
+    F: Fn(&SessionEffect) -> Option<SessionWireIdentity>,
+{
+    effects.iter().find_map(predicate)
+}
+
+fn record_terminal_send_result<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    peer: PeerIncarnation,
+    wire: SessionWireIdentity,
+    result: &Result<(), ReplicationError>,
+) {
+    let Some(event) = result.as_ref().err().map(|error| match error {
+        ReplicationError::Overlay(error) if replication_bulk_backpressure(error) => {
+            SessionEvent::SendBackpressured { wire }
+        }
+        _ => SessionEvent::MessageLost { wire },
+    }) else {
+        return;
+    };
+    // The retry identity was armed by the reducer when it selected the send.
+    // This transition records the transport outcome without allocating a new
+    // nonce, cursor, page, or transfer.
+    rt.v3_sync.lock().transition_session(peer, event);
+}
+
+async fn request_v3_terminal_sync_toward<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    dst: NodeIdentifier,
+    reason: StrictCatchupReason,
+    desired_cut: Option<TerminalCut>,
+) {
+    let Some(epoch) = rt.net.member_boot_epoch(dst) else {
+        return;
+    };
+    if !rt.v3_repair_supported_by(dst) {
+        return;
+    }
+    let peer = PeerIncarnation::new(dst, epoch);
+    let metric_reason =
+        CatchupReason::from_v3_wire(reason as i32).unwrap_or(CatchupReason::TerminalFence);
+    {
+        let mut history = rt.v3_history.lock();
+        if history.has_active_transfer(peer) {
+            history.defer_terminal_sync(peer, reason);
+            metrics::record_strict_catchup_session_event(
+                metric_reason,
+                StrictCatchupSessionEvent::Coalesced,
+            );
+            return;
+        }
+    }
+    if desired_cut.is_some_and(|desired| {
+        rt.v3_sync
+            .lock()
+            .known_source_cut(peer)
+            .is_some_and(|known| source_cut_covers(known, desired))
+    }) {
+        start_v3_repository_after_terminal(rt, peer, None).await;
+        return;
+    }
+    let wire = {
+        let mut sync = rt.v3_sync.lock();
+        // The lifecycle reducer owns the request cursor, while the durable
+        // source cut is validated and retained by the payload coordinator.
+        // Align them before every new/coalesced trigger so direct decisions
+        // and a prior completed transfer become the exact delta baseline.
+        if let Some(known) = sync.known_source_cut(peer) {
+            sync.transition_session(
+                peer,
+                SessionEvent::SourceCutObserved {
+                    epoch: SessionPeerEpoch::new(peer.boot_epoch()),
+                    cut: cut_to_reducer(known),
+                },
+            );
+        }
+        let effects = sync.transition_session(
+            peer,
+            SessionEvent::Trigger(SessionTrigger {
+                kind: SessionSyncKind::Terminal,
+                origin: SessionTriggerOrigin::External,
+                desired_cut: desired_cut.map(cut_to_reducer),
+            }),
+        );
+        let Some(wire) = terminal_start_wire(&effects) else {
+            sync.coalesce_terminal_intent_if_active(peer, reason as i32, desired_cut);
+            metrics::record_strict_catchup_session_event(
+                metric_reason,
+                StrictCatchupSessionEvent::Coalesced,
+            );
+            return;
+        };
+        wire
+    };
+    start_reducer_owned_terminal_client(rt, peer, reason, desired_cut, wire).await;
+}
+
+async fn start_reducer_owned_terminal_client<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    peer: PeerIncarnation,
+    reason: StrictCatchupReason,
+    desired_cut: Option<TerminalCut>,
+    wire: SessionWireIdentity,
+) {
+    let metric_reason =
+        CatchupReason::from_v3_wire(reason as i32).unwrap_or(CatchupReason::TerminalFence);
+    if wire.transfer().get() != 0 {
+        metrics::record_strict_catchup_session_event(
+            metric_reason,
+            StrictCatchupSessionEvent::Coalesced,
+        );
+        return;
+    }
+    let known = rt.v3_sync.lock().begin_terminal_client_cache(
+        peer,
+        reason as i32,
+        desired_cut,
+        wire.nonce().get(),
+        wire.cursor().value(),
+        rt.cfg.pending_propose_ttl(),
+    );
+    metrics::record_strict_catchup_session_start(metric_reason);
+    let set_digest = Bytes::copy_from_slice(
+        rt.terminal_journal
+            .lock()
+            .terminal_cut()
+            .terminal_set_digest(),
+    );
+    let request = StrictTerminalSyncReq {
+        src_node: rt.self_id as u32,
+        expected_responder_boot_epoch: peer.boot_epoch(),
+        reason: reason as i32,
+        known_source_cut: known.map(cut_to_wire),
+        requester_terminal_set_digest: set_digest,
+        transfer_id: 0,
+        request_nonce: wire.nonce().get(),
+        expected_cursor: wire.cursor().value(),
+    };
+    rt.v3_retries.lock().register_request(
+        peer,
+        request.clone(),
+        rt.cfg.bulk_retry_delay(),
+        rt.cfg.pending_propose_ttl(),
+        rt.cfg.strict_bulk_retry_jitter_pct(),
+        v3_retry_salt(rt.self_id, &rt.topic),
+    );
+    let send_result = send_v3_metadata_control(
+        rt,
+        peer.node(),
+        StrictBody::TerminalSyncReq(request),
+        metric_reason,
+        CatchupPhase::Metadata,
+    )
+    .await;
+    record_terminal_send_result(rt, peer, wire, &send_result);
+}
+
+async fn resume_deferred_v3_terminal_sync<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    peer: PeerIncarnation,
+) {
+    let deferred = rt.v3_sync.lock().take_deferred_client(peer);
+    let Some((reason, desired_cut)) = deferred else {
+        return;
+    };
+    let reason = StrictCatchupReason::try_from(reason)
+        .ok()
+        .unwrap_or(StrictCatchupReason::TerminalFence);
+    request_v3_terminal_sync_toward(rt, peer.node(), reason, desired_cut).await;
+}
+
+async fn complete_deferred_v3_terminal_sync_from_equal_set<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    peer: PeerIncarnation,
+) {
+    let deferred = rt.v3_sync.lock().take_deferred_client(peer);
+    let Some((_reason, desired_cut)) = deferred else {
+        return;
+    };
+    // The authenticated requester advertised the same canonical terminal set
+    // as this node. Any cut captured from that requester by the preceding
+    // metadata probe is therefore satisfied without opening the reverse
+    // terminal direction merely to recover its source-lineage identity.
+    if let Some(desired_cut) = desired_cut {
+        rt.v3_sync.lock().remember_source_cut(peer, desired_cut);
+    }
+    start_v3_repository_after_terminal(rt, peer, None).await;
+}
+
+fn v3_retry_salt(node: NodeIdentifier, topic: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ node as u64;
+    for byte in topic.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+/// Retry only the exact request or final ACK still owned by the peer
+/// incarnation. The bulk transport separately handles enqueue backpressure.
+pub(super) async fn retry_v3_terminal_transmissions<R: StrictReplicable>(rt: &StrictRuntime<R>) {
+    let now = Instant::now();
+    // Retry entries and client sessions share the same TTL, but are stored
+    // separately. Expire the owning session on every retry-loop tick so a
+    // lost request cannot leave its active gauge resident indefinitely.
+    let expired_deferred = {
+        let mut sync = rt.v3_sync.lock();
+        sync.expire(now);
+        sync.take_expired_deferred_clients()
+    };
+    let expired_history = rt.v3_history.lock().expire_clients(now);
+    for expired in expired_history {
+        let peer = expired.peer();
+        let reason = CatchupReason::from_v3_wire(expired.metric_reason() as i32)
+            .unwrap_or(CatchupReason::RepositoryGap);
+        metrics::record_strict_catchup_session_completion(
+            reason,
+            StrictCatchupSessionOutcome::Expired,
+        );
+        rt.v3_retries.lock().cancel_history_request(peer);
+        let deferred = { rt.v3_history.lock().take_deferred_terminal_sync(peer) };
+        if let Some(reason) = deferred {
+            request_v3_terminal_sync_toward(rt, peer.node(), reason, None).await;
+        }
+    }
+    let salt = v3_retry_salt(rt.self_id, &rt.topic);
+    let (requests, final_acks, history_requests, history_final_acks) = rt.v3_retries.lock().due(
+        now,
+        rt.cfg.strict_bulk_retry_max_delay(),
+        rt.cfg.strict_bulk_retry_jitter_pct(),
+        salt,
+    );
+    for (peer, request) in requests {
+        if v3_peer(rt, peer.node(), peer.boot_epoch()).is_none()
+            || !rt.v3_retries.lock().request_is_current(peer, &request)
+        {
+            continue;
+        }
+        let Some(wire) = terminal_session_wire(
+            peer.boot_epoch(),
+            request.transfer_id,
+            request.request_nonce,
+            request.expected_cursor,
+        ) else {
+            continue;
+        };
+        let effects = rt
+            .v3_sync
+            .lock()
+            .transition_session(peer, SessionEvent::RetryReady { wire });
+        if !effects.iter().any(|effect| {
+            matches!(effect, SessionEffect::SendRequest { kind: SessionSyncKind::Terminal, wire: expected } if *expected == wire)
+        }) {
+            continue;
+        }
+        let reason =
+            CatchupReason::from_v3_wire(request.reason).unwrap_or(CatchupReason::TerminalFence);
+        let send_result = retry_v3_metadata_control(
+            rt,
+            peer.node(),
+            StrictBody::TerminalSyncReq(request),
+            reason,
+            CatchupPhase::Metadata,
+        )
+        .await;
+        record_terminal_send_result(rt, peer, wire, &send_result);
+    }
+    for (peer, ack) in final_acks {
+        if v3_peer(rt, peer.node(), peer.boot_epoch()).is_none()
+            || !rt.v3_retries.lock().final_ack_is_current(peer, &ack)
+        {
+            continue;
+        }
+        let Some(target) = ack.target_cut.as_ref().and_then(cut_from_wire) else {
+            continue;
+        };
+        let Some(wire) = terminal_session_wire(
+            peer.boot_epoch(),
+            ack.transfer_id,
+            ack.request_nonce,
+            target.generation(),
+        ) else {
+            continue;
+        };
+        let effects = rt
+            .v3_sync
+            .lock()
+            .transition_session(peer, SessionEvent::RetryReady { wire });
+        if !effects.iter().any(|effect| {
+            matches!(effect, SessionEffect::SendAck { kind: SessionSyncKind::Terminal, wire: expected, .. } if *expected == wire)
+        }) {
+            continue;
+        }
+        let send_result = retry_v3_metadata_control(
+            rt,
+            peer.node(),
+            StrictBody::TerminalSyncAck(ack),
+            CatchupReason::TerminalFence,
+            CatchupPhase::FinalAck,
+        )
+        .await;
+        record_terminal_send_result(rt, peer, wire, &send_result);
+    }
+    for (peer, request) in history_requests {
+        if v3_peer(rt, peer.node(), peer.boot_epoch()).is_none()
+            || !rt.v3_history.lock().has_active_transfer(peer)
+            || !rt
+                .v3_retries
+                .lock()
+                .history_request_is_current(peer, &request)
+        {
+            continue;
+        }
+        let Some(reason) = v3_history_reason(&request) else {
+            continue;
+        };
+        let phase = v3_history_request_phase(&request);
+        let _ = rt
+            .net
+            .send_redundant_catchup_unicast(
+                peer.node(),
+                &rt.topic,
+                StrictBody::CatchupReq(request),
+                reason,
+                phase,
+            )
+            .await;
+    }
+    for (peer, ack) in history_final_acks {
+        if v3_peer(rt, peer.node(), peer.boot_epoch()).is_none()
+            || !rt
+                .v3_retries
+                .lock()
+                .history_final_ack_is_current(peer, &ack)
+        {
+            continue;
+        }
+        let Some(reason) = v3_history_reason(&ack) else {
+            continue;
+        };
+        let _ = rt
+            .net
+            .send_redundant_catchup_unicast(
+                peer.node(),
+                &rt.topic,
+                StrictBody::CatchupReq(ack),
+                reason,
+                CatchupPhase::FinalAck,
+            )
+            .await;
+    }
+    for (peer, reason, desired_cut) in expired_deferred {
+        if v3_peer(rt, peer.node(), peer.boot_epoch()).is_none() {
+            continue;
+        }
+        let reason = StrictCatchupReason::try_from(reason)
+            .ok()
+            .unwrap_or(StrictCatchupReason::TerminalFence);
+        request_v3_terminal_sync_toward(rt, peer.node(), reason, desired_cut).await;
+    }
+}
+
+fn v3_error_page<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    epoch: u64,
+    req: &StrictTerminalSyncReq,
+    status: StrictTerminalSyncStatus,
+) -> StrictTerminalSyncPage {
+    StrictTerminalSyncPage {
+        responder_node: rt.self_id as u32,
+        expected_requester_boot_epoch: epoch,
+        transfer_id: req.transfer_id,
+        request_nonce: req.request_nonce,
+        status: status as i32,
+        kind: StrictTerminalPageKind::Unspecified as i32,
+        base_cut: None,
+        target_cut: None,
+        cursor: req.expected_cursor,
+        next_cursor: req.expected_cursor,
+        image_digest: Bytes::new(),
+        checkpoint_states: Vec::new(),
+        deltas: Vec::new(),
+        has_more: false,
+    }
+}
+
+fn render_v3_page<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    session: &ResponderSession,
+    nonce: u64,
+    epoch: u64,
+) -> Option<(StrictTerminalSyncPage, u64, Option<TerminalCut>)> {
+    let limit = rt.cfg.strict_max_catchup_ops().max(1);
+    let byte_limit = rt.strict_catchup_response_budget();
+    let journal = rt.terminal_journal.lock();
+    match session.kind() {
+        StrictTerminalPageKind::Delta => {
+            let base = session.cursor_cut().or(session.base_cut())?;
+            let page = journal.terminal_deltas_between(&base, &session.target_cut(), limit)?;
+            let mut previous = *base.chain_digest();
+            let mut progress = base;
+            let mut deltas = Vec::new();
+            for entry in page.into_entries() {
+                let (generation, chain, op_id, record) = entry.into_parts();
+                let state = StrictRuntime::<R>::terminal_state_from_journal_record(op_id, &record)?;
+                let delta = StrictTerminalDelta {
+                    generation,
+                    state: Some(state),
+                    previous_chain_digest: Bytes::copy_from_slice(&previous),
+                    chain_digest: Bytes::copy_from_slice(&chain),
+                };
+                deltas.push(delta);
+                let candidate = StrictTerminalSyncPage {
+                    responder_node: rt.self_id as u32,
+                    expected_requester_boot_epoch: epoch,
+                    transfer_id: session.transfer_id(),
+                    request_nonce: nonce,
+                    status: StrictTerminalSyncStatus::Ok as i32,
+                    kind: StrictTerminalPageKind::Delta as i32,
+                    base_cut: Some(cut_to_wire(base)),
+                    target_cut: Some(cut_to_wire(session.target_cut())),
+                    cursor: base.generation(),
+                    next_cursor: generation,
+                    image_digest: Bytes::copy_from_slice(
+                        session.target_cut().terminal_set_digest(),
+                    ),
+                    checkpoint_states: Vec::new(),
+                    deltas: deltas.clone(),
+                    has_more: generation < session.target_cut().generation(),
+                };
+                let fits = rt
+                    .strict_replication_payload_len(&StrictBody::TerminalSyncPage(candidate))
+                    .is_ok_and(|encoded| encoded <= byte_limit);
+                if !fits {
+                    deltas.pop();
+                    if deltas.is_empty() {
+                        return Some((
+                            v3_resource_limit_page(rt, session, nonce, epoch),
+                            base.generation(),
+                            Some(base),
+                        ));
+                    }
+                    break;
+                }
+                previous = chain;
+                progress = journal.terminal_cut_at(generation)?;
+            }
+            let has_more = progress.generation() < session.target_cut().generation();
+            Some((
+                StrictTerminalSyncPage {
+                    responder_node: rt.self_id as u32,
+                    expected_requester_boot_epoch: epoch,
+                    transfer_id: session.transfer_id(),
+                    request_nonce: nonce,
+                    status: if deltas.is_empty() {
+                        StrictTerminalSyncStatus::UpToDate as i32
+                    } else {
+                        StrictTerminalSyncStatus::Ok as i32
+                    },
+                    kind: StrictTerminalPageKind::Delta as i32,
+                    base_cut: Some(cut_to_wire(base)),
+                    target_cut: Some(cut_to_wire(session.target_cut())),
+                    cursor: base.generation(),
+                    next_cursor: progress.generation(),
+                    image_digest: Bytes::copy_from_slice(
+                        session.target_cut().terminal_set_digest(),
+                    ),
+                    checkpoint_states: Vec::new(),
+                    deltas,
+                    has_more,
+                },
+                progress.generation(),
+                Some(progress),
+            ))
+        }
+        StrictTerminalPageKind::Checkpoint => {
+            let page = journal.terminal_checkpoint_page_at(
+                &session.target_cut(),
+                session.next_cursor(),
+                limit,
+            )?;
+            let cursor = page.cursor();
+            let mut next = cursor;
+            let mut states = Vec::new();
+            for entry in page.into_entries() {
+                let (op_id, record) = entry.into_parts();
+                let state = StrictRuntime::<R>::terminal_state_from_journal_record(op_id, &record)?;
+                states.push(state);
+                let candidate_next = cursor.saturating_add(states.len() as u64);
+                let candidate = StrictTerminalSyncPage {
+                    responder_node: rt.self_id as u32,
+                    expected_requester_boot_epoch: epoch,
+                    transfer_id: session.transfer_id(),
+                    request_nonce: nonce,
+                    status: StrictTerminalSyncStatus::Ok as i32,
+                    kind: StrictTerminalPageKind::Checkpoint as i32,
+                    base_cut: session.base_cut().map(cut_to_wire),
+                    target_cut: Some(cut_to_wire(session.target_cut())),
+                    cursor,
+                    next_cursor: candidate_next,
+                    image_digest: Bytes::copy_from_slice(
+                        session.target_cut().terminal_set_digest(),
+                    ),
+                    checkpoint_states: states.clone(),
+                    deltas: Vec::new(),
+                    has_more: candidate_next < session.target_cut().generation(),
+                };
+                let fits = rt
+                    .strict_replication_payload_len(&StrictBody::TerminalSyncPage(candidate))
+                    .is_ok_and(|encoded| encoded <= byte_limit);
+                if !fits {
+                    states.pop();
+                    if states.is_empty() {
+                        return Some((
+                            v3_resource_limit_page(rt, session, nonce, epoch),
+                            cursor,
+                            None,
+                        ));
+                    }
+                    break;
+                }
+                next = candidate_next;
+            }
+            let has_more = next < session.target_cut().generation();
+            Some((
+                StrictTerminalSyncPage {
+                    responder_node: rt.self_id as u32,
+                    expected_requester_boot_epoch: epoch,
+                    transfer_id: session.transfer_id(),
+                    request_nonce: nonce,
+                    status: StrictTerminalSyncStatus::Ok as i32,
+                    kind: StrictTerminalPageKind::Checkpoint as i32,
+                    base_cut: session.base_cut().map(cut_to_wire),
+                    target_cut: Some(cut_to_wire(session.target_cut())),
+                    cursor,
+                    next_cursor: next,
+                    // v3 defines checkpoint image identity as the target set digest.
+                    image_digest: Bytes::copy_from_slice(
+                        session.target_cut().terminal_set_digest(),
+                    ),
+                    checkpoint_states: states,
+                    deltas: Vec::new(),
+                    has_more,
+                },
+                next,
+                None,
+            ))
+        }
+        StrictTerminalPageKind::Unspecified => None,
+    }
+}
+
+fn v3_resource_limit_page<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    session: &ResponderSession,
+    nonce: u64,
+    epoch: u64,
+) -> StrictTerminalSyncPage {
+    StrictTerminalSyncPage {
+        responder_node: rt.self_id as u32,
+        expected_requester_boot_epoch: epoch,
+        transfer_id: session.transfer_id(),
+        request_nonce: nonce,
+        status: StrictTerminalSyncStatus::ResourceLimit as i32,
+        kind: session.kind() as i32,
+        base_cut: session.base_cut().map(cut_to_wire),
+        target_cut: Some(cut_to_wire(session.target_cut())),
+        cursor: session.next_cursor(),
+        next_cursor: session.next_cursor(),
+        image_digest: Bytes::copy_from_slice(session.target_cut().terminal_set_digest()),
+        checkpoint_states: Vec::new(),
+        deltas: Vec::new(),
+        has_more: false,
+    }
+}
+
+async fn send_v3_page<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    dst: NodeIdentifier,
+    page: StrictTerminalSyncPage,
+    reason: CatchupReason,
+    record_logical: bool,
+) {
+    let reducer_identity = terminal_session_wire(
+        page.expected_requester_boot_epoch,
+        page.transfer_id,
+        page.request_nonce,
+        page.cursor,
+    )
+    .map(|wire| {
+        (
+            PeerIncarnation::new(dst, page.expected_requester_boot_epoch),
+            wire,
+        )
+    });
+    let has_operations = !page.checkpoint_states.is_empty() || !page.deltas.is_empty();
+    let phase = if has_operations {
+        CatchupPhase::from_terminal_page_kind(page.kind).unwrap_or(CatchupPhase::Metadata)
+    } else {
+        CatchupPhase::Metadata
+    };
+    let records = page
+        .checkpoint_states
+        .len()
+        .saturating_add(page.deltas.len());
+    let body = StrictBody::TerminalSyncPage(page);
+    let encoded_len = rt.strict_replication_payload_len(&body).unwrap_or(0);
+    if record_logical {
+        metrics::record_catchup_response_detail(
+            CatchupMode::Strict,
+            reason,
+            phase,
+            records,
+            encoded_len,
+        );
+    }
+    let send_result = if has_operations {
+        rt.net
+            .send_bulk_catchup_unicast(
+                dst,
+                &rt.topic,
+                body,
+                rt.cfg.bulk_retry_delay(),
+                reason,
+                phase,
+            )
+            .await
+    } else {
+        send_v3_metadata_control(rt, dst, body, reason, phase).await
+    };
+    if let Some((peer, wire)) = reducer_identity {
+        record_terminal_send_result(rt, peer, wire, &send_result);
+    }
+}
+
+pub(super) async fn recv_v3_terminal_sync_req<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    from: NodeIdentifier,
+    epoch: u64,
+    req: StrictTerminalSyncReq,
+) {
+    let Some(peer) = v3_peer(rt, from, epoch) else {
+        return;
+    };
+    let Some(metric_reason) = CatchupReason::from_v3_wire(req.reason) else {
+        return;
+    };
+    if node_from_u32(req.src_node) != Some(from)
+        || req.expected_responder_boot_epoch != rt.boot_epoch
+        || req.request_nonce == 0
+        || req.requester_terminal_set_digest.len() != 32
+    {
+        return;
+    }
+    if rt.v3_history.lock().has_any_transfer(peer) {
+        send_v3_page(
+            rt,
+            from,
+            v3_error_page(rt, epoch, &req, StrictTerminalSyncStatus::ResourceLimit),
+            metric_reason,
+            true,
+        )
+        .await;
+        return;
+    }
+    let mut arbitration = SessionInboundArbitration::KeepCurrent;
+    if req.transfer_id == 0 {
+        let disposition = rt
+            .v3_sync
+            .lock()
+            .resolve_inbound_terminal_start(rt.self_id, peer);
+        match disposition {
+            InboundTerminalSyncDisposition::Accept => {}
+            InboundTerminalSyncDisposition::Deflect => {
+                // The lower node owns the first requester direction. Keep the
+                // losing peer's request identity alive so its retry can be
+                // yielded when our corresponding request arrives; never
+                // allocate a second responder transfer for the collision.
+                send_v3_page(
+                    rt,
+                    from,
+                    v3_error_page(rt, epoch, &req, StrictTerminalSyncStatus::ResourceLimit),
+                    metric_reason,
+                    true,
+                )
+                .await;
+                return;
+            }
+            InboundTerminalSyncDisposition::Yielded { cancelled_nonce } => {
+                arbitration = SessionInboundArbitration::AcceptInbound;
+                rt.v3_retries.lock().complete_request(peer, cancelled_nonce);
+                metrics::record_strict_catchup_session_event(
+                    metric_reason,
+                    StrictCatchupSessionEvent::Coalesced,
+                );
+            }
+        }
+    }
+    let Some(incoming_wire) = terminal_session_wire(
+        epoch,
+        req.transfer_id,
+        req.request_nonce,
+        req.expected_cursor,
+    ) else {
+        return;
+    };
+    let reducer_effects = rt.v3_sync.lock().transition_session(
+        peer,
+        SessionEvent::RequestReceived {
+            kind: SessionSyncKind::Terminal,
+            wire: incoming_wire,
+            arbitration,
+        },
+    );
+    if let Some(status) = reducer_effects.iter().find_map(|effect| match effect {
+        SessionEffect::SendStatus { status, .. } => Some(*status),
+        _ => None,
+    }) {
+        let status = match status {
+            SessionStatus::TransferExpired => StrictTerminalSyncStatus::TransferExpired,
+            SessionStatus::CursorMismatch => StrictTerminalSyncStatus::CursorMismatch,
+            SessionStatus::IncarnationMismatch => StrictTerminalSyncStatus::IncarnationMismatch,
+        };
+        send_v3_page(
+            rt,
+            from,
+            v3_error_page(rt, epoch, &req, status),
+            metric_reason,
+            true,
+        )
+        .await;
+        return;
+    }
+    let reducer_request = terminal_effect_wire(&reducer_effects, |effect| match effect {
+        SessionEffect::PreparePage {
+            kind: SessionSyncKind::Terminal,
+            request,
+        } => Some(*request),
+        _ => None,
+    });
+    let reducer_cached = reducer_effects.iter().any(|effect| {
+        matches!(
+            effect,
+            SessionEffect::SendCachedPage {
+                kind: SessionSyncKind::Terminal,
+                ..
+            }
+        )
+    });
+    if reducer_request.is_none() && !reducer_cached {
+        return;
+    }
+    // Equal terminal sets are a metadata-only fast path. Check this before
+    // taking a bulk response-build permit and without allocating responder
+    // transfer state; its cost is independent of retained journal length.
+    if req.transfer_id == 0 {
+        let (target, offered_cut_is_current) = {
+            let journal = rt.terminal_journal.lock();
+            let target = journal.terminal_cut();
+            let offered_cut_is_current = req
+                .known_source_cut
+                .as_ref()
+                .and_then(cut_from_wire)
+                .is_some_and(|known| {
+                    journal.recognizes_terminal_cut(&known) && source_cut_covers(known, target)
+                });
+            (target, offered_cut_is_current)
+        };
+        let terminal_sets_equal =
+            req.requester_terminal_set_digest.as_ref() == target.terminal_set_digest();
+        if terminal_sets_equal || offered_cut_is_current {
+            let page = StrictTerminalSyncPage {
+                responder_node: rt.self_id as u32,
+                expected_requester_boot_epoch: epoch,
+                transfer_id: 0,
+                request_nonce: req.request_nonce,
+                status: StrictTerminalSyncStatus::UpToDate as i32,
+                kind: StrictTerminalPageKind::Delta as i32,
+                base_cut: Some(cut_to_wire(target)),
+                target_cut: Some(cut_to_wire(target)),
+                cursor: target.generation(),
+                next_cursor: target.generation(),
+                image_digest: Bytes::copy_from_slice(target.terminal_set_digest()),
+                checkpoint_states: Vec::new(),
+                deltas: Vec::new(),
+                has_more: false,
+            };
+            if let Some(request) = reducer_request {
+                let effects = rt.v3_sync.lock().transition_session(
+                    peer,
+                    SessionEvent::UpToDateResponded {
+                        request,
+                        target_cut: cut_to_reducer(target),
+                        satisfies_dirty: terminal_sets_equal,
+                    },
+                );
+                if !effects.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        SessionEffect::SendPage {
+                            kind: SessionSyncKind::Terminal,
+                            ..
+                        }
+                    )
+                }) {
+                    return;
+                }
+            }
+            send_v3_page(rt, from, page, metric_reason, true).await;
+            // UP_TO_DATE deliberately allocates no responder transfer and
+            // therefore has no final ACK edge. Equal canonical sets satisfy
+            // both directions; an offered responder cut only satisfies the
+            // requester direction, so preserve any yielded reverse intent.
+            if terminal_sets_equal {
+                complete_deferred_v3_terminal_sync_from_equal_set(rt, peer).await;
+            } else {
+                resume_deferred_v3_terminal_sync(rt, peer).await;
+            }
+            return;
+        }
+    }
+
+    let Some(_permit) = rt
+        .cfg
+        .try_begin_catchup(CatchupMode::Strict, &rt.topic, from)
+    else {
+        if let Some(wire) = reducer_request {
+            rt.v3_sync.lock().transition_session(
+                peer,
+                SessionEvent::TransferExpired {
+                    epoch: SessionPeerEpoch::new(epoch),
+                    wire,
+                },
+            );
+        }
+        return;
+    };
+    let now = Instant::now();
+    let ttl = rt.cfg.pending_propose_ttl();
+    let response = {
+        let mut sync = rt.v3_sync.lock();
+        sync.expire(now);
+
+        (|| -> Option<(StrictTerminalSyncPage, Option<BulkPageIdentity>, bool)> {
+            if req.transfer_id != 0 {
+                let Some(session) = sync.responder(peer).cloned() else {
+                    return Some((
+                        v3_error_page(rt, epoch, &req, StrictTerminalSyncStatus::TransferExpired),
+                        None,
+                        true,
+                    ));
+                };
+                if session.transfer_id() != req.transfer_id {
+                    return Some((
+                        v3_error_page(rt, epoch, &req, StrictTerminalSyncStatus::TransferExpired),
+                        None,
+                        true,
+                    ));
+                }
+                if let Some(page) = session.cached_page_for(req.request_nonce) {
+                    metrics::record_strict_catchup_duplicate(
+                        StrictCatchupDuplicateOutcome::CachedReplay,
+                    );
+                    return Some((page, None, false));
+                }
+                if session.next_cursor() != req.expected_cursor || session.final_nonce().is_some() {
+                    return Some((
+                        v3_error_page(rt, epoch, &req, StrictTerminalSyncStatus::CursorMismatch),
+                        None,
+                        true,
+                    ));
+                }
+                let Some((page, next, progress)) =
+                    render_v3_page(rt, &session, req.request_nonce, epoch)
+                else {
+                    sync.remove_responder(peer);
+                    if let Some(wire) = reducer_request {
+                        sync.transition_session(
+                            peer,
+                            SessionEvent::TransferExpired {
+                                epoch: SessionPeerEpoch::new(epoch),
+                                wire,
+                            },
+                        );
+                    }
+                    return None;
+                };
+                let request = reducer_request?;
+                let effects = sync.transition_session(
+                    peer,
+                    SessionEvent::PagePrepared {
+                        kind: SessionSyncKind::Terminal,
+                        request,
+                        next_cursor: SessionCursor::new(
+                            SessionCursorKind::TerminalGeneration,
+                            next,
+                        ),
+                        target_cut: cut_to_reducer(session.target_cut()),
+                        has_more: page.has_more,
+                    },
+                );
+                if !effects.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        SessionEffect::SendPage {
+                            kind: SessionSyncKind::Terminal,
+                            ..
+                        }
+                    )
+                }) {
+                    return None;
+                }
+                if let Some(active) = sync.responder_mut(peer) {
+                    active.record_page(req.request_nonce, page.clone(), next, progress, ttl);
+                }
+                let acknowledged = session.cached_page_nonce().map(|request_nonce| {
+                    BulkPageIdentity::terminal(session.transfer_id(), request_nonce)
+                });
+                return Some((page, acknowledged, true));
+            }
+
+            if let Some(existing) = sync.responder(peer).cloned() {
+                return if let Some(page) = existing.cached_page_for(req.request_nonce) {
+                    metrics::record_strict_catchup_duplicate(
+                        StrictCatchupDuplicateOutcome::CachedReplay,
+                    );
+                    Some((page, None, false))
+                } else {
+                    Some((
+                        v3_error_page(rt, epoch, &req, StrictTerminalSyncStatus::ResourceLimit),
+                        None,
+                        true,
+                    ))
+                };
+            }
+            if sync.completed_matches_request(peer, 0, req.request_nonce) {
+                return Some((
+                    v3_error_page(rt, epoch, &req, StrictTerminalSyncStatus::TransferExpired),
+                    None,
+                    true,
+                ));
+            }
+
+            let known = req.known_source_cut.as_ref().and_then(cut_from_wire);
+            let (target, kind) = {
+                let journal = rt.terminal_journal.lock();
+                let target = journal.terminal_cut();
+                let kind = if known
+                    .as_ref()
+                    .is_some_and(|cut| journal.recognizes_terminal_cut(cut))
+                {
+                    StrictTerminalPageKind::Delta
+                } else {
+                    StrictTerminalPageKind::Checkpoint
+                };
+                (target, kind)
+            };
+            let request = reducer_request?;
+            let id = request.transfer().get();
+            let session = ResponderSession::new(id, known, target, kind, req.request_nonce, ttl);
+            let Some((page, next, progress)) =
+                render_v3_page(rt, &session, req.request_nonce, epoch)
+            else {
+                sync.transition_session(
+                    peer,
+                    SessionEvent::TransferExpired {
+                        epoch: SessionPeerEpoch::new(epoch),
+                        wire: request,
+                    },
+                );
+                return None;
+            };
+            let effects = sync.transition_session(
+                peer,
+                SessionEvent::PagePrepared {
+                    kind: SessionSyncKind::Terminal,
+                    request,
+                    next_cursor: SessionCursor::new(SessionCursorKind::TerminalGeneration, next),
+                    target_cut: cut_to_reducer(target),
+                    has_more: page.has_more,
+                },
+            );
+            if !effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    SessionEffect::SendPage {
+                        kind: SessionSyncKind::Terminal,
+                        ..
+                    }
+                )
+            }) {
+                return None;
+            }
+            sync.insert_responder(peer, session);
+            if let Some(active) = sync.responder_mut(peer) {
+                active.record_page(req.request_nonce, page.clone(), next, progress, ttl);
+            }
+            Some((page, None, true))
+        })()
+    };
+
+    let Some((page, acknowledged_bulk_page, record_logical)) = response else {
+        return;
+    };
+    if let Some(identity) = acknowledged_bulk_page {
+        rt.net.acknowledge_bulk_unicast(from, &rt.topic, identity);
+    }
+    send_v3_page(rt, from, page, metric_reason, record_logical).await;
+}
+
+fn validated_v3_terminal_state(
+    terminal: &super::super::proto::StrictTerminalState,
+) -> Option<(
+    (u64, u64),
+    Option<TerminalDecisionIdentity>,
+    JournalTerminalDecision,
+)> {
+    let coord = node_from_u32(terminal.coord_node)?;
+    let op_id = (terminal.op_id_hi, terminal.op_id_lo);
+    if node_from_u32((op_id.0 >> 48) as u32) != Some(coord) {
+        return None;
+    }
+    let identity = terminal_identity_from_wire(
+        terminal.resolver_node,
+        terminal.resolver_boot_epoch,
+        &terminal.frozen_targets,
+        terminal.ballot,
+        op_id,
+        coord,
+    )
+    .ok()?;
+    let decision = match terminal.outcome.as_ref()? {
+        super::super::proto::StrictTerminalOutcome::Commit(commit) => {
+            JournalTerminalDecision::commit(CommitCandidate::from_bytes(
+                terminal.ballot,
+                commit.ts_final,
+                commit.op_msgpack.clone(),
+            ))
+        }
+        super::super::proto::StrictTerminalOutcome::Abort(_) => {
+            JournalTerminalDecision::abort(terminal.ballot)
+        }
+    };
+    Some((op_id, identity, decision))
+}
+
+pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    from: NodeIdentifier,
+    epoch: u64,
+    page: StrictTerminalSyncPage,
+) {
+    let Some(peer) = v3_peer(rt, from, epoch) else {
+        return;
+    };
+    if node_from_u32(page.responder_node) != Some(from)
+        || page.expected_requester_boot_epoch != rt.boot_epoch
+        || page.request_nonce == 0
+    {
+        return;
+    }
+    let Some(status) = StrictTerminalSyncStatus::try_from(page.status).ok() else {
+        return;
+    };
+    if !matches!(
+        status,
+        StrictTerminalSyncStatus::Ok | StrictTerminalSyncStatus::UpToDate
+    ) {
+        let (correlated, collision_deflection) = rt
+            .v3_sync
+            .lock()
+            .client(peer)
+            .map(|client| {
+                let correlated = client.pending_nonce() == page.request_nonce
+                    && (client.transfer_id() == 0 || client.transfer_id() == page.transfer_id);
+                let collision_deflection = correlated
+                    && status == StrictTerminalSyncStatus::ResourceLimit
+                    && client.transfer_id() == 0
+                    && page.transfer_id == 0
+                    && page.base_cut.is_none()
+                    && page.target_cut.is_none();
+                (correlated, collision_deflection)
+            })
+            .unwrap_or((false, false));
+        // RESOURCE_LIMIT is also the deterministic simultaneous-start
+        // deflection. Retain the exact client/request identity: the peer's
+        // winning request will either make us yield or this request will be
+        // retried unchanged after the responder direction disappears.
+        if collision_deflection {
+            return;
+        }
+        if correlated {
+            let completed = rt.v3_sync.lock().finish_client(peer);
+            rt.v3_retries
+                .lock()
+                .complete_request(peer, page.request_nonce);
+            if let Some(session) = completed {
+                let reason = CatchupReason::from_v3_wire(session.started_reason())
+                    .unwrap_or(CatchupReason::TerminalFence);
+                let outcome = match status {
+                    StrictTerminalSyncStatus::TransferExpired => {
+                        StrictCatchupSessionOutcome::Expired
+                    }
+                    StrictTerminalSyncStatus::IncarnationMismatch => {
+                        StrictCatchupSessionOutcome::IncarnationMismatch
+                    }
+                    StrictTerminalSyncStatus::ResourceLimit => {
+                        StrictCatchupSessionOutcome::ResourceLimit
+                    }
+                    _ => StrictCatchupSessionOutcome::Failed,
+                };
+                metrics::record_strict_catchup_session_completion(reason, outcome);
+            }
+        }
+        return;
+    }
+    if (status == StrictTerminalSyncStatus::Ok && page.transfer_id == 0)
+        || (status == StrictTerminalSyncStatus::UpToDate && page.transfer_id != 0)
+    {
+        return;
+    }
+    let Some(kind) = StrictTerminalPageKind::try_from(page.kind).ok() else {
+        return;
+    };
+    let Some(target) = page.target_cut.as_ref().and_then(cut_from_wire) else {
+        return;
+    };
+    if page.image_digest.as_ref() != target.terminal_set_digest().as_slice() {
+        return;
+    }
+    if rt.v3_sync.lock().client(peer).is_none() {
+        let duplicate_ack = StrictTerminalSyncAck {
+            src_node: rt.self_id as u32,
+            expected_responder_boot_epoch: epoch,
+            transfer_id: page.transfer_id,
+            request_nonce: page.request_nonce,
+            target_cut: Some(cut_to_wire(target)),
+        };
+        let ack_pending = rt
+            .v3_retries
+            .lock()
+            .final_ack_is_current(peer, &duplicate_ack);
+        let source_already_advanced =
+            rt.v3_sync
+                .lock()
+                .known_source_cut(peer)
+                .is_some_and(|known| {
+                    known.journal_id() == target.journal_id()
+                        && known.generation() >= target.generation()
+                });
+        if ack_pending || source_already_advanced {
+            metrics::record_strict_catchup_duplicate(StrictCatchupDuplicateOutcome::Suppressed);
+        }
+        return;
+    }
+    let (expected_progress, reducer_wire) = {
+        let sync = rt.v3_sync.lock();
+        let Some(client) = sync.client(peer) else {
+            return;
+        };
+        let delayed_duplicate = client.pending_nonce() != page.request_nonce
+            && client.transfer_id() != 0
+            && client.transfer_id() == page.transfer_id
+            && client.target_cut().is_some_and(|cut| cut == target)
+            && client.kind().is_some_and(|expected| expected == kind)
+            && page.next_cursor <= client.next_cursor();
+        if delayed_duplicate {
+            if let Some(delayed_wire) =
+                terminal_session_wire(epoch, page.transfer_id, page.request_nonce, page.cursor)
+            {
+                rt.v3_sync
+                    .lock()
+                    .transition_session(peer, SessionEvent::MessageDelayed { wire: delayed_wire });
+            }
+            metrics::record_strict_catchup_duplicate(StrictCatchupDuplicateOutcome::Suppressed);
+            return;
+        }
+        if client.pending_nonce() != page.request_nonce
+            || (client.transfer_id() != 0 && client.transfer_id() != page.transfer_id)
+            || (status != StrictTerminalSyncStatus::UpToDate && client.next_cursor() != page.cursor)
+            || client.target_cut().is_some_and(|cut| cut != target)
+            || client.kind().is_some_and(|expected| expected != kind)
+            || (client.target_cut().is_none()
+                && client
+                    .desired_cut()
+                    .is_some_and(|desired| !source_cut_covers(target, desired)))
+        {
+            return;
+        }
+        let Some(wire) = terminal_session_wire(
+            epoch,
+            page.transfer_id,
+            page.request_nonce,
+            client.next_cursor(),
+        ) else {
+            return;
+        };
+        (client.progress_cut(), wire)
+    };
+
+    if page.next_cursor < page.cursor
+        || (page.has_more && page.next_cursor == page.cursor)
+        || page.has_more != (page.next_cursor < target.generation())
+        || (!page.has_more && page.next_cursor != target.generation())
+        || (status == StrictTerminalSyncStatus::UpToDate
+            && (page.has_more
+                || !page.deltas.is_empty()
+                || !page.checkpoint_states.is_empty()
+                || page.cursor != target.generation()))
+    {
+        return;
+    }
+
+    if status == StrictTerminalSyncStatus::UpToDate {
+        let effects = rt.v3_sync.lock().transition_session(
+            peer,
+            SessionEvent::PageReceived {
+                kind: SessionSyncKind::Terminal,
+                wire: reducer_wire,
+                next_cursor: SessionCursor::new(
+                    SessionCursorKind::TerminalGeneration,
+                    page.next_cursor,
+                ),
+                target_cut: cut_to_reducer(target),
+                has_more: false,
+            },
+        );
+        if !effects.iter().any(|effect| {
+            matches!(effect, SessionEffect::ValidateAndApply { kind: SessionSyncKind::Terminal, wire } if *wire == reducer_wire)
+        }) {
+            metrics::record_strict_catchup_duplicate(StrictCatchupDuplicateOutcome::Suppressed);
+            return;
+        }
+        if let Some(client) = rt.v3_sync.lock().client_mut(peer) {
+            client.accept_manifest(page.transfer_id, target, kind, rt.cfg.pending_propose_ttl());
+        }
+        if let Some(client) = rt.v3_sync.lock().client_mut(peer) {
+            client.set_progress_cut(target);
+        }
+    } else {
+        match kind {
+            StrictTerminalPageKind::Delta => {
+                if !page.checkpoint_states.is_empty() {
+                    return;
+                }
+                let Some(mut progress) = page.base_cut.as_ref().and_then(cut_from_wire) else {
+                    return;
+                };
+                if page.cursor != progress.generation()
+                    || !expected_progress
+                        .is_some_and(|expected| expected.has_same_chain_position(&progress))
+                    || progress.journal_id() != target.journal_id()
+                    || progress.generation() > target.generation()
+                {
+                    return;
+                }
+                let mut validated = Vec::with_capacity(page.deltas.len());
+                for delta in &page.deltas {
+                    let Some(state) = delta.state.as_ref() else {
+                        return;
+                    };
+                    let Some((op_id, identity, decision)) = validated_v3_terminal_state(state)
+                    else {
+                        return;
+                    };
+                    if !TerminalJournal::verifies_terminal_transition(
+                        &progress,
+                        delta.generation,
+                        op_id,
+                        identity
+                            .as_ref()
+                            .map(|identity| identity.frozen_targets.as_slice()),
+                        identity.as_ref().map(|identity| identity.resolver),
+                        &decision,
+                        &delta.previous_chain_digest,
+                        &delta.chain_digest,
+                    ) {
+                        return;
+                    }
+                    let Ok(chain) = <[u8; 32]>::try_from(delta.chain_digest.as_ref()) else {
+                        return;
+                    };
+                    progress = TerminalCut::new(
+                        *target.journal_id(),
+                        delta.generation,
+                        chain,
+                        if delta.generation == target.generation() {
+                            *target.terminal_set_digest()
+                        } else {
+                            [0; 32]
+                        },
+                    );
+                    validated.push(state.clone());
+                }
+                if progress.generation() != page.next_cursor {
+                    return;
+                }
+                let effects = rt.v3_sync.lock().transition_session(
+                    peer,
+                    SessionEvent::PageReceived {
+                        kind: SessionSyncKind::Terminal,
+                        wire: reducer_wire,
+                        next_cursor: SessionCursor::new(
+                            SessionCursorKind::TerminalGeneration,
+                            page.next_cursor,
+                        ),
+                        target_cut: cut_to_reducer(target),
+                        has_more: page.has_more,
+                    },
+                );
+                if !effects.iter().any(|effect| {
+                    matches!(effect, SessionEffect::ValidateAndApply { kind: SessionSyncKind::Terminal, wire } if *wire == reducer_wire)
+                }) {
+                    metrics::record_strict_catchup_duplicate(StrictCatchupDuplicateOutcome::Suppressed);
+                    return;
+                }
+                if let Some(client) = rt.v3_sync.lock().client_mut(peer) {
+                    client.accept_manifest(
+                        page.transfer_id,
+                        target,
+                        kind,
+                        rt.cfg.pending_propose_ttl(),
+                    );
+                }
+                for state in validated {
+                    if !rt.apply_v3_catchup_terminal_state(peer, state) {
+                        rt.v3_sync.lock().transition_session(
+                            peer,
+                            SessionEvent::ApplyFailed {
+                                epoch: SessionPeerEpoch::new(epoch),
+                                wire: reducer_wire,
+                            },
+                        );
+                        return;
+                    }
+                }
+                if let Some(client) = rt.v3_sync.lock().client_mut(peer) {
+                    client.set_progress_cut(progress);
+                }
+            }
+            StrictTerminalPageKind::Checkpoint => {
+                if !page.deltas.is_empty() {
+                    return;
+                }
+                let mut progress = if page.cursor == 0 {
+                    TerminalCut::new(*target.journal_id(), 0, [0; 32], [0; 32])
+                } else {
+                    let Some(progress) = expected_progress else {
+                        return;
+                    };
+                    if progress.generation() != page.cursor
+                        || progress.journal_id() != target.journal_id()
+                    {
+                        return;
+                    }
+                    progress
+                };
+                let mut validated = Vec::with_capacity(page.checkpoint_states.len());
+                for state in &page.checkpoint_states {
+                    let Some((op_id, identity, decision)) = validated_v3_terminal_state(state)
+                    else {
+                        return;
+                    };
+                    let generation = progress.generation().saturating_add(1);
+                    let Some(chain) = TerminalJournal::terminal_transition_chain_digest(
+                        &progress,
+                        generation,
+                        op_id,
+                        identity
+                            .as_ref()
+                            .map(|identity| identity.frozen_targets.as_slice()),
+                        identity.as_ref().map(|identity| identity.resolver),
+                        &decision,
+                    ) else {
+                        return;
+                    };
+                    progress = TerminalCut::new(
+                        *target.journal_id(),
+                        generation,
+                        chain,
+                        if generation == target.generation() {
+                            *target.terminal_set_digest()
+                        } else {
+                            [0; 32]
+                        },
+                    );
+                    validated.push(state.clone());
+                }
+                if progress.generation() != page.next_cursor {
+                    return;
+                }
+                let effects = rt.v3_sync.lock().transition_session(
+                    peer,
+                    SessionEvent::PageReceived {
+                        kind: SessionSyncKind::Terminal,
+                        wire: reducer_wire,
+                        next_cursor: SessionCursor::new(
+                            SessionCursorKind::TerminalGeneration,
+                            page.next_cursor,
+                        ),
+                        target_cut: cut_to_reducer(target),
+                        has_more: page.has_more,
+                    },
+                );
+                if !effects.iter().any(|effect| {
+                    matches!(effect, SessionEffect::ValidateAndApply { kind: SessionSyncKind::Terminal, wire } if *wire == reducer_wire)
+                }) {
+                    metrics::record_strict_catchup_duplicate(StrictCatchupDuplicateOutcome::Suppressed);
+                    return;
+                }
+                if let Some(client) = rt.v3_sync.lock().client_mut(peer) {
+                    client.accept_manifest(
+                        page.transfer_id,
+                        target,
+                        kind,
+                        rt.cfg.pending_propose_ttl(),
+                    );
+                }
+                for state in validated {
+                    if !rt.apply_v3_catchup_terminal_state(peer, state) {
+                        rt.v3_sync.lock().transition_session(
+                            peer,
+                            SessionEvent::ApplyFailed {
+                                epoch: SessionPeerEpoch::new(epoch),
+                                wire: reducer_wire,
+                            },
+                        );
+                        return;
+                    }
+                }
+                if let Some(client) = rt.v3_sync.lock().client_mut(peer) {
+                    client.set_progress_cut(progress);
+                }
+            }
+            StrictTerminalPageKind::Unspecified => return,
+        }
+    }
+
+    let apply_effects = rt.v3_sync.lock().transition_session(
+        peer,
+        SessionEvent::ApplySucceeded {
+            epoch: SessionPeerEpoch::new(epoch),
+            wire: reducer_wire,
+        },
+    );
+
+    // The complete correlated page is durable locally. Any subsequent retry
+    // must now refer to the next cursor (or the final ACK), never this page.
+    rt.v3_retries
+        .lock()
+        .complete_request(peer, page.request_nonce);
+
+    if page.has_more {
+        let Some(continuation_wire) = terminal_effect_wire(&apply_effects, |effect| match effect {
+            SessionEffect::Continue {
+                kind: SessionSyncKind::Terminal,
+                wire,
+            } => Some(*wire),
+            _ => None,
+        }) else {
+            return;
+        };
+        let (nonce, transfer_id, reason) = {
+            let mut sync = rt.v3_sync.lock();
+            let Some(client) = sync.client_mut(peer) else {
+                return;
+            };
+            client.prepare_continuation(
+                continuation_wire.nonce().get(),
+                continuation_wire.cursor().value(),
+            );
+            (
+                continuation_wire.nonce().get(),
+                continuation_wire.transfer().get(),
+                client.reason(),
+            )
+        };
+        let request = StrictTerminalSyncReq {
+            src_node: rt.self_id as u32,
+            expected_responder_boot_epoch: epoch,
+            reason,
+            known_source_cut: rt.v3_sync.lock().known_source_cut(peer).map(cut_to_wire),
+            requester_terminal_set_digest: Bytes::copy_from_slice(
+                rt.terminal_journal
+                    .lock()
+                    .terminal_cut()
+                    .terminal_set_digest(),
+            ),
+            transfer_id,
+            request_nonce: nonce,
+            expected_cursor: page.next_cursor,
+        };
+        rt.v3_retries.lock().register_request(
+            peer,
+            request.clone(),
+            rt.cfg.bulk_retry_delay(),
+            rt.cfg.pending_propose_ttl(),
+            rt.cfg.strict_bulk_retry_jitter_pct(),
+            v3_retry_salt(rt.self_id, &rt.topic),
+        );
+        let metric_reason =
+            CatchupReason::from_v3_wire(reason).unwrap_or(CatchupReason::TerminalFence);
+        let send_result = send_v3_metadata_control(
+            rt,
+            from,
+            StrictBody::TerminalSyncReq(request),
+            metric_reason,
+            CatchupPhase::Metadata,
+        )
+        .await;
+        record_terminal_send_result(rt, peer, continuation_wire, &send_result);
+        return;
+    }
+
+    let source_chain_complete = rt
+        .v3_sync
+        .lock()
+        .client(peer)
+        .and_then(|client| client.progress_cut())
+        .is_some_and(|progress| progress.has_same_chain_position(&target));
+    if !source_chain_complete {
+        return;
+    }
+
+    let completed = {
+        let mut sync = rt.v3_sync.lock();
+        sync.remember_source_cut(peer, target);
+        sync.begin_client_finalization(peer)
+    };
+    let Some(completed) = completed else {
+        // A concurrently delivered copy may have passed the initial client
+        // check before the first copy completed the session. Only the winner
+        // owns completion, continuation, and active-gauge accounting.
+        metrics::record_strict_catchup_duplicate(StrictCatchupDuplicateOutcome::Suppressed);
+        return;
+    };
+    let completed_reason = CatchupReason::from_v3_wire(completed.started_reason())
+        .unwrap_or(CatchupReason::TerminalFence);
+    let follow_up_reason = StrictCatchupReason::try_from(completed.reason())
+        .ok()
+        .unwrap_or(StrictCatchupReason::TerminalFence);
+    let inherited_metric_reason = StrictCatchupReason::try_from(completed.started_reason())
+        .ok()
+        .unwrap_or(StrictCatchupReason::TerminalFence);
+    if page.transfer_id == 0 {
+        rt.v3_sync.lock().finish_client_finalization(
+            peer,
+            page.transfer_id,
+            page.request_nonce,
+            target,
+        );
+        if let Some(dirty_wire) = terminal_start_wire(&apply_effects) {
+            metrics::record_strict_catchup_session_completion(
+                completed_reason,
+                StrictCatchupSessionOutcome::Completed,
+            );
+            metrics::record_strict_catchup_session_event(
+                completed_reason,
+                StrictCatchupSessionEvent::DirtyRefresh,
+            );
+            let reason = completed
+                .dirty()
+                .then_some(follow_up_reason)
+                .unwrap_or(StrictCatchupReason::TerminalFence);
+            let desired_cut = completed.dirty().then(|| completed.desired_cut()).flatten();
+            start_reducer_owned_terminal_client(rt, peer, reason, desired_cut, dirty_wire).await;
+        } else if !start_v3_repository_after_terminal(rt, peer, Some(inherited_metric_reason)).await
+        {
+            metrics::record_strict_catchup_session_completion(
+                completed_reason,
+                StrictCatchupSessionOutcome::Completed,
+            );
+        }
+        return;
+    }
+    let ack = StrictTerminalSyncAck {
+        src_node: rt.self_id as u32,
+        expected_responder_boot_epoch: epoch,
+        transfer_id: page.transfer_id,
+        request_nonce: page.request_nonce,
+        target_cut: Some(cut_to_wire(target)),
+    };
+    rt.v3_retries.lock().register_final_ack(
+        peer,
+        ack.clone(),
+        rt.cfg.bulk_retry_delay(),
+        rt.cfg.pending_propose_ttl(),
+        rt.cfg.strict_bulk_retry_jitter_pct(),
+        v3_retry_salt(rt.self_id, &rt.topic),
+    );
+    metrics::record_strict_catchup_session_event(
+        completed_reason,
+        StrictCatchupSessionEvent::FinalAck,
+    );
+    let final_ack_wire = terminal_session_wire(
+        epoch,
+        page.transfer_id,
+        page.request_nonce,
+        page.next_cursor,
+    )
+    .expect("validated terminal final ACK identity");
+    let send_result = send_v3_metadata_control(
+        rt,
+        from,
+        StrictBody::TerminalSyncAck(ack),
+        completed_reason,
+        CatchupPhase::FinalAck,
+    )
+    .await;
+    record_terminal_send_result(rt, peer, final_ack_wire, &send_result);
+}
+
+pub(super) async fn recv_v3_terminal_sync_ack<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    from: NodeIdentifier,
+    epoch: u64,
+    ack: StrictTerminalSyncAck,
+) {
+    let Some(peer) = v3_peer(rt, from, epoch) else {
+        return;
+    };
+    let Some(target) = ack.target_cut.as_ref().and_then(cut_from_wire) else {
+        return;
+    };
+    if node_from_u32(ack.src_node) != Some(from)
+        || ack.expected_responder_boot_epoch != rt.boot_epoch
+    {
+        return;
+    }
+    let responder_active = rt.v3_sync.lock().responder(peer).is_some();
+    let mut responder_completion_effects = Vec::new();
+    if responder_active {
+        let Some(wire) = terminal_session_wire(
+            epoch,
+            ack.transfer_id,
+            ack.request_nonce,
+            target.generation(),
+        ) else {
+            return;
+        };
+        responder_completion_effects = rt.v3_sync.lock().transition_session(
+            peer,
+            SessionEvent::AckReceived {
+                epoch: SessionPeerEpoch::new(epoch),
+                wire,
+                cut: cut_to_reducer(target),
+            },
+        );
+        if !responder_completion_effects
+            .iter()
+            .any(|effect| matches!(effect, SessionEffect::ReleaseBulk { .. }))
+        {
+            return;
+        }
+    }
+    let accepted = rt.v3_sync.lock().acknowledge_responder(
+        peer,
+        ack.transfer_id,
+        ack.request_nonce,
+        target,
+        rt.cfg.pending_propose_ttl(),
+    );
+    if accepted {
+        rt.net.acknowledge_bulk_unicast(
+            from,
+            &rt.topic,
+            BulkPageIdentity::terminal(ack.transfer_id, ack.request_nonce),
+        );
+        let confirmation = StrictTerminalSyncAck {
+            src_node: rt.self_id as u32,
+            expected_responder_boot_epoch: epoch,
+            transfer_id: ack.transfer_id,
+            request_nonce: ack.request_nonce,
+            target_cut: Some(cut_to_wire(target)),
+        };
+        let _ = send_v3_metadata_control(
+            rt,
+            from,
+            StrictBody::TerminalSyncAck(confirmation),
+            CatchupReason::TerminalFence,
+            CatchupPhase::FinalAck,
+        )
+        .await;
+        if let Some(dirty_wire) = terminal_start_wire(&responder_completion_effects) {
+            let deferred = rt.v3_sync.lock().take_deferred_client(peer);
+            let (reason, desired_cut) = deferred
+                .map(|(reason, desired_cut)| {
+                    (
+                        StrictCatchupReason::try_from(reason)
+                            .ok()
+                            .unwrap_or(StrictCatchupReason::TerminalFence),
+                        desired_cut,
+                    )
+                })
+                .unwrap_or((StrictCatchupReason::TerminalFence, None));
+            start_reducer_owned_terminal_client(rt, peer, reason, desired_cut, dirty_wire).await;
+        } else {
+            resume_deferred_v3_terminal_sync(rt, peer).await;
+        }
+        return;
+    }
+
+    let completed = rt.v3_sync.lock().finish_client_finalization(
+        peer,
+        ack.transfer_id,
+        ack.request_nonce,
+        target,
+    );
+    let Some(completed) = completed else {
+        return;
+    };
+    rt.v3_retries
+        .lock()
+        .complete_final_ack(peer, ack.transfer_id, ack.request_nonce);
+    let final_wire = terminal_session_wire(
+        epoch,
+        ack.transfer_id,
+        ack.request_nonce,
+        target.generation(),
+    )
+    .expect("validated terminal final ACK nonce");
+    let final_effects = rt.v3_sync.lock().transition_session(
+        peer,
+        SessionEvent::FinalAckDelivered {
+            epoch: SessionPeerEpoch::new(epoch),
+            wire: final_wire,
+        },
+    );
+
+    let completed_reason = CatchupReason::from_v3_wire(completed.started_reason())
+        .unwrap_or(CatchupReason::TerminalFence);
+    let follow_up_reason = StrictCatchupReason::try_from(completed.reason())
+        .ok()
+        .unwrap_or(StrictCatchupReason::TerminalFence);
+    let inherited_metric_reason = StrictCatchupReason::try_from(completed.started_reason())
+        .ok()
+        .unwrap_or(StrictCatchupReason::TerminalFence);
+    if let Some(dirty_wire) = terminal_start_wire(&final_effects) {
+        metrics::record_strict_catchup_session_completion(
+            completed_reason,
+            StrictCatchupSessionOutcome::Completed,
+        );
+        metrics::record_strict_catchup_session_event(
+            completed_reason,
+            StrictCatchupSessionEvent::DirtyRefresh,
+        );
+        let reason = completed
+            .dirty()
+            .then_some(follow_up_reason)
+            .unwrap_or(StrictCatchupReason::TerminalFence);
+        let desired_cut = completed.dirty().then(|| completed.desired_cut()).flatten();
+        start_reducer_owned_terminal_client(rt, peer, reason, desired_cut, dirty_wire).await;
+    } else if !start_v3_repository_after_terminal(rt, peer, Some(inherited_metric_reason)).await {
+        metrics::record_strict_catchup_session_completion(
+            completed_reason,
+            StrictCatchupSessionOutcome::Completed,
+        );
+    }
 }
 
 struct CatchupStrictMetadata {
@@ -2144,6 +4983,7 @@ mod tests {
             terminal_decision_generation: 0,
             snapshot_transfer_id: 0,
             snapshot_chunk_cursor: 0,
+            history_transfer: None,
         }
     }
 
@@ -2220,6 +5060,7 @@ mod tests {
                 terminal_decision_generation: 0,
                 snapshot_transfer_id: 0,
                 snapshot_chunk_cursor: 0,
+                history_transfer: None,
             },
         )
         .await;
@@ -2291,6 +5132,7 @@ mod tests {
                 terminal_decision_generation: 0,
                 snapshot_transfer_id: 0,
                 snapshot_chunk_cursor: 0,
+                history_transfer: None,
             },
         )
         .await;
@@ -2327,6 +5169,7 @@ mod tests {
                 terminal_decision_generation: 0,
                 snapshot_transfer_id: 0,
                 snapshot_chunk_cursor: 0,
+                history_transfer: None,
             },
         )
         .await;
@@ -2764,6 +5607,7 @@ mod tests {
             snapshot_sha256: Bytes::from(vec![0x11; 32]),
             snapshot_has_more: true,
             snapshot_transfer_rejected: false,
+            history_transfer: None,
         };
         apply_response(&sink, 1, first_response).await;
         sink_net.drain_captures();
@@ -2793,6 +5637,7 @@ mod tests {
             snapshot_sha256: Bytes::from(vec![0x22; 32]),
             snapshot_has_more: true,
             snapshot_transfer_rejected: false,
+            history_transfer: None,
         };
         apply_response(&sink, 3, second_response).await;
 
@@ -2840,6 +5685,7 @@ mod tests {
                 terminal_decision_generation: 0,
                 snapshot_transfer_id: 0,
                 snapshot_chunk_cursor: 0,
+                history_transfer: None,
             },
         )
         .await;
@@ -3172,6 +6018,7 @@ mod tests {
                 terminal_decision_generation: 0,
                 snapshot_transfer_id: 0,
                 snapshot_chunk_cursor: 0,
+                history_transfer: None,
             },
         )
         .await;

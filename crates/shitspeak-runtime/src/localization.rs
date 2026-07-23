@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use crate::messages::encoder::{DenyType, RejectType};
+use shitspeak_messages::messages::encoder::{DenyType, RejectType};
 
 pub use shitspeak_core::Language;
 

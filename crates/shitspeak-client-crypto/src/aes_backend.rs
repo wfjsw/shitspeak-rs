@@ -184,36 +184,48 @@ mod native {
         /// SAFETY: caller asserts the host supports the `aes` and `sse2`
         /// target features.
         pub unsafe fn new(key: &[u8; 16]) -> Self {
-            let enc = key_expansion(*key);
-            let dec = inverse_round_keys(&enc);
-            Self { enc, dec }
+            // SAFETY: the caller guarantees the CPU supports the target
+            // features required by the AES-NI key-schedule routines.
+            unsafe {
+                let enc = key_expansion(*key);
+                let dec = inverse_round_keys(&enc);
+                Self { enc, dec }
+            }
         }
 
         #[target_feature(enable = "aes,sse2")]
         pub unsafe fn encrypt_blocks(&self, buffer: &mut [u8]) {
-            let mut chunks = buffer.chunks_exact_mut(BLOCK_BYTES * 8);
-            for chunk in &mut chunks {
-                encrypt_8(&self.enc, chunk);
-            }
-            let rem = chunks.into_remainder();
-            for block in rem.chunks_exact_mut(BLOCK_BYTES) {
-                let b = _mm_loadu_si128(block.as_ptr() as *const __m128i);
-                let c = encrypt_one(&self.enc, b);
-                _mm_storeu_si128(block.as_mut_ptr() as *mut __m128i, c);
+            // SAFETY: this function is only called after runtime AES/SSE2
+            // feature detection; each block is exactly 16 readable/writable bytes.
+            unsafe {
+                let mut chunks = buffer.chunks_exact_mut(BLOCK_BYTES * 8);
+                for chunk in &mut chunks {
+                    encrypt_8(&self.enc, chunk);
+                }
+                let rem = chunks.into_remainder();
+                for block in rem.chunks_exact_mut(BLOCK_BYTES) {
+                    let b = _mm_loadu_si128(block.as_ptr() as *const __m128i);
+                    let c = encrypt_one(&self.enc, b);
+                    _mm_storeu_si128(block.as_mut_ptr() as *mut __m128i, c);
+                }
             }
         }
 
         #[target_feature(enable = "aes,sse2")]
         pub unsafe fn decrypt_blocks(&self, buffer: &mut [u8]) {
-            let mut chunks = buffer.chunks_exact_mut(BLOCK_BYTES * 8);
-            for chunk in &mut chunks {
-                decrypt_8(&self.dec, chunk);
-            }
-            let rem = chunks.into_remainder();
-            for block in rem.chunks_exact_mut(BLOCK_BYTES) {
-                let b = _mm_loadu_si128(block.as_ptr() as *const __m128i);
-                let c = decrypt_one(&self.dec, b);
-                _mm_storeu_si128(block.as_mut_ptr() as *mut __m128i, c);
+            // SAFETY: this function is only called after runtime AES/SSE2
+            // feature detection; each block is exactly 16 readable/writable bytes.
+            unsafe {
+                let mut chunks = buffer.chunks_exact_mut(BLOCK_BYTES * 8);
+                for chunk in &mut chunks {
+                    decrypt_8(&self.dec, chunk);
+                }
+                let rem = chunks.into_remainder();
+                for block in rem.chunks_exact_mut(BLOCK_BYTES) {
+                    let b = _mm_loadu_si128(block.as_ptr() as *const __m128i);
+                    let c = decrypt_one(&self.dec, b);
+                    _mm_storeu_si128(block.as_mut_ptr() as *mut __m128i, c);
+                }
             }
         }
     }
@@ -255,108 +267,116 @@ mod native {
     /// 1-cycle throughput on modern Intel/AMD).
     #[target_feature(enable = "aes,sse2")]
     unsafe fn encrypt_8(rk: &[__m128i; 11], chunk: &mut [u8]) {
-        let p = chunk.as_mut_ptr();
-        let mut b0 = _mm_loadu_si128(p.add(0) as *const __m128i);
-        let mut b1 = _mm_loadu_si128(p.add(16) as *const __m128i);
-        let mut b2 = _mm_loadu_si128(p.add(32) as *const __m128i);
-        let mut b3 = _mm_loadu_si128(p.add(48) as *const __m128i);
-        let mut b4 = _mm_loadu_si128(p.add(64) as *const __m128i);
-        let mut b5 = _mm_loadu_si128(p.add(80) as *const __m128i);
-        let mut b6 = _mm_loadu_si128(p.add(96) as *const __m128i);
-        let mut b7 = _mm_loadu_si128(p.add(112) as *const __m128i);
+        // SAFETY: the caller supplies exactly eight AES blocks and the target
+        // features guarantee that all AES/SSE2 intrinsics are available.
+        unsafe {
+            let p = chunk.as_mut_ptr();
+            let mut b0 = _mm_loadu_si128(p.add(0) as *const __m128i);
+            let mut b1 = _mm_loadu_si128(p.add(16) as *const __m128i);
+            let mut b2 = _mm_loadu_si128(p.add(32) as *const __m128i);
+            let mut b3 = _mm_loadu_si128(p.add(48) as *const __m128i);
+            let mut b4 = _mm_loadu_si128(p.add(64) as *const __m128i);
+            let mut b5 = _mm_loadu_si128(p.add(80) as *const __m128i);
+            let mut b6 = _mm_loadu_si128(p.add(96) as *const __m128i);
+            let mut b7 = _mm_loadu_si128(p.add(112) as *const __m128i);
 
-        let k0 = rk[0];
-        b0 = _mm_xor_si128(b0, k0);
-        b1 = _mm_xor_si128(b1, k0);
-        b2 = _mm_xor_si128(b2, k0);
-        b3 = _mm_xor_si128(b3, k0);
-        b4 = _mm_xor_si128(b4, k0);
-        b5 = _mm_xor_si128(b5, k0);
-        b6 = _mm_xor_si128(b6, k0);
-        b7 = _mm_xor_si128(b7, k0);
+            let k0 = rk[0];
+            b0 = _mm_xor_si128(b0, k0);
+            b1 = _mm_xor_si128(b1, k0);
+            b2 = _mm_xor_si128(b2, k0);
+            b3 = _mm_xor_si128(b3, k0);
+            b4 = _mm_xor_si128(b4, k0);
+            b5 = _mm_xor_si128(b5, k0);
+            b6 = _mm_xor_si128(b6, k0);
+            b7 = _mm_xor_si128(b7, k0);
 
-        for i in 1..10 {
-            let ki = rk[i];
-            b0 = _mm_aesenc_si128(b0, ki);
-            b1 = _mm_aesenc_si128(b1, ki);
-            b2 = _mm_aesenc_si128(b2, ki);
-            b3 = _mm_aesenc_si128(b3, ki);
-            b4 = _mm_aesenc_si128(b4, ki);
-            b5 = _mm_aesenc_si128(b5, ki);
-            b6 = _mm_aesenc_si128(b6, ki);
-            b7 = _mm_aesenc_si128(b7, ki);
+            for i in 1..10 {
+                let ki = rk[i];
+                b0 = _mm_aesenc_si128(b0, ki);
+                b1 = _mm_aesenc_si128(b1, ki);
+                b2 = _mm_aesenc_si128(b2, ki);
+                b3 = _mm_aesenc_si128(b3, ki);
+                b4 = _mm_aesenc_si128(b4, ki);
+                b5 = _mm_aesenc_si128(b5, ki);
+                b6 = _mm_aesenc_si128(b6, ki);
+                b7 = _mm_aesenc_si128(b7, ki);
+            }
+            let kl = rk[10];
+            b0 = _mm_aesenclast_si128(b0, kl);
+            b1 = _mm_aesenclast_si128(b1, kl);
+            b2 = _mm_aesenclast_si128(b2, kl);
+            b3 = _mm_aesenclast_si128(b3, kl);
+            b4 = _mm_aesenclast_si128(b4, kl);
+            b5 = _mm_aesenclast_si128(b5, kl);
+            b6 = _mm_aesenclast_si128(b6, kl);
+            b7 = _mm_aesenclast_si128(b7, kl);
+
+            _mm_storeu_si128(p.add(0) as *mut __m128i, b0);
+            _mm_storeu_si128(p.add(16) as *mut __m128i, b1);
+            _mm_storeu_si128(p.add(32) as *mut __m128i, b2);
+            _mm_storeu_si128(p.add(48) as *mut __m128i, b3);
+            _mm_storeu_si128(p.add(64) as *mut __m128i, b4);
+            _mm_storeu_si128(p.add(80) as *mut __m128i, b5);
+            _mm_storeu_si128(p.add(96) as *mut __m128i, b6);
+            _mm_storeu_si128(p.add(112) as *mut __m128i, b7);
         }
-        let kl = rk[10];
-        b0 = _mm_aesenclast_si128(b0, kl);
-        b1 = _mm_aesenclast_si128(b1, kl);
-        b2 = _mm_aesenclast_si128(b2, kl);
-        b3 = _mm_aesenclast_si128(b3, kl);
-        b4 = _mm_aesenclast_si128(b4, kl);
-        b5 = _mm_aesenclast_si128(b5, kl);
-        b6 = _mm_aesenclast_si128(b6, kl);
-        b7 = _mm_aesenclast_si128(b7, kl);
-
-        _mm_storeu_si128(p.add(0) as *mut __m128i, b0);
-        _mm_storeu_si128(p.add(16) as *mut __m128i, b1);
-        _mm_storeu_si128(p.add(32) as *mut __m128i, b2);
-        _mm_storeu_si128(p.add(48) as *mut __m128i, b3);
-        _mm_storeu_si128(p.add(64) as *mut __m128i, b4);
-        _mm_storeu_si128(p.add(80) as *mut __m128i, b5);
-        _mm_storeu_si128(p.add(96) as *mut __m128i, b6);
-        _mm_storeu_si128(p.add(112) as *mut __m128i, b7);
     }
 
     #[target_feature(enable = "aes,sse2")]
     unsafe fn decrypt_8(dk: &[__m128i; 11], chunk: &mut [u8]) {
-        let p = chunk.as_mut_ptr();
-        let mut b0 = _mm_loadu_si128(p.add(0) as *const __m128i);
-        let mut b1 = _mm_loadu_si128(p.add(16) as *const __m128i);
-        let mut b2 = _mm_loadu_si128(p.add(32) as *const __m128i);
-        let mut b3 = _mm_loadu_si128(p.add(48) as *const __m128i);
-        let mut b4 = _mm_loadu_si128(p.add(64) as *const __m128i);
-        let mut b5 = _mm_loadu_si128(p.add(80) as *const __m128i);
-        let mut b6 = _mm_loadu_si128(p.add(96) as *const __m128i);
-        let mut b7 = _mm_loadu_si128(p.add(112) as *const __m128i);
+        // SAFETY: the caller supplies exactly eight AES blocks and the target
+        // features guarantee that all AES/SSE2 intrinsics are available.
+        unsafe {
+            let p = chunk.as_mut_ptr();
+            let mut b0 = _mm_loadu_si128(p.add(0) as *const __m128i);
+            let mut b1 = _mm_loadu_si128(p.add(16) as *const __m128i);
+            let mut b2 = _mm_loadu_si128(p.add(32) as *const __m128i);
+            let mut b3 = _mm_loadu_si128(p.add(48) as *const __m128i);
+            let mut b4 = _mm_loadu_si128(p.add(64) as *const __m128i);
+            let mut b5 = _mm_loadu_si128(p.add(80) as *const __m128i);
+            let mut b6 = _mm_loadu_si128(p.add(96) as *const __m128i);
+            let mut b7 = _mm_loadu_si128(p.add(112) as *const __m128i);
 
-        let k0 = dk[0];
-        b0 = _mm_xor_si128(b0, k0);
-        b1 = _mm_xor_si128(b1, k0);
-        b2 = _mm_xor_si128(b2, k0);
-        b3 = _mm_xor_si128(b3, k0);
-        b4 = _mm_xor_si128(b4, k0);
-        b5 = _mm_xor_si128(b5, k0);
-        b6 = _mm_xor_si128(b6, k0);
-        b7 = _mm_xor_si128(b7, k0);
+            let k0 = dk[0];
+            b0 = _mm_xor_si128(b0, k0);
+            b1 = _mm_xor_si128(b1, k0);
+            b2 = _mm_xor_si128(b2, k0);
+            b3 = _mm_xor_si128(b3, k0);
+            b4 = _mm_xor_si128(b4, k0);
+            b5 = _mm_xor_si128(b5, k0);
+            b6 = _mm_xor_si128(b6, k0);
+            b7 = _mm_xor_si128(b7, k0);
 
-        for i in 1..10 {
-            let ki = dk[i];
-            b0 = _mm_aesdec_si128(b0, ki);
-            b1 = _mm_aesdec_si128(b1, ki);
-            b2 = _mm_aesdec_si128(b2, ki);
-            b3 = _mm_aesdec_si128(b3, ki);
-            b4 = _mm_aesdec_si128(b4, ki);
-            b5 = _mm_aesdec_si128(b5, ki);
-            b6 = _mm_aesdec_si128(b6, ki);
-            b7 = _mm_aesdec_si128(b7, ki);
+            for i in 1..10 {
+                let ki = dk[i];
+                b0 = _mm_aesdec_si128(b0, ki);
+                b1 = _mm_aesdec_si128(b1, ki);
+                b2 = _mm_aesdec_si128(b2, ki);
+                b3 = _mm_aesdec_si128(b3, ki);
+                b4 = _mm_aesdec_si128(b4, ki);
+                b5 = _mm_aesdec_si128(b5, ki);
+                b6 = _mm_aesdec_si128(b6, ki);
+                b7 = _mm_aesdec_si128(b7, ki);
+            }
+            let kl = dk[10];
+            b0 = _mm_aesdeclast_si128(b0, kl);
+            b1 = _mm_aesdeclast_si128(b1, kl);
+            b2 = _mm_aesdeclast_si128(b2, kl);
+            b3 = _mm_aesdeclast_si128(b3, kl);
+            b4 = _mm_aesdeclast_si128(b4, kl);
+            b5 = _mm_aesdeclast_si128(b5, kl);
+            b6 = _mm_aesdeclast_si128(b6, kl);
+            b7 = _mm_aesdeclast_si128(b7, kl);
+
+            _mm_storeu_si128(p.add(0) as *mut __m128i, b0);
+            _mm_storeu_si128(p.add(16) as *mut __m128i, b1);
+            _mm_storeu_si128(p.add(32) as *mut __m128i, b2);
+            _mm_storeu_si128(p.add(48) as *mut __m128i, b3);
+            _mm_storeu_si128(p.add(64) as *mut __m128i, b4);
+            _mm_storeu_si128(p.add(80) as *mut __m128i, b5);
+            _mm_storeu_si128(p.add(96) as *mut __m128i, b6);
+            _mm_storeu_si128(p.add(112) as *mut __m128i, b7);
         }
-        let kl = dk[10];
-        b0 = _mm_aesdeclast_si128(b0, kl);
-        b1 = _mm_aesdeclast_si128(b1, kl);
-        b2 = _mm_aesdeclast_si128(b2, kl);
-        b3 = _mm_aesdeclast_si128(b3, kl);
-        b4 = _mm_aesdeclast_si128(b4, kl);
-        b5 = _mm_aesdeclast_si128(b5, kl);
-        b6 = _mm_aesdeclast_si128(b6, kl);
-        b7 = _mm_aesdeclast_si128(b7, kl);
-
-        _mm_storeu_si128(p.add(0) as *mut __m128i, b0);
-        _mm_storeu_si128(p.add(16) as *mut __m128i, b1);
-        _mm_storeu_si128(p.add(32) as *mut __m128i, b2);
-        _mm_storeu_si128(p.add(48) as *mut __m128i, b3);
-        _mm_storeu_si128(p.add(64) as *mut __m128i, b4);
-        _mm_storeu_si128(p.add(80) as *mut __m128i, b5);
-        _mm_storeu_si128(p.add(96) as *mut __m128i, b6);
-        _mm_storeu_si128(p.add(112) as *mut __m128i, b7);
     }
 
     /// AES-128 key schedule via `aeskeygenassist`. Round constants for AES-128
@@ -364,19 +384,23 @@ mod native {
     /// powers of 2 in GF(2^8) modulo the AES polynomial.
     #[target_feature(enable = "aes,sse2")]
     unsafe fn key_expansion(key: [u8; 16]) -> [__m128i; 11] {
-        let mut rk = [_mm_setzero_si128(); 11];
-        rk[0] = _mm_loadu_si128(key.as_ptr() as *const __m128i);
-        rk[1] = expand_step::<0x01>(rk[0]);
-        rk[2] = expand_step::<0x02>(rk[1]);
-        rk[3] = expand_step::<0x04>(rk[2]);
-        rk[4] = expand_step::<0x08>(rk[3]);
-        rk[5] = expand_step::<0x10>(rk[4]);
-        rk[6] = expand_step::<0x20>(rk[5]);
-        rk[7] = expand_step::<0x40>(rk[6]);
-        rk[8] = expand_step::<0x80>(rk[7]);
-        rk[9] = expand_step::<0x1b>(rk[8]);
-        rk[10] = expand_step::<0x36>(rk[9]);
-        rk
+        // SAFETY: the target features guarantee the AES/SSE2 intrinsics, and
+        // `key` provides the 16 bytes required by the unaligned load.
+        unsafe {
+            let mut rk = [_mm_setzero_si128(); 11];
+            rk[0] = _mm_loadu_si128(key.as_ptr() as *const __m128i);
+            rk[1] = expand_step::<0x01>(rk[0]);
+            rk[2] = expand_step::<0x02>(rk[1]);
+            rk[3] = expand_step::<0x04>(rk[2]);
+            rk[4] = expand_step::<0x08>(rk[3]);
+            rk[5] = expand_step::<0x10>(rk[4]);
+            rk[6] = expand_step::<0x20>(rk[5]);
+            rk[7] = expand_step::<0x40>(rk[6]);
+            rk[8] = expand_step::<0x80>(rk[7]);
+            rk[9] = expand_step::<0x1b>(rk[8]);
+            rk[10] = expand_step::<0x36>(rk[9]);
+            rk
+        }
     }
 
     #[target_feature(enable = "aes,sse2")]

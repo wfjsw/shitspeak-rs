@@ -19,7 +19,7 @@ use crate::server::Server;
 /// waiting for a quiet period of 500 ms before triggering a reload.
 pub fn spawn_config_watcher(
     server: Arc<Box<Server>>,
-    mut shutdown: watch::Receiver<()>,
+    shutdown: watch::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {

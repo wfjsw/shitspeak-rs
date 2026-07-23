@@ -10,8 +10,8 @@ pub struct ServerConfig {
     pub max_users: Option<u32>,
 }
 
-impl From<crate::mumble_proto::ServerConfig> for ServerConfig {
-    fn from(proto: crate::mumble_proto::ServerConfig) -> Self {
+impl From<shitspeak_proto::mumble_proto::ServerConfig> for ServerConfig {
+    fn from(proto: shitspeak_proto::mumble_proto::ServerConfig) -> Self {
         Self {
             max_bandwidth: proto.max_bandwidth,
             welcome_text: proto.welcome_text,
@@ -23,9 +23,9 @@ impl From<crate::mumble_proto::ServerConfig> for ServerConfig {
     }
 }
 
-impl From<ServerConfig> for crate::mumble_proto::ServerConfig {
+impl From<ServerConfig> for shitspeak_proto::mumble_proto::ServerConfig {
     fn from(value: ServerConfig) -> Self {
-        crate::mumble_proto::ServerConfig {
+        shitspeak_proto::mumble_proto::ServerConfig {
             max_bandwidth: value.max_bandwidth,
             welcome_text: value.welcome_text,
             allow_html: value.allow_html,

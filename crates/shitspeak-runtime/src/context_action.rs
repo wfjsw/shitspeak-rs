@@ -24,7 +24,7 @@ use std::{
 
 use parking_lot::RwLock;
 
-use crate::messages::encoder::ContextActionModify;
+use shitspeak_messages::messages::encoder::ContextActionModify;
 
 // ── Context bitmask ──────────────────────────────────────────────────────
 
@@ -412,6 +412,8 @@ impl Default for ContextActionRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
 
     fn noop_one_shot() -> OneShotCallback {
@@ -518,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_one_shot() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::Ordering;
 
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = Arc::clone(&called);
@@ -552,8 +554,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_toggle_flips_state() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         let last_state = Arc::new(std::sync::Mutex::new(false));
         let last_state_clone = Arc::clone(&last_state);
 

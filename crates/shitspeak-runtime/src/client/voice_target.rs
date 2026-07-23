@@ -4,7 +4,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use super::{ClientInstanceId, client_session_identifier::ClientSessionIdentifier};
-use crate::messages::encoder::AudioContext;
+use shitspeak_messages::messages::encoder::AudioContext;
 
 #[derive(Debug, Clone)]
 pub struct VoiceTarget {

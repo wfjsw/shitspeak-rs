@@ -8,7 +8,7 @@
 
 #![cfg(any(test, feature = "test-support"))]
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,6 +17,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
+use prost::Message as _;
 use serde::{Deserialize, Serialize};
 
 use super::error::ReplicationError;
@@ -24,7 +25,55 @@ use super::owner::runtime::OwnerNet;
 use super::proto::{OwnerBody, StrictBody};
 use super::strict::runtime::StrictNet;
 use shitspeak_core::NodeIdentifier;
-use shitspeak_s2s_transport::ServiceLevel;
+use shitspeak_s2s_transport::{SendError, ServiceLevel, TransportKind};
+
+/// Logical transport lane selected by the strict runtime.
+///
+/// This is intentionally recorded separately from [`CapturedFrame`] so the
+/// long-standing frame shapes remain convenient for existing tests while new
+/// pressure tests can assert that operation-bearing pages never use the
+/// redundant control path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictSendLane {
+    Ordinary,
+    RedundantControl,
+    Bulk,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrictSendTarget {
+    Unicast(NodeIdentifier),
+    Multicast(Vec<NodeIdentifier>),
+    Broadcast,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictSendOutcome {
+    Sent,
+    InjectedFailure,
+    Backpressure,
+}
+
+/// One attempted strict send, including the exact protobuf payload produced by
+/// the mock transport before any enqueue outcome is applied.
+#[derive(Debug, Clone)]
+pub struct StrictSendObservation {
+    pub lane: StrictSendLane,
+    pub target: StrictSendTarget,
+    pub topic: String,
+    pub body: StrictBody,
+    pub encoded: Bytes,
+    pub retry_delay: Option<Duration>,
+    pub outcome: StrictSendOutcome,
+}
+
+/// Script item consumed by successive calls to `send_bulk_unicast`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockBulkSendOutcome {
+    Sent,
+    Backpressure,
+    Failure,
+}
 
 #[derive(Debug, Clone)]
 pub enum CapturedFrame {
@@ -73,6 +122,8 @@ pub struct MockNet {
     strict_multicast_failures: AtomicBool,
     owner_unicast_failures: Mutex<std::collections::HashSet<NodeIdentifier>>,
     pub captured: Mutex<Vec<CapturedFrame>>,
+    strict_send_observations: Mutex<Vec<StrictSendObservation>>,
+    bulk_send_outcomes: Mutex<VecDeque<MockBulkSendOutcome>>,
     pub edge_rtts: Mutex<Vec<Duration>>,
 }
 
@@ -95,6 +146,8 @@ impl MockNet {
             strict_multicast_failures: AtomicBool::new(false),
             owner_unicast_failures: Mutex::new(Default::default()),
             captured: Mutex::new(Vec::new()),
+            strict_send_observations: Mutex::new(Vec::new()),
+            bulk_send_outcomes: Mutex::new(VecDeque::new()),
             edge_rtts: Mutex::new(Vec::new()),
         })
     }
@@ -189,6 +242,55 @@ impl MockNet {
         std::mem::take(&mut *self.captured.lock())
     }
 
+    pub fn strict_send_observations(&self) -> Vec<StrictSendObservation> {
+        self.strict_send_observations.lock().clone()
+    }
+
+    pub fn drain_strict_send_observations(&self) -> Vec<StrictSendObservation> {
+        std::mem::take(&mut *self.strict_send_observations.lock())
+    }
+
+    /// Replace the scripted outcomes for successive bulk sends. Once the
+    /// script is exhausted, later sends succeed.
+    pub fn script_bulk_send_outcomes(
+        &self,
+        outcomes: impl IntoIterator<Item = MockBulkSendOutcome>,
+    ) {
+        *self.bulk_send_outcomes.lock() = outcomes.into_iter().collect();
+    }
+
+    pub fn strict_encoded_bytes_for_lane(&self, lane: StrictSendLane) -> usize {
+        self.strict_send_observations
+            .lock()
+            .iter()
+            .filter(|observation| observation.lane == lane)
+            .map(|observation| observation.encoded.len())
+            .sum()
+    }
+
+    fn observe_strict_send(
+        &self,
+        lane: StrictSendLane,
+        target: StrictSendTarget,
+        topic: &str,
+        body: &StrictBody,
+        retry_delay: Option<Duration>,
+        outcome: StrictSendOutcome,
+    ) {
+        let encoded = Bytes::from(super::proto::wrap_strict(topic, body.clone()).encode_to_vec());
+        self.strict_send_observations
+            .lock()
+            .push(StrictSendObservation {
+                lane,
+                target,
+                topic: topic.to_owned(),
+                body: body.clone(),
+                encoded,
+                retry_delay,
+                outcome,
+            });
+    }
+
     pub fn count_strict_multicasts(&self) -> usize {
         self.captured
             .lock()
@@ -222,7 +324,20 @@ impl StrictNet for MockNet {
         topic: &str,
         body: StrictBody,
     ) -> Result<(), ReplicationError> {
-        if self.strict_unicast_failures.lock().contains(&dst) {
+        let failed = self.strict_unicast_failures.lock().contains(&dst);
+        self.observe_strict_send(
+            StrictSendLane::Ordinary,
+            StrictSendTarget::Unicast(dst),
+            topic,
+            &body,
+            None,
+            if failed {
+                StrictSendOutcome::InjectedFailure
+            } else {
+                StrictSendOutcome::Sent
+            },
+        );
+        if failed {
             return Err(ReplicationError::Malformed(
                 "injected strict unicast failure",
             ));
@@ -235,13 +350,104 @@ impl StrictNet for MockNet {
         Ok(())
     }
 
+    async fn send_redundant_unicast(
+        &self,
+        dst: NodeIdentifier,
+        topic: &str,
+        body: StrictBody,
+    ) -> Result<(), ReplicationError> {
+        let failed = self.strict_unicast_failures.lock().contains(&dst);
+        self.observe_strict_send(
+            StrictSendLane::RedundantControl,
+            StrictSendTarget::Unicast(dst),
+            topic,
+            &body,
+            None,
+            if failed {
+                StrictSendOutcome::InjectedFailure
+            } else {
+                StrictSendOutcome::Sent
+            },
+        );
+        if failed {
+            return Err(ReplicationError::Malformed(
+                "injected strict redundant unicast failure",
+            ));
+        }
+        self.captured.lock().push(CapturedFrame::StrictUnicast {
+            dst,
+            topic: topic.to_owned(),
+            body,
+        });
+        Ok(())
+    }
+
+    async fn send_bulk_unicast(
+        &self,
+        dst: NodeIdentifier,
+        topic: &str,
+        body: StrictBody,
+        retry_delay: Duration,
+    ) -> Result<(), ReplicationError> {
+        let scripted = self
+            .bulk_send_outcomes
+            .lock()
+            .pop_front()
+            .unwrap_or(MockBulkSendOutcome::Sent);
+        let outcome = match scripted {
+            MockBulkSendOutcome::Sent => StrictSendOutcome::Sent,
+            MockBulkSendOutcome::Backpressure => StrictSendOutcome::Backpressure,
+            MockBulkSendOutcome::Failure => StrictSendOutcome::InjectedFailure,
+        };
+        self.observe_strict_send(
+            StrictSendLane::Bulk,
+            StrictSendTarget::Unicast(dst),
+            topic,
+            &body,
+            Some(retry_delay),
+            outcome,
+        );
+        match scripted {
+            MockBulkSendOutcome::Sent => {
+                self.captured.lock().push(CapturedFrame::StrictUnicast {
+                    dst,
+                    topic: topic.to_owned(),
+                    body,
+                });
+                Ok(())
+            }
+            MockBulkSendOutcome::Backpressure => Err(ReplicationError::Overlay(
+                crate::overlay::OverlayError::Send(SendError::Backpressure {
+                    node: dst,
+                    transport: TransportKind::Tcp,
+                }),
+            )),
+            MockBulkSendOutcome::Failure => Err(ReplicationError::Malformed(
+                "injected strict bulk unicast failure",
+            )),
+        }
+    }
+
     async fn send_multicast(
         &self,
         dsts: &[NodeIdentifier],
         topic: &str,
         body: StrictBody,
     ) -> Result<(), ReplicationError> {
-        if self.strict_multicast_failures.load(Ordering::Relaxed) {
+        let failed = self.strict_multicast_failures.load(Ordering::Relaxed);
+        self.observe_strict_send(
+            StrictSendLane::Ordinary,
+            StrictSendTarget::Multicast(dsts.to_vec()),
+            topic,
+            &body,
+            None,
+            if failed {
+                StrictSendOutcome::InjectedFailure
+            } else {
+                StrictSendOutcome::Sent
+            },
+        );
+        if failed {
             return Err(ReplicationError::Malformed(
                 "injected strict multicast failure",
             ));
@@ -254,7 +460,47 @@ impl StrictNet for MockNet {
         Ok(())
     }
 
+    async fn send_redundant_multicast(
+        &self,
+        dsts: &[NodeIdentifier],
+        topic: &str,
+        body: StrictBody,
+    ) -> Result<(), ReplicationError> {
+        let failed = self.strict_multicast_failures.load(Ordering::Relaxed);
+        self.observe_strict_send(
+            StrictSendLane::RedundantControl,
+            StrictSendTarget::Multicast(dsts.to_vec()),
+            topic,
+            &body,
+            None,
+            if failed {
+                StrictSendOutcome::InjectedFailure
+            } else {
+                StrictSendOutcome::Sent
+            },
+        );
+        if failed {
+            return Err(ReplicationError::Malformed(
+                "injected strict redundant multicast failure",
+            ));
+        }
+        self.captured.lock().push(CapturedFrame::StrictMulticast {
+            dsts: dsts.to_vec(),
+            topic: topic.to_owned(),
+            body,
+        });
+        Ok(())
+    }
+
     async fn send_broadcast(&self, topic: &str, body: StrictBody) -> Result<(), ReplicationError> {
+        self.observe_strict_send(
+            StrictSendLane::Ordinary,
+            StrictSendTarget::Broadcast,
+            topic,
+            &body,
+            None,
+            StrictSendOutcome::Sent,
+        );
         self.captured.lock().push(CapturedFrame::StrictBroadcast {
             topic: topic.to_owned(),
             body,

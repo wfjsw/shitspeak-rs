@@ -28,17 +28,17 @@ impl ChannelState {
     pub fn with_permission_info(
         mut self,
         is_enter_restricted: bool,
-        perms: enumflags2::BitFlags<crate::acl::ACLPermissions>,
+        perms: enumflags2::BitFlags<shitspeak_core::ACLPermissions>,
     ) -> Self {
-        use crate::acl::ACLPermissions;
+        use shitspeak_core::ACLPermissions;
         self.is_enter_restricted = Some(is_enter_restricted);
         self.can_enter = Some(perms.contains(ACLPermissions::Enter));
         self
     }
 }
 
-impl From<crate::mumble_proto::ChannelState> for ChannelState {
-    fn from(proto: crate::mumble_proto::ChannelState) -> Self {
+impl From<shitspeak_proto::mumble_proto::ChannelState> for ChannelState {
+    fn from(proto: shitspeak_proto::mumble_proto::ChannelState) -> Self {
         Self {
             channel_id: proto.channel_id,
             parent: proto.parent,
@@ -57,9 +57,9 @@ impl From<crate::mumble_proto::ChannelState> for ChannelState {
     }
 }
 
-impl From<ChannelState> for crate::mumble_proto::ChannelState {
+impl From<ChannelState> for shitspeak_proto::mumble_proto::ChannelState {
     fn from(value: ChannelState) -> Self {
-        crate::mumble_proto::ChannelState {
+        shitspeak_proto::mumble_proto::ChannelState {
             channel_id: value.channel_id,
             parent: value.parent,
             name: value.name,

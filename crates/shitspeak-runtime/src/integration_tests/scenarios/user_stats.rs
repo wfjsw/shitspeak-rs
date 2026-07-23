@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
-use crate::messages::Message;
-use crate::messages::encoder::{Ping, UserStats};
+use shitspeak_messages::messages::Message;
+use shitspeak_messages::messages::encoder::{Ping, UserStats};
 use shitspeak_state::Channel;
 use shitspeak_state::{ACL, ACLPermissions};
 

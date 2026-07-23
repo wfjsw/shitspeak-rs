@@ -5,7 +5,7 @@ use crate::{
     errors::MessageHandlerError,
     localization::{TextKey, text},
     messages::{
-        Message, WriteMessageExt,
+        Message,
         encoder::{Acl as EncoderAcl, ChanAcl},
     },
     server::Server,
@@ -49,8 +49,8 @@ pub async fn handle_acl(
     let root_perm = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
     if !target_perm.contains(ACLPermissions::Write) && !root_perm.contains(ACLPermissions::Write) {
         return Err(MessageHandlerError::PermissionDenied(
-            crate::messages::encoder::PermissionDenied {
-                r#type: crate::messages::encoder::DenyType::Permission,
+            shitspeak_messages::messages::encoder::PermissionDenied {
+                r#type: shitspeak_messages::messages::encoder::DenyType::Permission,
                 session: u32::from(sender.get_session_id()),
                 channel_id: Some(channel_id),
                 reason: Some(text(sender.language(), TextKey::WriteAclRequired)),
@@ -122,8 +122,8 @@ pub async fn handle_acl(
 
         if !msg.groups.is_empty() {
             return Err(MessageHandlerError::PermissionDenied(
-                crate::messages::encoder::PermissionDenied {
-                    r#type: crate::messages::encoder::DenyType::Permission,
+                shitspeak_messages::messages::encoder::PermissionDenied {
+                    r#type: shitspeak_messages::messages::encoder::DenyType::Permission,
                     session: u32::from(sender.get_session_id()),
                     channel_id: Some(channel_id),
                     reason: Some("ACL group updates are not supported".into()),

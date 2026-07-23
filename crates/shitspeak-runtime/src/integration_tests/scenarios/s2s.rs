@@ -15,17 +15,17 @@ use crate::integration_tests::harness::{
     TestClient, TestS2sServerOpts, TestServer, TestServerOpts, spawn_s2s_test_server,
     spawn_s2s_test_server_with_config, test_client::ConnectError,
 };
-use crate::messages::Message;
-use crate::messages::encoder::{Ping, PluginDataTransmission, TextMessage, UserStats, VoiceTarget};
-use crate::mumble_proto::voice_target::Target as VoiceTargetEntry;
+use shitspeak_messages::messages::Message;
+use shitspeak_messages::messages::encoder::{Ping, PluginDataTransmission, TextMessage, UserStats, VoiceTarget};
 use crate::voice::codec::AudioPayload;
 use crate::voice::metrics::{
     VoiceRouteKind, VoiceRouteSource, route_metric_snapshot, route_resolution_metric_snapshot,
 };
+use shitspeak_proto::mumble_proto::voice_target::Target as VoiceTargetEntry;
 use shitspeak_runtime_config::{S2sConfig, S2sSeedAddressConfig, S2sTransportKindConfig};
 use shitspeak_s2s::testing::{
     LinkChaos, MessageType, Pki, loopback, mint_pki, pick_free_port, pick_free_udp_port,
-    s2s_network_test_guard, wait_until, wait_until_with,
+    s2s_network_test_guard, wait_until,
 };
 use shitspeak_s2s_transport::{
     MessageClass, PeerAddress, SendOptions, ServiceLevel, TransportKind,
@@ -965,7 +965,7 @@ async fn wait_for_user_state_update(
     observer: &TestClient,
     session: u32,
     deadline: Duration,
-    predicate: impl Fn(&crate::mumble_proto::UserState) -> bool,
+    predicate: impl Fn(&shitspeak_proto::mumble_proto::UserState) -> bool,
 ) -> Option<Duration> {
     let started = Instant::now();
     while started.elapsed() < deadline {
@@ -3343,7 +3343,7 @@ async fn run_s2s_root_children_shout_traffic(tree_delivery_enabled: bool) {
     let legacy_before = S2SDebugVoiceIoSnapshot::capture("application.voice.frame");
     let tree_original_before = S2SDebugVoiceIoSnapshot::capture("application.voice.tree.original");
     let tree_repair_before = S2SDebugVoiceIoSnapshot::capture("application.voice.tree.repair");
-    let speak_start = Instant::now();
+    let _speak_start = Instant::now();
     let send_task =
         async { send_s2s_shout_voice_segment(&alice, S2S_SHOUT_TARGET_SLOT, &frames).await };
     let receive_task = async {
@@ -4385,7 +4385,7 @@ async fn s2s_six_node_800_users_direct_link_severed_no_client_visible_churn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn s2s_six_node_800_users_ungraceful_node_failure_client_visible_convergence() {
     let _guard = s2s_network_test_guard().await;
-    let mut cluster = spawn_s2s_convergence_cluster().await;
+    let cluster = spawn_s2s_convergence_cluster().await;
     let servers = &cluster.servers;
     println!("node-offline setup: spawned 6 S2S runtimes");
 

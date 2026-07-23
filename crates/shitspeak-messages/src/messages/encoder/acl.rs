@@ -12,8 +12,8 @@ pub struct ChanAcl {
     pub deny: u32,
 }
 
-impl From<crate::mumble_proto::acl::ChanAcl> for ChanAcl {
-    fn from(proto: crate::mumble_proto::acl::ChanAcl) -> Self {
+impl From<shitspeak_proto::mumble_proto::acl::ChanAcl> for ChanAcl {
+    fn from(proto: shitspeak_proto::mumble_proto::acl::ChanAcl) -> Self {
         Self {
             apply_here: proto.apply_here.unwrap_or(true),
             apply_subs: proto.apply_subs.unwrap_or(true),
@@ -26,9 +26,9 @@ impl From<crate::mumble_proto::acl::ChanAcl> for ChanAcl {
     }
 }
 
-impl From<ChanAcl> for crate::mumble_proto::acl::ChanAcl {
+impl From<ChanAcl> for shitspeak_proto::mumble_proto::acl::ChanAcl {
     fn from(acl: ChanAcl) -> Self {
-        crate::mumble_proto::acl::ChanAcl {
+        shitspeak_proto::mumble_proto::acl::ChanAcl {
             apply_here: Some(acl.apply_here),
             apply_subs: Some(acl.apply_subs),
             inherited: Some(acl.inherited),
@@ -45,13 +45,13 @@ impl From<ChanAcl> for crate::mumble_proto::acl::ChanAcl {
 pub struct Acl {
     pub channel_id: u32,
     pub inherit_acls: Option<bool>,
-    pub groups: Vec<crate::mumble_proto::acl::ChanGroup>,
+    pub groups: Vec<shitspeak_proto::mumble_proto::acl::ChanGroup>,
     pub acls: Vec<ChanAcl>,
     pub query: Option<bool>,
 }
 
-impl From<crate::mumble_proto::Acl> for Acl {
-    fn from(proto: crate::mumble_proto::Acl) -> Self {
+impl From<shitspeak_proto::mumble_proto::Acl> for Acl {
+    fn from(proto: shitspeak_proto::mumble_proto::Acl) -> Self {
         Self {
             channel_id: proto.channel_id,
             inherit_acls: Some(proto.inherit_acls.unwrap_or(true)),
@@ -74,16 +74,16 @@ impl Default for Acl {
     }
 }
 
-impl From<Acl> for crate::mumble_proto::Acl {
+impl From<Acl> for shitspeak_proto::mumble_proto::Acl {
     fn from(acl: Acl) -> Self {
-        crate::mumble_proto::Acl {
+        shitspeak_proto::mumble_proto::Acl {
             channel_id: acl.channel_id,
             inherit_acls: acl.inherit_acls,
             groups: acl.groups,
             acls: acl
                 .acls
                 .into_iter()
-                .map(crate::mumble_proto::acl::ChanAcl::from)
+                .map(shitspeak_proto::mumble_proto::acl::ChanAcl::from)
                 .collect(),
             query: acl.query,
         }

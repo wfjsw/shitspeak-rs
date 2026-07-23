@@ -25,11 +25,11 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::integration_tests::harness::TestServer;
-use crate::messages::encoder::{
+use shitspeak_messages::messages::encoder::{
     Authenticate, ChanAcl, ChannelRemove, ClientType, ContextAction, RequestBlob, UserRemove,
     UserState, Version, VoiceTarget,
 };
-use crate::messages::{Message, ReadMessageExt, WriteMessageExt};
+use shitspeak_messages::messages::{Message, ReadMessageExt, WriteMessageExt};
 use crate::protocol_version::ProtocolVersion;
 use crate::voice::codec::{Audio, AudioPayload, IncomingUdpPacket, OpusPayload, PacketFormat};
 use crate::voice::ping::PingRequest;
@@ -53,7 +53,7 @@ fn encode_legacy_client_voice(target: u32, frame_number: u64, opus: &[u8]) -> By
 /// official client does. Type byte 0x00 prefixes the encoded `MumbleUDP.Audio`.
 /// `sender_session` is omitted (server fills it from the authenticated session).
 fn encode_protobuf_client_voice(target: u32, frame_number: u64, opus: &[u8]) -> Bytes {
-    use crate::messages::encoder::{Audio as AudioWire, AudioHeader, AudioTarget};
+    use shitspeak_messages::messages::encoder::{Audio as AudioWire, AudioHeader, AudioTarget};
     use prost::Message as _;
     let wire = AudioWire {
         header: Some(AudioHeader::Target(AudioTarget::from(target))),
@@ -64,7 +64,7 @@ fn encode_protobuf_client_voice(target: u32, frame_number: u64, opus: &[u8]) -> 
         volume_adjustment: 0.0,
         is_terminator: false,
     };
-    let proto: crate::mumble_udp::Audio = wire.into();
+    let proto: shitspeak_proto::mumble_udp::Audio = wire.into();
     let mut buf = BytesMut::with_capacity(1 + proto.encoded_len());
     buf.put_u8(0x00);
     proto.encode(&mut buf).expect("encode protobuf audio");
@@ -107,7 +107,7 @@ fn decode_legacy_server_voice(data: &[u8]) -> Option<Audio> {
     if (header >> 5) != 4 {
         return None; // not VoiceOpus
     }
-    let target = crate::messages::encoder::AudioTarget::from((header & 0x1f) as u32);
+    let target = shitspeak_messages::messages::encoder::AudioTarget::from((header & 0x1f) as u32);
     let mut pos = 1usize;
     let (sender_session, n) = read_pds_varint(&data[pos..])?;
     pos += n;
@@ -199,7 +199,7 @@ fn encode_protobuf_client_voice_ex(
     is_terminator: bool,
     positional: Option<[f32; 3]>,
 ) -> Bytes {
-    use crate::messages::encoder::{Audio as AudioWire, AudioHeader, AudioTarget};
+    use shitspeak_messages::messages::encoder::{Audio as AudioWire, AudioHeader, AudioTarget};
     use prost::Message as _;
     let wire = AudioWire {
         header: Some(AudioHeader::Target(AudioTarget::from(target))),
@@ -213,7 +213,7 @@ fn encode_protobuf_client_voice_ex(
         volume_adjustment: 0.0,
         is_terminator,
     };
-    let proto: crate::mumble_udp::Audio = wire.into();
+    let proto: shitspeak_proto::mumble_udp::Audio = wire.into();
     let mut buf = BytesMut::with_capacity(1 + proto.encoded_len());
     buf.put_u8(0x00);
     proto.encode(&mut buf).expect("encode protobuf audio");
@@ -250,7 +250,7 @@ pub enum ConnectError {
     Tls(String),
     Read(String),
     Write(String),
-    Rejected(crate::mumble_proto::Reject),
+    Rejected(shitspeak_proto::mumble_proto::Reject),
     NoCryptSetup,
     NoServerSync,
 }
@@ -265,9 +265,9 @@ impl From<std::io::Error> for ConnectError {
 pub struct TestClient {
     pub session_id: u32,
     pub user_id: Option<u32>,
-    pub initial_channel_states: Vec<crate::mumble_proto::ChannelState>,
-    pub initial_user_states: Vec<crate::mumble_proto::UserState>,
-    pub initial_context_actions: Vec<crate::mumble_proto::ContextActionModify>,
+    pub initial_channel_states: Vec<shitspeak_proto::mumble_proto::ChannelState>,
+    pub initial_user_states: Vec<shitspeak_proto::mumble_proto::UserState>,
+    pub initial_context_actions: Vec<shitspeak_proto::mumble_proto::ContextActionModify>,
     pub welcome_text: Option<String>,
     pub max_bandwidth: Option<u32>,
     pub initial_permissions: Option<u64>,
@@ -738,7 +738,7 @@ impl TestClient {
 
     pub async fn create_channel(&self, parent: u32, name: &str, temporary: bool) {
         // ChannelState without a channel_id triggers "create" path on the server.
-        let cs = crate::messages::encoder::ChannelState {
+        let cs = shitspeak_messages::messages::encoder::ChannelState {
             channel_id: None,
             parent: Some(parent),
             name: Some(name.into()),
@@ -757,7 +757,7 @@ impl TestClient {
     }
 
     pub async fn update_channel_name(&self, channel_id: u32, name: &str) {
-        let cs = crate::messages::encoder::ChannelState {
+        let cs = shitspeak_messages::messages::encoder::ChannelState {
             channel_id: Some(channel_id),
             parent: None,
             name: Some(name.into()),
@@ -781,7 +781,7 @@ impl TestClient {
     }
 
     pub async fn set_acls(&self, channel_id: u32, acls: Vec<ChanAcl>, inherit_acls: bool) {
-        let m: Message = crate::messages::encoder::Acl {
+        let m: Message = shitspeak_messages::messages::encoder::Acl {
             channel_id,
             inherit_acls: Some(inherit_acls),
             groups: Vec::new(),
@@ -793,7 +793,7 @@ impl TestClient {
     }
 
     pub async fn query_acls(&self, channel_id: u32) {
-        let m: Message = crate::messages::encoder::Acl {
+        let m: Message = shitspeak_messages::messages::encoder::Acl {
             channel_id,
             inherit_acls: None,
             groups: Vec::new(),

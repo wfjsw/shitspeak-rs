@@ -30,8 +30,8 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
-use crate::s2s_transport_proto as pb;
 use crate::types::NodeIdentifier;
+use shitspeak_proto::s2s_transport_proto as pb;
 
 use super::adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
 use super::compression::{

@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use tokio::runtime::{Handle, Runtime};
 use tracing::Instrument as _;
 
-use crate::api::{
+use shitspeak_auth::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
     ExternalAuthClaims, RegisteredUser, ReloadableAuthenticator,
 };

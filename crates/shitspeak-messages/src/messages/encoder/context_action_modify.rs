@@ -8,8 +8,8 @@ pub struct ContextActionModify {
     pub operation: Option<i32>,
 }
 
-impl From<crate::mumble_proto::ContextActionModify> for ContextActionModify {
-    fn from(proto: crate::mumble_proto::ContextActionModify) -> Self {
+impl From<shitspeak_proto::mumble_proto::ContextActionModify> for ContextActionModify {
+    fn from(proto: shitspeak_proto::mumble_proto::ContextActionModify) -> Self {
         Self {
             action: proto.action,
             text: proto.text,
@@ -19,9 +19,9 @@ impl From<crate::mumble_proto::ContextActionModify> for ContextActionModify {
     }
 }
 
-impl From<ContextActionModify> for crate::mumble_proto::ContextActionModify {
+impl From<ContextActionModify> for shitspeak_proto::mumble_proto::ContextActionModify {
     fn from(context_action_modify: ContextActionModify) -> Self {
-        crate::mumble_proto::ContextActionModify {
+        shitspeak_proto::mumble_proto::ContextActionModify {
             action: context_action_modify.action,
             text: context_action_modify.text,
             context: context_action_modify.context,

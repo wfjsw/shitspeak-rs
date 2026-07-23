@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use crate::messages::Message;
-use crate::protocol_version::ProtocolVersion;
+use shitspeak_core::ProtocolVersion;
 
 #[derive(Debug)]
 struct CachedOsInfo {
@@ -28,8 +28,8 @@ pub struct Version {
     pub os_version: Option<String>,
 }
 
-impl From<crate::mumble_proto::Version> for Version {
-    fn from(proto: crate::mumble_proto::Version) -> Self {
+impl From<shitspeak_proto::mumble_proto::Version> for Version {
+    fn from(proto: shitspeak_proto::mumble_proto::Version) -> Self {
         Self {
             version: match (proto.version_v2, proto.version_v1) {
                 (Some(v2), _) => Some(ProtocolVersion::from(v2)),
@@ -94,9 +94,9 @@ impl Version {
     }
 }
 
-impl From<Version> for crate::mumble_proto::Version {
+impl From<Version> for shitspeak_proto::mumble_proto::Version {
     fn from(version: Version) -> Self {
-        crate::mumble_proto::Version {
+        shitspeak_proto::mumble_proto::Version {
             version_v1: version.version.map(u32::from),
             version_v2: version.version.map(u64::from),
             release: version.release,

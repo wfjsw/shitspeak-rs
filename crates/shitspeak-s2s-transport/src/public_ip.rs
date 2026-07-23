@@ -7,8 +7,8 @@ use tokio::net::{UdpSocket, lookup_host};
 use tokio::time::timeout;
 use tracing::debug;
 
-use crate::geoip::{NodeGeo, valid_coordinates};
 use crate::http_client;
+use shitspeak_core::{NodeGeo, valid_coordinates};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const STUN_HEADER_LEN: usize = 20;

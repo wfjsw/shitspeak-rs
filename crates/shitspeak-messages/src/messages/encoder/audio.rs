@@ -130,10 +130,10 @@ pub struct Audio {
     pub is_terminator: bool,
 }
 
-impl TryFrom<crate::mumble_udp::Audio> for Audio {
+impl TryFrom<shitspeak_proto::mumble_udp::Audio> for Audio {
     type Error = AudioProtocolError;
 
-    fn try_from(proto: crate::mumble_udp::Audio) -> Result<Self, AudioProtocolError> {
+    fn try_from(proto: shitspeak_proto::mumble_udp::Audio) -> Result<Self, AudioProtocolError> {
         // Positional data must be absent or exactly [x, y, z].
         if !matches!(proto.positional_data.len(), 0 | 3) {
             return Err(AudioProtocolError::InvalidPositionalDataLength(
@@ -146,10 +146,10 @@ impl TryFrom<crate::mumble_udp::Audio> for Audio {
         // reference behavior). The wrapper still preserves which variant the
         // wire used for downstream callers that care.
         let header = proto.header.map(|h| match h {
-            crate::mumble_udp::audio::Header::Target(t) => {
+            shitspeak_proto::mumble_udp::audio::Header::Target(t) => {
                 AudioHeader::Target(AudioTarget::from(t))
             }
-            crate::mumble_udp::audio::Header::Context(c) => {
+            shitspeak_proto::mumble_udp::audio::Header::Context(c) => {
                 AudioHeader::Target(AudioTarget::from(c))
             }
         });
@@ -166,12 +166,16 @@ impl TryFrom<crate::mumble_udp::Audio> for Audio {
     }
 }
 
-impl From<Audio> for crate::mumble_udp::Audio {
+impl From<Audio> for shitspeak_proto::mumble_udp::Audio {
     fn from(a: Audio) -> Self {
-        crate::mumble_udp::Audio {
+        shitspeak_proto::mumble_udp::Audio {
             header: a.header.map(|h| match h {
-                AudioHeader::Target(t) => crate::mumble_udp::audio::Header::Target(u32::from(t)),
-                AudioHeader::Context(c) => crate::mumble_udp::audio::Header::Context(u32::from(c)),
+                AudioHeader::Target(t) => {
+                    shitspeak_proto::mumble_udp::audio::Header::Target(u32::from(t))
+                }
+                AudioHeader::Context(c) => {
+                    shitspeak_proto::mumble_udp::audio::Header::Context(u32::from(c))
+                }
             }),
             sender_session: a.sender_session,
             frame_number: a.frame_number,
@@ -196,19 +200,20 @@ impl Audio {
     /// type prefix). Funnels protobuf parsing through prost and applies the
     /// domain validation in `TryFrom<mumble_udp::Audio>`.
     pub fn decode_wire(data: &[u8]) -> Result<Self, AudioWireError> {
-        let proto = crate::mumble_udp::Audio::decode(data).map_err(AudioWireError::Protobuf)?;
+        let proto =
+            shitspeak_proto::mumble_udp::Audio::decode(data).map_err(AudioWireError::Protobuf)?;
         Self::try_from(proto).map_err(AudioWireError::Domain)
     }
 
     /// Length of the encoded protobuf payload (without the 1-byte type prefix).
     pub fn encoded_len(&self) -> usize {
-        let proto: crate::mumble_udp::Audio = self.clone().into();
+        let proto: shitspeak_proto::mumble_udp::Audio = self.clone().into();
         proto.encoded_len()
     }
 
     /// Encode the protobuf payload (without the 1-byte type prefix) into `buf`.
     pub fn encode(self, buf: &mut bytes::BytesMut) -> Result<(), prost::EncodeError> {
-        let proto: crate::mumble_udp::Audio = self.into();
+        let proto: shitspeak_proto::mumble_udp::Audio = self.into();
         proto.encode(buf)
     }
 }

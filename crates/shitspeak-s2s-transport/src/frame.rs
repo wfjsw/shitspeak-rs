@@ -7,13 +7,13 @@ use bytes::{Bytes, BytesMut};
 use prost::Message as ProstMessage;
 use tokio_util::codec::LengthDelimitedCodec;
 
-use crate::s2s_transport_proto as pb;
 use crate::types::NodeIdentifier;
+use shitspeak_proto::s2s_transport_proto as pb;
 
 use super::service_level::{MessageClass, ServiceLevel};
 
 /// Re-export the generated message under a domain-friendly alias.
-pub use crate::s2s_transport_proto::Frame;
+pub use shitspeak_proto::s2s_transport_proto::Frame;
 
 /// Internal frame disposition. Maps 1:1 onto `pb::FrameType` but keeps callers
 /// off of the generated type.

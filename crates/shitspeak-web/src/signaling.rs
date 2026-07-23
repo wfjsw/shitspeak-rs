@@ -15,7 +15,7 @@ use crate::protocol::{
 };
 use crate::session::client_is_current;
 use crate::simd;
-use shitspeak_runtime::api::{
+use shitspeak_auth::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
     canonical_authenticator_ip,
 };
@@ -828,7 +828,7 @@ fn server_event_from_message(message: Message) -> Option<ServerEvent> {
     }
 }
 
-fn web_user_state(user_state: shitspeak_runtime::mumble_proto::UserState) -> WebUserState {
+fn web_user_state(user_state: shitspeak_proto::mumble_proto::UserState) -> WebUserState {
     let user_id_cleared = user_state.user_id == Some(u32::MAX);
     WebUserState {
         session: user_state.session,
@@ -867,7 +867,7 @@ fn web_user_state(user_state: shitspeak_runtime::mumble_proto::UserState) -> Web
 }
 
 fn web_channel_state(
-    channel_state: shitspeak_runtime::mumble_proto::ChannelState,
+    channel_state: shitspeak_proto::mumble_proto::ChannelState,
 ) -> WebChannelState {
     WebChannelState {
         channel_id: channel_state.channel_id,
@@ -886,7 +886,7 @@ fn web_channel_state(
     }
 }
 
-fn web_server_sync(sync: shitspeak_runtime::mumble_proto::ServerSync) -> WebServerSync {
+fn web_server_sync(sync: shitspeak_proto::mumble_proto::ServerSync) -> WebServerSync {
     WebServerSync {
         session: sync.session,
         max_bandwidth: sync.max_bandwidth,
@@ -895,7 +895,7 @@ fn web_server_sync(sync: shitspeak_runtime::mumble_proto::ServerSync) -> WebServ
     }
 }
 
-fn web_server_config(config: shitspeak_runtime::mumble_proto::ServerConfig) -> WebServerConfig {
+fn web_server_config(config: shitspeak_proto::mumble_proto::ServerConfig) -> WebServerConfig {
     WebServerConfig {
         max_bandwidth: config.max_bandwidth,
         welcome_text: config.welcome_text,
@@ -908,7 +908,7 @@ fn web_server_config(config: shitspeak_runtime::mumble_proto::ServerConfig) -> W
 }
 
 fn web_permission_denied(
-    denied: shitspeak_runtime::mumble_proto::PermissionDenied,
+    denied: shitspeak_proto::mumble_proto::PermissionDenied,
 ) -> WebPermissionDenied {
     WebPermissionDenied {
         deny_type: denied.r#type.and_then(web_deny_type_name),
@@ -925,7 +925,7 @@ fn base64_payload(payload: Vec<u8>) -> String {
 }
 
 fn web_deny_type_name(value: i32) -> Option<String> {
-    use shitspeak_runtime::mumble_proto::permission_denied::DenyType;
+    use shitspeak_proto::mumble_proto::permission_denied::DenyType;
 
     let deny_type = match value {
         0 => DenyType::Text,
@@ -2313,9 +2313,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use shitspeak_runtime::api::{
-        AuthenticateResult, AuthenticationExpiryAction, AuthenticationRejection,
-    };
+    use shitspeak_auth::{AuthenticateResult, AuthenticationExpiryAction, AuthenticationRejection};
     use shitspeak_runtime::localization::Language;
 
     #[test]

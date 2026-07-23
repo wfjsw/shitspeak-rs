@@ -336,6 +336,13 @@ fn classify_replication_payload(payload: &Bytes) -> PacketKind {
                 (7, "replication.strict.recovery_req"),
                 (8, "replication.strict.recovery_ack"),
                 (9, "replication.strict.recovery_commit"),
+                (18, "replication.strict.clock_probe_req"),
+                (19, "replication.strict.clock_probe_resp"),
+                (20, "replication.strict.history_probe_req"),
+                (21, "replication.strict.history_probe_resp"),
+                (22, "replication.strict.terminal_sync_req"),
+                (23, "replication.strict.terminal_sync_page"),
+                (24, "replication.strict.terminal_sync_ack"),
             ],
             "replication.strict.empty",
             "replication.strict.unknown",
@@ -537,7 +544,11 @@ mod tests {
     use std::thread;
 
     use crate::overlay::proto::{OverlayData, level_to_wire, node_to_wire};
-    use crate::replications::proto::{StrictBody, StrictClockTick, wrap_strict};
+    use crate::replications::proto::{
+        StrictBody, StrictClockProbeReq, StrictClockProbeResp, StrictClockTick,
+        StrictHistoryProbeReq, StrictHistoryProbeResp, StrictTerminalSyncAck,
+        StrictTerminalSyncPage, StrictTerminalSyncReq, wrap_strict,
+    };
     use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
     fn overlay_data(tag: u32, payload: Bytes) -> OverlayData {
@@ -587,6 +598,48 @@ mod tests {
         let kind = classify_overlay_body(&body);
 
         assert_eq!(kind.into_name(), "replication.strict.clock_tick");
+    }
+
+    #[test]
+    fn classifies_v3_strict_repair_packets_independently() {
+        let cases = [
+            (
+                StrictBody::ClockProbeReq(StrictClockProbeReq::default()),
+                "replication.strict.clock_probe_req",
+            ),
+            (
+                StrictBody::ClockProbeResp(StrictClockProbeResp::default()),
+                "replication.strict.clock_probe_resp",
+            ),
+            (
+                StrictBody::HistoryProbeReq(StrictHistoryProbeReq::default()),
+                "replication.strict.history_probe_req",
+            ),
+            (
+                StrictBody::HistoryProbeResp(StrictHistoryProbeResp::default()),
+                "replication.strict.history_probe_resp",
+            ),
+            (
+                StrictBody::TerminalSyncReq(StrictTerminalSyncReq::default()),
+                "replication.strict.terminal_sync_req",
+            ),
+            (
+                StrictBody::TerminalSyncPage(StrictTerminalSyncPage::default()),
+                "replication.strict.terminal_sync_page",
+            ),
+            (
+                StrictBody::TerminalSyncAck(StrictTerminalSyncAck::default()),
+                "replication.strict.terminal_sync_ack",
+            ),
+        ];
+
+        for (body, expected) in cases {
+            let repl = wrap_strict("channels", body);
+            let payload = repl_proto::encode(&repl).unwrap();
+            let body =
+                OverlayBody::Data(overlay_data(repl_proto::REPLICATION_SERVICE_TAG, payload));
+            assert_eq!(classify_overlay_body(&body).into_name(), expected);
+        }
     }
 
     #[test]

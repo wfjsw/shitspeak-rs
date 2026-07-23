@@ -1,9 +1,8 @@
 use std::{fmt::Display, result::Result};
 
+use crate::errors::ProxyProtocolHeaderTooLargeError;
 use ppp::{HeaderResult, PartialResult as _};
 use tokio::io::AsyncReadExt as _;
-
-use crate::errors::ProxyProtocolHeaderTooLargeError;
 
 const PROXY_PROTOCOL_MAX_HEADER_LEN: usize = 16_384;
 const PROXY_PROTOCOL_V2_MINIMUM_LENGTH: usize = 16;
@@ -261,7 +260,7 @@ fn invalid_proxy_protocol_header_error() -> GetProxyProtocolRealIpError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncWriteExt as _;
     use tokio::net::{TcpListener, TcpStream};
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {

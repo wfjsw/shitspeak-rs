@@ -17,50 +17,6 @@ use crate::client::{ClientInstanceId, client_session_identifier::ClientSessionId
 use crate::client_repository::ClientRepository;
 use crate::types::default_server_id;
 
-// ─── Macros ──────────────────────────────────────────────────────────────────
-
-/// In `from_diff`: compare `old.$getter()` vs `new.$getter()`, and if they
-/// differ, set `d.$field = Some(<expr>)`.
-macro_rules! diff_plain {
-    ($d:ident, $old:ident, $new:ident, $field:ident, $getter:ident) => {
-        if $old.$getter() != $new.$getter() {
-            $d.$field = Some($new.$getter());
-        }
-    };
-}
-macro_rules! diff_clone {
-    ($d:ident, $old:ident, $new:ident, $field:ident, $getter:ident) => {
-        if $old.$getter() != $new.$getter() {
-            $d.$field = Some($new.$getter().clone());
-        }
-    };
-}
-/// Like `diff_clone` but copies into `Bytes` — for
-/// getters that return `&[u8]` when the delta field is `Bytes`.
-macro_rules! diff_to_vec {
-    ($d:ident, $old:ident, $new:ident, $field:ident, $getter:ident) => {
-        if $old.$getter() != $new.$getter() {
-            $d.$field = Some(Bytes::copy_from_slice($new.$getter()));
-        }
-    };
-}
-/// Like `diff_clone` but calls `.to_owned()` instead of `.clone()` — for
-/// getters that return `&str` when the delta field is `String`.
-macro_rules! diff_to_owned {
-    ($d:ident, $old:ident, $new:ident, $field:ident, $getter:ident) => {
-        if $old.$getter() != $new.$getter() {
-            $d.$field = Some($new.$getter().to_owned());
-        }
-    };
-}
-macro_rules! diff_option {
-    ($d:ident, $old:ident, $new:ident, $field:ident, $getter:ident) => {
-        if $old.$getter() != $new.$getter() {
-            $d.$field = Some($new.$getter().map(|s| s.to_owned()));
-        }
-    };
-}
-
 // ─── ClientGlobalStateDelta ───────────────────────────────────────────────────
 
 /// A mirror of `ClientGlobalState` where every field is `Option<T>`.
@@ -182,8 +138,8 @@ impl ClientGlobalStateDelta {
         &self,
         session_id: ClientSessionIdentifier,
         cert_hash: Option<&Bytes>,
-    ) -> crate::messages::encoder::UserState {
-        crate::messages::encoder::UserState {
+    ) -> shitspeak_messages::messages::encoder::UserState {
+        shitspeak_messages::messages::encoder::UserState {
             session: Some(session_id),
             actor: None,
             name: self.display_name.clone().flatten(),
@@ -411,7 +367,7 @@ pub struct ClientStateBroadcastPayload {
     /// `0` means the node's old epoch was cleared and subscribers should
     /// forget their last-seen version for that node.
     pub versions: HashMap<u16, u64>,
-    canonical_message: tokio::sync::OnceCell<Option<crate::messages::Message>>,
+    canonical_message: tokio::sync::OnceCell<Option<shitspeak_messages::messages::Message>>,
 }
 
 impl ClientStateBroadcastPayload {
@@ -432,7 +388,7 @@ impl ClientStateBroadcastPayload {
     pub async fn canonical_message(
         &self,
         repo: &ClientRepository,
-    ) -> Option<&crate::messages::Message> {
+    ) -> Option<&shitspeak_messages::messages::Message> {
         if !self.entry.is_current_instance(repo).await {
             return None;
         }
@@ -515,7 +471,7 @@ impl ClientStateLogEntry {
         repo: &ClientRepository,
         viewer_session_id: ClientSessionIdentifier,
         viewer_client_instance_id: ClientInstanceId,
-    ) -> Option<crate::messages::Message> {
+    ) -> Option<shitspeak_messages::messages::Message> {
         match &self.op {
             ClientStateOperation::UpdateGlobalState {
                 server_id,
@@ -531,7 +487,7 @@ impl ClientStateLogEntry {
                 if *client_instance_id != 0 && client.client_instance_id() != *client_instance_id {
                     return None;
                 }
-                Some(crate::messages::encoder::PermissionQuery::flush_cache().into())
+                Some(shitspeak_messages::messages::encoder::PermissionQuery::flush_cache().into())
             }
             _ => None,
         }
@@ -542,7 +498,7 @@ impl ClientStateLogEntry {
         repo: &ClientRepository,
         viewer_session_id: ClientSessionIdentifier,
         viewer_client_instance_id: ClientInstanceId,
-    ) -> Vec<crate::messages::Message> {
+    ) -> Vec<shitspeak_messages::messages::Message> {
         let mut messages = Vec::new();
         if matches!(
             &self.op,
@@ -575,8 +531,8 @@ impl ClientStateLogEntry {
         repo: &ClientRepository,
         viewer_session_id: ClientSessionIdentifier,
         viewer_client_instance_id: ClientInstanceId,
-        canonical_message: Option<&crate::messages::Message>,
-    ) -> Vec<crate::messages::Message> {
+        canonical_message: Option<&shitspeak_messages::messages::Message>,
+    ) -> Vec<shitspeak_messages::messages::Message> {
         let mut messages = Vec::new();
         if matches!(
             &self.op,
@@ -612,14 +568,14 @@ impl ClientStateLogEntry {
     /// * `AddClient` -> `UserState` snapshot of the new client
     /// * `RemoveClient` -> `UserRemove` message
     /// * `UpdateGlobalState` -> `UserState` delta (only changed fields)
-    pub async fn to_message(&self, repo: &ClientRepository) -> Option<crate::messages::Message> {
+    pub async fn to_message(&self, repo: &ClientRepository) -> Option<shitspeak_messages::messages::Message> {
         if !self.is_current_instance(repo).await {
             return None;
         }
         self.to_message_unchecked()
     }
 
-    fn to_message_unchecked(&self) -> Option<crate::messages::Message> {
+    fn to_message_unchecked(&self) -> Option<shitspeak_messages::messages::Message> {
         match &self.op {
             ClientStateOperation::AddClient {
                 session_id,
@@ -628,7 +584,7 @@ impl ClientStateLogEntry {
                 ..
             } => {
                 let us = initial_state.to_initial_user_state(*session_id, cert_hash.as_ref());
-                Some(crate::messages::Message::UserState(us.into()))
+                Some(shitspeak_messages::messages::Message::UserState(us.into()))
             }
             ClientStateOperation::RemoveClient {
                 session_id,
@@ -637,7 +593,7 @@ impl ClientStateLogEntry {
                 ban,
                 ..
             } => Some(
-                crate::messages::encoder::UserRemove {
+                shitspeak_messages::messages::encoder::UserRemove {
                     session: u32::from(*session_id),
                     actor: actor.map(u32::from),
                     reason: reason.clone(),
@@ -651,7 +607,7 @@ impl ClientStateLogEntry {
                 delta,
                 ..
             } => {
-                let mut us = crate::messages::encoder::UserState {
+                let mut us = shitspeak_messages::messages::encoder::UserState {
                     session: Some(*session_id),
                     actor: *sender_session_id,
                     name: None,
@@ -874,7 +830,7 @@ mod tests {
             .expect("user-id clear should produce a user-state message");
         assert!(matches!(
             message,
-            crate::messages::Message::UserState(user_state)
+            shitspeak_messages::messages::Message::UserState(user_state)
                 if user_state.user_id == Some(u32::MAX)
         ));
         assert!(matches!(
@@ -945,8 +901,8 @@ mod tests {
         assert!(matches!(
             messages.as_slice(),
             [
-                crate::messages::Message::PermissionQuery(query),
-                crate::messages::Message::UserState(user_state),
+                shitspeak_messages::messages::Message::PermissionQuery(query),
+                shitspeak_messages::messages::Message::UserState(user_state),
             ] if query.flush == Some(true) && user_state.name.as_deref() == Some("updated")
         ));
     }

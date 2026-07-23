@@ -47,6 +47,16 @@ message StrictMessage {
     // ignore this cumulative-protocol body instead of treating it as a
     // recoverable legacy proposal after dropping unknown fields.
     StrictProposeV1     propose_v1      = 16;
+    // Pairwise v3 repair traffic deliberately uses new oneof tags. A v2
+    // decoder drops these bodies instead of interpreting a metadata probe as
+    // a legacy cursor-zero catchup request.
+    StrictClockProbeReq      clock_probe_req      = 18;
+    StrictClockProbeResp     clock_probe_resp     = 19;
+    StrictHistoryProbeReq    history_probe_req    = 20;
+    StrictHistoryProbeResp   history_probe_resp   = 21;
+    StrictTerminalSyncReq    terminal_sync_req    = 22;
+    StrictTerminalSyncPage   terminal_sync_page   = 23;
+    StrictTerminalSyncAck    terminal_sync_ack    = 24;
   }
   // End-to-end origin proof for routed strict traffic. The signature binds
   // the topic, oneof body, logical source node, and source boot epoch; it is
@@ -119,6 +129,154 @@ message StrictClockTick {
   uint64 src_clock = 2;
 }
 
+// ------- Strict pairwise repair (v3) -------
+
+// A source-specific durable terminal-journal cut. `journal_id` identifies
+// the journal lineage, while the chain digest proves that `generation` is a
+// prefix of that lineage. The set digest permits equal-state comparison even
+// when two replicas learned the same terminal fences in different orders.
+message StrictTerminalCut {
+  bytes  journal_id          = 1;
+  uint64 generation          = 2;
+  bytes  chain_digest        = 3;
+  bytes  terminal_set_digest = 4;
+}
+
+enum StrictCatchupReason {
+  STRICT_CATCHUP_REASON_UNSPECIFIED        = 0;
+  STRICT_CATCHUP_REASON_HISTORY_ELECTION   = 1;
+  STRICT_CATCHUP_REASON_ADMISSION          = 2;
+  STRICT_CATCHUP_REASON_STEADY_STATE       = 3;
+  STRICT_CATCHUP_REASON_TERMINAL_FENCE     = 4;
+  STRICT_CATCHUP_REASON_DELIVERY_WATERMARK = 5;
+  STRICT_CATCHUP_REASON_PEER_BEHIND        = 6;
+  STRICT_CATCHUP_REASON_REPOSITORY_GAP     = 7;
+  STRICT_CATCHUP_REASON_LEGACY_V2          = 8;
+  STRICT_CATCHUP_REASON_OWNER_ANTI_ENTROPY = 9;
+}
+
+enum StrictTerminalSyncStatus {
+  STRICT_TERMINAL_SYNC_STATUS_UNSPECIFIED          = 0;
+  STRICT_TERMINAL_SYNC_STATUS_OK                   = 1;
+  STRICT_TERMINAL_SYNC_STATUS_UP_TO_DATE           = 2;
+  STRICT_TERMINAL_SYNC_STATUS_TRANSFER_EXPIRED     = 3;
+  STRICT_TERMINAL_SYNC_STATUS_CURSOR_MISMATCH      = 4;
+  STRICT_TERMINAL_SYNC_STATUS_INCARNATION_MISMATCH = 5;
+  STRICT_TERMINAL_SYNC_STATUS_RESOURCE_LIMIT       = 6;
+}
+
+enum StrictTerminalPageKind {
+  STRICT_TERMINAL_PAGE_KIND_UNSPECIFIED = 0;
+  STRICT_TERMINAL_PAGE_KIND_DELTA       = 1;
+  STRICT_TERMINAL_PAGE_KIND_CHECKPOINT  = 2;
+}
+
+message StrictClockProbeReq {
+  uint32 src_node                      = 1;
+  uint64 expected_responder_boot_epoch = 2;
+  uint64 request_nonce                 = 3;
+  StrictCatchupReason reason            = 4;
+}
+
+message StrictClockProbeResp {
+  uint32 responder_node               = 1;
+  uint64 expected_requester_boot_epoch = 2;
+  uint64 request_nonce                 = 3;
+  uint64 src_clock                    = 4;
+  StrictCatchupReason reason           = 5;
+}
+
+message StrictHistoryProbeReq {
+  uint32 src_node                      = 1;
+  uint64 expected_responder_boot_epoch = 2;
+  uint64 request_nonce                 = 3;
+  StrictCatchupReason reason            = 4;
+}
+
+// Metadata only. Repository operations, terminal records, and snapshots are
+// intentionally absent so history election cannot create a bulk transfer.
+message StrictHistoryProbeResp {
+  uint32 responder_node                = 1;
+  uint64 expected_requester_boot_epoch = 2;
+  uint64 request_nonce                  = 3;
+  uint64 repository_version             = 4;
+  int64  history_freshness              = 5;
+  uint64 runtime_started_at             = 6;
+  uint32 history_node                   = 7;
+  StrictTerminalCut terminal_cut        = 8;
+  StrictCatchupReason reason             = 9;
+}
+
+// V3-only correlation for repository suffix/snapshot pagination. These
+// nested fields are ignored by v2 decoders. A v3 requester owns transfer_id,
+// rotates request_nonce for each page, and fixes target_version before data
+// transfer begins so delayed `has_more` responses cannot branch a new chain.
+message StrictHistoryTransferReq {
+  uint64 expected_responder_boot_epoch = 1;
+  uint64 transfer_id                   = 2;
+  uint64 request_nonce                 = 3;
+  uint64 expected_cursor               = 4;
+  uint64 target_version                = 5;
+  StrictCatchupReason reason           = 6;
+  // Zero on the first request. A continuation echoes the exact response
+  // nonce whose operation-bearing bulk reservation it acknowledges.
+  uint64 acknowledged_request_nonce    = 7;
+  // A bounded, operation-free final acknowledgement. It releases the last
+  // response page and never starts or continues repository pagination.
+  bool final_ack                        = 8;
+}
+
+message StrictHistoryTransferResp {
+  uint64 expected_requester_boot_epoch = 1;
+  uint64 transfer_id                   = 2;
+  uint64 request_nonce                 = 3;
+  uint64 cursor                        = 4;
+  uint64 target_version                = 5;
+}
+
+message StrictTerminalSyncReq {
+  uint32 src_node                      = 1;
+  uint64 expected_responder_boot_epoch = 2;
+  StrictCatchupReason reason           = 3;
+  StrictTerminalCut known_source_cut   = 4;
+  bytes  requester_terminal_set_digest = 5;
+  uint64 transfer_id                   = 6; // zero starts a transfer
+  uint64 request_nonce                 = 7; // nonzero for every request
+  uint64 expected_cursor               = 8;
+}
+
+message StrictTerminalDelta {
+  uint64 generation            = 1;
+  StrictTerminalState state    = 2;
+  bytes previous_chain_digest  = 3;
+  bytes chain_digest           = 4;
+}
+
+message StrictTerminalSyncPage {
+  uint32 responder_node                 = 1;
+  uint64 expected_requester_boot_epoch  = 2;
+  uint64 transfer_id                    = 3;
+  uint64 request_nonce                  = 4;
+  StrictTerminalSyncStatus status       = 5;
+  StrictTerminalPageKind kind           = 6;
+  StrictTerminalCut base_cut            = 7;
+  StrictTerminalCut target_cut          = 8;
+  uint64 cursor                         = 9;
+  uint64 next_cursor                    = 10;
+  bytes image_digest                    = 11;
+  repeated StrictTerminalState checkpoint_states = 12;
+  repeated StrictTerminalDelta deltas   = 13;
+  bool has_more                         = 14;
+}
+
+message StrictTerminalSyncAck {
+  uint32 src_node                      = 1;
+  uint64 expected_responder_boot_epoch = 2;
+  uint64 transfer_id                   = 3;
+  uint64 request_nonce                 = 4;
+  StrictTerminalCut target_cut         = 5;
+}
+
 message StrictCatchupReq {
   uint32 src_node      = 1;
   uint64 since_version = 2;
@@ -136,6 +294,7 @@ message StrictCatchupReq {
   // Byte offset of the requested snapshot chunk. This is meaningful only
   // with a nonzero `snapshot_transfer_id`.
   uint64 snapshot_chunk_cursor = 9;
+  StrictHistoryTransferReq history_transfer = 10; // v3 only
 }
 
 message StrictCatchupResp {
@@ -173,6 +332,7 @@ message StrictCatchupResp {
   // image under its resource limit. A v2 receiver restarts history election
   // rather than treating this as an empty snapshot.
   bool   snapshot_transfer_rejected = 24;
+  StrictHistoryTransferResp history_transfer = 25; // v3 only
 }
 
 message CatchupOp {
@@ -353,6 +513,14 @@ message StrictDecision {
   // Default/empty fields are accepted only as descriptor-less legacy data.
   uint64 resolver_boot_epoch = 9;
   repeated StrictFrozenTarget frozen_targets = 10;
+  // v3 source-journal transition. These fields describe the resolver's
+  // durable cut after installing this decision. Empty values preserve the
+  // v2 decision wire contract during a rolling upgrade.
+  bytes  source_journal_id                = 11;
+  uint64 source_terminal_generation       = 12;
+  bytes  source_previous_chain_digest     = 13;
+  bytes  source_chain_digest              = 14;
+  bytes  source_terminal_set_digest       = 15;
 }
 
 // Catchup representation of a terminal decision. Legacy terminal states leave

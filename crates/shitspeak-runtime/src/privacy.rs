@@ -1,4 +1,4 @@
-use crate::messages::encoder::UserState;
+use shitspeak_messages::messages::encoder::UserState;
 
 const CERTIFICATE_HASH_REMAP_CONTEXT: &[u8] = b"shitspeak-rs/privacy/certificate-hash/v1";
 const CERTIFICATE_HASH_AES_KEY_CONTEXT: &[u8] = b"shitspeak-rs/privacy/certificate-hash/aes-key/v1";

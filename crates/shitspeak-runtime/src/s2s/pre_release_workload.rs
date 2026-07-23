@@ -1139,6 +1139,7 @@ fn replication_error_kind(error: &ReplicationError) -> &'static str {
         ReplicationError::Shutdown => "shutdown",
         ReplicationError::NotOwner { .. } => "not_owner",
         ReplicationError::Malformed(_) => "malformed",
+        ReplicationError::StrictBulkFrameTooLarge { .. } => "strict_bulk_frame_too_large",
     }
 }
 

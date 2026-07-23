@@ -6,10 +6,8 @@
 use std::sync::Arc;
 
 use crate::{
-    context_action::{ContextActionPayload, ContextActionRegistry},
-    errors::MessageHandlerError,
-    messages::encoder::ContextAction,
-    server::Server,
+    context_action::ContextActionPayload, errors::MessageHandlerError,
+    messages::encoder::ContextAction, server::Server,
 };
 
 /// Handle an incoming `ContextAction` message.

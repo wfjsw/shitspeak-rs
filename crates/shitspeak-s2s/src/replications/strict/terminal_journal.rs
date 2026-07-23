@@ -13,12 +13,20 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use aws_lc_rs::{
+    digest::{SHA256, digest},
+    rand::{SecureRandom, SystemRandom},
+};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const JOURNAL_DIRECTORY: &str = "strict-terminal-journal";
-const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_VERSION: u32 = 2;
+const LEGACY_JOURNAL_VERSION: u32 = 1;
+const JOURNAL_ID_LEN: usize = 16;
+const DIGEST_LEN: usize = 32;
+const EMPTY_CHAIN_DIGEST: [u8; DIGEST_LEN] = [0; DIGEST_LEN];
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -39,6 +47,101 @@ unsafe extern "system" {
 
 /// An operation identifier encoded by strict protocol messages as `(hi, lo)`.
 pub(crate) type TerminalJournalOpId = (u64, u64);
+
+/// A durable, source-specific name for one terminal-journal fence cut.
+///
+/// The lineage and chain identify an ordered source history. The terminal-set
+/// digest identifies the order-independent set of fences at the cut, allowing
+/// independently learned but equivalent terminal state to take the fast path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TerminalCut {
+    journal_id: [u8; JOURNAL_ID_LEN],
+    generation: u64,
+    chain_digest: [u8; DIGEST_LEN],
+    terminal_set_digest: [u8; DIGEST_LEN],
+}
+
+impl TerminalCut {
+    pub(crate) fn new(
+        journal_id: [u8; JOURNAL_ID_LEN],
+        generation: u64,
+        chain_digest: [u8; DIGEST_LEN],
+        terminal_set_digest: [u8; DIGEST_LEN],
+    ) -> Self {
+        Self {
+            journal_id,
+            generation,
+            chain_digest,
+            terminal_set_digest,
+        }
+    }
+
+    pub(crate) fn journal_id(&self) -> &[u8; JOURNAL_ID_LEN] {
+        &self.journal_id
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn chain_digest(&self) -> &[u8; DIGEST_LEN] {
+        &self.chain_digest
+    }
+
+    pub(crate) fn terminal_set_digest(&self) -> &[u8; DIGEST_LEN] {
+        &self.terminal_set_digest
+    }
+
+    /// Compare the authenticated ordered position while deliberately ignoring
+    /// the set digest. Intermediate v3 delta pages carry the source chain
+    /// position, but the complete canonical set digest is only authenticated
+    /// once the fixed transfer target has been installed.
+    pub(crate) fn has_same_chain_position(&self, other: &Self) -> bool {
+        self.journal_id == other.journal_id
+            && self.generation == other.generation
+            && self.chain_digest == other.chain_digest
+    }
+}
+
+/// The exact source-journal transition assigned when one operation first
+/// became terminal.
+///
+/// Runtime decision construction obtains this value while still holding the
+/// journal mutation lock. That prevents a concurrent append from making an
+/// outbound decision advertise another operation's generation or digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalTransition {
+    previous_cut: TerminalCut,
+    resulting_cut: TerminalCut,
+    decision_digest: [u8; DIGEST_LEN],
+}
+
+impl TerminalTransition {
+    pub(crate) fn previous_cut(&self) -> TerminalCut {
+        self.previous_cut
+    }
+
+    pub(crate) fn resulting_cut(&self) -> TerminalCut {
+        self.resulting_cut
+    }
+
+    /// Check that another journal lineage assigned this exact durable
+    /// decision at the advertised contiguous transition.
+    pub(crate) fn verifies_source_transition(
+        &self,
+        source_previous: &TerminalCut,
+        source_resulting: &TerminalCut,
+    ) -> bool {
+        source_previous.journal_id == source_resulting.journal_id
+            && source_previous.generation.checked_add(1) == Some(source_resulting.generation)
+            && terminal_chain_digest(
+                source_resulting.journal_id,
+                source_previous.chain_digest,
+                source_resulting.generation,
+                self.decision_digest,
+            ) == source_resulting.chain_digest
+    }
+}
 
 /// One member incarnation frozen into a strict protocol v2 proposal target
 /// descriptor.
@@ -250,6 +353,10 @@ pub(crate) struct TerminalJournalRecord {
     accepted_commit: Option<CommitCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_decision: Option<TerminalDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_chain_digest: Option<[u8; DIGEST_LEN]>,
 }
 
 impl TerminalJournalRecord {
@@ -280,6 +387,14 @@ impl TerminalJournalRecord {
     pub(crate) fn is_terminal(&self) -> bool {
         self.terminal_decision.is_some()
     }
+
+    pub(crate) fn terminal_generation(&self) -> Option<u64> {
+        self.terminal_generation
+    }
+
+    pub(crate) fn terminal_chain_digest(&self) -> Option<&[u8; DIGEST_LEN]> {
+        self.terminal_chain_digest.as_ref()
+    }
 }
 
 /// One record returned by [`TerminalJournal::snapshot`].
@@ -292,6 +407,107 @@ pub(crate) struct TerminalJournalSnapshotEntry {
 impl TerminalJournalSnapshotEntry {
     pub(crate) fn into_parts(self) -> (TerminalJournalOpId, TerminalJournalRecord) {
         (self.op_id, self.record)
+    }
+}
+
+/// One ordered terminal delta returned by [`TerminalJournal::terminal_deltas_after`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalJournalDeltaEntry {
+    generation: u64,
+    chain_digest: [u8; DIGEST_LEN],
+    op_id: TerminalJournalOpId,
+    record: TerminalJournalRecord,
+}
+
+impl TerminalJournalDeltaEntry {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        u64,
+        [u8; DIGEST_LEN],
+        TerminalJournalOpId,
+        TerminalJournalRecord,
+    ) {
+        (self.generation, self.chain_digest, self.op_id, self.record)
+    }
+}
+
+/// A bounded immutable terminal-delta page captured at one target cut.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalJournalDeltaPage {
+    base: TerminalCut,
+    target: TerminalCut,
+    entries: Vec<TerminalJournalDeltaEntry>,
+    has_more: bool,
+}
+
+impl TerminalJournalDeltaPage {
+    #[cfg(test)]
+    pub(crate) fn base(&self) -> TerminalCut {
+        self.base
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target(&self) -> TerminalCut {
+        self.target
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> &[TerminalJournalDeltaEntry] {
+        &self.entries
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    pub(crate) fn into_entries(self) -> Vec<TerminalJournalDeltaEntry> {
+        self.entries
+    }
+}
+
+/// A bounded exact-state checkpoint page containing terminal records only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalJournalCheckpointPage {
+    target: TerminalCut,
+    cursor: u64,
+    next_cursor: u64,
+    entries: Vec<TerminalJournalSnapshotEntry>,
+    has_more: bool,
+}
+
+impl TerminalJournalCheckpointPage {
+    #[cfg(test)]
+    pub(crate) fn target(&self) -> TerminalCut {
+        self.target
+    }
+
+    pub(crate) fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_cursor(&self) -> u64 {
+        self.next_cursor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> &[TerminalJournalSnapshotEntry] {
+        &self.entries
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    pub(crate) fn into_entries(self) -> Vec<TerminalJournalSnapshotEntry> {
+        self.entries
     }
 }
 
@@ -393,6 +609,10 @@ pub(crate) enum TerminalJournalError {
     ConflictingPendingProposal { op_id_hi: u64, op_id_lo: u64 },
     #[error("strict terminal journal terminal-decision generation is exhausted")]
     DecisionGenerationExhausted,
+    #[error("strict terminal journal could not generate a journal lineage identifier")]
+    JournalIdGeneration,
+    #[error("invalid strict terminal journal metadata at {path:?}: {reason}")]
+    InvalidMetadata { path: PathBuf, reason: &'static str },
 }
 
 /// A per-topic terminal-resolution journal.
@@ -406,10 +626,14 @@ pub(crate) struct TerminalJournal {
     // Retains the stable sidecar lock while the journal JSON is replaced.
     _lock_file: Option<File>,
     records: BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+    journal_id: [u8; JOURNAL_ID_LEN],
     // Persisted monotonic fence-cut identifier. Catchup peers echo this only
     // after they have installed every terminal decision in the corresponding
     // stable journal snapshot.
     terminal_decision_generation: u64,
+    terminal_chain_digest: [u8; DIGEST_LEN],
+    terminal_set_digest: [u8; DIGEST_LEN],
+    generation_index: BTreeMap<u64, TerminalJournalOpId>,
 }
 
 impl TerminalJournal {
@@ -421,12 +645,18 @@ impl TerminalJournal {
         let topic = topic.into();
         let path = journal_path(root.as_deref(), &topic);
         let Some(path) = path else {
+            let journal_id = generate_journal_id()?;
+            let terminal_set_digest = compute_terminal_set_digest(&BTreeMap::new());
             return Ok(Self {
                 topic,
                 path: None,
                 _lock_file: None,
                 records: BTreeMap::new(),
+                journal_id,
                 terminal_decision_generation: 0,
+                terminal_chain_digest: EMPTY_CHAIN_DIGEST,
+                terminal_set_digest,
+                generation_index: BTreeMap::new(),
             });
         };
 
@@ -469,9 +699,11 @@ impl TerminalJournal {
             }
         }
 
-        let (records, terminal_decision_generation) = match fs::read(&path) {
+        let loaded = match fs::read(&path) {
             Ok(bytes) => load_records(&path, &topic, &bytes)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (BTreeMap::new(), 0),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                LoadedTerminalJournal::empty(generate_journal_id()?, true)
+            }
             Err(source) => {
                 return Err(TerminalJournalError::Io {
                     path: path.clone(),
@@ -480,22 +712,42 @@ impl TerminalJournal {
             }
         };
 
-        Ok(Self {
+        let needs_rewrite = loaded.needs_rewrite;
+        let journal = Self {
             topic,
             path: Some(path),
             _lock_file: Some(lock_file),
-            records,
-            terminal_decision_generation,
-        })
+            records: loaded.records,
+            journal_id: loaded.journal_id,
+            terminal_decision_generation: loaded.terminal_decision_generation,
+            terminal_chain_digest: loaded.terminal_chain_digest,
+            terminal_set_digest: loaded.terminal_set_digest,
+            generation_index: loaded.generation_index,
+        };
+        if needs_rewrite {
+            journal.persist(
+                &journal.records,
+                journal.terminal_decision_generation,
+                journal.terminal_chain_digest,
+                journal.terminal_set_digest,
+            )?;
+        }
+        Ok(journal)
     }
 
     pub(crate) fn in_memory(topic: impl Into<String>) -> Self {
+        let journal_id = generate_journal_id()
+            .expect("the system random generator must provide a terminal journal id");
         Self {
             topic: topic.into(),
             path: None,
             _lock_file: None,
             records: BTreeMap::new(),
+            journal_id,
             terminal_decision_generation: 0,
+            terminal_chain_digest: EMPTY_CHAIN_DIGEST,
+            terminal_set_digest: compute_terminal_set_digest(&BTreeMap::new()),
+            generation_index: BTreeMap::new(),
         }
     }
 
@@ -534,6 +786,247 @@ impl TerminalJournal {
 
     pub(crate) fn terminal_decision_generation(&self) -> u64 {
         self.terminal_decision_generation
+    }
+
+    pub(crate) fn terminal_cut(&self) -> TerminalCut {
+        TerminalCut::new(
+            self.journal_id,
+            self.terminal_decision_generation,
+            self.terminal_chain_digest,
+            self.terminal_set_digest,
+        )
+    }
+
+    /// Return the exact authenticated cut for one retained generation.
+    /// Generation zero names the empty prefix of this journal lineage.
+    pub(crate) fn terminal_cut_at(&self, generation: u64) -> Option<TerminalCut> {
+        if generation > self.terminal_decision_generation {
+            return None;
+        }
+        let chain_digest = if generation == 0 {
+            EMPTY_CHAIN_DIGEST
+        } else {
+            *self
+                .generation_index
+                .get(&generation)
+                .and_then(|op_id| self.records.get(op_id))
+                .and_then(TerminalJournalRecord::terminal_chain_digest)?
+        };
+        Some(TerminalCut::new(
+            self.journal_id,
+            generation,
+            chain_digest,
+            compute_terminal_set_digest_through(&self.records, generation),
+        ))
+    }
+
+    /// Return the immutable transition assigned to one terminal record.
+    pub(crate) fn terminal_transition(
+        &self,
+        op_id: TerminalJournalOpId,
+    ) -> Option<TerminalTransition> {
+        let record = self.records.get(&op_id)?;
+        let generation = record.terminal_generation()?;
+        Some(TerminalTransition {
+            previous_cut: self.terminal_cut_at(generation.checked_sub(1)?)?,
+            resulting_cut: self.terminal_cut_at(generation)?,
+            decision_digest: canonical_terminal_decision_digest(op_id, record),
+        })
+    }
+
+    pub(crate) fn terminal_set_matches(&self, digest: &[u8]) -> bool {
+        digest == self.terminal_set_digest.as_slice()
+    }
+
+    /// Verify one source-journal transition without mutating this journal.
+    ///
+    /// This is intentionally expressed in durable journal types rather than
+    /// protobuf types. Callers must first validate and canonicalize the wire
+    /// terminal identity exactly as normal decision installation does.
+    pub(crate) fn verifies_terminal_transition(
+        previous: &TerminalCut,
+        generation: u64,
+        op_id: TerminalJournalOpId,
+        frozen_targets: Option<&[FrozenTarget]>,
+        resolver: Option<TerminalResolver>,
+        decision: &TerminalDecision,
+        advertised_previous_chain_digest: &[u8],
+        advertised_chain_digest: &[u8],
+    ) -> bool {
+        if advertised_previous_chain_digest != previous.chain_digest.as_slice()
+            || advertised_chain_digest.len() != DIGEST_LEN
+        {
+            return false;
+        }
+        Self::terminal_transition_chain_digest(
+            previous,
+            generation,
+            op_id,
+            frozen_targets,
+            resolver,
+            decision,
+        )
+        .is_some_and(|digest| digest.as_slice() == advertised_chain_digest)
+    }
+
+    /// Calculate the authenticated chain result for one already validated
+    /// canonical terminal state. Checkpoint receivers use this to reconstruct
+    /// and verify the source chain even though checkpoint entries omit the
+    /// redundant per-record chain fields.
+    pub(crate) fn terminal_transition_chain_digest(
+        previous: &TerminalCut,
+        generation: u64,
+        op_id: TerminalJournalOpId,
+        frozen_targets: Option<&[FrozenTarget]>,
+        resolver: Option<TerminalResolver>,
+        decision: &TerminalDecision,
+    ) -> Option<[u8; DIGEST_LEN]> {
+        if generation != previous.generation.checked_add(1)? {
+            return None;
+        }
+        let record = TerminalJournalRecord {
+            frozen_targets: frozen_targets.map(<[FrozenTarget]>::to_vec),
+            terminal_resolver: resolver,
+            terminal_decision: Some(decision.clone()),
+            ..TerminalJournalRecord::default()
+        };
+        Some(terminal_chain_digest(
+            previous.journal_id,
+            previous.chain_digest,
+            generation,
+            canonical_terminal_decision_digest(op_id, &record),
+        ))
+    }
+
+    /// Return whether `cut` is a valid prefix of this journal lineage.
+    ///
+    /// The set digest deliberately does not participate in prefix validation:
+    /// only the current set digest is retained, while the chain authenticates
+    /// every historical generation in the source ordering.
+    pub(crate) fn recognizes_terminal_cut(&self, cut: &TerminalCut) -> bool {
+        if cut.journal_id != self.journal_id || cut.generation > self.terminal_decision_generation {
+            return false;
+        }
+        if cut.generation == 0 {
+            return cut.chain_digest == EMPTY_CHAIN_DIGEST;
+        }
+        self.generation_index
+            .get(&cut.generation)
+            .and_then(|op_id| self.records.get(op_id))
+            .and_then(TerminalJournalRecord::terminal_chain_digest)
+            .is_some_and(|digest| digest == &cut.chain_digest)
+    }
+
+    /// Select at most `max_entries` terminal generations after a recognized
+    /// source cut. `None` requests a checkpoint because the cut is not a
+    /// prefix of this journal lineage. A zero bound is treated as one so a
+    /// continuation can never return a non-progressing `has_more` page.
+    #[cfg(test)]
+    pub(crate) fn terminal_deltas_after(
+        &self,
+        base: &TerminalCut,
+        max_entries: usize,
+    ) -> Option<TerminalJournalDeltaPage> {
+        self.terminal_deltas_between(base, &self.terminal_cut(), max_entries)
+    }
+
+    /// Select a bounded delta page without advancing beyond a transfer's
+    /// previously captured target cut.
+    pub(crate) fn terminal_deltas_between(
+        &self,
+        base: &TerminalCut,
+        target: &TerminalCut,
+        max_entries: usize,
+    ) -> Option<TerminalJournalDeltaPage> {
+        if !self.recognizes_terminal_cut(base)
+            || !self.recognizes_terminal_cut(target)
+            || base.generation > target.generation
+        {
+            return None;
+        }
+
+        let entries = if base.generation == target.generation {
+            Vec::new()
+        } else {
+            self.generation_index
+                .range(base.generation + 1..=target.generation)
+                .take(max_entries.max(1))
+                .map(|(generation, op_id)| {
+                    let record = self
+                        .records
+                        .get(op_id)
+                        .expect("generation index references a terminal record");
+                    TerminalJournalDeltaEntry {
+                        generation: *generation,
+                        chain_digest: *record
+                            .terminal_chain_digest()
+                            .expect("indexed terminal record has a chain digest"),
+                        op_id: *op_id,
+                        record: record.clone(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let last_generation = entries
+            .last()
+            .map(TerminalJournalDeltaEntry::generation)
+            .unwrap_or(base.generation);
+        Some(TerminalJournalDeltaPage {
+            base: *base,
+            target: *target,
+            entries,
+            has_more: last_generation < target.generation,
+        })
+    }
+
+    /// Return a bounded, generation-ordered page of the exact terminal fence
+    /// set. A zero bound is treated as one to guarantee cursor progress.
+    /// Nonterminal promise/accept records are intentionally excluded.
+    #[cfg(test)]
+    pub(crate) fn terminal_checkpoint_page(
+        &self,
+        cursor: u64,
+        max_entries: usize,
+    ) -> TerminalJournalCheckpointPage {
+        self.terminal_checkpoint_page_at(&self.terminal_cut(), cursor, max_entries)
+            .expect("the current terminal cut is always recognized")
+    }
+
+    /// Return a stable checkpoint page bounded by a previously captured cut.
+    /// New decisions append later generations and cannot move its cursor.
+    pub(crate) fn terminal_checkpoint_page_at(
+        &self,
+        target: &TerminalCut,
+        cursor: u64,
+        max_entries: usize,
+    ) -> Option<TerminalJournalCheckpointPage> {
+        if !self.recognizes_terminal_cut(target) {
+            return None;
+        }
+        let start = usize::try_from(cursor).unwrap_or(usize::MAX);
+        let entries = self
+            .generation_index
+            .iter()
+            .take(usize::try_from(target.generation).unwrap_or(usize::MAX))
+            .skip(start)
+            .take(max_entries.max(1))
+            .map(|(_, op_id)| TerminalJournalSnapshotEntry {
+                op_id: *op_id,
+                record: self
+                    .records
+                    .get(op_id)
+                    .expect("generation index references a terminal record")
+                    .clone(),
+            })
+            .collect::<Vec<_>>();
+        let next_cursor = cursor.saturating_add(entries.len() as u64);
+        Some(TerminalJournalCheckpointPage {
+            target: *target,
+            cursor,
+            next_cursor,
+            entries,
+            has_more: next_cursor < target.generation,
+        })
     }
 
     /// Record a higher promise ballot. Returns whether durable state changed.
@@ -817,15 +1310,36 @@ impl TerminalJournal {
         }
 
         let terminal_decision_generation = if !had_terminal_decision && record.is_terminal() {
-            self.terminal_decision_generation
+            let generation = self
+                .terminal_decision_generation
                 .checked_add(1)
-                .ok_or(TerminalJournalError::DecisionGenerationExhausted)?
+                .ok_or(TerminalJournalError::DecisionGenerationExhausted)?;
+            record.terminal_generation = Some(generation);
+            generation
         } else {
             self.terminal_decision_generation
         };
-        self.persist(&records, terminal_decision_generation)?;
+        let derived = derive_terminal_state(&mut records, self.journal_id).map_err(|reason| {
+            TerminalJournalError::InvalidMetadata {
+                path: self.path.clone().unwrap_or_default(),
+                reason,
+            }
+        })?;
+        debug_assert_eq!(
+            derived.terminal_decision_generation,
+            terminal_decision_generation
+        );
+        self.persist(
+            &records,
+            derived.terminal_decision_generation,
+            derived.terminal_chain_digest,
+            derived.terminal_set_digest,
+        )?;
         self.records = records;
-        self.terminal_decision_generation = terminal_decision_generation;
+        self.terminal_decision_generation = derived.terminal_decision_generation;
+        self.terminal_chain_digest = derived.terminal_chain_digest;
+        self.terminal_set_digest = derived.terminal_set_digest;
+        self.generation_index = derived.generation_index;
         Ok(true)
     }
 
@@ -833,6 +1347,8 @@ impl TerminalJournal {
         &self,
         records: &BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
         terminal_decision_generation: u64,
+        terminal_chain_digest: [u8; DIGEST_LEN],
+        terminal_set_digest: [u8; DIGEST_LEN],
     ) -> Result<(), TerminalJournalError> {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
@@ -840,7 +1356,10 @@ impl TerminalJournal {
         let payload = PersistedTerminalJournal {
             version: JOURNAL_VERSION,
             topic: self.topic.clone(),
+            journal_id: self.journal_id,
             terminal_decision_generation,
+            terminal_chain_digest,
+            terminal_set_digest,
             records: records
                 .iter()
                 .map(
@@ -1016,33 +1535,11 @@ fn upsert_decision_in_record(
                 TerminalDecision::Commit {
                     candidate: next_candidate,
                 },
-            ) if existing_candidate.has_same_value(next_candidate) => {
-                if next_candidate.ballot() <= existing_candidate.ballot() {
-                    return Ok(false);
-                }
-                record.promise_ballot = record.promise_ballot.max(next_candidate.ballot());
-                record.accepted_commit = Some(next_candidate.clone());
-                record.terminal_decision = Some(decision);
-                return Ok(true);
-            }
+            ) if existing_candidate.has_same_value(next_candidate) => return Ok(false),
             (TerminalDecision::Commit { .. }, TerminalDecision::Abort { .. }) => {
                 return Ok(false);
             }
-            (
-                TerminalDecision::Abort {
-                    ballot: existing_ballot,
-                },
-                TerminalDecision::Abort {
-                    ballot: next_ballot,
-                },
-            ) => {
-                if next_ballot <= existing_ballot {
-                    return Ok(false);
-                }
-                record.promise_ballot = record.promise_ballot.max(*next_ballot);
-                record.terminal_decision = Some(decision);
-                return Ok(true);
-            }
+            (TerminalDecision::Abort { .. }, TerminalDecision::Abort { .. }) => return Ok(false),
             _ => {
                 return Err(TerminalJournalError::ConflictingTerminalDecision {
                     op_id_hi: op_id.0,
@@ -1128,12 +1625,225 @@ fn learn_v2_terminal_decision_in_record(
     Ok(true)
 }
 
+struct DerivedTerminalState {
+    terminal_decision_generation: u64,
+    terminal_chain_digest: [u8; DIGEST_LEN],
+    terminal_set_digest: [u8; DIGEST_LEN],
+    generation_index: BTreeMap<u64, TerminalJournalOpId>,
+}
+
+struct LoadedTerminalJournal {
+    records: BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+    journal_id: [u8; JOURNAL_ID_LEN],
+    terminal_decision_generation: u64,
+    terminal_chain_digest: [u8; DIGEST_LEN],
+    terminal_set_digest: [u8; DIGEST_LEN],
+    generation_index: BTreeMap<u64, TerminalJournalOpId>,
+    needs_rewrite: bool,
+}
+
+impl LoadedTerminalJournal {
+    fn empty(journal_id: [u8; JOURNAL_ID_LEN], needs_rewrite: bool) -> Self {
+        Self {
+            records: BTreeMap::new(),
+            journal_id,
+            terminal_decision_generation: 0,
+            terminal_chain_digest: EMPTY_CHAIN_DIGEST,
+            terminal_set_digest: compute_terminal_set_digest(&BTreeMap::new()),
+            generation_index: BTreeMap::new(),
+            needs_rewrite,
+        }
+    }
+
+    fn from_derived(
+        records: BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+        journal_id: [u8; JOURNAL_ID_LEN],
+        derived: DerivedTerminalState,
+        needs_rewrite: bool,
+    ) -> Self {
+        Self {
+            records,
+            journal_id,
+            terminal_decision_generation: derived.terminal_decision_generation,
+            terminal_chain_digest: derived.terminal_chain_digest,
+            terminal_set_digest: derived.terminal_set_digest,
+            generation_index: derived.generation_index,
+            needs_rewrite,
+        }
+    }
+}
+
+fn generate_journal_id() -> Result<[u8; JOURNAL_ID_LEN], TerminalJournalError> {
+    let random = SystemRandom::new();
+    let mut journal_id = [0; JOURNAL_ID_LEN];
+    random
+        .fill(&mut journal_id)
+        .map_err(|_| TerminalJournalError::JournalIdGeneration)?;
+    if journal_id == [0; JOURNAL_ID_LEN] {
+        random
+            .fill(&mut journal_id)
+            .map_err(|_| TerminalJournalError::JournalIdGeneration)?;
+    }
+    (journal_id != [0; JOURNAL_ID_LEN])
+        .then_some(journal_id)
+        .ok_or(TerminalJournalError::JournalIdGeneration)
+}
+
+fn derive_terminal_state(
+    records: &mut BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+    journal_id: [u8; JOURNAL_ID_LEN],
+) -> Result<DerivedTerminalState, &'static str> {
+    let mut generation_index = BTreeMap::new();
+    for (op_id, record) in records.iter() {
+        if record.is_terminal() {
+            let generation = record
+                .terminal_generation
+                .ok_or("terminal record is missing its generation")?;
+            if generation == 0 || generation_index.insert(generation, *op_id).is_some() {
+                return Err("terminal generations are zero or duplicated");
+            }
+        } else if record.terminal_generation.is_some() || record.terminal_chain_digest.is_some() {
+            return Err("nonterminal record retains terminal cut metadata");
+        }
+    }
+    for (offset, generation) in generation_index.keys().copied().enumerate() {
+        if generation != (offset as u64).saturating_add(1) {
+            return Err("terminal generations are not contiguous");
+        }
+    }
+
+    let mut previous = EMPTY_CHAIN_DIGEST;
+    for (generation, op_id) in &generation_index {
+        let record = records
+            .get_mut(op_id)
+            .expect("generation index references an existing record");
+        previous = terminal_chain_digest(
+            journal_id,
+            previous,
+            *generation,
+            canonical_terminal_decision_digest(*op_id, record),
+        );
+        record.terminal_chain_digest = Some(previous);
+    }
+
+    Ok(DerivedTerminalState {
+        terminal_decision_generation: generation_index.len() as u64,
+        terminal_chain_digest: previous,
+        terminal_set_digest: compute_terminal_set_digest(records),
+        generation_index,
+    })
+}
+
+fn terminal_chain_digest(
+    journal_id: [u8; JOURNAL_ID_LEN],
+    previous: [u8; DIGEST_LEN],
+    generation: u64,
+    decision_digest: [u8; DIGEST_LEN],
+) -> [u8; DIGEST_LEN] {
+    let mut image = Vec::with_capacity(24 + DIGEST_LEN * 2);
+    image.extend_from_slice(b"shitspeak-terminal-chain-v2\0");
+    image.extend_from_slice(&journal_id);
+    image.extend_from_slice(&previous);
+    image.extend_from_slice(&generation.to_be_bytes());
+    image.extend_from_slice(&decision_digest);
+    sha256(&image)
+}
+
+fn compute_terminal_set_digest(
+    records: &BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+) -> [u8; DIGEST_LEN] {
+    compute_terminal_set_digest_through(records, u64::MAX)
+}
+
+fn compute_terminal_set_digest_through(
+    records: &BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+    through_generation: u64,
+) -> [u8; DIGEST_LEN] {
+    let included = |record: &&TerminalJournalRecord| {
+        record
+            .terminal_generation()
+            .is_some_and(|generation| generation <= through_generation)
+    };
+    let terminal_count = records.values().filter(included).count() as u64;
+    let mut image = Vec::with_capacity(40 + terminal_count as usize * DIGEST_LEN);
+    image.extend_from_slice(b"shitspeak-terminal-set-v2\0");
+    image.extend_from_slice(&terminal_count.to_be_bytes());
+    for (op_id, record) in records.iter().filter(|(_, record)| {
+        record
+            .terminal_generation()
+            .is_some_and(|generation| generation <= through_generation)
+    }) {
+        image.extend_from_slice(&canonical_terminal_decision_digest(*op_id, record));
+    }
+    sha256(&image)
+}
+
+fn canonical_terminal_decision_digest(
+    op_id: TerminalJournalOpId,
+    record: &TerminalJournalRecord,
+) -> [u8; DIGEST_LEN] {
+    let mut image = Vec::new();
+    image.extend_from_slice(b"shitspeak-terminal-decision-v2\0");
+    image.extend_from_slice(&op_id.0.to_be_bytes());
+    image.extend_from_slice(&op_id.1.to_be_bytes());
+    match record.frozen_targets() {
+        Some(targets) => {
+            image.push(1);
+            image.extend_from_slice(&(targets.len() as u64).to_be_bytes());
+            for target in targets {
+                image.extend_from_slice(&target.node().to_be_bytes());
+                image.extend_from_slice(&target.boot_epoch().to_be_bytes());
+            }
+        }
+        None => image.push(0),
+    }
+    match record.terminal_resolver() {
+        Some(resolver) => {
+            image.push(1);
+            image.extend_from_slice(&resolver.node().to_be_bytes());
+            image.extend_from_slice(&resolver.boot_epoch().to_be_bytes());
+        }
+        None => image.push(0),
+    }
+    match record
+        .terminal_decision()
+        .expect("terminal digest is computed only for a terminal record")
+    {
+        TerminalDecision::Commit { candidate } => {
+            image.push(1);
+            // A higher-ballot rebroadcast of this chosen value is an
+            // idempotent no-op. The resolution ballot therefore does not
+            // participate in the immutable terminal outcome identity.
+            image.extend_from_slice(&candidate.ts_final().to_be_bytes());
+            image.extend_from_slice(&(candidate.op_msgpack().len() as u64).to_be_bytes());
+            image.extend_from_slice(candidate.op_msgpack());
+        }
+        TerminalDecision::Abort { .. } => {
+            image.push(2);
+        }
+    }
+    sha256(&image)
+}
+
+fn sha256(image: &[u8]) -> [u8; DIGEST_LEN] {
+    let digest = digest(&SHA256, image);
+    let mut bytes = [0; DIGEST_LEN];
+    bytes.copy_from_slice(digest.as_ref());
+    bytes
+}
+
 #[derive(Serialize, Deserialize)]
 struct PersistedTerminalJournal {
     version: u32,
     topic: String,
     #[serde(default)]
+    journal_id: [u8; JOURNAL_ID_LEN],
+    #[serde(default)]
     terminal_decision_generation: u64,
+    #[serde(default)]
+    terminal_chain_digest: [u8; DIGEST_LEN],
+    #[serde(default)]
+    terminal_set_digest: [u8; DIGEST_LEN],
     records: Vec<PersistedTerminalJournalRecord>,
 }
 
@@ -1161,13 +1871,13 @@ fn load_records(
     path: &Path,
     expected_topic: &str,
     bytes: &[u8],
-) -> Result<(BTreeMap<TerminalJournalOpId, TerminalJournalRecord>, u64), TerminalJournalError> {
+) -> Result<LoadedTerminalJournal, TerminalJournalError> {
     let payload: PersistedTerminalJournal =
         serde_json::from_slice(bytes).map_err(|source| TerminalJournalError::Json {
             path: path.to_path_buf(),
             source,
         })?;
-    if payload.version != JOURNAL_VERSION {
+    if payload.version != LEGACY_JOURNAL_VERSION && payload.version != JOURNAL_VERSION {
         return Err(TerminalJournalError::UnsupportedVersion {
             path: path.to_path_buf(),
             version: payload.version,
@@ -1181,6 +1891,7 @@ fn load_records(
         });
     }
 
+    let version = payload.version;
     let mut records = BTreeMap::new();
     for entry in payload.records {
         let op_id = (entry.op_id_hi, entry.op_id_lo);
@@ -1194,17 +1905,73 @@ fn load_records(
         validate_record(path, op_id, &entry.record)?;
         records.insert(op_id, entry.record);
     }
-    // Journals written before the generation field existed must not use zero
-    // as a successful fence-sync token when they already contain decisions.
-    // One is sufficient: every subsequent newly learned decision advances it.
-    let terminal_decision_generation = if payload.terminal_decision_generation == 0
-        && records.values().any(TerminalJournalRecord::is_terminal)
+    if version == LEGACY_JOURNAL_VERSION {
+        let journal_id = generate_journal_id()?;
+        for (offset, record) in records
+            .values_mut()
+            .filter(|record| record.is_terminal())
+            .enumerate()
+        {
+            record.terminal_generation = Some((offset as u64).saturating_add(1));
+        }
+        let derived = derive_terminal_state(&mut records, journal_id).map_err(|reason| {
+            TerminalJournalError::InvalidMetadata {
+                path: path.to_path_buf(),
+                reason,
+            }
+        })?;
+        return Ok(LoadedTerminalJournal::from_derived(
+            records, journal_id, derived, true,
+        ));
+    }
+
+    if payload.journal_id == [0; JOURNAL_ID_LEN] {
+        return Err(TerminalJournalError::InvalidMetadata {
+            path: path.to_path_buf(),
+            reason: "journal lineage identifier is missing or all zero",
+        });
+    }
+    let persisted_record_metadata = records
+        .iter()
+        .filter_map(|(op_id, record)| {
+            record.is_terminal().then_some((
+                *op_id,
+                (record.terminal_generation, record.terminal_chain_digest),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let derived = derive_terminal_state(&mut records, payload.journal_id).map_err(|reason| {
+        TerminalJournalError::InvalidMetadata {
+            path: path.to_path_buf(),
+            reason,
+        }
+    })?;
+    if payload.terminal_decision_generation != derived.terminal_decision_generation
+        || payload.terminal_chain_digest != derived.terminal_chain_digest
+        || payload.terminal_set_digest != derived.terminal_set_digest
     {
-        1
-    } else {
-        payload.terminal_decision_generation
-    };
-    Ok((records, terminal_decision_generation))
+        return Err(TerminalJournalError::InvalidMetadata {
+            path: path.to_path_buf(),
+            reason: "persisted terminal cut does not match the terminal records",
+        });
+    }
+    if persisted_record_metadata.iter().any(|(op_id, metadata)| {
+        let record = records
+            .get(op_id)
+            .expect("derived terminal record remains present");
+        metadata.0 != record.terminal_generation || metadata.1 != record.terminal_chain_digest
+    }) {
+        return Err(TerminalJournalError::InvalidMetadata {
+            path: path.to_path_buf(),
+            reason: "persisted terminal generation or chain digest is invalid",
+        });
+    }
+    Ok(LoadedTerminalJournal::from_derived(
+        records,
+        payload.journal_id,
+        derived,
+        false,
+    ))
 }
 
 fn validate_record(
@@ -1805,32 +2572,37 @@ mod tests {
     }
 
     #[test]
-    fn terminal_commit_can_be_rebroadcast_at_a_higher_resolution_ballot() {
+    fn terminal_identity_is_immutable_across_higher_ballot_rebroadcasts() {
         let mut journal = TerminalJournal::in_memory("channels");
         assert!(
             journal
                 .upsert_commit_decision((1, 1), 3, 10, b"value".to_vec())
                 .unwrap()
         );
+        let original_cut = journal.terminal_cut();
         assert!(
-            journal
+            !journal
                 .upsert_commit_decision((1, 1), 4, 10, b"value".to_vec())
                 .unwrap()
         );
-        assert_eq!(
-            journal
-                .get((1, 1))
-                .unwrap()
-                .terminal_decision()
-                .unwrap()
-                .ballot(),
-            4
-        );
+        assert_eq!(journal.terminal_cut(), original_cut);
+        let commit_record = journal.get((1, 1)).unwrap();
+        assert_eq!(commit_record.promise_ballot(), 3);
+        assert_eq!(commit_record.accepted_commit().unwrap().ballot(), 3);
+        assert_eq!(commit_record.terminal_decision().unwrap().ballot(), 3);
         assert!(!journal.upsert_abort_decision((1, 1), 4).unwrap());
         assert!(matches!(
             journal.upsert_commit_decision((1, 1), 5, 10, b"other".to_vec()),
             Err(TerminalJournalError::ConflictingTerminalDecision { .. })
         ));
+
+        assert!(journal.upsert_abort_decision((3, 3), 6).unwrap());
+        let abort_cut = journal.terminal_cut();
+        assert!(!journal.upsert_abort_decision((3, 3), 9).unwrap());
+        assert_eq!(journal.terminal_cut(), abort_cut);
+        let abort_record = journal.get((3, 3)).unwrap();
+        assert_eq!(abort_record.promise_ballot(), 6);
+        assert_eq!(abort_record.terminal_decision().unwrap().ballot(), 6);
 
         let mut accepted = TerminalJournal::in_memory("users");
         accepted
@@ -1920,5 +2692,212 @@ mod tests {
     fn terminal_decision_serializes_a_tagged_outcome() {
         let encoded = serde_json::to_string(&TerminalDecision::abort(5)).unwrap();
         assert!(encoded.contains(r#""outcome":"abort""#));
+    }
+
+    #[test]
+    fn terminal_deltas_are_generation_ordered_and_bounded() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        let empty_cut = journal.terminal_cut();
+        assert!(journal.upsert_abort_decision((9, 9), 1).unwrap());
+        assert!(journal.upsert_abort_decision((1, 1), 2).unwrap());
+        assert!(journal.upsert_abort_decision((5, 5), 3).unwrap());
+
+        let first = journal.terminal_deltas_after(&empty_cut, 2).unwrap();
+        assert_eq!(first.entries().len(), 2);
+        assert_eq!(first.entries()[0].generation(), 1);
+        assert_eq!(first.entries()[0].clone().into_parts().2, (9, 9));
+        assert_eq!(first.entries()[1].generation(), 2);
+        assert_eq!(first.entries()[1].clone().into_parts().2, (1, 1));
+        assert!(first.has_more());
+        assert_eq!(first.target(), journal.terminal_cut());
+
+        let second_base = journal.terminal_cut_at(2).unwrap();
+        assert!(journal.recognizes_terminal_cut(&second_base));
+        let second = journal.terminal_deltas_after(&second_base, 2).unwrap();
+        assert_eq!(second.entries().len(), 1);
+        assert_eq!(second.entries()[0].clone().into_parts().2, (5, 5));
+        assert!(!second.has_more());
+
+        let foreign = super::TerminalCut::new([0x55; 16], 0, [0; 32], [0; 32]);
+        assert!(journal.terminal_deltas_after(&foreign, 1).is_none());
+    }
+
+    #[test]
+    fn source_transition_verification_authenticates_the_canonical_decision() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        let base = journal.terminal_cut();
+        journal
+            .upsert_commit_decision((9, 9), 7, 11, b"value".to_vec())
+            .unwrap();
+        let delta = journal
+            .terminal_deltas_after(&base, 1)
+            .unwrap()
+            .into_entries()
+            .pop()
+            .unwrap();
+        let (generation, chain, op_id, record) = delta.into_parts();
+        let decision = record.terminal_decision().unwrap();
+
+        assert!(TerminalJournal::verifies_terminal_transition(
+            &base,
+            generation,
+            op_id,
+            record.frozen_targets(),
+            record.terminal_resolver(),
+            decision,
+            base.chain_digest(),
+            &chain,
+        ));
+        assert!(!TerminalJournal::verifies_terminal_transition(
+            &base,
+            generation,
+            (op_id.0, op_id.1 + 1),
+            record.frozen_targets(),
+            record.terminal_resolver(),
+            decision,
+            base.chain_digest(),
+            &chain,
+        ));
+        assert_eq!(
+            TerminalJournal::terminal_transition_chain_digest(
+                &base,
+                generation,
+                op_id,
+                record.frozen_targets(),
+                record.terminal_resolver(),
+                decision,
+            ),
+            Some(chain),
+        );
+    }
+
+    #[test]
+    fn intermediate_terminal_cut_is_exact_and_continues_to_a_fixed_target() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        let zero = journal.terminal_cut_at(0).unwrap();
+        journal.upsert_abort_decision((9, 9), 1).unwrap();
+        journal.upsert_abort_decision((1, 1), 2).unwrap();
+        let intermediate = journal.terminal_cut_at(1).unwrap();
+        let target = journal.terminal_cut();
+        let mut prefix = TerminalJournal::in_memory("channels");
+        prefix.journal_id = journal.journal_id;
+        prefix.upsert_abort_decision((9, 9), 1).unwrap();
+
+        assert!(journal.recognizes_terminal_cut(&zero));
+        assert!(journal.recognizes_terminal_cut(&intermediate));
+        assert_eq!(intermediate, prefix.terminal_cut());
+        assert_ne!(
+            intermediate.terminal_set_digest(),
+            zero.terminal_set_digest()
+        );
+        assert_ne!(
+            intermediate.terminal_set_digest(),
+            target.terminal_set_digest()
+        );
+
+        let page = journal
+            .terminal_deltas_between(&intermediate, &target, 1)
+            .unwrap();
+        assert_eq!(page.base(), intermediate);
+        assert_eq!(page.target(), target);
+        assert_eq!(page.entries().len(), 1);
+        assert_eq!(page.entries()[0].generation(), 2);
+        assert!(!page.has_more());
+    }
+
+    #[test]
+    fn terminal_set_digest_is_independent_of_learning_order() {
+        let mut left = TerminalJournal::in_memory("channels");
+        let mut right = TerminalJournal::in_memory("channels");
+        right.journal_id = left.journal_id;
+        left.upsert_abort_decision((1, 1), 4).unwrap();
+        left.upsert_abort_decision((2, 2), 5).unwrap();
+        right.upsert_abort_decision((2, 2), 5).unwrap();
+        right.upsert_abort_decision((1, 1), 4).unwrap();
+
+        assert_eq!(
+            left.terminal_cut().terminal_set_digest(),
+            right.terminal_cut().terminal_set_digest()
+        );
+        assert_ne!(
+            left.terminal_cut().chain_digest(),
+            right.terminal_cut().chain_digest()
+        );
+    }
+
+    #[test]
+    fn terminal_checkpoint_is_bounded_and_excludes_nonterminal_records() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        journal.upsert_promise((0, 0), 7).unwrap();
+        journal.upsert_abort_decision((1, 1), 8).unwrap();
+        journal.upsert_abort_decision((2, 2), 9).unwrap();
+
+        let first = journal.terminal_checkpoint_page(0, 1);
+        assert_eq!(first.cursor(), 0);
+        assert_eq!(first.next_cursor(), 1);
+        assert_eq!(first.entries().len(), 1);
+        assert_eq!(first.entries()[0].clone().into_parts().0, (1, 1));
+        assert!(first.has_more());
+        let second = journal.terminal_checkpoint_page(first.next_cursor(), 1);
+        assert_eq!(second.entries()[0].clone().into_parts().0, (2, 2));
+        assert!(!second.has_more());
+    }
+
+    #[test]
+    fn zero_page_bounds_still_advance_delta_and_checkpoint_cursors() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        let empty_cut = journal.terminal_cut();
+        journal.upsert_abort_decision((1, 1), 1).unwrap();
+        journal.upsert_abort_decision((2, 2), 2).unwrap();
+
+        let first_delta = journal.terminal_deltas_after(&empty_cut, 0).unwrap();
+        assert_eq!(first_delta.entries().len(), 1);
+        assert_eq!(first_delta.entries()[0].generation(), 1);
+        assert!(first_delta.has_more());
+        let generation_one = journal.terminal_cut_at(1).unwrap();
+        let second_delta = journal
+            .terminal_deltas_between(&generation_one, &first_delta.target(), 0)
+            .unwrap();
+        assert_eq!(second_delta.entries().len(), 1);
+        assert_eq!(second_delta.entries()[0].generation(), 2);
+        assert!(!second_delta.has_more());
+
+        let first_checkpoint = journal.terminal_checkpoint_page(0, 0);
+        assert_eq!(first_checkpoint.entries().len(), 1);
+        assert_eq!(first_checkpoint.next_cursor(), 1);
+        assert!(first_checkpoint.has_more());
+        let second_checkpoint = journal.terminal_checkpoint_page_at(
+            &first_checkpoint.target(),
+            first_checkpoint.next_cursor(),
+            0,
+        );
+        let second_checkpoint = second_checkpoint.unwrap();
+        assert_eq!(second_checkpoint.entries().len(), 1);
+        assert_eq!(second_checkpoint.next_cursor(), 2);
+        assert!(!second_checkpoint.has_more());
+    }
+
+    #[test]
+    fn legacy_journal_is_atomically_migrated_to_valid_v2_metadata() {
+        let root = TempDir::new().unwrap();
+        let topic = "channels";
+        let directory = root.path().join("strict-terminal-journal");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("topic-{}.json", hex::encode(topic.as_bytes())));
+        fs::write(
+            &path,
+            r#"{"version":1,"topic":"channels","terminal_decision_generation":1,"records":[{"op_id_hi":1,"op_id_lo":2,"promise_ballot":3,"terminal_decision":{"outcome":"abort","ballot":3}}]}"#,
+        )
+        .unwrap();
+
+        let journal = TerminalJournal::load(Some(root.path().to_path_buf()), topic).unwrap();
+        assert_eq!(journal.terminal_cut().generation(), 1);
+        assert_ne!(journal.terminal_cut().journal_id(), &[0; 16]);
+        assert_eq!(journal.get((1, 2)).unwrap().terminal_generation(), Some(1));
+        let migrated: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(migrated["version"], 2);
+        assert!(migrated["journal_id"].is_array());
+        assert!(migrated["terminal_chain_digest"].is_array());
+        assert!(migrated["terminal_set_digest"].is_array());
     }
 }

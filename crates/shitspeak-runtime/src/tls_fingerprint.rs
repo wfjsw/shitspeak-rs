@@ -365,11 +365,11 @@ mod tests {
 
     #[test]
     fn ja4_excludes_sni_from_count_and_hash() {
-        let mut without_sni = test_client_hello(vec![(
+        let without_sni = test_client_hello(vec![(
             TLS_EXTENSION_ALPN,
             vec![0x00, 0x03, 0x02, b'h', b'2'],
         )]);
-        let mut with_sni = test_client_hello(vec![
+        let with_sni = test_client_hello(vec![
             (
                 TLS_EXTENSION_SERVER_NAME,
                 vec![

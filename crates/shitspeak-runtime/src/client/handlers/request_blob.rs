@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{Message, WriteMessageExt, encoder::RequestBlob},
+    messages::{Message, encoder::RequestBlob},
     server::Server,
 };
 
@@ -63,7 +63,7 @@ pub async fn handle_request_blob(
             None => None,
         };
 
-        let reply: Message = crate::messages::encoder::UserState {
+        let reply: Message = shitspeak_messages::messages::encoder::UserState {
             session: Some(
                 crate::client::client_session_identifier::ClientSessionIdentifier::from(
                     *session_raw,
@@ -132,7 +132,7 @@ pub async fn handle_request_blob(
             None => None,
         };
 
-        let reply: Message = crate::messages::encoder::UserState {
+        let reply: Message = shitspeak_messages::messages::encoder::UserState {
             session: Some(
                 crate::client::client_session_identifier::ClientSessionIdentifier::from(
                     *session_raw,
@@ -203,7 +203,7 @@ pub async fn handle_request_blob(
             }
         }
 
-        let mut cs = crate::messages::encoder::ChannelState {
+        let mut cs = shitspeak_messages::messages::encoder::ChannelState {
             channel_id: Some(ch.id),
             parent: ch.parent_id,
             name: Some(ch.name.clone()),
