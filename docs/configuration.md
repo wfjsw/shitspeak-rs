@@ -13,17 +13,23 @@ The server loads:
 1. `config.toml` from the process working directory.
 2. Environment variable overrides with the `SHITSPEAK_` prefix.
 
-Use underscores for nested keys:
+Use a double underscore between TOML table levels and retain single
+underscores inside key names:
 
 ```powershell
 $env:SHITSPEAK_LISTEN = "0.0.0.0:64738"
 $env:SHITSPEAK_MAX_USERS = "250"
-$env:SHITSPEAK_AUTHENTICATOR_BACKEND = "wasm"
-$env:SHITSPEAK_AUTHENTICATOR_WASM_PATH = "auth/auth.wasm"
-$env:SHITSPEAK_PRIVACY_CERTIFICATE_HASH_SECRET = "replace-with-a-long-random-secret"
+$env:SHITSPEAK_AUTHENTICATOR__BACKEND = "wasm"
+$env:SHITSPEAK_AUTHENTICATOR__WASM__PATH = "auth/auth.wasm"
+$env:SHITSPEAK_PRIVACY__CERTIFICATE_HASH_SECRET = "replace-with-a-long-random-secret"
 ```
 
 TOML remains the clearest format for arrays and tables. Environment variables are best for simple scalar values and secrets.
+
+The older single-underscore nesting form remains accepted for compatibility,
+but it is ambiguous when a key itself contains underscores. Prefer the
+double-underscore form above. Unknown keys are ignored, so review spelling and
+nesting carefully when an override appears to have no effect.
 
 ## Minimal Local Config
 
@@ -120,7 +126,7 @@ path = "/etc/shitspeak-rs/auth/auth.wasm"
 [privacy]
 protect_certificate_hashes = "irreversible"
 certificate_hash_secret = "replace-with-a-long-random-cluster-secret"
-# Prefer SHITSPEAK_PRIVACY_CERTIFICATE_HASH_SECRET for real deployments.
+# Prefer SHITSPEAK_PRIVACY__CERTIFICATE_HASH_SECRET for real deployments.
 
 [acl]
 debug_acl_enter = false
@@ -191,6 +197,10 @@ default_channel = 0
 ```
 
 `default_channel` is the channel id used for new sessions when no persisted last/listening channel restoration applies.
+
+`cert_required = true` rejects native clients that do not present a TLS client
+certificate. It checks certificate presence, not whether the certificate chains
+to a trusted client CA.
 
 ## PROXY Protocol
 
@@ -441,7 +451,7 @@ The viewer's own certificate hash is sent unchanged. In clusters, every node mus
 Prefer storing the secret in the environment:
 
 ```powershell
-$env:SHITSPEAK_PRIVACY_CERTIFICATE_HASH_SECRET = "replace-with-a-long-random-cluster-secret"
+$env:SHITSPEAK_PRIVACY__CERTIFICATE_HASH_SECRET = "replace-with-a-long-random-cluster-secret"
 ```
 
 ## GeoIP
@@ -551,8 +561,12 @@ Transport and replication tuning examples:
 
 ```toml
 [s2s.transport]
+latency_ewma_alpha = 0.2
+jitter_ewma_alpha = 0.0625
+packet_loss_ewma_alpha = 0.02
 ping_interval_secs = 2
 idle_ping_interval_secs = 10
+native_stats_interval_secs = 10
 stream_write_timeout_ms = 1000
 # Deadline for establishing and acknowledging all required QUIC v2 lanes.
 quic_session_setup_timeout_ms = 10000
@@ -561,7 +575,16 @@ quic_session_setup_timeout_ms = 10000
 # Nonzero values must be at least 1200 bytes.
 quic_datagram_send_buffer_bytes = 65536
 quic_datagram_receive_buffer_bytes = 262144
+max_pending_pings = 64
+recent_probe_retry_cap_secs = 30
+stale_probe_retry_cap_secs = 600
+stale_probe_age_secs = 3600
+unconfirmed_address_retry_floor_secs = 300
+unconfirmed_address_retry_cap_secs = 1800
+unconfirmed_address_decay_failures = 5
+dial_attempt_timeout_secs = 10
 self_seed_quarantine_secs = 3600
+unselected_link_probe_interval_secs = 30
 max_dial_attempts_per_peer_tick = 1
 max_outgoing_connections = 1024
 # UDP-family sampling and health gates. Unhealthy datagram candidates are
@@ -610,6 +633,8 @@ compression_min_bytes = 1024
 compression_min_savings_percent = 10
 compression_level = 1
 compression_adaptive_dictionary_enabled = true
+# Optional; all participating UDP peers must use identical dictionary bytes.
+# compression_dictionary_path = "s2s-transport.zdict"
 
 [s2s.transport.kcp]
 nodelay = true
@@ -637,6 +662,16 @@ delivery_strategy = "broadcast"
 # for its server/channel target and changes its group version only when the
 # resolved recipient-node set changes.
 tree_delivery_enabled = true
+reorder_max_delay_ms = 40
+reorder_max_buffered_frames = 48
+reorder_max_total_buffer = 4096
+reorder_idle_reset_ms = 2000
+reorder_disabled = false
+adaptive_jitter_enabled = true
+adaptive_jitter_min_delay_ms = 40
+adaptive_jitter_max_delay_ms = 120
+adaptive_jitter_growth_step_ms = 20
+adaptive_jitter_decay_step_ms = 10
 repair_enabled = true
 transport_ttl_ms = 750
 repair_transport_ttl_ms = 750
@@ -645,7 +680,9 @@ repair_transport_ttl_ms = 750
 # a relative response deadline.
 repair_request_ttl_ms = 750
 repair_cache_ms = 1600
-adaptive_jitter_max_delay_ms = 750
+repair_loss_start_ppm = 10000
+repair_full_dup_loss_ppm = 30000
+repair_jitter_start_ms = 40
 # At most two proactive copies may be requested per frame. The default is one.
 # This caps demand; conserved-credit overflow is ranked separately by marginal
 # on-time utility and destination fairness.
@@ -659,10 +696,31 @@ repair_reactive_hard_reserve_pct = 10
 [s2s.overlay]
 hello_interval_ms = 1000
 hello_dead_interval_ms = 4000
+lsa_max_age_ms = 120000
+lsdb_sync_max_response_lsas = 2048
+lsa_flood_pacing_interval_ms = 1000
+lsa_flood_max_batch_lsas = 4096
+lsa_refresh_reduction_enabled = true
+lsa_unchanged_refresh_interval_secs = 90
 routing_dynamic_spf_enabled = true
+cost_rerun_min_interval_ms = 5000
+cost_rerun_loss_ppm = 100000
 route_transit_messages = true
+ordered_lane_cap = 64
+ordered_pending_window_packets = 1024
+ordered_reorder_buffer_packets = 1024
+ordered_repair_cache_packets = 1024
+ordered_ack_timeout_ms = 250
+ordered_retry_initial_ms = 250
+ordered_retry_max_ms = 2000
+ordered_retry_max_age_ms = 30000
+ordered_retry_max_attempts = 16
 
 [s2s.replications]
+fallback_clock_tick_ms = 250
+min_clock_tick_ms = 100
+max_clock_tick_ms = 5000
+delivery_tick_interval_ms = 50
 propose_ttl_ms = 10000
 propose_semaphore_size = 32
 strict_max_catchup_ops = 256
@@ -677,7 +735,21 @@ strict_max_catchup_bytes = 524288
 strict_max_snapshot_transfer_bytes = 67108864
 strict_bootstrap_retry_interval_ms = 500
 strict_steady_state_catchup_interval_ms = 5000
+pending_propose_ttl_ms = 20000
+recovery_ttl_ms = 10000
+owner_catchup_timeout_ms = 5000
+owner_anti_entropy_interval_ms = 30000
+owner_max_catchup_ops = 256
+catchup_max_in_flight_total = 8
+catchup_max_in_flight_per_peer = 1
+client_replication_max_in_flight = 32
 blob_chunk_size = 65536
+blob_request_timeout_ms = 10000
+blob_offer_wait_ms = 250
+blob_retry_interval_ms = 500
+blob_max_parallel_peers = 3
+blob_decay_interval_ms = 60000
+blob_unused_grace_ms = 600000
 bulk_retry_delay_ms = 250
 bulk_max_in_flight_per_peer = 1
 ```
@@ -1052,6 +1124,9 @@ retry_max_interval_ms = 30000
 ```
 
 `url` can be a Loki base URL or the full `/loki/api/v1/push` endpoint. If `filter` is omitted, Loki shipping defaults to this crate's logs instead of all dependency logs. Loki streams automatically include `node_id`, the resolved S2S node id.
+
+Loki also accepts `tenant_id`, `username`, `password`, and `bearer_token` in
+the same table. A bearer token takes precedence over basic authentication.
 
 ## Metrics And Remote Write
 

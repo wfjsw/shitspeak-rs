@@ -1682,7 +1682,14 @@ impl Config {
     fn build_config() -> ConfigCrate {
         ConfigCrate::builder()
             .add_source(File::with_name("config"))
+            // Preserve the original single-underscore nesting convention for
+            // existing deployments, then layer the unambiguous form on top.
             .add_source(Environment::with_prefix("SHITSPEAK").separator("_"))
+            .add_source(
+                Environment::with_prefix("SHITSPEAK")
+                    .prefix_separator("_")
+                    .separator("__"),
+            )
             .build()
             .expect("Failed to build config sources")
     }
@@ -1695,6 +1702,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::path::Path;
     use std::time::Duration;
 
@@ -1710,6 +1718,63 @@ mod tests {
             .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
             .build()?
             .try_deserialize()
+    }
+
+    #[test]
+    fn canonical_environment_keys_preserve_snake_case_leaves() {
+        let base = r#"
+            listen = "127.0.0.1:64738"
+            register_name = "test"
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            send_version = true
+            send_build_info = true
+            send_os_info = true
+            allowed_proxies = []
+            min_client_version = 0
+            max_users = 100
+        "#;
+        let environment = HashMap::from([
+            ("SHITSPEAK_MAX_USERS".to_owned(), "250".to_owned()),
+            (
+                "SHITSPEAK_AUTHENTICATOR__BACKEND".to_owned(),
+                "wasm".to_owned(),
+            ),
+            (
+                "SHITSPEAK_AUTHENTICATOR__WASM__PATH".to_owned(),
+                "auth/auth.wasm".to_owned(),
+            ),
+            (
+                "SHITSPEAK_PRIVACY__CERTIFICATE_HASH_SECRET".to_owned(),
+                "secret".to_owned(),
+            ),
+        ]);
+
+        let cfg: Config = ::config::Config::builder()
+            .add_source(::config::File::from_str(base, ::config::FileFormat::Toml))
+            .add_source(
+                ::config::Environment::with_prefix("SHITSPEAK")
+                    .separator("_")
+                    .source(Some(environment.clone())),
+            )
+            .add_source(
+                ::config::Environment::with_prefix("SHITSPEAK")
+                    .prefix_separator("_")
+                    .separator("__")
+                    .source(Some(environment)),
+            )
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("environment overrides deserialize");
+
+        assert_eq!(cfg.max_users, 250);
+        assert_eq!(cfg.authenticator.backend(), AuthenticatorBackend::Wasm);
+        assert_eq!(
+            cfg.authenticator.wasm().path(),
+            Some(&PathBuf::from("auth/auth.wasm"))
+        );
+        assert_eq!(cfg.privacy.certificate_hash_secret(), Some("secret"));
     }
 
     #[test]
@@ -1865,6 +1930,10 @@ mod tests {
             cfg.udp_ping_user_count_scope,
             UdpPingUserCountScope::Cluster
         );
+        assert_eq!(cfg.blob_storage_dir, Some(PathBuf::from("data")));
+        assert_eq!(cfg.client_idle_timeout_secs, 30);
+        assert_eq!(cfg.authenticate_timeout_ms, 30_000);
+        assert_eq!(cfg.pending_delete_timeout_ms, 5_000);
         // Spot-check a value from each new block.
         assert!(cfg.s2s.transport.latency_ewma_alpha > 0.0);
         assert!(cfg.s2s.overlay.lsdb_sync_max_response_lsas >= 1);

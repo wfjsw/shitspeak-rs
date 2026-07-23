@@ -1,11 +1,12 @@
-# ShitSpeak server configuration for local testing
+# ShitSpeak server configuration for local testing.
+# See docs/configuration.md for loading rules, constraints, and deployment examples.
 
 listen = "0.0.0.0:64738"
 register_name = "ShitSpeak Test"
 
 # ── Public server registration ──────────────────────────────────────────
-# Uncomment and fill in to register this server with the public Mumble
-# server list.  All three fields are required for registration to activate.
+# Registration requires the non-empty register_name above, register_password,
+# register_url, and udp_ping_enabled = true. Hostname and location are optional.
 # register_password = "your-registry-password"
 # Public URL shown for this server in the registry response.
 # register_url = "mumble://my-server.example.com:64738"
@@ -42,6 +43,10 @@ hide_channels_without_traverse = false
 # When enabled, superusers see each user's hosting node id appended to display names.
 show_node_id_for_superusers = true
 
+# Require authenticated users to belong to at least one listed group. An empty
+# list permits every successfully authenticated user.
+required_groups = []
+
 # UDP
 udp_voice_enabled = true
 udp_ping_enabled = true
@@ -52,6 +57,25 @@ udp_ping_user_count_scope = "cluster"
 # Native UDP voice processing queue floor. Effective capacity scales from max_users:
 # baseline = max_users * 16 packets, burst = 5x baseline, hard cap = max_users * 128 packets.
 udp_channel_size = 2048
+
+# Idle timeout (seconds)
+client_idle_timeout_secs = 30
+# Authenticate timeout (milliseconds) after TLS setup.
+authenticate_timeout_ms = 30000
+# Number of clients allowed to run UDP crypt setup, authenticator work, and post-auth
+# finalization concurrently. Set to 0 to disable the login queue and concurrency limit.
+# Authenticator CPU runs on a bounded background-priority runtime regardless.
+# Default when omitted: floor(3rd root(active CPU count)), minimum 1.
+# auth_finalization_concurrency = 1
+pending_delete_timeout_ms = 5000
+
+# Persistence
+blob_storage_dir = "data"
+channel_log_max_entries = 300
+client_log_max_entries = 2000
+channel_snapshot_every_ops = 10
+channel_snapshot_every_secs = 60
+channel_wal_compaction_expire_count = 2000
 
 # Voice latency and UDP send-backpressure budgets (milliseconds).
 # These values hot-reload. Higher age limits reduce drops during short stalls
@@ -72,25 +96,6 @@ mode = "startup_calibrated" # startup_calibrated, sequential, fixed
 # small_payload_rayon_min_len = 256
 # large_payload_rayon_threshold = 512
 # large_payload_rayon_min_len = 256
-
-# Idle timeout (seconds)
-client_idle_timeout_secs = 30
-# Authenticate timeout (milliseconds) after TLS setup.
-authenticate_timeout_ms = 30000
-# Number of clients allowed to run UDP crypt setup, authenticator work, and post-auth
-# finalization concurrently. Set to 0 to disable the login queue and concurrency limit.
-# Authenticator CPU runs on a bounded background-priority runtime regardless.
-# Default when omitted: floor(3rd root(active CPU count)), minimum 1.
-# auth_finalization_concurrency = 1
-pending_delete_timeout_ms = 5000
-
-# Persistence
-blob_storage_dir = "data"
-channel_log_max_entries = 300
-client_log_max_entries = 2000
-channel_snapshot_every_ops = 10
-channel_snapshot_every_secs = 60
-channel_wal_compaction_expire_count = 2000
 
 # Authentication backend. Defaults to `demo`; other built-in backends are
 # `wasm` and `exec`.
@@ -146,8 +151,7 @@ allow_move_without_traverse = false
 protect_certificate_hashes = false
 # Required when protect_certificate_hashes is true, "irreversible", or
 # "reversible". In clusters, every node must use the same secret. Prefer
-# SHITSPEAK_PRIVACY_CERTIFICATE_HASH_SECRET, which maps to the nested
-# privacy.certificate.hash.secret override.
+# SHITSPEAK_PRIVACY__CERTIFICATE_HASH_SECRET.
 # certificate_hash_secret = "replace-with-a-long-random-cluster-secret"
 
 # Global GeoIP lookup for shared resolver use such as ACL IP masks. This is
@@ -197,6 +201,8 @@ ping_interval_secs = 2
 idle_ping_interval_secs = 10
 # How often stream transports sample native loss counters; zero disables it.
 native_stats_interval_secs = 10
+# Per-frame timeout for writes to reliable stream transports.
+stream_write_timeout_ms = 1000
 # Maximum time to establish and acknowledge all required QUIC v2 class lanes.
 quic_session_setup_timeout_ms = 10000
 # QUIC unreliable DATAGRAM queue budgets; enabled buffers must be at least
@@ -221,9 +227,15 @@ stale_probe_age_secs = 3600
 unconfirmed_address_retry_floor_secs = 300
 unconfirmed_address_retry_cap_secs = 1800
 unconfirmed_address_decay_failures = 5
+# Per-address outbound dial deadline; zero disables the deadline.
+dial_attempt_timeout_secs = 10
+# Ignore a discovered local/self seed for this long.
+self_seed_quarantine_secs = 3600
 # How often to sample one otherwise unselected peer/transport while the
 # outgoing cap is full. Set to 0 to disable.
 unselected_link_probe_interval_secs = 30
+# Bound address attempts made for one peer in one discovery tick.
+max_dial_attempts_per_peer_tick = 1
 # Soft cap on live outbound S2S transport sessions. Inbound is still accepted.
 max_outgoing_connections = 1024
 # UDP-family sampling and health gates. Unhealthy datagram candidates are
@@ -265,6 +277,8 @@ voice_path_stickiness_enabled = true
 voice_path_min_hold_ms = 750
 voice_path_challenger_confirm_ms = 500
 voice_path_idle_reset_ms = 2000
+# Route metrics older than this are treated as stale.
+transport_metric_stale_after_ms = 1500
 # Legacy queue capacity hints. Inbound and outbound transport queues now use
 # adaptive byte budgets sized from available memory; these values only raise
 # the per-lane minimum budget for compatibility with older configs.
@@ -288,6 +302,17 @@ compression_adaptive_dictionary_enabled = true
 # negotiation, so configure identical bytes before using static dictionaries on UDP.
 # compression_dictionary_path = "s2s-transport.zdict"
 
+[s2s.transport.kcp]
+nodelay = true
+interval_ms = 10
+fast_resend = 2
+no_congestion = false
+flush_write = true
+flush_acks_input = true
+failaway_with_alternative_ms = 250
+failaway_without_alternative_ms = 750
+no_progress_close_ms = 1500
+
 # ── L3 voice distribution and repair ──────────────────────────────────
 # Long-haul S2S transport and repair budgets. In-order remote voice is fanned
 # out immediately; only an observed S2S sequence gap waits in its per-speaker
@@ -296,6 +321,7 @@ compression_adaptive_dictionary_enabled = true
 # automatically scale from the live top-level max_users value. They have no
 # fixed queue-size settings; lowering max_users blocks only future admission.
 [s2s.application.voice]
+delivery_strategy = "broadcast" # broadcast, targeted
 tree_delivery_enabled = true
 transport_ttl_ms = 750
 repair_enabled = true
@@ -308,6 +334,8 @@ repair_cache_ms = 1600
 # Only an observed S2S sequence gap is held. The delay adapts per speaker
 # within this narrow range; ordinary contiguous frames are never paced.
 reorder_max_delay_ms = 40
+reorder_disabled = false
+adaptive_jitter_enabled = true
 adaptive_jitter_min_delay_ms = 40
 adaptive_jitter_max_delay_ms = 120
 adaptive_jitter_growth_step_ms = 20
@@ -315,6 +343,11 @@ adaptive_jitter_decay_step_ms = 10
 reorder_idle_reset_ms = 2000
 reorder_max_buffered_frames = 48
 reorder_max_total_buffer = 4096
+# Proactive alternate-copy demand starts at these loss/jitter thresholds and
+# reaches the configured copy budget at repair_full_dup_loss_ppm.
+repair_loss_start_ppm = 10000
+repair_full_dup_loss_ppm = 30000
+repair_jitter_start_ms = 40
 # Proactive copies are limited to 0 through 2 per frame (default: 1). This caps
 # demand; conserved-credit overflow is ranked by marginal on-time utility and
 # destination fairness.
@@ -333,6 +366,8 @@ repair_reactive_hard_reserve_pct = 10
 # when recoverable scheduler/network pauses cause direct-link churn.
 hello_interval_ms = 1000
 hello_dead_interval_ms = 4000
+# Maximum age of an LSA before it expires.
+lsa_max_age_ms = 120000
 # Max LSAs per `LsdbSyncResp` frame. Larger = fewer round trips on a
 # big diff but bigger response packets.
 lsdb_sync_max_response_lsas = 2048
@@ -345,9 +380,22 @@ lsa_refresh_reduction_enabled = true
 lsa_unchanged_refresh_interval_secs = 90
 # Maintain routing tables incrementally after startup.
 routing_dynamic_spf_enabled = true
+# Minimum interval and loss-change threshold for cost-only SPF reruns.
+cost_rerun_min_interval_ms = 5000
+cost_rerun_loss_ppm = 100000
 # Whether this node may be used as a transit router for other nodes' S2S
 # overlay data. Local delivery and locally originated messages still work.
 route_transit_messages = true
+# Ordered overlay-lane windows, retry timing, and repair cache bounds.
+ordered_lane_cap = 64
+ordered_pending_window_packets = 1024
+ordered_reorder_buffer_packets = 1024
+ordered_repair_cache_packets = 1024
+ordered_ack_timeout_ms = 250
+ordered_retry_initial_ms = 250
+ordered_retry_max_ms = 2000
+ordered_retry_max_age_ms = 30000
+ordered_retry_max_attempts = 16
 
 # ── L3 replications tunables ──────────────────────────────────────────
 [s2s.replications]
@@ -370,6 +418,9 @@ propose_ttl_ms = 10000
 propose_semaphore_size = 32
 # Cap on `CatchupOp`s returned per `StrictCatchupResp` chunk.
 strict_max_catchup_ops = 256
+# Byte bounds for strict catchup chunks and retained resumable snapshots.
+strict_max_catchup_bytes = 524288
+strict_max_snapshot_transfer_bytes = 67108864
 # Minimum spacing between strict startup/heal history-election attempts.
 strict_bootstrap_retry_interval_ms = 500
 # Periodic strict steady-state log catchup interval after history election.
@@ -385,8 +436,13 @@ recovery_ttl_ms = 10000
 # Owner-mode catchup.
 # Suppress duplicate per-origin catchup requests within this window.
 owner_catchup_timeout_ms = 5000
+# Periodic owner-mode anti-entropy and response size/concurrency bounds.
+owner_anti_entropy_interval_ms = 30000
 # Cap on `CatchupOp`s returned per `OwnerCatchupResp` chunk.
 owner_max_catchup_ops = 256
+catchup_max_in_flight_total = 8
+catchup_max_in_flight_per_peer = 1
+client_replication_max_in_flight = 32
 
 # Content-addressed channel blob transfer.
 # Max bytes per blob chunk carried inside one replication frame.
@@ -403,8 +459,11 @@ blob_max_parallel_peers = 3
 blob_decay_interval_ms = 60000
 # Time an unreferenced channel blob must remain unused before deletion.
 blob_unused_grace_ms = 600000
+# Retry delay and per-peer concurrency for bulk replication sends.
+bulk_retry_delay_ms = 250
+bulk_max_in_flight_per_peer = 1
 
-# Browser WebRTC gateway. Disabled until the HTTP/signaling gateway is wired.
+# Browser gateway. Disabled by default and requires the relevant Cargo feature.
 [web]
 enabled = false
 listen = "0.0.0.0:64739"

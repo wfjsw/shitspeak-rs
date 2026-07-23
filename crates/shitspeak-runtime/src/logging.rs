@@ -264,6 +264,11 @@ fn load_logging_config() -> Result<LoggingRootConfig, config::ConfigError> {
     ConfigCrate::builder()
         .add_source(File::with_name("config").required(false))
         .add_source(Environment::with_prefix("SHITSPEAK").separator("_"))
+        .add_source(
+            Environment::with_prefix("SHITSPEAK")
+                .prefix_separator("_")
+                .separator("__"),
+        )
         .build()?
         .try_deserialize::<LoggingRootConfig>()
 }

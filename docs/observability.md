@@ -15,7 +15,8 @@ cargo run
 
 ## Loki Logging
 
-Enable `[logging.loki]` in `config.toml` or set equivalent `SHITSPEAK_LOGGING_LOKI_*` environment variables:
+Enable `[logging.loki]` in `config.toml` or set equivalent
+`SHITSPEAK_LOGGING__LOKI__*` environment variables:
 
 ```toml
 [logging.loki]

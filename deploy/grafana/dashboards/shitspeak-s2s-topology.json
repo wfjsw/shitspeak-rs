@@ -6441,9 +6441,26 @@
               }
             ]
           },
-          "unit": "ops"
+          "unit": "short"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* enqueue .*"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
@@ -6475,8 +6492,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (queue, metric) (shitspeak_voice_queue_status{job=~\"$job\"})",
-          "legendFormat": "{{queue}} {{metric}}",
+          "expr": "max by (queue) (shitspeak_voice_queue_status{job=~\"$job\",metric=\"depth\"})",
+          "legendFormat": "{{queue}} max depth",
           "range": true,
           "refId": "A"
         },
@@ -6492,7 +6509,7 @@
           "refId": "B"
         }
       ],
-      "title": "Voice Queue Status and Enqueues",
+      "title": "Voice Queue Depth and Enqueue Rate",
       "type": "timeseries"
     },
     {
