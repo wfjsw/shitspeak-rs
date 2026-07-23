@@ -211,7 +211,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "avg(max by (source, target, transport) (shitspeak_s2s_link_rtt_us{job=~\"$job\"})) / 1000",
+          "expr": "avg(max by (source, target, transport) (shitspeak_s2s_link_rtt_us{job=~\"$job\"}) < 750000) / 1000",
           "instant": false,
           "legendFormat": "avg rtt",
           "range": true,
@@ -278,7 +278,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "avg(max by (source, target, transport) (shitspeak_s2s_link_loss_ppm{job=~\"$job\"})) / 1000000",
+          "expr": "avg(max by (source, target, transport) (shitspeak_s2s_link_loss_ppm{job=~\"$job\"}) and on (source, target, transport) (max by (source, target, transport) (shitspeak_s2s_link_rtt_us{job=~\"$job\"}) < 750000)) / 1000000",
           "instant": false,
           "legendFormat": "avg loss",
           "range": true,
