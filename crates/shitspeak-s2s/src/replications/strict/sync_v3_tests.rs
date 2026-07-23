@@ -724,6 +724,48 @@ async fn duplicate_final_page_is_suppressed_without_another_ack_or_continuation(
 }
 
 #[tokio::test]
+async fn delayed_duplicate_page_does_not_block_the_active_continuation() {
+    let config = ReplicationConfig::default().with_strict_max_catchup_ops(1);
+    let (source, source_net) = runtime(1, config.clone());
+    let (sink, sink_net) = runtime(2, config);
+    for sequence in 1..=3 {
+        assert!(source.apply_catchup_terminal_state(terminal_abort(sequence)));
+    }
+
+    request_v3_terminal_sync(&sink, 1, StrictCatchupReason::SteadyState).await;
+    let request = terminal_request(sink_net.drain_captures().pop().expect("initial request"));
+    sink_net.drain_strict_send_observations();
+    recv_v3_terminal_sync_req(&source, 2, 22, request).await;
+    let first_page = terminal_page(source_net.drain_captures().pop().expect("first page"));
+    assert!(first_page.has_more);
+
+    recv_v3_terminal_sync_page(&sink, 1, 11, first_page.clone()).await;
+    let continuation = terminal_request(
+        sink_net
+            .drain_captures()
+            .pop()
+            .expect("continuation request"),
+    );
+    sink_net.drain_strict_send_observations();
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        recv_v3_terminal_sync_page(&sink, 1, 11, first_page),
+    )
+    .await
+    .expect("delayed duplicate page handling must not block");
+
+    let peer = PeerIncarnation::new(1, 11);
+    let sync = sink.v3_sync.lock();
+    let client = sync.client(peer).expect("active continuation");
+    assert_eq!(client.pending_nonce(), continuation.request_nonce);
+    assert_eq!(client.transfer_id(), continuation.transfer_id);
+    assert_eq!(client.next_cursor(), continuation.expected_cursor);
+    assert!(sink_net.drain_captures().is_empty());
+    assert!(sink_net.drain_strict_send_observations().is_empty());
+}
+
+#[tokio::test]
 async fn checkpoint_completes_when_requester_has_additional_local_fences() {
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
     let (source, source_net) = runtime(1, config.clone());

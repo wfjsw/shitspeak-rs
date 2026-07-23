@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use enumflags2::BitFlags;
 use serde::{Deserialize, Serialize};
@@ -329,6 +329,216 @@ fn root_only_permissions() -> BitFlags<ACLPermissions> {
         | ACLPermissions::ResetUserContent
 }
 
+#[derive(Debug, Clone)]
+struct CompiledHierarchy {
+    channel_id: u32,
+    ancestors: Arc<[u32]>,
+}
+
+impl CompiledHierarchy {
+    fn from_channels(channel_id: u32, ancestors: &[crate::Channel]) -> Self {
+        Self {
+            channel_id,
+            ancestors: ancestors
+                .iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+
+    fn as_hierarchy(&self) -> ChannelHierarchy<'_> {
+        ChannelHierarchy::new(self.channel_id, self.ancestors.as_ref())
+    }
+}
+
+/// One ordered ACL operation with enough context to evaluate its raw
+/// principal expression without consulting the channel tree.
+#[derive(Debug, Clone)]
+struct CompiledAclEntry {
+    user_id: Option<i32>,
+    group: Option<String>,
+    allow: BitFlags<ACLPermissions>,
+    deny: BitFlags<ACLPermissions>,
+    evaluation_channel: CompiledHierarchy,
+    acl_channel: CompiledHierarchy,
+}
+
+impl CompiledAclEntry {
+    fn matches(&self, user_id: Option<u32>, client: &ClientMembershipQuery) -> bool {
+        if let Some(expected_user_id) = self.user_id {
+            return user_id.is_some_and(|user_id| user_id as i32 == expected_user_id);
+        }
+
+        self.group.as_deref().is_some_and(|group| {
+            is_member_in_group(
+                group,
+                self.evaluation_channel.as_hierarchy(),
+                Some(self.acl_channel.as_hierarchy()),
+                &[],
+                client,
+            )
+        })
+    }
+
+    fn depends_on_home_channel(&self) -> bool {
+        self.group
+            .as_deref()
+            .is_some_and(group_depends_on_home_channel)
+    }
+
+    fn group_matches(&self, client: &ClientMembershipQuery) -> bool {
+        self.group.as_deref().is_some_and(|group| {
+            is_member_in_group(
+                group,
+                self.evaluation_channel.as_hierarchy(),
+                Some(self.acl_channel.as_hierarchy()),
+                &[],
+                client,
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompiledPathStage {
+    entries: Vec<CompiledAclEntry>,
+}
+
+/// A compiled ACL chain owned by one channel entry.
+///
+/// `destination` is the flattened root-to-target rule stream. `path` contains
+/// a separate flattened stream for every actual ancestor, because Traverse is
+/// gated at each path segment rather than only at the destination.
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledEffectiveAcl {
+    destination: Vec<CompiledAclEntry>,
+    path: Vec<CompiledPathStage>,
+    path_has_home_channel_dependent_group: bool,
+    ancestor_ids: Vec<u32>,
+    source_id: u32,
+    source_parent_id: Option<u32>,
+    source_inherit_acl: bool,
+    source_acls: Vec<ACL>,
+}
+
+impl CompiledEffectiveAcl {
+    pub(crate) fn ancestor_ids(&self) -> &[u32] {
+        &self.ancestor_ids
+    }
+
+    pub(crate) fn depends_on_home_channel(&self) -> bool {
+        self.path_has_home_channel_dependent_group
+            || self
+                .destination
+                .iter()
+                .any(CompiledAclEntry::depends_on_home_channel)
+    }
+
+    pub(crate) fn is_current(&self, channel: &crate::Channel) -> bool {
+        self.source_id == channel.id
+            && self.source_parent_id == channel.parent_id
+            && self.source_inherit_acl == channel.inherit_acl
+            && self.source_acls == channel.acls
+    }
+}
+
+pub(crate) fn compile_effective_acl(
+    channel: &crate::Channel,
+    ancestors: &[crate::Channel],
+) -> CompiledEffectiveAcl {
+    let destination = compile_acl_chain(channel, ancestors, false);
+    let path = (0..ancestors.len())
+        .rev()
+        .map(|index| CompiledPathStage {
+            entries: compile_acl_chain(&ancestors[index], &ancestors[index + 1..], true),
+        })
+        .collect::<Vec<_>>();
+    let path_has_home_channel_dependent_group = path.iter().any(|stage| {
+        stage.entries.iter().any(|entry| {
+            entry.depends_on_home_channel()
+                && (entry.allow | entry.deny)
+                    .intersects(ACLPermissions::Traverse | ACLPermissions::Write)
+        })
+    });
+
+    CompiledEffectiveAcl {
+        destination,
+        path,
+        path_has_home_channel_dependent_group,
+        ancestor_ids: ancestors.iter().map(|ancestor| ancestor.id).collect(),
+        source_id: channel.id,
+        source_parent_id: channel.parent_id,
+        source_inherit_acl: channel.inherit_acl,
+        source_acls: channel.acls.clone(),
+    }
+}
+
+fn compile_acl_chain(
+    channel: &crate::Channel,
+    ancestors: &[crate::Channel],
+    acl_uses_full_hierarchy: bool,
+) -> Vec<CompiledAclEntry> {
+    let evaluation_channel = CompiledHierarchy::from_channels(channel.id, ancestors);
+    let inherited_len = effective_inherited_len(channel, ancestors);
+    let mut entries = Vec::new();
+
+    for index in (0..inherited_len).rev() {
+        append_compiled_entries(
+            &mut entries,
+            &ancestors[index].acls,
+            false,
+            &evaluation_channel,
+            CompiledHierarchy::from_channels(
+                ancestors[index].id,
+                if acl_uses_full_hierarchy {
+                    &ancestors[index + 1..]
+                } else {
+                    &ancestors[index + 1..inherited_len]
+                },
+            ),
+        );
+    }
+
+    let local_acl_channel = if acl_uses_full_hierarchy {
+        evaluation_channel.clone()
+    } else {
+        CompiledHierarchy::from_channels(channel.id, &ancestors[..inherited_len])
+    };
+    append_compiled_entries(
+        &mut entries,
+        &channel.acls,
+        true,
+        &evaluation_channel,
+        local_acl_channel,
+    );
+    entries
+}
+
+fn append_compiled_entries(
+    entries: &mut Vec<CompiledAclEntry>,
+    acls: &[ACL],
+    apply_here: bool,
+    evaluation_channel: &CompiledHierarchy,
+    acl_channel: CompiledHierarchy,
+) {
+    entries.extend(acls.iter().filter_map(|acl| {
+        let applies = if apply_here {
+            acl.apply_here
+        } else {
+            acl.apply_subs
+        };
+        applies.then(|| CompiledAclEntry {
+            user_id: acl.user_id,
+            group: acl.group.clone(),
+            allow: acl.allow,
+            deny: acl.deny,
+            evaluation_channel: evaluation_channel.clone(),
+            acl_channel: acl_channel.clone(),
+        })
+    }));
+}
+
 /// Evaluate the effective permissions for a user on a given channel.
 ///
 /// Walks the ACL chain in Mumble order: root to target, applying each channel's
@@ -351,6 +561,20 @@ pub fn evaluate_permission_with_behavior(
     client: &ClientMembershipQuery,
     explicit_enter_deny_overrides_write: bool,
 ) -> BitFlags<ACLPermissions> {
+    if let Some(compiled) = channel
+        .effective_acl_cache
+        .as_ref()
+        .filter(|compiled| compiled.is_current(channel))
+    {
+        return evaluate_compiled_acl(
+            channel.id,
+            compiled,
+            user_id,
+            client,
+            explicit_enter_deny_overrides_write,
+        );
+    }
+
     if !ancestor_path_allows_traverse(ancestors, user_id, client) {
         return BitFlags::empty();
     }
@@ -360,6 +584,62 @@ pub fn evaluate_permission_with_behavior(
         ancestors,
         user_id,
         client,
+        explicit_enter_deny_overrides_write,
+    )
+}
+
+fn evaluate_compiled_acl(
+    channel_id: u32,
+    compiled: &CompiledEffectiveAcl,
+    user_id: Option<u32>,
+    client: &ClientMembershipQuery,
+    explicit_enter_deny_overrides_write: bool,
+) -> BitFlags<ACLPermissions> {
+    for stage in &compiled.path {
+        let mut traverse = true;
+        let mut write = false;
+        for entry in &stage.entries {
+            if !entry.matches(user_id, client) {
+                continue;
+            }
+            if entry.allow.contains(ACLPermissions::Traverse) {
+                traverse = true;
+            }
+            if entry.deny.contains(ACLPermissions::Traverse) {
+                traverse = false;
+            }
+            if entry.allow.contains(ACLPermissions::Write) {
+                write = true;
+            }
+            if entry.deny.contains(ACLPermissions::Write) {
+                write = false;
+            }
+        }
+        if !traverse && !write {
+            return BitFlags::empty();
+        }
+    }
+
+    let mut permissions = default_permissions();
+    let mut enter_explicitly_denied = false;
+    for entry in &compiled.destination {
+        if !entry.matches(user_id, client) {
+            continue;
+        }
+        permissions.insert(entry.allow);
+        if entry.allow.contains(ACLPermissions::Enter) {
+            enter_explicitly_denied = false;
+        }
+        permissions.remove(entry.deny);
+        if entry.deny.contains(ACLPermissions::Enter) {
+            enter_explicitly_denied = true;
+        }
+    }
+
+    finalize_permissions(
+        channel_id,
+        permissions,
+        enter_explicitly_denied,
         explicit_enter_deny_overrides_write,
     )
 }
@@ -406,6 +686,20 @@ fn evaluate_channel_acl(
         &mut enter_explicitly_denied,
     );
 
+    finalize_permissions(
+        target_id,
+        permissions,
+        enter_explicitly_denied,
+        explicit_enter_deny_overrides_write,
+    )
+}
+
+fn finalize_permissions(
+    channel_id: u32,
+    mut permissions: BitFlags<ACLPermissions>,
+    enter_explicitly_denied: bool,
+    explicit_enter_deny_overrides_write: bool,
+) -> BitFlags<ACLPermissions> {
     if !permissions.contains(ACLPermissions::Traverse)
         && !permissions.contains(ACLPermissions::Write)
     {
@@ -417,12 +711,12 @@ fn evaluate_channel_acl(
         if explicit_enter_deny_overrides_write && enter_explicitly_denied {
             permissions.remove(ACLPermissions::Enter);
         }
-        if target_id == 0 {
+        if channel_id == 0 {
             permissions.insert(root_only_permissions());
         }
     }
 
-    if target_id != 0 {
+    if channel_id != 0 {
         permissions.remove(root_only_permissions());
     }
 
@@ -626,6 +920,14 @@ pub fn effective_acl_chain_has_home_channel_dependent_group(
     channel: &crate::Channel,
     ancestors: &[crate::Channel],
 ) -> bool {
+    if let Some(compiled) = channel
+        .effective_acl_cache
+        .as_ref()
+        .filter(|compiled| compiled.is_current(channel))
+    {
+        return compiled.depends_on_home_channel();
+    }
+
     path_gate_has_home_channel_dependent_group(ancestors)
         || any_applicable_effective_acl(channel, ancestors, |acl, _, _| {
             acl.group
@@ -640,6 +942,25 @@ pub fn effective_acl_chain_home_channel_match_changes(
     old_home: ChannelHierarchy<'_>,
     new_home: ChannelHierarchy<'_>,
 ) -> bool {
+    if let Some(compiled) = channel
+        .effective_acl_cache
+        .as_ref()
+        .filter(|compiled| compiled.is_current(channel))
+    {
+        if compiled.path_has_home_channel_dependent_group {
+            return true;
+        }
+
+        let old_query = ClientMembershipQuery::new(&[], true, &[], None, false, None)
+            .with_home_channel(old_home);
+        let new_query = ClientMembershipQuery::new(&[], true, &[], None, false, None)
+            .with_home_channel(new_home);
+        return compiled.destination.iter().any(|entry| {
+            entry.depends_on_home_channel()
+                && entry.group_matches(&old_query) != entry.group_matches(&new_query)
+        });
+    }
+
     if path_gate_has_home_channel_dependent_group(ancestors) {
         return true;
     }
@@ -699,6 +1020,16 @@ pub fn channel_has_effective_restriction(
     ancestors: &[crate::Channel],
     perm: ACLPermissions,
 ) -> bool {
+    if let Some(compiled) = channel
+        .effective_acl_cache
+        .as_ref()
+        .filter(|compiled| compiled.is_current(channel))
+    {
+        return compiled.destination.iter().any(|entry| {
+            entry.deny.contains(perm) || entry.deny.contains(ACLPermissions::Traverse)
+        });
+    }
+
     any_applicable_effective_acl(channel, ancestors, |acl, _, _| {
         acl.deny.contains(perm) || acl.deny.contains(ACLPermissions::Traverse)
     })
@@ -749,6 +1080,182 @@ mod tests {
             allow,
             deny,
         }
+    }
+
+    fn assert_cached_equivalent(
+        channel: &Channel,
+        ancestors: &[Channel],
+        user_id: Option<u32>,
+        client: &ClientMembershipQuery<'_>,
+        explicit_enter_deny_overrides_write: bool,
+    ) -> BitFlags<ACLPermissions> {
+        let expected = evaluate_permission_with_behavior(
+            channel,
+            ancestors,
+            user_id,
+            client,
+            explicit_enter_deny_overrides_write,
+        );
+        let mut cached = channel.clone();
+        cached.rebuild_effective_acl_cache(ancestors);
+        let actual = evaluate_permission_with_behavior(
+            &cached,
+            &[],
+            user_id,
+            client,
+            explicit_enter_deny_overrides_write,
+        );
+        assert_eq!(actual, expected);
+        actual
+    }
+
+    #[test]
+    fn compiled_acl_matches_dynamic_and_multiple_group_ordering() {
+        let root = Channel::new(0, "Root", 0, 0, None);
+        let parent = Channel::new(1, "Parent", 0, 0, Some(0));
+        let mut destination = Channel::new(2, "Destination", 0, 0, Some(1));
+        destination.acls = vec![
+            scoped_acl(
+                None,
+                Some("all"),
+                true,
+                false,
+                BitFlags::empty(),
+                ACLPermissions::Speak.into(),
+            ),
+            scoped_acl(
+                None,
+                Some("operators"),
+                true,
+                false,
+                ACLPermissions::Speak.into(),
+                BitFlags::empty(),
+            ),
+            scoped_acl(
+                None,
+                Some("muted"),
+                true,
+                false,
+                BitFlags::empty(),
+                ACLPermissions::Speak.into(),
+            ),
+            scoped_acl(
+                None,
+                Some("~sub,-1,0"),
+                true,
+                false,
+                ACLPermissions::Whisper.into(),
+                BitFlags::empty(),
+            ),
+            scoped_acl(
+                Some(7),
+                None,
+                true,
+                false,
+                ACLPermissions::Speak.into(),
+                BitFlags::empty(),
+            ),
+        ];
+        let ancestors = [parent, root];
+        let groups = ["operators", "muted"];
+        let member = ClientMembershipQuery::new(&groups, true, &[], None, false, None)
+            .with_home_channel(ChannelHierarchy::new(4, &[3, 1, 0]));
+
+        let privileged =
+            assert_cached_equivalent(&destination, &ancestors, Some(7), &member, false);
+        assert!(privileged.contains(ACLPermissions::Speak));
+        assert!(privileged.contains(ACLPermissions::Whisper));
+
+        let ordinary = assert_cached_equivalent(&destination, &ancestors, Some(8), &member, false);
+        assert!(!ordinary.contains(ACLPermissions::Speak));
+        assert!(ordinary.contains(ACLPermissions::Whisper));
+    }
+
+    #[test]
+    fn compiled_acl_preserves_every_actual_path_barrier() {
+        let root = Channel::new(0, "Root", 0, 0, None);
+        let mut boundary = Channel::new(1, "Boundary", 0, 0, Some(0));
+        boundary.inherit_acl = false;
+        boundary.acls = vec![scoped_acl(
+            None,
+            Some("all"),
+            true,
+            true,
+            BitFlags::empty(),
+            ACLPermissions::Traverse.into(),
+        )];
+        let mut parent = Channel::new(2, "Parent", 0, 0, Some(1));
+        parent.acls = vec![scoped_acl(
+            None,
+            Some("all"),
+            true,
+            true,
+            ACLPermissions::Traverse.into(),
+            BitFlags::empty(),
+        )];
+        let mut destination = Channel::new(3, "Destination", 0, 0, Some(2));
+        destination.acls = vec![scoped_acl(
+            None,
+            Some("all"),
+            true,
+            false,
+            ACLPermissions::Traverse.into(),
+            BitFlags::empty(),
+        )];
+        let ancestors = [parent, boundary, root];
+        let client = membership(3, &[2, 1, 0]);
+
+        assert!(
+            assert_cached_equivalent(&destination, &ancestors, Some(7), &client, false).is_empty()
+        );
+    }
+
+    #[test]
+    fn compiled_acl_preserves_write_modifiers_and_explicit_enter_behavior() {
+        let mut destination = Channel::new(0, "Root", 0, 0, None);
+        destination.acls = vec![
+            scoped_acl(
+                None,
+                Some("editors"),
+                true,
+                false,
+                ACLPermissions::Write.into(),
+                BitFlags::empty(),
+            ),
+            scoped_acl(
+                None,
+                Some("editors"),
+                true,
+                false,
+                BitFlags::empty(),
+                ACLPermissions::Enter.into(),
+            ),
+        ];
+        let groups = ["editors"];
+        let client = ClientMembershipQuery::new(&groups, true, &[], None, false, None);
+
+        let permissions = assert_cached_equivalent(&destination, &[], Some(7), &client, true);
+        assert!(permissions.contains(ACLPermissions::Write));
+        assert!(permissions.contains(ACLPermissions::Kick));
+        assert!(!permissions.contains(ACLPermissions::Enter));
+    }
+
+    #[test]
+    fn directly_mutated_channel_does_not_use_stale_compiled_acl() {
+        let mut channel = Channel::new(0, "Root", 0, 0, None);
+        channel.acls = vec![group_acl(
+            "all",
+            ACLPermissions::Write.into(),
+            BitFlags::empty(),
+        )];
+        channel.rebuild_effective_acl_cache(&[]);
+        assert!(channel.has_effective_acl_cache());
+
+        channel.acls.clear();
+        assert!(!channel.has_effective_acl_cache());
+        let client = membership(0, &[]);
+        let permissions = evaluate_permission(&channel, &[], Some(7), &client);
+        assert!(!permissions.contains(ACLPermissions::Write));
     }
 
     #[test]

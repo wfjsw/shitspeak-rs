@@ -4243,7 +4243,7 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
         return;
     }
     let (expected_progress, reducer_wire) = {
-        let sync = rt.v3_sync.lock();
+        let mut sync = rt.v3_sync.lock();
         let Some(client) = sync.client(peer) else {
             return;
         };
@@ -4257,9 +4257,7 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
             if let Some(delayed_wire) =
                 terminal_session_wire(epoch, page.transfer_id, page.request_nonce, page.cursor)
             {
-                rt.v3_sync
-                    .lock()
-                    .transition_session(peer, SessionEvent::MessageDelayed { wire: delayed_wire });
+                sync.transition_session(peer, SessionEvent::MessageDelayed { wire: delayed_wire });
             }
             metrics::record_strict_catchup_duplicate(StrictCatchupDuplicateOutcome::Suppressed);
             return;

@@ -2263,9 +2263,9 @@ fn protect_user_state_hash_for_viewer(
         return;
     }
     let visibility_generation = server.visibility_generation();
-    if let Some(cached) = target.and_then(|target| {
-        target.cached_protected_certificate_hash_hex(visibility_generation)
-    }) {
+    if let Some(cached) = target
+        .and_then(|target| target.cached_protected_certificate_hash_hex(visibility_generation))
+    {
         if let Some(protected) = cached {
             state.hash = Some(protected);
         }

@@ -84,6 +84,7 @@ impl ChannelAclOverride {
         let mut channel = channel.clone();
         channel.inherit_acl = self.inherit_acl;
         channel.acls.clone_from(&self.acls);
+        channel.clear_effective_acl_cache();
         channel
     }
 }
@@ -182,25 +183,34 @@ impl ClientAclEvaluationContext {
         let Some(snapshot_channel) = self.snapshot.channel(channel_id) else {
             return false;
         };
-        let overridden_channel = acl_override
-            .filter(|acl_override| acl_override.channel_id == channel_id)
-            .map(|acl_override| acl_override.apply_to(snapshot_channel));
+        let overridden_channel = acl_override.map(|acl_override| {
+            let mut channel = if acl_override.channel_id == channel_id {
+                acl_override.apply_to(snapshot_channel)
+            } else {
+                snapshot_channel.clone()
+            };
+            channel.clear_effective_acl_cache();
+            channel
+        });
         let channel = overridden_channel.as_ref().unwrap_or(snapshot_channel);
-        let ancestors = self
-            .snapshot
-            .ancestor_ids(channel_id)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|ancestor_id| {
-                let ancestor = self.snapshot.channel(*ancestor_id)?;
-                Some(match acl_override {
-                    Some(acl_override) if acl_override.channel_id == *ancestor_id => {
-                        acl_override.apply_to(ancestor)
-                    }
-                    _ => ancestor.clone(),
+        let ancestors = if acl_override.is_none() && channel.has_effective_acl_cache() {
+            Vec::new()
+        } else {
+            self.snapshot
+                .ancestor_ids(channel_id)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|ancestor_id| {
+                    let ancestor = self.snapshot.channel(*ancestor_id)?;
+                    Some(match acl_override {
+                        Some(acl_override) if acl_override.channel_id == *ancestor_id => {
+                            acl_override.apply_to(ancestor)
+                        }
+                        _ => ancestor.clone(),
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        };
         shitspeak_state::channel_has_effective_restriction(
             channel,
             &ancestors,
@@ -226,25 +236,34 @@ impl ClientAclEvaluationContext {
             return enumflags2::BitFlags::empty();
         };
 
-        let overridden_channel = acl_override
-            .filter(|acl_override| acl_override.channel_id == channel_id)
-            .map(|acl_override| acl_override.apply_to(snapshot_channel));
+        let overridden_channel = acl_override.map(|acl_override| {
+            let mut channel = if acl_override.channel_id == channel_id {
+                acl_override.apply_to(snapshot_channel)
+            } else {
+                snapshot_channel.clone()
+            };
+            channel.clear_effective_acl_cache();
+            channel
+        });
         let channel = overridden_channel.as_ref().unwrap_or(snapshot_channel);
-        let ancestors = self
-            .snapshot
-            .ancestor_ids(channel_id)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|ancestor_id| {
-                let ancestor = self.snapshot.channel(*ancestor_id)?;
-                Some(match acl_override {
-                    Some(acl_override) if acl_override.channel_id == *ancestor_id => {
-                        acl_override.apply_to(ancestor)
-                    }
-                    _ => ancestor.clone(),
+        let ancestors = if acl_override.is_none() && channel.has_effective_acl_cache() {
+            Vec::new()
+        } else {
+            self.snapshot
+                .ancestor_ids(channel_id)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|ancestor_id| {
+                    let ancestor = self.snapshot.channel(*ancestor_id)?;
+                    Some(match acl_override {
+                        Some(acl_override) if acl_override.channel_id == *ancestor_id => {
+                            acl_override.apply_to(ancestor)
+                        }
+                        _ => ancestor.clone(),
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        };
 
         let group_refs = BorrowedStrs::<8>::from_strings(&self.groups);
         let token_refs = BorrowedStrs::<8>::from_strings(&self.tokens);
@@ -466,15 +485,27 @@ async fn compute_permissions_for_client_inner(
     }
 
     let server_id = client.server_id();
-    let (channel_acl_generation, channel, ancestors) = channels
-        .get_channel_with_ancestors_for_acl_in_server(&server_id, channel_id)
+    let (mut channel_acl_generation, mut channel) = channels
+        .get_channel_for_acl_in_server(&server_id, channel_id)
         .await;
+    let mut ancestors = Vec::new();
+    if channel
+        .as_ref()
+        .is_some_and(|channel| !channel.has_effective_acl_cache())
+    {
+        (channel_acl_generation, channel, ancestors) = channels
+            .get_channel_with_ancestors_for_acl_in_server(&server_id, channel_id)
+            .await;
+    }
     let Some(channel) = channel else {
         tracing::trace!(session, channel_id, "ACL compute found no channel");
         return enumflags2::BitFlags::empty();
     };
-    let depends_on_home_channel =
-        shitspeak_state::effective_acl_chain_has_home_channel_dependent_group(&channel, &ancestors);
+    let depends_on_home_channel = if channel.has_effective_acl_cache() {
+        channel.effective_acl_depends_on_home_channel()
+    } else {
+        shitspeak_state::effective_acl_chain_has_home_channel_dependent_group(&channel, &ancestors)
+    };
 
     let (user_id, groups) = match identity_override {
         Some((user_id, groups, _)) => (user_id, groups),
@@ -485,7 +516,10 @@ async fn compute_permissions_for_client_inner(
     let token_refs = BorrowedStrs::<8>::from_strings(&tokens);
     let home_channel_id = home_channel_override.unwrap_or_else(|| client.get_current_channel_id());
     let home_ancestors: Vec<u32> = if home_channel_id == channel_id {
-        ancestors.iter().map(|ancestor| ancestor.id).collect()
+        channel.effective_acl_ancestor_ids().map_or_else(
+            || ancestors.iter().map(|ancestor| ancestor.id).collect(),
+            <[u32]>::to_vec,
+        )
     } else {
         channels
             .get_ancestors_in_server(&server_id, home_channel_id)

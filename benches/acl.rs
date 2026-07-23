@@ -29,18 +29,9 @@ fn make_channel_with_acls(n: usize) -> Channel {
             deny,
         });
     }
-    Channel {
-        id: 1,
-        name: "Test".into(),
-        position: 0,
-        max_users: 0,
-        parent_id: Some(0),
-        inherit_acl: true,
-        links: Default::default(),
-        description_hash: None,
-        acls,
-        pending_delete: None,
-    }
+    let mut channel = Channel::new(1, "Test", 0, 0, Some(0));
+    channel.acls = acls;
+    channel
 }
 
 fn make_membership() -> ClientMembershipQuery<'static> {

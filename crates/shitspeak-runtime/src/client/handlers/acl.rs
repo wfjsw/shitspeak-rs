@@ -161,6 +161,7 @@ pub async fn handle_acl(
             if let Some(mut channel) = channel {
                 channel.inherit_acl = inherit_acl;
                 channel.acls = new_acls.clone();
+                channel.clear_effective_acl_cache();
 
                 let user_id = sender.get_user_id();
                 let groups: Vec<String> = sender.get_groups_clone().into_iter().collect();

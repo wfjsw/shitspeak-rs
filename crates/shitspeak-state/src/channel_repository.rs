@@ -23,11 +23,11 @@
 //!
 //! # ACL cache
 //!
-//! Effective permissions are cached per `(session_id_u64, client_instance_id,
-//! channel_id)` after first computation.  The cache is invalidated when ACLs
-//! change or when a user changes channels.  The actual ACL evaluation logic
-//! lives in `acl.rs`; the repository only drives invalidation and cache
-//! storage.
+//! Each channel owns a derived, compiled effective ACL program that is rebuilt
+//! after load and whenever its tree path can change. Per-client permission
+//! results are also cached after first computation and generation-invalidated
+//! when ACL or client membership state changes. The evaluator lives in
+//! `acl.rs`; the repository maintains both cache lifecycles.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -1077,6 +1077,7 @@ impl ChannelRepository {
             .entry(DEFAULT_SERVER_ID.to_owned())
             .or_insert_with(HashMap::new)
             .insert(0, root_channel(&root_config));
+        rebuild_all_effective_acl_caches(&mut channels);
         let mut versions = HashMap::new();
         versions.insert(DEFAULT_SERVER_ID.to_owned(), 0);
         Arc::new(Self {
@@ -1236,6 +1237,7 @@ impl ChannelRepository {
         for scoped_channels in channels.values_mut() {
             ensure_root_channel(scoped_channels, &root_config);
         }
+        rebuild_all_effective_acl_caches(&mut channels);
         versions.entry(DEFAULT_SERVER_ID.to_owned()).or_insert(0);
         let link_topologies = rebuild_all_link_topologies(&mut channels);
 
@@ -1979,6 +1981,24 @@ impl ChannelRepository {
         }
     }
 
+    /// Return a prepared channel from a stable ACL generation snapshot.
+    ///
+    /// Repository channels carry a compiled effective ACL program, so the
+    /// permission hot path normally does not need to clone their ancestors.
+    pub async fn get_channel_for_acl_in_server(
+        &self,
+        server_id: &str,
+        channel_id: u32,
+    ) -> (u64, Option<Channel>) {
+        loop {
+            let generation = self.channel_acl_generation_for_channel(server_id, channel_id);
+            let channel = self.get_channel_in_server(server_id, channel_id).await;
+            if self.channel_acl_generation_for_channel(server_id, channel_id) == generation {
+                return (generation, channel);
+            }
+        }
+    }
+
     // ── Mutation API ──────────────────────────────────────────────────────
 
     /// Allocate a fresh channel ID.  Temporary channels get bit-31 set.
@@ -2052,6 +2072,7 @@ impl ChannelRepository {
                 },
             );
             channels.insert(channel.id, channel.clone());
+            rebuild_effective_acl_caches_for_subtree(channels, channel.id);
             if !channel.links.is_empty() {
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, server_id, channels);
@@ -2129,6 +2150,9 @@ impl ChannelRepository {
                 },
             );
             apply_patch(channels.get_mut(&id).unwrap(), &patch);
+            if parent_changed {
+                rebuild_effective_acl_caches_for_subtree(channels, id);
+            }
             let updated = channels[&id].clone();
             (op, updated)
         };
@@ -2234,6 +2258,9 @@ impl ChannelRepository {
             }
 
             apply_patch(channels.get_mut(&id).unwrap(), &patch);
+            if parent_changed {
+                rebuild_effective_acl_caches_for_subtree(channels, id);
+            }
             if links_changed {
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, server_id, channels);
@@ -2597,6 +2624,7 @@ impl ChannelRepository {
             let old_acls = ch.acls.clone();
             ch.inherit_acl = inherit_acl;
             ch.acls = acls.clone();
+            rebuild_effective_acl_caches_for_subtree(channels, channel_id);
             build_acl_change_hint(
                 channels,
                 channel_id,
@@ -3164,6 +3192,7 @@ impl ChannelRepository {
                     }
                 }
             };
+            rebuild_effective_acl_caches_for_op(channels, &normalized_op);
             apply_link_topology_effect(
                 &self.link_topologies,
                 &op.server_id,
@@ -3349,6 +3378,7 @@ impl ChannelRepository {
                     }
                 }
             };
+            rebuild_effective_acl_caches_for_op(channels, &op.op);
             apply_link_topology_effect(
                 &self.link_topologies,
                 &server_id,
@@ -3612,6 +3642,7 @@ impl ChannelRepository {
                     channels.insert(channel.id, channel);
                 }
                 ensure_root_channel(channels, &root_config);
+                rebuild_all_effective_acl_caches_in_map(channels);
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, server_id, channels);
                 ids.extend(channels.keys().copied());
@@ -4221,6 +4252,97 @@ fn apply_link_topology_effect(
     }
 }
 
+fn rebuild_all_effective_acl_caches(
+    channels_by_server: &mut HashMap<String, HashMap<u32, Channel>>,
+) {
+    for channels in channels_by_server.values_mut() {
+        rebuild_all_effective_acl_caches_in_map(channels);
+    }
+}
+
+fn rebuild_all_effective_acl_caches_in_map(channels: &mut HashMap<u32, Channel>) {
+    let channel_ids: HashSet<u32> = channels.keys().copied().collect();
+    rebuild_effective_acl_caches(channels, channel_ids);
+}
+
+fn rebuild_effective_acl_caches_for_subtree(channels: &mut HashMap<u32, Channel>, root_id: u32) {
+    let channel_ids = collect_subtree(channels, root_id).into_iter().collect();
+    rebuild_effective_acl_caches(channels, channel_ids);
+}
+
+fn rebuild_effective_acl_caches_for_op(channels: &mut HashMap<u32, Channel>, op: &ChannelOp) {
+    match op {
+        ChannelOp::CreateChannel { channel } => {
+            rebuild_effective_acl_caches_for_subtree(channels, channel.id);
+        }
+        ChannelOp::SetAcls { channel_id, .. } => {
+            rebuild_effective_acl_caches_for_subtree(channels, *channel_id);
+        }
+        ChannelOp::UpdateChannel { id, patch } | ChannelOp::EditChannel { id, patch, .. }
+            if patch.parent_id.is_some() =>
+        {
+            rebuild_effective_acl_caches_for_subtree(channels, *id);
+        }
+        ChannelOp::InstallSnapshot { .. } => rebuild_all_effective_acl_caches_in_map(channels),
+        ChannelOp::UpdateChannel { .. }
+        | ChannelOp::EditChannel { .. }
+        | ChannelOp::MarkPendingDelete { .. }
+        | ChannelOp::DeleteChannel { .. }
+        | ChannelOp::CancelPendingDelete { .. }
+        | ChannelOp::AddLink { .. }
+        | ChannelOp::RemoveLink { .. } => {}
+    }
+}
+
+fn rebuild_effective_acl_caches(
+    channels: &mut HashMap<u32, Channel>,
+    mut channel_ids: HashSet<u32>,
+) {
+    channel_ids.extend(
+        channels
+            .values()
+            .filter(|channel| !channel.has_effective_acl_cache())
+            .map(|channel| channel.id),
+    );
+
+    let rebuilt = channel_ids
+        .into_iter()
+        .filter_map(|channel_id| {
+            let mut channel = channels.get(&channel_id)?.clone();
+            let ancestors = ancestor_channels_in_map(channels, channel_id);
+            channel.rebuild_effective_acl_cache(&ancestors);
+            Some(channel)
+        })
+        .collect::<Vec<_>>();
+
+    for channel in rebuilt {
+        channels.insert(channel.id, channel);
+    }
+}
+
+fn ancestor_channels_in_map(channels: &HashMap<u32, Channel>, channel_id: u32) -> Vec<Channel> {
+    let mut ancestors = Vec::new();
+    let mut visited = HashSet::from([channel_id]);
+    let mut current_id = channel_id;
+    loop {
+        let Some(parent_id) = channels
+            .get(&current_id)
+            .and_then(|channel| channel.parent_id)
+        else {
+            break;
+        };
+        if !visited.insert(parent_id) {
+            break;
+        }
+        let Some(parent) = channels.get(&parent_id) else {
+            break;
+        };
+        ancestors.push(parent.clone());
+        current_id = parent_id;
+    }
+    ancestors
+}
+
 /// Apply a `ChannelOp` to the in-memory channel map.
 fn apply_op_to_map(
     channels: &mut HashMap<u32, Channel>,
@@ -4580,6 +4702,7 @@ impl ChannelSnapshotState {
             description_hash: self.description_hash,
             acls: self.acls,
             pending_delete: self.pending_delete,
+            effective_acl_cache: None,
         }
     }
 }
@@ -4779,6 +4902,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::{ChannelHierarchy, ClientMembershipQuery, evaluate_permission};
 
     fn cached_permissions(depends_on_home_channel: bool) -> CachedAclPermissions {
         CachedAclPermissions {
@@ -4887,6 +5011,197 @@ mod tests {
             allow: ACLPermissions::Enter.into(),
             deny: BitFlags::empty(),
         }
+    }
+
+    fn group_acl(
+        group: &str,
+        apply_here: bool,
+        apply_subs: bool,
+        allow: BitFlags<ACLPermissions>,
+        deny: BitFlags<ACLPermissions>,
+    ) -> ACL {
+        ACL {
+            user_id: None,
+            group: Some(group.to_owned()),
+            apply_here,
+            apply_subs,
+            allow,
+            deny,
+        }
+    }
+
+    fn cached_group_permissions(channel: &Channel, groups: &[&str]) -> BitFlags<ACLPermissions> {
+        assert!(channel.has_effective_acl_cache());
+        let membership = ClientMembershipQuery::new(groups, true, &[], None, false, None)
+            .with_home_channel(ChannelHierarchy::new(channel.id, &[]));
+        evaluate_permission(channel, &[], Some(7), &membership)
+    }
+
+    fn parent_patch(parent_id: u32) -> ChannelPatch {
+        ChannelPatch {
+            name: None,
+            position: None,
+            max_users: None,
+            description_hash: None,
+            parent_id: Some(Some(parent_id)),
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_open_eagerly_rebuilds_effective_acl_cache_after_wal_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+                .await
+                .unwrap();
+            repo.create_channel(Channel::new(1, "parent", 0, 0, Some(0)))
+                .await
+                .unwrap();
+            repo.create_channel(Channel::new(2, "leaf", 0, 0, Some(1)))
+                .await
+                .unwrap();
+            repo.set_acls(
+                1,
+                true,
+                vec![group_acl(
+                    "staff",
+                    false,
+                    true,
+                    ACLPermissions::Move.into(),
+                    BitFlags::empty(),
+                )],
+            )
+            .await
+            .unwrap();
+        }
+
+        let reopened = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        let leaf = reopened.get_channel(2).await.unwrap();
+
+        assert!(cached_group_permissions(&leaf, &["staff"]).contains(ACLPermissions::Move));
+    }
+
+    #[tokio::test]
+    async fn own_acl_change_rebuilds_effective_acl_cache() {
+        let repo = repo();
+        repo.create_channel(Channel::new(1, "target", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.set_acls(
+            1,
+            true,
+            vec![group_acl(
+                "staff",
+                true,
+                false,
+                ACLPermissions::Move.into(),
+                BitFlags::empty(),
+            )],
+        )
+        .await
+        .unwrap();
+        let target = repo.get_channel(1).await.unwrap();
+        assert!(cached_group_permissions(&target, &["staff"]).contains(ACLPermissions::Move));
+
+        repo.set_acls(
+            1,
+            true,
+            vec![group_acl(
+                "staff",
+                true,
+                false,
+                BitFlags::empty(),
+                ACLPermissions::Move.into(),
+            )],
+        )
+        .await
+        .unwrap();
+        let target = repo.get_channel(1).await.unwrap();
+        assert!(!cached_group_permissions(&target, &["staff"]).contains(ACLPermissions::Move));
+    }
+
+    #[tokio::test]
+    async fn moving_subtree_rebuilds_effective_acl_caches() {
+        let repo = repo();
+        for channel in [
+            Channel::new(1, "allow-parent", 0, 0, Some(0)),
+            Channel::new(2, "deny-parent", 0, 0, Some(0)),
+            Channel::new(3, "moved", 0, 0, Some(1)),
+            Channel::new(4, "leaf", 0, 0, Some(3)),
+        ] {
+            repo.create_channel(channel).await.unwrap();
+        }
+        repo.set_acls(
+            1,
+            true,
+            vec![group_acl(
+                "staff",
+                false,
+                true,
+                ACLPermissions::Move.into(),
+                BitFlags::empty(),
+            )],
+        )
+        .await
+        .unwrap();
+        repo.set_acls(
+            2,
+            true,
+            vec![group_acl(
+                "staff",
+                false,
+                true,
+                BitFlags::empty(),
+                ACLPermissions::Move.into(),
+            )],
+        )
+        .await
+        .unwrap();
+
+        for id in [3, 4] {
+            let channel = repo.get_channel(id).await.unwrap();
+            assert!(cached_group_permissions(&channel, &["staff"]).contains(ACLPermissions::Move));
+        }
+
+        repo.update_channel(3, parent_patch(2)).await.unwrap();
+
+        for id in [3, 4] {
+            let channel = repo.get_channel(id).await.unwrap();
+            assert!(!cached_group_permissions(&channel, &["staff"]).contains(ACLPermissions::Move));
+        }
+    }
+
+    #[tokio::test]
+    async fn ancestor_traverse_change_rebuilds_cache_below_inheritance_barrier() {
+        let repo = repo();
+        for channel in [
+            Channel::new(1, "parent", 0, 0, Some(0)),
+            Channel::new(2, "barrier", 0, 0, Some(1)),
+            Channel::new(3, "leaf", 0, 0, Some(2)),
+        ] {
+            repo.create_channel(channel).await.unwrap();
+        }
+        repo.set_acls(2, false, Vec::new()).await.unwrap();
+        let leaf = repo.get_channel(3).await.unwrap();
+        assert!(!cached_group_permissions(&leaf, &["staff"]).is_empty());
+
+        repo.set_acls(
+            1,
+            true,
+            vec![group_acl(
+                "staff",
+                true,
+                false,
+                BitFlags::empty(),
+                ACLPermissions::Traverse.into(),
+            )],
+        )
+        .await
+        .unwrap();
+        let leaf = repo.get_channel(3).await.unwrap();
+        assert!(cached_group_permissions(&leaf, &["staff"]).is_empty());
     }
 
     #[tokio::test]

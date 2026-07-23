@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ACL;
+use crate::{ACL, acl::CompiledEffectiveAcl};
 
 /// Replicated two-phase delete marker for a channel subtree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +32,10 @@ pub struct Channel {
     pub acls: Vec<ACL>,
     #[serde(default)]
     pub pending_delete: Option<PendingDeleteState>,
+    /// Derived effective ACL program. It is rebuilt by the channel repository
+    /// and is never part of replicated or persisted channel state.
+    #[serde(skip)]
+    pub(crate) effective_acl_cache: Option<CompiledEffectiveAcl>,
 }
 
 impl Channel {
@@ -53,7 +57,46 @@ impl Channel {
             description_hash: None,
             acls: Vec::new(),
             pending_delete: None,
+            effective_acl_cache: None,
         }
+    }
+
+    /// Rebuild the derived ACL program for this channel.
+    pub(crate) fn rebuild_effective_acl_cache(&mut self, ancestors: &[Channel]) {
+        self.effective_acl_cache = Some(crate::acl::compile_effective_acl(self, ancestors));
+    }
+
+    /// Discard derived ACL state after mutating ACL-relevant channel fields.
+    ///
+    /// Most callers should let `ChannelRepository` maintain this cache. This
+    /// method exists for short-lived channel clones that override ACL fields.
+    #[doc(hidden)]
+    pub fn clear_effective_acl_cache(&mut self) {
+        self.effective_acl_cache = None;
+    }
+
+    /// Whether this channel can be evaluated without loading its ancestors.
+    pub fn has_effective_acl_cache(&self) -> bool {
+        self.effective_acl_cache
+            .as_ref()
+            .is_some_and(|cache| cache.is_current(self))
+    }
+
+    /// Target-to-root ancestor IDs captured by the derived ACL program.
+    pub fn effective_acl_ancestor_ids(&self) -> Option<&[u32]> {
+        self.effective_acl_cache
+            .as_ref()
+            .filter(|cache| cache.is_current(self))
+            .map(CompiledEffectiveAcl::ancestor_ids)
+    }
+
+    /// Whether evaluating this ACL program can depend on the client's home
+    /// channel hierarchy.
+    pub fn effective_acl_depends_on_home_channel(&self) -> bool {
+        self.effective_acl_cache
+            .as_ref()
+            .filter(|cache| cache.is_current(self))
+            .is_some_and(CompiledEffectiveAcl::depends_on_home_channel)
     }
 
     pub fn has_description(&self) -> bool {

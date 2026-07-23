@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
@@ -74,6 +74,7 @@ const VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL: Duration = Duration::from_millis(1
 const S2S_CHANNEL_REPLICATION_SLOW_STAGE: Duration = Duration::from_secs(1);
 const S2S_CLIENT_REPLICATION_SLOW_PROPOSE: Duration = Duration::from_secs(1);
 const S2S_CLIENT_REPLICATION_SLOW_QUEUE_WAIT: Duration = Duration::from_millis(250);
+const S2S_CLIENT_SNAPSHOT_DEFER_ERROR_AFTER: Duration = Duration::from_secs(20);
 const S2S_GATEWAY_MEMORY_FRACTION_DIVISOR: u64 = 20;
 const S2S_GATEWAY_MIN_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 const S2S_GATEWAY_FALLBACK_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
@@ -3802,6 +3803,102 @@ struct ClientReplicationAdapter {
     clients: Arc<ClientRepository>,
     channels: Arc<ChannelRepository>,
     local_epoch: u64,
+    snapshot_deferrals: ClientSnapshotDeferralGuard,
+}
+
+#[derive(Clone, Default)]
+struct ClientSnapshotDeferralGuard {
+    state: Arc<Mutex<ClientSnapshotDeferralState>>,
+}
+
+#[derive(Default)]
+struct ClientSnapshotDeferralState {
+    next_generation: u64,
+    by_origin: HashMap<NodeIdentifier, ClientSnapshotDeferral>,
+}
+
+struct ClientSnapshotDeferral {
+    generation: u64,
+    epoch: u64,
+    version: u64,
+    deferred_at: tokio::time::Instant,
+    error_emitted: bool,
+}
+
+impl ClientSnapshotDeferralGuard {
+    fn record_deferred(&self, origin: NodeIdentifier, epoch: u64, version: u64) {
+        let (generation, deadline) = {
+            let mut state = self.state.lock();
+            if let Some(deferred) = state.by_origin.get_mut(&origin) {
+                deferred.epoch = epoch;
+                deferred.version = version;
+                return;
+            }
+
+            state.next_generation = state.next_generation.wrapping_add(1);
+            let generation = state.next_generation;
+            let deferred_at = tokio::time::Instant::now();
+            state.by_origin.insert(
+                origin,
+                ClientSnapshotDeferral {
+                    generation,
+                    epoch,
+                    version,
+                    deferred_at,
+                    error_emitted: false,
+                },
+            );
+            (
+                generation,
+                deferred_at + S2S_CLIENT_SNAPSHOT_DEFER_ERROR_AFTER,
+            )
+        };
+
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            let overdue = {
+                let mut state = state.lock();
+                let Some(deferred) = state.by_origin.get_mut(&origin) else {
+                    return;
+                };
+                if deferred.generation != generation || deferred.error_emitted {
+                    return;
+                }
+                deferred.error_emitted = true;
+                Some((
+                    deferred.epoch,
+                    deferred.version,
+                    deferred.deferred_at.elapsed(),
+                ))
+            };
+            if let Some((epoch, version, deferred_for)) = overdue {
+                error!(
+                    origin,
+                    epoch,
+                    version,
+                    deferred_for_ms = deferred_for.as_millis() as u64,
+                    "s2s client snapshot has remained deferred on recipient"
+                );
+            }
+        });
+    }
+
+    fn clear(&self, origin: NodeIdentifier) {
+        self.state.lock().by_origin.remove(&origin);
+    }
+
+    #[cfg(test)]
+    fn status(&self, origin: NodeIdentifier) -> Option<(u64, u64, u64, bool)> {
+        self.state.lock().by_origin.get(&origin).map(|deferred| {
+            (
+                deferred.generation,
+                deferred.epoch,
+                deferred.version,
+                deferred.error_emitted,
+            )
+        })
+    }
 }
 
 impl ClientReplicationAdapter {
@@ -3814,6 +3911,7 @@ impl ClientReplicationAdapter {
             clients,
             channels,
             local_epoch,
+            snapshot_deferrals: ClientSnapshotDeferralGuard::default(),
         }
     }
 
@@ -3998,53 +4096,79 @@ impl OwnerReplicable for ClientReplicationAdapter {
         version: u64,
         snapshot: Bytes,
     ) -> Result<OwnerSnapshotInstallOutcome, OwnerSnapshotInstallError> {
-        if snapshot.len() > MAX_CLIENT_ORIGIN_SNAPSHOT_BYTES {
-            return Err(OwnerSnapshotInstallError::new(format!(
-                "s2s client snapshot for origin {origin} is {} bytes; maximum is {MAX_CLIENT_ORIGIN_SNAPSHOT_BYTES}",
-                snapshot.len()
-            )));
-        }
-        let decoded: ClientOriginSnapshot = match rmp_serde::from_slice(&snapshot) {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
+        let outcome = async {
+            if snapshot.len() > MAX_CLIENT_ORIGIN_SNAPSHOT_BYTES {
                 return Err(OwnerSnapshotInstallError::new(format!(
-                    "s2s client snapshot decode failed for origin {origin}: {e}"
+                    "s2s client snapshot for origin {origin} is {} bytes; maximum is {MAX_CLIENT_ORIGIN_SNAPSHOT_BYTES}",
+                    snapshot.len()
                 )));
             }
-        };
-        let mut current_channel_versions = HashMap::new();
-        let mut entries = Vec::with_capacity(decoded.entries.len());
-        for mut entry in decoded.entries {
-            let current_channel_version = self
-                .channels
-                .current_version_in_server(entry.op.server_id());
-            current_channel_versions
-                .entry(entry.op.server_id().to_owned())
-                .and_modify(|version: &mut u64| *version = (*version).max(current_channel_version))
-                .or_insert(current_channel_version);
-            self.sanitize_channel_dependencies(&mut entry, current_channel_version)
-                .await;
-            entries.push(entry);
+            let decoded: ClientOriginSnapshot = match rmp_serde::from_slice(&snapshot) {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    return Err(OwnerSnapshotInstallError::new(format!(
+                        "s2s client snapshot decode failed for origin {origin}: {e}"
+                    )));
+                }
+            };
+            let mut current_channel_versions = HashMap::new();
+            let mut entries = Vec::with_capacity(decoded.entries.len());
+            for mut entry in decoded.entries {
+                let current_channel_version = self
+                    .channels
+                    .current_version_in_server(entry.op.server_id());
+                current_channel_versions
+                    .entry(entry.op.server_id().to_owned())
+                    .and_modify(|version: &mut u64| {
+                        *version = (*version).max(current_channel_version)
+                    })
+                    .or_insert(current_channel_version);
+                self.sanitize_channel_dependencies(&mut entry, current_channel_version)
+                    .await;
+                entries.push(entry);
+            }
+            match self
+                .clients
+                .install_remote_client_snapshot(
+                    origin,
+                    epoch,
+                    version,
+                    decoded.version,
+                    entries,
+                    &current_channel_versions,
+                )
+                .await
+                .map_err(|error| OwnerSnapshotInstallError::new(error.to_string()))?
+            {
+                ClientSnapshotInstallOutcome::Installed => {
+                    Ok(OwnerSnapshotInstallOutcome::Installed)
+                }
+                ClientSnapshotInstallOutcome::Deferred => {
+                    Ok(OwnerSnapshotInstallOutcome::Deferred)
+                }
+            }
         }
-        match self
-            .clients
-            .install_remote_client_snapshot(
-                origin,
-                epoch,
-                version,
-                decoded.version,
-                entries,
-                &current_channel_versions,
-            )
-            .await
-            .map_err(|error| OwnerSnapshotInstallError::new(error.to_string()))?
-        {
-            ClientSnapshotInstallOutcome::Installed => Ok(OwnerSnapshotInstallOutcome::Installed),
-            ClientSnapshotInstallOutcome::Deferred => Ok(OwnerSnapshotInstallOutcome::Deferred),
+        .await;
+
+        match outcome {
+            Ok(OwnerSnapshotInstallOutcome::Deferred) => {
+                self.snapshot_deferrals
+                    .record_deferred(origin, epoch, version);
+                Ok(OwnerSnapshotInstallOutcome::Deferred)
+            }
+            Ok(OwnerSnapshotInstallOutcome::Installed) => {
+                self.snapshot_deferrals.clear(origin);
+                Ok(OwnerSnapshotInstallOutcome::Installed)
+            }
+            Err(error) => {
+                self.snapshot_deferrals.clear(origin);
+                Err(error)
+            }
         }
     }
 
     async fn reset_origin(&self, origin: NodeIdentifier, new_epoch: u64) {
+        self.snapshot_deferrals.clear(origin);
         if origin != self.clients.local_node_id() {
             self.clients
                 .reset_clients_from_node(origin, new_epoch)
@@ -4053,6 +4177,7 @@ impl OwnerReplicable for ClientReplicationAdapter {
     }
 
     async fn remove_origin(&self, origin: NodeIdentifier) {
+        self.snapshot_deferrals.clear(origin);
         if origin != self.clients.local_node_id() {
             self.clients.remove_clients_from_node(origin).await;
         }
@@ -4120,6 +4245,57 @@ mod tests {
             strict_proposal_gateway_response_timeout(&cfg),
             S2S_GATEWAY_RESPONSE_TIMEOUT
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn client_snapshot_deferral_guard_errors_once_per_continuous_interval() {
+        let guard = ClientSnapshotDeferralGuard::default();
+
+        guard.record_deferred(1, 42, 10);
+        tokio::task::yield_now().await;
+        let (generation, _, _, error_emitted) = guard.status(1).unwrap();
+        assert!(!error_emitted);
+
+        tokio::time::advance(Duration::from_secs(19)).await;
+        tokio::task::yield_now().await;
+        assert!(!guard.status(1).unwrap().3);
+
+        guard.record_deferred(1, 43, 11);
+        assert_eq!(guard.status(1), Some((generation, 43, 11, false)));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(guard.status(1), Some((generation, 43, 11, true)));
+        assert!(logs_contain(
+            "ERROR client_snapshot_deferral_guard_errors_once_per_continuous_interval: shitspeak_runtime::s2s: s2s client snapshot has remained deferred on recipient"
+        ));
+
+        guard.record_deferred(1, 44, 12);
+        tokio::time::advance(S2S_CLIENT_SNAPSHOT_DEFER_ERROR_AFTER).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            guard.status(1),
+            Some((generation, 44, 12, true)),
+            "retries must not emit another error or restart the interval"
+        );
+
+        guard.record_deferred(2, 50, 20);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        guard.clear(2);
+        guard.record_deferred(2, 51, 21);
+        tokio::task::yield_now().await;
+        let replacement = guard.status(2).unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(guard.status(2), Some(replacement));
+        assert!(!replacement.3, "a stale timer must not flag a new interval");
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert!(guard.status(2).unwrap().3);
+
+        guard.clear(1);
+        assert_eq!(guard.status(1), None);
     }
 
     #[test]
@@ -5023,6 +5199,32 @@ mod tests {
                 .unwrap(),
             OwnerSnapshotInstallOutcome::Deferred
         );
+        assert_eq!(
+            peer_adapter
+                .snapshot_deferrals
+                .status(1)
+                .map(|status| status.1),
+            Some(42),
+            "recipient tracks the deferred snapshot epoch"
+        );
+        assert!(
+            peer_adapter
+                .install_snapshot_for_origin(1, 42, version, Bytes::from_static(b"invalid"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            peer_adapter.snapshot_deferrals.status(1),
+            None,
+            "rejecting a snapshot clears its deferral watchdog"
+        );
+        assert_eq!(
+            peer_adapter
+                .install_snapshot_for_origin(1, 42, version, dependent_bytes.clone())
+                .await
+                .unwrap(),
+            OwnerSnapshotInstallOutcome::Deferred
+        );
         assert!(
             peer_clients
                 .get_client(live.get_session_id())
@@ -5043,6 +5245,11 @@ mod tests {
                 .await
                 .unwrap(),
             OwnerSnapshotInstallOutcome::Installed
+        );
+        assert_eq!(
+            peer_adapter.snapshot_deferrals.status(1),
+            None,
+            "installing the snapshot clears its deferral watchdog"
         );
         let replicated = peer_clients
             .get_client(live.get_session_id())
