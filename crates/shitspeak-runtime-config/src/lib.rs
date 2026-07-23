@@ -1191,10 +1191,10 @@ pub struct Config {
     /// Default: 30000.
     #[serde(default = "default_authenticate_timeout_ms")]
     pub authenticate_timeout_ms: u64,
-    /// Maximum number of clients concurrently running post-authentication
-    /// finalization (initial channel/user sync and publish). Authenticator
-    /// calls still run independently. Default: floor(3rd root(active CPU count)),
-    /// minimum 1.
+    /// Maximum number of clients concurrently running UDP crypt setup,
+    /// authenticator backend work, and post-authentication finalization. Zero
+    /// disables the login queue and concurrency limit. Default: floor(3rd
+    /// root(active CPU count)), minimum 1.
     #[serde(default = "default_auth_finalization_concurrency")]
     pub auth_finalization_concurrency: usize,
     /// Milliseconds before a pending two-phase channel delete is rolled back.
@@ -1820,6 +1820,28 @@ mod tests {
             default_auth_finalization_concurrency(),
             integer_third_root(active_cpus).max(1)
         );
+    }
+
+    #[test]
+    fn auth_finalization_concurrency_preserves_explicit_zero() {
+        let cfg = parse_config(
+            r#"
+                listen = "127.0.0.1:64738"
+                register_name = "test"
+                cert_path = "cert.pem"
+                key_path = "key.pem"
+                send_version = true
+                send_build_info = true
+                send_os_info = true
+                allowed_proxies = []
+                min_client_version = 0
+                max_users = 100
+                auth_finalization_concurrency = 0
+            "#,
+        )
+        .expect("config deserialize");
+
+        assert_eq!(cfg.auth_finalization_concurrency, 0);
     }
 
     /// Ensure the checked-in `config.toml` parses cleanly under the current

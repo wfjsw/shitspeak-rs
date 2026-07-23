@@ -1140,6 +1140,36 @@ async fn authentication_expiry_reauth_budget_defers_excess_clients() {
 }
 
 #[tokio::test]
+async fn authentication_expiry_reauth_is_unlimited_when_concurrency_is_zero() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let mut config = test_config(Vec::new());
+    config.auth_finalization_concurrency = 0;
+    let server = Server::new(config, authenticator).await.expect("server");
+    assert!(server.crypt_setup_semaphore.is_none());
+    let first = authentication_expiry_test_client(&server).await;
+    let second = authentication_expiry_test_client(&server).await;
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&first, deadline, AuthenticationExpiryAction::Reauth);
+    set_expiring_authentication(&second, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(1), calls.recv())
+            .await
+            .expect("reauthentication started")
+            .expect("reauthentication call");
+    }
+    assert!(first.is_reauthentication_in_progress());
+    assert!(second.is_reauthentication_in_progress());
+
+    for _ in 0..2 {
+        responses
+            .send(Err(AuthenticationRejection::WrongPassword))
+            .expect("release reauthentication");
+    }
+}
+
+#[tokio::test]
 async fn detached_client_waiting_for_reauth_permit_does_not_call_authenticator() {
     let (authenticator, mut calls, _responses) = controlled_authenticator();
     let mut config = test_config(Vec::new());
@@ -1772,6 +1802,7 @@ fn auth_finalization_queue_keeps_new_arrivals_behind_existing_waiters() {
 
     let first_permit = match queue.reserve_or_queue() {
         AuthFinalizationAdmission::Immediate(permit) => permit,
+        AuthFinalizationAdmission::Unlimited => panic!("limited queue should not be unlimited"),
         AuthFinalizationAdmission::Queued(_) => {
             panic!("first acquire should use the free permit")
         }
@@ -1779,6 +1810,7 @@ fn auth_finalization_queue_keeps_new_arrivals_behind_existing_waiters() {
     let second_ticket = match queue.reserve_or_queue() {
         AuthFinalizationAdmission::Queued(ticket) => ticket,
         AuthFinalizationAdmission::Immediate(_) => panic!("second acquire should queue"),
+        AuthFinalizationAdmission::Unlimited => panic!("limited queue should not be unlimited"),
     };
 
     drop(first_permit);
@@ -1788,10 +1820,27 @@ fn auth_finalization_queue_keeps_new_arrivals_behind_existing_waiters() {
         AuthFinalizationAdmission::Immediate(_) => {
             panic!("new arrival must not bypass an existing queued waiter")
         }
+        AuthFinalizationAdmission::Unlimited => panic!("limited queue should not be unlimited"),
     };
 
     assert_eq!(queue.position(second_ticket), Some(1));
     assert_eq!(queue.position(third_ticket), Some(2));
+}
+
+#[test]
+fn auth_finalization_queue_is_bypassed_when_unlimited() {
+    let queue = Arc::new(AuthFinalizationQueue::new(
+        0,
+        ReloadableAuthenticator::fixed(TestAuthenticator),
+    ));
+
+    for _ in 0..3 {
+        assert!(matches!(
+            queue.reserve_or_queue(),
+            AuthFinalizationAdmission::Unlimited
+        ));
+    }
+    assert_eq!(queue.position(1), None);
 }
 
 #[tokio::test]

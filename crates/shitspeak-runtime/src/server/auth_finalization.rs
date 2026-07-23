@@ -17,7 +17,8 @@ const AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL: Duration = Duration::from_secs(5)
 
 pub(super) struct AuthFinalizationQueue {
     authenticator: Arc<ReloadableAuthenticator>,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    concurrency_limit: Option<usize>,
+    semaphore: Option<Arc<tokio::sync::Semaphore>>,
     next_ticket: AtomicU64,
     waiters: Mutex<VecDeque<AuthFinalizationWaiter>>,
     waiters_changed: tokio::sync::Notify,
@@ -32,6 +33,7 @@ struct AuthFinalizationWaiter {
 
 pub(super) enum AuthFinalizationAdmission {
     Immediate(tokio::sync::OwnedSemaphorePermit),
+    Unlimited,
     Queued(u64),
 }
 
@@ -74,7 +76,7 @@ impl AuthFinalizationTestGateHandle {
 }
 
 pub struct AuthFinalizationPermit {
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
     queue: Arc<AuthFinalizationQueue>,
     ticket: u64,
 }
@@ -83,7 +85,8 @@ impl AuthFinalizationQueue {
     pub(super) fn new(limit: usize, authenticator: ReloadableAuthenticator) -> Self {
         Self {
             authenticator: Arc::new(authenticator),
-            semaphore: Arc::new(tokio::sync::Semaphore::new(limit.max(1))),
+            concurrency_limit: (limit != 0).then_some(limit),
+            semaphore: (limit != 0).then(|| Arc::new(tokio::sync::Semaphore::new(limit))),
             next_ticket: AtomicU64::new(1),
             waiters: Mutex::new(VecDeque::new()),
             waiters_changed: tokio::sync::Notify::new(),
@@ -99,6 +102,10 @@ impl AuthFinalizationQueue {
     pub(super) fn authenticator_arc(&self) -> Arc<dyn Authenticator> {
         let authenticator: Arc<dyn Authenticator> = self.authenticator.clone();
         authenticator
+    }
+
+    pub(super) fn concurrency_limit(&self) -> Option<usize> {
+        self.concurrency_limit
     }
 
     pub(super) fn prepare_authenticator_reload(
@@ -120,7 +127,15 @@ impl AuthFinalizationQueue {
             AuthFinalizationAdmission::Immediate(permit) => {
                 self.wait_for_test_gate_if_needed().await;
                 return Ok(AuthFinalizationPermit {
-                    _permit: permit,
+                    _permit: Some(permit),
+                    queue: Arc::clone(self),
+                    ticket: 0,
+                });
+            }
+            AuthFinalizationAdmission::Unlimited => {
+                self.wait_for_test_gate_if_needed().await;
+                return Ok(AuthFinalizationPermit {
+                    _permit: None,
                     queue: Arc::clone(self),
                     ticket: 0,
                 });
@@ -142,7 +157,7 @@ impl AuthFinalizationQueue {
         drop(waiter);
         self.wait_for_test_gate_if_needed().await;
         Ok(AuthFinalizationPermit {
-            _permit: permit,
+            _permit: Some(permit),
             queue: Arc::clone(self),
             ticket,
         })
@@ -155,7 +170,15 @@ impl AuthFinalizationQueue {
             AuthFinalizationAdmission::Immediate(permit) => {
                 self.wait_for_test_gate_if_needed().await;
                 return AuthFinalizationPermit {
-                    _permit: permit,
+                    _permit: Some(permit),
+                    queue: Arc::clone(self),
+                    ticket: 0,
+                };
+            }
+            AuthFinalizationAdmission::Unlimited => {
+                self.wait_for_test_gate_if_needed().await;
+                return AuthFinalizationPermit {
+                    _permit: None,
                     queue: Arc::clone(self),
                     ticket: 0,
                 };
@@ -176,25 +199,33 @@ impl AuthFinalizationQueue {
                 continue;
             }
 
-            break Arc::clone(&self.semaphore)
-                .acquire_owned()
-                .await
-                .expect("auth finalization semaphore should not be closed");
+            break Arc::clone(
+                self.semaphore
+                    .as_ref()
+                    .expect("queued auth finalization requires a concurrency limit"),
+            )
+            .acquire_owned()
+            .await
+            .expect("auth finalization semaphore should not be closed");
         };
 
         drop(waiter);
         self.wait_for_test_gate_if_needed().await;
         AuthFinalizationPermit {
-            _permit: permit,
+            _permit: Some(permit),
             queue: Arc::clone(self),
             ticket,
         }
     }
 
     pub(super) fn reserve_or_queue(self: &Arc<Self>) -> AuthFinalizationAdmission {
+        let Some(semaphore) = self.semaphore.as_ref() else {
+            return AuthFinalizationAdmission::Unlimited;
+        };
+
         let mut waiters = self.waiters.lock();
         if waiters.is_empty()
-            && let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned()
+            && let Ok(permit) = Arc::clone(semaphore).try_acquire_owned()
         {
             return AuthFinalizationAdmission::Immediate(permit);
         }
@@ -230,7 +261,12 @@ impl AuthFinalizationQueue {
                 continue;
             }
 
-            let permit = Arc::clone(&self.semaphore).acquire_owned();
+            let permit = Arc::clone(
+                self.semaphore
+                    .as_ref()
+                    .expect("queued auth finalization requires a concurrency limit"),
+            )
+            .acquire_owned();
             tokio::pin!(permit);
             loop {
                 tokio::select! {

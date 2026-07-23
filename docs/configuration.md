@@ -98,7 +98,8 @@ udp_channel_size = 4096
 
 client_idle_timeout_secs = 30
 authenticate_timeout_ms = 30000
-# Default: floor(3rd root(active CPU count)), minimum 1.
+# Set to 0 to disable the login queue and concurrency limit.
+# Default when omitted: floor(3rd root(active CPU count)), minimum 1.
 # auth_finalization_concurrency = 1
 pending_delete_timeout_ms = 5000
 
@@ -301,12 +302,13 @@ are ignored outside fixed mode.
 ```toml
 client_idle_timeout_secs = 30
 authenticate_timeout_ms = 30000
-# Default: floor(3rd root(active CPU count)), minimum 1.
+# Set to 0 to disable the login queue and concurrency limit.
+# Default when omitted: floor(3rd root(active CPU count)), minimum 1.
 # auth_finalization_concurrency = 1
 pending_delete_timeout_ms = 5000
 ```
 
-`authenticate_timeout_ms` starts after TLS setup. `auth_finalization_concurrency` limits how many clients can concurrently create UDP crypt setup state, run authenticator backend work, and perform the initial sync/publish path. When omitted, it defaults to `floor(3rd root(active CPU count))` with a minimum of 1. `pending_delete_timeout_ms` controls rollback timing for pending two-phase channel deletes.
+`authenticate_timeout_ms` starts after TLS setup. Positive `auth_finalization_concurrency` values limit how many clients can concurrently create UDP crypt setup state, run authenticator backend work, and perform the initial sync/publish path. Setting it to `0` bypasses the login queue and imposes no concurrency limit on those operations. When omitted, it defaults to `floor(3rd root(active CPU count))` with a minimum of 1. `pending_delete_timeout_ms` controls rollback timing for pending two-phase channel deletes.
 
 ## Persistence
 
@@ -353,7 +355,7 @@ file_access_dir = ["auth/files"]
 working_dir = "auth/files"
 ```
 
-The server keeps a reusable pool of WASM instances and creates more as queued authenticator work needs them. `auth_finalization_concurrency` controls how many login authenticator calls can run at once. The same limit also throttles per-client UDP crypt setup so connection spikes do not generate unbounded key setup work. Instance creation itself remains serialized. `file_access_dir` bounds file access from the WASM raw stream imports. When it is empty, file stream imports are unavailable.
+The server keeps a reusable pool of WASM instances and creates more as queued authenticator work needs them. Positive `auth_finalization_concurrency` values control how many login authenticator calls can run at once and also throttle per-client UDP crypt setup. Setting it to `0` bypasses that queue and limit, although WASM instance creation itself remains serialized. `file_access_dir` bounds file access from the WASM raw stream imports. When it is empty, file stream imports are unavailable.
 
 ### Exec Authenticator
 

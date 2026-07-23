@@ -176,7 +176,7 @@ pub struct Server {
     channels: Arc<ChannelRepository>,
     visibility_fanout_index: Arc<crate::client::visibility::VisibilityFanoutIndex>,
     auth_finalization_queue: Arc<AuthFinalizationQueue>,
-    crypt_setup_semaphore: Arc<tokio::sync::Semaphore>,
+    crypt_setup_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     channel_blobs: Arc<ChannelBlobStore>,
     session_blobs: Arc<SessionBlobStore>,
     user_channel_cache: Arc<UserChannelCache>,
@@ -265,7 +265,7 @@ impl Server {
         // ── Channel repository & blob stores ─────────────────────────────
         let node_id = config.local_node_id().map_err(std::io::Error::other)?;
         let client_log_max_entries = config.client_log_max_entries;
-        let auth_finalization_concurrency = config.auth_finalization_concurrency.max(1);
+        let auth_finalization_concurrency = config.auth_finalization_concurrency;
         let channel_repo_tuning = channel_repo_tuning(&config);
         let channel_root_config = channel_root_config(&config);
         let (channels, channel_blobs, session_blobs, user_channel_cache, bans) = match &config
@@ -323,9 +323,8 @@ impl Server {
                 auth_finalization_concurrency,
                 authenticator,
             )),
-            crypt_setup_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                auth_finalization_concurrency,
-            )),
+            crypt_setup_semaphore: (auth_finalization_concurrency != 0)
+                .then(|| Arc::new(tokio::sync::Semaphore::new(auth_finalization_concurrency))),
             channel_blobs,
             session_blobs,
             user_channel_cache,
@@ -1449,7 +1448,10 @@ impl Server {
     ) {
         let timeout = chrono::Duration::seconds(timeout_secs as i64);
         let clients = self.clients.get_local_clients().await;
-        let mut reauth_budget = self.read_config().auth_finalization_concurrency.max(1);
+        let mut reauth_budget = self
+            .auth_finalization_queue
+            .concurrency_limit()
+            .unwrap_or(usize::MAX);
 
         for client in &clients {
             if let Some(action) = client.take_expired_authentication(now, reauth_budget > 0) {
@@ -2155,12 +2157,15 @@ impl Server {
         client: &Client,
         mode: &str,
     ) -> Result<(), shitspeak_client_crypto::CryptError> {
-        let permit = self
-            .crypt_setup_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("crypt setup semaphore should not be closed");
+        let permit = match &self.crypt_setup_semaphore {
+            Some(semaphore) => Some(
+                Arc::clone(semaphore)
+                    .acquire_owned()
+                    .await
+                    .expect("crypt setup semaphore should not be closed"),
+            ),
+            None => None,
+        };
         let result = client.create_crypt_state(mode);
         drop(permit);
         result
