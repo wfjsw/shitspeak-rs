@@ -18,7 +18,7 @@ use crate::{
     client::{
         Client, ClientInstanceId, ClientStateSubscription,
         client_session_identifier::ClientSessionIdentifier,
-        random_client_instance_id,
+        next_client_instance_id,
         state_log::{
             ClientGlobalStateDelta, ClientStateBroadcastPayload, ClientStateLogEntry,
             ClientStateOperation,
@@ -76,6 +76,96 @@ pub struct ClientRepository {
     deferred_commit_tx: Option<mpsc::UnboundedSender<DeferredClientCommit>>,
     deferred_commit_pending: Arc<AtomicUsize>,
     versions: Arc<ClientVersionIndex>,
+    authenticated_client_counts: AuthenticatedClientCounts,
+}
+
+#[derive(Default)]
+struct AuthenticatedClientCounts {
+    by_server: ParkingRwLock<HashMap<String, Arc<AtomicU64>>>,
+}
+
+impl AuthenticatedClientCounts {
+    fn counter(&self, server_id: &str) -> Arc<AtomicU64> {
+        if let Some(counter) = self.by_server.read().get(server_id).cloned() {
+            return counter;
+        }
+        Arc::clone(
+            self.by_server
+                .write()
+                .entry(server_id.to_owned())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+        )
+    }
+
+    fn get(&self, server_id: &str) -> u64 {
+        self.by_server
+            .read()
+            .get(server_id)
+            .map(|counter| counter.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    fn try_increment_below(&self, server_id: &str, limit: u64) -> bool {
+        let counter = self.counter(server_id);
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < limit).then_some(count + 1)
+            })
+            .is_ok()
+    }
+
+    fn increment(&self, server_id: &str) {
+        self.counter(server_id).fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn decrement(&self, server_id: &str) {
+        let counter = self.counter(server_id);
+        let result = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            count.checked_sub(1)
+        });
+        debug_assert!(result.is_ok(), "authenticated client count underflow");
+    }
+
+    fn replace_remote_counts(
+        &self,
+        previous: &HashMap<String, u64>,
+        replacement: &HashMap<String, u64>,
+    ) {
+        let server_ids = previous
+            .keys()
+            .chain(replacement.keys())
+            .collect::<HashSet<_>>();
+        for server_id in server_ids {
+            let old = previous.get(server_id).copied().unwrap_or(0);
+            let new = replacement.get(server_id).copied().unwrap_or(0);
+            match new.cmp(&old) {
+                std::cmp::Ordering::Greater => {
+                    self.counter(server_id)
+                        .fetch_add(new - old, Ordering::AcqRel);
+                }
+                std::cmp::Ordering::Less => {
+                    let counter = self.counter(server_id);
+                    let delta = old - new;
+                    let result =
+                        counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            count.checked_sub(delta)
+                        });
+                    debug_assert!(result.is_ok(), "authenticated client count underflow");
+                }
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+    }
+}
+
+fn authenticated_counts_by_server(
+    clients: &HashMap<ScopedSessionId, Arc<Box<Client>>>,
+) -> HashMap<String, u64> {
+    let mut counts = HashMap::new();
+    for client in clients.values() {
+        *counts.entry(client.server_id()).or_default() += 1;
+    }
+    counts
 }
 
 pub(crate) struct ClientSnapshotWithVersions {
@@ -92,6 +182,11 @@ impl ClientSnapshotWithVersions {
 struct DeferredClientCommit {
     op: ClientStateOperation,
     channel_version_dep: Option<u64>,
+}
+
+enum AuthenticatedClientCountChange {
+    Added(String),
+    Removed(String),
 }
 
 pub(crate) enum ClientOriginLogSlice {
@@ -166,6 +261,8 @@ impl ClientVersionIndex {
 pub struct ClientRegister {
     /// Clients homed on this node.
     local_clients: HashMap<ScopedSessionId, Arc<Box<Client>>>,
+    /// Local sessions that own a slot in `authenticated_client_counts`.
+    authenticated_local_clients: HashSet<ScopedSessionId>,
     /// Ring buffer of local log entries.
     local_log: VecDeque<Arc<ClientStateLogEntry>>,
     /// Monotonic local version counter.
@@ -405,6 +502,7 @@ impl ClientRepository {
         let log_max_entries = log_max_entries.max(1);
         let register = Arc::new(AsyncRwLock::new(ClientRegister {
             local_clients: HashMap::new(),
+            authenticated_local_clients: HashSet::new(),
             local_log: VecDeque::new(),
             version: 0,
             clients_by_channel: HashMap::new(),
@@ -454,12 +552,73 @@ impl ClientRepository {
             deferred_commit_tx,
             deferred_commit_pending,
             versions,
+            authenticated_client_counts: AuthenticatedClientCounts::default(),
         }
     }
 
     /// The node ID of this repository.
     pub fn local_node_id(&self) -> u16 {
         self.local_node_id
+    }
+
+    /// Return the number of authenticated local and replicated clients in a
+    /// virtual server without materializing a repository snapshot.
+    pub fn authenticated_client_count_in_server(&self, server_id: &str) -> u64 {
+        self.authenticated_client_counts.get(server_id)
+    }
+
+    fn apply_authenticated_client_count_change(
+        &self,
+        change: Option<AuthenticatedClientCountChange>,
+    ) {
+        match change {
+            Some(AuthenticatedClientCountChange::Added(server_id)) => {
+                self.authenticated_client_counts.increment(&server_id);
+            }
+            Some(AuthenticatedClientCountChange::Removed(server_id)) => {
+                self.authenticated_client_counts.decrement(&server_id);
+            }
+            None => {}
+        }
+    }
+
+    /// Atomically reserve one authenticated-client slot for a local session.
+    /// The reservation is owned by the repository and is released when the
+    /// session is removed, including authentication cancellation paths.
+    pub async fn try_reserve_authenticated_client_in_server(
+        &self,
+        server_id: &str,
+        id: ClientSessionIdentifier,
+        max_users: u64,
+    ) -> bool {
+        let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
+        let mut register = self.register.write().await;
+        if !register.local_clients.contains_key(&scoped_id) {
+            return false;
+        }
+        if register.authenticated_local_clients.contains(&scoped_id) {
+            return true;
+        }
+        if !self
+            .authenticated_client_counts
+            .try_increment_below(server_id, max_users)
+        {
+            return false;
+        }
+        register.authenticated_local_clients.insert(scoped_id);
+        true
+    }
+
+    pub(crate) async fn release_authenticated_client_reservation_in_server(
+        &self,
+        server_id: &str,
+        id: ClientSessionIdentifier,
+    ) {
+        let scoped_id = ScopedSessionId::new(server_id.to_owned(), id);
+        let mut register = self.register.write().await;
+        if register.authenticated_local_clients.remove(&scoped_id) {
+            self.authenticated_client_counts.decrement(server_id);
+        }
     }
 
     async fn get_remote_register(
@@ -539,49 +698,6 @@ impl ClientRepository {
             .insert(local_session_id);
     }
 
-    fn allocate_client_instance_id(register: &ClientRegister) -> ClientInstanceId {
-        let occupied = Self::occupied_client_instance_ids(register);
-        for _ in 0..1024 {
-            let candidate = random_client_instance_id();
-            if !occupied.contains(&candidate) {
-                return candidate;
-            }
-        }
-
-        panic!("failed to allocate unique client instance id after repeated collisions");
-    }
-
-    fn occupied_client_instance_ids(register: &ClientRegister) -> HashSet<ClientInstanceId> {
-        let mut occupied =
-            HashSet::with_capacity(register.local_clients.len() + register.local_log.len() + 1);
-        occupied.insert(0);
-        occupied.extend(
-            register
-                .local_clients
-                .values()
-                .map(|client| client.client_instance_id()),
-        );
-        occupied.extend(
-            register
-                .local_log
-                .iter()
-                .map(|entry| entry.op.client_instance_id()),
-        );
-        occupied
-    }
-
-    fn client_instance_id_collides(register: &ClientRegister, candidate: ClientInstanceId) -> bool {
-        candidate == 0
-            || register
-                .local_clients
-                .values()
-                .any(|client| client.client_instance_id() == candidate)
-            || register
-                .local_log
-                .iter()
-                .any(|entry| entry.op.client_instance_id() == candidate)
-    }
-
     pub async fn move_local_client_to_server(
         &self,
         old_server_id: &str,
@@ -604,6 +720,13 @@ impl ClientRepository {
             let client = register.local_clients.remove(&old_scoped_id)?;
             register.channel_index_remove(&old_scoped_id);
             register.listener_index_remove_all(&old_scoped_id);
+            if register.authenticated_local_clients.remove(&old_scoped_id) {
+                self.authenticated_client_counts.decrement(old_server_id);
+                self.authenticated_client_counts.increment(new_server_id);
+                register
+                    .authenticated_local_clients
+                    .insert(new_scoped_id.clone());
+            }
 
             let tcp_address = client.get_tcp_address();
             if let Some(set) = client_by_host_guard.get_mut(&tcp_address.ip()) {
@@ -680,7 +803,7 @@ impl ClientRepository {
 
         let id = self.allocate_local_session_id(&server_id);
         let client_identifier = ClientSessionIdentifier::new(self.local_node_id, id).unwrap();
-        let client_instance_id = Self::allocate_client_instance_id(&register);
+        let client_instance_id = next_client_instance_id(self.local_node_id);
         let scoped_id = ScopedSessionId::new(server_id.clone(), client_identifier);
         let client = Client::new_local_in_server_with_instance_id(
             server_id,
@@ -766,7 +889,7 @@ impl ClientRepository {
 
         let id = self.allocate_local_session_id(&server_id);
         let client_identifier = ClientSessionIdentifier::new(self.local_node_id, id).unwrap();
-        let client_instance_id = Self::allocate_client_instance_id(&register);
+        let client_instance_id = next_client_instance_id(self.local_node_id);
         let scoped_id = ScopedSessionId::new(server_id.clone(), client_identifier);
         let client = Client::new_web_gateway_in_server_with_instance_id(
             server_id,
@@ -818,7 +941,7 @@ impl ClientRepository {
 
         let id = self.allocate_local_session_id(&server_id);
         let client_identifier = ClientSessionIdentifier::new(self.local_node_id, id).unwrap();
-        let client_instance_id = Self::allocate_client_instance_id(&register);
+        let client_instance_id = next_client_instance_id(self.local_node_id);
         let scoped_id = ScopedSessionId::new(server_id.clone(), client_identifier);
         let client = Client::new_moq_gateway_in_server_with_instance_id(
             server_id,
@@ -874,6 +997,13 @@ impl ClientRepository {
             if client.is_published() {
                 return;
             }
+            if client.is_authenticated()
+                && register
+                    .authenticated_local_clients
+                    .insert(scoped_id.clone())
+            {
+                self.authenticated_client_counts.increment(server_id);
+            }
             register.sync_local_client_indexes(&scoped_id, &client);
             let initial_state =
                 ClientGlobalStateDelta::from_global_state(&client.read_global_state());
@@ -917,7 +1047,9 @@ impl ClientRepository {
         let mut register = remote_register.write().await;
         let channel_id = client.get_current_channel_id();
         let listener_channels = client.get_listening_channel_ids();
-        register.clients.insert(scoped_id.clone(), client);
+        if register.clients.insert(scoped_id.clone(), client).is_none() {
+            self.authenticated_client_counts.increment(&server_id);
+        }
         register.channel_index_insert(scoped_id.clone(), channel_id);
         for channel_id in listener_channels {
             register.listener_index_add(scoped_id.clone(), channel_id);
@@ -1003,6 +1135,9 @@ impl ClientRepository {
             if let Some(client) = register.local_clients.remove(&scoped_id) {
                 register.channel_index_remove(&scoped_id);
                 register.listener_index_remove_all(&scoped_id);
+                if register.authenticated_local_clients.remove(&scoped_id) {
+                    self.authenticated_client_counts.decrement(server_id);
+                }
 
                 // Remove any UDP address dynamically bound to this session (may
                 // differ from the initial udp_address field if the client's port
@@ -1034,7 +1169,7 @@ impl ClientRepository {
             client
         } else {
             let remote_register = self.get_remote_register(id.node_id).await?;
-            let (removed, should_remove_register) = {
+            let removed = {
                 let mut register = remote_register.write().await;
                 if let Some(expected) = expected_client_instance_id {
                     if let Some(client) = register.clients.get(&scoped_id) {
@@ -1051,26 +1186,16 @@ impl ClientRepository {
                     }
                 }
                 let removed = register.clients.remove(&scoped_id);
+                if removed.is_some() {
+                    self.authenticated_client_counts.decrement(server_id);
+                }
                 register.channel_index_remove(&scoped_id);
                 register.listener_index_remove_all(&scoped_id);
-                let should_remove_register = removed.is_some()
-                    && register.clients.is_empty()
-                    && register.log.is_empty()
-                    && register.pending_ops.is_empty()
-                    && register.version == 0;
-                (removed, should_remove_register)
+                removed
             };
-            if should_remove_register {
-                let mut registers = self.remote_registers.write().await;
-                if registers
-                    .get(&id.node_id)
-                    .is_some_and(|current| Arc::ptr_eq(current, &remote_register))
-                {
-                    registers.remove(&id.node_id);
-                }
-            }
             removed?
         };
+        client.mark_removed();
 
         if client.get_node_id() == self.local_node_id && client.is_published() {
             if self
@@ -1142,8 +1267,11 @@ impl ClientRepository {
                 )
             })
             .collect();
+        let previous_counts = authenticated_counts_by_server(&register.clients);
         let base_version = register.version;
         register.clear_materialized_state();
+        self.authenticated_client_counts
+            .replace_remote_counts(&previous_counts, &HashMap::new());
         register.epoch = Some(new_epoch);
         register.epoch_version_floor = 0;
         register.materialized = true;
@@ -1171,6 +1299,7 @@ impl ClientRepository {
                 )
             })
             .collect();
+        let previous_counts = authenticated_counts_by_server(&register.clients);
         let base_version = register.version;
         let epoch_version_floor = register
             .pending_ops
@@ -1179,6 +1308,8 @@ impl ClientRepository {
             .unwrap_or(base_version)
             .max(base_version);
         register.clear_materialized_state();
+        self.authenticated_client_counts
+            .replace_remote_counts(&previous_counts, &HashMap::new());
         register.epoch_version_floor = register.epoch_version_floor.max(epoch_version_floor);
         register.materialized = false;
         self.broadcast_origin_removals(node_id, removals, base_version);
@@ -2180,7 +2311,7 @@ impl ClientRepository {
         replacement.snapshot_history_floor = envelope_version;
         replacement.epoch_version_floor = envelope_version;
         for entry in &normalized_entries {
-            Self::apply_op_inner(&mut replacement, entry, origin, self.log_max_entries);
+            let _ = Self::apply_op_inner(&mut replacement, entry, origin, self.log_max_entries);
         }
         if normalized_entries.is_empty() && envelope_version > 0 {
             let marker = Arc::new(ClientStateLogEntry {
@@ -2192,7 +2323,7 @@ impl ClientRepository {
                     server_id: crate::types::default_server_id(),
                 },
             });
-            Self::apply_op_inner(&mut replacement, &marker, origin, self.log_max_entries);
+            let _ = Self::apply_op_inner(&mut replacement, &marker, origin, self.log_max_entries);
         }
         replacement.version = envelope_version;
         replacement.pending_ops = retained_pending;
@@ -2212,7 +2343,11 @@ impl ClientRepository {
                 .or_insert(*effective_dep);
         }
 
+        let previous_counts = authenticated_counts_by_server(&register.clients);
+        let replacement_counts = authenticated_counts_by_server(&replacement.clients);
         *register = replacement;
+        self.authenticated_client_counts
+            .replace_remote_counts(&previous_counts, &replacement_counts);
 
         // Snapshot replacement is an atomic state transition, not a sequence
         // from the owner's retained log. Publish a global reset boundary,
@@ -2271,7 +2406,9 @@ impl ClientRepository {
             if entry.version <= register.version {
                 continue;
             }
-            Self::apply_op_inner(&mut register, &entry, origin, self.log_max_entries);
+            let count_change =
+                Self::apply_op_inner(&mut register, &entry, origin, self.log_max_entries);
+            self.apply_authenticated_client_count_change(count_change);
             let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload::new(
                 entry,
                 HashMap::from([(origin, register.version)]),
@@ -2681,6 +2818,7 @@ impl ClientRepository {
                     return Err(());
                 }
                 Some(current_epoch) if origin_epoch > current_epoch => {
+                    let previous_counts = authenticated_counts_by_server(&register.clients);
                     let removals = register
                         .clients
                         .iter()
@@ -2694,6 +2832,8 @@ impl ClientRepository {
                         .collect();
                     let base_version = register.version;
                     register.clear_materialized_state();
+                    self.authenticated_client_counts
+                        .replace_remote_counts(&previous_counts, &HashMap::new());
                     register.epoch = Some(origin_epoch);
                     register.epoch_version_floor = 0;
                     register.materialized = true;
@@ -2778,7 +2918,9 @@ impl ClientRepository {
             if op.version < expected_next_version {
                 return Ok(());
             }
-            Self::apply_op_inner(&mut register, &op, remote_node, self.log_max_entries);
+            let count_change =
+                Self::apply_op_inner(&mut register, &op, remote_node, self.log_max_entries);
+            self.apply_authenticated_client_count_change(count_change);
             let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload::new(
                 Arc::clone(&op),
                 HashMap::from([(remote_node, register.version)]),
@@ -2828,7 +2970,9 @@ impl ClientRepository {
                     remote_node,
                     available_channel_version,
                 );
-                Self::apply_op_inner(&mut register, &op, remote_node, self.log_max_entries);
+                let count_change =
+                    Self::apply_op_inner(&mut register, &op, remote_node, self.log_max_entries);
+                self.apply_authenticated_client_count_change(count_change);
                 let _ = self.tx.send(Arc::new(ClientStateBroadcastPayload::new(
                     Arc::clone(&op),
                     HashMap::from([(remote_node, register.version)]),
@@ -2857,8 +3001,8 @@ impl ClientRepository {
         op: &ClientStateLogEntry,
         remote_node: u16,
         log_max_entries: usize,
-    ) {
-        match &op.op {
+    ) -> Option<AuthenticatedClientCountChange> {
+        let count_change = match &op.op {
             ClientStateOperation::AddClient {
                 server_id,
                 session_id,
@@ -2878,6 +3022,7 @@ impl ClientRepository {
                         session = u32::from(*session_id),
                         "remote AddClient ignored: session node does not match operation origin"
                     );
+                    None
                 } else {
                     let scoped_id = ScopedSessionId::new(server_id.clone(), *session_id);
                     let client = Arc::new(Client::new_remote_in_server(
@@ -2898,11 +3043,12 @@ impl ClientRepository {
                     }
                     let channel_id = client.get_current_channel_id();
                     let listener_channels = client.get_listening_channel_ids();
-                    register.clients.insert(scoped_id.clone(), client);
+                    let added = register.clients.insert(scoped_id.clone(), client).is_none();
                     register.channel_index_insert(scoped_id.clone(), channel_id);
                     for channel_id in listener_channels {
                         register.listener_index_add(scoped_id.clone(), channel_id);
                     }
+                    added.then(|| AuthenticatedClientCountChange::Added(server_id.clone()))
                 }
             }
             ClientStateOperation::RemoveClient {
@@ -2926,6 +3072,7 @@ impl ClientRepository {
                     register.clients.remove(&scoped_id);
                     register.channel_index_remove(&scoped_id);
                     register.listener_index_remove_all(&scoped_id);
+                    Some(AuthenticatedClientCountChange::Removed(server_id.clone()))
                 } else {
                     tracing::trace!(
                         remote_node,
@@ -2933,6 +3080,7 @@ impl ClientRepository {
                         client_instance_id,
                         "remote RemoveClient ignored: client instance mismatch"
                     );
+                    None
                 }
             }
             ClientStateOperation::UpdateGlobalState {
@@ -2973,9 +3121,10 @@ impl ClientRepository {
                         );
                     }
                 }
+                None
             }
-            ClientStateOperation::ResetNode { .. } => {}
-        }
+            ClientStateOperation::ResetNode { .. } => None,
+        };
 
         register.log.push_back(Arc::new(op.clone()));
         while register.log.len() > log_max_entries {
@@ -2983,6 +3132,7 @@ impl ClientRepository {
         }
         register.version = op.version;
         register.epoch_version_floor = register.epoch_version_floor.max(op.version);
+        count_change
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
@@ -3238,6 +3388,90 @@ mod tests {
         assert_eq!(versions.voice_routing_in_server("alpha"), 3);
     }
 
+    #[tokio::test]
+    async fn authenticated_client_reservations_are_atomic_scoped_and_released() {
+        let repo = ClientRepository::new(1, 128);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (first_tx, _first_rx) = tokio::sync::mpsc::channel(8);
+        let first = repo
+            .allocate_web_client_in_server(
+                "alpha",
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30001),
+                local,
+                first_tx,
+            )
+            .await;
+        let (second_tx, _second_rx) = tokio::sync::mpsc::channel(8);
+        let second = repo
+            .allocate_web_client_in_server(
+                "alpha",
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30002),
+                local,
+                second_tx,
+            )
+            .await;
+
+        let (first_reserved, second_reserved) = tokio::join!(
+            repo.try_reserve_authenticated_client_in_server("alpha", first.get_session_id(), 1),
+            repo.try_reserve_authenticated_client_in_server("alpha", second.get_session_id(), 1),
+        );
+        assert_ne!(first_reserved, second_reserved);
+        assert_eq!(repo.authenticated_client_count_in_server("alpha"), 1);
+
+        let (winner, loser) = if first_reserved {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        repo.remove_client_in_server("alpha", winner.get_session_id())
+            .await;
+        assert_eq!(repo.authenticated_client_count_in_server("alpha"), 0);
+        assert!(
+            repo.try_reserve_authenticated_client_in_server("alpha", loser.get_session_id(), 1)
+                .await
+        );
+        repo.release_authenticated_client_reservation_in_server("alpha", loser.get_session_id())
+            .await;
+        assert_eq!(repo.authenticated_client_count_in_server("alpha"), 0);
+        assert!(
+            repo.try_reserve_authenticated_client_in_server("alpha", loser.get_session_id(), 1)
+                .await
+        );
+
+        let moved_session = repo
+            .move_local_client_to_server("alpha", loser.get_session_id(), "beta")
+            .await
+            .expect("reserved client moves between server scopes");
+        assert_eq!(repo.authenticated_client_count_in_server("alpha"), 0);
+        assert_eq!(repo.authenticated_client_count_in_server("beta"), 1);
+        repo.remove_client_in_server("beta", moved_session).await;
+        assert_eq!(repo.authenticated_client_count_in_server("beta"), 0);
+    }
+
+    #[tokio::test]
+    async fn publishing_an_authenticated_client_adopts_one_counted_slot() {
+        let repo = ClientRepository::new(1, 128);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30003);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let client = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, tx)
+            .await;
+
+        client.set_authenticated(true);
+        repo.publish_client_in_server("alpha", client.get_session_id())
+            .await;
+        repo.publish_client_in_server("alpha", client.get_session_id())
+            .await;
+        assert_eq!(repo.authenticated_client_count_in_server("alpha"), 1);
+
+        repo.remove_client_in_server("alpha", client.get_session_id())
+            .await;
+        assert_eq!(repo.authenticated_client_count_in_server("alpha"), 0);
+    }
+
     fn text_message(message: &str) -> Message {
         Message::TextMessage(
             TextMessage {
@@ -3391,6 +3625,7 @@ mod tests {
             .await;
 
         assert_eq!(alpha.get_session_id(), beta.get_session_id());
+        assert_ne!(alpha.client_instance_id(), beta.client_instance_id());
         assert_eq!(alpha.server_id(), "alpha");
         assert_eq!(beta.server_id(), "beta");
         assert_eq!(repo_a.local_len_in_server("alpha").await, 1);
@@ -3517,6 +3752,7 @@ mod tests {
         for server_id in ["alpha", "beta"] {
             let (clients, versions) = repo.snapshot_with_versions_in_server(server_id).await;
             assert_eq!(clients.len(), 1);
+            assert_eq!(repo.authenticated_client_count_in_server(server_id), 1);
             assert_eq!(versions.get(&2), Some(&5));
             assert!(
                 repo.replay_since_in_server(server_id, &versions)
@@ -4099,6 +4335,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removing_last_direct_remote_client_retains_shard_for_safe_reuse() {
+        let repo = ClientRepository::new(1, 128);
+        let remote_session = ClientSessionIdentifier::new(2, 7).unwrap();
+        let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let tcp_addr = SocketAddr::new(real_ip, 30001);
+        let local_addr = SocketAddr::new(real_ip, 64738);
+
+        let first = Arc::new(Client::new_remote_in_server(
+            "alpha".to_owned(),
+            remote_session,
+            real_ip,
+            tcp_addr,
+            None,
+            local_addr,
+            None,
+            Utc::now(),
+            7,
+        ));
+        repo.add_remote_client(remote_session, first).await;
+
+        let retained = repo
+            .get_remote_register(2)
+            .await
+            .expect("remote shard exists after insertion");
+        repo.remove_client_in_server("alpha", remote_session)
+            .await
+            .expect("remote client is removed");
+
+        assert_eq!(repo.authenticated_client_count_in_server("alpha"), 0);
+        assert!(retained.read().await.clients.is_empty());
+        assert!(Arc::ptr_eq(
+            &retained,
+            &repo
+                .get_remote_register(2)
+                .await
+                .expect("empty remote shard remains registered")
+        ));
+
+        let replacement = Arc::new(Client::new_remote_in_server(
+            "alpha".to_owned(),
+            remote_session,
+            real_ip,
+            tcp_addr,
+            None,
+            local_addr,
+            None,
+            Utc::now(),
+            8,
+        ));
+        repo.add_remote_client(remote_session, replacement).await;
+
+        assert_eq!(repo.authenticated_client_count_in_server("alpha"), 1);
+        assert_eq!(
+            repo.get_client_in_server("alpha", remote_session)
+                .await
+                .expect("replacement client is visible")
+                .client_instance_id(),
+            8
+        );
+    }
+
+    #[tokio::test]
     async fn voice_recipient_index_snapshot_is_scoped_to_all_servers() {
         let repo = ClientRepository::new(1, 128);
         let real_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -4196,6 +4494,10 @@ mod tests {
         repo.clear_clients_from_node(2).await;
 
         assert!(repo.get_client(remote_session).await.is_none());
+        assert_eq!(
+            repo.authenticated_client_count_in_server(crate::types::DEFAULT_SERVER_ID),
+            0
+        );
         assert_eq!(repo.current_version(), 0);
 
         let payload = rx.recv().await.expect("global reset broadcast");
@@ -4321,7 +4623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_instance_id_collision_check_covers_live_clients_and_retained_logs() {
+    async fn client_instance_id_is_not_reused_while_old_operations_are_retained() {
         let repo = ClientRepository::new(1, 128);
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30003);
         let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
@@ -4332,28 +4634,26 @@ mod tests {
             .await;
         let instance_id = client.client_instance_id();
 
-        {
-            let register = repo.register.read().await;
-            assert!(ClientRepository::client_instance_id_collides(
-                &register,
-                instance_id
-            ));
-        }
-
         repo.publish_client_in_server("alpha", client.get_session_id())
             .await;
         repo.remove_client_in_server("alpha", client.get_session_id())
             .await;
 
+        let (replacement_tx, _replacement_rx) = tokio::sync::mpsc::channel(8);
+        let replacement = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, replacement_tx)
+            .await;
+
         let register = repo.register.read().await;
-        assert!(ClientRepository::client_instance_id_collides(
-            &register,
-            instance_id
-        ));
-        let non_colliding = (1..)
-            .find(|candidate| !ClientRepository::client_instance_id_collides(&register, *candidate))
-            .expect("available non-colliding client instance id");
-        assert_ne!(non_colliding, 0);
+        assert!(
+            register
+                .local_log
+                .iter()
+                .any(|entry| entry.op.client_instance_id() == instance_id),
+            "the old instance ID should still be retained in the operation log"
+        );
+        assert_ne!(replacement.client_instance_id(), 0);
+        assert_ne!(replacement.client_instance_id(), instance_id);
     }
 
     #[tokio::test]

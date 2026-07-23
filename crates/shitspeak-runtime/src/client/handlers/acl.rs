@@ -158,7 +158,8 @@ pub async fn handle_acl(
                 .get_channels()
                 .get_channel_with_ancestors_in_server(&server_id, channel_id)
                 .await;
-            if let Some(mut channel) = channel {
+            if let Some(channel) = channel {
+                let mut channel = channel.as_ref().clone();
                 channel.inherit_acl = inherit_acl;
                 channel.acls = new_acls.clone();
                 channel.clear_effective_acl_cache();
@@ -192,7 +193,7 @@ pub async fn handle_acl(
                 )
                 .with_home_channel(home_channel);
 
-                let post_write = shitspeak_state::evaluate_permission(
+                let post_write = shitspeak_state::evaluate_permission_shared(
                     &channel,
                     &ancestors,
                     user_id,

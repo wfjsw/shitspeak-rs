@@ -172,7 +172,21 @@ impl WebSessionContext {
         };
 
         let display_name = result.display_name.clone();
-        configure_authenticated_client(&server, &client, result, credential).await;
+        if configure_authenticated_client(&server, &client, result, credential)
+            .await
+            .is_err()
+        {
+            let server_id = client.server_id();
+            server
+                .get_clients()
+                .remove_client_instance_in_server(
+                    &server_id,
+                    client.get_session_id(),
+                    client.client_instance_id(),
+                )
+                .await;
+            return None;
+        }
         Some((
             server,
             Arc::clone(&client),
@@ -223,12 +237,27 @@ pub enum WebSessionTransport {
     Moq,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigureAuthenticatedClientError {
+    MissingRequiredGroup,
+    ServerFull,
+}
+
+impl ConfigureAuthenticatedClientError {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::MissingRequiredGroup => "missing required group",
+            Self::ServerFull => "server full",
+        }
+    }
+}
+
 pub async fn configure_authenticated_client(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     result: AuthenticateResult,
     credential: Option<Credential>,
-) {
+) -> Result<(), ConfigureAuthenticatedClientError> {
     client
         .in_tracing_span(configure_authenticated_client_inner(
             server, client, result, credential,
@@ -241,7 +270,7 @@ async fn configure_authenticated_client_inner(
     client: &Arc<Box<Client>>,
     result: AuthenticateResult,
     credential: Option<Credential>,
-) {
+) -> Result<(), ConfigureAuthenticatedClientError> {
     let cache_username = credential
         .as_ref()
         .map(|credential| credential.username.clone());
@@ -252,6 +281,8 @@ async fn configure_authenticated_client_inner(
     let auth_session_id = result.auth_session_id.clone();
     let authenticated_until = result.authenticated_until;
     let authentication_expiry_action = result.authentication_expiry_action;
+    let initial_texture_url = result.texture_url.clone();
+    let initial_comment_url = result.comment_url.clone();
     if let Some(auth_server_id) = result.virtual_server_id.as_deref() {
         let provisional_server_id = client.server_id();
         if auth_server_id != provisional_server_id {
@@ -274,6 +305,36 @@ async fn configure_authenticated_client_inner(
             }
         }
     }
+    let server_id = client.server_id();
+    if server
+        .get_clients()
+        .authenticated_client_count_in_server(&server_id)
+        >= server.get_max_users()
+    {
+        return Err(ConfigureAuthenticatedClientError::ServerFull);
+    }
+    {
+        let config = server.read_config();
+        if !config.required_groups.is_empty()
+            && !result
+                .groups
+                .iter()
+                .any(|group| config.required_groups.contains(group))
+        {
+            return Err(ConfigureAuthenticatedClientError::MissingRequiredGroup);
+        }
+    }
+    if !server
+        .get_clients()
+        .try_reserve_authenticated_client_in_server(
+            &server_id,
+            client.get_session_id(),
+            server.get_max_users(),
+        )
+        .await
+    {
+        return Err(ConfigureAuthenticatedClientError::ServerFull);
+    }
     client.set_language(result.language);
     client.set_max_bandwidth(result.max_bandwidth);
     client.set_protocol_version(Some(
@@ -285,13 +346,14 @@ async fn configure_authenticated_client_inner(
         gs.set_display_name(result.display_name);
         gs.set_superuser(result.is_superuser);
         gs.set_groups(result.groups.into_iter().collect());
+        gs.set_texture_blob(initial_texture_url, None);
+        gs.set_comment_blob(initial_comment_url, None);
     }
     if let Some(credential) = credential {
         let mut ext = client.user_info_extended().await;
         ext.set_credential(credential);
     }
 
-    let server_id = client.server_id();
     let restored_channels = shitspeak_runtime::user_channel_cache::resolve_login_channels(
         server,
         client,
@@ -354,6 +416,7 @@ async fn configure_authenticated_client_inner(
         authenticated_until,
         authentication_expiry_action,
     );
+    client.stage_session_blob_resolution(result.user_id, result.texture_url, result.comment_url);
     server
         .get_clients()
         .publish_client_in_server(&server_id, client.get_session_id())
@@ -368,6 +431,7 @@ async fn configure_authenticated_client_inner(
         "client authenticated"
     );
     shitspeak_runtime::voice::spawn_voice_routing_task(Arc::clone(server), Arc::clone(client));
+    Ok(())
 }
 
 pub fn control_message_from_command(
@@ -588,15 +652,16 @@ pub async fn initial_server_events(
     let server_id = client.server_id();
     let mut events = Vec::new();
 
-    let channels = server.get_channels().get_all_in_server(&server_id).await;
-    for message in shitspeak_runtime::channel_handler::build_visible_channel_snapshot_messages(
-        server,
-        client,
-        &channels,
-        channel_tree_shadow,
-        server.get_send_permission_info(),
-    )
-    .await
+    let channels = server.get_channels().ordered_snapshot_in_server(&server_id);
+    for message in
+        shitspeak_runtime::channel_handler::build_visible_ordered_channel_snapshot_messages(
+            server,
+            client,
+            &channels,
+            channel_tree_shadow,
+            server.get_send_permission_info(),
+        )
+        .await
     {
         push_message_event(&mut events, message);
     }

@@ -413,11 +413,11 @@ impl ClientProjectionState {
         latest: u64,
         outbound: &mut Vec<Message>,
     ) {
-        let snapshot = server.channels.get_all_in_server(server_id).await;
+        let snapshot = server.channels.ordered_snapshot_in_server(server_id);
         self.channel_permission_shadow.clear();
         let previous = self.channel_tree_shadow.clone();
         let mut current = ChannelTreeShadow::new();
-        let messages = crate::channel_handler::build_visible_channel_snapshot_messages(
+        let messages = crate::channel_handler::build_visible_ordered_channel_snapshot_messages(
             server,
             &self.client,
             &snapshot,

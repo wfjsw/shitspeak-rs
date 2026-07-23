@@ -201,7 +201,7 @@ pub struct ChannelTreeShadow {
 /// from independently cloning and indexing the complete channel tree.
 #[derive(Debug)]
 pub(crate) struct HomeChannelMoveImpact {
-    channels: Vec<Channel>,
+    channels: Vec<Arc<Channel>>,
     channel_indexes: HashMap<u32, usize>,
     new_channel_id: u32,
     permission_channel_ids: HashSet<u32>,
@@ -220,11 +220,12 @@ impl HomeChannelMoveImpact {
         Self::from_channels(channels, old_channel_id, new_channel_id)
     }
 
-    fn from_channels(
-        channels: Vec<Channel>,
+    fn from_channels<C: Into<Arc<Channel>>>(
+        channels: Vec<C>,
         old_channel_id: Option<u32>,
         new_channel_id: u32,
     ) -> Self {
+        let channels = channels.into_iter().map(Into::into).collect::<Vec<_>>();
         let tree = ChannelTree::new(&channels);
         let permission_channel_ids = match old_channel_id {
             Some(old_channel_id) => tree.home_channel_move_affected_channel_ids_for_channel_ids(
@@ -251,7 +252,7 @@ impl HomeChannelMoveImpact {
         }
     }
 
-    pub(crate) fn channels(&self) -> &[Channel] {
+    pub(crate) fn channels(&self) -> &[Arc<Channel>] {
         &self.channels
     }
 
@@ -263,7 +264,7 @@ impl HomeChannelMoveImpact {
         self.new_channel_id
     }
 
-    fn channel(&self, channel_id: u32) -> Option<&Channel> {
+    fn channel(&self, channel_id: u32) -> Option<&Arc<Channel>> {
         self.channel_indexes
             .get(&channel_id)
             .map(|index| &self.channels[*index])
@@ -325,13 +326,13 @@ impl ChannelTreeShadow {
 /// Returns a channel and its complete parent chain from an in-memory channel
 /// snapshot. The result is used to retain the viewer's own placement even
 /// when an ACL update removes Traverse from that channel.
-pub(crate) fn channel_and_ancestor_ids(
-    channels: &[shitspeak_state::Channel],
+pub(crate) fn channel_and_ancestor_ids<C: AsRef<shitspeak_state::Channel>>(
+    channels: &[C],
     channel_id: u32,
 ) -> HashSet<u32> {
     let by_id: HashMap<u32, &shitspeak_state::Channel> = channels
         .iter()
-        .map(|channel| (channel.id, channel))
+        .map(|channel| (channel.as_ref().id, channel.as_ref()))
         .collect();
     let mut result = HashSet::new();
     let mut current_id = channel_id;
@@ -351,8 +352,8 @@ pub(crate) fn channel_and_ancestor_ids(
 /// channel. Building the parent-to-children index once keeps reparent and
 /// home-channel refreshes linear in the channel tree rather than repeatedly
 /// walking it per affected root.
-pub(crate) fn expand_channel_ids_to_descendant_closure(
-    channels: &[shitspeak_state::Channel],
+pub(crate) fn expand_channel_ids_to_descendant_closure<C: AsRef<shitspeak_state::Channel>>(
+    channels: &[C],
     channel_ids: &mut HashSet<u32>,
 ) {
     if channel_ids.is_empty() {
@@ -361,6 +362,7 @@ pub(crate) fn expand_channel_ids_to_descendant_closure(
 
     let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
     for channel in channels {
+        let channel = channel.as_ref();
         if let Some(parent_id) = channel.parent_id {
             children_by_parent
                 .entry(parent_id)
@@ -385,24 +387,62 @@ pub(crate) fn expand_channel_ids_to_descendant_closure(
 /// Orders a set of channel removals so descendants are removed before their
 /// parents. A client treats a removed parent as a subtree removal, so numeric
 /// ID ordering can otherwise make the socket-local tree diverge.
-pub(crate) fn channel_removal_ids_descendant_first(
-    channels: &[shitspeak_state::Channel],
+pub(crate) fn channel_removal_ids_descendant_first<C: AsRef<shitspeak_state::Channel>>(
+    channels: &[C],
     channel_ids: &HashSet<u32>,
 ) -> Vec<u32> {
-    let present_ids = channels
+    let by_id = channels
         .iter()
+        .map(|channel| (channel.as_ref().id, channel.as_ref()))
+        .collect::<HashMap<_, _>>();
+    let mut children = HashMap::<Option<u32>, Vec<u32>>::new();
+    for channel in by_id.values() {
+        children
+            .entry(channel.parent_id)
+            .or_default()
+            .push(channel.id);
+    }
+    for child_ids in children.values_mut() {
+        child_ids.sort_unstable_by_key(|id| {
+            by_id
+                .get(id)
+                .map(|channel| (channel.position, channel.id))
+                .unwrap_or((0, *id))
+        });
+    }
+
+    let mut root_first = Vec::with_capacity(channels.len());
+    let mut visited = HashSet::with_capacity(channels.len());
+    let mut queue = VecDeque::from([0]);
+    while let Some(channel_id) = queue.pop_front() {
+        if !visited.insert(channel_id) || !by_id.contains_key(&channel_id) {
+            continue;
+        }
+        root_first.push(channel_id);
+        if let Some(child_ids) = children.get(&Some(channel_id)) {
+            queue.extend(child_ids.iter().copied());
+        }
+    }
+    let mut remaining = by_id
+        .values()
+        .filter(|channel| !visited.contains(&channel.id))
         .map(|channel| channel.id)
-        .collect::<HashSet<_>>();
-    let mut ordered = ordered_snapshot_channels(channels)
+        .collect::<Vec<_>>();
+    remaining.sort_unstable_by_key(|id| {
+        let channel = by_id[id];
+        (channel.parent_id.unwrap_or(0), channel.position, channel.id)
+    });
+    root_first.extend(remaining);
+
+    let mut ordered = root_first
         .into_iter()
-        .map(|channel| channel.id)
         .filter(|channel_id| channel_ids.contains(channel_id))
         .collect::<Vec<_>>();
     ordered.reverse();
 
     let mut missing = channel_ids
         .iter()
-        .filter(|channel_id| !present_ids.contains(channel_id))
+        .filter(|channel_id| !by_id.contains_key(channel_id))
         .copied()
         .collect::<Vec<_>>();
     missing.sort_unstable_by(|left, right| right.cmp(left));
@@ -576,20 +616,35 @@ async fn filter_visible_channel_links(
     *links = visible_links;
 }
 
+fn visible_snapshot_channels<'a, C: AsRef<Channel>>(
+    snapshot: &'a [C],
+    visible_channel_ids: Option<&'a HashSet<u32>>,
+) -> impl Iterator<Item = (usize, &'a Channel)> {
+    snapshot
+        .iter()
+        .enumerate()
+        .map(|(index, channel)| (index, channel.as_ref()))
+        .filter(move |(_, channel)| {
+            visible_channel_ids.is_none_or(|visible| visible.contains(&channel.id))
+        })
+}
+
 /// Builds a channel snapshot containing only the tree visible to this client.
+/// `snapshot` must use the root-first order returned by `ChannelRepository`.
 /// The shadow records exactly the channel IDs emitted to the socket.
-pub async fn build_visible_channel_snapshot_messages(
+pub async fn build_visible_ordered_channel_snapshot_messages<C: AsRef<Channel>>(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    snapshot: &[Channel],
+    snapshot: &[C],
     channel_tree_shadow: &mut ChannelTreeShadow,
     include_permission_info: bool,
 ) -> Vec<Message> {
     channel_tree_shadow.clear();
 
-    let mut visible_channel_ids = HashSet::with_capacity(snapshot.len());
-    if server.get_hide_channels_without_traverse() {
+    let visible_channel_ids = if server.get_hide_channels_without_traverse() {
+        let mut visible_channel_ids = HashSet::with_capacity(snapshot.len());
         for (index, channel) in snapshot.iter().enumerate() {
+            let channel = channel.as_ref();
             if index != 0 && index % 64 == 0 {
                 tokio::task::yield_now().await;
             }
@@ -602,29 +657,33 @@ pub async fn build_visible_channel_snapshot_messages(
             client.get_current_channel_id(),
         ));
         close_visible_channel_ancestors(snapshot, &mut visible_channel_ids);
+        Some(visible_channel_ids)
     } else {
-        visible_channel_ids.extend(snapshot.iter().map(|channel| channel.id));
-    }
+        None
+    };
 
-    let mut messages = Vec::with_capacity(visible_channel_ids.len());
-    for (index, channel) in ordered_snapshot_channels(snapshot).into_iter().enumerate() {
+    let mut messages = Vec::with_capacity(
+        visible_channel_ids
+            .as_ref()
+            .map_or(snapshot.len(), HashSet::len),
+    );
+    for (index, channel) in visible_snapshot_channels(snapshot, visible_channel_ids.as_ref()) {
         if index != 0 && index % 64 == 0 {
             tokio::task::yield_now().await;
-        }
-        if !visible_channel_ids.contains(&channel.id) {
-            continue;
         }
         let mut state = build_channel_state_message_with_options(
             server,
             client,
-            &channel,
+            channel,
             include_permission_info,
             None,
         )
         .await;
-        state
-            .links
-            .retain(|channel_id| visible_channel_ids.contains(channel_id));
+        if let Some(visible_channel_ids) = &visible_channel_ids {
+            state
+                .links
+                .retain(|channel_id| visible_channel_ids.contains(channel_id));
+        }
         channel_tree_shadow.insert(channel.id);
         messages.push(state.into());
     }
@@ -1171,7 +1230,7 @@ async fn prepare_channel_visibility_refresh_inner(
         let mut channels_by_id = HashMap::with_capacity(affected_channel_ids.len());
         let mut pending = affected_channel_ids.iter().copied().collect::<Vec<_>>();
         while let Some(channel_id) = pending.pop() {
-            if let Some(channel) = snapshot.channel(channel_id)
+            if let Some(channel) = snapshot.channel_arc(channel_id)
                 && channels_by_id.insert(channel.id, channel.clone()).is_none()
                 && let Some(parent_id) = channel.parent_id
             {
@@ -1192,7 +1251,10 @@ async fn prepare_channel_visibility_refresh_inner(
                 .get_channel_in_server(&server_id, channel_id)
                 .await
             {
-                if channels_by_id.insert(channel.id, channel.clone()).is_none() {
+                if channels_by_id
+                    .insert(channel.id, Arc::clone(&channel))
+                    .is_none()
+                {
                     if let Some(parent_id) = channel.parent_id {
                         pending.push(parent_id);
                         affected_channel_ids.insert(parent_id);
@@ -1668,18 +1730,18 @@ pub(crate) async fn permission_info_for_channel(
     channel_id: u32,
 ) -> (bool, enumflags2::BitFlags<shitspeak_state::ACLPermissions>) {
     let server_id = client.server_id();
-    let (_, channel, ancestors) = server
+    let (_, channel) = server
         .get_channels()
-        .get_channel_with_ancestors_for_acl_in_server(&server_id, channel_id)
+        .get_channel_for_acl_in_server(&server_id, channel_id)
         .await;
     let is_enter_restricted = channel.as_ref().is_some_and(|channel| {
         shitspeak_state::channel_has_effective_restriction(
             channel,
-            &ancestors,
+            &[],
             shitspeak_state::ACLPermissions::Traverse,
         ) || shitspeak_state::channel_has_effective_restriction(
             channel,
-            &ancestors,
+            &[],
             shitspeak_state::ACLPermissions::Enter,
         )
     });
@@ -1695,18 +1757,18 @@ async fn permission_info_for_channel_with_home(
     home_channel_id: u32,
 ) -> (bool, enumflags2::BitFlags<shitspeak_state::ACLPermissions>) {
     let server_id = client.server_id();
-    let (_, channel, ancestors) = server
+    let (_, channel) = server
         .get_channels()
-        .get_channel_with_ancestors_for_acl_in_server(&server_id, channel_id)
+        .get_channel_for_acl_in_server(&server_id, channel_id)
         .await;
     let is_enter_restricted = channel.as_ref().is_some_and(|channel| {
         shitspeak_state::channel_has_effective_restriction(
             channel,
-            &ancestors,
+            &[],
             shitspeak_state::ACLPermissions::Traverse,
         ) || shitspeak_state::channel_has_effective_restriction(
             channel,
-            &ancestors,
+            &[],
             shitspeak_state::ACLPermissions::Enter,
         )
     });
@@ -2126,7 +2188,7 @@ async fn deleted_subtree_from_shadow(
 }
 
 fn has_ancestor(
-    channels_by_id: &HashMap<u32, shitspeak_state::Channel>,
+    channels_by_id: &HashMap<u32, Arc<shitspeak_state::Channel>>,
     channel_id: u32,
     ancestor_id: u32,
 ) -> bool {
@@ -2429,10 +2491,10 @@ async fn replay_channel_snapshot(
     if let Some(shadow) = permission_shadow.as_deref_mut() {
         shadow.clear();
     }
-    let snapshot = channels.get_all_in_server(server_id).await;
+    let snapshot = channels.ordered_snapshot_in_server(server_id);
     let previous = channel_tree_shadow.clone();
     let mut current = ChannelTreeShadow::new();
-    let messages = build_visible_channel_snapshot_messages(
+    let messages = build_visible_ordered_channel_snapshot_messages(
         server,
         client,
         &snapshot,
@@ -2484,15 +2546,17 @@ async fn replay_channel_snapshot(
     Ok(())
 }
 
-pub fn ordered_snapshot_channels(
-    channels: &[shitspeak_state::Channel],
-) -> Vec<shitspeak_state::Channel> {
-    let by_id: HashMap<u32, &shitspeak_state::Channel> = channels
+pub fn ordered_snapshot_channels<C>(channels: &[C]) -> Vec<C>
+where
+    C: AsRef<shitspeak_state::Channel> + Clone,
+{
+    let by_id: HashMap<u32, &C> = channels
         .iter()
-        .map(|channel| (channel.id, channel))
+        .map(|channel| (channel.as_ref().id, channel))
         .collect();
     let mut children: HashMap<Option<u32>, Vec<u32>> = HashMap::new();
     for channel in channels {
+        let channel = channel.as_ref();
         children
             .entry(channel.parent_id)
             .or_default()
@@ -2502,7 +2566,10 @@ pub fn ordered_snapshot_channels(
         child_ids.sort_by_key(|id| {
             by_id
                 .get(id)
-                .map(|channel| (channel.position, channel.id))
+                .map(|channel| {
+                    let channel = channel.as_ref();
+                    (channel.position, channel.id)
+                })
                 .unwrap_or((0, *id))
         });
     }
@@ -2521,7 +2588,7 @@ pub fn ordered_snapshot_channels(
         let Some(channel) = by_id.get(&id) else {
             continue;
         };
-        out.push((*channel).clone());
+        out.push(C::clone(channel));
         if let Some(child_ids) = children.get(&Some(id)) {
             queue.extend(child_ids.iter().copied());
         }
@@ -2529,10 +2596,13 @@ pub fn ordered_snapshot_channels(
 
     let mut remaining: Vec<_> = channels
         .iter()
-        .filter(|channel| !visited.contains(&channel.id))
+        .filter(|channel| !visited.contains(&channel.as_ref().id))
         .cloned()
         .collect();
-    remaining.sort_by_key(|channel| (channel.parent_id.unwrap_or(0), channel.position, channel.id));
+    remaining.sort_by_key(|channel| {
+        let channel = channel.as_ref();
+        (channel.parent_id.unwrap_or(0), channel.position, channel.id)
+    });
     out.extend(remaining);
     out
 }
@@ -2541,13 +2611,13 @@ pub fn ordered_snapshot_channels(
 /// present too.  ACLs may make a non-inheriting child traversable while its
 /// parent is not, so close the direct visibility result over the channel tree
 /// before emitting any ChannelState messages.
-pub(crate) fn close_visible_channel_ancestors(
-    channels: &[shitspeak_state::Channel],
+pub(crate) fn close_visible_channel_ancestors<C: AsRef<shitspeak_state::Channel>>(
+    channels: &[C],
     visible_channel_ids: &mut HashSet<u32>,
 ) {
     let by_id: HashMap<u32, &shitspeak_state::Channel> = channels
         .iter()
-        .map(|channel| (channel.id, channel))
+        .map(|channel| (channel.as_ref().id, channel.as_ref()))
         .collect();
     let initially_visible = visible_channel_ids.clone();
     let mut hidden = Vec::new();
@@ -2594,6 +2664,7 @@ mod tests {
         channels_affected_by_home_channel_move, channels_with_home_channel_dependent_acls,
         close_visible_channel_ancestors, expand_channel_ids_to_descendant_closure,
         ordered_snapshot_channels, suppress_known_projected_permission_messages,
+        visible_snapshot_channels,
     };
 
     #[test]
@@ -2758,6 +2829,24 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(ordered_ids, vec![0, 2, 3, 5, 4, 6, 7]);
+    }
+
+    #[test]
+    fn visible_snapshot_filter_preserves_repository_order() {
+        let channels = vec![
+            channel(0, None, 0),
+            channel(2, Some(0), 0),
+            channel(3, Some(0), 1),
+            channel(5, Some(2), 0),
+            channel(4, Some(3), 0),
+        ];
+        let visible = HashSet::from([0, 3, 4]);
+
+        let visible_ids = visible_snapshot_channels(&channels, Some(&visible))
+            .map(|(_, channel)| channel.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible_ids, vec![0, 3, 4]);
     }
 
     #[test]
@@ -3492,7 +3581,7 @@ pub async fn home_channel_dependent_channel_ids(
 async fn build_channel_permission_info_refresh_messages_for_channels(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    mut channels: Vec<Channel>,
+    mut channels: Vec<Arc<Channel>>,
 ) -> Vec<Message> {
     channels.sort_by_key(|channel| (channel.parent_id.unwrap_or(0), channel.position, channel.id));
 
@@ -3515,7 +3604,7 @@ async fn build_channel_permission_info_refresh_messages_for_channels(
 async fn build_scoped_permission_info_refresh_messages_for_channels(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    mut channels: Vec<Channel>,
+    mut channels: Vec<Arc<Channel>>,
     home_channel_id: u32,
 ) -> Vec<Message> {
     channels.sort_by_key(|channel| (channel.parent_id.unwrap_or(0), channel.position, channel.id));
@@ -3547,20 +3636,20 @@ async fn build_scoped_permission_info_refresh_messages_for_channels(
     messages
 }
 
-fn channels_with_home_channel_dependent_acls(channels: Vec<Channel>) -> Vec<Channel> {
+fn channels_with_home_channel_dependent_acls<C: AsRef<Channel>>(channels: Vec<C>) -> Vec<C> {
     let affected = ChannelTree::new(&channels).home_channel_dependent_acl_channel_ids();
 
     channels
         .into_iter()
-        .filter(|channel| affected.contains(&channel.id))
+        .filter(|channel| affected.contains(&channel.as_ref().id))
         .collect()
 }
 
-fn channels_affected_by_home_channel_move(
-    channels: Vec<Channel>,
+fn channels_affected_by_home_channel_move<C: AsRef<Channel>>(
+    channels: Vec<C>,
     old_channel_id: u32,
     new_channel_id: u32,
-) -> Vec<Channel> {
+) -> Vec<C> {
     let affected = {
         let tree = ChannelTree::new(&channels);
         tree.home_channel_move_affected_channel_ids_for_channel_ids(old_channel_id, new_channel_id)
@@ -3568,7 +3657,7 @@ fn channels_affected_by_home_channel_move(
 
     channels
         .into_iter()
-        .filter(|channel| affected.contains(&channel.id))
+        .filter(|channel| affected.contains(&channel.as_ref().id))
         .collect()
 }
 
@@ -3609,13 +3698,14 @@ enum AclApplication {
 }
 
 impl<'a> ChannelTree<'a> {
-    fn new(channels: &'a [Channel]) -> Self {
+    fn new<C: AsRef<Channel>>(channels: &'a [C]) -> Self {
         let by_id: HashMap<u32, &Channel> = channels
             .iter()
-            .map(|channel| (channel.id, channel))
+            .map(|channel| (channel.as_ref().id, channel.as_ref()))
             .collect();
         let mut children_by_parent_id: HashMap<Option<u32>, Vec<u32>> = HashMap::new();
         for channel in channels {
+            let channel = channel.as_ref();
             children_by_parent_id
                 .entry(channel.parent_id)
                 .or_default()

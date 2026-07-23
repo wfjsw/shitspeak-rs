@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use acl::handle_acl;
 use authenticate::handle_authenticate;
+pub use authenticate::spawn_staged_session_blob_resolution;
 use ban_list::handle_ban_list;
 use channel_remove::handle_channel_remove;
 use channel_state::handle_channel_state;

@@ -4,9 +4,9 @@ use bytes::Bytes;
 
 use crate::{
     channel_handler::{
-        ChannelTreeShadow, SessionChannelShadow, build_visible_channel_snapshot_messages,
+        ChannelTreeShadow, SessionChannelShadow, build_visible_ordered_channel_snapshot_messages,
     },
-    client::{Client, OwnedMessageBatch, user_info::Credential},
+    client::{Client, DeferredSessionBlobResolution, OwnedMessageBatch, user_info::Credential},
     errors::{AuthRejection, MessageHandlerError},
     localization::{TextKey, text},
     messages::{
@@ -16,7 +16,7 @@ use crate::{
     server::Server,
 };
 use shitspeak_auth::{
-    AuthenticateAuxiliaryData, AuthenticationRejection, canonical_authenticator_ip,
+    AuthenticateAuxiliaryData, AuthenticationRejection, Authenticator, canonical_authenticator_ip,
 };
 
 const AUTH_FINALIZATION_YIELD_EVERY: usize = 64;
@@ -205,37 +205,22 @@ pub async fn handle_authenticate(
     }
     let server_id = sender.server_id();
 
-    // ── Snapshot clients for the selected server scope for max-users.
-    let (limit_clients, _) = server
-        .get_clients()
-        .snapshot_with_versions_in_server(&server_id)
-        .await;
-
-    // ── Max-users check ───────────────────────────────────────────────────
-    {
-        let authenticated_clients = limit_clients
-            .iter()
-            .filter(|client| client.is_authenticated())
-            .count() as u64;
-        if authenticated_clients >= server.get_max_users() {
-            return Err(AuthRejection::new_with_language(
-                RejectType::ServerFull,
-                sender.language(),
-            )
-            .into());
-        }
+    // Avoid identity/ACL finalization work when the selected server is
+    // already full. The reservation CAS below remains the race-safe check.
+    if repo.authenticated_client_count_in_server(&server_id) >= server.get_max_users() {
+        return Err(
+            AuthRejection::new_with_language(RejectType::ServerFull, sender.language()).into(),
+        );
     }
 
     // ── Required groups check ─────────────────────────────────────────────
     {
-        let required = server.get_required_groups();
-        if !required.is_empty() {
-            let user_groups = result
+        let config = server.read_config();
+        if !config.required_groups.is_empty() {
+            let has_required = result
                 .groups
                 .iter()
-                .map(|s| s.as_str())
-                .collect::<std::collections::HashSet<_>>();
-            let has_required = required.iter().any(|g| user_groups.contains(g.as_str()));
+                .any(|group| config.required_groups.contains(group));
             if !has_required {
                 tracing::trace!(
                     session = u32::from(session),
@@ -248,70 +233,8 @@ pub async fn handle_authenticate(
         }
     }
 
-    let (texture_url, texture_hash) = match result.texture_url {
-        Some(url) => {
-            let hash = server
-                .get_session_blobs()
-                .fetch_and_cache(&url)
-                .await
-                .map(|(hash, _)| hash);
-            (Some(url), hash)
-        }
-        None => match result.user_id {
-            Some(user_id) => {
-                let hash = match auth_permit.authenticator().get_user_texture(user_id).await {
-                    Some(texture) if !texture.is_empty() => server
-                        .get_session_blobs()
-                        .put_content(&texture)
-                        .await
-                        .map_err(|e| {
-                            tracing::warn!(
-                                error = %e,
-                                user_id,
-                                "failed to cache authenticator texture blob"
-                            );
-                            e
-                        })
-                        .ok(),
-                    _ => None,
-                };
-                (None, hash)
-            }
-            None => (None, None),
-        },
-    };
-    let (comment_url, comment_hash) = match result.comment_url {
-        Some(url) => {
-            let hash = server
-                .get_session_blobs()
-                .fetch_and_cache(&url)
-                .await
-                .map(|(hash, _)| hash);
-            (Some(url), hash)
-        }
-        None => match result.user_id {
-            Some(user_id) => {
-                let hash = match auth_permit.authenticator().get_user_comment(user_id).await {
-                    Some(comment) if !comment.is_empty() => server
-                        .get_session_blobs()
-                        .put_content(comment.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            tracing::warn!(
-                                error = %e,
-                                user_id,
-                                "failed to cache authenticator comment blob"
-                            );
-                            e
-                        })
-                        .ok(),
-                    _ => None,
-                };
-                (None, hash)
-            }
-            None => (None, None),
-        },
-    };
+    let initial_texture_url = result.texture_url.clone();
+    let initial_comment_url = result.comment_url.clone();
 
     // ── Store identity on client ─────────────────────────────────────────
     {
@@ -321,8 +244,8 @@ pub async fn handle_authenticate(
         gs.set_display_name(result.display_name);
         gs.set_superuser(result.is_superuser);
         gs.set_groups(result.groups.into_iter().collect());
-        gs.set_texture_blob(texture_url, texture_hash);
-        gs.set_comment_blob(comment_url, comment_hash);
+        gs.set_texture_blob(initial_texture_url, None);
+        gs.set_comment_blob(initial_comment_url, None);
         // Set access tokens within the same guard
         gs.set_tokens(msg.tokens.into_iter().collect());
     }
@@ -331,12 +254,33 @@ pub async fn handle_authenticate(
         ext.set_credential(Credential::new(username, password));
     }
 
+    // Reserve before the root ACL check so concurrent over-capacity attempts
+    // do not all perform the same permission computation. Replicated counts
+    // remain eventually consistent across cluster nodes.
+    if !repo
+        .try_reserve_authenticated_client_in_server(
+            &server_id,
+            sender.get_session_id(),
+            server.get_max_users(),
+        )
+        .await
+    {
+        return Err(
+            AuthRejection::new_with_language(RejectType::ServerFull, sender.language()).into(),
+        );
+    }
+
     // ── Traverse permission check on root channel ─────────────────────────
     // Superusers bypass this check.
     if !sender.is_superuser() {
         let root_perms =
             crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
         if !root_perms.contains(shitspeak_state::ACLPermissions::Traverse) {
+            repo.release_authenticated_client_reservation_in_server(
+                &server_id,
+                sender.get_session_id(),
+            )
+            .await;
             tracing::trace!(
                 session = u32::from(session),
                 "Authenticate built outbound Reject payload"
@@ -346,7 +290,7 @@ pub async fn handle_authenticate(
                 .into());
         }
     }
-
+    sender.stage_session_blob_resolution(result.user_id, result.texture_url, result.comment_url);
     sender.complete_authentication(
         auth_session_id,
         authenticated_until,
@@ -461,7 +405,7 @@ pub async fn handle_authenticate(
 
     // 1. Channel tree — BFS from root
     {
-        for message in build_visible_channel_snapshot_messages(
+        for message in build_visible_ordered_channel_snapshot_messages(
             server,
             sender,
             &all_channels,
@@ -637,4 +581,218 @@ pub async fn handle_authenticate(
     // No need to broadcast manually here.
 
     Ok(())
+}
+
+pub fn spawn_staged_session_blob_resolution(server: Arc<Box<Server>>, client: Arc<Box<Client>>) {
+    if let Some(resolution) = client.take_session_blob_resolution() {
+        spawn_deferred_session_blob_resolution(server, client, resolution);
+    }
+}
+
+fn spawn_deferred_session_blob_resolution(
+    server: Arc<Box<Server>>,
+    client: Arc<Box<Client>>,
+    resolution: DeferredSessionBlobResolution,
+) {
+    tokio::spawn(async move {
+        if !client_is_current(&server, &client).await {
+            return;
+        }
+        let (user_id, texture_url, comment_url, texture_revision, comment_revision) =
+            resolution.into_parts();
+        let authenticator = server.authenticator_arc();
+        let texture = resolve_texture(&server, Arc::clone(&authenticator), user_id, texture_url);
+        let comment = resolve_comment(&server, authenticator, user_id, comment_url);
+        tokio::pin!(texture);
+        tokio::pin!(comment);
+        let mut texture_done = false;
+        let mut comment_done = false;
+
+        while !texture_done || !comment_done {
+            tokio::select! {
+                _ = client.removed() => return,
+                resolved = &mut texture, if !texture_done => {
+                    texture_done = true;
+                    apply_resolved_texture(&server, &client, texture_revision, resolved).await;
+                }
+                resolved = &mut comment, if !comment_done => {
+                    comment_done = true;
+                    apply_resolved_comment(&server, &client, comment_revision, resolved).await;
+                }
+            }
+        }
+    });
+}
+
+async fn resolve_texture(
+    server: &Arc<Box<Server>>,
+    authenticator: Arc<dyn Authenticator>,
+    user_id: Option<u32>,
+    texture_url: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match texture_url {
+        Some(url) => {
+            let hash = server
+                .get_session_blobs()
+                .fetch_and_cache(&url)
+                .await
+                .map(|(hash, _)| hash);
+            (Some(url), hash)
+        }
+        None => {
+            let hash = match user_id {
+                Some(user_id) => match authenticator.get_user_texture(user_id).await {
+                    Some(texture) if !texture.is_empty() => server
+                        .get_session_blobs()
+                        .put_content(&texture)
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(
+                                %error,
+                                user_id,
+                                "failed to cache authenticator texture blob"
+                            );
+                            error
+                        })
+                        .ok(),
+                    _ => None,
+                },
+                None => None,
+            };
+            (None, hash)
+        }
+    }
+}
+
+async fn resolve_comment(
+    server: &Arc<Box<Server>>,
+    authenticator: Arc<dyn Authenticator>,
+    user_id: Option<u32>,
+    comment_url: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match comment_url {
+        Some(url) => {
+            let hash = server
+                .get_session_blobs()
+                .fetch_and_cache(&url)
+                .await
+                .map(|(hash, _)| hash);
+            (Some(url), hash)
+        }
+        None => {
+            let hash = match user_id {
+                Some(user_id) => match authenticator.get_user_comment(user_id).await {
+                    Some(comment) if !comment.is_empty() => server
+                        .get_session_blobs()
+                        .put_content(comment.as_bytes())
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(
+                                %error,
+                                user_id,
+                                "failed to cache authenticator comment blob"
+                            );
+                            error
+                        })
+                        .ok(),
+                    _ => None,
+                },
+                None => None,
+            };
+            (None, hash)
+        }
+    }
+}
+
+async fn apply_resolved_texture(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    expected_revision: u64,
+    (url, hash): (Option<String>, Option<String>),
+) {
+    if !client_is_current(server, client).await
+        || !client.is_authenticated()
+        || !client.is_published()
+    {
+        return;
+    }
+    let mut state = client.write_global_state(server.get_clients());
+    apply_texture_if_revision(&mut state, expected_revision, url, hash);
+}
+
+async fn apply_resolved_comment(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    expected_revision: u64,
+    (url, hash): (Option<String>, Option<String>),
+) {
+    if !client_is_current(server, client).await
+        || !client.is_authenticated()
+        || !client.is_published()
+    {
+        return;
+    }
+    let mut state = client.write_global_state(server.get_clients());
+    apply_comment_if_revision(&mut state, expected_revision, url, hash);
+}
+
+fn apply_texture_if_revision(
+    state: &mut crate::client::client_global_state::ClientGlobalState,
+    expected_revision: u64,
+    url: Option<String>,
+    hash: Option<String>,
+) {
+    if state.texture_blob_revision() == expected_revision {
+        state.set_texture_blob(url, hash);
+    }
+}
+
+fn apply_comment_if_revision(
+    state: &mut crate::client::client_global_state::ClientGlobalState,
+    expected_revision: u64,
+    url: Option<String>,
+    hash: Option<String>,
+) {
+    if state.comment_blob_revision() == expected_revision {
+        state.set_comment_blob(url, hash);
+    }
+}
+
+async fn client_is_current(server: &Arc<Box<Server>>, client: &Arc<Box<Client>>) -> bool {
+    server
+        .get_clients()
+        .get_client_in_server(&client.server_id(), client.get_session_id())
+        .await
+        .is_some_and(|current| Arc::ptr_eq(&current, client))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_comment_if_revision, apply_texture_if_revision};
+    use crate::client::client_global_state::ClientGlobalState;
+
+    #[test]
+    fn explicit_clear_blocks_late_authenticator_blobs() {
+        let mut state = ClientGlobalState::new();
+        let texture_revision = state.texture_blob_revision();
+        let comment_revision = state.comment_blob_revision();
+
+        state.clear_texture_blob();
+        state.clear_comment_blob();
+        apply_texture_if_revision(
+            &mut state,
+            texture_revision,
+            None,
+            Some("late-texture".to_owned()),
+        );
+        apply_comment_if_revision(
+            &mut state,
+            comment_revision,
+            None,
+            Some("late-comment".to_owned()),
+        );
+
+        assert!(state.get_texture_hash().is_none());
+        assert!(state.get_comment_hash().is_none());
+    }
 }

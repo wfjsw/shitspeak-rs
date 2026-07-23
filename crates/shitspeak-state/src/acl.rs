@@ -4,7 +4,8 @@ use enumflags2::BitFlags;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ChannelHierarchy, ClientMembershipQuery, group_depends_on_home_channel, is_member_in_group,
+    ChannelHierarchy, ChannelReference, ClientMembershipQuery, group_depends_on_home_channel,
+    is_member_in_group,
 };
 
 pub use shitspeak_core::ACLPermissions;
@@ -336,12 +337,12 @@ struct CompiledHierarchy {
 }
 
 impl CompiledHierarchy {
-    fn from_channels(channel_id: u32, ancestors: &[crate::Channel]) -> Self {
+    fn from_channels<A: ChannelReference>(channel_id: u32, ancestors: &[A]) -> Self {
         Self {
             channel_id,
             ancestors: ancestors
                 .iter()
-                .map(|channel| channel.id)
+                .map(|channel| channel.as_ref().id)
                 .collect::<Vec<_>>()
                 .into(),
         }
@@ -443,15 +444,15 @@ impl CompiledEffectiveAcl {
     }
 }
 
-pub(crate) fn compile_effective_acl(
+pub(crate) fn compile_effective_acl<A: ChannelReference>(
     channel: &crate::Channel,
-    ancestors: &[crate::Channel],
+    ancestors: &[A],
 ) -> CompiledEffectiveAcl {
     let destination = compile_acl_chain(channel, ancestors, false);
     let path = (0..ancestors.len())
         .rev()
         .map(|index| CompiledPathStage {
-            entries: compile_acl_chain(&ancestors[index], &ancestors[index + 1..], true),
+            entries: compile_acl_chain(ancestors[index].as_ref(), &ancestors[index + 1..], true),
         })
         .collect::<Vec<_>>();
     let path_has_home_channel_dependent_group = path.iter().any(|stage| {
@@ -466,7 +467,10 @@ pub(crate) fn compile_effective_acl(
         destination,
         path,
         path_has_home_channel_dependent_group,
-        ancestor_ids: ancestors.iter().map(|ancestor| ancestor.id).collect(),
+        ancestor_ids: ancestors
+            .iter()
+            .map(|ancestor| ancestor.as_ref().id)
+            .collect(),
         source_id: channel.id,
         source_parent_id: channel.parent_id,
         source_inherit_acl: channel.inherit_acl,
@@ -474,9 +478,9 @@ pub(crate) fn compile_effective_acl(
     }
 }
 
-fn compile_acl_chain(
+fn compile_acl_chain<A: ChannelReference>(
     channel: &crate::Channel,
-    ancestors: &[crate::Channel],
+    ancestors: &[A],
     acl_uses_full_hierarchy: bool,
 ) -> Vec<CompiledAclEntry> {
     let evaluation_channel = CompiledHierarchy::from_channels(channel.id, ancestors);
@@ -484,13 +488,14 @@ fn compile_acl_chain(
     let mut entries = Vec::new();
 
     for index in (0..inherited_len).rev() {
+        let ancestor = ancestors[index].as_ref();
         append_compiled_entries(
             &mut entries,
-            &ancestors[index].acls,
+            &ancestor.acls,
             false,
             &evaluation_channel,
             CompiledHierarchy::from_channels(
-                ancestors[index].id,
+                ancestor.id,
                 if acl_uses_full_hierarchy {
                     &ancestors[index + 1..]
                 } else {
@@ -553,10 +558,53 @@ pub fn evaluate_permission(
     evaluate_permission_with_behavior(channel, ancestors, user_id, client, false)
 }
 
+/// Evaluate effective permissions using shared channel ancestors.
+pub fn evaluate_permission_shared(
+    channel: &crate::Channel,
+    ancestors: &[Arc<crate::Channel>],
+    user_id: Option<u32>,
+    client: &ClientMembershipQuery,
+) -> BitFlags<ACLPermissions> {
+    evaluate_permission_with_behavior_shared(channel, ancestors, user_id, client, false)
+}
+
 /// Evaluate permissions with configurable ACL compatibility behavior.
 pub fn evaluate_permission_with_behavior(
     channel: &crate::Channel,
     ancestors: &[crate::Channel],
+    user_id: Option<u32>,
+    client: &ClientMembershipQuery,
+    explicit_enter_deny_overrides_write: bool,
+) -> BitFlags<ACLPermissions> {
+    evaluate_permission_impl(
+        channel,
+        ancestors,
+        user_id,
+        client,
+        explicit_enter_deny_overrides_write,
+    )
+}
+
+/// Evaluate permissions with configurable ACL behavior using shared ancestors.
+pub fn evaluate_permission_with_behavior_shared(
+    channel: &crate::Channel,
+    ancestors: &[Arc<crate::Channel>],
+    user_id: Option<u32>,
+    client: &ClientMembershipQuery,
+    explicit_enter_deny_overrides_write: bool,
+) -> BitFlags<ACLPermissions> {
+    evaluate_permission_impl(
+        channel,
+        ancestors,
+        user_id,
+        client,
+        explicit_enter_deny_overrides_write,
+    )
+}
+
+fn evaluate_permission_impl<A: ChannelReference>(
+    channel: &crate::Channel,
+    ancestors: &[A],
     user_id: Option<u32>,
     client: &ClientMembershipQuery,
     explicit_enter_deny_overrides_write: bool,
@@ -644,9 +692,9 @@ fn evaluate_compiled_acl(
     )
 }
 
-fn evaluate_channel_acl(
+fn evaluate_channel_acl<A: ChannelReference>(
     channel: &crate::Channel,
-    ancestors: &[crate::Channel],
+    ancestors: &[A],
     user_id: Option<u32>,
     client: &ClientMembershipQuery,
     explicit_enter_deny_overrides_write: bool,
@@ -660,13 +708,12 @@ fn evaluate_channel_acl(
         ChannelHierarchy::from_channels(target_id, &ancestors[..inherited_len]);
 
     for index in (0..inherited_len).rev() {
-        let acl_channel = ChannelHierarchy::from_channels(
-            ancestors[index].id,
-            &ancestors[index + 1..inherited_len],
-        );
+        let ancestor = ancestors[index].as_ref();
+        let acl_channel =
+            ChannelHierarchy::from_channels(ancestor.id, &ancestors[index + 1..inherited_len]);
         apply_permission_acl_entries(
-            &ancestors[index].acls,
-            ancestors[index].id == target_id,
+            &ancestor.acls,
+            ancestor.id == target_id,
             evaluation_channel,
             acl_channel,
             user_id,
@@ -771,19 +818,24 @@ fn apply_permission_acl_entries(
 /// Only Traverse and Write participate in the path gate. Borrowed channel
 /// slices avoid recursively evaluating every permission or rebuilding ID
 /// vectors for each ancestor.
-fn ancestor_path_allows_traverse(
-    ancestors: &[crate::Channel],
+fn ancestor_path_allows_traverse<A: ChannelReference>(
+    ancestors: &[A],
     user_id: Option<u32>,
     client: &ClientMembershipQuery,
 ) -> bool {
     (0..ancestors.len()).rev().all(|index| {
-        channel_allows_path_traverse(&ancestors[index], &ancestors[index + 1..], user_id, client)
+        channel_allows_path_traverse(
+            ancestors[index].as_ref(),
+            &ancestors[index + 1..],
+            user_id,
+            client,
+        )
     })
 }
 
-fn channel_allows_path_traverse(
+fn channel_allows_path_traverse<A: ChannelReference>(
     channel: &crate::Channel,
-    ancestors: &[crate::Channel],
+    ancestors: &[A],
     user_id: Option<u32>,
     client: &ClientMembershipQuery,
 ) -> bool {
@@ -793,17 +845,17 @@ fn channel_allows_path_traverse(
     let inherited_len = if channel.inherit_acl {
         ancestors
             .iter()
-            .position(|ancestor| !ancestor.inherit_acl)
+            .position(|ancestor| !ancestor.as_ref().inherit_acl)
             .map_or(ancestors.len(), |index| index + 1)
     } else {
         0
     };
 
     for index in (0..inherited_len).rev() {
-        let acl_channel =
-            ChannelHierarchy::from_channels(ancestors[index].id, &ancestors[index + 1..]);
+        let ancestor = ancestors[index].as_ref();
+        let acl_channel = ChannelHierarchy::from_channels(ancestor.id, &ancestors[index + 1..]);
         apply_path_acl_entries(
-            &ancestors[index].acls,
+            &ancestor.acls,
             false,
             evaluation_channel,
             acl_channel,
@@ -869,20 +921,23 @@ fn apply_path_acl_entries(
     }
 }
 
-fn effective_inherited_len(channel: &crate::Channel, ancestors: &[crate::Channel]) -> usize {
+fn effective_inherited_len<A: ChannelReference>(
+    channel: &crate::Channel,
+    ancestors: &[A],
+) -> usize {
     if !channel.inherit_acl {
         return 0;
     }
 
     ancestors
         .iter()
-        .position(|ancestor| !ancestor.inherit_acl)
+        .position(|ancestor| !ancestor.as_ref().inherit_acl)
         .map_or(ancestors.len(), |index| index + 1)
 }
 
-fn any_applicable_effective_acl(
+fn any_applicable_effective_acl<A: ChannelReference>(
     channel: &crate::Channel,
-    ancestors: &[crate::Channel],
+    ancestors: &[A],
     mut predicate: impl FnMut(&ACL, ChannelHierarchy<'_>, ChannelHierarchy<'_>) -> bool,
 ) -> bool {
     let target_id = channel.id;
@@ -892,7 +947,7 @@ fn any_applicable_effective_acl(
         ChannelHierarchy::from_channels(target_id, &ancestors[..inherited_len]);
 
     for index in (0..inherited_len).rev() {
-        let ch = &ancestors[index];
+        let ch = ancestors[index].as_ref();
         let acl_channel =
             ChannelHierarchy::from_channels(ch.id, &ancestors[index + 1..inherited_len]);
         for acl in &ch.acls {
@@ -920,6 +975,21 @@ pub fn effective_acl_chain_has_home_channel_dependent_group(
     channel: &crate::Channel,
     ancestors: &[crate::Channel],
 ) -> bool {
+    effective_acl_chain_has_home_channel_dependent_group_impl(channel, ancestors)
+}
+
+/// Check home-channel dependence using shared channel ancestors.
+pub fn effective_acl_chain_has_home_channel_dependent_group_shared(
+    channel: &crate::Channel,
+    ancestors: &[Arc<crate::Channel>],
+) -> bool {
+    effective_acl_chain_has_home_channel_dependent_group_impl(channel, ancestors)
+}
+
+fn effective_acl_chain_has_home_channel_dependent_group_impl<A: ChannelReference>(
+    channel: &crate::Channel,
+    ancestors: &[A],
+) -> bool {
     if let Some(compiled) = channel
         .effective_acl_cache
         .as_ref()
@@ -939,6 +1009,25 @@ pub fn effective_acl_chain_has_home_channel_dependent_group(
 pub fn effective_acl_chain_home_channel_match_changes(
     channel: &crate::Channel,
     ancestors: &[crate::Channel],
+    old_home: ChannelHierarchy<'_>,
+    new_home: ChannelHierarchy<'_>,
+) -> bool {
+    effective_acl_chain_home_channel_match_changes_impl(channel, ancestors, old_home, new_home)
+}
+
+/// Check whether a home-channel move changes matching using shared ancestors.
+pub fn effective_acl_chain_home_channel_match_changes_shared(
+    channel: &crate::Channel,
+    ancestors: &[Arc<crate::Channel>],
+    old_home: ChannelHierarchy<'_>,
+    new_home: ChannelHierarchy<'_>,
+) -> bool {
+    effective_acl_chain_home_channel_match_changes_impl(channel, ancestors, old_home, new_home)
+}
+
+fn effective_acl_chain_home_channel_match_changes_impl<A: ChannelReference>(
+    channel: &crate::Channel,
+    ancestors: &[A],
     old_home: ChannelHierarchy<'_>,
     new_home: ChannelHierarchy<'_>,
 ) -> bool {
@@ -999,9 +1088,9 @@ pub fn effective_acl_chain_home_channel_match_changes(
     )
 }
 
-fn path_gate_has_home_channel_dependent_group(ancestors: &[crate::Channel]) -> bool {
+fn path_gate_has_home_channel_dependent_group<A: ChannelReference>(ancestors: &[A]) -> bool {
     ancestors.iter().any(|ancestor| {
-        ancestor.acls.iter().any(|acl| {
+        ancestor.as_ref().acls.iter().any(|acl| {
             (acl.apply_here || acl.apply_subs)
                 && (acl.allow | acl.deny)
                     .intersects(ACLPermissions::Traverse | ACLPermissions::Write)
@@ -1018,6 +1107,23 @@ fn path_gate_has_home_channel_dependent_group(ancestors: &[crate::Channel]) -> b
 pub fn channel_has_effective_restriction(
     channel: &crate::Channel,
     ancestors: &[crate::Channel],
+    perm: ACLPermissions,
+) -> bool {
+    channel_has_effective_restriction_impl(channel, ancestors, perm)
+}
+
+/// Check an effective restriction using shared channel ancestors.
+pub fn channel_has_effective_restriction_shared(
+    channel: &crate::Channel,
+    ancestors: &[Arc<crate::Channel>],
+    perm: ACLPermissions,
+) -> bool {
+    channel_has_effective_restriction_impl(channel, ancestors, perm)
+}
+
+fn channel_has_effective_restriction_impl<A: ChannelReference>(
+    channel: &crate::Channel,
+    ancestors: &[A],
     perm: ACLPermissions,
 ) -> bool {
     if let Some(compiled) = channel
@@ -1248,7 +1354,7 @@ mod tests {
             ACLPermissions::Write.into(),
             BitFlags::empty(),
         )];
-        channel.rebuild_effective_acl_cache(&[]);
+        channel.rebuild_effective_acl_cache::<Channel>(&[]);
         assert!(channel.has_effective_acl_cache());
 
         channel.acls.clear();

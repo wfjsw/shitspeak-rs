@@ -1682,11 +1682,12 @@ impl Server {
     }
 
     fn authentication_result_has_required_group(&self, result: &AuthenticateResult) -> bool {
-        let required = self.get_required_groups();
-        required.is_empty()
-            || required
+        let config = self.read_config();
+        config.required_groups.is_empty()
+            || result
+                .groups
                 .iter()
-                .any(|required| result.groups.iter().any(|group| group == required))
+                .any(|group| config.required_groups.contains(group))
     }
 
     async fn deregister_expired_local_client(self: &Arc<Box<Self>>, client: &Arc<Box<Client>>) {
@@ -2159,10 +2160,6 @@ impl Server {
 
     pub fn get_cert_required(&self) -> bool {
         self.read_config().cert_required
-    }
-
-    pub fn get_required_groups(&self) -> Vec<String> {
-        self.read_config().required_groups.clone()
     }
 
     pub async fn acquire_auth_finalization_permit(

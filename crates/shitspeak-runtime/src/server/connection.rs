@@ -129,9 +129,9 @@ pub(super) async fn activate_client_subscriptions(
             session = u32::from(client_session_id),
             "post-auth baseline missing; rebuilding subscription shadows from repositories"
         );
-        let channels = server.channels.get_all_in_server(&server_id).await;
+        let channels = server.channels.ordered_snapshot_in_server(&server_id);
         if server.get_hide_channels_without_traverse() {
-            for channel in channels {
+            for channel in channels.iter() {
                 if crate::channel_handler::can_view_channel_with_ancestors(
                     server, client, channel.id,
                 )
@@ -141,7 +141,7 @@ pub(super) async fn activate_client_subscriptions(
                 }
             }
         } else {
-            channel_tree_shadow.extend(channels.into_iter().map(|channel| channel.id));
+            channel_tree_shadow.extend(channels.iter().map(|channel| channel.id));
         }
         if crate::client::visibility::user_filtering_enabled(server, client) {
             crate::client::visibility::initialize(
@@ -192,6 +192,10 @@ pub(super) async fn activate_client_subscriptions(
         client.get_last_client_versions().await,
     )
     .await?;
+    crate::client::handlers::spawn_staged_session_blob_resolution(
+        Arc::clone(server),
+        Arc::clone(client),
+    );
     Ok(())
 }
 
@@ -240,7 +244,7 @@ pub(super) async fn activate_client_projection(
             let mut user_visibility = UserVisibilityState::default();
             let visibility_generation = server.visibility_generation();
             if server.get_hide_channels_without_traverse() {
-                for channel in &channels {
+                for channel in channels.iter() {
                     if crate::channel_handler::can_view_channel_with_ancestors(
                         server, client, channel.id,
                     )
@@ -303,6 +307,10 @@ pub(super) async fn activate_client_projection(
             ))
         })?;
     *registration = Some(projection_registration);
+    crate::client::handlers::spawn_staged_session_blob_resolution(
+        Arc::clone(server),
+        Arc::clone(client),
+    );
     Ok(())
 }
 

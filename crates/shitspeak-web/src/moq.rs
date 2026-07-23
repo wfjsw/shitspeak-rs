@@ -672,7 +672,23 @@ impl MoqSessionRuntime {
             return Err("MoQ authentication is not wired to this server".to_string());
         };
         let display_name = result.display_name.clone();
-        crate::session::configure_authenticated_client(&server, &client, result, credential).await;
+        if let Err(error) =
+            crate::session::configure_authenticated_client(&server, &client, result, credential)
+                .await
+        {
+            let server_id = client.server_id();
+            server
+                .get_clients()
+                .remove_client_instance_in_server(
+                    &server_id,
+                    client.get_session_id(),
+                    client.client_instance_id(),
+                )
+                .await;
+            return Ok(vec![ServerEvent::AuthenticationRejected {
+                reason: error.reason().to_string(),
+            }]);
+        }
         let session = u32::from(client.get_session_id());
 
         self.outbound_rx = Some(outbound_rx);
@@ -708,6 +724,10 @@ impl MoqSessionRuntime {
         client.update_last_client_versions(&versions).await;
         self.client_log_rx = Some(server.get_clients().subscribe());
         self.channel_log_rx = Some(server.get_channels().subscribe());
+        shitspeak_runtime::client::handlers::spawn_staged_session_blob_resolution(
+            Arc::clone(&server),
+            Arc::clone(&client),
+        );
         Ok(events)
     }
 
@@ -2397,7 +2417,7 @@ mod tests {
             authenticate_timeout_ms: 30_000,
             auth_finalization_concurrency: 4,
             pending_delete_timeout_ms: 5_000,
-            required_groups: Vec::new(),
+            required_groups: Default::default(),
             send_permission_info: false,
             hide_users_without_traverse: false,
             hide_channels_without_traverse: false,

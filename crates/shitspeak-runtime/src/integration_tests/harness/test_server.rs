@@ -263,7 +263,7 @@ async fn spawn_test_server_with_pki(
         authenticate_timeout_ms: opts.authenticate_timeout_ms,
         auth_finalization_concurrency: opts.auth_finalization_concurrency,
         pending_delete_timeout_ms: 5_000,
-        required_groups: Vec::new(),
+        required_groups: Default::default(),
         send_permission_info: opts.send_permission_info,
         hide_users_without_traverse: opts.hide_users_without_traverse,
         hide_channels_without_traverse: opts.hide_channels_without_traverse,

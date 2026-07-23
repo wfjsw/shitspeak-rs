@@ -504,7 +504,9 @@ async fn compute_permissions_for_client_inner(
     let depends_on_home_channel = if channel.has_effective_acl_cache() {
         channel.effective_acl_depends_on_home_channel()
     } else {
-        shitspeak_state::effective_acl_chain_has_home_channel_dependent_group(&channel, &ancestors)
+        shitspeak_state::effective_acl_chain_has_home_channel_dependent_group_shared(
+            &channel, &ancestors,
+        )
     };
 
     let (user_id, groups) = match identity_override {
@@ -561,7 +563,7 @@ async fn compute_permissions_for_client_inner(
         "Computing ACL permissions"
     );
 
-    let mut permissions = shitspeak_state::evaluate_permission_with_behavior(
+    let mut permissions = shitspeak_state::evaluate_permission_with_behavior_shared(
         &channel,
         &ancestors,
         user_id,

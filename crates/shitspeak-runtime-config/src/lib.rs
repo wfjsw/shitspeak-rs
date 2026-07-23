@@ -1,6 +1,6 @@
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -1209,7 +1209,7 @@ pub struct Config {
     /// allowed.  If non-empty, a user must belong to at least one of these
     /// groups to pass authentication.
     #[serde(default)]
-    pub required_groups: Vec<String>,
+    pub required_groups: HashSet<String>,
 
     /// When `true`, `ChannelState` messages include `is_enter_restricted`
     /// and `can_enter` fields computed from ACLs.  Default: `false`.
@@ -2592,6 +2592,33 @@ mod tests {
             .try_deserialize()
             .expect("config deserialize");
         assert_eq!(cfg.udp_ping_user_count_scope, UdpPingUserCountScope::Local);
+    }
+
+    #[test]
+    fn required_groups_parse_as_a_set() {
+        let raw = r#"
+            listen = "127.0.0.1:64738"
+            register_name = "test"
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            send_version = true
+            send_build_info = true
+            send_os_info = true
+            allowed_proxies = []
+            min_client_version = 0
+            max_users = 100
+            required_groups = ["member", "admin", "member"]
+        "#;
+        let cfg: Config = ::config::Config::builder()
+            .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("config deserialize");
+
+        assert_eq!(cfg.required_groups.len(), 2);
+        assert!(cfg.required_groups.contains("member"));
+        assert!(cfg.required_groups.contains("admin"));
     }
 
     #[test]

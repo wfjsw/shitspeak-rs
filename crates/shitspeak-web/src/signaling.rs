@@ -1425,7 +1425,29 @@ async fn handle_successful_password_auth(
     let mut initial_state_client = None;
     if let Some((server, client, outbound_rx)) = preallocated {
         session.outbound_rx = Some(outbound_rx);
-        crate::session::configure_authenticated_client(&server, &client, result, credential).await;
+        if let Err(error) =
+            crate::session::configure_authenticated_client(&server, &client, result, credential)
+                .await
+        {
+            let server_id = client.server_id();
+            server
+                .get_clients()
+                .remove_client_instance_in_server(
+                    &server_id,
+                    client.get_session_id(),
+                    client.client_instance_id(),
+                )
+                .await;
+            session.outbound_rx = None;
+            session.session_id = DEFAULT_WEB_SESSION_ID;
+            return send_server_event(
+                stream,
+                &ServerEvent::AuthenticationRejected {
+                    reason: error.reason().to_string(),
+                },
+            )
+            .await;
+        }
         session.session_id = u32::from(client.get_session_id());
         initial_state_client = Some((Arc::clone(&server), Arc::clone(&client)));
         session.client = Some(client);
@@ -1442,7 +1464,29 @@ async fn handle_successful_password_auth(
             )
             .await;
         session.outbound_rx = Some(outbound_rx);
-        crate::session::configure_authenticated_client(server, &client, result, credential).await;
+        if let Err(error) =
+            crate::session::configure_authenticated_client(server, &client, result, credential)
+                .await
+        {
+            let server_id = client.server_id();
+            server
+                .get_clients()
+                .remove_client_instance_in_server(
+                    &server_id,
+                    client.get_session_id(),
+                    client.client_instance_id(),
+                )
+                .await;
+            session.outbound_rx = None;
+            session.session_id = DEFAULT_WEB_SESSION_ID;
+            return send_server_event(
+                stream,
+                &ServerEvent::AuthenticationRejected {
+                    reason: error.reason().to_string(),
+                },
+            )
+            .await;
+        }
         session.session_id = u32::from(client.get_session_id());
         initial_state_client = Some((Arc::clone(server), Arc::clone(&client)));
         session.client = Some(client);
@@ -1475,6 +1519,10 @@ async fn handle_successful_password_auth(
         client.update_last_client_versions(&versions).await;
         session.client_log_rx = Some(server.get_clients().subscribe());
         session.channel_log_rx = Some(server.get_channels().subscribe());
+        shitspeak_runtime::client::handlers::spawn_staged_session_blob_resolution(
+            Arc::clone(&server),
+            Arc::clone(&client),
+        );
     }
     Ok(())
 }
@@ -1488,15 +1536,16 @@ async fn send_initial_server_state(
     user_visibility: &mut UserVisibilityState,
 ) -> io::Result<()> {
     let server_id = client.server_id();
-    let channels = server.get_channels().get_all_in_server(&server_id).await;
-    for message in shitspeak_runtime::channel_handler::build_visible_channel_snapshot_messages(
-        server,
-        client,
-        &channels,
-        channel_tree_shadow,
-        server.get_send_permission_info(),
-    )
-    .await
+    let channels = server.get_channels().ordered_snapshot_in_server(&server_id);
+    for message in
+        shitspeak_runtime::channel_handler::build_visible_ordered_channel_snapshot_messages(
+            server,
+            client,
+            &channels,
+            channel_tree_shadow,
+            server.get_send_permission_info(),
+        )
+        .await
     {
         send_web_outbound_message(stream, None, message).await?;
     }
@@ -3124,7 +3173,7 @@ mod tests {
             authenticate_timeout_ms: 30_000,
             auth_finalization_concurrency: 4,
             pending_delete_timeout_ms: 5_000,
-            required_groups: Vec::new(),
+            required_groups: Default::default(),
             send_permission_info: false,
             hide_users_without_traverse: false,
             hide_channels_without_traverse: false,

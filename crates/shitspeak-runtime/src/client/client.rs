@@ -31,6 +31,7 @@ use crate::{
         client_session_identifier::ClientSessionIdentifier,
         client_stats::ClientStats,
         global_state_guard::GlobalStateWriteGuard,
+        next_client_instance_id,
         options::ClientOptions,
         user_info::UserInfoExtended,
         voice_target::VoiceTarget,
@@ -131,6 +132,42 @@ pub type ClientInstanceId = u64;
 pub type ClientStateSubscription = tokio::sync::broadcast::Receiver<
     std::sync::Arc<crate::client::state_log::ClientStateBroadcastPayload>,
 >;
+
+pub(crate) struct DeferredSessionBlobResolution {
+    user_id: Option<u32>,
+    texture_url: Option<String>,
+    comment_url: Option<String>,
+    texture_revision: u64,
+    comment_revision: u64,
+}
+
+impl DeferredSessionBlobResolution {
+    pub(crate) fn new(
+        user_id: Option<u32>,
+        texture_url: Option<String>,
+        comment_url: Option<String>,
+        texture_revision: u64,
+        comment_revision: u64,
+    ) -> Self {
+        Self {
+            user_id,
+            texture_url,
+            comment_url,
+            texture_revision,
+            comment_revision,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Option<u32>, Option<String>, Option<String>, u64, u64) {
+        (
+            self.user_id,
+            self.texture_url,
+            self.comment_url,
+            self.texture_revision,
+            self.comment_revision,
+        )
+    }
+}
 pub type StagedChannelStateSubscription = (u64, shitspeak_state::ChannelStateSubscription);
 
 #[derive(Debug, Clone, Default)]
@@ -267,15 +304,6 @@ pub enum ClientOutboundMessage {
     Batch(Vec<Message>),
 }
 
-pub(crate) fn random_client_instance_id() -> ClientInstanceId {
-    loop {
-        let id = rand::random::<ClientInstanceId>();
-        if id != 0 {
-            return id;
-        }
-    }
-}
-
 fn client_tracing_span(
     session_id: ClientSessionIdentifier,
     real_ip_address: IpAddr,
@@ -321,6 +349,8 @@ pub struct Client {
     transport: ClientTransport,
     disconnect_tx: watch::Sender<bool>,
     disconnect_rx: watch::Receiver<bool>,
+    removed_tx: watch::Sender<bool>,
+    removed_rx: watch::Receiver<bool>,
     is_verified: bool,
 
     // Statistics
@@ -363,6 +393,7 @@ pub struct Client {
     pending_client_state_subscription: ParkingMutex<Option<ClientStateSubscription>>,
     pending_channel_state_subscription: ParkingMutex<Option<StagedChannelStateSubscription>>,
     pending_post_auth_baseline: ParkingMutex<Option<PostAuthBaseline>>,
+    pending_session_blob_resolution: ParkingMutex<Option<DeferredSessionBlobResolution>>,
 
     /// If true, send voice through TCP `UDPTunnel` instead of UDP.
     /// This is toggled when tunneled voice is received and reset once
@@ -453,7 +484,7 @@ impl Client {
             connection,
             tls_ja4,
             uses_proxy_protocol,
-            random_client_instance_id(),
+            next_client_instance_id(session_id.get_node_id()),
         )
     }
 
@@ -502,6 +533,7 @@ impl Client {
             .ok();
         let (connection_rx, connection_tx) = tokio::io::split(connection);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
+        let (removed_tx, removed_rx) = watch::channel(false);
 
         Box::new(Client {
             session_id: ParkingRwLock::new(session_id),
@@ -521,6 +553,8 @@ impl Client {
             },
             disconnect_tx,
             disconnect_rx,
+            removed_tx,
+            removed_rx,
             is_verified,
             login_time: now,
             last_active: ParkingMutex::new(now),
@@ -549,6 +583,7 @@ impl Client {
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
             pending_post_auth_baseline: ParkingMutex::new(None),
+            pending_session_blob_resolution: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
             can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
@@ -572,7 +607,7 @@ impl Client {
             local_address,
             outbound_tx,
             ClientTransportKind::WebRtc,
-            random_client_instance_id(),
+            next_client_instance_id(session_id.get_node_id()),
         )
     }
 
@@ -591,7 +626,7 @@ impl Client {
             tcp_address,
             local_address,
             outbound_tx,
-            random_client_instance_id(),
+            next_client_instance_id(session_id.get_node_id()),
         )
     }
 
@@ -631,7 +666,7 @@ impl Client {
             tcp_address,
             local_address,
             outbound_tx,
-            random_client_instance_id(),
+            next_client_instance_id(session_id.get_node_id()),
         )
     }
 
@@ -673,6 +708,7 @@ impl Client {
         let (outbound_message_tx, outbound_message_rx) =
             mpsc::channel::<ClientOutboundMessage>(OUTBOUND_MESSAGE_QUEUE_CAPACITY);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
+        let (removed_tx, removed_rx) = watch::channel(false);
 
         Box::new(Client {
             session_id: ParkingRwLock::new(session_id),
@@ -688,6 +724,8 @@ impl Client {
             transport: ClientTransport::WebGateway { kind, outbound_tx },
             disconnect_tx,
             disconnect_rx,
+            removed_tx,
+            removed_rx,
             is_verified: false,
             login_time: now,
             last_active: ParkingMutex::new(now),
@@ -716,6 +754,7 @@ impl Client {
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
             pending_post_auth_baseline: ParkingMutex::new(None),
+            pending_session_blob_resolution: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
             can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
@@ -742,7 +781,7 @@ impl Client {
             local_address,
             cert_hash,
             login_time,
-            random_client_instance_id(),
+            next_client_instance_id(session_id.get_node_id()),
         )
     }
 
@@ -760,6 +799,7 @@ impl Client {
         let is_verified = cert_hash.is_some();
         let certificate_hash_hex = cert_hash.as_deref().map(hex::encode);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
+        let (removed_tx, removed_rx) = watch::channel(false);
 
         Box::new(Client {
             session_id: ParkingRwLock::new(session_id),
@@ -775,6 +815,8 @@ impl Client {
             transport: ClientTransport::Remote,
             disconnect_tx,
             disconnect_rx,
+            removed_tx,
+            removed_rx,
             is_verified,
             login_time,
             last_active: ParkingMutex::new(login_time),
@@ -803,6 +845,7 @@ impl Client {
             pending_client_state_subscription: ParkingMutex::new(None),
             pending_channel_state_subscription: ParkingMutex::new(None),
             pending_post_auth_baseline: ParkingMutex::new(None),
+            pending_session_blob_resolution: ParkingMutex::new(None),
             prefer_tcp_tunnel: AtomicBool::new(false),
             can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
@@ -853,6 +896,27 @@ impl Client {
 
     pub(crate) fn take_post_auth_baseline(&self) -> Option<PostAuthBaseline> {
         self.pending_post_auth_baseline.lock().take()
+    }
+
+    pub fn stage_session_blob_resolution(
+        &self,
+        user_id: Option<u32>,
+        texture_url: Option<String>,
+        comment_url: Option<String>,
+    ) {
+        let state = self.global_state.read();
+        let resolution = DeferredSessionBlobResolution::new(
+            user_id,
+            texture_url,
+            comment_url,
+            state.texture_blob_revision(),
+            state.comment_blob_revision(),
+        );
+        *self.pending_session_blob_resolution.lock() = Some(resolution);
+    }
+
+    pub(crate) fn take_session_blob_resolution(&self) -> Option<DeferredSessionBlobResolution> {
+        self.pending_session_blob_resolution.lock().take()
     }
 
     pub fn set_prefer_tcp_tunnel(&self, value: bool) {
@@ -1218,6 +1282,18 @@ impl Client {
 
     pub async fn disconnected(&self) {
         let mut rx = self.disconnect_rx.clone();
+        if *rx.borrow() {
+            return;
+        }
+        let _ = rx.changed().await;
+    }
+
+    pub(crate) fn mark_removed(&self) {
+        let _ = self.removed_tx.send(true);
+    }
+
+    pub(crate) async fn removed(&self) {
+        let mut rx = self.removed_rx.clone();
         if *rx.borrow() {
             return;
         }
@@ -2165,6 +2241,10 @@ mod tests {
         assert!(!*client.disconnect_rx.borrow());
         client.request_disconnect();
         assert!(*client.disconnect_rx.borrow());
+
+        assert!(!*client.removed_rx.borrow());
+        client.mark_removed();
+        assert!(*client.removed_rx.borrow());
     }
 
     #[test]

@@ -158,7 +158,7 @@ fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
         authenticate_timeout_ms: 30_000,
         auth_finalization_concurrency: 4,
         pending_delete_timeout_ms: 5_000,
-        required_groups: Vec::new(),
+        required_groups: Default::default(),
         send_permission_info: false,
         hide_users_without_traverse: false,
         hide_channels_without_traverse: false,

@@ -3615,7 +3615,7 @@ impl BlobReplicable for ChannelBlobReplicationAdapter {
             .get_all_in_server(&self.server_id)
             .await
             .into_iter()
-            .filter_map(|channel| channel.description_hash)
+            .filter_map(|channel| channel.description_hash.clone())
             .filter(|key| key.len() == 40)
             .collect()
     }
@@ -5233,7 +5233,12 @@ mod tests {
         );
         assert!(!peer_adapter.known_versions().contains_key(&1));
 
-        let mut channel_snapshot = peer_channels.get_all().await;
+        let mut channel_snapshot = peer_channels
+            .get_all()
+            .await
+            .into_iter()
+            .map(|channel| channel.as_ref().clone())
+            .collect::<Vec<_>>();
         channel_snapshot.push(shitspeak_state::Channel::new(42, "ready", 0, 0, Some(0)));
         peer_channels
             .install_s2s_snapshot(1, channel_snapshot)

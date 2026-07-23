@@ -1,8 +1,9 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ACL, acl::CompiledEffectiveAcl};
+use crate::{ACL, ChannelReference, acl::CompiledEffectiveAcl};
 
 /// Replicated two-phase delete marker for a channel subtree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,7 +36,13 @@ pub struct Channel {
     /// Derived effective ACL program. It is rebuilt by the channel repository
     /// and is never part of replicated or persisted channel state.
     #[serde(skip)]
-    pub(crate) effective_acl_cache: Option<CompiledEffectiveAcl>,
+    pub(crate) effective_acl_cache: Option<Arc<CompiledEffectiveAcl>>,
+}
+
+impl AsRef<Channel> for Channel {
+    fn as_ref(&self) -> &Channel {
+        self
+    }
 }
 
 impl Channel {
@@ -62,8 +69,9 @@ impl Channel {
     }
 
     /// Rebuild the derived ACL program for this channel.
-    pub(crate) fn rebuild_effective_acl_cache(&mut self, ancestors: &[Channel]) {
-        self.effective_acl_cache = Some(crate::acl::compile_effective_acl(self, ancestors));
+    pub(crate) fn rebuild_effective_acl_cache<A: ChannelReference>(&mut self, ancestors: &[A]) {
+        self.effective_acl_cache =
+            Some(Arc::new(crate::acl::compile_effective_acl(self, ancestors)));
     }
 
     /// Discard derived ACL state after mutating ACL-relevant channel fields.
@@ -87,7 +95,7 @@ impl Channel {
         self.effective_acl_cache
             .as_ref()
             .filter(|cache| cache.is_current(self))
-            .map(CompiledEffectiveAcl::ancestor_ids)
+            .map(|cache| cache.ancestor_ids())
     }
 
     /// Whether evaluating this ACL program can depend on the client's home
@@ -96,7 +104,7 @@ impl Channel {
         self.effective_acl_cache
             .as_ref()
             .filter(|cache| cache.is_current(self))
-            .is_some_and(CompiledEffectiveAcl::depends_on_home_channel)
+            .is_some_and(|cache| cache.depends_on_home_channel())
     }
 
     pub fn has_description(&self) -> bool {

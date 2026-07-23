@@ -25,10 +25,12 @@ pub struct ClientGlobalState {
     // ── Texture blob ───────────────────────────────────────────────────────
     texture_url: Option<String>,
     texture_hash: Option<String>,
+    texture_blob_revision: u64,
 
     // ── Comment blob ───────────────────────────────────────────────────────
     comment_url: Option<String>,
     comment_hash: Option<String>,
+    comment_blob_revision: u64,
 
     // ── User identity ─────────────────────────────────────────────────────
     user_id: Option<u32>,
@@ -69,8 +71,10 @@ impl ClientGlobalState {
 
             texture_url: None,
             texture_hash: None,
+            texture_blob_revision: 0,
             comment_url: None,
             comment_hash: None,
+            comment_blob_revision: 0,
 
             user_id: None,
             groups: HashSet::new(),
@@ -175,6 +179,10 @@ impl ClientGlobalState {
         self.texture_hash.as_deref()
     }
 
+    pub(crate) fn texture_blob_revision(&self) -> u64 {
+        self.texture_blob_revision
+    }
+
     pub fn set_texture_blob(&mut self, url: Option<String>, hash: Option<String>) {
         if self.texture_url == url && self.texture_hash == hash {
             return;
@@ -183,6 +191,7 @@ impl ClientGlobalState {
         let old_hash = self.texture_hash.clone();
         self.texture_url = url;
         self.texture_hash = hash;
+        self.texture_blob_revision = self.texture_blob_revision.wrapping_add(1);
         if self.delta_recording {
             if self.texture_url != old_url {
                 self.pending_delta.texture_url = Some(self.texture_url.clone());
@@ -194,7 +203,11 @@ impl ClientGlobalState {
     }
 
     pub fn clear_texture_blob(&mut self) {
+        let revision = self.texture_blob_revision;
         self.set_texture_blob(None, None);
+        if self.texture_blob_revision == revision {
+            self.texture_blob_revision = self.texture_blob_revision.wrapping_add(1);
+        }
     }
 
     pub fn get_comment_url(&self) -> Option<&str> {
@@ -205,6 +218,10 @@ impl ClientGlobalState {
         self.comment_hash.as_deref()
     }
 
+    pub(crate) fn comment_blob_revision(&self) -> u64 {
+        self.comment_blob_revision
+    }
+
     pub fn set_comment_blob(&mut self, url: Option<String>, hash: Option<String>) {
         if self.comment_url == url && self.comment_hash == hash {
             return;
@@ -213,6 +230,7 @@ impl ClientGlobalState {
         let old_hash = self.comment_hash.clone();
         self.comment_url = url;
         self.comment_hash = hash;
+        self.comment_blob_revision = self.comment_blob_revision.wrapping_add(1);
         if self.delta_recording {
             if self.comment_url != old_url {
                 self.pending_delta.comment_url = Some(self.comment_url.clone());
@@ -224,7 +242,11 @@ impl ClientGlobalState {
     }
 
     pub fn clear_comment_blob(&mut self) {
+        let revision = self.comment_blob_revision;
         self.set_comment_blob(None, None);
+        if self.comment_blob_revision == revision {
+            self.comment_blob_revision = self.comment_blob_revision.wrapping_add(1);
+        }
     }
 
     // ── Voice / moderation getters & setters ─────────────────────────────
@@ -572,6 +594,30 @@ mod tests {
 
         assert_eq!(state.get_acl_generation(), 0);
         assert_eq!(state.get_acl_cache_generations(), (0, 0));
+    }
+
+    #[test]
+    fn blob_revisions_detect_change_then_clear() {
+        let mut state = ClientGlobalState::new();
+        let texture_revision = state.texture_blob_revision();
+        let comment_revision = state.comment_blob_revision();
+
+        state.clear_texture_blob();
+        state.clear_comment_blob();
+
+        assert_ne!(state.texture_blob_revision(), texture_revision);
+        assert_ne!(state.comment_blob_revision(), comment_revision);
+        let texture_revision = state.texture_blob_revision();
+        let comment_revision = state.comment_blob_revision();
+        state.set_texture_blob(None, Some("texture".to_owned()));
+        state.clear_texture_blob();
+        state.set_comment_blob(None, Some("comment".to_owned()));
+        state.clear_comment_blob();
+
+        assert_ne!(state.texture_blob_revision(), texture_revision);
+        assert_ne!(state.comment_blob_revision(), comment_revision);
+        assert!(state.get_texture_hash().is_none());
+        assert!(state.get_comment_hash().is_none());
     }
 
     #[test]

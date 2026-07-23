@@ -1,4 +1,4 @@
-use std::{net::IpAddr, str::FromStr};
+use std::{net::IpAddr, str::FromStr, sync::Arc};
 
 use cidr::AnyIpCidr;
 
@@ -8,6 +8,39 @@ use crate::Channel;
 enum HierarchyAncestors<'a> {
     Ids(&'a [u32]),
     Channels(&'a [Channel]),
+    BorrowedChannels(&'a [&'a Channel]),
+    SharedChannels(&'a [Arc<Channel>]),
+}
+
+pub(crate) trait ChannelReference: AsRef<Channel> + Sized {
+    fn hierarchy(current_channel_id: u32, ancestors: &[Self]) -> ChannelHierarchy<'_>;
+}
+
+impl ChannelReference for Channel {
+    fn hierarchy(current_channel_id: u32, ancestors: &[Self]) -> ChannelHierarchy<'_> {
+        ChannelHierarchy {
+            current_channel_id,
+            ancestors: HierarchyAncestors::Channels(ancestors),
+        }
+    }
+}
+
+impl ChannelReference for &Channel {
+    fn hierarchy<'a>(current_channel_id: u32, ancestors: &'a [Self]) -> ChannelHierarchy<'a> {
+        ChannelHierarchy {
+            current_channel_id,
+            ancestors: HierarchyAncestors::BorrowedChannels(ancestors),
+        }
+    }
+}
+
+impl ChannelReference for Arc<Channel> {
+    fn hierarchy(current_channel_id: u32, ancestors: &[Self]) -> ChannelHierarchy<'_> {
+        ChannelHierarchy {
+            current_channel_id,
+            ancestors: HierarchyAncestors::SharedChannels(ancestors),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -24,17 +57,19 @@ impl<'a> ChannelHierarchy<'a> {
         }
     }
 
-    pub(crate) fn from_channels(current_channel_id: u32, ancestors: &'a [Channel]) -> Self {
-        Self {
-            current_channel_id,
-            ancestors: HierarchyAncestors::Channels(ancestors),
-        }
+    pub(crate) fn from_channels<T: ChannelReference>(
+        current_channel_id: u32,
+        ancestors: &'a [T],
+    ) -> Self {
+        T::hierarchy(current_channel_id, ancestors)
     }
 
     fn ancestor_len(&self) -> usize {
         match self.ancestors {
             HierarchyAncestors::Ids(ancestors) => ancestors.len(),
             HierarchyAncestors::Channels(ancestors) => ancestors.len(),
+            HierarchyAncestors::BorrowedChannels(ancestors) => ancestors.len(),
+            HierarchyAncestors::SharedChannels(ancestors) => ancestors.len(),
         }
     }
 
@@ -48,6 +83,14 @@ impl<'a> ChannelHierarchy<'a> {
                 ancestors.iter().rev().position(|id| *id == channel_id)
             }
             HierarchyAncestors::Channels(ancestors) => ancestors
+                .iter()
+                .rev()
+                .position(|channel| channel.id == channel_id),
+            HierarchyAncestors::BorrowedChannels(ancestors) => ancestors
+                .iter()
+                .rev()
+                .position(|channel| channel.id == channel_id),
+            HierarchyAncestors::SharedChannels(ancestors) => ancestors
                 .iter()
                 .rev()
                 .position(|channel| channel.id == channel_id),
@@ -71,6 +114,12 @@ impl<'a> ChannelHierarchy<'a> {
             HierarchyAncestors::Channels(ancestors) => {
                 ancestors.get(ancestor_index).map(|channel| channel.id)
             }
+            HierarchyAncestors::BorrowedChannels(ancestors) => {
+                ancestors.get(ancestor_index).map(|channel| channel.id)
+            }
+            HierarchyAncestors::SharedChannels(ancestors) => {
+                ancestors.get(ancestor_index).map(|channel| channel.id)
+            }
         }
     }
 
@@ -79,6 +128,12 @@ impl<'a> ChannelHierarchy<'a> {
             || match self.ancestors {
                 HierarchyAncestors::Ids(ancestors) => ancestors.contains(&channel_id),
                 HierarchyAncestors::Channels(ancestors) => {
+                    ancestors.iter().any(|channel| channel.id == channel_id)
+                }
+                HierarchyAncestors::BorrowedChannels(ancestors) => {
+                    ancestors.iter().any(|channel| channel.id == channel_id)
+                }
+                HierarchyAncestors::SharedChannels(ancestors) => {
                     ancestors.iter().any(|channel| channel.id == channel_id)
                 }
             }

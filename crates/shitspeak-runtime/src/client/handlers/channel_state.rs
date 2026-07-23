@@ -611,7 +611,7 @@ async fn inherited_creator_permissions(
     )
     .with_home_channel(home_channel);
 
-    shitspeak_state::evaluate_permission_with_behavior(
+    shitspeak_state::evaluate_permission_with_behavior_shared(
         channel,
         &ancestors,
         user_id,

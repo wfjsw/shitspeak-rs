@@ -52,6 +52,10 @@ use shitspeak_messages::messages::{Message, encoder};
 
 const TEMPORARY_CHANNEL_ID_BIT: u32 = 0x8000_0000;
 
+type ChannelMap = HashMap<u32, Arc<Channel>>;
+type ChannelsByServer = HashMap<String, ChannelMap>;
+pub type OrderedChannelSnapshot = Arc<[Arc<Channel>]>;
+
 #[cfg(windows)]
 const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
 #[cfg(windows)]
@@ -534,6 +538,73 @@ impl AclCacheHit {
     }
 }
 
+fn ordered_channel_ids(channels: &ChannelMap) -> Arc<[u32]> {
+    let mut children: HashMap<Option<u32>, Vec<u32>> = HashMap::new();
+    for channel in channels.values() {
+        children
+            .entry(channel.parent_id)
+            .or_default()
+            .push(channel.id);
+    }
+    for child_ids in children.values_mut() {
+        child_ids.sort_unstable_by_key(|id| {
+            channels
+                .get(id)
+                .map(|channel| (channel.position, channel.id))
+                .unwrap_or((0, *id))
+        });
+    }
+
+    let mut ordered = Vec::with_capacity(channels.len());
+    let mut visited = HashSet::with_capacity(channels.len());
+    let mut queue = VecDeque::new();
+    if channels.contains_key(&0) {
+        queue.push_back(0);
+    }
+
+    while let Some(channel_id) = queue.pop_front() {
+        if !visited.insert(channel_id) || !channels.contains_key(&channel_id) {
+            continue;
+        }
+        ordered.push(channel_id);
+        if let Some(child_ids) = children.get(&Some(channel_id)) {
+            queue.extend(child_ids.iter().copied());
+        }
+    }
+
+    let mut remaining: Vec<_> = channels
+        .values()
+        .filter(|channel| !visited.contains(&channel.id))
+        .map(|channel| channel.id)
+        .collect();
+    remaining.sort_unstable_by_key(|id| {
+        let channel = &channels[id];
+        (channel.parent_id.unwrap_or(0), channel.position, channel.id)
+    });
+    ordered.extend(remaining);
+    Arc::from(ordered.into_boxed_slice())
+}
+
+fn ordered_channels(channels: &ChannelMap) -> OrderedChannelSnapshot {
+    let ordered_ids = ordered_channel_ids(channels);
+    Arc::from(
+        ordered_ids
+            .iter()
+            .filter_map(|channel_id| channels.get(channel_id).map(Arc::clone))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    )
+}
+
+fn rebuild_all_ordered_channel_views(
+    channels_by_server: &ChannelsByServer,
+) -> HashMap<String, OrderedChannelSnapshot> {
+    channels_by_server
+        .iter()
+        .map(|(server_id, channels)| (server_id.clone(), ordered_channels(channels)))
+        .collect()
+}
+
 /// A stable, operation-scoped view of a server's channel tree.
 ///
 /// The repository's ordinary read helpers acquire the channel lock and rebuild
@@ -542,13 +613,19 @@ impl AclCacheHit {
 /// and ancestor chains are indexed once when the snapshot is created.
 #[derive(Clone, Debug)]
 pub struct ChannelTreeSnapshot {
-    channels: Arc<HashMap<u32, Channel>>,
+    channels: Arc<ChannelMap>,
+    ordered_channel_ids: Arc<[u32]>,
     children_by_parent: Arc<HashMap<u32, Arc<[u32]>>>,
     ancestor_ids_by_channel: Arc<HashMap<u32, Arc<[u32]>>>,
 }
 
 impl ChannelTreeSnapshot {
-    fn new(channels: HashMap<u32, Channel>) -> Self {
+    fn new(channels: ChannelMap) -> Self {
+        let ordered_channel_ids = ordered_channel_ids(&channels);
+        Self::new_with_order(channels, ordered_channel_ids)
+    }
+
+    fn new_with_order(channels: ChannelMap, ordered_channel_ids: Arc<[u32]>) -> Self {
         let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
         for channel in channels.values() {
             if let Some(parent_id) = channel.parent_id {
@@ -592,6 +669,7 @@ impl ChannelTreeSnapshot {
 
         Self {
             channels: Arc::new(channels),
+            ordered_channel_ids,
             children_by_parent: Arc::new(children_by_parent),
             ancestor_ids_by_channel: Arc::new(ancestor_ids_by_channel),
         }
@@ -606,15 +684,27 @@ impl ChannelTreeSnapshot {
     }
 
     pub fn channel(&self, channel_id: u32) -> Option<&Channel> {
+        self.channels.get(&channel_id).map(AsRef::as_ref)
+    }
+
+    pub fn channel_arc(&self, channel_id: u32) -> Option<&Arc<Channel>> {
         self.channels.get(&channel_id)
     }
 
     pub fn channels(&self) -> impl ExactSizeIterator<Item = &Channel> {
-        self.channels.values()
+        self.channels.values().map(AsRef::as_ref)
     }
 
     pub fn channel_ids(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
         self.channels.keys().copied()
+    }
+
+    /// Channels in root-first breadth-first order, with siblings ordered by
+    /// position and id. Orphans and cycles follow in stable fallback order.
+    pub fn ordered_channels(&self) -> impl ExactSizeIterator<Item = &Channel> {
+        self.ordered_channel_ids
+            .iter()
+            .map(|channel_id| self.channels[channel_id].as_ref())
     }
 
     /// Return precomputed ancestor ids, from the immediate parent to root.
@@ -632,7 +722,7 @@ impl ChannelTreeSnapshot {
         if self
             .channels
             .get(&root_id)
-            .is_some_and(Channel::is_temporary)
+            .is_some_and(|channel| channel.is_temporary())
         {
             return vec![root_id];
         }
@@ -663,7 +753,7 @@ impl ChannelTreeSnapshot {
             if self
                 .channels
                 .get(&channel_id)
-                .is_some_and(Channel::is_temporary)
+                .is_some_and(|channel| channel.is_temporary())
             {
                 continue;
             }
@@ -694,7 +784,7 @@ impl ChannelTreeSnapshot {
         if self
             .channels
             .get(&root_id)
-            .is_some_and(Channel::is_temporary)
+            .is_some_and(|channel| channel.is_temporary())
         {
             return result;
         }
@@ -800,7 +890,7 @@ impl AclChangeHint {
 }
 
 fn build_acl_change_hint(
-    channels: &HashMap<u32, Channel>,
+    channels: &ChannelMap,
     channel_id: u32,
     old_inherit_acl: bool,
     old_acls: Vec<ACL>,
@@ -862,7 +952,7 @@ struct LinkTopology {
 }
 
 impl LinkTopology {
-    fn from_channels(channels: &HashMap<u32, Channel>) -> Self {
+    fn from_channels(channels: &ChannelMap) -> Self {
         let mut adjacency: HashMap<u32, HashSet<u32>> = HashMap::new();
 
         for (&id, channel) in channels {
@@ -915,7 +1005,7 @@ impl LinkTopology {
         self.groups_by_channel.get(&channel_id).cloned()
     }
 
-    fn remove_deleted_channels(&mut self, channels: &HashMap<u32, Channel>, deleted_ids: &[u32]) {
+    fn remove_deleted_channels(&mut self, channels: &ChannelMap, deleted_ids: &[u32]) {
         let deleted_ids: HashSet<u32> = deleted_ids.iter().copied().collect();
         let mut affected_ids = HashSet::new();
 
@@ -1009,7 +1099,11 @@ fn channel_op_affects_link_topology(op: &ChannelOp) -> bool {
 pub struct ChannelRepository {
     node_id: u16,
     root_config: ParkingRwLock<ChannelRootConfig>,
-    channels: ParkingRwLock<HashMap<String, HashMap<u32, Channel>>>,
+    channels: ParkingRwLock<ChannelsByServer>,
+    /// Immutable root-first, position-ordered channel views derived from `channels`.
+    /// Writers update this while holding the channel write guard; readers
+    /// acquire the channel read guard before reading this index.
+    ordered_channels: ParkingRwLock<HashMap<String, OrderedChannelSnapshot>>,
     /// Derived transitive link groups, rebuilt from direct channel links.
     link_topologies: ParkingRwLock<HashMap<String, LinkTopology>>,
     versions: ParkingRwLock<HashMap<String, u64>>,
@@ -1076,14 +1170,16 @@ impl ChannelRepository {
         channels
             .entry(DEFAULT_SERVER_ID.to_owned())
             .or_insert_with(HashMap::new)
-            .insert(0, root_channel(&root_config));
+            .insert(0, Arc::new(root_channel(&root_config)));
         rebuild_all_effective_acl_caches(&mut channels);
+        let ordered_channels = rebuild_all_ordered_channel_views(&channels);
         let mut versions = HashMap::new();
         versions.insert(DEFAULT_SERVER_ID.to_owned(), 0);
         Arc::new(Self {
             node_id,
             root_config: ParkingRwLock::new(root_config),
             channels: ParkingRwLock::new(channels),
+            ordered_channels: ParkingRwLock::new(ordered_channels),
             link_topologies: ParkingRwLock::new(HashMap::new()),
             versions: ParkingRwLock::new(versions),
             strict_applied_ops: ParkingRwLock::new(HashSet::new()),
@@ -1141,12 +1237,12 @@ impl ChannelRepository {
                             reason: format!("snapshot corrupt: {e}"),
                         }
                     })?;
-                    let mut map: HashMap<String, HashMap<u32, Channel>> = HashMap::new();
+                    let mut map: ChannelsByServer = HashMap::new();
                     for scoped in snap.channels {
                         let channel = scoped.channel.into_channel(&root_config);
                         map.entry(scoped.server_id)
                             .or_default()
-                            .insert(channel.id, channel);
+                            .insert(channel.id, Arc::new(channel));
                     }
                     let mut versions = snap.versions;
                     if versions.is_empty() {
@@ -1240,6 +1336,7 @@ impl ChannelRepository {
         rebuild_all_effective_acl_caches(&mut channels);
         versions.entry(DEFAULT_SERVER_ID.to_owned()).or_insert(0);
         let link_topologies = rebuild_all_link_topologies(&mut channels);
+        let ordered_channels = rebuild_all_ordered_channel_views(&channels);
 
         let (tx, _) = broadcast::channel(256);
 
@@ -1247,6 +1344,7 @@ impl ChannelRepository {
             node_id,
             root_config: ParkingRwLock::new(root_config),
             channels: ParkingRwLock::new(channels),
+            ordered_channels: ParkingRwLock::new(ordered_channels),
             link_topologies: ParkingRwLock::new(link_topologies),
             versions: ParkingRwLock::new(versions),
             strict_applied_ops: ParkingRwLock::new(strict_applied_ops),
@@ -1320,16 +1418,15 @@ impl ChannelRepository {
     pub async fn strict_snapshot_in_server(&self, server_id: &str) -> ChannelStrictSnapshot {
         let _write_transaction = self.strict_apply_lock.lock().await;
         let root_config = self.root_config.read().clone();
-        let channels = self
-            .channels
-            .read()
+        let all_channels = self.channels.read();
+        let channels = all_channels
             .get(server_id)
             .map(|channels| {
-                let mut channels: Vec<_> = channels.values().cloned().collect();
-                if !channels.iter().any(|channel| channel.id == 0) {
-                    channels.push(root_channel(&root_config));
-                }
-                channels
+                self.ordered_channel_view_in_server(server_id, channels)
+                    .as_ref()
+                    .iter()
+                    .map(|channel| channel.as_ref().clone())
+                    .collect()
             })
             .unwrap_or_else(|| vec![root_channel(&root_config)]);
         let version = self.versions.read().get(server_id).copied().unwrap_or(0);
@@ -1478,6 +1575,39 @@ impl ChannelRepository {
         self.root_config.read().name().to_owned()
     }
 
+    fn ensure_ordered_channel_view_in_server(&self, server_id: &str, channels: &ChannelMap) {
+        if self.ordered_channels.read().contains_key(server_id) {
+            return;
+        }
+        self.rebuild_ordered_channel_view_in_server(server_id, channels);
+    }
+
+    fn rebuild_ordered_channel_view_in_server(&self, server_id: &str, channels: &ChannelMap) {
+        self.ordered_channels
+            .write()
+            .insert(server_id.to_owned(), ordered_channels(channels));
+    }
+
+    fn ordered_channel_view_in_server(
+        &self,
+        server_id: &str,
+        channels: &ChannelMap,
+    ) -> OrderedChannelSnapshot {
+        if !channels.contains_key(&0) {
+            let mut with_root = channels.clone();
+            with_root.insert(0, Arc::new(self.root_channel()));
+            return ordered_channels(&with_root);
+        }
+        let ordered = self
+            .ordered_channels
+            .read()
+            .get(server_id)
+            .cloned()
+            .unwrap_or_else(|| ordered_channels(channels));
+        debug_assert_eq!(ordered.len(), channels.len());
+        ordered
+    }
+
     pub async fn update_root_channel_config(&self, root_config: ChannelRootConfig) {
         let _write_transaction = self.strict_apply_lock.lock().await;
         let mut changed_servers = Vec::new();
@@ -1496,8 +1626,9 @@ impl ChannelRepository {
             for (server_id, channels) in all_channels.iter_mut() {
                 ensure_root_channel(channels, &root_config);
                 if let Some(root) = channels.get_mut(&0) {
-                    root.name = root_config.name().to_owned();
+                    Arc::make_mut(root).name = root_config.name().to_owned();
                 }
+                self.rebuild_ordered_channel_view_in_server(server_id, channels);
                 changed_servers.push(server_id.clone());
             }
         }
@@ -1528,17 +1659,17 @@ impl ChannelRepository {
 
     // ── Read API ──────────────────────────────────────────────────────────
 
-    pub async fn get_channel(&self, id: u32) -> Option<Channel> {
+    pub async fn get_channel(&self, id: u32) -> Option<Arc<Channel>> {
         self.get_channel_in_server(DEFAULT_SERVER_ID, id).await
     }
 
-    pub async fn get_channel_in_server(&self, server_id: &str, id: u32) -> Option<Channel> {
+    pub async fn get_channel_in_server(&self, server_id: &str, id: u32) -> Option<Arc<Channel>> {
         self.channels
             .read()
             .get(server_id)
             .and_then(|channels| channels.get(&id))
             .cloned()
-            .or_else(|| (id == 0).then(|| self.root_channel()))
+            .or_else(|| (id == 0).then(|| Arc::new(self.root_channel())))
     }
 
     /// Clone one stable server channel tree and build its reusable indexes.
@@ -1548,14 +1679,30 @@ impl ChannelRepository {
     /// repository for subtrees and ancestor chains.
     pub fn channel_tree_snapshot_in_server(&self, server_id: &str) -> ChannelTreeSnapshot {
         let root = self.root_channel();
-        let mut channels = self
-            .channels
+        let all_channels = self.channels.read();
+        let mut channels = all_channels.get(server_id).cloned().unwrap_or_default();
+        channels.entry(0).or_insert_with(|| Arc::new(root));
+        let ordered_ids = self
+            .ordered_channels
             .read()
             .get(server_id)
-            .cloned()
-            .unwrap_or_default();
-        channels.entry(0).or_insert(root);
-        ChannelTreeSnapshot::new(channels)
+            .filter(|ordered| {
+                ordered.len() == channels.len()
+                    && ordered
+                        .iter()
+                        .all(|channel| channels.contains_key(&channel.id))
+            })
+            .map(|ordered| {
+                Arc::from(
+                    ordered
+                        .iter()
+                        .map(|channel| channel.id)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                )
+            })
+            .unwrap_or_else(|| ordered_channel_ids(&channels));
+        ChannelTreeSnapshot::new_with_order(channels, ordered_ids)
     }
 
     pub fn existing_channel_ids_in_server(
@@ -1789,40 +1936,33 @@ impl ChannelRepository {
             .await
     }
 
-    pub async fn get_all(&self) -> Vec<Channel> {
+    pub async fn get_all(&self) -> Vec<Arc<Channel>> {
         self.get_all_in_server(DEFAULT_SERVER_ID).await
     }
 
-    pub async fn get_all_in_server(&self, server_id: &str) -> Vec<Channel> {
+    pub async fn get_all_in_server(&self, server_id: &str) -> Vec<Arc<Channel>> {
+        self.ordered_snapshot_in_server(server_id).as_ref().to_vec()
+    }
+
+    /// Return the immutable, maintained root-first channel view for one scope.
+    pub fn ordered_snapshot_in_server(&self, server_id: &str) -> OrderedChannelSnapshot {
         let channels = self.channels.read();
         match channels.get(server_id) {
-            Some(channels) => {
-                let mut channels: Vec<Channel> = channels.values().cloned().collect();
-                if !channels.iter().any(|channel| channel.id == 0) {
-                    channels.push(self.root_channel());
-                }
-                channels
-            }
-            None => vec![self.root_channel()],
+            Some(channels) => self.ordered_channel_view_in_server(server_id, channels),
+            None => Arc::from(vec![Arc::new(self.root_channel())].into_boxed_slice()),
         }
     }
 
     pub fn snapshot_with_version_and_subscription_in_server(
         &self,
         server_id: &str,
-    ) -> (Vec<Channel>, u64, ChannelStateSubscription) {
+    ) -> (OrderedChannelSnapshot, u64, ChannelStateSubscription) {
         let channels = self.channels.read();
         let version = self.versions.read().get(server_id).copied().unwrap_or(0);
         let rx = self.tx.subscribe();
         let channels = match channels.get(server_id) {
-            Some(channels) => {
-                let mut channels: Vec<Channel> = channels.values().cloned().collect();
-                if !channels.iter().any(|channel| channel.id == 0) {
-                    channels.push(self.root_channel());
-                }
-                channels
-            }
-            None => vec![self.root_channel()],
+            Some(channels) => self.ordered_channel_view_in_server(server_id, channels),
+            None => Arc::from(vec![Arc::new(self.root_channel())].into_boxed_slice()),
         };
         (channels, version, rx)
     }
@@ -1840,12 +1980,16 @@ impl ChannelRepository {
             .unwrap_or(1)
     }
 
-    pub async fn get_children(&self, parent_id: u32) -> Vec<Channel> {
+    pub async fn get_children(&self, parent_id: u32) -> Vec<Arc<Channel>> {
         self.get_children_in_server(DEFAULT_SERVER_ID, parent_id)
             .await
     }
 
-    pub async fn get_children_in_server(&self, server_id: &str, parent_id: u32) -> Vec<Channel> {
+    pub async fn get_children_in_server(
+        &self,
+        server_id: &str,
+        parent_id: u32,
+    ) -> Vec<Arc<Channel>> {
         self.channels
             .read()
             .get(server_id)
@@ -1859,15 +2003,14 @@ impl ChannelRepository {
             .unwrap_or_default()
     }
 
-    pub async fn get_all_scoped(&self) -> Vec<(String, Channel)> {
+    pub async fn get_all_scoped(&self) -> Vec<(String, Arc<Channel>)> {
         self.channels
             .read()
             .iter()
             .flat_map(|(server_id, channels)| {
                 channels
                     .values()
-                    .cloned()
-                    .map(|channel| (server_id.clone(), channel))
+                    .map(|channel| (server_id.clone(), Arc::clone(channel)))
                     .collect::<Vec<_>>()
             })
             .collect()
@@ -1879,12 +2022,16 @@ impl ChannelRepository {
 
     /// Returns the chain of ancestors for `channel_id`, starting from the
     /// immediate parent up to (and including) the root.
-    pub async fn get_ancestors(&self, channel_id: u32) -> Vec<Channel> {
+    pub async fn get_ancestors(&self, channel_id: u32) -> Vec<Arc<Channel>> {
         self.get_ancestors_in_server(DEFAULT_SERVER_ID, channel_id)
             .await
     }
 
-    pub async fn get_ancestors_in_server(&self, server_id: &str, channel_id: u32) -> Vec<Channel> {
+    pub async fn get_ancestors_in_server(
+        &self,
+        server_id: &str,
+        channel_id: u32,
+    ) -> Vec<Arc<Channel>> {
         let channels = self.channels.read();
         let Some(channels) = channels.get(server_id) else {
             return Vec::new();
@@ -1899,7 +2046,7 @@ impl ChannelRepository {
             let Some(parent) = channels.get(&pid) else {
                 break;
             };
-            result.push(parent.clone());
+            result.push(Arc::clone(parent));
             current_id = pid;
         }
         result
@@ -1910,7 +2057,7 @@ impl ChannelRepository {
     pub async fn get_channel_with_ancestors(
         &self,
         channel_id: u32,
-    ) -> (Option<Channel>, Vec<Channel>) {
+    ) -> (Option<Arc<Channel>>, Vec<Arc<Channel>>) {
         self.get_channel_with_ancestors_in_server(DEFAULT_SERVER_ID, channel_id)
             .await
     }
@@ -1919,11 +2066,11 @@ impl ChannelRepository {
         &self,
         server_id: &str,
         channel_id: u32,
-    ) -> (Option<Channel>, Vec<Channel>) {
+    ) -> (Option<Arc<Channel>>, Vec<Arc<Channel>>) {
         let channels = self.channels.read();
         let Some(channels) = channels.get(server_id) else {
             return if channel_id == 0 {
-                (Some(self.root_channel()), Vec::new())
+                (Some(Arc::new(self.root_channel())), Vec::new())
             } else {
                 (None, Vec::new())
             };
@@ -1931,14 +2078,14 @@ impl ChannelRepository {
         let channel = channels
             .get(&channel_id)
             .cloned()
-            .or_else(|| (channel_id == 0).then(|| self.root_channel()));
+            .or_else(|| (channel_id == 0).then(|| Arc::new(self.root_channel())));
         let mut ancestors = Vec::new();
         let mut current_id = channel_id;
         loop {
             let Some(ch) = channels
                 .get(&current_id)
                 .cloned()
-                .or_else(|| (current_id == 0).then(|| self.root_channel()))
+                .or_else(|| (current_id == 0).then(|| Arc::new(self.root_channel())))
             else {
                 break;
             };
@@ -1946,7 +2093,7 @@ impl ChannelRepository {
             let Some(parent) = channels
                 .get(&pid)
                 .cloned()
-                .or_else(|| (pid == 0).then(|| self.root_channel()))
+                .or_else(|| (pid == 0).then(|| Arc::new(self.root_channel())))
             else {
                 break;
             };
@@ -1960,7 +2107,7 @@ impl ChannelRepository {
     pub async fn get_channel_with_ancestors_for_acl(
         &self,
         channel_id: u32,
-    ) -> (u64, Option<Channel>, Vec<Channel>) {
+    ) -> (u64, Option<Arc<Channel>>, Vec<Arc<Channel>>) {
         self.get_channel_with_ancestors_for_acl_in_server(DEFAULT_SERVER_ID, channel_id)
             .await
     }
@@ -1969,7 +2116,7 @@ impl ChannelRepository {
         &self,
         server_id: &str,
         channel_id: u32,
-    ) -> (u64, Option<Channel>, Vec<Channel>) {
+    ) -> (u64, Option<Arc<Channel>>, Vec<Arc<Channel>>) {
         loop {
             let generation = self.channel_acl_generation_for_channel(server_id, channel_id);
             let (channel, ancestors) = self
@@ -1989,7 +2136,7 @@ impl ChannelRepository {
         &self,
         server_id: &str,
         channel_id: u32,
-    ) -> (u64, Option<Channel>) {
+    ) -> (u64, Option<Arc<Channel>>) {
         loop {
             let generation = self.channel_acl_generation_for_channel(server_id, channel_id);
             let channel = self.get_channel_in_server(server_id, channel_id).await;
@@ -2022,7 +2169,7 @@ impl ChannelRepository {
     pub async fn create_channel(
         self: &Arc<Self>,
         channel: Channel,
-    ) -> Result<Channel, ChannelRepoError> {
+    ) -> Result<Arc<Channel>, ChannelRepoError> {
         self.create_channel_in_server(DEFAULT_SERVER_ID, channel)
             .await
     }
@@ -2031,13 +2178,14 @@ impl ChannelRepository {
         self: &Arc<Self>,
         server_id: &str,
         mut channel: Channel,
-    ) -> Result<Channel, ChannelRepoError> {
+    ) -> Result<Arc<Channel>, ChannelRepoError> {
         let _write_transaction = self.strict_apply_lock.lock().await;
-        let op = {
+        let (op, created) = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
+            self.ensure_ordered_channel_view_in_server(server_id, channels);
 
             // Validate parent exists
             if let Some(pid) = channel.parent_id {
@@ -2071,24 +2219,25 @@ impl ChannelRepository {
                     channel: channel.clone(),
                 },
             );
-            channels.insert(channel.id, channel.clone());
+            channels.insert(channel.id, Arc::new(channel.clone()));
             rebuild_effective_acl_caches_for_subtree(channels, channel.id);
+            self.rebuild_ordered_channel_view_in_server(server_id, channels);
             if !channel.links.is_empty() {
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, server_id, channels);
             }
-            op
+            (op, Arc::clone(&channels[&channel.id]))
         };
 
         self.commit(op).await?;
-        Ok(channel)
+        Ok(created)
     }
 
     pub async fn update_channel(
         self: &Arc<Self>,
         id: u32,
         patch: ChannelPatch,
-    ) -> Result<Channel, ChannelRepoError> {
+    ) -> Result<Arc<Channel>, ChannelRepoError> {
         self.update_channel_in_server(DEFAULT_SERVER_ID, id, patch)
             .await
     }
@@ -2098,7 +2247,7 @@ impl ChannelRepository {
         server_id: &str,
         id: u32,
         patch: ChannelPatch,
-    ) -> Result<Channel, ChannelRepoError> {
+    ) -> Result<Arc<Channel>, ChannelRepoError> {
         let _write_transaction = self.strict_apply_lock.lock().await;
         let parent_changed = patch.parent_id.is_some();
         let patch = self.normalize_patch_for_channel(id, patch);
@@ -2107,6 +2256,7 @@ impl ChannelRepository {
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
+            self.ensure_ordered_channel_view_in_server(server_id, channels);
 
             if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
@@ -2149,11 +2299,12 @@ impl ChannelRepository {
                     patch: patch.clone(),
                 },
             );
-            apply_patch(channels.get_mut(&id).unwrap(), &patch);
+            apply_patch(Arc::make_mut(channels.get_mut(&id).unwrap()), &patch);
             if parent_changed {
                 rebuild_effective_acl_caches_for_subtree(channels, id);
             }
-            let updated = channels[&id].clone();
+            self.rebuild_ordered_channel_view_in_server(server_id, channels);
+            let updated = Arc::clone(&channels[&id]);
             (op, updated)
         };
 
@@ -2171,7 +2322,7 @@ impl ChannelRepository {
         patch: ChannelPatch,
         links_add: Vec<u32>,
         links_remove: Vec<u32>,
-    ) -> Result<Channel, ChannelRepoError> {
+    ) -> Result<Arc<Channel>, ChannelRepoError> {
         self.edit_channel_in_server(DEFAULT_SERVER_ID, id, patch, links_add, links_remove)
             .await
     }
@@ -2183,7 +2334,7 @@ impl ChannelRepository {
         patch: ChannelPatch,
         links_add: Vec<u32>,
         links_remove: Vec<u32>,
-    ) -> Result<Channel, ChannelRepoError> {
+    ) -> Result<Arc<Channel>, ChannelRepoError> {
         let _write_transaction = self.strict_apply_lock.lock().await;
         let parent_changed = patch.parent_id.is_some();
         let patch = self.normalize_patch_for_channel(id, patch);
@@ -2193,6 +2344,7 @@ impl ChannelRepository {
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
+            self.ensure_ordered_channel_view_in_server(server_id, channels);
 
             if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
@@ -2244,28 +2396,33 @@ impl ChannelRepository {
                 if link_add == id {
                     continue;
                 }
-                channels.get_mut(&id).unwrap().links.insert(link_add);
+                Arc::make_mut(channels.get_mut(&id).unwrap())
+                    .links
+                    .insert(link_add);
                 if let Some(target) = channels.get_mut(&link_add) {
-                    target.links.insert(id);
+                    Arc::make_mut(target).links.insert(id);
                 }
             }
 
             for &link_remove in &links_remove {
-                channels.get_mut(&id).unwrap().links.remove(&link_remove);
+                Arc::make_mut(channels.get_mut(&id).unwrap())
+                    .links
+                    .remove(&link_remove);
                 if let Some(target) = channels.get_mut(&link_remove) {
-                    target.links.remove(&id);
+                    Arc::make_mut(target).links.remove(&id);
                 }
             }
 
-            apply_patch(channels.get_mut(&id).unwrap(), &patch);
+            apply_patch(Arc::make_mut(channels.get_mut(&id).unwrap()), &patch);
             if parent_changed {
                 rebuild_effective_acl_caches_for_subtree(channels, id);
             }
+            self.rebuild_ordered_channel_view_in_server(server_id, channels);
             if links_changed {
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, server_id, channels);
             }
-            channels[&id].clone()
+            Arc::clone(&channels[&id])
         };
 
         let op = self.make_op_in_server(
@@ -2346,6 +2503,7 @@ impl ChannelRepository {
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
+            self.ensure_ordered_channel_view_in_server(server_id, channels);
             if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
             }
@@ -2353,13 +2511,14 @@ impl ChannelRepository {
             let started_at_ms = chrono::Utc::now().timestamp_millis();
             for del_id in &to_delete {
                 if let Some(ch) = channels.get_mut(del_id) {
-                    ch.pending_delete = Some(PendingDeleteState {
+                    Arc::make_mut(ch).pending_delete = Some(PendingDeleteState {
                         nonce,
                         started_at_ms,
                         origin_node: self.node_id,
                     });
                 }
             }
+            self.rebuild_ordered_channel_view_in_server(server_id, channels);
             to_delete
         };
         let op = self.make_op_in_server(
@@ -2400,11 +2559,13 @@ impl ChannelRepository {
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
+            self.ensure_ordered_channel_view_in_server(server_id, channels);
             if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
             };
             let applied_delete = apply_delete_channel_to_map(channels, id, nonce);
             if let Some(applied_delete) = &applied_delete {
+                self.rebuild_ordered_channel_view_in_server(server_id, channels);
                 apply_link_topology_effect(
                     &self.link_topologies,
                     server_id,
@@ -2456,6 +2617,7 @@ impl ChannelRepository {
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
+            self.ensure_ordered_channel_view_in_server(server_id, channels);
             let to_cancel = collect_subtree(&channels, id);
             for cancel_id in &to_cancel {
                 if let Some(ch) = channels.get_mut(cancel_id) {
@@ -2464,10 +2626,11 @@ impl ChannelRepository {
                         .as_ref()
                         .is_some_and(|pending| pending.nonce == nonce)
                     {
-                        ch.pending_delete = None;
+                        Arc::make_mut(ch).pending_delete = None;
                     }
                 }
             }
+            self.rebuild_ordered_channel_view_in_server(server_id, channels);
         }
         let op = self.make_op_in_server(server_id, ChannelOp::CancelPendingDelete { id, nonce });
         self.commit(op).await?;
@@ -2493,6 +2656,7 @@ impl ChannelRepository {
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
+            self.ensure_ordered_channel_view_in_server(server_id, channels);
             if !channels.contains_key(&a) {
                 return Err(ChannelRepoError::NotFound(a));
             }
@@ -2505,8 +2669,9 @@ impl ChannelRepository {
             if channels[&b].is_temporary() {
                 return Err(ChannelRepoError::TemporaryChannelCannotBeLinked(b));
             }
-            channels.get_mut(&a).unwrap().links.insert(b);
-            channels.get_mut(&b).unwrap().links.insert(a);
+            Arc::make_mut(channels.get_mut(&a).unwrap()).links.insert(b);
+            Arc::make_mut(channels.get_mut(&b).unwrap()).links.insert(a);
+            self.rebuild_ordered_channel_view_in_server(server_id, channels);
             let mut link_topologies = self.link_topologies.write();
             sync_link_topology_for_server(&mut link_topologies, server_id, channels);
         }
@@ -2532,12 +2697,14 @@ impl ChannelRepository {
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
+            self.ensure_ordered_channel_view_in_server(server_id, channels);
             if let Some(ch) = channels.get_mut(&a) {
-                ch.links.remove(&b);
+                Arc::make_mut(ch).links.remove(&b);
             }
             if let Some(ch) = channels.get_mut(&b) {
-                ch.links.remove(&a);
+                Arc::make_mut(ch).links.remove(&a);
             }
+            self.rebuild_ordered_channel_view_in_server(server_id, channels);
             let mut link_topologies = self.link_topologies.write();
             sync_link_topology_for_server(&mut link_topologies, server_id, channels);
         }
@@ -2614,6 +2781,7 @@ impl ChannelRepository {
             let channels = all_channels.entry(server_id.to_owned()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
+            self.ensure_ordered_channel_view_in_server(server_id, channels);
             let ch = channels
                 .get_mut(&channel_id)
                 .ok_or(ChannelRepoError::NotFound(channel_id))?;
@@ -2622,9 +2790,11 @@ impl ChannelRepository {
             }
             let old_inherit_acl = ch.inherit_acl;
             let old_acls = ch.acls.clone();
+            let ch = Arc::make_mut(ch);
             ch.inherit_acl = inherit_acl;
             ch.acls = acls.clone();
             rebuild_effective_acl_caches_for_subtree(channels, channel_id);
+            self.rebuild_ordered_channel_view_in_server(server_id, channels);
             build_acl_change_hint(
                 channels,
                 channel_id,
@@ -2873,7 +3043,7 @@ impl ChannelRepository {
         versions: HashMap<String, u64>,
         history_freshness: HashMap<String, i64>,
         strict_applied_ops: HashSet<StrictOperationKey>,
-        channels_by_server: HashMap<String, HashMap<u32, Channel>>,
+        channels_by_server: ChannelsByServer,
     ) -> Snapshot {
         let version = versions.get(DEFAULT_SERVER_ID).copied().unwrap_or_default();
         let mut strict_applied_ops: Vec<_> = strict_applied_ops.into_iter().collect();
@@ -3158,6 +3328,7 @@ impl ChannelRepository {
             let channels = all_channels.entry(op.server_id.clone()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
+            self.ensure_ordered_channel_view_in_server(&op.server_id, channels);
             let normalized_op = normalize_op_for_root(&op.op, &root_config);
             let mut should_invalidate_acl = channel_op_invalidates_acl_cache(&normalized_op);
             if let ChannelOp::SetAcls {
@@ -3193,6 +3364,7 @@ impl ChannelRepository {
                 }
             };
             rebuild_effective_acl_caches_for_op(channels, &normalized_op);
+            self.rebuild_ordered_channel_view_in_server(&op.server_id, channels);
             apply_link_topology_effect(
                 &self.link_topologies,
                 &op.server_id,
@@ -3335,6 +3507,7 @@ impl ChannelRepository {
             let channels = all_channels.entry(server_id.clone()).or_default();
             let root_config = self.root_config.read().clone();
             ensure_root_channel(channels, &root_config);
+            self.ensure_ordered_channel_view_in_server(&server_id, channels);
             op.op = normalize_op_for_root(&op.op, &root_config);
             let old_acl_state = match &op.op {
                 ChannelOp::SetAcls { channel_id, .. } => channels
@@ -3379,6 +3552,7 @@ impl ChannelRepository {
                 }
             };
             rebuild_effective_acl_caches_for_op(channels, &op.op);
+            self.rebuild_ordered_channel_view_in_server(&server_id, channels);
             apply_link_topology_effect(
                 &self.link_topologies,
                 &server_id,
@@ -3578,7 +3752,7 @@ impl ChannelRepository {
             if channel.id == 0 {
                 channel.name = root_config.name().to_owned();
             }
-            replacement.insert(channel.id, channel);
+            replacement.insert(channel.id, Arc::new(channel));
         }
         ensure_root_channel(&mut replacement, &root_config);
         channels_by_server.insert(server_id.to_owned(), replacement);
@@ -3639,14 +3813,16 @@ impl ChannelRepository {
                     if channel.id == 0 {
                         channel.name = root_config.name().to_owned();
                     }
-                    channels.insert(channel.id, channel);
+                    channels.insert(channel.id, Arc::new(channel));
                 }
                 ensure_root_channel(channels, &root_config);
                 rebuild_all_effective_acl_caches_in_map(channels);
+                self.rebuild_ordered_channel_view_in_server(server_id, channels);
                 let mut link_topologies = self.link_topologies.write();
                 sync_link_topology_for_server(&mut link_topologies, server_id, channels);
                 ids.extend(channels.keys().copied());
-                notification_channels.extend(channels.values().cloned());
+                notification_channels
+                    .extend(channels.values().map(|channel| channel.as_ref().clone()));
                 removed_channel_ids.extend(
                     old_ids
                         .difference(&ids)
@@ -4177,7 +4353,7 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn next_available_channel_id(channels: &HashMap<u32, Channel>, temporary: bool) -> u32 {
+fn next_available_channel_id(channels: &ChannelMap, temporary: bool) -> u32 {
     let max_non_temporary_id = channels
         .keys()
         .filter(|id| **id & TEMPORARY_CHANNEL_ID_BIT == 0)
@@ -4206,7 +4382,7 @@ fn next_available_channel_id(channels: &HashMap<u32, Channel>, temporary: bool) 
 }
 
 fn validate_new_channel_links(
-    channels: &HashMap<u32, Channel>,
+    channels: &ChannelMap,
     channel: &Channel,
 ) -> Result<(), ChannelRepoError> {
     if channel.links.is_empty() {
@@ -4232,7 +4408,7 @@ fn validate_new_channel_links(
 fn apply_link_topology_effect(
     link_topologies: &ParkingRwLock<HashMap<String, LinkTopology>>,
     server_id: &str,
-    channels: &mut HashMap<u32, Channel>,
+    channels: &mut ChannelMap,
     effect: LinkTopologyEffect,
 ) {
     match effect {
@@ -4252,25 +4428,23 @@ fn apply_link_topology_effect(
     }
 }
 
-fn rebuild_all_effective_acl_caches(
-    channels_by_server: &mut HashMap<String, HashMap<u32, Channel>>,
-) {
+fn rebuild_all_effective_acl_caches(channels_by_server: &mut ChannelsByServer) {
     for channels in channels_by_server.values_mut() {
         rebuild_all_effective_acl_caches_in_map(channels);
     }
 }
 
-fn rebuild_all_effective_acl_caches_in_map(channels: &mut HashMap<u32, Channel>) {
+fn rebuild_all_effective_acl_caches_in_map(channels: &mut ChannelMap) {
     let channel_ids: HashSet<u32> = channels.keys().copied().collect();
     rebuild_effective_acl_caches(channels, channel_ids);
 }
 
-fn rebuild_effective_acl_caches_for_subtree(channels: &mut HashMap<u32, Channel>, root_id: u32) {
+fn rebuild_effective_acl_caches_for_subtree(channels: &mut ChannelMap, root_id: u32) {
     let channel_ids = collect_subtree(channels, root_id).into_iter().collect();
     rebuild_effective_acl_caches(channels, channel_ids);
 }
 
-fn rebuild_effective_acl_caches_for_op(channels: &mut HashMap<u32, Channel>, op: &ChannelOp) {
+fn rebuild_effective_acl_caches_for_op(channels: &mut ChannelMap, op: &ChannelOp) {
     match op {
         ChannelOp::CreateChannel { channel } => {
             rebuild_effective_acl_caches_for_subtree(channels, channel.id);
@@ -4294,10 +4468,7 @@ fn rebuild_effective_acl_caches_for_op(channels: &mut HashMap<u32, Channel>, op:
     }
 }
 
-fn rebuild_effective_acl_caches(
-    channels: &mut HashMap<u32, Channel>,
-    mut channel_ids: HashSet<u32>,
-) {
+fn rebuild_effective_acl_caches(channels: &mut ChannelMap, mut channel_ids: HashSet<u32>) {
     channel_ids.extend(
         channels
             .values()
@@ -4305,22 +4476,18 @@ fn rebuild_effective_acl_caches(
             .map(|channel| channel.id),
     );
 
-    let rebuilt = channel_ids
-        .into_iter()
-        .filter_map(|channel_id| {
-            let mut channel = channels.get(&channel_id)?.clone();
-            let ancestors = ancestor_channels_in_map(channels, channel_id);
-            channel.rebuild_effective_acl_cache(&ancestors);
-            Some(channel)
-        })
-        .collect::<Vec<_>>();
-
-    for channel in rebuilt {
-        channels.insert(channel.id, channel);
+    for channel_id in channel_ids {
+        let ancestors = ancestor_channels_in_map(channels, channel_id);
+        let Some(current) = channels.get(&channel_id) else {
+            continue;
+        };
+        let mut channel = current.as_ref().clone();
+        channel.rebuild_effective_acl_cache(&ancestors);
+        channels.insert(channel_id, Arc::new(channel));
     }
 }
 
-fn ancestor_channels_in_map(channels: &HashMap<u32, Channel>, channel_id: u32) -> Vec<Channel> {
+fn ancestor_channels_in_map(channels: &ChannelMap, channel_id: u32) -> Vec<Arc<Channel>> {
     let mut ancestors = Vec::new();
     let mut visited = HashSet::from([channel_id]);
     let mut current_id = channel_id;
@@ -4337,7 +4504,7 @@ fn ancestor_channels_in_map(channels: &HashMap<u32, Channel>, channel_id: u32) -
         let Some(parent) = channels.get(&parent_id) else {
             break;
         };
-        ancestors.push(parent.clone());
+        ancestors.push(Arc::clone(parent));
         current_id = parent_id;
     }
     ancestors
@@ -4345,7 +4512,7 @@ fn ancestor_channels_in_map(channels: &HashMap<u32, Channel>, channel_id: u32) -
 
 /// Apply a `ChannelOp` to the in-memory channel map.
 fn apply_op_to_map(
-    channels: &mut HashMap<u32, Channel>,
+    channels: &mut ChannelMap,
     op: &ChannelOp,
     origin_node: u16,
     root_config: &ChannelRootConfig,
@@ -4353,7 +4520,7 @@ fn apply_op_to_map(
     let op = normalize_op_for_root(op, root_config);
     match &op {
         ChannelOp::CreateChannel { channel } => {
-            channels.insert(channel.id, channel.clone());
+            channels.insert(channel.id, Arc::new(channel.clone()));
         }
         ChannelOp::EditChannel {
             id,
@@ -4366,27 +4533,27 @@ fn apply_op_to_map(
                     continue;
                 }
                 if let Some(ch) = channels.get_mut(id) {
-                    ch.links.insert(*link_add);
+                    Arc::make_mut(ch).links.insert(*link_add);
                 }
                 if let Some(target) = channels.get_mut(link_add) {
-                    target.links.insert(*id);
+                    Arc::make_mut(target).links.insert(*id);
                 }
             }
             for link_remove in links_remove {
                 if let Some(ch) = channels.get_mut(id) {
-                    ch.links.remove(link_remove);
+                    Arc::make_mut(ch).links.remove(link_remove);
                 }
                 if let Some(target) = channels.get_mut(link_remove) {
-                    target.links.remove(id);
+                    Arc::make_mut(target).links.remove(id);
                 }
             }
             if let Some(ch) = channels.get_mut(id) {
-                apply_patch(ch, patch);
+                apply_patch(Arc::make_mut(ch), patch);
             }
         }
         ChannelOp::UpdateChannel { id, patch } => {
             if let Some(ch) = channels.get_mut(id) {
-                apply_patch(ch, patch);
+                apply_patch(Arc::make_mut(ch), patch);
             }
         }
         ChannelOp::MarkPendingDelete { id, nonce, .. } => {
@@ -4394,7 +4561,7 @@ fn apply_op_to_map(
             let to_mark = collect_subtree(channels, *id);
             for mark_id in to_mark {
                 if let Some(ch) = channels.get_mut(&mark_id) {
-                    ch.pending_delete = Some(PendingDeleteState {
+                    Arc::make_mut(ch).pending_delete = Some(PendingDeleteState {
                         nonce: *nonce,
                         started_at_ms,
                         origin_node,
@@ -4414,25 +4581,25 @@ fn apply_op_to_map(
                         .as_ref()
                         .is_some_and(|pending| pending.nonce == *nonce)
                     {
-                        ch.pending_delete = None;
+                        Arc::make_mut(ch).pending_delete = None;
                     }
                 }
             }
         }
         ChannelOp::AddLink { a, b } => {
             if let Some(ch) = channels.get_mut(a) {
-                ch.links.insert(*b);
+                Arc::make_mut(ch).links.insert(*b);
             }
             if let Some(ch) = channels.get_mut(b) {
-                ch.links.insert(*a);
+                Arc::make_mut(ch).links.insert(*a);
             }
         }
         ChannelOp::RemoveLink { a, b } => {
             if let Some(ch) = channels.get_mut(a) {
-                ch.links.remove(b);
+                Arc::make_mut(ch).links.remove(b);
             }
             if let Some(ch) = channels.get_mut(b) {
-                ch.links.remove(a);
+                Arc::make_mut(ch).links.remove(a);
             }
         }
         ChannelOp::SetAcls {
@@ -4441,6 +4608,7 @@ fn apply_op_to_map(
             acls,
         } => {
             if let Some(ch) = channels.get_mut(channel_id) {
+                let ch = Arc::make_mut(ch);
                 ch.inherit_acl = *inherit_acl;
                 ch.acls = acls.clone();
             }
@@ -4454,7 +4622,7 @@ fn apply_op_to_map(
                 if channel.id == 0 {
                     channel.name = root_config.name().to_owned();
                 }
-                channels.insert(channel.id, channel);
+                channels.insert(channel.id, Arc::new(channel));
             }
             ensure_root_channel(channels, root_config);
         }
@@ -4480,7 +4648,7 @@ fn apply_patch(ch: &mut Channel, patch: &ChannelPatch) {
 }
 
 fn apply_delete_channel_to_map(
-    channels: &mut HashMap<u32, Channel>,
+    channels: &mut ChannelMap,
     id: u32,
     nonce: u64,
 ) -> Option<DeleteChannelApplied> {
@@ -4513,7 +4681,7 @@ fn apply_delete_channel_to_map(
 }
 
 fn rebuild_all_link_topologies(
-    channels_by_server: &mut HashMap<String, HashMap<u32, Channel>>,
+    channels_by_server: &mut ChannelsByServer,
 ) -> HashMap<String, LinkTopology> {
     let mut topologies = HashMap::new();
     for (server_id, channels) in channels_by_server {
@@ -4526,13 +4694,13 @@ fn rebuild_all_link_topologies(
 fn sync_link_topology_for_server(
     link_topologies: &mut HashMap<String, LinkTopology>,
     server_id: &str,
-    channels: &mut HashMap<u32, Channel>,
+    channels: &mut ChannelMap,
 ) {
     normalize_channel_links(channels);
     link_topologies.insert(server_id.to_owned(), LinkTopology::from_channels(channels));
 }
 
-fn normalize_channel_links(channels: &mut HashMap<u32, Channel>) {
+fn normalize_channel_links(channels: &mut ChannelMap) {
     let channel_ids: HashSet<u32> = channels.keys().copied().collect();
     let mut edges = HashSet::new();
 
@@ -4546,20 +4714,20 @@ fn normalize_channel_links(channels: &mut HashMap<u32, Channel>) {
     }
 
     for channel in channels.values_mut() {
-        channel.links.clear();
+        Arc::make_mut(channel).links.clear();
     }
 
     for (a, b) in edges {
         if let Some(channel) = channels.get_mut(&a) {
-            channel.links.insert(b);
+            Arc::make_mut(channel).links.insert(b);
         }
         if let Some(channel) = channels.get_mut(&b) {
-            channel.links.insert(a);
+            Arc::make_mut(channel).links.insert(a);
         }
     }
 }
 
-fn deleted_channels_have_links(channels: &HashMap<u32, Channel>, deleted_ids: &[u32]) -> bool {
+fn deleted_channels_have_links(channels: &ChannelMap, deleted_ids: &[u32]) -> bool {
     deleted_ids.iter().any(|id| {
         channels
             .get(id)
@@ -4568,7 +4736,7 @@ fn deleted_channels_have_links(channels: &HashMap<u32, Channel>, deleted_ids: &[
 }
 
 fn linked_neighbors_outside_deleted_subtree(
-    channels: &HashMap<u32, Channel>,
+    channels: &ChannelMap,
     deleted_ids: &[u32],
 ) -> Vec<u32> {
     let deleted_ids: HashSet<u32> = deleted_ids.iter().copied().collect();
@@ -4586,7 +4754,7 @@ fn linked_neighbors_outside_deleted_subtree(
 }
 
 fn remove_links_from_deleted_channel_neighbors(
-    channels: &mut HashMap<u32, Channel>,
+    channels: &mut ChannelMap,
     neighbor_ids: &[u32],
     removed_ids: &[u32],
 ) {
@@ -4596,7 +4764,7 @@ fn remove_links_from_deleted_channel_neighbors(
     let removed_ids: HashSet<u32> = removed_ids.iter().copied().collect();
     for neighbor_id in neighbor_ids {
         if let Some(channel) = channels.get_mut(neighbor_id) {
-            channel
+            Arc::make_mut(channel)
                 .links
                 .retain(|linked_id| !removed_ids.contains(linked_id));
         }
@@ -4607,13 +4775,16 @@ fn ordered_link_edge(a: u32, b: u32) -> (u32, u32) {
     if a < b { (a, b) } else { (b, a) }
 }
 
-fn ensure_root_channel(channels: &mut HashMap<u32, Channel>, root_config: &ChannelRootConfig) {
+fn ensure_root_channel(channels: &mut ChannelMap, root_config: &ChannelRootConfig) {
     channels
         .entry(0)
-        .or_insert_with(|| root_channel(root_config));
+        .or_insert_with(|| Arc::new(root_channel(root_config)));
     if let Some(root) = channels.get_mut(&0) {
-        root.name = root_config.name().to_owned();
-        root.parent_id = None;
+        if root.name != root_config.name() || root.parent_id.is_some() {
+            let root = Arc::make_mut(root);
+            root.name = root_config.name().to_owned();
+            root.parent_id = None;
+        }
     }
 }
 
@@ -4728,7 +4899,7 @@ pub fn channel_op_invalidates_acl_cache(op: &ChannelOp) -> bool {
 }
 
 fn acl_affected_channel_ids_for_op_in_map(
-    channels: &HashMap<u32, Channel>,
+    channels: &ChannelMap,
     op: &ChannelOp,
 ) -> Option<HashSet<u32>> {
     match op {
@@ -4756,9 +4927,7 @@ fn acl_affected_channel_ids_for_op_in_map(
     }
 }
 
-fn channels_with_home_channel_dependent_acls_in_map(
-    channels: &HashMap<u32, Channel>,
-) -> HashSet<u32> {
+fn channels_with_home_channel_dependent_acls_in_map(channels: &ChannelMap) -> HashSet<u32> {
     let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
     for channel in channels.values() {
         if let Some(parent_id) = channel.parent_id {
@@ -4777,7 +4946,7 @@ fn channels_with_home_channel_dependent_acls_in_map(
 }
 
 fn channels_with_home_channel_dependent_acls_with_children(
-    channels: &HashMap<u32, Channel>,
+    channels: &ChannelMap,
     children_by_parent: &HashMap<u32, Arc<[u32]>>,
 ) -> HashSet<u32> {
     let mut roots: Vec<u32> = channels
@@ -4805,7 +4974,7 @@ fn channels_with_home_channel_dependent_acls_with_children(
 }
 
 fn collect_home_channel_dependent_acl_channel_ids(
-    channels: &HashMap<u32, Channel>,
+    channels: &ChannelMap,
     children_by_parent: &HashMap<u32, Arc<[u32]>>,
     channel_id: u32,
     inherited_home_channel_dependent_acl: bool,
@@ -4851,7 +5020,7 @@ fn collect_home_channel_dependent_acl_channel_ids(
 }
 
 /// Collect `root_id` and all of its descendants (BFS), returning their IDs.
-fn collect_subtree(channels: &HashMap<u32, Channel>, root_id: u32) -> Vec<u32> {
+fn collect_subtree(channels: &ChannelMap, root_id: u32) -> Vec<u32> {
     if channels
         .get(&root_id)
         .is_some_and(|channel| channel.is_temporary())
@@ -4884,7 +5053,7 @@ fn collect_subtree(channels: &HashMap<u32, Channel>, root_id: u32) -> Vec<u32> {
 }
 
 /// Return `true` if `candidate` is a descendant of `ancestor_id`.
-fn is_descendant(channels: &HashMap<u32, Channel>, candidate: u32, ancestor_id: u32) -> bool {
+fn is_descendant(channels: &ChannelMap, candidate: u32, ancestor_id: u32) -> bool {
     let mut current = candidate;
     loop {
         if current == ancestor_id {
@@ -5291,8 +5460,14 @@ mod tests {
     fn temporary_subtree_collection_is_leaf_only() {
         let temp_id = TEMPORARY_CHANNEL_ID_BIT | 1;
         let mut channels = HashMap::new();
-        channels.insert(temp_id, Channel::new(temp_id, "temp", 0, 0, Some(0)));
-        channels.insert(10, Channel::new(10, "legacy-child", 0, 0, Some(temp_id)));
+        channels.insert(
+            temp_id,
+            Arc::new(Channel::new(temp_id, "temp", 0, 0, Some(0))),
+        );
+        channels.insert(
+            10,
+            Arc::new(Channel::new(10, "legacy-child", 0, 0, Some(temp_id))),
+        );
 
         assert_eq!(collect_subtree(&channels, temp_id), vec![temp_id]);
     }
@@ -5362,14 +5537,14 @@ mod tests {
     #[test]
     fn channel_tree_snapshot_inheriting_subtree_stops_at_acl_barriers() {
         let mut channels = HashMap::from([
-            (0, Channel::new(0, "root", 0, 0, None)),
-            (1, Channel::new(1, "one", 0, 0, Some(0))),
-            (2, Channel::new(2, "two", 0, 0, Some(1))),
-            (3, Channel::new(3, "three", 0, 0, Some(1))),
-            (4, Channel::new(4, "four", 0, 0, Some(2))),
-            (5, Channel::new(5, "five", 0, 0, Some(3))),
+            (0, Arc::new(Channel::new(0, "root", 0, 0, None))),
+            (1, Arc::new(Channel::new(1, "one", 0, 0, Some(0)))),
+            (2, Arc::new(Channel::new(2, "two", 0, 0, Some(1)))),
+            (3, Arc::new(Channel::new(3, "three", 0, 0, Some(1)))),
+            (4, Arc::new(Channel::new(4, "four", 0, 0, Some(2)))),
+            (5, Arc::new(Channel::new(5, "five", 0, 0, Some(3)))),
         ]);
-        channels.get_mut(&3).unwrap().inherit_acl = false;
+        Arc::make_mut(channels.get_mut(&3).unwrap()).inherit_acl = false;
         let snapshot = ChannelTreeSnapshot::new(channels);
 
         assert_eq!(snapshot.inheriting_subtree_ids(1, true), vec![1, 2, 4]);
@@ -5675,7 +5850,12 @@ mod tests {
             .unwrap();
         let acl_op = repo.get_log_since(0).await.pop().unwrap();
         assert!(repo.acl_change_hint_for_operation(&acl_op).is_some());
-        let channels = repo.get_all().await;
+        let channels = repo
+            .get_all()
+            .await
+            .into_iter()
+            .map(|channel| channel.as_ref().clone())
+            .collect();
         repo.install_s2s_snapshot(repo.current_version(), channels)
             .await
             .unwrap();
@@ -6138,6 +6318,216 @@ mod tests {
             .expect("snapshot subscription receives channel operation");
         assert_eq!(op.server_id, "alpha");
         assert_eq!(op.version, 1);
+    }
+
+    #[tokio::test]
+    async fn repository_snapshots_reuse_root_first_position_order_after_mutations() {
+        let repo = repo();
+        repo.create_channel(Channel::new(3, "right", 0, 1, Some(0)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(2, "left", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(5, "left-child", 0, 0, Some(2)))
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(4, "right-child", 0, 0, Some(3)))
+            .await
+            .unwrap();
+
+        let ids = repo
+            .get_all()
+            .await
+            .into_iter()
+            .map(|channel| channel.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![0, 2, 3, 5, 4]);
+
+        let (before_update, _, _) =
+            repo.snapshot_with_version_and_subscription_in_server(DEFAULT_SERVER_ID);
+        let (same_view, _, _) =
+            repo.snapshot_with_version_and_subscription_in_server(DEFAULT_SERVER_ID);
+        assert!(Arc::ptr_eq(&before_update, &same_view));
+        let authoritative_before =
+            Arc::clone(repo.channels.read()[DEFAULT_SERVER_ID].get(&3).unwrap());
+        let ordered_before = before_update
+            .iter()
+            .find(|channel| channel.id == 3)
+            .unwrap();
+        let tree_before = repo.channel_tree_snapshot_in_server(DEFAULT_SERVER_ID);
+        let tree_channel_before = tree_before.channels.get(&3).unwrap();
+        assert!(Arc::ptr_eq(&authoritative_before, ordered_before));
+        assert!(Arc::ptr_eq(&authoritative_before, tree_channel_before));
+        let unchanged_before = Arc::clone(repo.channels.read()[DEFAULT_SERVER_ID].get(&2).unwrap());
+        let root_before = Arc::clone(repo.channels.read()[DEFAULT_SERVER_ID].get(&0).unwrap());
+
+        repo.create_channel(Channel::new(99, "right", 0, 0, Some(0)))
+            .await
+            .expect_err("duplicate sibling name is rejected");
+        let after_rejection = repo.ordered_snapshot_in_server(DEFAULT_SERVER_ID);
+        assert!(Arc::ptr_eq(
+            &root_before,
+            repo.channels.read()[DEFAULT_SERVER_ID].get(&0).unwrap()
+        ));
+        assert!(Arc::ptr_eq(&root_before, &after_rejection[0]));
+
+        repo.update_channel(
+            3,
+            ChannelPatch {
+                name: Some("renamed-right".to_owned()),
+                position: None,
+                max_users: Some(42),
+                description_hash: None,
+                parent_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (content_update, _, _) =
+            repo.snapshot_with_version_and_subscription_in_server(DEFAULT_SERVER_ID);
+        assert!(!Arc::ptr_eq(&before_update, &content_update));
+        assert_eq!(
+            before_update
+                .iter()
+                .find(|channel| channel.id == 3)
+                .unwrap()
+                .name
+                .as_str(),
+            "right"
+        );
+        let updated = content_update
+            .iter()
+            .find(|channel| channel.id == 3)
+            .unwrap();
+        assert_eq!(updated.name.as_str(), "renamed-right");
+        assert_eq!(updated.max_users, 42);
+        assert!(!Arc::ptr_eq(&authoritative_before, updated));
+        assert!(Arc::ptr_eq(
+            &unchanged_before,
+            content_update
+                .iter()
+                .find(|channel| channel.id == 2)
+                .unwrap()
+        ));
+
+        repo.set_acls(3, false, vec![test_acl("staff")])
+            .await
+            .unwrap();
+        let (acl_update, _, _) =
+            repo.snapshot_with_version_and_subscription_in_server(DEFAULT_SERVER_ID);
+        assert!(!Arc::ptr_eq(&content_update, &acl_update));
+        assert!(
+            content_update
+                .iter()
+                .find(|channel| channel.id == 3)
+                .unwrap()
+                .acls
+                .is_empty()
+        );
+        assert_eq!(
+            acl_update
+                .iter()
+                .find(|channel| channel.id == 3)
+                .unwrap()
+                .acls
+                .len(),
+            1
+        );
+
+        repo.update_channel(
+            3,
+            ChannelPatch {
+                name: None,
+                position: Some(-1),
+                max_users: None,
+                description_hash: None,
+                parent_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (channels, _, _) =
+            repo.snapshot_with_version_and_subscription_in_server(DEFAULT_SERVER_ID);
+        assert!(!Arc::ptr_eq(&acl_update, &channels));
+        assert_eq!(
+            channels
+                .iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            vec![0, 3, 2, 4, 5]
+        );
+        assert_eq!(
+            repo.channel_tree_snapshot_in_server(DEFAULT_SERVER_ID)
+                .ordered_channels()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            vec![0, 3, 2, 4, 5]
+        );
+    }
+
+    #[tokio::test]
+    async fn installed_snapshot_order_preserves_orphans_cycles_and_server_scope() {
+        let repo = repo();
+        repo.create_channel_in_server("beta", Channel::new(10, "beta", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.install_s2s_snapshot_in_server(
+            "alpha",
+            7,
+            vec![
+                Channel::new(7, "orphan", 0, 0, Some(99)),
+                Channel::new(3, "right", 0, 1, Some(0)),
+                Channel::new(0, "ignored-root-name", 0, 0, None),
+                Channel::new(2, "left", 0, 0, Some(0)),
+                Channel::new(5, "left-child", 0, 0, Some(2)),
+                Channel::new(9, "cycle-b", 0, 0, Some(8)),
+                Channel::new(8, "cycle-a", 0, 0, Some(9)),
+            ],
+            11,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.get_all_in_server("alpha")
+                .await
+                .into_iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3, 5, 9, 8, 7]
+        );
+        assert_eq!(
+            repo.get_all_in_server("beta")
+                .await
+                .into_iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            vec![0, 10]
+        );
+    }
+
+    #[test]
+    fn ordered_snapshot_synthesizes_root_before_building_breadth_first_order() {
+        let repo = repo();
+        {
+            let mut all_channels = repo.channels.write();
+            let channels = all_channels.get_mut(DEFAULT_SERVER_ID).unwrap();
+            channels.clear();
+            channels.insert(3, Arc::new(Channel::new(3, "first", 0, 0, Some(0))));
+            channels.insert(2, Arc::new(Channel::new(2, "second", 1, 0, Some(0))));
+            channels.insert(4, Arc::new(Channel::new(4, "first-child", 0, 0, Some(3))));
+            channels.insert(5, Arc::new(Channel::new(5, "second-child", 0, 0, Some(2))));
+            repo.ordered_channels.write().remove(DEFAULT_SERVER_ID);
+        }
+
+        assert_eq!(
+            repo.ordered_snapshot_in_server(DEFAULT_SERVER_ID)
+                .iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            vec![0, 3, 2, 4, 5]
+        );
     }
 
     #[tokio::test]
