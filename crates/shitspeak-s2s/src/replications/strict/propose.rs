@@ -209,10 +209,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             ));
         }
         self.spawn_proposal_deadline(op_id);
-        // Start repair before awaiting the initial route-diverse multicast.
-        // On a hostile topology that send can spend meaningful time walking
-        // alternate first hops; the proposal TTL must retain concurrent
-        // opportunities to reach and hear from the frozen targets.
+        // Start repair before awaiting the initial multicast. The first
+        // attempt and every retry use one selected route per destination;
+        // the RTT-scaled worker provides bounded recovery without duplicating
+        // every proposal over alternate routes.
         self.spawn_propose_retries(op_id);
         tracing::debug!(
             topic = %self.topic,
@@ -247,11 +247,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             frozen_targets: super::runtime::frozen_targets_to_wire(&frozen_targets),
         });
         if !dsts.is_empty() {
-            if let Err(e) = self
-                .net
-                .send_redundant_multicast(&dsts, &self.topic, body)
-                .await
-            {
+            if let Err(e) = self.net.send_multicast(&dsts, &self.topic, body).await {
                 trace!(error=%e, "send propose multicast failed");
             }
         }

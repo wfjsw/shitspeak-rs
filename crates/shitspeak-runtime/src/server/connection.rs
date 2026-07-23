@@ -19,10 +19,10 @@ use crate::client::{
     visibility::UserVisibilityState,
 };
 use crate::errors::{HandleIncomingConnectionError, MessageHandlerError, WriteProtoMessageError};
-use shitspeak_messages::messages::encoder::Version;
-use shitspeak_messages::messages::{Message, WriteMessageExt};
 use crate::proxy_protocol::consume_proxy_protocol_connection_info;
 use crate::types::default_server_id;
+use shitspeak_messages::messages::encoder::Version;
+use shitspeak_messages::messages::{Message, WriteMessageExt};
 use shitspeak_state::{ChannelOp, ChannelOperation};
 
 use super::Server;

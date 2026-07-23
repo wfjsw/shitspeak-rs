@@ -2859,14 +2859,15 @@ async fn deliver_text_message_to_local_recipients(
                 continue;
             }
         }
-        let message: shitspeak_messages::messages::Message = shitspeak_messages::messages::encoder::TextMessage {
-            actor: Some(envelope.sender_session),
-            session: envelope.session.clone(),
-            channel_id: envelope.channel_id.clone(),
-            tree_id: envelope.tree_id.clone(),
-            message: envelope.message.clone(),
-        }
-        .into();
+        let message: shitspeak_messages::messages::Message =
+            shitspeak_messages::messages::encoder::TextMessage {
+                actor: Some(envelope.sender_session),
+                session: envelope.session.clone(),
+                channel_id: envelope.channel_id.clone(),
+                tree_id: envelope.tree_id.clone(),
+                message: envelope.message.clone(),
+            }
+            .into();
         server
             .get_clients()
             .send_to_in_server(&server_id, id, &message)
@@ -3132,13 +3133,14 @@ async fn apply_user_remove_patch(
         } else {
             None
         };
-    let remove_notice: shitspeak_messages::messages::Message = shitspeak_messages::messages::encoder::UserRemove {
-        session: u32::from(target_id),
-        actor: actor_for_target,
-        reason: patch.reason.clone(),
-        ban: Some(patch.ban),
-    }
-    .into();
+    let remove_notice: shitspeak_messages::messages::Message =
+        shitspeak_messages::messages::encoder::UserRemove {
+            session: u32::from(target_id),
+            actor: actor_for_target,
+            reason: patch.reason.clone(),
+            ban: Some(patch.ban),
+        }
+        .into();
     if let Err(e) = target.write_proto_message_direct(&remove_notice).await {
         trace!(
             error = %e,

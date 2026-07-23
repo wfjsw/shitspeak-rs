@@ -84,10 +84,6 @@ pub(super) const STRICT_PROTOCOL_VERSION_V3: u32 =
 /// control path. This bounds the strict envelope and nested protobuf body;
 /// mandatory origin-proof material has separate certificate/signature bounds.
 pub(super) const STRICT_V3_CONTROL_MAX_ENCODED_BYTES: usize = 2 * 1024;
-/// Strict replication never occupies the high-priority transport queue. Keep
-/// its per-enqueue transport lifetime long enough for high-latency links while
-/// bounding stale queued work independently from protocol/session retries.
-const STRICT_REPLICATION_TRANSPORT_TTL: Duration = Duration::from_secs(1);
 const STRICT_REPLICATION_MESSAGE_CLASS: MessageClass = MessageClass::Regular;
 const NORMAL_ACCEPT_BALLOT: u64 = 0;
 const OP_ID_BOOT_EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -95,11 +91,14 @@ const OP_ID_BOOT_EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// Build transport options for every production strict-replication enqueue.
 ///
 /// Keeping the queue lifetime policy here prevents control, consensus, and
-/// bulk paths from silently acquiring different transport TTLs. Protocol
-/// retries remain responsible for reliability beyond this bounded enqueue
-/// lifetime.
-fn strict_replication_transport_options(allow_l1_compression: bool) -> OverlaySendOptions {
-    let options = OverlaySendOptions::default().expire_after(STRICT_REPLICATION_TRANSPORT_TTL);
+/// bulk paths from silently acquiring different transport TTLs. This TTL
+/// bounds each hop's enqueue lifetime; it is not an end-to-end packet
+/// deadline. Protocol retries provide reliability beyond that bound.
+fn strict_replication_transport_options(
+    allow_l1_compression: bool,
+    transport_ttl: Duration,
+) -> OverlaySendOptions {
+    let options = OverlaySendOptions::default().expire_after(transport_ttl);
     if allow_l1_compression {
         options.allow_l1_compression()
     } else {
@@ -167,6 +166,109 @@ pub(crate) fn p95_clock_tick_interval(samples: &[Duration], cfg: &ReplicationCon
     let idx_one_based = ((n as f64) * 0.95).ceil() as usize;
     let idx = idx_one_based.saturating_sub(1).min(n - 1);
     buf[idx].clamp(cfg.min_clock_tick(), cfg.max_clock_tick())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteRttSet {
+    Empty,
+    Measured(Duration),
+    Unknown,
+}
+
+fn max_route_rtt(net: &dyn StrictNet, dsts: &[NodeIdentifier]) -> RouteRttSet {
+    if dsts.is_empty() {
+        return RouteRttSet::Empty;
+    }
+    let mut maximum = None;
+    for dst in dsts {
+        let Some(rtt) = net.route_rtt(*dst).filter(|rtt| !rtt.is_zero()) else {
+            return RouteRttSet::Unknown;
+        };
+        maximum = Some(maximum.map_or(rtt, |current: Duration| current.max(rtt)));
+    }
+    RouteRttSet::Measured(maximum.expect("non-empty route set has a measured maximum"))
+}
+
+/// Retransmissions wait for two measured route round trips plus an operator
+/// configured queue/scheduler margin. The maximum missing-target RTT is used:
+/// a long-haul minority target must not be hidden by a cluster percentile.
+fn consensus_retry_interval(
+    net: &dyn StrictNet,
+    dsts: &[NodeIdentifier],
+    cfg: &ReplicationConfig,
+) -> Duration {
+    let min = cfg.strict_consensus_retry_min();
+    let max = cfg.strict_consensus_retry_max().max(min);
+    let interval = match max_route_rtt(net, dsts) {
+        RouteRttSet::Measured(rtt) => rtt
+            .saturating_mul(2)
+            .saturating_add(cfg.strict_consensus_rtt_margin()),
+        RouteRttSet::Empty => min,
+        RouteRttSet::Unknown => max,
+    };
+    interval.max(cfg.delivery_tick_interval()).clamp(min, max)
+}
+
+#[derive(Clone, Copy)]
+enum ConsensusRetryPhase {
+    Propose = 1,
+    Accept = 2,
+    ProposeAck = 3,
+    AcceptAck = 4,
+    Resolution = 5,
+    RecoveryCommit = 6,
+    TerminalDecision = 7,
+}
+
+fn consensus_retry_delay(
+    base: Duration,
+    cfg: &ReplicationConfig,
+    node: NodeIdentifier,
+    topic: &str,
+    op_id: OpId,
+    phase: ConsensusRetryPhase,
+    attempt: u32,
+) -> Duration {
+    let jitter_pct = cfg.strict_consensus_retry_jitter_pct();
+    if base.is_zero() || jitter_pct == 0 {
+        return base;
+    }
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in (node as u64)
+        .to_le_bytes()
+        .into_iter()
+        .chain(topic.as_bytes().iter().copied())
+        .chain(op_id.0.to_le_bytes())
+        .chain(op_id.1.to_le_bytes())
+        .chain([phase as u8])
+        .chain(attempt.to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    let jitter_window_nanos = base.as_nanos().saturating_mul(u128::from(jitter_pct)) / 100;
+    if jitter_window_nanos == 0 {
+        return base;
+    }
+    let jitter_nanos = u128::from(hash) % jitter_window_nanos.saturating_add(1);
+    base.saturating_add(Duration::from_nanos(
+        u64::try_from(jitter_nanos).unwrap_or(u64::MAX),
+    ))
+}
+
+fn strict_transport_ttl(
+    route_rtt: Option<Duration>,
+    min: Duration,
+    max: Duration,
+    rtt_margin: Duration,
+) -> Duration {
+    let max = max.max(min);
+    route_rtt
+        .map(|rtt| rtt.saturating_add(rtt_margin))
+        .unwrap_or(max)
+        .clamp(min, max)
 }
 
 // ---------- OpId ----------
@@ -306,14 +408,6 @@ pub(crate) trait StrictNet: Send + Sync + 'static {
             encoded_len,
         );
         result
-    }
-    async fn send_redundant_multicast(
-        &self,
-        dsts: &[NodeIdentifier],
-        topic: &str,
-        body: StrictBody,
-    ) -> Result<(), ReplicationError> {
-        self.send_multicast(dsts, topic, body).await
     }
     async fn send_bulk_unicast(
         &self,
@@ -481,6 +575,11 @@ pub(crate) trait StrictNet: Send + Sync + 'static {
     /// Snapshot of every directed-edge RTT in the overlay's LSDB. Used to
     /// scale the clock-tick cadence to measured network latency.
     fn edge_rtt_snapshot(&self) -> Vec<Duration>;
+    /// Measured end-to-end RTT for the currently selected reliable route.
+    /// `None` preserves conservative timing when no route measurement exists.
+    fn route_rtt(&self, _dst: NodeIdentifier) -> Option<Duration> {
+        None
+    }
 }
 
 /// Production `StrictNet` impl that wraps `OverlayNetwork`.
@@ -491,6 +590,9 @@ pub(crate) struct OverlayStrictNet {
     bulk_retry_max_delay: Duration,
     bulk_retry_jitter_pct: u32,
     bulk_reservation_ttl: Duration,
+    consensus_rtt_margin: Duration,
+    transport_ttl_min: Duration,
+    transport_ttl_max: Duration,
 }
 
 struct StrictOriginProofMetadata<'a> {
@@ -613,7 +715,34 @@ impl OverlayStrictNet {
             bulk_retry_max_delay: cfg.strict_bulk_retry_max_delay(),
             bulk_retry_jitter_pct: cfg.strict_bulk_retry_jitter_pct(),
             bulk_reservation_ttl: cfg.pending_propose_ttl(),
+            consensus_rtt_margin: cfg.strict_consensus_rtt_margin(),
+            transport_ttl_min: cfg.strict_transport_ttl_min(),
+            transport_ttl_max: cfg.strict_transport_ttl_max(),
         }
+    }
+
+    fn transport_ttl(&self, dsts: &[NodeIdentifier]) -> Duration {
+        let mut route_rtt = None;
+        for dst in dsts
+            .iter()
+            .copied()
+            .filter(|dst| *dst != self.overlay.local_node_id())
+        {
+            let Some(rtt) = self.overlay.route_latency_with_metric(
+                dst,
+                ServiceLevel::Reliable,
+                RoutingMetric::ReliableCost,
+            ) else {
+                return self.transport_ttl_max.max(self.transport_ttl_min);
+            };
+            route_rtt = Some(route_rtt.map_or(rtt, |current: Duration| current.max(rtt)));
+        }
+        strict_transport_ttl(
+            route_rtt,
+            self.transport_ttl_min,
+            self.transport_ttl_max,
+            self.consensus_rtt_margin,
+        )
     }
 
     fn member_replication_capabilities(
@@ -723,7 +852,7 @@ impl OverlayStrictNet {
                 RoutingMetric::ReliableCost,
                 STRICT_REPLICATION_MESSAGE_CLASS,
                 bytes.clone(),
-                strict_replication_transport_options(false),
+                strict_replication_transport_options(false, self.transport_ttl(&[dst])),
             )
             .await;
         if let Some((reason, phase)) = catchup_metric {
@@ -755,7 +884,8 @@ impl OverlayStrictNet {
                 RoutingMetric::ReliableCost,
                 STRICT_REPLICATION_MESSAGE_CLASS,
                 bytes,
-                strict_replication_transport_options(false).avoid_first_hop(primary_next_hop),
+                strict_replication_transport_options(false, self.transport_ttl(&[dst]))
+                    .avoid_first_hop(primary_next_hop),
             )
             .await;
         if let Some((reason, phase)) = catchup_metric {
@@ -834,7 +964,7 @@ impl OverlayStrictNet {
                     RoutingMetric::ReliableCost,
                     STRICT_REPLICATION_MESSAGE_CLASS,
                     bytes.clone(),
-                    strict_replication_transport_options(true),
+                    strict_replication_transport_options(true, self.transport_ttl(&[dst])),
                 )
                 .await;
 
@@ -1093,7 +1223,10 @@ impl StrictNet for OverlayStrictNet {
                 RoutingMetric::ReliableCost,
                 STRICT_REPLICATION_MESSAGE_CLASS,
                 bytes,
-                strict_replication_transport_options(allow_l1_compression),
+                strict_replication_transport_options(
+                    allow_l1_compression,
+                    self.transport_ttl(&[dst]),
+                ),
             )
             .await?;
         Ok(())
@@ -1119,67 +1252,6 @@ impl StrictNet for OverlayStrictNet {
     ) -> Result<(), ReplicationError> {
         self.send_redundant_unicast_inner(dst, topic, body, Some((reason, phase)))
             .await
-    }
-
-    async fn send_redundant_multicast(
-        &self,
-        dsts: &[NodeIdentifier],
-        topic: &str,
-        body: StrictBody,
-    ) -> Result<(), ReplicationError> {
-        if dsts.is_empty() {
-            return Ok(());
-        }
-        let encode_started_at = Instant::now();
-        let bytes = self.encode_strict_payload(topic, body)?;
-        metrics::record_pipeline_stage(
-            ReplicationPipelineKind::Strict,
-            ReplicationPipelineStage::ProtobufEncode,
-            encode_started_at.elapsed(),
-        );
-        let primary = self
-            .overlay
-            .send_multicast_unordered_with_routing_metric_and_options(
-                dsts,
-                REPLICATION_SERVICE_TAG,
-                ServiceLevel::Reliable,
-                RoutingMetric::ReliableCost,
-                STRICT_REPLICATION_MESSAGE_CLASS,
-                bytes.clone(),
-                strict_replication_transport_options(false),
-            )
-            .await;
-        let mut alternate_succeeded = false;
-        for dst in dsts.iter().copied() {
-            let Some(primary_next_hop) = self.overlay.route_to_with_metric(
-                dst,
-                ServiceLevel::Reliable,
-                RoutingMetric::ReliableCost,
-            ) else {
-                continue;
-            };
-            if self
-                .overlay
-                .send_unicast_unordered_with_routing_metric_and_options(
-                    dst,
-                    REPLICATION_SERVICE_TAG,
-                    ServiceLevel::Reliable,
-                    RoutingMetric::ReliableCost,
-                    STRICT_REPLICATION_MESSAGE_CLASS,
-                    bytes.clone(),
-                    strict_replication_transport_options(false).avoid_first_hop(primary_next_hop),
-                )
-                .await
-                .is_ok()
-            {
-                alternate_succeeded = true;
-            }
-        }
-        match primary {
-            Ok(()) | Err(_) if alternate_succeeded => Ok(()),
-            Ok(()) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
     }
 
     async fn send_bulk_unicast(
@@ -1239,7 +1311,7 @@ impl StrictNet for OverlayStrictNet {
                 RoutingMetric::ReliableCost,
                 STRICT_REPLICATION_MESSAGE_CLASS,
                 bytes,
-                strict_replication_transport_options(false),
+                strict_replication_transport_options(false, self.transport_ttl(dsts)),
             )
             .await?;
         Ok(())
@@ -1366,6 +1438,14 @@ impl StrictNet for OverlayStrictNet {
 
     fn edge_rtt_snapshot(&self) -> Vec<Duration> {
         self.overlay.edge_rtt_snapshot()
+    }
+
+    fn route_rtt(&self, dst: NodeIdentifier) -> Option<Duration> {
+        self.overlay.route_latency_with_metric(
+            dst,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+        )
     }
 }
 
@@ -3065,7 +3145,7 @@ fn phase_two_completion_grace(cfg: &ReplicationConfig) -> Duration {
         .checked_div(4)
         .unwrap_or_else(|| cfg.delivery_tick_interval())
         .max(cfg.delivery_tick_interval())
-        .max(Duration::from_millis(500))
+        .max(cfg.strict_consensus_retry_min())
 }
 
 // ---------- Generic runtime ----------
@@ -3608,6 +3688,70 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             && self.net.local_strict_replication_protocol_version() >= STRICT_PROTOCOL_VERSION_V3
             && self.net.peer_strict_replication_protocol_version(peer) >= STRICT_PROTOCOL_VERSION_V3
             && self.net.member_boot_epoch(peer).is_some()
+    }
+
+    fn decision_has_complete_v3_repair_coverage(
+        &self,
+        dsts: &[NodeIdentifier],
+        body: &StrictBody,
+    ) -> bool {
+        let StrictBody::Decision(decision) = body else {
+            return false;
+        };
+        let Some(coord) = node_from_u32(decision.coord_node) else {
+            return false;
+        };
+        let op_id = (decision.op_id_hi, decision.op_id_lo);
+        let Ok(frozen_targets) = frozen_targets_from_wire(&decision.frozen_targets, op_id, coord)
+        else {
+            return false;
+        };
+        if Self::v3_source_transition_from_decision(decision).is_none()
+            || !self.terminal_storage_ready()
+            || self.repo.strict_replication_protocol_version() < STRICT_PROTOCOL_VERSION_V2
+            || self.net.local_strict_replication_protocol_version() < STRICT_PROTOCOL_VERSION_V3
+        {
+            return false;
+        }
+        if FrozenTarget::find_in_canonical(&frozen_targets, self.self_id)
+            .is_none_or(|target| target.boot_epoch() != self.boot_epoch)
+        {
+            return false;
+        }
+        dsts.iter().all(|peer| {
+            FrozenTarget::find_in_canonical(&frozen_targets, *peer).is_some_and(|target| {
+                self.net.member_boot_epoch(*peer) == Some(target.boot_epoch())
+                    && self.v3_repair_supported_by(*peer)
+            })
+        })
+    }
+
+    fn spawn_terminal_fanout_retries(&self, dsts: Vec<NodeIdentifier>, body: StrictBody) {
+        // Pairwise capability is enough for v3 repair. In a mixed cluster,
+        // retain the legacy replay tail only for peers that cannot repair
+        // this exact source transition through terminal deltas.
+        let legacy_dsts: Vec<_> = dsts
+            .into_iter()
+            .filter(|peer| !self.decision_has_complete_v3_repair_coverage(&[*peer], &body))
+            .collect();
+        if legacy_dsts.is_empty() {
+            return;
+        }
+        let op_id = match &body {
+            StrictBody::Decision(decision) => (decision.op_id_hi, decision.op_id_lo),
+            _ => (0, 0),
+        };
+        spawn_commit_fanout_retries(
+            self.net.clone(),
+            self.shutdown.clone(),
+            self.topic.clone(),
+            self.self_id,
+            op_id,
+            legacy_dsts,
+            body,
+            self.cfg.clone(),
+            self.cfg.pending_propose_ttl(),
+        );
     }
 
     pub(super) fn advance_v3_clock_probe(&self) -> u64 {
@@ -5263,11 +5407,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     pub(crate) fn spawn_propose_retries(self: &Arc<Self>, op_id: OpId) {
         let rt = self.clone();
         tokio::spawn(async move {
-            let broadcast_interval = rt
-                .cfg
-                .delivery_tick_interval()
-                .max(Duration::from_millis(500));
-            let mut last_broadcast_at = Instant::now();
+            let mut retry_attempt = 0u32;
             loop {
                 let Some(retry) = rt.pending_propose_retry(op_id) else {
                     return;
@@ -5277,10 +5417,17 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 if elapsed >= proposal_ttl {
                     return;
                 }
-                let delay = rt
-                    .cfg
-                    .delivery_tick_interval()
-                    .min(proposal_ttl.saturating_sub(elapsed));
+                let base = consensus_retry_interval(rt.net.as_ref(), &retry.dsts, &rt.cfg);
+                let delay = consensus_retry_delay(
+                    base,
+                    &rt.cfg,
+                    rt.self_id,
+                    &rt.topic,
+                    op_id,
+                    ConsensusRetryPhase::Propose,
+                    retry_attempt,
+                )
+                .min(proposal_ttl.saturating_sub(elapsed));
                 tokio::select! {
                     _ = rt.shutdown.cancelled() => return,
                     _ = tokio::time::sleep(delay) => {},
@@ -5325,13 +5472,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     continue;
                 }
                 if retry.dsts.is_empty() {
-                    if retry.accept_started {
-                        // Phase two has its own retry loop. Once every
-                        // frozen target has durably observed the proposal,
-                        // this loop has no remaining repair work.
-                        return;
-                    }
-                    continue;
+                    return;
                 }
                 debug!(
                     topic = %rt.topic,
@@ -5342,7 +5483,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     target_count = retry.target_count,
                     fast_quorum = retry.fast_quorum,
                     missing_count = retry.dsts.len(),
-                    phase_two_started = retry.accept_started,
                     "strict proposal retrying missing frozen-target acknowledgements"
                 );
                 let body = StrictBody::ProposeV1(StrictProposeV1 {
@@ -5355,23 +5495,17 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     protocol_version: STRICT_PROTOCOL_VERSION_V2,
                     frozen_targets: frozen_targets_to_wire(&retry.frozen_targets),
                 });
-                let now = Instant::now();
-                let use_broadcast = now.duration_since(last_broadcast_at) >= broadcast_interval;
-                if use_broadcast {
-                    last_broadcast_at = now;
-                }
-                if let Err(e) = rt
-                    .net
-                    .send_redundant_multicast(&retry.dsts, &rt.topic, body.clone())
-                    .await
+                if let Err(e) = send_retry_multicast_with_broadcast(
+                    rt.net.as_ref(),
+                    &retry.dsts,
+                    &rt.topic,
+                    body,
+                )
+                .await
                 {
                     trace!(error=%e, "send propose retry multicast failed");
                 }
-                if use_broadcast {
-                    if let Err(e) = rt.net.send_broadcast(&rt.topic, body).await {
-                        trace!(error=%e, "send propose retry broadcast failed");
-                    }
-                }
+                retry_attempt = retry_attempt.saturating_add(1);
             }
         });
     }
@@ -5478,11 +5612,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let Some(rt) = weak.upgrade() else {
                 return;
             };
-            let broadcast_interval = rt
-                .cfg
-                .delivery_tick_interval()
-                .max(Duration::from_millis(500));
-            let mut last_broadcast_at = Instant::now();
+            let mut retry_attempt = 0u32;
             loop {
                 let Some(retry) = rt.pending_accept_retry(op_id) else {
                     return;
@@ -5492,10 +5622,23 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 if elapsed >= proposal_ttl {
                     return;
                 }
-                let delay = rt
-                    .cfg
-                    .delivery_tick_interval()
-                    .min(proposal_ttl.saturating_sub(elapsed));
+                let timing_dsts: Vec<_> = retry
+                    .dsts
+                    .iter()
+                    .copied()
+                    .filter(|dst| *dst != rt.self_id)
+                    .collect();
+                let base = consensus_retry_interval(rt.net.as_ref(), &timing_dsts, &rt.cfg);
+                let delay = consensus_retry_delay(
+                    base,
+                    &rt.cfg,
+                    rt.self_id,
+                    &rt.topic,
+                    op_id,
+                    ConsensusRetryPhase::Accept,
+                    retry_attempt,
+                )
+                .min(proposal_ttl.saturating_sub(elapsed));
                 tokio::select! {
                     _ = rt.shutdown.cancelled() => return,
                     _ = tokio::time::sleep(delay) => {},
@@ -5551,7 +5694,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 if let Some(proposal) = rt.state.lock().proposals.get_mut(&op_id) {
                     proposal.phase_two_retry_attempts += 1;
                 }
-                if let Err(error) = send_terminal_fanout(
+                if let Err(error) = send_retry_multicast_with_broadcast(
                     rt.net.as_ref(),
                     &remote_dsts,
                     &rt.topic,
@@ -5561,17 +5704,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 {
                     trace!(%error, "send strict v2 accept retry multicast failed");
                 }
-                let now = Instant::now();
-                if now.duration_since(last_broadcast_at) >= broadcast_interval {
-                    last_broadcast_at = now;
-                    if let Err(error) = rt
-                        .net
-                        .send_broadcast(&rt.topic, StrictBody::Accept(retry.body))
-                        .await
-                    {
-                        trace!(%error, "send strict v2 accept retry broadcast failed");
-                    }
-                }
+                retry_attempt = retry_attempt.saturating_add(1);
             }
         });
     }
@@ -5579,7 +5712,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     fn pending_propose_retry(&self, op_id: OpId) -> Option<PendingProposeRetry> {
         let s = self.state.lock();
         let p = s.proposals.get(&op_id)?;
-        if p.committed {
+        if p.committed || p.accept_started {
             return None;
         }
         let ack_count = p.acks.len();
@@ -6024,10 +6157,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             };
             let started_at = Instant::now();
             let retry_ttl = runtime.cfg.propose_ttl();
-            let retry_interval = runtime.cfg.delivery_tick_interval();
-            let broadcast_interval = retry_interval.max(Duration::from_millis(500));
-            let mut last_broadcast_at = started_at;
             let mut initial_send = true;
+            let mut retry_attempt = 0u32;
             loop {
                 let retry_is_still_valid = {
                     let state = runtime.state.lock();
@@ -6046,9 +6177,24 @@ impl<R: StrictReplicable> StrictRuntime<R> {
 
                 if !initial_send {
                     let remaining = retry_ttl.saturating_sub(started_at.elapsed());
+                    let coordinator = ack.coord_node as NodeIdentifier;
+                    let retry_interval = consensus_retry_interval(
+                        runtime.net.as_ref(),
+                        &[coordinator],
+                        &runtime.cfg,
+                    );
+                    let retry_delay = consensus_retry_delay(
+                        retry_interval,
+                        &runtime.cfg,
+                        runtime.self_id,
+                        &runtime.topic,
+                        op_id,
+                        ConsensusRetryPhase::ProposeAck,
+                        retry_attempt,
+                    );
                     tokio::select! {
                         _ = runtime.shutdown.cancelled() => break,
-                        _ = tokio::time::sleep(retry_interval.min(remaining)) => {}
+                        _ = tokio::time::sleep(retry_delay.min(remaining)) => {}
                     }
                     if started_at.elapsed() >= retry_ttl {
                         break;
@@ -6069,52 +6215,36 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     }
                 }
 
-                let now = Instant::now();
                 let was_initial_send = initial_send;
-                let use_broadcast = !was_initial_send
-                    && now.duration_since(last_broadcast_at) >= broadcast_interval;
-                if use_broadcast {
-                    last_broadcast_at = now;
-                }
                 initial_send = false;
                 let body = StrictBody::ProposeAck(ack.clone());
-                let result = if use_broadcast {
+                let coordinator = ack.coord_node as NodeIdentifier;
+                let result = if was_initial_send {
                     tokio::select! {
                         _ = runtime.shutdown.cancelled() => break,
-                        result = send_accept_ack_fanout(
+                        result = send_redundant_unicast_with_broadcast_on_failure(
                             runtime.net.as_ref(),
-                            ack.coord_node as NodeIdentifier,
+                            coordinator,
                             &runtime.topic,
-                            body.clone(),
+                            body,
                         ) => result,
                     }
                 } else {
                     tokio::select! {
                         _ = runtime.shutdown.cancelled() => break,
-                        result = runtime.net.send_redundant_unicast(
-                            ack.coord_node as NodeIdentifier,
+                        result = send_retry_unicast_with_broadcast(
+                            runtime.net.as_ref(),
+                            coordinator,
                             &runtime.topic,
-                            body.clone(),
+                            body,
                         ) => result,
                     }
-                };
-                let result = if was_initial_send && result.is_err() {
-                    last_broadcast_at = Instant::now();
-                    let targeted_error = result.expect_err("checked above");
-                    tokio::select! {
-                        _ = runtime.shutdown.cancelled() => break,
-                        result = runtime.net.send_broadcast(&runtime.topic, body) => {
-                            match result {
-                                Ok(()) => Ok(()),
-                                Err(_) => Err(targeted_error),
-                            }
-                        }
-                    }
-                } else {
-                    result
                 };
                 if let Err(error) = result {
                     trace!(%error, "retry strict propose-ack failed");
+                }
+                if !was_initial_send {
+                    retry_attempt = retry_attempt.saturating_add(1);
                 }
             }
             runtime.propose_ack_broadcasts.lock().remove(&op_id);
@@ -6333,15 +6463,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 {
                     trace!(error=%e, "send commit multicast failed");
                 }
-                spawn_commit_fanout_retries(
-                    self.net.clone(),
-                    self.shutdown.clone(),
-                    self.topic.clone(),
-                    accepted.dsts,
-                    accepted.body,
-                    self.cfg.delivery_tick_interval(),
-                    self.cfg.pending_propose_ttl(),
-                );
+                self.spawn_terminal_fanout_retries(accepted.dsts, accepted.body);
             }
             ProposeQuorumOutcome::V1(accept) => {
                 self.send_normal_accept_phase(op_id, accept).await;
@@ -6429,11 +6551,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let Some(rt) = weak.upgrade() else {
                 return;
             };
-            let send = rt.net.send_redundant_multicast(
-                &accept.dsts,
-                &rt.topic,
-                StrictBody::Accept(accept.body),
-            );
+            let send =
+                rt.net
+                    .send_multicast(&accept.dsts, &rt.topic, StrictBody::Accept(accept.body));
             tokio::select! {
                 _ = rt.shutdown.cancelled() => {}
                 result = send => {
@@ -6746,21 +6866,22 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let Some(rt) = weak.upgrade() else {
                 return;
             };
-            let broadcast_interval = rt
-                .cfg
-                .propose_ttl()
-                .checked_div(4)
-                .unwrap_or_else(|| rt.cfg.delivery_tick_interval())
-                .clamp(Duration::from_millis(500), Duration::from_secs(2));
-            let mut last_broadcast_at = fence.pending_seen_at;
+            let mut retry_attempt = 0u32;
             loop {
                 if !rt.accept_ack_retry_is_valid(op_id, &ack, &fence) {
                     break;
                 }
-                let delay = rt
-                    .cfg
-                    .delivery_tick_interval()
-                    .min(fence.deadline.saturating_duration_since(Instant::now()));
+                let base = consensus_retry_interval(rt.net.as_ref(), &[fence.coordinator], &rt.cfg);
+                let delay = consensus_retry_delay(
+                    base,
+                    &rt.cfg,
+                    rt.self_id,
+                    &rt.topic,
+                    op_id,
+                    ConsensusRetryPhase::AcceptAck,
+                    retry_attempt,
+                )
+                .min(fence.deadline.saturating_duration_since(Instant::now()));
                 tokio::select! {
                     _ = rt.shutdown.cancelled() => break,
                     _ = sleep(delay) => {},
@@ -6772,32 +6893,18 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 if coord == rt.self_id {
                     rt.recv_accept_ack(rt.self_id, ack.clone()).await;
                 } else {
-                    let now = Instant::now();
-                    let use_broadcast = now.duration_since(last_broadcast_at) >= broadcast_interval;
-                    if use_broadcast {
-                        last_broadcast_at = now;
-                    }
-                    let result = if use_broadcast {
-                        send_accept_ack_fanout(
-                            rt.net.as_ref(),
-                            coord,
-                            &rt.topic,
-                            StrictBody::AcceptAck(ack.clone()),
-                        )
-                        .await
-                    } else {
-                        rt.net
-                            .send_redundant_unicast(
-                                coord,
-                                &rt.topic,
-                                StrictBody::AcceptAck(ack.clone()),
-                            )
-                            .await
-                    };
+                    let result = send_retry_unicast_with_broadcast(
+                        rt.net.as_ref(),
+                        coord,
+                        &rt.topic,
+                        StrictBody::AcceptAck(ack.clone()),
+                    )
+                    .await;
                     if let Err(error) = result {
                         trace!(%error, "retry strict accept ack failed");
                     }
                 }
+                retry_attempt = retry_attempt.saturating_add(1);
             }
             rt.accept_ack_retries.lock().remove(&op_id);
             rt.accept_ack_broadcasts.lock().remove(&op_id);
@@ -6925,7 +7032,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             );
             return;
         }
-        let terminal = {
+        let (terminal, targeted_propose_repair) = {
             let mut state = self.state.lock();
             let Some(proposal) = state.proposals.get(&op_id) else {
                 return;
@@ -6951,75 +7058,108 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 return;
             }
             state.observe_peer(ack_node, ack.src_clock);
-            let (
-                accepted_count,
-                fast_quorum,
-                ts_final,
-                op_msgpack,
-                dsts,
-                accepted_waker,
-                frozen_targets,
-            ) = {
+            let repair_src_clock = state.clock;
+            let (terminal, targeted_propose_repair) = {
                 let proposal = state.proposals.get_mut(&op_id).expect("checked above");
-                proposal.accept_acks.insert(ack_node, ack.accepted);
+                let previous_accept = proposal.accept_acks.insert(ack_node, ack.accepted);
+                let targeted_propose_repair = (!ack.accepted
+                    && previous_accept.is_none()
+                    && proposal.protocol_version == STRICT_PROTOCOL_VERSION_V2
+                    && !proposal.acks.contains_key(&ack_node))
+                .then(|| {
+                    StrictBody::ProposeV1(StrictProposeV1 {
+                        coord_node: self.self_id as u32,
+                        op_id_hi: op_id.0,
+                        op_id_lo: op_id.1,
+                        ts_propose: proposal.ts_propose,
+                        op_msgpack: proposal.op_msgpack.clone(),
+                        src_clock: repair_src_clock,
+                        protocol_version: STRICT_PROTOCOL_VERSION_V2,
+                        frozen_targets: frozen_targets_to_wire(&frozen_targets_from_epochs(
+                            &proposal.target_epochs,
+                        )),
+                    })
+                });
                 let accepted_count = proposal.accept_acks.values().filter(|ok| **ok).count();
                 let fast_quorum = fast_quorum_size(proposal.target_set.len());
                 if accepted_count < fast_quorum {
-                    return;
-                }
-                let (ts_final, op_msgpack) =
-                    if proposal.protocol_version == STRICT_PROTOCOL_VERSION_V2 {
-                        let phase_two = proposal
-                            .phase_two_accept
-                            .as_ref()
-                            .expect("started v2 accept phase must retain its frozen value");
-                        (phase_two.ts_final, phase_two.op_msgpack.clone())
-                    } else {
-                        (
+                    (None, targeted_propose_repair)
+                } else {
+                    let (ts_final, op_msgpack) =
+                        if proposal.protocol_version == STRICT_PROTOCOL_VERSION_V2 {
+                            let phase_two = proposal
+                                .phase_two_accept
+                                .as_ref()
+                                .expect("started v2 accept phase must retain its frozen value");
+                            (phase_two.ts_final, phase_two.op_msgpack.clone())
+                        } else {
+                            (
+                                proposal
+                                    .acks
+                                    .values()
+                                    .copied()
+                                    .max()
+                                    .unwrap_or(proposal.ts_propose),
+                                proposal.op_msgpack.clone(),
+                            )
+                        };
+                    proposal.committed = true;
+                    (
+                        Some((
+                            accepted_count,
+                            fast_quorum,
+                            // Phase-one ACK retries can arrive after phase two has
+                            // started. They must not rebuild the chosen timestamp:
+                            // every acceptor and the durable journal already hold
+                            // this exact immutable ballot-zero value.
+                            ts_final,
+                            op_msgpack,
                             proposal
-                                .acks
-                                .values()
+                                .target_set
+                                .iter()
+                                .filter(|node| **node != self.self_id)
                                 .copied()
-                                .max()
-                                .unwrap_or(proposal.ts_propose),
-                            proposal.op_msgpack.clone(),
-                        )
-                    };
-                proposal.committed = true;
-                (
+                                .collect::<Vec<_>>(),
+                            proposal.accepted_waker.take(),
+                            (proposal.protocol_version == STRICT_PROTOCOL_VERSION_V2)
+                                .then(|| frozen_targets_from_epochs(&proposal.target_epochs)),
+                        )),
+                        targeted_propose_repair,
+                    )
+                }
+            };
+            let terminal = terminal.map(
+                |(
                     accepted_count,
                     fast_quorum,
-                    // Phase-one ACK retries can arrive after phase two has
-                    // started. They must not rebuild the chosen timestamp:
-                    // every acceptor and the durable journal already hold
-                    // this exact immutable ballot-zero value.
                     ts_final,
                     op_msgpack,
-                    proposal
-                        .target_set
-                        .iter()
-                        .filter(|node| **node != self.self_id)
-                        .copied()
-                        .collect::<Vec<_>>(),
-                    proposal.accepted_waker.take(),
-                    (proposal.protocol_version == STRICT_PROTOCOL_VERSION_V2)
-                        .then(|| frozen_targets_from_epochs(&proposal.target_epochs)),
-                )
-            };
-            let _ = accepted_count;
-            let _ = fast_quorum;
-            let src_clock = state.clock.max(ts_final);
-            state.clock = src_clock;
-            state.peer_clocks.insert(self.self_id, src_clock);
-            Some((
-                ts_final,
-                op_msgpack,
-                dsts,
-                accepted_waker,
-                src_clock,
-                frozen_targets,
-            ))
+                    dsts,
+                    accepted_waker,
+                    frozen_targets,
+                )| {
+                    let _ = accepted_count;
+                    let _ = fast_quorum;
+                    let src_clock = state.clock.max(ts_final);
+                    state.clock = src_clock;
+                    state.peer_clocks.insert(self.self_id, src_clock);
+                    (
+                        ts_final,
+                        op_msgpack,
+                        dsts,
+                        accepted_waker,
+                        src_clock,
+                        frozen_targets,
+                    )
+                },
+            );
+            (terminal, targeted_propose_repair)
         };
+        if let Some(repair) = targeted_propose_repair {
+            if let Err(error) = self.net.send_unicast(ack_node, &self.topic, repair).await {
+                trace!(%error, ack_node, "send targeted strict proposal repair failed");
+            }
+        }
         let Some((ts_final, op_msgpack, dsts, accepted_waker, src_clock, frozen_targets)) =
             terminal
         else {
@@ -7098,15 +7238,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         {
             trace!(%error, "send strict terminal commit decision failed");
         }
-        spawn_commit_fanout_retries(
-            self.net.clone(),
-            self.shutdown.clone(),
-            self.topic.clone(),
-            dsts,
-            decision,
-            self.cfg.delivery_tick_interval(),
-            self.cfg.pending_propose_ttl(),
-        );
+        self.spawn_terminal_fanout_retries(dsts, decision);
     }
 
     pub async fn recv_decision(&self, from: NodeIdentifier, decision: StrictDecision) {
@@ -7876,15 +8008,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         {
             trace!(%error, "send strict terminal resolution decision failed");
         }
-        spawn_commit_fanout_retries(
-            self.net.clone(),
-            self.shutdown.clone(),
-            self.topic.clone(),
-            dsts,
-            body,
-            self.cfg.delivery_tick_interval(),
-            self.cfg.pending_propose_ttl(),
-        );
+        self.spawn_terminal_fanout_retries(dsts, body);
     }
 
     async fn start_resolution(
@@ -8134,7 +8258,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let body = StrictBody::ResolutionPrepare(prepare);
             if let Err(error) = self
                 .net
-                .send_redundant_multicast(&dsts, &self.topic, body.clone())
+                .send_multicast(&dsts, &self.topic, body.clone())
                 .await
             {
                 trace!(%error, "send strict resolution prepare failed");
@@ -8157,17 +8281,30 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let Some(weak) = weak else {
             return;
         };
-        let interval = self.cfg.delivery_tick_interval();
         let retry_ttl = self.cfg.pending_propose_ttl();
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             let started_at = Instant::now();
+            let mut retry_attempt = 0u32;
             loop {
                 let elapsed = started_at.elapsed();
                 if elapsed >= retry_ttl {
                     return;
                 }
-                let delay = interval.min(retry_ttl.saturating_sub(elapsed));
+                let Some(runtime) = weak.upgrade() else {
+                    return;
+                };
+                let interval = consensus_retry_interval(runtime.net.as_ref(), &dsts, &runtime.cfg);
+                let delay = consensus_retry_delay(
+                    interval,
+                    &runtime.cfg,
+                    runtime.self_id,
+                    &runtime.topic,
+                    op_id,
+                    ConsensusRetryPhase::Resolution,
+                    retry_attempt,
+                )
+                .min(retry_ttl.saturating_sub(elapsed));
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
                     _ = tokio::time::sleep(delay) => {}
@@ -8175,9 +8312,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 if started_at.elapsed() >= retry_ttl {
                     return;
                 }
-                let Some(runtime) = weak.upgrade() else {
-                    return;
-                };
                 let active = runtime
                     .resolutions
                     .lock()
@@ -8186,13 +8320,17 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 if !active {
                     return;
                 }
-                if let Err(error) = runtime
-                    .net
-                    .send_redundant_multicast(&dsts, &runtime.topic, body.clone())
-                    .await
+                if let Err(error) = send_retry_multicast_with_broadcast(
+                    runtime.net.as_ref(),
+                    &dsts,
+                    &runtime.topic,
+                    body.clone(),
+                )
+                .await
                 {
                     trace!(%error, "strict resolution prepare retry failed");
                 }
+                retry_attempt = retry_attempt.saturating_add(1);
             }
         });
     }
@@ -8474,15 +8612,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             {
                 trace!(error=%e, "send commit gossip multicast failed");
             }
-            spawn_commit_fanout_retries(
-                self.net.clone(),
-                self.shutdown.clone(),
-                self.topic.clone(),
-                dsts,
-                body,
-                self.cfg.delivery_tick_interval(),
-                self.cfg.pending_propose_ttl(),
-            );
+            self.spawn_terminal_fanout_retries(dsts, body);
         }
     }
 
@@ -8896,7 +9026,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if !dsts.is_empty() {
             if let Err(e) = self
                 .net
-                .send_redundant_multicast(&dsts, &self.topic, body.clone())
+                .send_multicast(&dsts, &self.topic, body.clone())
                 .await
             {
                 trace!(error=%e, "send recovery-commit multicast failed");
@@ -8907,9 +9037,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             self.shutdown.clone(),
             self.topic.clone(),
             self.self_id,
+            op_id,
             target,
             body,
-            self.cfg.delivery_tick_interval(),
+            self.cfg.clone(),
             self.cfg.pending_propose_ttl(),
         );
     }
@@ -9091,11 +9222,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 op_id_lo: op_id.1,
                 src_clock,
             });
-            if let Err(e) = self
-                .net
-                .send_redundant_multicast(&dsts, &self.topic, body)
-                .await
-            {
+            if let Err(e) = self.net.send_multicast(&dsts, &self.topic, body).await {
                 trace!(error=%e, "send recovery-prepare multicast failed");
             }
         }
@@ -9666,7 +9793,7 @@ async fn send_terminal_fanout(
     if dsts.is_empty() {
         return Ok(());
     }
-    net.send_redundant_multicast(dsts, topic, body).await
+    net.send_multicast(dsts, topic, body).await
 }
 
 async fn send_terminal_fanout_with_broadcast(
@@ -9675,7 +9802,43 @@ async fn send_terminal_fanout_with_broadcast(
     topic: &str,
     body: StrictBody,
 ) -> Result<(), ReplicationError> {
-    match send_terminal_fanout(net, dsts, topic, body.clone()).await {
+    if let [dst] = dsts {
+        return send_retry_unicast_with_broadcast(net, *dst, topic, body).await;
+    }
+    // A multi-destination multicast can partially enqueue before reporting
+    // an error. Broadcasting here would duplicate every successful bucket.
+    send_terminal_fanout(net, dsts, topic, body).await
+}
+
+/// Consensus retries take one ordinary route. A cluster-wide broadcast is
+/// reserved for an enqueue failure, rather than emitted periodically after a
+/// successful targeted send.
+async fn send_retry_multicast_with_broadcast(
+    net: &dyn StrictNet,
+    dsts: &[NodeIdentifier],
+    topic: &str,
+    body: StrictBody,
+) -> Result<(), ReplicationError> {
+    if dsts.is_empty() {
+        return Ok(());
+    }
+    if let [dst] = dsts {
+        return send_retry_unicast_with_broadcast(net, *dst, topic, body).await;
+    }
+    // Overlay multicast can partially enqueue before reporting one failed
+    // next-hop bucket. A broadcast here would duplicate every successful
+    // bucket and recreate the amplification this retry path is preventing.
+    // Leave ambiguous multi-target failures to the next correlated retry.
+    net.send_multicast(dsts, topic, body).await
+}
+
+async fn send_retry_unicast_with_broadcast(
+    net: &dyn StrictNet,
+    dst: NodeIdentifier,
+    topic: &str,
+    body: StrictBody,
+) -> Result<(), ReplicationError> {
+    match net.send_unicast(dst, topic, body.clone()).await {
         Ok(()) => Ok(()),
         Err(targeted_error) => match net.send_broadcast(topic, body).await {
             Ok(()) => Ok(()),
@@ -9684,17 +9847,18 @@ async fn send_terminal_fanout_with_broadcast(
     }
 }
 
-async fn send_accept_ack_fanout(
+async fn send_redundant_unicast_with_broadcast_on_failure(
     net: &dyn StrictNet,
-    coord: NodeIdentifier,
+    dst: NodeIdentifier,
     topic: &str,
     body: StrictBody,
 ) -> Result<(), ReplicationError> {
-    let unicast = net.send_redundant_unicast(coord, topic, body.clone()).await;
-    let broadcast = net.send_broadcast(topic, body).await;
-    match (unicast, broadcast) {
-        (Ok(()), Ok(())) | (Ok(()), Err(_)) | (Err(_), Ok(())) => Ok(()),
-        (Err(error), Err(_)) => Err(error),
+    match net.send_redundant_unicast(dst, topic, body.clone()).await {
+        Ok(()) => Ok(()),
+        Err(targeted_error) => match net.send_broadcast(topic, body).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(targeted_error),
+        },
     }
 }
 
@@ -9718,9 +9882,11 @@ fn spawn_commit_fanout_retries(
     net: Arc<dyn StrictNet>,
     shutdown: CancellationToken,
     topic: String,
+    self_id: NodeIdentifier,
+    op_id: OpId,
     dsts: Vec<NodeIdentifier>,
     body: StrictBody,
-    interval: Duration,
+    cfg: Arc<ReplicationConfig>,
     retry_ttl: Duration,
 ) {
     if dsts.is_empty() || retry_ttl.is_zero() {
@@ -9728,21 +9894,29 @@ fn spawn_commit_fanout_retries(
     }
     tokio::spawn(async move {
         let started_at = Instant::now();
-        // Terminal decisions are already fanned out immediately. Keep the
-        // long-lived repair worker below the delivery tick so several prior
-        // rounds cannot monopolize the reliable control queues and starve a
-        // new proposal's phase-two acknowledgements.
-        let retry_floor = retry_ttl
-            .checked_div(2)
-            .unwrap_or(retry_ttl)
-            .min(Duration::from_secs(2));
-        let retry_interval = interval.max(retry_floor);
+        // There is no terminal-delivery ACK in the legacy protocol. Begin at
+        // the measured route RTO and back off after every unacknowledged
+        // attempt so retained decisions cannot become a periodic flood.
+        let mut retry_interval = consensus_retry_interval(net.as_ref(), &dsts, &cfg).min(retry_ttl);
+        let mut retry_attempt = 0u32;
         loop {
             let elapsed = started_at.elapsed();
             if elapsed >= retry_ttl {
                 return;
             }
-            let delay = retry_interval.min(retry_ttl.saturating_sub(elapsed));
+            retry_interval = retry_interval
+                .max(consensus_retry_interval(net.as_ref(), &dsts, &cfg))
+                .min(retry_ttl);
+            let delay = consensus_retry_delay(
+                retry_interval,
+                &cfg,
+                self_id,
+                &topic,
+                op_id,
+                ConsensusRetryPhase::TerminalDecision,
+                retry_attempt,
+            )
+            .min(retry_ttl.saturating_sub(elapsed));
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = tokio::time::sleep(delay) => {},
@@ -9753,6 +9927,8 @@ fn spawn_commit_fanout_retries(
             if let Err(e) = net.send_multicast(&dsts, &topic, body.clone()).await {
                 trace!(error=%e, "commit fanout retry failed");
             }
+            retry_attempt = retry_attempt.saturating_add(1);
+            retry_interval = retry_interval.saturating_mul(2).min(retry_ttl);
         }
     });
 }
@@ -9778,9 +9954,10 @@ fn spawn_recovery_commit_repair_retries(
     shutdown: CancellationToken,
     topic: String,
     self_id: NodeIdentifier,
+    op_id: OpId,
     frozen_targets: HashSet<NodeIdentifier>,
     body: StrictBody,
-    interval: Duration,
+    cfg: Arc<ReplicationConfig>,
     retry_ttl: Duration,
 ) {
     if retry_ttl.is_zero() {
@@ -9788,12 +9965,24 @@ fn spawn_recovery_commit_repair_retries(
     }
     tokio::spawn(async move {
         let started_at = Instant::now();
+        let mut retry_attempt = 0u32;
         loop {
             let elapsed = started_at.elapsed();
             if elapsed >= retry_ttl {
                 return;
             }
-            let delay = interval.min(retry_ttl.saturating_sub(elapsed));
+            let dsts = recovery_commit_repair_dsts(net.as_ref(), self_id, &frozen_targets);
+            let interval = consensus_retry_interval(net.as_ref(), &dsts, &cfg);
+            let delay = consensus_retry_delay(
+                interval,
+                &cfg,
+                self_id,
+                &topic,
+                op_id,
+                ConsensusRetryPhase::RecoveryCommit,
+                retry_attempt,
+            )
+            .min(retry_ttl.saturating_sub(elapsed));
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = tokio::time::sleep(delay) => {},
@@ -9805,12 +9994,12 @@ fn spawn_recovery_commit_repair_retries(
             if dsts.is_empty() {
                 continue;
             }
-            if let Err(e) = net
-                .send_redundant_multicast(&dsts, &topic, body.clone())
-                .await
+            if let Err(e) =
+                send_retry_multicast_with_broadcast(net.as_ref(), &dsts, &topic, body.clone()).await
             {
                 trace!(error=%e, "recovery commit repair retry failed");
             }
+            retry_attempt = retry_attempt.saturating_add(1);
         }
     });
 }
@@ -10486,11 +10675,7 @@ async fn emit_clock_tick<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
         .into_iter()
         .filter(|node| *node != rt.self_id)
         .collect();
-    if let Err(e) = rt
-        .net
-        .send_redundant_multicast(&dsts, &rt.topic, body)
-        .await
-    {
+    if let Err(e) = rt.net.send_multicast(&dsts, &rt.topic, body).await {
         trace!(error=%e, "clock tick broadcast failed");
     }
 }
@@ -11423,7 +11608,10 @@ fn choose_resolution_decision<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replications::test_support::{CapturedFrame, CountingStrictRepo, MockNet};
+    use crate::replications::test_support::{
+        CapturedFrame, CountingStrictRepo, MockNet, StrictSendLane, StrictSendOutcome,
+        StrictSendTarget,
+    };
 
     fn v1_runtime(
         cfg: ReplicationConfig,
@@ -11800,13 +11988,185 @@ mod tests {
     }
 
     #[test]
-    fn strict_transport_ttl_is_bounded_for_long_links() {
+    fn consensus_retry_jitter_is_stable_positive_and_bounded() {
+        let cfg = ReplicationConfig::default().with_strict_consensus_retry_jitter_pct(25);
+        let base = Duration::from_millis(800);
+        let first = consensus_retry_delay(
+            base,
+            &cfg,
+            7,
+            "strict/channel/example",
+            (11, 12),
+            ConsensusRetryPhase::Propose,
+            3,
+        );
+        let repeated = consensus_retry_delay(
+            base,
+            &cfg,
+            7,
+            "strict/channel/example",
+            (11, 12),
+            ConsensusRetryPhase::Propose,
+            3,
+        );
+
+        assert_eq!(first, repeated);
+        assert!(first >= base);
+        assert!(first <= Duration::from_secs(1));
+        assert_ne!(
+            first,
+            consensus_retry_delay(
+                base,
+                &cfg,
+                7,
+                "strict/channel/example",
+                (11, 13),
+                ConsensusRetryPhase::Propose,
+                3,
+            )
+        );
+        assert_ne!(
+            first,
+            consensus_retry_delay(
+                base,
+                &cfg,
+                7,
+                "strict/channel/example",
+                (11, 12),
+                ConsensusRetryPhase::Accept,
+                3,
+            )
+        );
+    }
+
+    #[test]
+    fn consensus_retry_jitter_can_be_disabled() {
+        let cfg = ReplicationConfig::default().with_strict_consensus_retry_jitter_pct(0);
+        let base = Duration::from_millis(800);
+
+        assert_eq!(
+            consensus_retry_delay(
+                base,
+                &cfg,
+                7,
+                "strict/channel/example",
+                (11, 12),
+                ConsensusRetryPhase::Propose,
+                3,
+            ),
+            base
+        );
+    }
+
+    #[test]
+    fn strict_transport_ttl_is_rtt_aware_and_bounded() {
+        let cfg = ReplicationConfig::default();
         assert!(matches!(
             STRICT_REPLICATION_MESSAGE_CLASS,
             MessageClass::Regular
         ));
-        assert!(STRICT_REPLICATION_TRANSPORT_TTL >= Duration::from_millis(500));
-        assert!(STRICT_REPLICATION_TRANSPORT_TTL <= Duration::from_secs(1));
+        let ttl = |rtt| {
+            strict_transport_ttl(
+                rtt,
+                cfg.strict_transport_ttl_min(),
+                cfg.strict_transport_ttl_max(),
+                cfg.strict_consensus_rtt_margin(),
+            )
+        };
+        assert_eq!(ttl(None), Duration::from_secs(1));
+        assert_eq!(
+            ttl(Some(Duration::from_millis(50))),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            ttl(Some(Duration::from_millis(700))),
+            Duration::from_millis(800)
+        );
+        assert_eq!(ttl(Some(Duration::from_secs(2))), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn consensus_retries_follow_the_slowest_missing_route_rtt() {
+        let cfg = ReplicationConfig::default();
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        assert_eq!(max_route_rtt(net.as_ref(), &[]), RouteRttSet::Empty);
+        assert_eq!(max_route_rtt(net.as_ref(), &[2]), RouteRttSet::Unknown);
+        assert_eq!(
+            consensus_retry_interval(net.as_ref(), &[2, 3], &cfg),
+            cfg.strict_consensus_retry_max()
+        );
+
+        net.set_route_rtt(2, Duration::from_millis(100));
+        assert_eq!(
+            consensus_retry_interval(net.as_ref(), &[2, 3], &cfg),
+            cfg.strict_consensus_retry_max()
+        );
+        net.set_route_rtt(3, Duration::from_millis(400));
+        assert_eq!(
+            max_route_rtt(net.as_ref(), &[2, 3]),
+            RouteRttSet::Measured(Duration::from_millis(400))
+        );
+        assert_eq!(
+            consensus_retry_interval(net.as_ref(), &[2, 3], &cfg),
+            Duration::from_millis(900)
+        );
+        assert_eq!(
+            consensus_retry_interval(net.as_ref(), &[2], &cfg),
+            cfg.strict_consensus_retry_min()
+        );
+
+        net.set_route_rtt(3, Duration::from_secs(2));
+        assert_eq!(
+            consensus_retry_interval(net.as_ref(), &[3], &cfg),
+            cfg.strict_consensus_retry_max()
+        );
+    }
+
+    #[tokio::test]
+    async fn consensus_retry_uses_one_regular_multicast_and_broadcasts_only_on_failure() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        let body = StrictBody::ProposeV1(StrictProposeV1 {
+            coord_node: 1,
+            op_id_hi: 1,
+            op_id_lo: 2,
+            protocol_version: STRICT_PROTOCOL_VERSION_V2,
+            ..Default::default()
+        });
+
+        send_retry_multicast_with_broadcast(net.as_ref(), &[2, 3], "channels", body.clone())
+            .await
+            .unwrap();
+        let sends = net.drain_strict_send_observations();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].lane, StrictSendLane::Ordinary);
+        assert_eq!(sends[0].target, StrictSendTarget::Multicast(vec![2, 3]));
+        assert_eq!(sends[0].outcome, StrictSendOutcome::Sent);
+
+        net.set_fail_strict_multicasts(true);
+        assert!(
+            send_retry_multicast_with_broadcast(net.as_ref(), &[2, 3], "channels", body.clone(),)
+                .await
+                .is_err()
+        );
+        let sends = net.drain_strict_send_observations();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].lane, StrictSendLane::Ordinary);
+        assert_eq!(sends[0].target, StrictSendTarget::Multicast(vec![2, 3]));
+        assert_eq!(sends[0].outcome, StrictSendOutcome::InjectedFailure);
+
+        net.set_fail_strict_multicasts(false);
+        net.fail_strict_unicasts_to([2]);
+        send_retry_multicast_with_broadcast(net.as_ref(), &[2], "channels", body)
+            .await
+            .unwrap();
+        let sends = net.drain_strict_send_observations();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0].lane, StrictSendLane::Ordinary);
+        assert_eq!(sends[0].target, StrictSendTarget::Unicast(2));
+        assert_eq!(sends[0].outcome, StrictSendOutcome::InjectedFailure);
+        assert_eq!(sends[1].lane, StrictSendLane::Ordinary);
+        assert_eq!(sends[1].target, StrictSendTarget::Broadcast);
+        assert_eq!(sends[1].outcome, StrictSendOutcome::Sent);
     }
 
     #[test]
@@ -11822,6 +12182,8 @@ mod tests {
             .expect("runtime unit-test delimiter must remain present")
             .0;
         assert!(!production.contains("MessageClass::HighPriority"));
+        assert!(!production.contains("send_redundant_multicast"));
+        assert!(!include_str!("propose.rs").contains("send_redundant_multicast"));
 
         let mut enqueue_count = 0usize;
         for method in ENQUEUE_METHODS {
@@ -11861,7 +12223,7 @@ mod tests {
         }
 
         assert_eq!(
-            enqueue_count, 7,
+            enqueue_count, 5,
             "audit new or removed strict overlay enqueue sites and update this sentinel"
         );
     }
@@ -12860,6 +13222,54 @@ mod tests {
             recovery_commit_repair_dsts(net.as_ref(), 2, &frozen_targets),
             vec![1, 3]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_commit_retry_waits_for_route_rtt_rto() {
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_route_rtt(2, Duration::from_millis(400));
+        let cfg = Arc::new(
+            ReplicationConfig::default()
+                .with_strict_consensus_retry_min(Duration::from_millis(50))
+                .with_strict_consensus_retry_max(Duration::from_secs(2))
+                .with_strict_consensus_rtt_margin(Duration::from_millis(100))
+                .with_strict_consensus_retry_jitter_pct(0),
+        );
+        let shutdown = CancellationToken::new();
+        let op_id = make_op_id(1, 1, 77);
+        let body = StrictBody::RecoveryCommit(StrictRecoveryCommit {
+            takeover_node: 1,
+            coord_node: 1,
+            op_id_hi: op_id.0,
+            op_id_lo: op_id.1,
+            ..Default::default()
+        });
+
+        spawn_recovery_commit_repair_retries(
+            net.clone(),
+            shutdown.clone(),
+            "channels".to_owned(),
+            1,
+            op_id,
+            HashSet::from([1, 2]),
+            body,
+            cfg,
+            Duration::from_secs(2),
+        );
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_millis(899)).await;
+        tokio::task::yield_now().await;
+        assert!(net.drain_strict_send_observations().is_empty());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        let sends = net.drain_strict_send_observations();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].lane, StrictSendLane::Ordinary);
+        assert_eq!(sends[0].target, StrictSendTarget::Unicast(2));
+        assert_eq!(sends[0].outcome, StrictSendOutcome::Sent);
+        shutdown.cancel();
     }
 
     #[test]
@@ -14573,7 +14983,8 @@ mod tests {
         assert!(net.captures().iter().any(|frame| {
             matches!(
                 frame,
-                CapturedFrame::StrictMulticast {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
                     body: StrictBody::Decision(StrictDecision {
                         outcome: Some(StrictDecisionOutcome::Commit(_)),
                         ..
@@ -15192,10 +15603,11 @@ mod tests {
     async fn v2_accept_retries_peers_without_a_positive_ack_and_commits() {
         let cfg = ReplicationConfig::default()
             .with_delivery_tick_interval(Duration::from_millis(1))
-            .with_propose_ttl(Duration::from_secs(1));
+            .with_propose_ttl(Duration::from_secs(2));
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
+        net.set_route_rtt(2, Duration::from_millis(400));
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
@@ -15274,18 +15686,30 @@ mod tests {
             Some(&false)
         );
 
+        tokio::time::sleep(Duration::from_millis(850)).await;
+        assert!(!net.drain_captures().iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictMulticast {
+                body: StrictBody::Accept(candidate),
+                ..
+            } | CapturedFrame::StrictUnicast {
+                body: StrictBody::Accept(candidate),
+                ..
+            } if (candidate.op_id_hi, candidate.op_id_lo) == op_id
+        )));
+
         let mut retried_accept = None;
-        for _ in 0..20 {
+        for _ in 0..80 {
             tokio::time::sleep(Duration::from_millis(5)).await;
             retried_accept = net
                 .drain_captures()
                 .into_iter()
                 .find_map(|frame| match frame {
-                    CapturedFrame::StrictMulticast {
-                        dsts,
+                    CapturedFrame::StrictUnicast {
+                        dst,
                         body: StrictBody::Accept(accept),
                         ..
-                    } => Some((dsts, accept)),
+                    } => Some((vec![dst], accept)),
                     _ => None,
                 });
             if retried_accept.is_some() {
@@ -15323,14 +15747,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_phase_two_keeps_repairing_frozen_targets_that_missed_propose() {
+    async fn v2_phase_two_stops_phase_one_retries_after_quorum() {
         let cfg = ReplicationConfig::default()
             .with_delivery_tick_interval(Duration::from_millis(1))
-            .with_propose_ttl(Duration::from_secs(1));
+            .with_propose_ttl(Duration::from_secs(2));
         let net = MockNet::new(1, vec![1, 2, 3, 4]);
         for node in 1..=4 {
             net.set_epoch(node, 1);
         }
+        net.set_route_rtt(2, Duration::from_millis(100));
+        net.set_route_rtt(3, Duration::from_millis(100));
+        net.set_route_rtt(4, Duration::from_millis(400));
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
@@ -15357,9 +15784,10 @@ mod tests {
             .expect("local proposal must be registered");
         net.drain_captures();
 
-        // Self plus nodes 2 and 3 form the 3-of-4 fast quorum. Node 4 has
-        // not seen the proposal, so the first Accept it receives would be
-        // correctly rejected until a retry restores the frozen descriptor.
+        // Self plus nodes 2 and 3 form the 3-of-4 fast quorum. Once phase two
+        // begins, terminal-decision delivery and terminal synchronization own
+        // repair for node 4; phase one must not keep retransmitting in
+        // parallel with Accept.
         for ack_node in [2, 3] {
             rt.recv_propose_ack(
                 ack_node,
@@ -15378,28 +15806,80 @@ mod tests {
         assert!(rt.state.lock().proposals[&op_id].accept_started);
         net.drain_captures();
 
-        let mut repair = None;
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            repair = net
-                .drain_captures()
-                .into_iter()
-                .find_map(|frame| match frame {
-                    CapturedFrame::StrictMulticast {
-                        dsts,
-                        body: StrictBody::ProposeV1(propose),
-                        ..
-                    } if (propose.op_id_hi, propose.op_id_lo) == op_id => Some((dsts, propose)),
-                    _ => None,
-                });
-            if repair.is_some() {
-                break;
-            }
-        }
-        let (dsts, repair) = repair.expect("phase two must continue repairing a missed proposal");
-        assert_eq!(dsts, vec![4]);
-        assert_eq!(repair.protocol_version, STRICT_PROTOCOL_VERSION_V2);
-        assert_eq!(repair.frozen_targets.len(), 4);
+        tokio::time::sleep(Duration::from_millis(850)).await;
+        assert!(!net.drain_captures().iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictMulticast {
+                body: StrictBody::ProposeV1(candidate),
+                ..
+            } | CapturedFrame::StrictUnicast {
+                body: StrictBody::ProposeV1(candidate),
+                ..
+            } if (candidate.op_id_hi, candidate.op_id_lo) == op_id
+        )));
+
+        rt.recv_accept_ack(
+            4,
+            StrictAcceptAck {
+                ack_node: 4,
+                coord_node: 1,
+                ballot: NORMAL_ACCEPT_BALLOT,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                accepted: false,
+                src_clock: 5,
+                ack_boot_epoch: 1,
+            },
+        )
+        .await;
+        let repair = net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 4,
+                    body: StrictBody::ProposeV1(propose),
+                    ..
+                } => Some(propose),
+                _ => None,
+            })
+            .expect("a rejecting peer that missed phase one gets one targeted repair");
+        assert_eq!((repair.op_id_hi, repair.op_id_lo), op_id);
+
+        rt.recv_accept_ack(
+            4,
+            StrictAcceptAck {
+                ack_node: 4,
+                coord_node: 1,
+                ballot: NORMAL_ACCEPT_BALLOT,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                accepted: false,
+                src_clock: 6,
+                ack_boot_epoch: 1,
+            },
+        )
+        .await;
+        assert!(!net.drain_captures().iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 4,
+                body: StrictBody::ProposeV1(candidate),
+                ..
+            } if (candidate.op_id_hi, candidate.op_id_lo) == op_id
+        )));
+
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(!net.drain_captures().iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictMulticast {
+                body: StrictBody::ProposeV1(candidate),
+                ..
+            } | CapturedFrame::StrictUnicast {
+                body: StrictBody::ProposeV1(candidate),
+                ..
+            } if (candidate.op_id_hi, candidate.op_id_lo) == op_id
+        )));
     }
 
     #[tokio::test]
@@ -15411,6 +15891,8 @@ mod tests {
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
+        net.set_route_rtt(2, Duration::from_millis(200));
+        net.set_route_rtt(3, Duration::from_millis(200));
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
@@ -15457,17 +15939,17 @@ mod tests {
         .await;
 
         let mut retry_to_last_peer = None;
-        for _ in 0..20 {
+        for _ in 0..130 {
             tokio::time::sleep(Duration::from_millis(5)).await;
             retry_to_last_peer = net
                 .drain_captures()
                 .into_iter()
                 .find_map(|frame| match frame {
-                    CapturedFrame::StrictMulticast {
-                        dsts,
+                    CapturedFrame::StrictUnicast {
+                        dst: 3,
                         body: StrictBody::ProposeV1(propose),
                         ..
-                    } if dsts == vec![3] => Some(propose),
+                    } => Some(propose),
                     _ => None,
                 });
             if retry_to_last_peer.is_some() {
@@ -16098,7 +16580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn healthy_terminal_fanout_uses_one_redundant_multicast() {
+    async fn healthy_terminal_fanout_uses_one_regular_multicast() {
         let net = MockNet::new(1, vec![1, 2, 3]);
         let body = StrictBody::Decision(StrictDecision {
             resolver_node: 1,
@@ -16133,7 +16615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_fanout_broadcasts_when_redundant_multicast_fails() {
+    async fn terminal_fanout_does_not_broadcast_after_ambiguous_multicast_failure() {
         let net = MockNet::new(1, vec![1, 2, 3]);
         net.set_fail_strict_multicasts(true);
         let body = StrictBody::Decision(StrictDecision {
@@ -16152,19 +16634,158 @@ mod tests {
             ..Default::default()
         });
 
-        send_terminal_fanout_with_broadcast(net.as_ref(), &[2, 3], "channels", body.clone())
-            .await
-            .unwrap();
+        assert!(
+            send_terminal_fanout_with_broadcast(net.as_ref(), &[2, 3], "channels", body.clone(),)
+                .await
+                .is_err()
+        );
 
         let captures = net.drain_captures();
-        assert_eq!(captures.len(), 1);
-        assert!(matches!(
-            &captures[0],
-            CapturedFrame::StrictBroadcast {
-                body: captured,
-                ..
-            } if captured == &body
-        ));
+        assert!(captures.is_empty());
+        let sends = net.drain_strict_send_observations();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].lane, StrictSendLane::Ordinary);
+        assert_eq!(sends[0].target, StrictSendTarget::Multicast(vec![2, 3]));
+        assert_eq!(sends[0].outcome, StrictSendOutcome::InjectedFailure);
+    }
+
+    fn terminal_replay_test_config() -> ReplicationConfig {
+        ReplicationConfig::default()
+            .with_delivery_tick_interval(Duration::from_millis(10))
+            .with_strict_consensus_retry_min(Duration::from_millis(50))
+            .with_strict_consensus_retry_max(Duration::from_millis(50))
+            .with_strict_consensus_rtt_margin(Duration::ZERO)
+            .with_pending_propose_ttl(Duration::from_millis(200))
+    }
+
+    fn valid_v3_terminal_replay_decision() -> StrictBody {
+        let op_id = make_op_id(1, 1, 135);
+        StrictBody::Decision(StrictDecision {
+            resolver_node: 1,
+            ballot: NORMAL_ACCEPT_BALLOT,
+            coord_node: 1,
+            op_id_hi: op_id.0,
+            op_id_lo: op_id.1,
+            outcome: Some(StrictDecisionOutcome::Abort(StrictDecisionAbort {})),
+            src_clock: 1,
+            resolver_boot_epoch: 1,
+            frozen_targets: vec![
+                StrictFrozenTarget {
+                    node: 1,
+                    boot_epoch: 1,
+                },
+                StrictFrozenTarget {
+                    node: 2,
+                    boot_epoch: 1,
+                },
+            ],
+            source_journal_id: Bytes::from(vec![1; 16]),
+            source_terminal_generation: 1,
+            source_previous_chain_digest: Bytes::from(vec![0; 32]),
+            source_chain_digest: Bytes::from(vec![2; 32]),
+            source_terminal_set_digest: Bytes::from(vec![3; 32]),
+        })
+    }
+
+    fn captured_terminal_replay(frames: &[CapturedFrame], expected: &StrictBody) -> bool {
+        frames.iter().any(|frame| {
+            matches!(
+                frame,
+                CapturedFrame::StrictMulticast { dsts, body, .. }
+                    if dsts == &[2] && body == expected
+            )
+        })
+    }
+
+    async fn advance_past_first_terminal_replay() {
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(101)).await;
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_v3_exact_incarnation_decision_has_no_terminal_replay_tail() {
+        let (rt, net, _repo) = v1_runtime(terminal_replay_test_config());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        let decision = valid_v3_terminal_replay_decision();
+
+        assert!(rt.decision_has_complete_v3_repair_coverage(&[2], &decision));
+        net.drain_captures();
+        rt.spawn_terminal_fanout_retries(vec![2], decision.clone());
+        advance_past_first_terminal_replay().await;
+
+        assert!(!captured_terminal_replay(&net.drain_captures(), &decision));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mixed_v2_v3_target_retains_terminal_replay_tail() {
+        let (rt, net, _repo) = v1_runtime(terminal_replay_test_config());
+        net.set_alive(vec![1, 2, 3]);
+        net.set_epoch(3, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V2);
+        net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V3);
+        let mut decision = valid_v3_terminal_replay_decision();
+        let StrictBody::Decision(candidate) = &mut decision else {
+            unreachable!();
+        };
+        candidate.frozen_targets.push(StrictFrozenTarget {
+            node: 3,
+            boot_epoch: 1,
+        });
+
+        rt.spawn_terminal_fanout_retries(vec![2, 3], decision.clone());
+        advance_past_first_terminal_replay().await;
+
+        let retries: Vec<_> = net
+            .drain_captures()
+            .into_iter()
+            .filter_map(|frame| match frame {
+                CapturedFrame::StrictMulticast {
+                    dsts,
+                    body: captured,
+                    ..
+                } if captured == decision => Some(dsts),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retries, vec![vec![2]]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_incarnation_retains_terminal_replay_tail() {
+        let (rt, net, _repo) = v1_runtime(terminal_replay_test_config());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        net.set_epoch(2, 2);
+        let decision = valid_v3_terminal_replay_decision();
+
+        rt.spawn_terminal_fanout_retries(vec![2], decision.clone());
+        advance_past_first_terminal_replay().await;
+
+        assert!(captured_terminal_replay(&net.drain_captures(), &decision));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_v3_transition_retains_terminal_replay_tail() {
+        let (rt, net, _repo) = v1_runtime(terminal_replay_test_config());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        let mut decision = valid_v3_terminal_replay_decision();
+        let StrictBody::Decision(candidate) = &mut decision else {
+            unreachable!();
+        };
+        candidate.source_terminal_generation = 0;
+
+        rt.spawn_terminal_fanout_retries(vec![2], decision.clone());
+        advance_past_first_terminal_replay().await;
+
+        assert!(captured_terminal_replay(&net.drain_captures(), &decision));
     }
 
     #[tokio::test]
@@ -16190,9 +16811,16 @@ mod tests {
             net.clone(),
             shutdown.clone(),
             "channels".to_owned(),
+            1,
+            make_op_id(1, 1, 135),
             vec![2],
             body.clone(),
-            Duration::from_millis(1),
+            Arc::new(
+                ReplicationConfig::default()
+                    .with_strict_consensus_retry_min(Duration::from_millis(1))
+                    .with_strict_consensus_retry_max(Duration::from_millis(1))
+                    .with_strict_consensus_rtt_margin(Duration::ZERO),
+            ),
             Duration::from_secs(1),
         );
 
@@ -16224,6 +16852,62 @@ mod tests {
             late_retry.expect("terminal fanout must outlive the former fixed retry window"),
             body
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_fanout_retry_uses_route_rtt_and_exponential_backoff() {
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_route_rtt(2, Duration::from_millis(100));
+        let shutdown = CancellationToken::new();
+        let op_id = make_op_id(1, 1, 136);
+        let body = StrictBody::Decision(StrictDecision {
+            resolver_node: 1,
+            ballot: NORMAL_ACCEPT_BALLOT,
+            coord_node: 1,
+            op_id_hi: op_id.0,
+            op_id_lo: op_id.1,
+            outcome: Some(StrictDecisionOutcome::Abort(StrictDecisionAbort {})),
+            src_clock: 1,
+            resolver_boot_epoch: 1,
+            ..Default::default()
+        });
+        let cfg = Arc::new(
+            ReplicationConfig::default()
+                .with_strict_consensus_retry_min(Duration::from_millis(50))
+                .with_strict_consensus_retry_max(Duration::from_secs(1))
+                .with_strict_consensus_rtt_margin(Duration::ZERO)
+                .with_strict_consensus_retry_jitter_pct(0),
+        );
+
+        spawn_commit_fanout_retries(
+            net.clone(),
+            shutdown.clone(),
+            "channels".to_owned(),
+            1,
+            op_id,
+            vec![2],
+            body.clone(),
+            cfg,
+            Duration::from_secs(2),
+        );
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_millis(199)).await;
+        tokio::task::yield_now().await;
+        assert!(net.drain_captures().is_empty());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(captured_terminal_replay(&net.drain_captures(), &body));
+
+        tokio::time::advance(Duration::from_millis(399)).await;
+        tokio::task::yield_now().await;
+        assert!(net.drain_captures().is_empty());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(captured_terminal_replay(&net.drain_captures(), &body));
+        shutdown.cancel();
     }
 
     #[tokio::test]

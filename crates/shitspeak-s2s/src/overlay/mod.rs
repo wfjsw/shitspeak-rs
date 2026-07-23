@@ -2128,6 +2128,22 @@ impl OverlayNetwork {
             .map(|e| e.next_hop)
     }
 
+    /// Return the selected route's aggregate RTT for `dst` and `level`.
+    /// The routing table accumulates advertised per-edge RTT, so this is an
+    /// end-to-end estimate for the same metric used to select the route.
+    pub fn route_latency_with_metric(
+        &self,
+        dst: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+    ) -> Option<Duration> {
+        let routing = self.inner.routing.load();
+        let latency_us = routing
+            .lookup_with_metric(dst, level, routing_metric)?
+            .latency_us;
+        (latency_us > 0).then(|| Duration::from_micros(latency_us))
+    }
+
     pub fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
         self.voice_route_qualities(&[dst])
             .into_iter()

@@ -29,6 +29,21 @@ pub struct ReplicationConfig {
     // ── Strict delivery loop / GC ──
     /// Cadence of the delivery + GC pass.
     delivery_tick_interval: Duration,
+    /// Lower bound for consensus retransmission intervals derived from the
+    /// measured network RTT.
+    strict_consensus_retry_min: Duration,
+    /// Upper bound for consensus retransmission intervals derived from the
+    /// measured network RTT.
+    strict_consensus_retry_max: Duration,
+    /// Scheduling and queueing margin added to the measured network RTT when
+    /// deriving a consensus retransmission interval.
+    strict_consensus_rtt_margin: Duration,
+    /// Positive deterministic jitter applied to consensus retry deadlines.
+    strict_consensus_retry_jitter_pct: u32,
+    /// Lower bound for strict replication per-hop enqueue TTLs derived from RTT.
+    strict_transport_ttl_min: Duration,
+    /// Upper bound for strict replication per-hop enqueue TTLs derived from RTT.
+    strict_transport_ttl_max: Duration,
     /// Per-proposal timeout. After this the propose future fails with
     /// [`super::error::ReplicationError::ProposeTimeout`].
     propose_ttl: Duration,
@@ -116,6 +131,12 @@ impl Default for ReplicationConfig {
             max_clock_tick: Duration::from_secs(5),
 
             delivery_tick_interval: Duration::from_millis(50),
+            strict_consensus_retry_min: Duration::from_millis(500),
+            strict_consensus_retry_max: Duration::from_secs(3),
+            strict_consensus_rtt_margin: Duration::from_millis(100),
+            strict_consensus_retry_jitter_pct: 25,
+            strict_transport_ttl_min: Duration::from_millis(500),
+            strict_transport_ttl_max: Duration::from_secs(1),
             propose_ttl: Duration::from_secs(10),
             propose_semaphore_size: 32,
             strict_max_catchup_ops: 256,
@@ -162,6 +183,24 @@ impl ReplicationConfig {
     }
     pub fn delivery_tick_interval(&self) -> Duration {
         self.delivery_tick_interval
+    }
+    pub fn strict_consensus_retry_min(&self) -> Duration {
+        self.strict_consensus_retry_min
+    }
+    pub fn strict_consensus_retry_max(&self) -> Duration {
+        self.strict_consensus_retry_max
+    }
+    pub fn strict_consensus_rtt_margin(&self) -> Duration {
+        self.strict_consensus_rtt_margin
+    }
+    pub fn strict_consensus_retry_jitter_pct(&self) -> u32 {
+        self.strict_consensus_retry_jitter_pct
+    }
+    pub fn strict_transport_ttl_min(&self) -> Duration {
+        self.strict_transport_ttl_min
+    }
+    pub fn strict_transport_ttl_max(&self) -> Duration {
+        self.strict_transport_ttl_max
     }
     pub fn propose_ttl(&self) -> Duration {
         self.propose_ttl
@@ -270,6 +309,30 @@ impl ReplicationConfig {
     }
     pub fn with_delivery_tick_interval(mut self, d: Duration) -> Self {
         self.delivery_tick_interval = d;
+        self
+    }
+    pub fn with_strict_consensus_retry_min(mut self, d: Duration) -> Self {
+        self.strict_consensus_retry_min = d;
+        self
+    }
+    pub fn with_strict_consensus_retry_max(mut self, d: Duration) -> Self {
+        self.strict_consensus_retry_max = d;
+        self
+    }
+    pub fn with_strict_consensus_rtt_margin(mut self, d: Duration) -> Self {
+        self.strict_consensus_rtt_margin = d;
+        self
+    }
+    pub fn with_strict_consensus_retry_jitter_pct(mut self, pct: u32) -> Self {
+        self.strict_consensus_retry_jitter_pct = pct;
+        self
+    }
+    pub fn with_strict_transport_ttl_min(mut self, d: Duration) -> Self {
+        self.strict_transport_ttl_min = d;
+        self
+    }
+    pub fn with_strict_transport_ttl_max(mut self, d: Duration) -> Self {
+        self.strict_transport_ttl_max = d;
         self
     }
     pub fn with_propose_ttl(mut self, d: Duration) -> Self {
@@ -469,6 +532,18 @@ pub struct ReplicationTuning {
     pub max_clock_tick_ms: u64,
     #[serde(default = "default_delivery_tick_interval_ms")]
     pub delivery_tick_interval_ms: u64,
+    #[serde(default = "default_strict_consensus_retry_min_ms")]
+    pub strict_consensus_retry_min_ms: u64,
+    #[serde(default = "default_strict_consensus_retry_max_ms")]
+    pub strict_consensus_retry_max_ms: u64,
+    #[serde(default = "default_strict_consensus_rtt_margin_ms")]
+    pub strict_consensus_rtt_margin_ms: u64,
+    #[serde(default = "default_strict_consensus_retry_jitter_pct")]
+    pub strict_consensus_retry_jitter_pct: u32,
+    #[serde(default = "default_strict_transport_ttl_min_ms")]
+    pub strict_transport_ttl_min_ms: u64,
+    #[serde(default = "default_strict_transport_ttl_max_ms")]
+    pub strict_transport_ttl_max_ms: u64,
     #[serde(default = "default_propose_ttl_ms")]
     pub propose_ttl_ms: u64,
     #[serde(default = "default_propose_semaphore_size")]
@@ -534,6 +609,12 @@ impl Default for ReplicationTuning {
             min_clock_tick_ms: default_min_clock_tick_ms(),
             max_clock_tick_ms: default_max_clock_tick_ms(),
             delivery_tick_interval_ms: default_delivery_tick_interval_ms(),
+            strict_consensus_retry_min_ms: default_strict_consensus_retry_min_ms(),
+            strict_consensus_retry_max_ms: default_strict_consensus_retry_max_ms(),
+            strict_consensus_rtt_margin_ms: default_strict_consensus_rtt_margin_ms(),
+            strict_consensus_retry_jitter_pct: default_strict_consensus_retry_jitter_pct(),
+            strict_transport_ttl_min_ms: default_strict_transport_ttl_min_ms(),
+            strict_transport_ttl_max_ms: default_strict_transport_ttl_max_ms(),
             propose_ttl_ms: default_propose_ttl_ms(),
             propose_semaphore_size: default_propose_semaphore_size(),
             strict_max_catchup_ops: default_strict_max_catchup_ops(),
@@ -569,6 +650,81 @@ impl Default for ReplicationTuning {
     }
 }
 
+impl ReplicationTuning {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            (
+                "strict_consensus_retry_min_ms",
+                self.strict_consensus_retry_min_ms,
+            ),
+            (
+                "strict_consensus_retry_max_ms",
+                self.strict_consensus_retry_max_ms,
+            ),
+            (
+                "strict_consensus_rtt_margin_ms",
+                self.strict_consensus_rtt_margin_ms,
+            ),
+            (
+                "strict_transport_ttl_min_ms",
+                self.strict_transport_ttl_min_ms,
+            ),
+            (
+                "strict_transport_ttl_max_ms",
+                self.strict_transport_ttl_max_ms,
+            ),
+        ] {
+            if value == 0 {
+                return Err(format!("s2s.replications.{name} must be greater than zero"));
+            }
+        }
+        if self.strict_consensus_retry_min_ms > self.strict_consensus_retry_max_ms {
+            return Err(
+                "s2s.replications.strict_consensus_retry_min_ms must not exceed \
+                 strict_consensus_retry_max_ms"
+                    .to_owned(),
+            );
+        }
+        if self.strict_transport_ttl_min_ms > self.strict_transport_ttl_max_ms {
+            return Err(
+                "s2s.replications.strict_transport_ttl_min_ms must not exceed \
+                 strict_transport_ttl_max_ms"
+                    .to_owned(),
+            );
+        }
+        if self.strict_transport_ttl_min_ms > self.strict_consensus_retry_min_ms
+            || self.strict_transport_ttl_max_ms > self.strict_consensus_retry_max_ms
+        {
+            return Err(
+                "s2s.replications strict transport TTL bounds must not exceed the corresponding consensus retry bounds"
+                    .to_owned(),
+            );
+        }
+        if self.strict_consensus_retry_jitter_pct > 100 {
+            return Err(
+                "s2s.replications.strict_consensus_retry_jitter_pct must be at most 100".to_owned(),
+            );
+        }
+        let jittered_retry_max_ms = u128::from(self.strict_consensus_retry_max_ms)
+            + u128::from(self.strict_consensus_retry_max_ms)
+                * u128::from(self.strict_consensus_retry_jitter_pct)
+                / 100;
+        if u128::from(self.propose_ttl_ms) <= jittered_retry_max_ms {
+            return Err(
+                "s2s.replications.propose_ttl_ms must exceed the maximum jittered consensus retry interval so at least one RTT-scaled retry can run"
+                    .to_owned(),
+            );
+        }
+        if u128::from(self.pending_propose_ttl_ms) <= jittered_retry_max_ms {
+            return Err(
+                "s2s.replications.pending_propose_ttl_ms must exceed the maximum jittered consensus retry interval so retained terminal repair can run"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl From<ReplicationTuning> for ReplicationConfig {
     fn from(t: ReplicationTuning) -> Self {
         ReplicationConfig::default()
@@ -576,6 +732,14 @@ impl From<ReplicationTuning> for ReplicationConfig {
             .with_min_clock_tick(Duration::from_millis(t.min_clock_tick_ms))
             .with_max_clock_tick(Duration::from_millis(t.max_clock_tick_ms))
             .with_delivery_tick_interval(Duration::from_millis(t.delivery_tick_interval_ms))
+            .with_strict_consensus_retry_min(Duration::from_millis(t.strict_consensus_retry_min_ms))
+            .with_strict_consensus_retry_max(Duration::from_millis(t.strict_consensus_retry_max_ms))
+            .with_strict_consensus_rtt_margin(Duration::from_millis(
+                t.strict_consensus_rtt_margin_ms,
+            ))
+            .with_strict_consensus_retry_jitter_pct(t.strict_consensus_retry_jitter_pct)
+            .with_strict_transport_ttl_min(Duration::from_millis(t.strict_transport_ttl_min_ms))
+            .with_strict_transport_ttl_max(Duration::from_millis(t.strict_transport_ttl_max_ms))
             .with_propose_ttl(Duration::from_millis(t.propose_ttl_ms))
             .with_propose_semaphore_size(t.propose_semaphore_size)
             .with_strict_max_catchup_ops(t.strict_max_catchup_ops)
@@ -630,6 +794,24 @@ fn default_max_clock_tick_ms() -> u64 {
 }
 fn default_delivery_tick_interval_ms() -> u64 {
     50
+}
+fn default_strict_consensus_retry_min_ms() -> u64 {
+    500
+}
+fn default_strict_consensus_retry_max_ms() -> u64 {
+    3_000
+}
+fn default_strict_consensus_rtt_margin_ms() -> u64 {
+    100
+}
+fn default_strict_consensus_retry_jitter_pct() -> u32 {
+    25
+}
+fn default_strict_transport_ttl_min_ms() -> u64 {
+    500
+}
+fn default_strict_transport_ttl_max_ms() -> u64 {
+    1_000
 }
 fn default_propose_ttl_ms() -> u64 {
     10_000
@@ -755,6 +937,125 @@ mod tests {
             Duration::from_millis(2_000)
         );
         assert_eq!(tuned.strict_bulk_retry_jitter_pct(), 10);
+    }
+
+    #[test]
+    fn strict_rtt_timing_defaults_and_tuning_conversion_match() {
+        let defaults = ReplicationConfig::default();
+        assert_eq!(
+            defaults.strict_consensus_retry_min(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            defaults.strict_consensus_retry_max(),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            defaults.strict_consensus_rtt_margin(),
+            Duration::from_millis(100)
+        );
+        assert_eq!(defaults.strict_consensus_retry_jitter_pct(), 25);
+        assert_eq!(
+            defaults.strict_transport_ttl_min(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(defaults.strict_transport_ttl_max(), Duration::from_secs(1));
+
+        let tuning = ReplicationTuning {
+            strict_consensus_retry_min_ms: 700,
+            strict_consensus_retry_max_ms: 2_500,
+            strict_consensus_rtt_margin_ms: 150,
+            strict_consensus_retry_jitter_pct: 10,
+            strict_transport_ttl_min_ms: 600,
+            strict_transport_ttl_max_ms: 900,
+            ..ReplicationTuning::default()
+        };
+        assert!(tuning.validate().is_ok());
+        let tuned = ReplicationConfig::from(tuning);
+        assert_eq!(
+            tuned.strict_consensus_retry_min(),
+            Duration::from_millis(700)
+        );
+        assert_eq!(
+            tuned.strict_consensus_retry_max(),
+            Duration::from_millis(2_500)
+        );
+        assert_eq!(
+            tuned.strict_consensus_rtt_margin(),
+            Duration::from_millis(150)
+        );
+        assert_eq!(tuned.strict_consensus_retry_jitter_pct(), 10);
+        assert_eq!(tuned.strict_transport_ttl_min(), Duration::from_millis(600));
+        assert_eq!(tuned.strict_transport_ttl_max(), Duration::from_millis(900));
+    }
+
+    #[test]
+    fn strict_rtt_timing_validation_rejects_zero_and_inverted_bounds() {
+        let zero = ReplicationTuning {
+            strict_consensus_rtt_margin_ms: 0,
+            ..ReplicationTuning::default()
+        };
+        assert!(zero.validate().is_err());
+
+        let retry_inverted = ReplicationTuning {
+            strict_consensus_retry_min_ms: 3_001,
+            strict_consensus_retry_max_ms: 3_000,
+            ..ReplicationTuning::default()
+        };
+        assert!(retry_inverted.validate().is_err());
+
+        let ttl_inverted = ReplicationTuning {
+            strict_transport_ttl_min_ms: 1_001,
+            strict_transport_ttl_max_ms: 1_000,
+            ..ReplicationTuning::default()
+        };
+        assert!(ttl_inverted.validate().is_err());
+
+        let ttl_outlives_retry = ReplicationTuning {
+            strict_transport_ttl_min_ms: 501,
+            strict_consensus_retry_min_ms: 500,
+            ..ReplicationTuning::default()
+        };
+        assert!(ttl_outlives_retry.validate().is_err());
+
+        let retry_outlives_proposal = ReplicationTuning {
+            strict_consensus_retry_max_ms: 10_000,
+            ..ReplicationTuning::default()
+        };
+        assert!(retry_outlives_proposal.validate().is_err());
+
+        let excessive_jitter = ReplicationTuning {
+            strict_consensus_retry_jitter_pct: 101,
+            ..ReplicationTuning::default()
+        };
+        assert!(excessive_jitter.validate().is_err());
+
+        let retry_with_jitter = ReplicationTuning {
+            propose_ttl_ms: 3_750,
+            ..ReplicationTuning::default()
+        };
+        assert!(retry_with_jitter.validate().is_err());
+
+        let pending_retry_with_jitter = ReplicationTuning {
+            pending_propose_ttl_ms: 3_750,
+            ..ReplicationTuning::default()
+        };
+        assert!(pending_retry_with_jitter.validate().is_err());
+
+        let above_jittered_retry = ReplicationTuning {
+            propose_ttl_ms: 3_751,
+            pending_propose_ttl_ms: 3_751,
+            ..ReplicationTuning::default()
+        };
+        assert!(above_jittered_retry.validate().is_ok());
+
+        let overflow_safe = ReplicationTuning {
+            strict_consensus_retry_max_ms: u64::MAX,
+            propose_ttl_ms: u64::MAX,
+            pending_propose_ttl_ms: u64::MAX,
+            ..ReplicationTuning::default()
+        };
+        assert!(overflow_safe.validate().is_err());
     }
 
     #[test]

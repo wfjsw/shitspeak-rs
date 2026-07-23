@@ -53,19 +53,71 @@ impl<T: tokio::io::AsyncWriteExt + Unpin + Send> WriteMessageExt for T {
                 return Ok(());
             }
 
-            // Pre-calculate total capacity: 6 bytes header + payload per message.
-            let total = messages.iter().map(|m| 6 + m.encoded_len()).sum();
+            // Cache each payload length while calculating the exact capacity.
+            // Protobuf `encoded_len` walks the message, so recomputing it for
+            // every frame header is material during large authentication bursts.
+            const INLINE_LENGTH_CAPACITY: usize = 8;
+            let mut inline_lengths = [0; INLINE_LENGTH_CAPACITY];
+            let mut heap_lengths = Vec::new();
+            let payload_lengths = if messages.len() <= INLINE_LENGTH_CAPACITY {
+                &mut inline_lengths[..messages.len()]
+            } else {
+                heap_lengths.resize(messages.len(), 0);
+                &mut heap_lengths
+            };
+            let mut total = messages.len() * 6;
+            for (message, payload_len) in messages.iter().zip(payload_lengths.iter_mut()) {
+                *payload_len = message.encoded_len();
+                total += *payload_len;
+            }
 
             let mut buf = BytesMut::with_capacity(total);
 
-            for msg in messages {
+            for (msg, payload_len) in messages.iter().zip(payload_lengths.iter().copied()) {
                 buf.extend_from_slice(&msg.proto_tag().to_be_bytes());
-                buf.extend_from_slice(&(msg.encoded_len() as u32).to_be_bytes());
+                buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
                 msg.to_proto(&mut buf)?;
             }
 
             self.write_all(&buf).await?;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use shitspeak_proto::mumble_proto::Version;
+    use tokio::io::AsyncReadExt as _;
+
+    #[tokio::test]
+    async fn batch_writer_preserves_message_framing() {
+        let version = Version {
+            version_v1: Some(0x0102_0304),
+            release: Some("test".to_owned()),
+            ..Version::default()
+        };
+        let messages = [
+            Message::Version(version),
+            Message::UDPTunnel(Bytes::from_static(&[0x80, 0x01, 0x02, 0x03])),
+        ];
+
+        let mut expected = Vec::new();
+        for message in &messages {
+            let payload = message.to_proto_vec().unwrap();
+            expected.extend_from_slice(&message.proto_tag().to_be_bytes());
+            expected.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            expected.extend_from_slice(&payload);
+        }
+
+        let (mut writer, mut reader) = tokio::io::duplex(256);
+        writer.write_proto_message_batch(&messages).await.unwrap();
+        drop(writer);
+
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
     }
 }

@@ -8,6 +8,8 @@ use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
 use crate::server::Server;
 use parking_lot::RwLock as ParkingRwLock;
+use shitspeak_messages::messages::Message;
+use shitspeak_messages::messages::encoder::{UserRemove, UserState};
 use shitspeak_state::ACLPermissions;
 use shitspeak_state::{ChannelOp, ChannelOperation};
 
@@ -1012,7 +1014,7 @@ pub async fn build_visible_user_state(
         state.listening_channel_add = sorted_channels(&listener_channels);
         state.listening_channel_remove.clear();
     }
-    project_user_state_fields_for_viewer(server, viewer, &mut state);
+    project_user_state_fields_for_viewer(server, viewer, Some(target), &mut state);
     state
 }
 
@@ -1327,7 +1329,24 @@ async fn project_message_at_home(
                 .await
             } else {
                 let mut projected = user_state;
-                project_user_state_fields_for_viewer(server, viewer, &mut projected);
+                let target = if viewer.is_superuser()
+                    || session == viewer.get_session_id()
+                    || projected.hash.is_none()
+                {
+                    None
+                } else {
+                    let server_id = viewer.server_id();
+                    server
+                        .get_clients()
+                        .get_client_in_server(&server_id, session)
+                        .await
+                };
+                project_user_state_fields_for_viewer(
+                    server,
+                    viewer,
+                    target.as_deref().map(Box::as_ref),
+                    &mut projected,
+                );
                 vec![projected.into()]
             }
         }
@@ -2085,7 +2104,7 @@ async fn project_user_state(
         let mut state = target.build_user_state_for_broadcast();
         state.listening_channel_add = sorted_channels(&new_listeners);
         state.listening_channel_remove.clear();
-        project_user_state_fields_for_viewer(server, viewer, &mut state);
+        project_user_state_fields_for_viewer(server, viewer, Some(&target), &mut state);
         return vec![state.into()];
     }
 
@@ -2096,7 +2115,7 @@ async fn project_user_state(
         visible_actor_with_home(server, viewer, raw.actor, effective_home_channel_id).await;
     projected.listening_channel_add = sorted_difference(&new_listeners, &old.listener_channels);
     projected.listening_channel_remove = sorted_difference(&old.listener_channels, &new_listeners);
-    project_user_state_fields_for_viewer(server, viewer, &mut projected);
+    project_user_state_fields_for_viewer(server, viewer, Some(&target), &mut projected);
 
     if user_state_delta_empty(&projected) {
         Vec::new()
@@ -2166,7 +2185,7 @@ async fn refresh_target_visibility(
             state.channel_id = Some(current_channel);
             state.listening_channel_add = sorted_channels(&new_listeners);
             state.listening_channel_remove.clear();
-            project_user_state_fields_for_viewer(server, viewer, &mut state);
+            project_user_state_fields_for_viewer(server, viewer, Some(target), &mut state);
             vec![state.into()]
         }
         Some(old) => {
@@ -2182,7 +2201,7 @@ async fn refresh_target_visibility(
             if include_user_state_name {
                 state.name = target.display_name_opt();
             }
-            project_user_state_fields_for_viewer(server, viewer, &mut state);
+            project_user_state_fields_for_viewer(server, viewer, Some(target), &mut state);
             if user_state_delta_empty(&state) {
                 Vec::new()
             } else {
@@ -2202,7 +2221,7 @@ fn user_state_name_refresh_for_viewer(
         name: target.display_name_opt(),
         ..Default::default()
     };
-    project_user_state_fields_for_viewer(server, viewer, &mut state);
+    project_user_state_fields_for_viewer(server, viewer, Some(target), &mut state);
     (!user_state_delta_empty(&state)).then(|| state.into())
 }
 
@@ -2234,26 +2253,57 @@ async fn visible_actor_with_home(
 fn protect_user_state_hash_for_viewer(
     server: &Arc<Box<Server>>,
     viewer: &Arc<Box<Client>>,
+    target: Option<&Client>,
     state: &mut UserState,
 ) {
+    if viewer.is_superuser()
+        || state.session == Some(viewer.get_session_id())
+        || state.hash.is_none()
+    {
+        return;
+    }
+    let visibility_generation = server.visibility_generation();
+    if let Some(cached) = target.and_then(|target| {
+        target.cached_protected_certificate_hash_hex(visibility_generation)
+    }) {
+        if let Some(protected) = cached {
+            state.hash = Some(protected);
+        }
+        return;
+    }
     let Some((protection, secret)) = server.get_certificate_hash_privacy() else {
         return;
     };
-    crate::privacy::protect_user_state_certificate_hash(
+    if !crate::privacy::should_protect_user_state_certificate_hash(
         state,
         viewer.is_superuser(),
         viewer.get_session_id(),
         protection,
-        Some(secret.as_str()),
-    );
+    ) {
+        return;
+    }
+    if let Some(protected) = target.and_then(|target| {
+        target.protected_certificate_hash_hex(visibility_generation, protection, &secret)
+    }) {
+        state.hash = Some(protected);
+    } else {
+        crate::privacy::protect_user_state_certificate_hash(
+            state,
+            false,
+            viewer.get_session_id(),
+            protection,
+            Some(secret.as_str()),
+        );
+    }
 }
 
 fn project_user_state_fields_for_viewer(
     server: &Arc<Box<Server>>,
     viewer: &Arc<Box<Client>>,
+    target: Option<&Client>,
     state: &mut UserState,
 ) {
-    protect_user_state_hash_for_viewer(server, viewer, state);
+    protect_user_state_hash_for_viewer(server, viewer, target, state);
     apply_superuser_node_display_trait(server, viewer, state);
 }
 

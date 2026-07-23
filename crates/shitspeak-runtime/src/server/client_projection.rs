@@ -453,7 +453,8 @@ impl ClientProjectionState {
             .sync_messages(visibility_messages.iter());
         outbound.extend(visibility_messages);
         for channel_id in removed {
-            let message = shitspeak_messages::messages::encoder::ChannelRemove { channel_id }.into();
+            let message =
+                shitspeak_messages::messages::encoder::ChannelRemove { channel_id }.into();
             self.channel_permission_shadow.sync_message(&message);
             outbound.push(message);
         }

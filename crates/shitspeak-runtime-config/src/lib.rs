@@ -179,6 +179,8 @@ impl S2sConfig {
             return Ok(None);
         }
 
+        self.replications.validate()?;
+
         let ca_path = self
             .ca_path
             .clone()

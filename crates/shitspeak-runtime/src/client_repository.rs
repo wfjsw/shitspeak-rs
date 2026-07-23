@@ -2306,7 +2306,13 @@ impl ClientRepository {
     pub async fn replay_since(
         &self,
         last_seen: &HashMap<u16, u64>,
-    ) -> Result<(Vec<shitspeak_messages::messages::Message>, HashMap<u16, u64>), ()> {
+    ) -> Result<
+        (
+            Vec<shitspeak_messages::messages::Message>,
+            HashMap<u16, u64>,
+        ),
+        (),
+    > {
         self.replay_since_in_server(DEFAULT_SERVER_ID, last_seen)
             .await
     }
@@ -2315,7 +2321,13 @@ impl ClientRepository {
         &self,
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
-    ) -> Result<(Vec<shitspeak_messages::messages::Message>, HashMap<u16, u64>), ()> {
+    ) -> Result<
+        (
+            Vec<shitspeak_messages::messages::Message>,
+            HashMap<u16, u64>,
+        ),
+        (),
+    > {
         self.replay_since_in_server_filtered(server_id, last_seen, None)
             .await
     }
@@ -2326,7 +2338,13 @@ impl ClientRepository {
         last_seen: &HashMap<u16, u64>,
         viewer_session_id: ClientSessionIdentifier,
         viewer_client_instance_id: ClientInstanceId,
-    ) -> Result<(Vec<shitspeak_messages::messages::Message>, HashMap<u16, u64>), ()> {
+    ) -> Result<
+        (
+            Vec<shitspeak_messages::messages::Message>,
+            HashMap<u16, u64>,
+        ),
+        (),
+    > {
         self.replay_since_in_server_filtered(
             server_id,
             last_seen,
@@ -2367,7 +2385,13 @@ impl ClientRepository {
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
         viewer: Option<(ClientSessionIdentifier, ClientInstanceId)>,
-    ) -> Result<(Vec<shitspeak_messages::messages::Message>, HashMap<u16, u64>), ()> {
+    ) -> Result<
+        (
+            Vec<shitspeak_messages::messages::Message>,
+            HashMap<u16, u64>,
+        ),
+        (),
+    > {
         let entries = self
             .replay_entries_since_in_server(server_id, last_seen)
             .await?;
@@ -3168,8 +3192,8 @@ mod tests {
         time::Duration,
     };
 
-    use shitspeak_messages::messages::{Message, encoder::TextMessage};
     use chrono::Utc;
+    use shitspeak_messages::messages::{Message, encoder::TextMessage};
 
     use super::*;
 

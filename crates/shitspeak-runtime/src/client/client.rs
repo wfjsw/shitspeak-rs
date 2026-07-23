@@ -70,6 +70,12 @@ struct ClientCachedAclPermissions {
     permissions: enumflags2::BitFlags<shitspeak_state::ACLPermissions>,
 }
 
+#[derive(Default)]
+struct CertificateHashProjectionCache {
+    visibility_generation: Option<u64>,
+    protected_hash_hex: Option<String>,
+}
+
 impl ClientCachedAclPermissions {
     fn hit_for(
         self,
@@ -324,6 +330,8 @@ pub struct Client {
     stats: RwLock<ClientStats>,
 
     certificate_hash: Option<Bytes>,
+    certificate_hash_hex: Option<String>,
+    certificate_hash_projection_cache: ParkingMutex<CertificateHashProjectionCache>,
     certificate_chain: Vec<CertificateDer<'static>>,
     user_info_extended: ParkingMutex<Option<UserInfoExtended>>,
 
@@ -481,6 +489,7 @@ impl Client {
         };
 
         let now = Utc::now();
+        let certificate_hash_hex = certificate_hash.as_deref().map(hex::encode);
 
         let (voice_routing_tx, voice_routing_rx) =
             mpsc::channel::<VoiceRoutingPayload>(VOICE_ROUTING_QUEUE_CAPACITY);
@@ -518,6 +527,10 @@ impl Client {
             last_ping: ParkingMutex::new(now),
             stats: RwLock::new(ClientStats::default()),
             certificate_hash,
+            certificate_hash_hex,
+            certificate_hash_projection_cache: ParkingMutex::new(
+                CertificateHashProjectionCache::default(),
+            ),
             certificate_chain,
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
             options: RwLock::new(ClientOptions::default()),
@@ -681,6 +694,10 @@ impl Client {
             last_ping: ParkingMutex::new(now),
             stats: RwLock::new(ClientStats::default()),
             certificate_hash: None,
+            certificate_hash_hex: None,
+            certificate_hash_projection_cache: ParkingMutex::new(
+                CertificateHashProjectionCache::default(),
+            ),
             certificate_chain: Vec::new(),
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
             options: RwLock::new(ClientOptions::default()),
@@ -741,6 +758,7 @@ impl Client {
         client_instance_id: ClientInstanceId,
     ) -> Box<Self> {
         let is_verified = cert_hash.is_some();
+        let certificate_hash_hex = cert_hash.as_deref().map(hex::encode);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
 
         Box::new(Client {
@@ -763,6 +781,10 @@ impl Client {
             last_ping: ParkingMutex::new(login_time),
             stats: RwLock::new(ClientStats::default()),
             certificate_hash: cert_hash,
+            certificate_hash_hex,
+            certificate_hash_projection_cache: ParkingMutex::new(
+                CertificateHashProjectionCache::default(),
+            ),
             certificate_chain: Vec::new(),
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
             options: RwLock::new(ClientOptions::default()),
@@ -904,6 +926,31 @@ impl Client {
 
     pub fn get_certificate_hash(&self) -> Option<&[u8]> {
         self.certificate_hash.as_deref()
+    }
+
+    pub(crate) fn protected_certificate_hash_hex(
+        &self,
+        visibility_generation: u64,
+        protection: shitspeak_runtime_config::CertificateHashProtection,
+        secret: &str,
+    ) -> Option<String> {
+        let source = self.certificate_hash_hex.as_deref()?;
+        let mut cache = self.certificate_hash_projection_cache.lock();
+        if cache.visibility_generation != Some(visibility_generation) {
+            cache.protected_hash_hex =
+                crate::privacy::protected_certificate_hash_hex(protection, secret, source);
+            cache.visibility_generation = Some(visibility_generation);
+        }
+        cache.protected_hash_hex.clone()
+    }
+
+    pub(crate) fn cached_protected_certificate_hash_hex(
+        &self,
+        visibility_generation: u64,
+    ) -> Option<Option<String>> {
+        let cache = self.certificate_hash_projection_cache.lock();
+        (cache.visibility_generation == Some(visibility_generation))
+            .then(|| cache.protected_hash_hex.clone())
     }
 
     pub fn get_certificate_chain(&self) -> &[CertificateDer<'static>] {
@@ -1398,6 +1445,53 @@ impl Client {
                     .map(|message| 6 + message.encoded_len())
                     .sum();
                 self.record_tcp_packets(messages.len(), bytes).await;
+            }
+            ClientTransport::Remote => return Err(transport_not_writable_error().into()),
+        }
+        Ok(())
+    }
+
+    /// Hand an owned message batch to the connection writer without cloning
+    /// the individual protocol messages.
+    pub async fn write_owned_message_batch(
+        &self,
+        batch: OwnedMessageBatch,
+    ) -> Result<(), WriteProtoMessageError> {
+        self.in_tracing_span(self.write_owned_message_batch_inner(batch))
+            .await
+    }
+
+    async fn write_owned_message_batch_inner(
+        &self,
+        batch: OwnedMessageBatch,
+    ) -> Result<(), WriteProtoMessageError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let messages = batch.into_messages();
+        match &self.transport {
+            ClientTransport::NativeTls { .. } => {
+                self.outbound_message_tx
+                    .as_ref()
+                    .ok_or_else(transport_closed_error)?
+                    .send(ClientOutboundMessage::Batch(messages))
+                    .await
+                    .map_err(|_| transport_closed_error())?;
+            }
+            ClientTransport::WebGateway { outbound_tx, .. } => {
+                let message_count = messages.len();
+                let bytes = messages
+                    .iter()
+                    .map(|message| 6 + message.encoded_len())
+                    .sum();
+                for message in messages {
+                    outbound_tx
+                        .send(message)
+                        .await
+                        .map_err(|_| transport_closed_error())?;
+                }
+                self.record_tcp_packets(message_count, bytes).await;
             }
             ClientTransport::Remote => return Err(transport_not_writable_error().into()),
         }
@@ -1996,7 +2090,7 @@ impl Client {
                 Some(gs.get_plugin_identity().to_owned())
             },
             comment: None,
-            hash: self.certificate_hash.as_ref().map(|h| hex::encode(h)),
+            hash: self.certificate_hash_hex.clone(),
             comment_hash: comment_hash_bytes,
             texture_hash: texture_hash_bytes,
             priority_speaker: if gs.is_priority_speaker() {
@@ -2115,6 +2209,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn certificate_hash_projection_cache_reuses_one_value_per_generation() {
+        let certificate_hash = Bytes::from_static(&[
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0x00, 0x11, 0x22, 0x33,
+        ]);
+        let client = Client::new_remote_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
+            ClientSessionIdentifier::from(0x0002_0001),
+            Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            None,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            Some(certificate_hash),
+            Utc::now(),
+            7,
+        );
+        let protection = shitspeak_runtime_config::CertificateHashProtection::Irreversible;
+
+        assert_eq!(
+            client.build_user_state_for_broadcast().hash.as_deref(),
+            Some("00112233445566778899aabbccddeeff00112233")
+        );
+
+        let generation_seven = client
+            .protected_certificate_hash_hex(7, protection, "first-secret")
+            .expect("valid certificate hash");
+        let same_generation = client
+            .protected_certificate_hash_hex(7, protection, "unused-secret")
+            .expect("cached certificate hash");
+        let generation_eight = client
+            .protected_certificate_hash_hex(8, protection, "second-secret")
+            .expect("recomputed certificate hash");
+
+        assert_eq!(same_generation, generation_seven);
+        assert_ne!(generation_eight, generation_seven);
+        assert_eq!(
+            generation_eight,
+            crate::privacy::protected_certificate_hash_hex(
+                protection,
+                "second-secret",
+                "00112233445566778899aabbccddeeff00112233",
+            )
+            .unwrap()
+        );
+        let cache = client.certificate_hash_projection_cache.lock();
+        assert_eq!(cache.visibility_generation, Some(8));
+        assert_eq!(
+            cache.protected_hash_hex.as_deref(),
+            Some(&*generation_eight)
+        );
+    }
+
     fn ping(timestamp: u64) -> Message {
         Message::Ping(
             msg_encoder::Ping {
@@ -2214,5 +2361,38 @@ mod tests {
         .expect_err("a batch larger than maximum capacity must not panic");
         assert!(matches!(oversized, mpsc::error::TrySendError::Full(_)));
         assert_eq!(outbound_batch_len(oversized.into_inner()), 3);
+    }
+
+    #[tokio::test]
+    async fn owned_message_batch_gateway_preserves_order_and_backpressure() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let client = Client::new_web_gateway(
+            ClientSessionIdentifier::from(0x0002_0001),
+            Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            tx,
+        );
+        let messages = vec![ping(11), ping(12)];
+        let expected_bytes = messages
+            .iter()
+            .map(|message| 6 + message.encoded_len())
+            .sum::<usize>();
+
+        let send = client.write_owned_message_batch(OwnedMessageBatch::new(messages));
+        let receive = async {
+            let first = rx.recv().await.expect("first message should arrive");
+            let second = rx.recv().await.expect("second message should arrive");
+            (first, second)
+        };
+        let (result, (first, second)) = tokio::join!(send, receive);
+
+        result.expect("owned gateway batch should be delivered");
+        assert!(matches!(first, Message::Ping(ping) if ping.timestamp == Some(11)));
+        assert!(matches!(second, Message::Ping(ping) if ping.timestamp == Some(12)));
+        assert_eq!(
+            client.stats.read().await.total_volume(),
+            expected_bytes as u64
+        );
     }
 }

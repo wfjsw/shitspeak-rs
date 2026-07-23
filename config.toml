@@ -411,6 +411,14 @@ max_clock_tick_ms = 5000
 
 # Strict delivery loop / GC.
 delivery_tick_interval_ms = 50
+strict_consensus_retry_min_ms = 500
+strict_consensus_retry_max_ms = 3000
+strict_consensus_rtt_margin_ms = 100
+strict_consensus_retry_jitter_pct = 25
+# Bounds for the per-hop enqueue lifetime. This is not an end-to-end packet
+# deadline; consensus retries provide reliability.
+strict_transport_ttl_min_ms = 500
+strict_transport_ttl_max_ms = 1000
 # Per-proposal timeout. After this the propose future fails with
 # `ProposeTimeout`.
 propose_ttl_ms = 10000

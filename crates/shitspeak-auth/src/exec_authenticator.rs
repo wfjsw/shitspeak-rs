@@ -471,34 +471,7 @@ impl ExecAuthenticatorInner {
         &self,
         stdout: &mut BufReader<ChildStdout>,
     ) -> Result<Vec<u8>, ExecAuthenticatorError> {
-        let mut response = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            let bytes_read =
-                stdout
-                    .read(&mut byte)
-                    .await
-                    .map_err(|source| ExecAuthenticatorError::Read {
-                        path: self.command.clone(),
-                        source,
-                    })?;
-            if bytes_read == 0 {
-                break;
-            }
-            response.push(byte[0]);
-            if response.len() > self.max_response_bytes {
-                return Err(ExecAuthenticatorError::ResponseTooLarge {
-                    path: self.command.clone(),
-                    limit: self.max_response_bytes,
-                });
-            }
-            if byte[0] == b'\n' {
-                break;
-            }
-        }
-        trim_line_end(&mut response);
-        self.check_response(&response)?;
-        Ok(response)
+        read_response_line_from(&self.command, self.max_response_bytes, stdout).await
     }
 
     fn unwrap_correlated_response(
@@ -507,13 +480,12 @@ impl ExecAuthenticatorInner {
         response: Vec<u8>,
         require_request_id: bool,
     ) -> Result<Vec<u8>, ExecAuthenticatorError> {
-        let mut value = serde_json::from_slice::<Value>(&response).map_err(|source| {
-            ExecAuthenticatorError::Json {
+        let request_id = serde_json::from_slice::<CorrelatedResponse>(&response)
+            .map_err(|source| ExecAuthenticatorError::Json {
                 path: self.command.clone(),
                 source,
-            }
-        })?;
-        let request_id = value.get("request_id").and_then(Value::as_u64);
+            })?
+            .request_id;
         if require_request_id && request_id.is_none() {
             return Err(ExecAuthenticatorError::MissingRequestId {
                 path: self.command.clone(),
@@ -528,10 +500,7 @@ impl ExecAuthenticatorInner {
                 actual: Some(actual),
             });
         }
-        if let Value::Object(ref mut object) = value {
-            object.remove("request_id");
-        }
-        serde_json::to_vec(&value).map_err(ExecAuthenticatorError::Serialize)
+        Ok(response)
     }
 
     fn check_response(&self, response: &[u8]) -> Result<(), ExecAuthenticatorError> {
@@ -745,6 +714,12 @@ fn line_json(request: &ExecAuthenticatorJsonRequest) -> Result<Vec<u8>, ExecAuth
     Ok(request_json)
 }
 
+#[derive(Deserialize)]
+struct CorrelatedResponse {
+    #[serde(default)]
+    request_id: Option<u64>,
+}
+
 async fn read_long_running_async_responses(
     path: PathBuf,
     max_response_bytes: usize,
@@ -759,11 +734,7 @@ async fn read_long_running_async_responses(
                 return;
             }
         };
-        let (request_id, response) = match unwrap_required_async_response(
-            &path,
-            max_response_bytes,
-            response,
-        ) {
+        let (request_id, response) = match unwrap_required_async_response(&path, response) {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(error = %error, path = %path.display(), "invalid async exec authenticator response");
@@ -788,33 +759,39 @@ async fn read_long_running_async_responses(
     }
 }
 
-async fn read_response_line_from(
+async fn read_response_line_from<Reader>(
     path: &Path,
     max_response_bytes: usize,
-    stdout: &mut BufReader<ChildStdout>,
-) -> Result<Vec<u8>, ExecAuthenticatorError> {
+    stdout: &mut Reader,
+) -> Result<Vec<u8>, ExecAuthenticatorError>
+where
+    Reader: AsyncBufRead + Unpin,
+{
     let mut response = Vec::new();
-    let mut byte = [0u8; 1];
     loop {
-        let bytes_read =
-            stdout
-                .read(&mut byte)
-                .await
-                .map_err(|source| ExecAuthenticatorError::Read {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-        if bytes_read == 0 {
+        let buffer = stdout
+            .fill_buf()
+            .await
+            .map_err(|source| ExecAuthenticatorError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if buffer.is_empty() {
             break;
         }
-        response.push(byte[0]);
-        if response.len() > max_response_bytes {
+
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let bytes_to_copy = newline.map_or(buffer.len(), |index| index + 1);
+        if bytes_to_copy > max_response_bytes - response.len() {
             return Err(ExecAuthenticatorError::ResponseTooLarge {
                 path: path.to_path_buf(),
                 limit: max_response_bytes,
             });
         }
-        if byte[0] == b'\n' {
+
+        response.extend_from_slice(&buffer[..bytes_to_copy]);
+        stdout.consume(bytes_to_copy);
+        if newline.is_some() {
             break;
         }
     }
@@ -829,25 +806,17 @@ async fn read_response_line_from(
 
 fn unwrap_required_async_response(
     path: &Path,
-    _max_response_bytes: usize,
     response: Vec<u8>,
 ) -> Result<(u64, Vec<u8>), ExecAuthenticatorError> {
-    let mut value = serde_json::from_slice::<Value>(&response).map_err(|source| {
-        ExecAuthenticatorError::Json {
+    let request_id = serde_json::from_slice::<CorrelatedResponse>(&response)
+        .map_err(|source| ExecAuthenticatorError::Json {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
-    let request_id = value
-        .get("request_id")
-        .and_then(Value::as_u64)
+        })?
+        .request_id
         .ok_or_else(|| ExecAuthenticatorError::MissingRequestId {
             path: path.to_path_buf(),
         })?;
-    if let Value::Object(ref mut object) = value {
-        object.remove("request_id");
-    }
-    let response = serde_json::to_vec(&value).map_err(ExecAuthenticatorError::Serialize)?;
     Ok((request_id, response))
 }
 
@@ -970,6 +939,44 @@ mod tests {
             os_version: Some("version".to_owned()),
             auth_session_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn response_line_reader_preserves_limit_and_buffered_following_line() {
+        let path = Path::new("test-authenticator");
+        let mut stdout = BufReader::new(&b"first\nsecond\n"[..]);
+
+        let first = read_response_line_from(path, 6, &mut stdout)
+            .await
+            .expect("first response line");
+        let second = read_response_line_from(path, 7, &mut stdout)
+            .await
+            .expect("second response line");
+
+        assert_eq!(first, b"first");
+        assert_eq!(second, b"second");
+
+        let mut oversized = BufReader::new(&b"first\n"[..]);
+        assert!(matches!(
+            read_response_line_from(path, 5, &mut oversized).await,
+            Err(ExecAuthenticatorError::ResponseTooLarge { limit: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn correlated_response_keeps_original_json_bytes() {
+        let response =
+            br#"{ "accepted": true, "request_id": 42, "display_name": "alice" }"#.to_vec();
+        let expected = response.clone();
+
+        let (request_id, response) =
+            unwrap_required_async_response(Path::new("test-authenticator"), response)
+                .expect("correlated response");
+
+        assert_eq!(request_id, 42);
+        assert_eq!(response, expected);
+        serde_json::from_slice::<AuthenticatorJsonAuthenticateResponse>(&response)
+            .expect("typed response ignores request_id");
     }
 
     #[tokio::test]

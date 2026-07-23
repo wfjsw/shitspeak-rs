@@ -6,7 +6,7 @@ use crate::{
     channel_handler::{
         ChannelTreeShadow, SessionChannelShadow, build_visible_channel_snapshot_messages,
     },
-    client::{Client, user_info::Credential},
+    client::{Client, OwnedMessageBatch, user_info::Credential},
     errors::{AuthRejection, MessageHandlerError},
     localization::{TextKey, text},
     messages::{
@@ -597,7 +597,9 @@ pub async fn handle_authenticate(
     }
 
     // ── Send the burst to the joining client in one shot ──────────────────
-    sender.write_proto_message_batch(&burst).await?;
+    sender
+        .write_owned_message_batch(OwnedMessageBatch::new(burst))
+        .await?;
 
     tracing::info!(
         server_id = %sender.server_id(),

@@ -568,7 +568,10 @@ impl ClientStateLogEntry {
     /// * `AddClient` -> `UserState` snapshot of the new client
     /// * `RemoveClient` -> `UserRemove` message
     /// * `UpdateGlobalState` -> `UserState` delta (only changed fields)
-    pub async fn to_message(&self, repo: &ClientRepository) -> Option<shitspeak_messages::messages::Message> {
+    pub async fn to_message(
+        &self,
+        repo: &ClientRepository,
+    ) -> Option<shitspeak_messages::messages::Message> {
         if !self.is_current_instance(repo).await {
             return None;
         }

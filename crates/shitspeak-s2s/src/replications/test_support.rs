@@ -103,8 +103,8 @@ pub enum CapturedFrame {
 }
 
 /// In-memory mock for both `StrictNet` and `OwnerNet`. Wraps an injectable
-/// alive-set, boot-epoch map, and edge-RTT sample list. Captures every
-/// outbound frame.
+/// alive-set, boot-epoch map, edge-RTT samples, and destination route RTTs.
+/// Captures every outbound frame.
 pub struct MockNet {
     pub self_id: NodeIdentifier,
     pub alive: Mutex<Vec<NodeIdentifier>>,
@@ -125,6 +125,7 @@ pub struct MockNet {
     strict_send_observations: Mutex<Vec<StrictSendObservation>>,
     bulk_send_outcomes: Mutex<VecDeque<MockBulkSendOutcome>>,
     pub edge_rtts: Mutex<Vec<Duration>>,
+    route_rtts: Mutex<std::collections::HashMap<NodeIdentifier, Duration>>,
 }
 
 impl MockNet {
@@ -149,11 +150,16 @@ impl MockNet {
             strict_send_observations: Mutex::new(Vec::new()),
             bulk_send_outcomes: Mutex::new(VecDeque::new()),
             edge_rtts: Mutex::new(Vec::new()),
+            route_rtts: Mutex::new(Default::default()),
         })
     }
 
     pub fn set_edge_rtts(&self, rtts: Vec<Duration>) {
         *self.edge_rtts.lock() = rtts;
+    }
+
+    pub fn set_route_rtt(&self, dst: NodeIdentifier, rtt: Duration) {
+        self.route_rtts.lock().insert(dst, rtt);
     }
 
     pub fn set_alive(&self, alive: Vec<NodeIdentifier>) {
@@ -460,38 +466,6 @@ impl StrictNet for MockNet {
         Ok(())
     }
 
-    async fn send_redundant_multicast(
-        &self,
-        dsts: &[NodeIdentifier],
-        topic: &str,
-        body: StrictBody,
-    ) -> Result<(), ReplicationError> {
-        let failed = self.strict_multicast_failures.load(Ordering::Relaxed);
-        self.observe_strict_send(
-            StrictSendLane::RedundantControl,
-            StrictSendTarget::Multicast(dsts.to_vec()),
-            topic,
-            &body,
-            None,
-            if failed {
-                StrictSendOutcome::InjectedFailure
-            } else {
-                StrictSendOutcome::Sent
-            },
-        );
-        if failed {
-            return Err(ReplicationError::Malformed(
-                "injected strict redundant multicast failure",
-            ));
-        }
-        self.captured.lock().push(CapturedFrame::StrictMulticast {
-            dsts: dsts.to_vec(),
-            topic: topic.to_owned(),
-            body,
-        });
-        Ok(())
-    }
-
     async fn send_broadcast(&self, topic: &str, body: StrictBody) -> Result<(), ReplicationError> {
         self.observe_strict_send(
             StrictSendLane::Ordinary,
@@ -570,6 +544,10 @@ impl StrictNet for MockNet {
 
     fn edge_rtt_snapshot(&self) -> Vec<Duration> {
         self.edge_rtts.lock().clone()
+    }
+
+    fn route_rtt(&self, dst: NodeIdentifier) -> Option<Duration> {
+        self.route_rtts.lock().get(&dst).copied()
     }
 }
 
