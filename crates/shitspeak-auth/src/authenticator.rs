@@ -62,6 +62,7 @@ pub enum AuthenticationExpiryAction {
     Deregister,
 }
 
+#[derive(Clone)]
 pub struct AuthenticateAuxiliaryData {
     pub certificate_hash: Option<Bytes>,
     pub session_id: u32,

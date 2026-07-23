@@ -13,10 +13,14 @@ use crate::messages::encoder::TextMessage;
 use crate::messages::{Message, WriteMessageExt};
 use shitspeak_runtime_config::Config;
 
+use super::auth_tasks::{BackgroundTaskExecutor, ScheduledAuthenticator};
+
 const AUTH_FINALIZATION_QUEUE_NOTICE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(super) struct AuthFinalizationQueue {
     authenticator: Arc<ReloadableAuthenticator>,
+    scheduled_authenticator: Arc<ScheduledAuthenticator>,
+    auth_task_executor: BackgroundTaskExecutor,
     concurrency_limit: Option<usize>,
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
     next_ticket: AtomicU64,
@@ -82,9 +86,20 @@ pub struct AuthFinalizationPermit {
 }
 
 impl AuthFinalizationQueue {
-    pub(super) fn new(limit: usize, authenticator: ReloadableAuthenticator) -> Self {
+    pub(super) fn new(
+        limit: usize,
+        authenticator: ReloadableAuthenticator,
+        auth_task_executor: BackgroundTaskExecutor,
+    ) -> Self {
+        let authenticator = Arc::new(authenticator);
+        let scheduled_authenticator = Arc::new(ScheduledAuthenticator::new(
+            Arc::clone(&authenticator),
+            auth_task_executor.clone(),
+        ));
         Self {
-            authenticator: Arc::new(authenticator),
+            authenticator,
+            scheduled_authenticator,
+            auth_task_executor,
             concurrency_limit: (limit != 0).then_some(limit),
             semaphore: (limit != 0).then(|| Arc::new(tokio::sync::Semaphore::new(limit))),
             next_ticket: AtomicU64::new(1),
@@ -96,11 +111,11 @@ impl AuthFinalizationQueue {
     }
 
     pub(super) fn authenticator(&self) -> &dyn Authenticator {
-        self.authenticator.as_ref()
+        self.scheduled_authenticator.as_ref()
     }
 
     pub(super) fn authenticator_arc(&self) -> Arc<dyn Authenticator> {
-        let authenticator: Arc<dyn Authenticator> = self.authenticator.clone();
+        let authenticator: Arc<dyn Authenticator> = self.scheduled_authenticator.clone();
         authenticator
     }
 
@@ -108,11 +123,17 @@ impl AuthFinalizationQueue {
         self.concurrency_limit
     }
 
-    pub(super) fn prepare_authenticator_reload(
+    pub(super) async fn prepare_authenticator_reload(
         &self,
         config: &Config,
-    ) -> Result<Option<Arc<dyn Authenticator>>, crate::api::AuthenticatorBackendError> {
-        self.authenticator.prepare_reload(config)
+    ) -> Result<Option<Arc<dyn Authenticator>>, Box<dyn std::error::Error>> {
+        let authenticator = Arc::clone(&self.authenticator);
+        let config = config.clone();
+        self.auth_task_executor
+            .run(async move { authenticator.prepare_reload(&config) })
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
     }
 
     pub(super) fn apply_prepared_authenticator_reload(&self, next: Option<Arc<dyn Authenticator>>) {

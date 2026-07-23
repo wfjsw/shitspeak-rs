@@ -642,10 +642,21 @@ impl TestClient {
     }
 
     pub async fn trigger_context_action(&self, action: &str) {
+        self.trigger_context_action_with_targets(action, None, None)
+            .await;
+    }
+
+    pub async fn trigger_context_action_with_targets(
+        &self,
+        action: &str,
+        session: Option<u32>,
+        channel_id: Option<u32>,
+    ) {
         self.send(
             ContextAction {
+                session,
+                channel_id,
                 action: action.to_owned(),
-                ..Default::default()
             }
             .into(),
         )

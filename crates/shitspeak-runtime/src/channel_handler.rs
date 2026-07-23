@@ -589,7 +589,10 @@ pub async fn build_visible_channel_snapshot_messages(
 
     let mut visible_channel_ids = HashSet::with_capacity(snapshot.len());
     if server.get_hide_channels_without_traverse() {
-        for channel in snapshot {
+        for (index, channel) in snapshot.iter().enumerate() {
+            if index != 0 && index % 64 == 0 {
+                tokio::task::yield_now().await;
+            }
             if can_view_channel(server, client, channel.id).await {
                 visible_channel_ids.insert(channel.id);
             }
@@ -604,7 +607,10 @@ pub async fn build_visible_channel_snapshot_messages(
     }
 
     let mut messages = Vec::with_capacity(visible_channel_ids.len());
-    for channel in ordered_snapshot_channels(snapshot) {
+    for (index, channel) in ordered_snapshot_channels(snapshot).into_iter().enumerate() {
+        if index != 0 && index % 64 == 0 {
+            tokio::task::yield_now().await;
+        }
         if !visible_channel_ids.contains(&channel.id) {
             continue;
         }
@@ -900,6 +906,66 @@ impl ClientAclOperationContext {
         permissions
     }
 
+    async fn precompute_background(
+        &self,
+        server: &Arc<Box<Server>>,
+        channel_ids: impl IntoIterator<Item = u32>,
+    ) {
+        let Some(evaluation) = self.evaluation.clone() else {
+            return;
+        };
+        let old_acl = self.old_acl.clone();
+        let mut channel_ids = channel_ids.into_iter().collect::<HashSet<_>>();
+        {
+            let new_permissions = self.new_permissions.lock();
+            let old_permissions = self.old_permissions.lock();
+            let new_restrictions = self.new_restrictions.lock();
+            let old_restrictions = self.old_restrictions.lock();
+            channel_ids.retain(|channel_id| {
+                !new_permissions.contains_key(channel_id)
+                    || !old_permissions.contains_key(channel_id)
+                    || !new_restrictions.contains_key(channel_id)
+                    || !old_restrictions.contains_key(channel_id)
+            });
+        }
+        if channel_ids.is_empty() {
+            return;
+        }
+        let computed = server
+            .run_acl_bulk_task(async move {
+                channel_ids
+                    .into_iter()
+                    .map(|channel_id| {
+                        (
+                            channel_id,
+                            evaluation.evaluate(channel_id),
+                            evaluation.evaluate_with_acl_override(channel_id, &old_acl),
+                            evaluation.is_enter_restricted(channel_id),
+                            evaluation.is_enter_restricted_with_acl_override(channel_id, &old_acl),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        let computed = match computed {
+            Ok(computed) => computed,
+            Err(error) => {
+                tracing::error!(%error, "background ACL precomputation failed");
+                return;
+            }
+        };
+        let mut new_permissions = self.new_permissions.lock();
+        let mut old_permissions = self.old_permissions.lock();
+        let mut new_restrictions = self.new_restrictions.lock();
+        let mut old_restrictions = self.old_restrictions.lock();
+        for (channel_id, new, old, new_restricted, old_restricted) in computed {
+            new_permissions.insert(channel_id, new);
+            old_permissions.insert(channel_id, old);
+            new_restrictions.insert(channel_id, new_restricted);
+            old_restrictions.insert(channel_id, old_restricted);
+        }
+    }
+
     fn evaluate_old(
         &self,
         channel_id: u32,
@@ -1138,6 +1204,18 @@ async fn prepare_channel_visibility_refresh_inner(
     };
 
     let mut visible_channel_ids = HashSet::with_capacity(candidate_channels.len());
+    if let Some(context) = acl_context {
+        let mut acl_channel_ids = candidate_channels
+            .iter()
+            .map(|channel| channel.id)
+            .collect::<HashSet<_>>();
+        for channel in &candidate_channels {
+            if let Some(ancestor_ids) = context.hint.tree_snapshot().ancestor_ids(channel.id) {
+                acl_channel_ids.extend(ancestor_ids.iter().copied());
+            }
+        }
+        context.precompute_background(server, acl_channel_ids).await;
+    }
     for channel in &candidate_channels {
         let visible = match (home_move_impact, acl_context) {
             (Some(impact), _) if server.get_hide_channels_without_traverse() => {
@@ -1768,11 +1846,15 @@ pub async fn convert_channel_operation_to_messages_with_acl_context_options(
     let permission_refresh = if !emit_permission_queries && !include_permission_info {
         None
     } else if let Some(context) = acl_context {
-        Some(build_precise_acl_permission_refresh_messages_from_context(
-            client,
-            context,
-            include_permission_info,
-        ))
+        Some(
+            build_precise_acl_permission_refresh_messages_from_context(
+                server,
+                client,
+                context,
+                include_permission_info,
+            )
+            .await,
+        )
     } else if let Some(hint) = channels.acl_change_hint_for_operation(op) {
         Some(
             build_precise_acl_permission_refresh_messages(
@@ -3115,13 +3197,16 @@ async fn build_precise_acl_permission_refresh_messages(
         old_restrictions: parking_lot::Mutex::new(HashMap::new()),
     };
     build_precise_acl_permission_refresh_messages_from_context(
+        server,
         client,
         &context,
         include_permission_info,
     )
+    .await
 }
 
-fn build_precise_acl_permission_refresh_messages_from_context(
+async fn build_precise_acl_permission_refresh_messages_from_context(
+    server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     context: &ClientAclOperationContext,
     include_permission_info: bool,
@@ -3176,6 +3261,10 @@ fn build_precise_acl_permission_refresh_messages_from_context(
         .copied()
         .collect::<Vec<_>>();
     channel_ids.sort_unstable();
+
+    context
+        .precompute_background(server, channel_ids.iter().copied())
+        .await;
 
     let mut permission_queries = Vec::new();
     let mut permission_info = Vec::new();

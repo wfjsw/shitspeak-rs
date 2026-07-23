@@ -24,7 +24,7 @@ pub(crate) async fn handle(
     if message.action != ACTION_ID {
         return false;
     }
-    if !sender.is_superuser() || message.session.is_some() || message.channel_id.is_some() {
+    if !sender.is_superuser() {
         return true;
     }
 

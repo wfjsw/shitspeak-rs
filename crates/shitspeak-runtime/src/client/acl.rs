@@ -93,6 +93,7 @@ impl ChannelAclOverride {
 /// Constructing the context captures all client state and performs the GeoIP
 /// lookup once. Permission checks after that are synchronous and use the
 /// stable channel tree snapshot rather than reacquiring repository locks.
+#[derive(Clone)]
 pub(crate) struct ClientAclEvaluationContext {
     snapshot: Arc<ChannelTreeSnapshot>,
     session: u32,

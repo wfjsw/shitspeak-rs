@@ -78,6 +78,7 @@ const UDP_KEX_RETRANSMIT_MAX_INTERVAL: Duration = Duration::from_secs(8);
 const UDP_KEX_RETRANSMIT_JITTER_DIVISOR: u32 = 4;
 const UDP_KEX_MAX_RETRANSMIT_AGE: Duration = Duration::from_secs(30);
 const UDP_KEX_MAX_RETRANSMITS: u32 = 16;
+const UDP_KEX_READY_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const UDP_WRITE_BATCH_MAX_FRAMES: usize = 32;
 const UDP_WRITE_BATCH_MAX_BYTES: usize = 64 * 1024;
 const KEX_TRANSCRIPT_DOMAIN: &[u8] = b"shitspeak-s2s-udp-kex-v1";
@@ -473,6 +474,7 @@ struct PeerKeyExchange {
     waiters: Vec<oneshot::Sender<io::Result<()>>>,
     local_initiated: bool,
     send_budget: ExchangeSendBudget,
+    stale_ready: StaleReadyGuard,
 }
 
 struct LocalKeyOffer {
@@ -516,6 +518,49 @@ struct HandshakePacketBudget {
     last_sent: Option<Instant>,
     retransmits: u32,
     exhausted_logged: bool,
+}
+
+#[derive(Default)]
+struct LogRateLimit {
+    last_emitted: Option<Instant>,
+    suppressed: u64,
+}
+
+impl LogRateLimit {
+    fn record(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last_emitted
+            .is_none_or(|last| now.saturating_duration_since(last) >= UDP_KEX_READY_LOG_INTERVAL)
+        {
+            self.last_emitted = Some(now);
+            return Some(std::mem::take(&mut self.suppressed));
+        }
+        self.suppressed = self.suppressed.saturating_add(1);
+        None
+    }
+
+    fn force(&mut self, now: Instant) -> u64 {
+        self.last_emitted = Some(now);
+        std::mem::take(&mut self.suppressed)
+    }
+}
+
+#[derive(Default)]
+struct StaleReadyGuard {
+    // A new exchange map entry restores this one-shot recovery budget after
+    // the current exchange succeeds or reaches its 30-second exhaustion cap.
+    restart_used: bool,
+    log: LogRateLimit,
+}
+
+impl StaleReadyGuard {
+    fn take_restart(&mut self, source_matches: bool) -> bool {
+        if self.restart_used || !source_matches {
+            return false;
+        }
+        self.restart_used = true;
+        true
+    }
 }
 
 struct PromoteSession {
@@ -1693,51 +1738,68 @@ async fn accept_key_ready(
 ) -> io::Result<(Vec<Vec<u8>>, Option<PromoteSession>)> {
     let mut exchanges = state.exchanges.lock().await;
     let exchange = exchanges.entry(peer_node).or_default();
-    exchange.peer_addr = Some(peer_addr);
-    let Some(exchange_id) = exchange
+    let now = Instant::now();
+    let Some((exchange_id, candidate_peer_addr)) = exchange
         .candidate
         .as_ref()
-        .map(|candidate| candidate.exchange_id)
+        .map(|candidate| (candidate.exchange_id, candidate.peer_addr))
     else {
-        if exchange.early_ready.len() < 4 {
-            exchange.early_ready.push(packet.to_vec());
+        let buffered = buffer_early_ready(exchange, packet);
+        if let Some(suppressed) = exchange.stale_ready.log.record(now) {
+            debug!(
+                local = %local_node,
+                peer = %peer_node,
+                received_exchange_id = header.seq,
+                buffered,
+                suppressed,
+                "buffering udp key ready before a candidate exists"
+            );
         }
-        debug!(
-            local = %local_node,
-            peer = %peer_node,
-            received_exchange_id = header.seq,
-            "buffering udp key ready before a candidate exists"
-        );
-        let packets = exchange_packets_due(exchange, Instant::now(), local_node, peer_node);
+        if !buffered {
+            return Ok((Vec::new(), None));
+        }
+        let packets = exchange_packets_due(exchange, now, local_node, peer_node);
         state.notify_exchange_retransmit();
         return Ok((packets, None));
     };
 
     if exchange_id != header.seq {
-        if local_node < peer_node {
+        let source_matches = candidate_peer_addr == peer_addr;
+        let restart_allowed =
+            local_node < peer_node && exchange.stale_ready.take_restart(source_matches);
+        if restart_allowed {
             restart_lower_node_exchange(exchange, identity, peer_node)?;
+            let suppressed = exchange.stale_ready.log.force(now);
             debug!(
                 local = %local_node,
                 peer = %peer_node,
                 previous_exchange_id = exchange_id,
                 received_exchange_id = header.seq,
+                suppressed,
                 "restarting udp key exchange after stale key ready"
             );
-            let packets = exchange_packets_due(exchange, Instant::now(), local_node, peer_node);
+            let packets = exchange_packets_due(exchange, now, local_node, peer_node);
             state.notify_exchange_retransmit();
             return Ok((packets, None));
         }
-        if exchange.early_ready.len() < 4 {
-            exchange.early_ready.push(packet.to_vec());
+        let buffered = if local_node > peer_node && source_matches {
+            buffer_early_ready(exchange, packet)
+        } else {
+            false
+        };
+        if let Some(suppressed) = exchange.stale_ready.log.record(now) {
+            debug!(
+                local = %local_node,
+                peer = %peer_node,
+                expected_exchange_id = exchange_id,
+                received_exchange_id = header.seq,
+                source_matches,
+                restart_rate_limited = local_node < peer_node && source_matches,
+                buffered,
+                suppressed,
+                "ignoring udp key ready for a stale exchange"
+            );
         }
-        debug!(
-            local = %local_node,
-            peer = %peer_node,
-            expected_exchange_id = exchange_id,
-            received_exchange_id = header.seq,
-            "ignoring udp key ready for a stale exchange"
-        );
-        state.notify_exchange_retransmit();
         return Ok((Vec::new(), None));
     }
 
@@ -1751,6 +1813,18 @@ async fn accept_key_ready(
         state.notify_exchange_retransmit();
     }
     Ok((packets, promote))
+}
+
+fn buffer_early_ready(exchange: &mut PeerKeyExchange, packet: &[u8]) -> bool {
+    let duplicate = exchange
+        .early_ready
+        .iter()
+        .any(|buffered| buffered.as_slice() == packet);
+    if duplicate || exchange.early_ready.len() >= 4 {
+        return false;
+    }
+    exchange.early_ready.push(packet.to_vec());
+    true
 }
 
 async fn decrypt_with_candidate_data(
@@ -3510,6 +3584,7 @@ mod tests {
             waiters: Vec::new(),
             local_initiated: true,
             send_budget: ExchangeSendBudget::default(),
+            stale_ready: StaleReadyGuard::default(),
         }
     }
 
@@ -3798,6 +3873,72 @@ mod tests {
                 .len(),
             1
         );
+
+        let (packets, promote) = accept_key_ready(
+            &state,
+            &identity,
+            2,
+            1,
+            SocketAddr::from(([127, 0, 0, 1], 64742)),
+            &packet,
+            header,
+        )
+        .await
+        .unwrap();
+        assert!(packets.is_empty());
+        assert!(promote.is_none());
+        assert_eq!(
+            state
+                .exchanges
+                .lock()
+                .await
+                .get(&1)
+                .unwrap()
+                .early_ready
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_early_key_ready_does_not_rearm_retransmission() {
+        let identity = test_identity("2");
+        let state = test_socket_state().await;
+        let mut exchange = test_exchange(false);
+        exchange.peer = None;
+        exchange.candidate = None;
+        state.exchanges.lock().await.insert(1, exchange);
+        let header = UdpPacketHeader {
+            kind: UdpPacketKind::KeyReady,
+            src: 1,
+            dst: 2,
+            seq: 99,
+        };
+        let packet = header.encode();
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 64742));
+
+        let (packets, _) = accept_key_ready(&state, &identity, 2, 1, peer_addr, &packet, header)
+            .await
+            .unwrap();
+        assert_eq!(packets, vec![vec![0xaa]]);
+        {
+            let mut exchanges = state.exchanges.lock().await;
+            let exchange = exchanges.get_mut(&1).unwrap();
+            exchange.send_budget.offer.last_sent =
+                Some(Instant::now() - UDP_KEX_RETRANSMIT_MAX_INTERVAL);
+        }
+
+        let (packets, promote) =
+            accept_key_ready(&state, &identity, 2, 1, peer_addr, &packet, header)
+                .await
+                .unwrap();
+
+        assert!(packets.is_empty());
+        assert!(promote.is_none());
+        let exchanges = state.exchanges.lock().await;
+        let exchange = exchanges.get(&1).unwrap();
+        assert_eq!(exchange.early_ready.len(), 1);
+        assert_eq!(exchange.send_budget.offer.retransmits, 0);
     }
 
     #[tokio::test]
@@ -3842,6 +3983,155 @@ mod tests {
         assert!(exchange.candidate.is_none());
         assert!(exchange.early_ready.is_empty());
         assert!(exchange.local_initiated);
+    }
+
+    #[tokio::test]
+    async fn lower_node_rate_limits_stale_ready_restarts() {
+        let identity = test_identity("1");
+        let state = test_socket_state().await;
+        state.exchanges.lock().await.insert(2, test_exchange(false));
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 64742));
+        let first_header = UdpPacketHeader {
+            kind: UdpPacketKind::KeyReady,
+            src: 2,
+            dst: 1,
+            seq: 99,
+        };
+        let first_packet = first_header.encode();
+
+        let (packets, _) = accept_key_ready(
+            &state,
+            &identity,
+            1,
+            2,
+            peer_addr,
+            &first_packet,
+            first_header,
+        )
+        .await
+        .unwrap();
+        assert_eq!(packets.len(), 1);
+        let restarted_offer_id = state
+            .exchanges
+            .lock()
+            .await
+            .get(&2)
+            .unwrap()
+            .local
+            .as_ref()
+            .unwrap()
+            .offer_id;
+
+        let (_, peer_public_key) = generate_ephemeral_keypair().unwrap();
+        let (_, promote) = accept_peer_offer(
+            &state,
+            &identity,
+            1,
+            2,
+            peer_addr,
+            PeerKeyOffer {
+                offer_id: 101,
+                public_key: peer_public_key,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(promote.is_none());
+        let candidate_exchange_id = state
+            .exchanges
+            .lock()
+            .await
+            .get(&2)
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap()
+            .exchange_id;
+        let stale_exchange_id = if candidate_exchange_id == u64::MAX {
+            1
+        } else {
+            candidate_exchange_id + 1
+        };
+        let second_header = UdpPacketHeader {
+            kind: UdpPacketKind::KeyReady,
+            src: 2,
+            dst: 1,
+            seq: stale_exchange_id,
+        };
+        let second_packet = second_header.encode();
+        let (packets, promote) = accept_key_ready(
+            &state,
+            &identity,
+            1,
+            2,
+            peer_addr,
+            &second_packet,
+            second_header,
+        )
+        .await
+        .unwrap();
+
+        assert!(packets.is_empty());
+        assert!(promote.is_none());
+        let exchanges = state.exchanges.lock().await;
+        let exchange = exchanges.get(&2).unwrap();
+        assert_eq!(
+            exchange.local.as_ref().unwrap().offer_id,
+            restarted_offer_id
+        );
+        assert_eq!(exchange.peer.as_ref().unwrap().offer_id, 101);
+        assert_eq!(
+            exchange.candidate.as_ref().unwrap().exchange_id,
+            candidate_exchange_id
+        );
+        assert!(exchange.stale_ready.restart_used);
+    }
+
+    #[tokio::test]
+    async fn lower_node_ignores_stale_ready_from_unexpected_address() {
+        let identity = test_identity("1");
+        let state = test_socket_state().await;
+        state.exchanges.lock().await.insert(2, test_exchange(false));
+        let header = UdpPacketHeader {
+            kind: UdpPacketKind::KeyReady,
+            src: 2,
+            dst: 1,
+            seq: 99,
+        };
+        let packet = header.encode();
+
+        let (packets, promote) = accept_key_ready(
+            &state,
+            &identity,
+            1,
+            2,
+            SocketAddr::from(([127, 0, 0, 1], 64743)),
+            &packet,
+            header,
+        )
+        .await
+        .unwrap();
+
+        assert!(packets.is_empty());
+        assert!(promote.is_none());
+        let exchanges = state.exchanges.lock().await;
+        let exchange = exchanges.get(&2).unwrap();
+        assert_eq!(exchange.local.as_ref().unwrap().offer_id, 11);
+        assert_eq!(exchange.peer.as_ref().unwrap().offer_id, 13);
+        assert_eq!(exchange.candidate.as_ref().unwrap().exchange_id, 17);
+        assert!(!exchange.stale_ready.restart_used);
+    }
+
+    #[test]
+    fn key_ready_logs_are_rate_limited_and_count_suppressed_events() {
+        let mut limiter = LogRateLimit::default();
+        let now = Instant::now();
+
+        assert_eq!(limiter.record(now), Some(0));
+        assert_eq!(limiter.record(now), None);
+        assert_eq!(limiter.force(now), 1);
+        assert_eq!(limiter.record(now), None);
+        assert_eq!(limiter.record(now + UDP_KEX_READY_LOG_INTERVAL), Some(1));
     }
 
     #[tokio::test]

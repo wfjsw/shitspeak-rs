@@ -79,6 +79,7 @@ client_idle_timeout_secs = 30
 authenticate_timeout_ms = 30000
 # Number of clients allowed to run UDP crypt setup, authenticator work, and post-auth
 # finalization concurrently. Set to 0 to disable the login queue and concurrency limit.
+# Authenticator CPU runs on a bounded background-priority runtime regardless.
 # Default when omitted: floor(3rd root(active CPU count)), minimum 1.
 # auth_finalization_concurrency = 1
 pending_delete_timeout_ms = 5000

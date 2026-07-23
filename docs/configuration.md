@@ -308,7 +308,7 @@ authenticate_timeout_ms = 30000
 pending_delete_timeout_ms = 5000
 ```
 
-`authenticate_timeout_ms` starts after TLS setup. Positive `auth_finalization_concurrency` values limit how many clients can concurrently create UDP crypt setup state, run authenticator backend work, and perform the initial sync/publish path. Setting it to `0` bypasses the login queue and imposes no concurrency limit on those operations. When omitted, it defaults to `floor(3rd root(active CPU count))` with a minimum of 1. `pending_delete_timeout_ms` controls rollback timing for pending two-phase channel deletes.
+`authenticate_timeout_ms` starts after TLS setup. Positive `auth_finalization_concurrency` values limit how many clients can concurrently create UDP crypt setup state, run authenticator backend work, and perform the initial sync/publish path. Authenticator calls run on a bounded background-priority runtime (nice `+10` on Linux, lowest thread priority on Windows); bulk ACL refresh evaluation uses a separate one-worker runtime with the same background priority, while ordinary ACL checks remain on their existing path. Setting `auth_finalization_concurrency` to `0` bypasses the login queue and admission limit. When omitted, it defaults to `floor(3rd root(active CPU count))` with a minimum of 1. `pending_delete_timeout_ms` controls rollback timing for pending two-phase channel deletes.
 
 ## Persistence
 

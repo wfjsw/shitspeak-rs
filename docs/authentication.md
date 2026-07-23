@@ -71,7 +71,7 @@ working_dir = "auth-files"
 
 `file_access_dir` bounds the raw file stream imports. When it is empty, file stream imports are unavailable. Relative guest file paths resolve under `working_dir` if configured.
 
-The server keeps a reusable pool of WASM instances instead of creating one per authentication call. Positive `auth_finalization_concurrency` values control authenticator concurrency through the login queue; setting the value to `0` bypasses the queue and imposes no concurrency limit. WASM instance creation itself remains serialized even though the pool may grow as needed.
+The server keeps a reusable pool of WASM instances instead of creating one per authentication call. Authenticator calls run on a bounded background-priority runtime so CPU-heavy login work does not occupy the Tokio workers serving ping and voice traffic. On Linux those workers use nice `+10`; on Windows they use the lowest thread-priority class. Positive `auth_finalization_concurrency` values control authenticator concurrency through the login queue; setting the value to `0` bypasses the queue and imposes no admission limit. WASM instance creation itself remains serialized even though the pool may grow as needed.
 
 When the configured `.wasm` file changes, reload compiles the new module before activating it. If compilation or loading fails, the previous authenticator remains active.
 

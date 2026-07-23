@@ -1798,6 +1798,7 @@ fn auth_finalization_queue_keeps_new_arrivals_behind_existing_waiters() {
     let queue = Arc::new(AuthFinalizationQueue::new(
         1,
         ReloadableAuthenticator::fixed(TestAuthenticator),
+        super::auth_tasks::BackgroundTaskExecutor::new("auth-test", 1).expect("auth executor"),
     ));
 
     let first_permit = match queue.reserve_or_queue() {
@@ -1832,6 +1833,7 @@ fn auth_finalization_queue_is_bypassed_when_unlimited() {
     let queue = Arc::new(AuthFinalizationQueue::new(
         0,
         ReloadableAuthenticator::fixed(TestAuthenticator),
+        super::auth_tasks::BackgroundTaskExecutor::new("auth-test", 1).expect("auth executor"),
     ));
 
     for _ in 0..3 {
@@ -1848,6 +1850,7 @@ async fn auth_finalization_queue_admits_waiters_fifo() {
     let queue = Arc::new(AuthFinalizationQueue::new(
         1,
         ReloadableAuthenticator::fixed(TestAuthenticator),
+        super::auth_tasks::BackgroundTaskExecutor::new("auth-test", 1).expect("auth executor"),
     ));
     let (first_client, _first_rx) = auth_queue_test_client(1);
     let first_permit = queue

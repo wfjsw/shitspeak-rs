@@ -561,6 +561,7 @@ impl ExecAuthenticatorInner {
             command.current_dir(working_dir);
         }
         apply_permission_drop(&mut command, self.uid, self.gid)?;
+        apply_background_priority(&mut command);
         command
             .spawn()
             .map_err(|source| ExecAuthenticatorError::Spawn {
@@ -667,6 +668,22 @@ impl ExecAuthenticatorInner {
                 timeout,
             })
     }
+}
+
+#[cfg(windows)]
+fn apply_background_priority(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS;
+
+    command
+        .as_std_mut()
+        .creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+}
+
+#[cfg(not(windows))]
+fn apply_background_priority(_command: &mut Command) {
+    // On Unix, process niceness is inherited from the low-priority auth
+    // runtime thread which spawns the helper.
 }
 
 enum ExecAuthenticatorMode {

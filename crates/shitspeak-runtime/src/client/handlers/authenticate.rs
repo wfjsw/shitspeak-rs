@@ -17,6 +17,8 @@ use crate::{
     server::Server,
 };
 
+const AUTH_FINALIZATION_YIELD_EVERY: usize = 64;
+
 pub async fn handle_authenticate(
     server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
@@ -472,7 +474,12 @@ pub async fn handle_authenticate(
 
     // 2. UserState for every published authenticated client (excluding self)
     {
-        for client in &all_clients {
+        for (index, client) in all_clients.iter().enumerate() {
+            if index != 0 && index % AUTH_FINALIZATION_YIELD_EVERY == 0 {
+                // Login snapshots are bulk/background work. Cooperate with the
+                // shared runtime so ping and small voice tasks run first.
+                tokio::task::yield_now().await;
+            }
             if client.get_session_id() == session_id
                 && client.client_instance_id() == sender.client_instance_id()
             {

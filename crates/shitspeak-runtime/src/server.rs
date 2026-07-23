@@ -37,6 +37,7 @@ use shitspeak_state::{
 };
 
 mod auth_finalization;
+mod auth_tasks;
 pub(crate) mod client_projection;
 mod client_projection_pool;
 mod connection;
@@ -57,6 +58,7 @@ pub use extensions::{
 };
 
 use auth_finalization::AuthFinalizationQueue;
+use auth_tasks::BackgroundTaskExecutor;
 use connection::sorted_channel_ids;
 use entrypoints::{
     EntrypointBindings, EntrypointListenSpec, EntrypointRuntime, ServerTcpListener, UdpPacket,
@@ -176,6 +178,7 @@ pub struct Server {
     channels: Arc<ChannelRepository>,
     visibility_fanout_index: Arc<crate::client::visibility::VisibilityFanoutIndex>,
     auth_finalization_queue: Arc<AuthFinalizationQueue>,
+    acl_bulk_task_executor: BackgroundTaskExecutor,
     crypt_setup_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     channel_blobs: Arc<ChannelBlobStore>,
     session_blobs: Arc<SessionBlobStore>,
@@ -266,6 +269,9 @@ impl Server {
         let node_id = config.local_node_id().map_err(std::io::Error::other)?;
         let client_log_max_entries = config.client_log_max_entries;
         let auth_finalization_concurrency = config.auth_finalization_concurrency;
+        let auth_task_executor =
+            BackgroundTaskExecutor::new("auth", auth_finalization_concurrency)?;
+        let acl_bulk_task_executor = BackgroundTaskExecutor::new("acl-bulk", 1)?;
         let channel_repo_tuning = channel_repo_tuning(&config);
         let channel_root_config = channel_root_config(&config);
         let (channels, channel_blobs, session_blobs, user_channel_cache, bans) = match &config
@@ -322,7 +328,9 @@ impl Server {
             auth_finalization_queue: Arc::new(AuthFinalizationQueue::new(
                 auth_finalization_concurrency,
                 authenticator,
+                auth_task_executor,
             )),
+            acl_bulk_task_executor,
             crypt_setup_semaphore: (auth_finalization_concurrency != 0)
                 .then(|| Arc::new(tokio::sync::Semaphore::new(auth_finalization_concurrency))),
             channel_blobs,
@@ -463,6 +471,17 @@ impl Server {
 
     pub fn authenticator_arc(&self) -> Arc<dyn Authenticator> {
         self.auth_finalization_queue.authenticator_arc()
+    }
+
+    pub(crate) async fn run_acl_bulk_task<F, T>(
+        &self,
+        future: F,
+    ) -> Result<T, tokio::task::JoinError>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.acl_bulk_task_executor.run(future).await
     }
 
     pub async fn run(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1822,7 +1841,8 @@ impl Server {
                 let next_tls_acceptor = load_c2s_tls_acceptor(&new_config, &self.extensions)?;
                 let prepared_authenticator = self
                     .auth_finalization_queue
-                    .prepare_authenticator_reload(&new_config)?;
+                    .prepare_authenticator_reload(&new_config)
+                    .await?;
                 let authenticator_reloaded = prepared_authenticator.is_some();
 
                 self.apply_entrypoint_config(&new_config).await?;
@@ -2306,9 +2326,22 @@ impl Server {
                     None,
                 )
                 .await;
-                let new_permissions = context.evaluate(current_channel_id);
-                let old_permissions =
-                    context.evaluate_with_acl_override(current_channel_id, &old_acl);
+                let old_acl = old_acl.clone();
+                let permissions = self
+                    .run_acl_bulk_task(async move {
+                        (
+                            context.evaluate(current_channel_id),
+                            context.evaluate_with_acl_override(current_channel_id, &old_acl),
+                        )
+                    })
+                    .await;
+                let (new_permissions, old_permissions) = match permissions {
+                    Ok(permissions) => permissions,
+                    Err(error) => {
+                        tracing::error!(%error, current_channel_id, "background ACL task failed");
+                        continue;
+                    }
+                };
                 if new_permissions.contains(shitspeak_state::ACLPermissions::Speak)
                     == old_permissions.contains(shitspeak_state::ACLPermissions::Speak)
                 {

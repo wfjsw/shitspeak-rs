@@ -721,7 +721,9 @@ async fn superuser_visibility_action_is_private_and_toggles_presence() {
     alice.drain_now().await;
     carol.drain_now().await;
 
-    alice.trigger_context_action(ACTION_ID).await;
+    alice
+        .trigger_context_action_with_targets(ACTION_ID, Some(alice.session_id), Some(0))
+        .await;
     for (expected_action, expected_operation, expected_text) in [
         ("existing.server.action", Operation::Remove, None),
         (ACTION_ID, Operation::Remove, None),
@@ -789,7 +791,9 @@ async fn superuser_visibility_action_is_private_and_toggles_presence() {
         "late regular users must not receive a hidden superuser in initial state"
     );
 
-    alice.trigger_context_action(ACTION_ID).await;
+    alice
+        .trigger_context_action_with_targets(ACTION_ID, None, Some(0))
+        .await;
     bob.recv_until(
         |message| {
             matches!(message, Message::UserState(state)

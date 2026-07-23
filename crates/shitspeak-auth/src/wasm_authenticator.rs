@@ -47,6 +47,10 @@ const MAX_WASM_AUTH_STATE_KEY_BYTES: usize = 1024;
 const MAX_WASM_AUTH_STATE_VALUE_BYTES: usize = MAX_WASM_RESPONSE_BYTES;
 const MAX_WASM_AUTH_FILE_PATH_BYTES: usize = 1024;
 const MAX_WASM_AUTH_OPEN_STREAMS: usize = 64;
+// Fuel yielding bounds the time a CPU-heavy guest spends in a single Future
+// poll. The high per-invocation budget is a runaway guard, not a normal limit.
+const WASM_AUTH_FUEL_YIELD_INTERVAL: u64 = 100_000;
+const WASM_AUTH_FUEL_PER_INVOCATION: u64 = 1_000_000_000;
 const WASM_AUTH_STATE_SUBDIR: &str = "wasm_authenticator";
 const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
@@ -336,7 +340,8 @@ impl WasmAuthenticator {
             path: path.to_path_buf(),
             source,
         })?;
-        let config = WasmConfig::new();
+        let mut config = WasmConfig::new();
+        config.consume_fuel(true);
         let engine =
             WasmEngine::new(&config).map_err(|source| WasmAuthenticatorError::Compile {
                 path: path.to_path_buf(),
@@ -524,6 +529,11 @@ impl CompiledWasmAuthenticator {
         }
 
         let mut checkout = self.checkout_instance().await?;
+        checkout
+            .instance
+            .store
+            .set_fuel(WASM_AUTH_FUEL_PER_INVOCATION)
+            .map_err(wasm_execution_error)?;
         let Some(func) = checkout
             .instance
             .instance
@@ -616,6 +626,12 @@ impl CompiledWasmAuthenticator {
                 streams: HostStreams::default(),
             },
         );
+        store
+            .set_fuel(WASM_AUTH_FUEL_PER_INVOCATION)
+            .map_err(wasm_execution_error)?;
+        store
+            .fuel_async_yield_interval(Some(WASM_AUTH_FUEL_YIELD_INTERVAL))
+            .map_err(wasm_execution_error)?;
         let instance = self
             .linker
             .instantiate_async(&mut store, &self.module)
