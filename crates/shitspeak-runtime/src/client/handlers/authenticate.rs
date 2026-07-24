@@ -21,12 +21,21 @@ use shitspeak_auth::{
 
 const AUTH_FINALIZATION_YIELD_EVERY: usize = 64;
 
+struct StagedUserChannelCacheWrite {
+    cache_key: String,
+    current_channel_id: u32,
+    listening_channel_ids: Vec<u32>,
+}
+
 pub async fn handle_authenticate(
     server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
     msg: Authenticate,
 ) -> Result<(), MessageHandlerError> {
     let repo = server.get_clients();
+    // Keep authentication policy and advertised limits coherent even if a
+    // configuration reload completes while this login is queued.
+    let auth_config = server.read_config();
     let mut session = sender.get_session_id();
     let provisional_server_id = sender.server_id();
     tracing::debug!(
@@ -103,7 +112,7 @@ pub async fn handle_authenticate(
         os_version,
     };
     // ── Certificate required ──────────────────────────────────────────────
-    if server.get_cert_required() && !sender.has_certificate() {
+    if auth_config.cert_required && !sender.has_certificate() {
         return Err(
             AuthRejection::new_with_language(RejectType::NoCertificate, sender.language()).into(),
         );
@@ -180,6 +189,7 @@ pub async fn handle_authenticate(
         )
         .into());
     }
+
     let auth_session_id = result.auth_session_id.clone();
     let authenticated_until = result.authenticated_until;
     let authentication_expiry_action = result.authentication_expiry_action;
@@ -207,7 +217,7 @@ pub async fn handle_authenticate(
 
     // Avoid identity/ACL finalization work when the selected server is
     // already full. The reservation CAS below remains the race-safe check.
-    if repo.authenticated_client_count_in_server(&server_id) >= server.get_max_users() {
+    if repo.authenticated_client_count_in_server(&server_id) >= auth_config.max_users {
         return Err(
             AuthRejection::new_with_language(RejectType::ServerFull, sender.language()).into(),
         );
@@ -215,12 +225,11 @@ pub async fn handle_authenticate(
 
     // ── Required groups check ─────────────────────────────────────────────
     {
-        let config = server.read_config();
-        if !config.required_groups.is_empty() {
+        if !auth_config.required_groups.is_empty() {
             let has_required = result
                 .groups
                 .iter()
-                .any(|group| config.required_groups.contains(group));
+                .any(|group| auth_config.required_groups.contains(group));
             if !has_required {
                 tracing::trace!(
                     session = u32::from(session),
@@ -261,7 +270,7 @@ pub async fn handle_authenticate(
         .try_reserve_authenticated_client_in_server(
             &server_id,
             sender.get_session_id(),
-            server.get_max_users(),
+            auth_config.max_users,
         )
         .await
     {
@@ -298,7 +307,7 @@ pub async fn handle_authenticate(
     );
 
     // ── Place user in cached/default channel ─────────────────────────────
-    {
+    let staged_channel_cache_write = {
         let restored_channels = crate::user_channel_cache::resolve_login_channels(
             server,
             sender,
@@ -332,36 +341,12 @@ pub async fn handle_authenticate(
             }
             gs.set_suppress(!initial_perms.contains(shitspeak_state::ACLPermissions::Speak));
         }
-        if let Some(cache_key) = channel_cache_key.as_deref() {
-            if let Err(error) = server
-                .get_user_channel_cache()
-                .remember_last_channel(cache_key, target_ch)
-                .await
-            {
-                tracing::warn!(
-                    error = %error,
-                    cache_key,
-                    "failed to stage user last channel cache"
-                );
-            }
-            if !restored_channels.listening_channel_ids.is_empty() {
-                if let Err(error) = server
-                    .get_user_channel_cache()
-                    .remember_listening_channels(
-                        cache_key,
-                        restored_channels.listening_channel_ids.iter().copied(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        error = %error,
-                        cache_key,
-                        "failed to stage user listening channel cache"
-                    );
-                }
-            }
-        }
-    }
+        channel_cache_key.map(|cache_key| StagedUserChannelCacheWrite {
+            cache_key,
+            current_channel_id: target_ch,
+            listening_channel_ids: restored_channels.listening_channel_ids,
+        })
+    };
 
     // ── Build the full burst of messages to send to the new client ────────
     //
@@ -410,7 +395,7 @@ pub async fn handle_authenticate(
             sender,
             &all_channels,
             &mut channel_tree_shadow,
-            server.get_send_permission_info(),
+            auth_config.send_permission_info,
         )
         .await
         {
@@ -514,8 +499,8 @@ pub async fn handle_authenticate(
         push_burst(Message::ServerSync(
             ServerSync {
                 session: Some(u32::from(session_id)),
-                max_bandwidth: Some(sender.max_bandwidth(server.get_max_bandwidth())),
-                welcome_text: server.get_welcome_text(),
+                max_bandwidth: Some(sender.max_bandwidth(auth_config.max_bandwidth)),
+                welcome_text: auth_config.welcome_text.clone(),
                 permissions: Some(root_perm),
             }
             .into(),
@@ -528,10 +513,10 @@ pub async fn handle_authenticate(
             ServerConfig {
                 max_bandwidth: None,
                 welcome_text: None,
-                allow_html: Some(server.get_allow_html()),
-                message_length: Some(server.get_max_text_message_length()),
-                image_message_length: Some(server.get_max_image_message_length()),
-                max_users: Some(server.get_max_users() as u32),
+                allow_html: Some(auth_config.allow_html),
+                message_length: Some(auth_config.max_text_message_length),
+                image_message_length: Some(auth_config.max_image_message_length),
+                max_users: Some(auth_config.max_users as u32),
             }
             .into(),
         ));
@@ -551,9 +536,43 @@ pub async fn handle_authenticate(
     }
 
     // ── Send the burst to the joining client in one shot ──────────────────
+    // The authentication state and initial sync burst are now finalized. Do
+    // not hold an admission slot while waiting for outbound queue capacity.
+    drop(auth_permit);
+
     sender
         .write_owned_message_batch(OwnedMessageBatch::new(burst))
         .await?;
+
+    if let Some(staged) = staged_channel_cache_write {
+        if let Err(error) = server
+            .get_user_channel_cache()
+            .remember_last_channel(&staged.cache_key, staged.current_channel_id)
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                cache_key = staged.cache_key,
+                "failed to stage user last channel cache"
+            );
+        }
+        if !staged.listening_channel_ids.is_empty() {
+            if let Err(error) = server
+                .get_user_channel_cache()
+                .remember_listening_channels(
+                    &staged.cache_key,
+                    staged.listening_channel_ids.iter().copied(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    cache_key = staged.cache_key,
+                    "failed to stage user listening channel cache"
+                );
+            }
+        }
+    }
 
     tracing::info!(
         server_id = %sender.server_id(),
@@ -585,8 +604,6 @@ pub async fn handle_authenticate(
             state.set_supports_opus(msg.opus.unwrap_or(false));
         }
     }
-
-    drop(auth_permit);
 
     // The AddClient log entry (emitted by allocate_local_client) will drive
     // the UserState broadcast to all existing per-client subscribers.

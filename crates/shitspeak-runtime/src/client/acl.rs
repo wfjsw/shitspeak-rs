@@ -120,8 +120,9 @@ impl ClientAclEvaluationContext {
         snapshot: Arc<ChannelTreeSnapshot>,
         home_channel_override: Option<u32>,
     ) -> Self {
+        let client_state = client.acl_state_snapshot();
         let home_channel_id =
-            home_channel_override.unwrap_or_else(|| client.get_current_channel_id());
+            home_channel_override.unwrap_or_else(|| client_state.current_channel_id());
         let home_ancestor_ids = snapshot
             .ancestor_ids(home_channel_id)
             .unwrap_or_default()
@@ -132,9 +133,9 @@ impl ClientAclEvaluationContext {
         Self {
             snapshot,
             session: u32::from(client.get_session_id()),
-            user_id: client.get_user_id(),
-            groups: client.get_groups_clone(),
-            tokens: client.get_tokens_clone(),
+            user_id: client_state.user_id(),
+            groups: client_state.groups().clone(),
+            tokens: client_state.tokens().clone(),
             certificate_hash: client.get_certificate_hash().map(<[u8]>::to_vec),
             verified: client.is_verified(),
             real_ip_address,
@@ -145,7 +146,7 @@ impl ClientAclEvaluationContext {
                 .map(str::to_owned),
             home_channel_id,
             home_ancestor_ids,
-            is_superuser: client.is_superuser(),
+            is_superuser: client_state.is_superuser(),
             debug_acl_enter: server.get_debug_acl_enter(),
             explicit_enter_deny_overrides_write: server.get_explicit_enter_deny_overrides_write(),
         }
@@ -324,13 +325,14 @@ pub(crate) fn client_matches_acl_viewer_scope(
     if scope.includes_all_viewers() {
         return true;
     }
-    if client
-        .get_user_id()
+    let client_state = client.acl_state_snapshot();
+    if client_state
+        .user_id()
         .is_some_and(|user_id| scope.user_ids().contains(&(user_id as i32)))
     {
         return true;
     }
-    client.get_groups_clone().iter().any(|group| {
+    client_state.groups().iter().any(|group| {
         scope
             .plain_client_groups()
             .contains(&group.trim().to_ascii_lowercase())
@@ -439,17 +441,17 @@ async fn compute_permissions_for_client_inner(
     identity_override: Option<(Option<u32>, HashSet<String>, bool)>,
 ) -> enumflags2::BitFlags<ACLPermissions> {
     let session = u32::from(client.get_session_id());
-    let is_superuser = identity_override
+    let (cached_is_superuser, (cached_subject_generation, cached_home_generation)) =
+        client.acl_cache_metadata();
+    let cached_is_superuser = identity_override
         .as_ref()
-        .map_or_else(|| client.is_superuser(), |(_, _, value)| *value);
+        .map_or(cached_is_superuser, |(_, _, value)| *value);
     let debug_acl_enter = server.get_debug_acl_enter();
     let explicit_enter_deny_overrides_write = server.get_explicit_enter_deny_overrides_write();
 
     let channels = server.get_channels();
-    let (client_acl_subject_generation, client_acl_home_generation) =
-        client.get_acl_cache_generations();
     let use_acl_cache =
-        !is_superuser && home_channel_override.is_none() && identity_override.is_none();
+        !cached_is_superuser && home_channel_override.is_none() && identity_override.is_none();
 
     let cached_permissions = if use_acl_cache {
         client.with_server_id(|server_id| {
@@ -458,17 +460,16 @@ async fn compute_permissions_for_client_inner(
             let (permissions, depends_on_home_channel) = client.get_cached_acl_permissions(
                 channel_id,
                 channel_acl_generation,
-                client_acl_subject_generation,
-                client_acl_home_generation,
+                cached_subject_generation,
+                cached_home_generation,
                 explicit_enter_deny_overrides_write,
             )?;
             let (current_subject_generation, current_home_generation) =
                 client.get_acl_cache_generations();
             (channels.channel_acl_generation_for_channel(server_id, channel_id)
                 == channel_acl_generation
-                && current_subject_generation == client_acl_subject_generation
-                && (!depends_on_home_channel
-                    || current_home_generation == client_acl_home_generation))
+                && current_subject_generation == cached_subject_generation
+                && (!depends_on_home_channel || current_home_generation == cached_home_generation))
                 .then_some(permissions)
         })
     } else {
@@ -509,14 +510,24 @@ async fn compute_permissions_for_client_inner(
         )
     };
 
+    // The cache-hit path above only needs two generations and a superuser
+    // bit. Clone the larger identity sets only when an ACL evaluation is
+    // actually required.
+    let client_state = client.acl_state_snapshot();
+    let (client_acl_subject_generation, client_acl_home_generation) =
+        client_state.acl_cache_generations();
+    let is_superuser = identity_override
+        .as_ref()
+        .map_or_else(|| client_state.is_superuser(), |(_, _, value)| *value);
+
     let (user_id, groups) = match identity_override {
         Some((user_id, groups, _)) => (user_id, groups),
-        None => (client.get_user_id(), client.get_groups_clone()),
+        None => (client_state.user_id(), client_state.groups().clone()),
     };
     let group_refs = BorrowedStrs::<8>::from_strings(&groups);
-    let tokens = client.get_tokens_clone();
-    let token_refs = BorrowedStrs::<8>::from_strings(&tokens);
-    let home_channel_id = home_channel_override.unwrap_or_else(|| client.get_current_channel_id());
+    let token_refs = BorrowedStrs::<8>::from_strings(client_state.tokens());
+    let home_channel_id =
+        home_channel_override.unwrap_or_else(|| client_state.current_channel_id());
     let home_ancestors: Vec<u32> = if home_channel_id == channel_id {
         channel.effective_acl_ancestor_ids().map_or_else(
             || ancestors.iter().map(|ancestor| ancestor.id).collect(),

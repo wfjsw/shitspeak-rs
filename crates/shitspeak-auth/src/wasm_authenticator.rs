@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize};
@@ -131,15 +132,25 @@ impl Authenticator for DemoAuthenticator {
 }
 
 pub struct ReloadableAuthenticator {
-    inner: RwLock<Arc<dyn Authenticator>>,
+    inner: ArcSwap<AuthenticatorHolder>,
     reloads_from_config: bool,
+}
+
+struct AuthenticatorHolder {
+    authenticator: Arc<dyn Authenticator>,
+}
+
+impl AuthenticatorHolder {
+    fn new(authenticator: Arc<dyn Authenticator>) -> Self {
+        Self { authenticator }
+    }
 }
 
 impl ReloadableAuthenticator {
     pub fn fixed<A: Authenticator>(authenticator: A) -> Self {
         let inner: Arc<dyn Authenticator> = Arc::new(authenticator);
         Self {
-            inner: RwLock::new(inner),
+            inner: ArcSwap::from_pointee(AuthenticatorHolder::new(inner)),
             reloads_from_config: false,
         }
     }
@@ -148,7 +159,9 @@ impl ReloadableAuthenticator {
         config: &(impl AuthenticatorConfigSource + ?Sized),
     ) -> Result<Self, AuthenticatorBackendError> {
         Ok(Self {
-            inner: RwLock::new(load_authenticator_from_config(config)?),
+            inner: ArcSwap::from_pointee(AuthenticatorHolder::new(load_authenticator_from_config(
+                config,
+            )?)),
             reloads_from_config: true,
         })
     }
@@ -165,15 +178,12 @@ impl ReloadableAuthenticator {
 
     pub fn apply_prepared_reload(&self, next: Option<Arc<dyn Authenticator>>) {
         if let Some(next) = next {
-            *self.inner.write().expect("Authenticator RwLock poisoned") = next;
+            self.inner.store(Arc::new(AuthenticatorHolder::new(next)));
         }
     }
 
     fn load_inner(&self) -> Arc<dyn Authenticator> {
-        self.inner
-            .read()
-            .expect("Authenticator RwLock poisoned")
-            .clone()
+        Arc::clone(&self.inner.load().authenticator)
     }
 }
 
@@ -323,6 +333,19 @@ mod tests {
             AuthenticatorBackendError::Exec(crate::ExecAuthenticatorError::MissingCommand)
         ));
     }
+
+    #[test]
+    fn prepared_reload_atomically_replaces_authenticator() {
+        let authenticator = ReloadableAuthenticator::fixed(DemoAuthenticator);
+        let previous = authenticator.load_inner();
+        let next: Arc<dyn Authenticator> = Arc::new(DemoAuthenticator);
+
+        authenticator.apply_prepared_reload(Some(Arc::clone(&next)));
+
+        let current = authenticator.load_inner();
+        assert!(Arc::ptr_eq(&current, &next));
+        assert!(!Arc::ptr_eq(&current, &previous));
+    }
 }
 
 pub struct WasmAuthenticator {
@@ -372,7 +395,7 @@ impl WasmAuthenticator {
                     file_access_dirs,
                     working_dir,
                 )?),
-                instance_pool: Mutex::new(WasmAuthenticatorInstancePool::default()),
+                instance_pool: scc::Bag::default(),
                 instance_creation: Mutex::new(()),
             }),
         })
@@ -488,7 +511,7 @@ struct CompiledWasmAuthenticator {
     http_client: reqwest::Client,
     cache: Arc<WasmAuthCache>,
     state: Arc<WasmAuthState>,
-    instance_pool: Mutex<WasmAuthenticatorInstancePool>,
+    instance_pool: scc::Bag<WasmAuthenticatorInstance>,
     instance_creation: Mutex<()>,
 }
 
@@ -539,7 +562,7 @@ impl CompiledWasmAuthenticator {
             .instance
             .get_func(&mut checkout.instance.store, export_name)
         else {
-            self.release_instance(checkout).await;
+            self.release_instance(checkout);
             return Ok(None);
         };
         let func = func
@@ -603,17 +626,17 @@ impl CompiledWasmAuthenticator {
                 .await;
         }
 
-        self.release_instance(checkout).await;
+        self.release_instance(checkout);
         Ok(Some(response))
     }
 
     async fn checkout_instance(&self) -> Result<WasmAuthenticatorCheckout, WasmAuthenticatorError> {
-        if let Some(instance) = self.instance_pool.lock().await.instances.pop() {
+        if let Some(instance) = self.instance_pool.pop() {
             return Ok(WasmAuthenticatorCheckout { instance });
         }
 
         let _creation = self.instance_creation.lock().await;
-        if let Some(instance) = self.instance_pool.lock().await.instances.pop() {
+        if let Some(instance) = self.instance_pool.pop() {
             return Ok(WasmAuthenticatorCheckout { instance });
         }
 
@@ -641,16 +664,11 @@ impl CompiledWasmAuthenticator {
         Ok(WasmAuthenticatorCheckout { instance })
     }
 
-    async fn release_instance(&self, checkout: WasmAuthenticatorCheckout) {
+    fn release_instance(&self, checkout: WasmAuthenticatorCheckout) {
         let WasmAuthenticatorCheckout { mut instance } = checkout;
         instance.store.data_mut().streams.clear();
-        self.instance_pool.lock().await.instances.push(instance);
+        self.instance_pool.push(instance);
     }
-}
-
-#[derive(Default)]
-struct WasmAuthenticatorInstancePool {
-    instances: Vec<WasmAuthenticatorInstance>,
 }
 
 struct WasmAuthenticatorCheckout {

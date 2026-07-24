@@ -4302,6 +4302,7 @@ dependencies = [
 name = "shitspeak-auth"
 version = "3.0.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "aws-lc-rs",
  "base64",
@@ -4310,6 +4311,7 @@ dependencies = [
  "hex",
  "reqwest 0.13.4",
  "rustls",
+ "scc",
  "serde",
  "serde_json",
  "shitspeak-core",

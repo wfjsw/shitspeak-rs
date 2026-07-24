@@ -3,8 +3,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock as StdRwLock, Weak};
+use std::sync::{Arc, Weak};
 
+use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock as ParkingRwLock};
 
@@ -163,7 +164,7 @@ pub struct Server {
     node_identifier: NodeIdentifier,
 
     // Shared config — can be hot-reloaded at runtime
-    config: Arc<StdRwLock<Config>>,
+    config: ArcSwap<Config>,
     voice_dispatch_plan: VoiceDispatchPlan,
 
     allowed_proxies: Vec<AnyIpCidr>,
@@ -173,6 +174,7 @@ pub struct Server {
     entrypoints: Arc<ParkingRwLock<EntrypointBindings>>,
     entrypoint_runtime: Mutex<Option<EntrypointRuntime>>,
     entrypoint_reload_lock: tokio::sync::Mutex<()>,
+    config_reload_lock: tokio::sync::Mutex<()>,
 
     clients: Arc<ClientRepository>,
     channels: Arc<ChannelRepository>,
@@ -304,10 +306,9 @@ impl Server {
             }
         };
 
-        let config = Arc::new(StdRwLock::new(config));
-        let s2s_manager = Arc::new(S2SManager::initialize(
-            &config.read().expect("Config RwLock poisoned"),
-        ));
+        let s2s_manager = Arc::new(S2SManager::initialize(&config));
+        let geoip_config = config.geoip.clone();
+        let config = ArcSwap::from_pointee(config);
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(());
         let (visibility_reload_tx, _visibility_reload_rx) = broadcast::channel(64);
 
@@ -320,6 +321,7 @@ impl Server {
             entrypoints: Arc::new(ParkingRwLock::new(entrypoints)),
             entrypoint_runtime: Mutex::new(None),
             entrypoint_reload_lock: tokio::sync::Mutex::new(()),
+            config_reload_lock: tokio::sync::Mutex::new(()),
             clients: Arc::new(ClientRepository::new(node_id, client_log_max_entries)),
             channels,
             visibility_fanout_index: Arc::new(
@@ -338,16 +340,14 @@ impl Server {
             user_channel_cache,
             bans,
             codec_info: Mutex::new(CodecInfo::default()),
-            config: Arc::clone(&config),
+            config,
             context_actions: Arc::new(
                 crate::context_action::ContextActionRegistry::with_reserved_actions([
                     crate::toggle_superuser_visibility::ACTION_ID,
                 ]),
             ),
             s2s_manager,
-            geoip_resolver: ParkingRwLock::new(Arc::new(GeoIpResolver::new(
-                config.read().expect("Config RwLock poisoned").geoip.clone(),
-            ))),
+            geoip_resolver: ParkingRwLock::new(Arc::new(GeoIpResolver::new(geoip_config))),
             shutdown_tx,
             visibility_reload_tx,
             visibility_generation: AtomicU64::new(0),
@@ -377,9 +377,9 @@ impl Server {
         Ok(server)
     }
 
-    /// Read the current config (acquires a read lock).
-    pub fn read_config(&self) -> std::sync::RwLockReadGuard<'_, Config> {
-        self.config.read().expect("Config RwLock poisoned")
+    /// Load a coherent snapshot of the current config.
+    pub fn read_config(&self) -> Arc<Config> {
+        self.config.load_full()
     }
 
     pub(crate) fn voice_dispatch_plan(&self) -> VoiceDispatchPlan {
@@ -1835,6 +1835,7 @@ impl Server {
     pub async fn reload_config(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
         match Config::reload() {
             Ok(Some(new_config)) => {
+                let _reload_guard = self.config_reload_lock.lock().await;
                 validate_visibility_config(&new_config)?;
                 validate_privacy_config(&new_config)?;
                 new_config.voice.dispatch().validate().map_err(|error| {
@@ -1853,7 +1854,7 @@ impl Server {
                     let mut invalidate_acl_cache = false;
                     let mut root_channel_config_update = None;
                     let mut visibility_reload = false;
-                    let mut current = self.config.write().expect("Config RwLock poisoned");
+                    let current = self.config.load_full();
                     // Log notable changes
                     if current.welcome_text != new_config.welcome_text {
                         tracing::info!("config reload: welcome_text changed");
@@ -2067,7 +2068,7 @@ impl Server {
                     }
                     self.replace_c2s_tls_acceptor(next_tls_acceptor);
                     tracing::info!("config reload: C2S TLS identity refreshed");
-                    *current = new_config;
+                    self.config.store(Arc::new(new_config));
                     (
                         root_channel_config_update,
                         invalidate_acl_cache,

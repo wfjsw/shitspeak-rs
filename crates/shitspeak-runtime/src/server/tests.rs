@@ -189,14 +189,16 @@ async fn allow_move_without_traverse_reads_live_acl_config() {
     assert!(!server.get_allow_move_without_traverse());
 
     {
-        let mut config = server.config.write().expect("config lock");
+        let mut config = (*server.config.load_full()).clone();
         config.acl = config.acl.clone().with_allow_move_without_traverse(true);
+        server.config.store(Arc::new(config));
     }
     assert!(server.get_allow_move_without_traverse());
 
     {
-        let mut config = server.config.write().expect("config lock");
+        let mut config = (*server.config.load_full()).clone();
         config.acl = config.acl.clone().with_allow_move_without_traverse(false);
+        server.config.store(Arc::new(config));
     }
     assert!(!server.get_allow_move_without_traverse());
 }
@@ -311,7 +313,7 @@ async fn assert_config_read_completes_during_root_channel_reload(
 ) {
     let next_root = ChannelRootConfig::new(next_root_name);
     let root_update = {
-        let current = server.config.write().expect("Config RwLock poisoned");
+        let current = server.config.load();
         assert_ne!(current.root_channel_name, next_root.name());
         Some(next_root)
     };
@@ -1968,8 +1970,9 @@ async fn sharded_visibility_reload_is_ordered_and_does_not_wait_for_full_writer(
         .await
         .expect("prefill slow writer");
     {
-        let mut config = server.config.write().expect("config lock");
+        let mut config = (*server.config.load_full()).clone();
         config.hide_users_without_traverse = true;
+        server.config.store(Arc::new(config));
     }
     event_tx
         .send(ClientProjectionEvent::VisibilityReload)

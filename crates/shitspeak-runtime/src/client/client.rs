@@ -71,6 +71,49 @@ struct ClientCachedAclPermissions {
     permissions: enumflags2::BitFlags<shitspeak_state::ACLPermissions>,
 }
 
+/// Coherent point-in-time copy of the client state used by ACL evaluation.
+///
+/// Keep the fields private so callers cannot couple themselves to the
+/// snapshot representation. Constructing this value takes the global-state
+/// read lock once, preventing an ACL evaluation from combining identity or
+/// home-channel values from different state revisions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClientAclStateSnapshot {
+    current_channel_id: u32,
+    user_id: Option<u32>,
+    groups: HashSet<String>,
+    tokens: HashSet<String>,
+    is_superuser: bool,
+    acl_subject_generation: u64,
+    acl_home_generation: u64,
+}
+
+impl ClientAclStateSnapshot {
+    pub(crate) fn current_channel_id(&self) -> u32 {
+        self.current_channel_id
+    }
+
+    pub(crate) fn user_id(&self) -> Option<u32> {
+        self.user_id
+    }
+
+    pub(crate) fn groups(&self) -> &HashSet<String> {
+        &self.groups
+    }
+
+    pub(crate) fn tokens(&self) -> &HashSet<String> {
+        &self.tokens
+    }
+
+    pub(crate) fn is_superuser(&self) -> bool {
+        self.is_superuser
+    }
+
+    pub(crate) fn acl_cache_generations(&self) -> (u64, u64) {
+        (self.acl_subject_generation, self.acl_home_generation)
+    }
+}
+
 #[derive(Default)]
 struct CertificateHashProjectionCache {
     visibility_generation: Option<u64>,
@@ -1014,6 +1057,25 @@ impl Client {
 
     pub fn get_groups_clone(&self) -> HashSet<String> {
         self.global_state.read().get_groups().clone()
+    }
+
+    pub(crate) fn acl_state_snapshot(&self) -> ClientAclStateSnapshot {
+        let state = self.global_state.read();
+        let (acl_subject_generation, acl_home_generation) = state.get_acl_cache_generations();
+        ClientAclStateSnapshot {
+            current_channel_id: state.get_current_channel_id(),
+            user_id: state.get_user_id(),
+            groups: state.get_groups().clone(),
+            tokens: state.get_tokens().clone(),
+            is_superuser: state.is_superuser(),
+            acl_subject_generation,
+            acl_home_generation,
+        }
+    }
+
+    pub(crate) fn acl_cache_metadata(&self) -> (bool, (u64, u64)) {
+        let state = self.global_state.read();
+        (state.is_superuser(), state.get_acl_cache_generations())
     }
 
     pub fn has_group(&self, group: &str) -> bool {
@@ -2322,6 +2384,56 @@ mod tests {
             client
                 .get_cached_acl_permissions(0, 3, 5, 7, false)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn acl_state_snapshot_is_a_coherent_owned_revision() {
+        let client = Client::new_remote_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
+            ClientSessionIdentifier::from(0x0002_0001),
+            Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            None,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            None,
+            Utc::now(),
+            7,
+        );
+        {
+            let mut state = client.write_global_state_direct();
+            state.set_current_channel_id(4);
+            state.set_user_id(Some(17));
+            state.set_groups(["first-group".to_owned()].into_iter().collect());
+            state.set_tokens(["FIRST-TOKEN".to_owned()].into_iter().collect());
+            state.set_superuser(true);
+        }
+
+        let first = client.acl_state_snapshot();
+        {
+            let mut state = client.write_global_state_direct();
+            state.set_current_channel_id(9);
+            state.set_user_id(Some(23));
+            state.set_groups(["second-group".to_owned()].into_iter().collect());
+            state.set_tokens(["second-token".to_owned()].into_iter().collect());
+            state.set_superuser(false);
+        }
+        let second = client.acl_state_snapshot();
+
+        assert_eq!(first.current_channel_id(), 4);
+        assert_eq!(first.user_id(), Some(17));
+        assert_eq!(first.groups(), &HashSet::from(["first-group".to_owned()]));
+        assert_eq!(first.tokens(), &HashSet::from(["first-token".to_owned()]));
+        assert!(first.is_superuser());
+
+        assert_eq!(second.current_channel_id(), 9);
+        assert_eq!(second.user_id(), Some(23));
+        assert_eq!(second.groups(), &HashSet::from(["second-group".to_owned()]));
+        assert_eq!(second.tokens(), &HashSet::from(["second-token".to_owned()]));
+        assert!(!second.is_superuser());
+        assert_ne!(
+            first.acl_cache_generations(),
+            second.acl_cache_generations()
         );
     }
 
