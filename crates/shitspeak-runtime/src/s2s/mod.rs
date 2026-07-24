@@ -3420,17 +3420,23 @@ impl StrictReplicable for ChannelReplicationAdapter {
                     .into_iter()
                     .map(|entry| {
                         let op = entry.op();
+                        let version = op.version;
+                        let mut canonical_op = (*op).clone();
+                        // The terminal journal stores the proposal before the repository
+                        // assigns its out-of-band version. Restore that field before
+                        // constructing the catchup terminal proof.
+                        canonical_op.version = 0;
                         let metadata = entry.strict_metadata().map(strict_log_metadata_from_repo);
                         let log_entry = match metadata {
                             Some(metadata) => {
                                 s2s_replications::strict::StrictLogEntry::with_metadata(
-                                    (*op).clone(),
+                                    canonical_op,
                                     metadata,
                                 )
                             }
-                            None => s2s_replications::strict::StrictLogEntry::new((*op).clone()),
+                            None => s2s_replications::strict::StrictLogEntry::new(canonical_op),
                         };
-                        (op.version, log_entry)
+                        (version, log_entry)
                     })
                     .collect(),
             ),
@@ -3701,17 +3707,22 @@ impl StrictReplicable for BanReplicationAdapter {
                     .into_iter()
                     .map(|entry| {
                         let op = entry.op();
+                        let version = op.version;
+                        let mut canonical_op = (*op).clone();
+                        // Restore the version-zero proposal held by the terminal journal;
+                        // catchup carries the assigned version separately.
+                        canonical_op.version = 0;
                         let metadata = entry.strict_metadata().map(strict_log_metadata_from_repo);
                         let log_entry = match metadata {
                             Some(metadata) => {
                                 s2s_replications::strict::StrictLogEntry::with_metadata(
-                                    (*op).clone(),
+                                    canonical_op,
                                     metadata,
                                 )
                             }
-                            None => s2s_replications::strict::StrictLogEntry::new((*op).clone()),
+                            None => s2s_replications::strict::StrictLogEntry::new(canonical_op),
                         };
-                        (op.version, log_entry)
+                        (version, log_entry)
                     })
                     .collect(),
             ),
@@ -4434,6 +4445,63 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_adapter_logs_restore_version_zero_proposal_bytes() {
+        let channel_proposal = strict_channel_create_op(69);
+        let channel_proposal_bytes =
+            rmp_serde::to_vec(&channel_proposal).expect("encode channel proposal");
+        let channel_adapter = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            test_channel_repo(1),
+            None,
+        );
+        let channel_metadata = strict_log_metadata(101, 102, 103);
+        assert_eq!(
+            channel_adapter
+                .apply_committed_once(1, channel_proposal, channel_metadata)
+                .await,
+            s2s_replications::strict::StrictCommitApplyOutcome::Applied
+        );
+        let s2s_replications::strict::LogSlice::Available(channel_log) =
+            channel_adapter.log_since(0)
+        else {
+            panic!("channel strict log must be available");
+        };
+        assert_eq!(channel_log.len(), 1);
+        let (channel_version, channel_entry) = &channel_log[0];
+        assert_eq!(*channel_version, 1);
+        assert_eq!(channel_entry.op.version, 0);
+        assert_eq!(channel_entry.metadata, Some(channel_metadata));
+        assert_eq!(
+            rmp_serde::to_vec(&channel_entry.op).expect("encode logged channel proposal"),
+            channel_proposal_bytes
+        );
+
+        let ban_proposal = strict_ban_add_op("203.0.113.69");
+        let ban_proposal_bytes = rmp_serde::to_vec(&ban_proposal).expect("encode ban proposal");
+        let ban_adapter = BanReplicationAdapter::new(BanRepository::new_in_memory(1));
+        let ban_metadata = strict_log_metadata(201, 202, 203);
+        assert_eq!(
+            ban_adapter
+                .apply_committed_once(1, ban_proposal, ban_metadata)
+                .await,
+            s2s_replications::strict::StrictCommitApplyOutcome::Applied
+        );
+        let s2s_replications::strict::LogSlice::Available(ban_log) = ban_adapter.log_since(0)
+        else {
+            panic!("ban strict log must be available");
+        };
+        assert_eq!(ban_log.len(), 1);
+        let (ban_version, ban_entry) = &ban_log[0];
+        assert_eq!(*ban_version, 1);
+        assert_eq!(ban_entry.op.version, 0);
+        assert_eq!(ban_entry.metadata, Some(ban_metadata));
+        assert_eq!(
+            rmp_serde::to_vec(&ban_entry.op).expect("encode logged ban proposal"),
+            ban_proposal_bytes
+        );
     }
 
     #[test]
