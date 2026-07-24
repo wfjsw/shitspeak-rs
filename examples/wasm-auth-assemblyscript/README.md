@@ -15,7 +15,7 @@ Then point the server at the generated module:
 backend = "wasm"
 
 [authenticator.wasm]
-path = "examples/wasm-auth-assemblyscript/build/auth.wasm"
+path = "<path-to-compiled-wasm-module>"
 ```
 
 Local demo behavior:

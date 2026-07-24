@@ -14,7 +14,7 @@ Then point the server at the generated module:
 backend = "wasm"
 
 [authenticator.wasm]
-path = "examples/wasm-auth-rust/target/wasm32-unknown-unknown/release/shitspeak_wasm_auth_rust_example.wasm"
+path = "<path-to-compiled-wasm-module>"
 ```
 
 Local demo behavior:

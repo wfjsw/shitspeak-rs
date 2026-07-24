@@ -5,7 +5,7 @@
 `blob_storage_dir` controls server-side durable state. The development config uses:
 
 ```toml
-blob_storage_dir = "data"
+blob_storage_dir = "state"
 ```
 
 When `blob_storage_dir` is omitted, persistence-backed components run in memory where supported.
@@ -39,7 +39,7 @@ S2S state has its own root:
 
 ```toml
 [s2s]
-persistence_dir = "s2s-state"
+persistence_dir = "state/s2s"
 ```
 
 Strict replication uses one cumulative capability version, currently `2`.

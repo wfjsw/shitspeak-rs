@@ -2,7 +2,8 @@
 
 [Docs index](README.md)
 
-This project is a Rust workspace-style crate with the default binary and package named `shitspeak-rs`.
+This project is a Cargo workspace. The root package and default server binary
+are named `shitspeak-rs`.
 
 ## Commands
 
@@ -13,12 +14,30 @@ cargo test
 cargo bench
 ```
 
+The default `cargo check` and `cargo test` commands exercise the root package.
+Before opening a change that touches a workspace library, run the full
+workspace checks instead:
+
+```powershell
+cargo check --workspace --all-targets --locked
+cargo test --workspace --all-targets --locked
+```
+
+Include the relevant optional feature when changing gateway code:
+
+```powershell
+cargo check --workspace --all-targets --features web --locked
+cargo check --workspace --all-targets --features moq --locked
+```
+
 Run the server locally:
 
 ```powershell
-cargo run --example gen-test-certs
 cargo run
 ```
+
+Provide a TLS certificate and key at the paths configured in `config.toml`
+before starting the server.
 
 Feature builds:
 
@@ -29,12 +48,16 @@ cargo build --features moq
 
 ## Generated Code
 
-`build.rs` compiles protobuf definitions from `src/protos` into generated Rust modules included by `src/lib.rs` and `src/main.rs`:
+`crates/shitspeak-proto/build.rs` compiles the definitions in
+`crates/shitspeak-proto/protos` with vendored `protoc`. Cargo writes the
+generated files to that crate's `OUT_DIR`, and
+`crates/shitspeak-proto/src/lib.rs` exposes them as:
 
 - `mumble_proto`
 - `mumble_udp`
 - `s2s_transport_proto`
 - `s2s_overlay_proto`
+- `s2s_upper_layer_proto`
 - `s2s_replication_proto`
 - `s2s_application_proto`
 
@@ -49,6 +72,7 @@ Criterion benchmarks live under `benches`:
 - `voice_e2e`
 - `voice_microbatch`
 - `s2s_compression`
+- `fanout_vs_broadcast`
 
 Run all benchmarks:
 
@@ -58,7 +82,10 @@ cargo bench
 
 ## Integration Tests
 
-Integration test harnesses and scenarios live under `src/integration_tests`. They cover authentication, ACLs, channel operations, voice behavior, user stats, self actions, moderation actions, and S2S transport/overlay/replication behavior.
+Integration test harnesses and scenarios live under
+`crates/shitspeak-runtime/src/integration_tests`. They cover authentication,
+ACLs, channel operations, voice behavior, user stats, self actions,
+moderation actions, and S2S transport/overlay/replication behavior.
 
 ## Vendored Dependencies
 

@@ -10,10 +10,10 @@ This project is under active development. The checked-in `config.toml` is intend
 
 ## Quick Start
 
-Generate local test certificates, build, and run:
+Configure a TLS certificate and key for the paths in `config.toml`, then build
+and run:
 
 ```powershell
-cargo run --example gen-test-certs
 cargo build
 cargo run
 ```
@@ -60,6 +60,12 @@ cargo check --workspace --all-targets --features web --locked
 cargo check --workspace --all-targets --features moq --locked
 ```
 
+Run the full workspace test suite with:
+
+```powershell
+cargo test --workspace --all-targets --locked
+```
+
 Optional feature builds:
 
 ```powershell
@@ -69,9 +75,11 @@ cargo build --features moq
 
 ## Repository Map
 
-- `src/`: Rust server, protocol, client, voice, auth, web, and S2S modules.
+- `src/`: thin binary launchers and the root re-export crate.
+- `crates/`: workspace libraries for runtime, configuration, authentication,
+  state, voice, S2S, web gateway, protocol generation, and shared types.
 - `config.toml`: local development configuration.
-- `examples/`: certificate generators, authenticator examples, and Docker Compose demos.
+- `examples/`: certificate generators and authenticator examples.
 - `web/`: browser demo and JavaScript SDK assets.
 - `deploy/`: Grafana and Prometheus provisioning examples.
 - `packaging/`: systemd service example.

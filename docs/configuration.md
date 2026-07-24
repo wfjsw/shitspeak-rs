@@ -39,8 +39,8 @@ These are the required top-level fields plus a small practical baseline:
 listen = "0.0.0.0:64738"
 register_name = "ShitSpeak Local"
 
-cert_path = "cert.pem"
-key_path = "key.pem"
+cert_path = "tls/server-cert.pem"
+key_path = "tls/server-key.pem"
 
 send_version = true
 send_build_info = true
@@ -54,19 +54,14 @@ welcome_text = "Welcome to ShitSpeak"
 root_channel_name = "Root"
 default_channel = 0
 
-blob_storage_dir = "data"
+blob_storage_dir = "state"
 
 [authenticator]
 backend = "demo"
 ```
 
-Generate local test certificates with:
-
-```powershell
-cargo run --example gen-test-certs
-```
-
-The generated certificates are for local testing only.
+Provide a TLS certificate and key at the configured paths before starting the
+server.
 
 ## Production-Style Single Node
 
@@ -76,8 +71,8 @@ This example keeps the shape small while showing the settings that usually matte
 listen = "0.0.0.0:64738"
 register_name = "Example Voice"
 
-cert_path = "/etc/shitspeak-rs/tls/cert.pem"
-key_path = "/etc/shitspeak-rs/tls/key.pem"
+cert_path = "/etc/shitspeak-rs/tls/server-cert.pem"
+key_path = "/etc/shitspeak-rs/tls/server-key.pem"
 
 send_version = true
 send_build_info = false
@@ -143,8 +138,8 @@ allow_move_without_traverse = false
 
 ```toml
 listen = "0.0.0.0:64738"
-cert_path = "cert.pem"
-key_path = "key.pem"
+cert_path = "tls/server-cert.pem"
+key_path = "tls/server-key.pem"
 ```
 
 `listen` is the default client TCP and UDP address. The server binds TCP and UDP on the same socket address. If the port is `0`, the server chooses an available dynamic port pair.
@@ -323,7 +318,7 @@ pending_delete_timeout_ms = 5000
 ## Persistence
 
 ```toml
-blob_storage_dir = "data"
+blob_storage_dir = "state"
 channel_log_max_entries = 10000
 client_log_max_entries = 10000
 channel_snapshot_every_ops = 10
@@ -503,7 +498,7 @@ enabled = true
 ca_path = "s2s/ca.pem"
 cert_path = "s2s/node-1-cert.pem"
 key_path = "s2s/node-1-key.pem"
-persistence_dir = "s2s-state"
+persistence_dir = "state/s2s"
 
 tcp_listen = "0.0.0.0:64739"
 kcp_listen = "0.0.0.0:64740"
@@ -1097,8 +1092,8 @@ MoQ/WebTransport uses a separate QUIC listener:
 enabled = true
 listen = "0.0.0.0:64740"
 public_url = "https://voice.example.com:64740/web/moq"
-cert_path = "/etc/shitspeak-rs/webtransport/cert.pem"
-key_path = "/etc/shitspeak-rs/webtransport/key.pem"
+cert_path = "/etc/shitspeak-rs/webtransport/server-cert.pem"
+key_path = "/etc/shitspeak-rs/webtransport/server-key.pem"
 max_speaker_tracks = 64
 audio_bitrate = 64000
 ```
@@ -1198,8 +1193,8 @@ If a reload fails to parse or a staged authenticator/TLS identity cannot be load
 Use paths relative to the process working directory or absolute paths:
 
 ```toml
-cert_path = "/etc/shitspeak-rs/tls/cert.pem"
-key_path = "/etc/shitspeak-rs/tls/key.pem"
+cert_path = "/etc/shitspeak-rs/tls/server-cert.pem"
+key_path = "/etc/shitspeak-rs/tls/server-key.pem"
 ```
 
 ### WASM File Access Returns Unavailable

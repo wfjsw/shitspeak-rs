@@ -19,14 +19,14 @@ The build uses `prost-build` and `protoc-bin-vendored`, so a separate system Pro
 From the repository root:
 
 ```powershell
-cargo run --example gen-test-certs
 cargo check
 cargo run
 ```
 
 The checked-in development configuration listens on `0.0.0.0:64738`. Connect a Mumble client to `localhost` on port `64738`.
 
-The generated certificates are for local testing only.
+Before starting the server, provide a TLS certificate and key at the paths
+configured in `config.toml`.
 
 ## Logging
 
@@ -44,4 +44,3 @@ The server also supports optional Loki shipping. See [Observability](observabili
 - Configure TLS, limits, authentication, and persistence in [Configuration](configuration.md).
 - Replace the demo authenticator before public deployment with [Authentication](authentication.md).
 - Review [Deployment](deployment.md) before exposing a server.
-- Try the local 16-node cluster in [Clustering](clustering.md).

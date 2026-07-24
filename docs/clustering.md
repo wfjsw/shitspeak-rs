@@ -22,7 +22,7 @@ enabled = true
 ca_path = "s2s-ca.pem"
 cert_path = "s2s-cert.pem"
 key_path = "s2s-key.pem"
-persistence_dir = "s2s-state"
+persistence_dir = "state/s2s"
 
 tcp_listen = "0.0.0.0:64739"
 kcp_listen = "0.0.0.0:64740"
@@ -49,11 +49,37 @@ nodes together because legacy unprefixed UDP-family traffic is rejected.
 
 Every clustered node needs a unique S2S leaf certificate whose Common Name is the numeric node id. When S2S is disabled or no S2S certificate is configured, the local node id defaults to `0`.
 
-Generate local S2S test certificates:
+## S2S Forwarder
+
+The optional `s2s-forwarder` binary joins the S2S overlay without accepting
+Mumble client connections. Use it for transit-only nodes or, when explicitly
+enabled, to host forwarding-side replication repositories.
+
+Run it from a directory containing `config.toml`:
 
 ```powershell
-cargo run --example gen-s2s-certs
+cargo run --bin s2s-forwarder
 ```
+
+It requires `[s2s].enabled = true` and a complete S2S transport configuration
+such as the minimal shape above. It always enables overlay transit routing,
+even when `s2s.overlay.route_transit_messages` is false. The forwarder loads
+its configuration at startup; restart it after configuration changes.
+
+Replication is disabled by default, so the forwarder can relay opaque S2S
+frames without local replication state. To enable its strict and content
+replication repositories, configure storage explicitly or set
+`s2s.persistence_dir`:
+
+```toml
+[replication]
+enabled = true
+storage_dir = "forwarder-replication"
+```
+
+With replication enabled, strict topics may be `bans`, `channels`, or
+`channels:<server_id>`; content topics may be `channel_blobs` or
+`channel_blobs:<server_id>`. Invalid topics stop the forwarder at startup.
 
 ## Address Advertisement
 
@@ -265,29 +291,3 @@ is consequently not yet a fully isolated reactive receiver path.
 `s2s.status_http_listen` exposes a local HTTP status page. It also serves Prometheus metrics on `/metrics` and `/s2s/metrics`.
 
 The separate `[observability.metrics]` server can expose the same topology metrics on a dedicated endpoint. See [Observability](observability.md).
-
-## Local 16-Node Demo
-
-The Docker Compose demo under `examples/docker-compose-16node` creates a local 16-node cluster with generated per-node config and S2S certificates.
-
-Build the Linux musl binary first:
-
-```powershell
-cross build --target=x86_64-unknown-linux-musl
-```
-
-Generate or refresh the demo:
-
-```powershell
-pwsh examples/docker-compose-16node/generate-compose-16node.ps1 -Force
-```
-
-Start it:
-
-```powershell
-docker compose -f examples/docker-compose-16node/compose.yaml up -d --build
-```
-
-Node `N` publishes Mumble TCP and UDP on `localhost:20000 + N` and its status page on `localhost:21000 + N`. Node 1 is reachable at `localhost:20001`, and its status page is `http://localhost:21001`.
-
-More details are in the [16-node demo README](../examples/docker-compose-16node/README.md).

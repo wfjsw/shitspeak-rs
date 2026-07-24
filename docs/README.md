@@ -11,8 +11,8 @@ This directory is the main documentation set for ShitSpeak. The top-level [READM
 
 ## Operators
 
-- [Deployment](deployment.md): Docker, systemd, public registration, and production checklist.
-- [Clustering](clustering.md): server-to-server transport, overlay routing, replication, certificates, and local demos.
+- [Deployment](deployment.md): systemd, public registration, and production checklist.
+- [Clustering](clustering.md): server-to-server transport, overlay routing, replication, and certificates.
 - [Observability](observability.md): logging, Loki, Prometheus metrics, remote write, S2S status pages, and Grafana artifacts.
 - [Web gateway](web-gateway.md): browser signaling, WebRTC, MoQ/WebTransport, SDK, and demo assets.
 
@@ -25,6 +25,5 @@ This directory is the main documentation set for ShitSpeak. The top-level [READM
 
 - [Systemd unit notes](../packaging/systemd/README.md)
 - [Grafana provisioning notes](../deploy/grafana/README.md)
-- [16-node Docker Compose demo](../examples/docker-compose-16node/README.md)
 - [Rust WASM authenticator example](../examples/wasm-auth-rust/README.md)
 - [AssemblyScript WASM authenticator example](../examples/wasm-auth-assemblyscript/README.md)
