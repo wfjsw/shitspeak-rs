@@ -215,22 +215,27 @@ pub(super) async fn activate_client_projection(
         .as_ref()
         .map(|(version, _)| *version)
         .unwrap_or_else(|| server.channels.current_version_in_server(&server_id));
-    let staged_client_versions = client.get_last_client_versions().await;
+    let (staged_client_versions, staged_client_epochs) = client.get_last_client_cursors().await;
     // Native clients no longer retain their own log receivers after auth. The
     // shard's registration hook catches up from these exact snapshot cursors.
     drop(staged_channel_subscription);
     drop(client.take_client_state_subscription());
 
-    let (baseline, last_client_versions, channel_snapshot_version) =
+    let (baseline, last_client_versions, last_client_epochs, channel_snapshot_version) =
         if let Some(baseline) = client.take_post_auth_baseline() {
-            (baseline, staged_client_versions, staged_channel_version)
+            (
+                baseline,
+                staged_client_versions,
+                staged_client_epochs,
+                staged_channel_version,
+            )
         } else {
             tracing::warn!(
                 server_id,
                 session = u32::from(client_session_id),
                 "post-auth baseline missing; atomically recapturing projection snapshots"
             );
-            let (snapshot_clients, snapshot_versions, snapshot_client_rx) = server
+            let (snapshot_clients, snapshot_versions, snapshot_epochs, snapshot_client_rx) = server
                 .clients
                 .published_snapshot_with_versions_and_subscription_in_server(&server_id)
                 .await;
@@ -280,6 +285,7 @@ pub(super) async fn activate_client_projection(
                     visibility_generation,
                 ),
                 snapshot_versions,
+                snapshot_epochs,
                 snapshot_channel_version,
             )
         };
@@ -289,9 +295,13 @@ pub(super) async fn activate_client_projection(
         Arc::clone(client),
         baseline,
         last_client_versions,
+        last_client_epochs,
         channel_snapshot_version,
     );
 
+    // Publish before the potentially expensive catch-up hook. Otherwise a
+    // burst of authenticated clients serializes publication behind growing
+    // per-client replay work and leaves users invisible for an extended time.
     server
         .clients
         .publish_client_in_server(&server_id, client_session_id)
@@ -325,21 +335,22 @@ async fn replay_client_log_entries_since(
     client_session_id: ClientSessionIdentifier,
     last_seen: HashMap<u16, u64>,
 ) -> Result<(), HandleIncomingConnectionError> {
+    let last_epochs = client.get_last_client_epochs().await;
     let catch_up = server
         .clients
         .replay_entries_since_in_server_for_client(
             server_id,
             &last_seen,
+            &last_epochs,
             client.get_session_id(),
             client.client_instance_id(),
         )
         .await;
-    let (rebases, missed, target_versions) = catch_up.into_parts();
+    let (rebases, missed, target_versions, target_epochs) = catch_up.into_parts();
 
     let mut out = Vec::new();
-    let mut rebase_versions = Vec::with_capacity(rebases.len());
     for rebase in rebases {
-        let (origin, version, entries) = rebase.into_parts();
+        let (origin, _version, _epoch, entries) = rebase.into_parts();
         append_client_origin_reset_messages(
             server,
             client,
@@ -373,7 +384,6 @@ async fn replay_client_log_entries_since(
             )
             .await?;
         }
-        rebase_versions.push((origin, version));
     }
     for entry in missed {
         if should_skip_client_add_entry(
@@ -402,10 +412,9 @@ async fn replay_client_log_entries_since(
         .write_proto_message_batch(&out)
         .await
         .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-    for (origin, version) in rebase_versions {
-        client.set_last_client_version(origin, version).await;
-    }
-    client.update_last_client_versions(&target_versions).await;
+    client
+        .set_last_client_cursors(target_versions, target_epochs)
+        .await;
     Ok(())
 }
 
@@ -1172,10 +1181,15 @@ async fn append_client_origin_reset_messages(
     origin: u16,
     out: &mut Vec<Message>,
 ) {
+    let viewer_session = client.get_session_id();
+    let viewer_old_channel = session_channel_shadow.get(&viewer_session).copied();
     let sessions = take_origin_sessions_from_shadow(session_channel_shadow, origin);
     for session in sessions {
-        if session == client.get_session_id() {
-            session_channel_shadow.insert(session, client.get_current_channel_id());
+        if session == viewer_session {
+            session_channel_shadow.insert(
+                session,
+                viewer_old_channel.unwrap_or_else(|| client.get_current_channel_id()),
+            );
             continue;
         }
         let removal: Message = shitspeak_messages::messages::encoder::UserRemove {

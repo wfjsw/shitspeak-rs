@@ -26,7 +26,7 @@ use shitspeak_runtime::client::user_info::Credential;
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{AsyncMessageHandlerExt, Client};
 use shitspeak_runtime::messages::Message;
-use shitspeak_runtime::messages::encoder::{CodecVersion, ServerConfig, ServerSync};
+use shitspeak_runtime::messages::encoder::{ChannelRemove, CodecVersion, ServerConfig, ServerSync};
 use shitspeak_runtime::server::Server;
 use shitspeak_runtime_config::{WebAuthMode, WebConfig};
 
@@ -644,7 +644,7 @@ where
                     }
                     Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
                         drain_web_visibility_reloads(&mut stream, &context, &mut session, false).await?;
-                        send_web_channel_log_gap(&mut stream, &context, &mut session).await?;
+                        send_web_channel_snapshot_recovery(&mut stream, &context, &mut session).await?;
                     }
                     Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) | None => {
                         send_websocket_error(&mut stream, "web channel update stream closed").await?;
@@ -1496,29 +1496,30 @@ async fn handle_successful_password_auth(
     session.authenticated = true;
     if let Some((server, client)) = initial_state_client {
         session.visibility_reload_rx = Some(server.subscribe_visibility_reload());
+        let (_clients, client_versions, client_epochs, client_log_rx) = server
+            .get_clients()
+            .published_snapshot_with_versions_and_subscription_in_server(&client.server_id())
+            .await;
+        let (channel_snapshot, channel_version, channel_log_rx) = server
+            .get_channels()
+            .ordered_snapshot_with_version_and_subscription_in_server(&client.server_id())
+            .await;
         send_initial_server_state(
             stream,
             &server,
             &client,
+            &channel_snapshot,
             &mut session.channel_tree_shadow,
             &mut session.channel_shadow,
             &mut session.user_visibility,
         )
         .await?;
+        client.set_last_channel_version(channel_version).await;
         client
-            .set_last_channel_version(
-                server
-                    .get_channels()
-                    .current_version_in_server(&client.server_id()),
-            )
+            .set_last_client_cursors(client_versions, client_epochs)
             .await;
-        let (_, versions) = server
-            .get_clients()
-            .snapshot_with_versions_in_server(&client.server_id())
-            .await;
-        client.update_last_client_versions(&versions).await;
-        session.client_log_rx = Some(server.get_clients().subscribe());
-        session.channel_log_rx = Some(server.get_channels().subscribe());
+        session.client_log_rx = Some(client_log_rx);
+        session.channel_log_rx = Some(channel_log_rx);
         shitspeak_runtime::client::handlers::spawn_staged_session_blob_resolution(
             Arc::clone(&server),
             Arc::clone(&client),
@@ -1531,17 +1532,17 @@ async fn send_initial_server_state(
     stream: &mut (impl AsyncWrite + Unpin),
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
+    channels: &shitspeak_state::OrderedChannelSnapshot,
     channel_tree_shadow: &mut ChannelTreeShadow,
     channel_shadow: &mut SessionChannelShadow,
     user_visibility: &mut UserVisibilityState,
 ) -> io::Result<()> {
     let server_id = client.server_id();
-    let channels = server.get_channels().ordered_snapshot_in_server(&server_id);
     for message in
         shitspeak_runtime::channel_handler::build_visible_ordered_channel_snapshot_messages(
             server,
             client,
-            &channels,
+            channels,
             channel_tree_shadow,
             server.get_send_permission_info(),
         )
@@ -1653,6 +1654,10 @@ async fn send_web_channel_log_update(
     let last = client.get_last_channel_version().await;
     let server_id = client.server_id();
     if op.server_id != server_id {
+        return Ok(());
+    }
+    if op.is_root_name_config_update() {
+        send_web_channel_snapshot_recovery(stream, context, session).await?;
         return Ok(());
     }
     if op.version <= last {
@@ -1781,9 +1786,12 @@ async fn send_web_channel_log_gap(
         .get_channels()
         .get_log_since_in_server(&server_id, last)
         .await;
-    if missed.is_empty() && last > 0 {
-        send_websocket_error(stream, "web channel update gap is unrecoverable").await?;
-        return Ok(());
+    if missed.is_empty()
+        || missed
+            .first()
+            .is_some_and(|op| op.version > last.saturating_add(1))
+    {
+        return send_web_channel_snapshot_recovery(stream, context, session).await;
     }
 
     for op in missed {
@@ -1884,6 +1892,68 @@ async fn send_web_channel_log_gap(
     Ok(())
 }
 
+async fn send_web_channel_snapshot_recovery(
+    stream: &mut (impl AsyncWrite + Unpin),
+    context: &SignalingContext,
+    session: &mut SignalingSession,
+) -> io::Result<()> {
+    let Some(server) = context.server.as_ref().cloned() else {
+        return Ok(());
+    };
+    let Some(client) = session.client.as_ref().cloned() else {
+        return Ok(());
+    };
+    let server_id = client.server_id();
+    let (snapshot, version) = server
+        .get_channels()
+        .ordered_snapshot_with_version_in_server(&server_id)
+        .await;
+    let previous = session.channel_tree_shadow.clone();
+    let mut current = ChannelTreeShadow::new();
+    let messages =
+        shitspeak_runtime::channel_handler::build_visible_ordered_channel_snapshot_messages(
+            &server,
+            &client,
+            &snapshot,
+            &mut current,
+            server.get_send_permission_info(),
+        )
+        .await;
+    session.channel_tree_shadow = current;
+    for message in messages {
+        send_web_outbound_message(stream, session.peer.as_ref(), message).await?;
+    }
+
+    let visibility_messages =
+        shitspeak_runtime::client::visibility::visibility_config_reload_messages(
+            &server,
+            &client,
+            &mut session.user_visibility,
+            &mut session.channel_tree_shadow,
+            &mut session.channel_shadow,
+        )
+        .await;
+    for message in visibility_messages {
+        send_web_outbound_message(stream, session.peer.as_ref(), message).await?;
+    }
+
+    let mut removed = previous
+        .difference(&session.channel_tree_shadow)
+        .copied()
+        .collect::<Vec<_>>();
+    removed.sort_unstable_by(|left, right| right.cmp(left));
+    for channel_id in removed {
+        send_web_outbound_message(
+            stream,
+            session.peer.as_ref(),
+            ChannelRemove { channel_id }.into(),
+        )
+        .await?;
+    }
+    client.set_last_channel_version(version).await;
+    Ok(())
+}
+
 async fn send_web_client_log_update(
     stream: &mut (impl AsyncWrite + Unpin),
     context: &SignalingContext,
@@ -1899,6 +1969,31 @@ async fn send_web_client_log_update(
 
     let entry = &payload.entry;
     let server_id = client.server_id();
+    if matches!(entry.op, ClientStateOperation::ResetNode { .. }) {
+        match payload.versions.get(&entry.node_id).copied() {
+            Some(0) => {
+                send_web_client_origin_reset(
+                    stream,
+                    &server,
+                    &client,
+                    session.peer.as_ref(),
+                    &mut session.channel_tree_shadow,
+                    &mut session.channel_shadow,
+                    &mut session.user_visibility,
+                    &server_id,
+                    entry.node_id,
+                )
+                .await?;
+                client.remove_last_client_version(entry.node_id).await;
+                return Ok(());
+            }
+            Some(_) => {
+                client.update_last_client_versions(&payload.versions).await;
+                return Ok(());
+            }
+            None => {}
+        }
+    }
     if entry.op.server_id() != server_id {
         return Ok(());
     }
@@ -1972,24 +2067,58 @@ async fn send_web_client_log_gap(
     };
 
     let last_seen = client.get_last_client_versions().await;
+    let last_epochs = client.get_last_client_epochs().await;
     let server_id = client.server_id();
-    let (missed, versions) = match server
+    let catch_up = server
         .get_clients()
         .replay_entries_since_in_server_for_client(
             &server_id,
             &last_seen,
+            &last_epochs,
             client.get_session_id(),
             client.client_instance_id(),
         )
-        .await
-    {
-        Ok(replay) => replay,
-        Err(()) => {
-            send_websocket_error(stream, "web client update gap is unrecoverable").await?;
-            return Ok(());
+        .await;
+    let (rebases, missed, versions, epochs) = catch_up.into_parts();
+    for rebase in rebases {
+        let (origin, _version, _epoch, entries) = rebase.into_parts();
+        send_web_client_origin_reset(
+            stream,
+            &server,
+            &client,
+            session.peer.as_ref(),
+            &mut session.channel_tree_shadow,
+            &mut session.channel_shadow,
+            &mut session.user_visibility,
+            &server_id,
+            origin,
+        )
+        .await?;
+        for entry in entries {
+            if is_own_add_client(&entry.op, client.get_session_id())
+                || is_known_add_client(&entry.op, &session.channel_shadow)
+            {
+                continue;
+            }
+            send_web_client_log_entry(
+                stream,
+                &server,
+                &client,
+                session.peer.as_ref(),
+                &mut session.channel_tree_shadow,
+                &mut session.channel_shadow,
+                &mut session.user_visibility,
+                &entry,
+            )
+            .await?;
         }
-    };
+    }
     for entry in missed {
+        if is_own_add_client(&entry.op, client.get_session_id())
+            || is_known_add_client(&entry.op, &session.channel_shadow)
+        {
+            continue;
+        }
         send_web_client_log_entry(
             stream,
             &server,
@@ -2002,7 +2131,58 @@ async fn send_web_client_log_gap(
         )
         .await?;
     }
-    client.update_last_client_versions(&versions).await;
+    client.set_last_client_cursors(versions, epochs).await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_web_client_origin_reset(
+    stream: &mut (impl AsyncWrite + Unpin),
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    peer: Option<&WebRtcPeer>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    origin: u16,
+) -> io::Result<()> {
+    let viewer_session = client.get_session_id();
+    let sessions = channel_shadow
+        .iter()
+        .map(|(session, _)| session)
+        .filter(|session| session.get_node_id() == origin)
+        .collect::<Vec<_>>();
+    for session in &sessions {
+        if *session != viewer_session {
+            channel_shadow.remove(session);
+        }
+    }
+
+    for session in sessions {
+        if session == viewer_session {
+            continue;
+        }
+        let removal: Message = shitspeak_runtime::messages::encoder::UserRemove {
+            session: u32::from(session),
+            actor: None,
+            reason: None,
+            ban: Some(false),
+        }
+        .into();
+        send_web_outbound_message_with_synthetic(
+            stream,
+            server,
+            client,
+            peer,
+            channel_tree_shadow,
+            channel_shadow,
+            user_visibility,
+            server_id,
+            &removal,
+        )
+        .await?;
+    }
     Ok(())
 }
 

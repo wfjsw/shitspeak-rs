@@ -15,11 +15,14 @@ When `blob_storage_dir` is omitted, persistence-backed components run in memory 
 The persistence directory stores:
 
 - Channel snapshots and write-ahead logs.
-- Client state logs used for replay and server-to-server propagation.
 - Channel blobs and session blob cache data.
 - `user_channel_cache.db` for TTL-bound last/listening channel restoration. Legacy `user_channel_cache.json` data is imported on first startup after upgrade.
 - WASM authenticator durable `state_*` data under `wasm_authenticator`.
 - S2S transport adaptive compression dictionary cache and strict-replication terminal journals when `s2s.persistence_dir` points at persistent storage.
+
+Client-state replay logs are in-memory only. They are not stored in
+`blob_storage_dir`, do not survive a process restart, and are rebuilt from live
+and S2S activity after startup.
 
 For durable deployments, back up the application state directory and place it on storage that survives process and host restarts.
 
@@ -34,6 +37,13 @@ channel_snapshot_every_ops = 10
 channel_snapshot_every_secs = 60
 channel_wal_compaction_expire_count = 2000
 ```
+
+`client_log_max_entries` bounds each client-state origin's in-memory replay
+history and defaults to `2000` when omitted. The value is captured when the
+client repository is created; changing it through hot reload does not resize
+the running repository, so the new value takes effect only after restart. A
+shorter history saves memory but makes lagging projections rebase from the
+materialized client snapshot more often.
 
 S2S state has its own root:
 

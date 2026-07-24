@@ -170,6 +170,12 @@ impl DeferredSessionBlobResolution {
 }
 pub type StagedChannelStateSubscription = (u64, shitspeak_state::ChannelStateSubscription);
 
+#[derive(Default)]
+struct ClientProjectionCursorState {
+    versions: HashMap<u16, u64>,
+    epochs: HashMap<u16, u64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PostAuthBaseline {
     session_channel_shadow: crate::channel_handler::SessionChannelShadow,
@@ -411,7 +417,7 @@ pub struct Client {
 
     /// The last client-state log version this connection has seen,
     /// indexed by node_id.  Used to detect gaps and replay missed entries.
-    last_client_version: ParkingMutex<HashMap<u16, u64>>,
+    client_state_cursors: ParkingMutex<ClientProjectionCursorState>,
     /// The last channel-state log version this connection has seen.
     /// Channels are fully serialized across the cluster, so a single
     /// version counter suffices.
@@ -587,7 +593,7 @@ impl Client {
             prefer_tcp_tunnel: AtomicBool::new(false),
             can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
-            last_client_version: ParkingMutex::new(HashMap::new()),
+            client_state_cursors: ParkingMutex::new(ClientProjectionCursorState::default()),
             last_channel_version: ParkingMutex::new(0),
         })
     }
@@ -758,7 +764,7 @@ impl Client {
             prefer_tcp_tunnel: AtomicBool::new(false),
             can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
-            last_client_version: ParkingMutex::new(HashMap::new()),
+            client_state_cursors: ParkingMutex::new(ClientProjectionCursorState::default()),
             last_channel_version: ParkingMutex::new(0),
         })
     }
@@ -849,7 +855,7 @@ impl Client {
             prefer_tcp_tunnel: AtomicBool::new(false),
             can_receive_voice: AtomicBool::new(true),
             protocol_version: AtomicU64::new(0),
-            last_client_version: ParkingMutex::new(HashMap::new()),
+            client_state_cursors: ParkingMutex::new(ClientProjectionCursorState::default()),
             last_channel_version: ParkingMutex::new(0),
         })
     }
@@ -948,39 +954,52 @@ impl Client {
 
     /// Get a clone of the full per-node last-seen version map.
     pub async fn get_last_client_versions(&self) -> HashMap<u16, u64> {
-        self.last_client_version.lock().clone()
+        self.client_state_cursors.lock().versions.clone()
     }
 
     /// Merge the given per-node version map into the client's last-seen
     /// trackers.  Each entry is updated to `max(existing, new)`, except
     /// version `0`, which marks a remote-origin reset and clears that node.
     pub async fn update_last_client_versions(&self, versions: &HashMap<u16, u64>) {
-        let mut map = self.last_client_version.lock();
+        let mut cursors = self.client_state_cursors.lock();
         for (&node_id, &version) in versions {
             if version == 0 {
-                map.remove(&node_id);
+                cursors.versions.remove(&node_id);
+                cursors.epochs.remove(&node_id);
                 continue;
             }
-            let entry = map.entry(node_id).or_insert(0);
+            let entry = cursors.versions.entry(node_id).or_insert(0);
             *entry = (*entry).max(version);
         }
     }
 
     pub async fn remove_last_client_version(&self, node_id: u16) {
-        self.last_client_version.lock().remove(&node_id);
+        let mut cursors = self.client_state_cursors.lock();
+        cursors.versions.remove(&node_id);
+        cursors.epochs.remove(&node_id);
     }
 
-    /// Set one origin cursor to an exact materialized version. Unlike
-    /// `update_last_client_versions`, this deliberately permits a lower value
-    /// after an origin changes epoch and the client projection rebases from a
-    /// new snapshot.
-    pub(crate) async fn set_last_client_version(&self, node_id: u16, version: u64) {
-        let mut map = self.last_client_version.lock();
-        if version == 0 {
-            map.remove(&node_id);
-        } else {
-            map.insert(node_id, version);
-        }
+    pub async fn get_last_client_epochs(&self) -> HashMap<u16, u64> {
+        self.client_state_cursors.lock().epochs.clone()
+    }
+
+    pub async fn get_last_client_cursors(&self) -> (HashMap<u16, u64>, HashMap<u16, u64>) {
+        let cursors = self.client_state_cursors.lock();
+        (cursors.versions.clone(), cursors.epochs.clone())
+    }
+
+    /// Replace the complete materialized client-state cursor cut.
+    pub async fn set_last_client_cursors(
+        &self,
+        versions: HashMap<u16, u64>,
+        epochs: HashMap<u16, u64>,
+    ) {
+        let mut cursors = self.client_state_cursors.lock();
+        cursors.versions = versions
+            .into_iter()
+            .filter(|(_, version)| *version != 0)
+            .collect();
+        cursors.epochs = epochs;
     }
 
     /// Get the last channel-state version seen.
@@ -1303,6 +1322,10 @@ impl Client {
 
     pub(crate) fn mark_removed(&self) {
         let _ = self.removed_tx.send(true);
+    }
+
+    pub(crate) fn is_removed(&self) -> bool {
+        *self.removed_rx.borrow()
     }
 
     pub(crate) async fn removed(&self) {

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use shitspeak_state::ChannelOperation;
@@ -19,6 +20,11 @@ use crate::client::state_log::{
 use crate::client::visibility::UserVisibilityState;
 use crate::client::{Client, ClientInstanceId, OwnedMessageBatch, PostAuthBaseline};
 use crate::errors::HandleIncomingConnectionError;
+use crate::observability::{
+    ClientProjectionDisconnectReason, ClientProjectionRecoveryOutcome,
+    ClientProjectionRecoveryReason, record_client_projection_disconnect,
+    record_client_projection_recovery,
+};
 use shitspeak_messages::messages::Message;
 
 use super::Server;
@@ -50,9 +56,12 @@ pub(crate) struct ClientProjectionState {
     session_channel_shadow: SessionChannelShadow,
     user_visibility: UserVisibilityState,
     last_client_versions: HashMap<u16, u64>,
+    last_client_epochs: HashMap<u16, u64>,
     last_channel_version: u64,
     replay_client_log: bool,
     replay_channel_log: bool,
+    reconcile_root_channel: bool,
+    client_recovery_reason: Option<ClientProjectionRecoveryReason>,
     baseline_visibility_generation: Option<u64>,
 }
 
@@ -64,6 +73,7 @@ impl ClientProjectionState {
         client: Arc<Box<Client>>,
         baseline: PostAuthBaseline,
         last_client_versions: HashMap<u16, u64>,
+        last_client_epochs: HashMap<u16, u64>,
         last_channel_version: u64,
     ) -> Self {
         let (session_channel_shadow, channel_tree_shadow, user_visibility, visibility_generation) =
@@ -75,6 +85,7 @@ impl ClientProjectionState {
             session_channel_shadow,
             user_visibility,
             last_client_versions,
+            last_client_epochs,
             last_channel_version,
         );
         state.baseline_visibility_generation = visibility_generation;
@@ -88,6 +99,7 @@ impl ClientProjectionState {
         session_channel_shadow: SessionChannelShadow,
         user_visibility: UserVisibilityState,
         last_client_versions: HashMap<u16, u64>,
+        last_client_epochs: HashMap<u16, u64>,
         last_channel_version: u64,
     ) -> Self {
         Self {
@@ -98,9 +110,12 @@ impl ClientProjectionState {
             session_channel_shadow,
             user_visibility,
             last_client_versions,
+            last_client_epochs,
             last_channel_version,
             replay_client_log: false,
             replay_channel_log: false,
+            reconcile_root_channel: false,
+            client_recovery_reason: None,
             baseline_visibility_generation: None,
         }
     }
@@ -200,12 +215,35 @@ impl ClientProjectionState {
             let last = self.last_channel_version;
             self.append_channel_gap(&server, last, u64::MAX, outbound)
                 .await?;
+            if self.reconcile_root_channel {
+                self.reconcile_root_channel = false;
+                self.append_current_root_channel(&server, outbound).await;
+            }
         }
         if self.replay_client_log {
             self.replay_client_log = false;
-            self.append_client_gap(&server, outbound).await?;
+            let reason = self.client_recovery_reason.take();
+            self.append_client_gap(&server, outbound, reason).await?;
         }
         Ok(())
+    }
+
+    async fn append_current_root_channel(
+        &mut self,
+        server: &Arc<Box<Server>>,
+        outbound: &mut Vec<Message>,
+    ) {
+        let server_id = self.client.server_id();
+        let Some(root) = server.channels.get_channel_in_server(&server_id, 0).await else {
+            return;
+        };
+        let message: Message =
+            crate::channel_handler::build_channel_state_message(server, &self.client, &root)
+                .await
+                .into();
+        self.channel_tree_shadow.sync_message(&message);
+        self.channel_permission_shadow.sync_message(&message);
+        outbound.push(message);
     }
 
     async fn append_channel_operation(
@@ -215,6 +253,17 @@ impl ClientProjectionState {
         outbound: &mut Vec<Message>,
     ) -> Result<(), HandleIncomingConnectionError> {
         if operation.server_id != self.client.server_id() {
+            return Ok(());
+        }
+
+        if let shitspeak_state::ChannelOp::UpdateChannel { id: 0, patch } = &operation.op
+            && let Some(name) = patch.name.as_deref()
+            && server
+                .channels
+                .get_channel_in_server(&operation.server_id, 0)
+                .await
+                .is_some_and(|root| root.name != name)
+        {
             return Ok(());
         }
 
@@ -389,7 +438,7 @@ impl ClientProjectionState {
         {
             let latest = server.channels.current_version_in_server(&server_id);
             if latest > last {
-                self.append_channel_snapshot(server, &server_id, latest, outbound)
+                self.append_channel_snapshot(server, &server_id, outbound)
                     .await;
             }
             return Ok(());
@@ -410,10 +459,12 @@ impl ClientProjectionState {
         &mut self,
         server: &Arc<Box<Server>>,
         server_id: &str,
-        latest: u64,
         outbound: &mut Vec<Message>,
     ) {
-        let snapshot = server.channels.ordered_snapshot_in_server(server_id);
+        let (snapshot, latest) = server
+            .channels
+            .ordered_snapshot_with_version_in_server(server_id)
+            .await;
         self.channel_permission_shadow.clear();
         let previous = self.channel_tree_shadow.clone();
         let mut current = ChannelTreeShadow::new();
@@ -475,6 +526,7 @@ impl ClientProjectionState {
                     self.append_origin_reset(server, entry.node_id, outbound)
                         .await;
                     self.last_client_versions.remove(&entry.node_id);
+                    self.last_client_epochs.remove(&entry.node_id);
                     return Ok(());
                 }
                 Some(_) => {
@@ -501,6 +553,7 @@ impl ClientProjectionState {
         match broadcast.versions.get(&entry.node_id).copied() {
             Some(0) => {
                 self.last_client_versions.remove(&entry.node_id);
+                self.last_client_epochs.remove(&entry.node_id);
                 last_for_node = entry.version.saturating_sub(1);
             }
             Some(current) if current < last_for_node => {
@@ -513,7 +566,7 @@ impl ClientProjectionState {
             return Ok(());
         }
         if entry.version > last_for_node.saturating_add(1) {
-            self.append_client_gap(server, outbound).await?;
+            self.append_client_gap(server, outbound, None).await?;
             return Ok(());
         }
         if should_skip_client_add_entry(
@@ -539,12 +592,16 @@ impl ClientProjectionState {
         origin: u16,
         outbound: &mut Vec<Message>,
     ) {
+        let viewer_session = self.client.get_session_id();
+        let viewer_old_channel = self.session_channel_shadow.get(&viewer_session).copied();
         let sessions = take_origin_sessions_from_shadow(&mut self.session_channel_shadow, origin);
         let server_id = self.client.server_id();
         for session in sessions {
-            if session == self.client.get_session_id() {
-                self.session_channel_shadow
-                    .insert(session, self.client.get_current_channel_id());
+            if session == viewer_session {
+                self.session_channel_shadow.insert(
+                    session,
+                    viewer_old_channel.unwrap_or_else(|| self.client.get_current_channel_id()),
+                );
                 continue;
             }
             let removal: Message = shitspeak_messages::messages::encoder::UserRemove {
@@ -642,25 +699,54 @@ impl ClientProjectionState {
         &mut self,
         server: &Arc<Box<Server>>,
         outbound: &mut Vec<Message>,
+        trigger_reason: Option<ClientProjectionRecoveryReason>,
     ) -> Result<(), HandleIncomingConnectionError> {
+        let started_at = Instant::now();
         let server_id = self.client.server_id();
         let catch_up = server
             .clients
             .replay_entries_since_in_server_for_client(
                 &server_id,
                 &self.last_client_versions,
+                &self.last_client_epochs,
                 self.client.get_session_id(),
                 self.client.client_instance_id(),
             )
             .await;
-        let (rebases, missed, target_versions) = catch_up.into_parts();
+        let (rebases, missed, target_versions, target_epochs) = catch_up.into_parts();
+        let mut recovery_reason = trigger_reason;
+        let mut projected_users: usize = 0;
 
-        let mut rebased_origins = std::collections::HashSet::with_capacity(rebases.len());
-        for rebase in rebases {
-            let (origin, version, entries) = rebase.into_parts();
-            rebased_origins.insert(origin);
-            self.append_origin_reset(server, origin, outbound).await;
-            for entry in entries {
+        let result = async {
+            for rebase in rebases {
+                let (origin, _version, epoch, entries) = rebase.into_parts();
+                let had_cursor = self.last_client_versions.contains_key(&origin)
+                    || self.last_client_epochs.contains_key(&origin);
+                if had_cursor && self.last_client_epochs.get(&origin).copied() != epoch {
+                    recovery_reason = Some(ClientProjectionRecoveryReason::EpochChange);
+                } else if !matches!(
+                    recovery_reason,
+                    Some(ClientProjectionRecoveryReason::EpochChange)
+                ) {
+                    recovery_reason = Some(ClientProjectionRecoveryReason::SnapshotFloor);
+                }
+                projected_users = projected_users.saturating_add(entries.len());
+
+                self.append_origin_reset(server, origin, outbound).await;
+                for entry in entries {
+                    if should_skip_client_add_entry(
+                        &entry.op,
+                        self.client.get_session_id(),
+                        self.client.client_instance_id(),
+                        &self.session_channel_shadow,
+                    ) {
+                        continue;
+                    }
+                    self.append_client_entry(server, &entry, outbound).await?;
+                }
+            }
+
+            for entry in missed {
                 if should_skip_client_add_entry(
                     &entry.op,
                     self.client.get_session_id(),
@@ -671,30 +757,30 @@ impl ClientProjectionState {
                 }
                 self.append_client_entry(server, &entry, outbound).await?;
             }
-            if version == 0 {
-                self.last_client_versions.remove(&origin);
+            self.last_client_versions = target_versions
+                .into_iter()
+                .filter(|(_, version)| *version != 0)
+                .collect();
+            self.last_client_epochs = target_epochs;
+            Ok(())
+        }
+        .await;
+
+        if let Some(reason) = recovery_reason {
+            let outcome = if result.is_ok() {
+                ClientProjectionRecoveryOutcome::Recovered
             } else {
-                self.last_client_versions.insert(origin, version);
-            }
+                ClientProjectionRecoveryOutcome::Failed
+            };
+            record_client_projection_recovery(
+                reason,
+                outcome,
+                started_at.elapsed(),
+                projected_users,
+            );
         }
 
-        for entry in missed {
-            if should_skip_client_add_entry(
-                &entry.op,
-                self.client.get_session_id(),
-                self.client.client_instance_id(),
-                &self.session_channel_shadow,
-            ) {
-                continue;
-            }
-            self.append_client_entry(server, &entry, outbound).await?;
-        }
-        for (origin, version) in target_versions {
-            if !rebased_origins.contains(&origin) {
-                merge_one_version(&mut self.last_client_versions, origin, version);
-            }
-        }
-        Ok(())
+        result
     }
 }
 
@@ -708,6 +794,7 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
         // this shard. Catch both logs up before registration is acknowledged.
         self.replay_channel_log = true;
         self.replay_client_log = true;
+        self.client_recovery_reason = Some(ClientProjectionRecoveryReason::Registration);
         let mut outbound = Vec::new();
         self.resynchronize(&mut outbound).await?;
         let server = self.server()?;
@@ -734,21 +821,22 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
         let result = async {
             match event {
                 ClientProjectionEvent::ClientLagged(skipped) => {
-                    tracing::error!(
+                    tracing::warn!(
                         session = u32::from(self.client.get_session_id()),
                         skipped,
-                        "client projection router lagged across an epoch boundary; disconnecting for clean resync"
+                        "client projection event bridge lagged; replaying immediately"
                     );
-                    return Err(HandleIncomingConnectionError::ClientLogGapUnrecoverable);
+                    self.replay_client_log = true;
+                    self.client_recovery_reason = Some(ClientProjectionRecoveryReason::RouterLag);
                 }
                 ClientProjectionEvent::ChannelLagged(skipped) => {
                     tracing::warn!(
                         session = u32::from(self.client.get_session_id()),
                         skipped,
-                        "channel projection event bridge lagged; scheduling replay"
+                        "channel projection event bridge lagged; replaying immediately"
                     );
                     self.replay_channel_log = true;
-                    return Ok(OwnedMessageBatch::new(Vec::new()));
+                    self.reconcile_root_channel = true;
                 }
                 _ => {}
             }
@@ -766,15 +854,14 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
                         .await?;
                 }
                 ClientProjectionEvent::VisibilityReload => {
-                    let messages =
-                        crate::client::visibility::visibility_config_reload_messages(
-                            &server,
-                            &self.client,
-                            &mut self.user_visibility,
-                            &mut self.channel_tree_shadow,
-                            &mut self.session_channel_shadow,
-                        )
-                        .await;
+                    let messages = crate::client::visibility::visibility_config_reload_messages(
+                        &server,
+                        &self.client,
+                        &mut self.user_visibility,
+                        &mut self.channel_tree_shadow,
+                        &mut self.session_channel_shadow,
+                    )
+                    .await;
                     outbound.extend(
                         crate::channel_handler::suppress_known_projected_permission_messages(
                             messages,
@@ -783,9 +870,7 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
                     );
                 }
                 ClientProjectionEvent::ClientLagged(_)
-                | ClientProjectionEvent::ChannelLagged(_) => {
-                    unreachable!("lag events return before normal dispatch")
-                }
+                | ClientProjectionEvent::ChannelLagged(_) => {}
             }
             Ok(OwnedMessageBatch::new(outbound))
         }
@@ -799,12 +884,19 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
     fn deliver(&self, output: Self::Output) -> DeliverResult {
         match self.client.try_write_owned_message_batch(output) {
             Ok(()) => DeliverResult::Delivered,
-            Err(
-                tokio::sync::mpsc::error::TrySendError::Full(_)
-                | tokio::sync::mpsc::error::TrySendError::Closed(_),
-            ) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 // A full queue cannot be awaited by a shard. Disconnecting is
                 // conservative and bounds both memory and head-of-line delay.
+                record_client_projection_disconnect(
+                    ClientProjectionDisconnectReason::WriterQueueFull,
+                );
+                self.client.request_disconnect();
+                DeliverResult::Remove
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                record_client_projection_disconnect(
+                    ClientProjectionDisconnectReason::WriterQueueClosed,
+                );
                 self.client.request_disconnect();
                 DeliverResult::Remove
             }
@@ -819,9 +911,38 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
         tracing::warn!(
             session = u32::from(self.client.get_session_id()),
             skipped,
-            "projection shard event log lagged; disconnecting subscriber for a clean resync"
+            "projection shard event log lagged; recovering merged state"
         );
-        LagAction::Remove
+        self.replay_client_log = true;
+        self.replay_channel_log = true;
+        self.reconcile_root_channel = true;
+        self.client_recovery_reason = Some(ClientProjectionRecoveryReason::ShardLag);
+        LagAction::Keep
+    }
+
+    async fn recover_lag(&mut self) -> Result<Option<Self::Output>, Self::Error> {
+        let mut outbound = Vec::new();
+        // The merged shard stream can contain visibility notifications as well
+        // as client and channel operations. Apply current visibility first so
+        // replay cannot transiently disclose state hidden by a skipped reload.
+        let server = self.server()?;
+        let messages = crate::client::visibility::visibility_config_reload_messages(
+            &server,
+            &self.client,
+            &mut self.user_visibility,
+            &mut self.channel_tree_shadow,
+            &mut self.session_channel_shadow,
+        )
+        .await;
+        outbound.extend(
+            crate::channel_handler::suppress_known_projected_permission_messages(
+                messages,
+                &mut self.channel_permission_shadow,
+            ),
+        );
+        self.resynchronize(&mut outbound).await?;
+
+        Ok((!outbound.is_empty()).then(|| OwnedMessageBatch::new(outbound)))
     }
 }
 
@@ -892,6 +1013,7 @@ mod tests {
             SessionChannelShadow::new(),
             UserVisibilityState::default(),
             HashMap::new(),
+            HashMap::new(),
             0,
         )
     }
@@ -920,6 +1042,22 @@ mod tests {
         removed.sort_unstable_by_key(|session| u32::from(*session));
         assert_eq!(removed, vec![node_one_a, node_one_b]);
         assert_eq!(shadow.get(&node_two), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn shard_lag_keeps_projection_and_marks_both_logs_for_replay() {
+        let repo = ClientRepository::new(1, 16);
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let local = SocketAddr::new(ip, 64738);
+        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(1);
+        let client = repo
+            .allocate_web_client(ip, SocketAddr::new(ip, 30000), local, output_tx)
+            .await;
+        let mut projection = projection_for_delivery(client);
+
+        assert_eq!(projection.on_lag(7), LagAction::Keep);
+        assert!(projection.replay_client_log);
+        assert!(projection.replay_channel_log);
     }
 
     #[tokio::test]

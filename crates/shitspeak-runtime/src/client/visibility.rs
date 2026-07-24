@@ -539,6 +539,18 @@ impl UserVisibilityState {
             .map(|known| known.channel_id)
     }
 
+    /// Record a user state that was sent through the viewer-independent fast
+    /// path. Keeping this shadow populated lets a later authoritative rebase
+    /// express removals and false/cleared fields as a real delta.
+    pub(crate) fn remember_projected_user(
+        &mut self,
+        session: ClientSessionIdentifier,
+        channel_id: u32,
+        listener_channels: HashSet<u32>,
+    ) {
+        self.insert(session, channel_id, listener_channels);
+    }
+
     fn get(&self, session: ClientSessionIdentifier) -> Option<&KnownUserVisibility> {
         self.known.get(&u32::from(session))
     }

@@ -35,6 +35,9 @@ struct TestSubscriber {
     registration: RegistrationBehavior,
     lag_action: LagAction,
     lag_tx: Option<mpsc::UnboundedSender<u64>>,
+    lag_recovery_output: Option<u64>,
+    lag_recovery_error: bool,
+    remove_delivery: Option<u64>,
     block_event: Option<u64>,
     handle_started_tx: Option<mpsc::UnboundedSender<()>>,
     handle_release: Option<Arc<Notify>>,
@@ -49,6 +52,9 @@ impl TestSubscriber {
             registration: RegistrationBehavior::None,
             lag_action: LagAction::Remove,
             lag_tx: None,
+            lag_recovery_output: None,
+            lag_recovery_error: false,
+            remove_delivery: None,
             block_event: None,
             handle_started_tx: None,
             handle_release: None,
@@ -69,6 +75,21 @@ impl TestSubscriber {
     ) -> Self {
         self.lag_action = lag_action;
         self.lag_tx = Some(lag_tx);
+        self
+    }
+
+    fn with_lag_recovery_output(mut self, output: u64) -> Self {
+        self.lag_recovery_output = Some(output);
+        self
+    }
+
+    fn with_lag_recovery_error(mut self) -> Self {
+        self.lag_recovery_error = true;
+        self
+    }
+
+    fn removing_delivery(mut self, output: u64) -> Self {
+        self.remove_delivery = Some(output);
         self
     }
 
@@ -128,6 +149,9 @@ impl ShardedSubscriber<u64> for TestSubscriber {
     }
 
     fn deliver(&self, output: Self::Output) -> DeliverResult {
+        if self.remove_delivery == Some(output) {
+            return DeliverResult::Remove;
+        }
         match self.output_tx.try_send(output) {
             Ok(()) => DeliverResult::Delivered,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -145,6 +169,14 @@ impl ShardedSubscriber<u64> for TestSubscriber {
             let _ = lag_tx.send(skipped);
         }
         self.lag_action
+    }
+
+    async fn recover_lag(&mut self) -> Result<Option<Self::Output>, Self::Error> {
+        if self.lag_recovery_error {
+            Err(TestError)
+        } else {
+            Ok(self.lag_recovery_output.take())
+        }
     }
 }
 
@@ -313,6 +345,114 @@ async fn lag_action_keeps_replayable_subscriber_and_removes_unrecoverable_peer()
     })
     .await
     .expect("subscriber returning LagAction::Remove was retained");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kept_subscriber_recovers_immediately_after_shard_lag() {
+    let (event_tx, _) = broadcast::channel(1);
+    let pool = ShardedSubscriberPool::new(&event_tx, MIN_PROJECTION_SHARDS).unwrap();
+    let (output_tx, mut output_rx) = mpsc::channel(8);
+    let (lag_tx, mut lag_rx) = mpsc::unbounded_channel();
+    let (handle_started_tx, mut handle_started_rx) = mpsc::unbounded_channel();
+    let handle_release = Arc::new(Notify::new());
+
+    let _registration = pool
+        .register(
+            "immediate-lag-recovery",
+            TestSubscriber::new(output_tx)
+                .with_lag_action(LagAction::Keep, lag_tx)
+                .with_lag_recovery_output(999)
+                .blocking_on(1, handle_started_tx, Arc::clone(&handle_release)),
+        )
+        .await
+        .unwrap();
+
+    event_tx.send(1).unwrap();
+    timeout(TEST_TIMEOUT, handle_started_rx.recv())
+        .await
+        .unwrap()
+        .expect("subscriber did not start handling the blocking event");
+    for event in 2..=32 {
+        event_tx.send(event).unwrap();
+    }
+    handle_release.notify_one();
+
+    assert_eq!(output_rx.recv().await, Some(1));
+    assert!(
+        timeout(TEST_TIMEOUT, lag_rx.recv())
+            .await
+            .unwrap()
+            .expect("subscriber did not observe shard lag")
+            > 0
+    );
+    assert_eq!(
+        timeout(TEST_TIMEOUT, output_rx.recv()).await.unwrap(),
+        Some(999),
+        "lag recovery waited for a later normal event"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_or_undeliverable_lag_recovery_removes_subscriber() {
+    let (event_tx, _) = broadcast::channel(1);
+    let pool = ShardedSubscriberPool::new(&event_tx, MIN_PROJECTION_SHARDS).unwrap();
+    let (error_output_tx, mut error_output_rx) = mpsc::channel(8);
+    let (remove_output_tx, mut remove_output_rx) = mpsc::channel(8);
+    let (lag_tx, mut lag_rx) = mpsc::unbounded_channel();
+    let (handle_started_tx, mut handle_started_rx) = mpsc::unbounded_channel();
+    let handle_release = Arc::new(Notify::new());
+
+    let error_registration = pool
+        .register(
+            "failed-lag-recovery",
+            TestSubscriber::new(error_output_tx)
+                .with_lag_action(LagAction::Keep, lag_tx)
+                .with_lag_recovery_error()
+                .blocking_on(1, handle_started_tx, Arc::clone(&handle_release)),
+        )
+        .await
+        .unwrap();
+    let remove_registration = pool
+        .register(
+            "failed-lag-recovery",
+            TestSubscriber::new(remove_output_tx)
+                .with_lag_action(LagAction::Keep, mpsc::unbounded_channel().0)
+                .with_lag_recovery_output(999)
+                .removing_delivery(999),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        error_registration.shard_index(),
+        remove_registration.shard_index()
+    );
+
+    event_tx.send(1).unwrap();
+    timeout(TEST_TIMEOUT, handle_started_rx.recv())
+        .await
+        .unwrap()
+        .expect("subscriber did not start handling the blocking event");
+    for event in 2..=32 {
+        event_tx.send(event).unwrap();
+    }
+    handle_release.notify_one();
+
+    assert_eq!(error_output_rx.recv().await, Some(1));
+    assert_eq!(remove_output_rx.recv().await, Some(1));
+    timeout(TEST_TIMEOUT, lag_rx.recv())
+        .await
+        .unwrap()
+        .expect("subscriber did not observe shard lag");
+    assert_eq!(
+        timeout(TEST_TIMEOUT, error_output_rx.recv()).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        timeout(TEST_TIMEOUT, remove_output_rx.recv())
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

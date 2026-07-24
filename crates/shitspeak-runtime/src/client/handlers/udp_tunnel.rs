@@ -9,11 +9,11 @@ pub(super) async fn handle_udp_tunnel(
     sender: &Arc<Box<crate::client::Client>>,
     data: Bytes,
 ) -> Result<(), MessageHandlerError> {
-    if !sender.is_authenticated() {
+    if !sender.is_authenticated() || !sender.is_published() || sender.is_removed() {
         tracing::trace!(
             session = u32::from(sender.get_session_id()),
             len = data.len(),
-            "dropping UDPTunnel before authentication completed"
+            "dropping UDPTunnel from inactive client"
         );
         return Ok(());
     }

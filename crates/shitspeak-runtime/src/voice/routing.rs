@@ -653,7 +653,7 @@ fn push_unique_target(
     {
         return;
     }
-    if !client.is_authenticated() {
+    if !client.is_authenticated() || !client.is_published() {
         return;
     }
     if !client.read_local_state().is_some() {
@@ -698,7 +698,7 @@ async fn live_targets_from_cached_recipients(
         if client.client_instance_id() != recipient.client_instance_id() {
             continue;
         }
-        if !client.is_authenticated() {
+        if !client.is_authenticated() || !client.is_published() {
             continue;
         }
         if !client.read_local_state().is_some() {
@@ -1575,6 +1575,13 @@ async fn route_voice_inner(
 ) {
     let started_at = Instant::now();
     let sender_id = sender.get_session_id();
+    if !sender.is_authenticated() || !sender.is_published() || sender.is_removed() {
+        tracing::trace!(
+            session = u32::from(sender_id),
+            "not routing voice packet from inactive client"
+        );
+        return;
+    }
     let server_id = sender.server_id();
     let sender_channel = sender.get_current_channel_id();
 

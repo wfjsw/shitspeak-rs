@@ -13,7 +13,7 @@ use crate::protocol::{
 };
 use crate::session::{
     WebSessionContext, WebSessionTransport, apply_control_command, client_is_current,
-    initial_server_events, server_event_from_message,
+    initial_server_events_with_channel_snapshot, server_event_from_message,
 };
 use crate::voice::{InboundVoiceMetadata, SsrcAllocator, VoiceTargetKind};
 use shitspeak_runtime::api::Authenticator;
@@ -22,6 +22,8 @@ use shitspeak_runtime::client::state_log::{ClientStateLogEntry, ClientStateOpera
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{Client, client_session_identifier::ClientSessionIdentifier};
 use shitspeak_runtime::messages::Message;
+#[cfg(feature = "moq")]
+use shitspeak_runtime::messages::encoder::ChannelRemove;
 use shitspeak_runtime::server::Server;
 use shitspeak_runtime::voice::codec::{Audio, AudioPayload, OpusPayload, PacketFormat};
 use shitspeak_runtime_config::{WebConfig, WebMoqConfig};
@@ -695,35 +697,36 @@ impl MoqSessionRuntime {
         self.voice_rx = client.take_voice_tcp_rx();
         self.client = Some(Arc::clone(&client));
         self.visibility_reload_rx = Some(server.subscribe_visibility_reload());
+        let (_clients, client_versions, client_epochs, client_log_rx) = server
+            .get_clients()
+            .published_snapshot_with_versions_and_subscription_in_server(&client.server_id())
+            .await;
+        let (channel_snapshot, channel_version, channel_log_rx) = server
+            .get_channels()
+            .ordered_snapshot_with_version_and_subscription_in_server(&client.server_id())
+            .await;
 
         let mut events = vec![ServerEvent::Authenticated {
             session,
             display_name,
         }];
         events.extend(
-            initial_server_events(
+            initial_server_events_with_channel_snapshot(
                 &server,
                 &client,
+                &channel_snapshot,
                 &mut self.channel_tree_shadow,
                 &mut self.channel_shadow,
                 &mut self.user_visibility,
             )
             .await,
         );
+        client.set_last_channel_version(channel_version).await;
         client
-            .set_last_channel_version(
-                server
-                    .get_channels()
-                    .current_version_in_server(&client.server_id()),
-            )
+            .set_last_client_cursors(client_versions, client_epochs)
             .await;
-        let (_, versions) = server
-            .get_clients()
-            .snapshot_with_versions_in_server(&client.server_id())
-            .await;
-        client.update_last_client_versions(&versions).await;
-        self.client_log_rx = Some(server.get_clients().subscribe());
-        self.channel_log_rx = Some(server.get_channels().subscribe());
+        self.client_log_rx = Some(client_log_rx);
+        self.channel_log_rx = Some(channel_log_rx);
         shitspeak_runtime::client::handlers::spawn_staged_session_blob_resolution(
             Arc::clone(&server),
             Arc::clone(&client),
@@ -960,11 +963,15 @@ impl MoqSessionRuntime {
                 events.extend(messages.into_iter().filter_map(server_event_from_message));
             }
         }
-        if let Some(op) = recv_broadcast_now(self.channel_log_rx.as_mut()).await? {
-            events.extend(self.channel_log_events(op).await?);
+        match recv_broadcast_now(self.channel_log_rx.as_mut()).await? {
+            BroadcastNow::Item(op) => events.extend(self.channel_log_events(op).await?),
+            BroadcastNow::Lagged => events.extend(self.channel_snapshot_recovery_events().await?),
+            BroadcastNow::Empty => {}
         }
-        if let Some(payload) = recv_broadcast_now(self.client_log_rx.as_mut()).await? {
-            events.extend(self.client_log_events(payload).await?);
+        match recv_broadcast_now(self.client_log_rx.as_mut()).await? {
+            BroadcastNow::Item(payload) => events.extend(self.client_log_events(payload).await?),
+            BroadcastNow::Lagged => events.extend(self.client_log_gap_events().await?),
+            BroadcastNow::Empty => {}
         }
         Ok(events)
     }
@@ -982,7 +989,13 @@ impl MoqSessionRuntime {
         };
         let last = client.get_last_channel_version().await;
         let server_id = client.server_id();
-        if op.server_id != server_id || op.version <= last {
+        if op.server_id != server_id {
+            return Ok(Vec::new());
+        }
+        if op.is_root_name_config_update() {
+            return self.channel_snapshot_recovery_events().await;
+        }
+        if op.version <= last {
             return Ok(Vec::new());
         }
         if op.version > last + 1 {
@@ -1101,8 +1114,12 @@ impl MoqSessionRuntime {
             .get_channels()
             .get_log_since_in_server(&server_id, last)
             .await;
-        if missed.is_empty() && last > 0 {
-            return Err("MoQ channel update gap is unrecoverable".to_string());
+        if missed.is_empty()
+            || missed
+                .first()
+                .is_some_and(|op| op.version > last.saturating_add(1))
+        {
+            return self.channel_snapshot_recovery_events().await;
         }
         let mut events = Vec::new();
         for op in missed {
@@ -1206,6 +1223,63 @@ impl MoqSessionRuntime {
     }
 
     #[cfg(feature = "moq")]
+    async fn channel_snapshot_recovery_events(&mut self) -> Result<Vec<ServerEvent>, String> {
+        let Some(server) = self.context.server().cloned() else {
+            return Ok(Vec::new());
+        };
+        let Some(client) = self.client.as_ref().cloned() else {
+            return Ok(Vec::new());
+        };
+        let server_id = client.server_id();
+        let (snapshot, version) = server
+            .get_channels()
+            .ordered_snapshot_with_version_in_server(&server_id)
+            .await;
+        let previous = self.channel_tree_shadow.clone();
+        let mut current = ChannelTreeShadow::new();
+        let messages =
+            shitspeak_runtime::channel_handler::build_visible_ordered_channel_snapshot_messages(
+                &server,
+                &client,
+                &snapshot,
+                &mut current,
+                server.get_send_permission_info(),
+            )
+            .await;
+        self.channel_tree_shadow = current;
+        let mut events = messages
+            .into_iter()
+            .filter_map(server_event_from_message)
+            .collect::<Vec<_>>();
+
+        let visibility_messages =
+            shitspeak_runtime::client::visibility::visibility_config_reload_messages(
+                &server,
+                &client,
+                &mut self.user_visibility,
+                &mut self.channel_tree_shadow,
+                &mut self.channel_shadow,
+            )
+            .await;
+        events.extend(
+            visibility_messages
+                .into_iter()
+                .filter_map(server_event_from_message),
+        );
+
+        let mut removed = previous
+            .difference(&self.channel_tree_shadow)
+            .copied()
+            .collect::<Vec<_>>();
+        removed.sort_unstable_by(|left, right| right.cmp(left));
+        events.extend(removed.into_iter().filter_map(|channel_id| {
+            server_event_from_message(ChannelRemove { channel_id }.into())
+        }));
+        client.set_last_channel_version(version).await;
+        Ok(events)
+    }
+
+    #[cfg(feature = "moq")]
     async fn client_log_events(
         &mut self,
         payload: Arc<shitspeak_runtime::client::state_log::ClientStateBroadcastPayload>,
@@ -1218,6 +1292,29 @@ impl MoqSessionRuntime {
         };
         let entry = &payload.entry;
         let server_id = client.server_id();
+        if matches!(entry.op, ClientStateOperation::ResetNode { .. }) {
+            match payload.versions.get(&entry.node_id).copied() {
+                Some(0) => {
+                    let events = client_origin_reset_events(
+                        &server,
+                        &client,
+                        &mut self.channel_tree_shadow,
+                        &mut self.channel_shadow,
+                        &mut self.user_visibility,
+                        &server_id,
+                        entry.node_id,
+                    )
+                    .await;
+                    client.remove_last_client_version(entry.node_id).await;
+                    return Ok(events);
+                }
+                Some(_) => {
+                    client.update_last_client_versions(&payload.versions).await;
+                    return Ok(Vec::new());
+                }
+                None => {}
+            }
+        }
         if entry.op.server_id() != server_id {
             return Ok(Vec::new());
         }
@@ -1268,19 +1365,59 @@ impl MoqSessionRuntime {
             return Ok(Vec::new());
         };
         let last_seen = client.get_last_client_versions().await;
+        let last_epochs = client.get_last_client_epochs().await;
         let server_id = client.server_id();
-        let (missed, versions) = server
+        let catch_up = server
             .get_clients()
             .replay_entries_since_in_server_for_client(
                 &server_id,
                 &last_seen,
+                &last_epochs,
                 client.get_session_id(),
                 client.client_instance_id(),
             )
-            .await
-            .map_err(|()| "MoQ client update gap is unrecoverable".to_string())?;
+            .await;
+        let (rebases, missed, versions, epochs) = catch_up.into_parts();
         let mut events = Vec::new();
+        for rebase in rebases {
+            let (origin, _version, _epoch, entries) = rebase.into_parts();
+            events.extend(
+                client_origin_reset_events(
+                    &server,
+                    &client,
+                    &mut self.channel_tree_shadow,
+                    &mut self.channel_shadow,
+                    &mut self.user_visibility,
+                    &server_id,
+                    origin,
+                )
+                .await,
+            );
+            for entry in entries {
+                if is_own_add_client(&entry.op, client.get_session_id())
+                    || is_known_add_client(&entry.op, &self.channel_shadow)
+                {
+                    continue;
+                }
+                events.extend(
+                    client_log_entry_events(
+                        &server,
+                        &client,
+                        &mut self.channel_tree_shadow,
+                        &mut self.channel_shadow,
+                        &mut self.user_visibility,
+                        &entry,
+                    )
+                    .await,
+                );
+            }
+        }
         for entry in missed {
+            if is_own_add_client(&entry.op, client.get_session_id())
+                || is_known_add_client(&entry.op, &self.channel_shadow)
+            {
+                continue;
+            }
             events.extend(
                 client_log_entry_events(
                     &server,
@@ -1293,7 +1430,7 @@ impl MoqSessionRuntime {
                 .await,
             );
         }
-        client.update_last_client_versions(&versions).await;
+        client.set_last_client_cursors(versions, epochs).await;
         Ok(events)
     }
 
@@ -1470,16 +1607,23 @@ fn write_audio_frame_to_track(
 }
 
 #[cfg(feature = "moq")]
+enum BroadcastNow<T> {
+    Item(Arc<T>),
+    Empty,
+    Lagged,
+}
+
+#[cfg(feature = "moq")]
 async fn recv_broadcast_now<T: Clone>(
     rx: Option<&mut tokio::sync::broadcast::Receiver<Arc<T>>>,
-) -> Result<Option<Arc<T>>, String> {
+) -> Result<BroadcastNow<T>, String> {
     let Some(rx) = rx else {
-        return Ok(None);
+        return Ok(BroadcastNow::Empty);
     };
     match rx.try_recv() {
-        Ok(item) => Ok(Some(item)),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => Ok(None),
-        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => Ok(None),
+        Ok(item) => Ok(BroadcastNow::Item(item)),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => Ok(BroadcastNow::Empty),
+        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => Ok(BroadcastNow::Lagged),
         Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
             Err("MoQ update stream closed".to_string())
         }
@@ -1628,6 +1772,56 @@ async fn client_log_entry_events(
     .into_iter()
     .filter_map(server_event_from_message)
     .collect()
+}
+
+#[cfg(feature = "moq")]
+async fn client_origin_reset_events(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+    server_id: &str,
+    origin: u16,
+) -> Vec<ServerEvent> {
+    let viewer_session = client.get_session_id();
+    let sessions = channel_shadow
+        .iter()
+        .map(|(session, _)| session)
+        .filter(|session| session.get_node_id() == origin)
+        .collect::<Vec<_>>();
+    for session in &sessions {
+        if *session != viewer_session {
+            channel_shadow.remove(session);
+        }
+    }
+
+    let mut events = Vec::new();
+    for session in sessions {
+        if session == viewer_session {
+            continue;
+        }
+        let removal: Message = shitspeak_runtime::messages::encoder::UserRemove {
+            session: u32::from(session),
+            actor: None,
+            reason: None,
+            ban: Some(false),
+        }
+        .into();
+        events.extend(
+            message_with_synthetic_events(
+                server,
+                client,
+                channel_tree_shadow,
+                channel_shadow,
+                user_visibility,
+                server_id,
+                &removal,
+            )
+            .await,
+        );
+    }
+    events
 }
 
 #[cfg(feature = "moq")]

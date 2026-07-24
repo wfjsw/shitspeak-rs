@@ -315,6 +315,10 @@ pending_delete_timeout_ms = 5000
 
 `authenticate_timeout_ms` starts after TLS setup. Positive `auth_finalization_concurrency` values limit how many clients can concurrently create UDP crypt setup state, run authenticator backend work, and perform the initial sync/publish path. Authenticator calls run on a bounded background-priority runtime (nice `+10` on Linux, lowest thread priority on Windows); bulk ACL refresh evaluation uses a separate one-worker runtime with the same background priority, while ordinary ACL checks remain on their existing path. Setting `auth_finalization_concurrency` to `0` bypasses the login queue and admission limit. When omitted, it defaults to `floor(3rd root(active CPU count))` with a minimum of 1. `pending_delete_timeout_ms` controls rollback timing for pending two-phase channel deletes.
 
+Client projection delivery uses a bounded outbound writer queue. A client that
+cannot drain that queue is disconnected when the queue fills so it cannot
+block other clients assigned to the same projection shard.
+
 ## Persistence
 
 ```toml
@@ -326,7 +330,17 @@ channel_snapshot_every_secs = 60
 channel_wal_compaction_expire_count = 2000
 ```
 
-`blob_storage_dir` stores channel snapshots, write-ahead logs, client state logs, channel blobs, session blob cache data, user channel cache data, and WASM authenticator durable state.
+`client_log_max_entries` bounds the replay history retained in memory for each
+client-state origin and defaults to `2000` when omitted. It is read when the
+client repository is created, so a hot-reload change takes effect only after
+restart. A shorter history saves memory but makes a lagging projection rebase
+from the materialized client snapshot more often. The client-state log is not
+written under `blob_storage_dir` and is rebuilt from live and S2S activity
+after every process start.
+
+`blob_storage_dir` stores channel snapshots, write-ahead logs, channel blobs,
+session blob cache data, user channel cache data, and WASM authenticator
+durable state.
 
 See [Persistence](persistence.md) for backup guidance.
 
@@ -1182,7 +1196,7 @@ Reloaded successfully at runtime:
 - `[privacy]` certificate hash protection and secret
 - additions to `server_entrypoints`
 
-Restart-sensitive settings include base listener changes, most existing listener remaps, S2S identity and most S2S transport/listen settings, storage paths, `auth_finalization_concurrency`, feature-gated web startup, metrics server startup, Loki startup, and public registration startup.
+Restart-sensitive settings include base listener changes, most existing listener remaps, S2S identity and most S2S transport/listen settings, storage paths, `client_log_max_entries`, `auth_finalization_concurrency`, feature-gated web startup, metrics server startup, Loki startup, and public registration startup.
 
 If a reload fails to parse or a staged authenticator/TLS identity cannot be loaded, the previous live configuration stays active.
 

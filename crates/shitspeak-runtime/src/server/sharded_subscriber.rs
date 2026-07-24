@@ -6,13 +6,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use futures_util::FutureExt as _;
+use futures_util::{FutureExt as _, StreamExt as _, stream};
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 pub(crate) const MIN_PROJECTION_SHARDS: usize = 4;
 pub(crate) const MAX_PROJECTION_SHARDS: usize = 8;
+const MAX_CONCURRENT_LAG_RECOVERIES: usize = 8;
 
 /// The outcome of a synchronous, non-blocking delivery attempt.
 ///
@@ -65,6 +66,15 @@ where
     /// Broadcast lag is explicit and conservative by default.
     fn on_lag(&mut self, _skipped: u64) -> LagAction {
         LagAction::Remove
+    }
+
+    /// Runs immediately after [`Self::on_lag`] elects to keep the subscriber.
+    ///
+    /// This is separate from `on_lag` so the cheap keep/remove decision remains
+    /// synchronous while log-backed subscribers can perform asynchronous
+    /// recovery without waiting for another live event to wake the shard.
+    async fn recover_lag(&mut self) -> Result<Option<Self::Output>, Self::Error> {
+        Ok(None)
     }
 }
 
@@ -380,19 +390,11 @@ where
                 match event {
                     Ok(event) => process_event(shard_index, &mut subscribers, &event).await,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        subscribers.retain(|registration_id, subscriber| {
-                            let keep = subscriber.on_lag(skipped) == LagAction::Keep;
-                            if !keep {
-                                subscriber.on_remove();
-                                tracing::warn!(
-                                    shard_index,
-                                    registration_id,
-                                    skipped,
-                                    "removing lagged sharded subscriber"
-                                );
-                            }
-                            keep
-                        });
+                        crate::observability::record_client_projection_lag(
+                            crate::observability::ClientProjectionLagSource::Shard,
+                            skipped,
+                        );
+                        process_lag(shard_index, &mut subscribers, skipped).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         return WorkerExit::EventSourceClosed;
@@ -401,6 +403,59 @@ where
             }
         }
     }
+}
+
+async fn process_lag<Event, Subscriber>(
+    shard_index: usize,
+    subscribers: &mut HashMap<u64, Subscriber>,
+    skipped: u64,
+) where
+    Event: Send + Sync + 'static,
+    Subscriber: ShardedSubscriber<Event>,
+{
+    // Recovery commonly scans shared repositories. Run the subscribers in a
+    // lagged shard concurrently so recovery time is bounded by the slowest
+    // subscriber rather than the sum of every subscriber's scan time.
+    let lagged = std::mem::take(subscribers);
+    let recovered = stream::iter(lagged.into_iter().map(
+        |(registration_id, mut subscriber)| async move {
+            let result = if subscriber.on_lag(skipped) == LagAction::Remove {
+                DeliverResult::Remove
+            } else {
+                match subscriber.recover_lag().await {
+                    Ok(Some(output)) => subscriber.deliver(output),
+                    Ok(None) => DeliverResult::Delivered,
+                    Err(error) => {
+                        tracing::warn!(
+                            shard_index,
+                            registration_id,
+                            skipped,
+                            error = %error,
+                            "removing sharded subscriber after lag recovery failed"
+                        );
+                        DeliverResult::Remove
+                    }
+                }
+            };
+
+            if result == DeliverResult::Remove {
+                subscriber.on_remove();
+                tracing::warn!(
+                    shard_index,
+                    registration_id,
+                    skipped,
+                    "removing lagged sharded subscriber"
+                );
+                None
+            } else {
+                Some((registration_id, subscriber))
+            }
+        },
+    ))
+    .buffer_unordered(MAX_CONCURRENT_LAG_RECOVERIES)
+    .collect::<Vec<_>>()
+    .await;
+    subscribers.extend(recovered.into_iter().flatten());
 }
 
 async fn process_event<Event, Subscriber>(

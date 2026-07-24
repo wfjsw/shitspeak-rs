@@ -1953,6 +1953,23 @@ impl ChannelRepository {
         }
     }
 
+    /// Capture a channel tree and its committed version under the repository's
+    /// write-transaction fence. This avoids pairing a version reserved by an
+    /// in-flight operation with the state from before that operation.
+    pub async fn ordered_snapshot_with_version_in_server(
+        &self,
+        server_id: &str,
+    ) -> (OrderedChannelSnapshot, u64) {
+        let _write_transaction = self.strict_apply_lock.lock().await;
+        let channels = self.channels.read();
+        let version = self.versions.read().get(server_id).copied().unwrap_or(0);
+        let channels = match channels.get(server_id) {
+            Some(channels) => self.ordered_channel_view_in_server(server_id, channels),
+            None => Arc::from(vec![Arc::new(self.root_channel())].into_boxed_slice()),
+        };
+        (channels, version)
+    }
+
     pub fn snapshot_with_version_and_subscription_in_server(
         &self,
         server_id: &str,
@@ -1965,6 +1982,16 @@ impl ChannelRepository {
             None => Arc::from(vec![Arc::new(self.root_channel())].into_boxed_slice()),
         };
         (channels, version, rx)
+    }
+
+    /// Capture a committed channel tree, its version, and a subscription that
+    /// receives every operation committed after that capture.
+    pub async fn ordered_snapshot_with_version_and_subscription_in_server(
+        &self,
+        server_id: &str,
+    ) -> (OrderedChannelSnapshot, u64, ChannelStateSubscription) {
+        let _write_transaction = self.strict_apply_lock.lock().await;
+        self.snapshot_with_version_and_subscription_in_server(server_id)
     }
 
     /// Return the total number of channels.
@@ -6303,8 +6330,9 @@ mod tests {
     #[tokio::test]
     async fn subscribed_snapshot_receives_followup_channel_operations() {
         let repo = repo();
-        let (channels, version, mut rx) =
-            repo.snapshot_with_version_and_subscription_in_server("alpha");
+        let (channels, version, mut rx) = repo
+            .ordered_snapshot_with_version_and_subscription_in_server("alpha")
+            .await;
 
         assert_eq!(version, 0);
         assert!(channels.iter().any(|channel| channel.id == 0));

@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -25,6 +26,147 @@ use shitspeak_s2s::overlay::OverlayNetwork;
 use shitspeak_s2s::status::{self, PrometheusSample};
 use shitspeak_s2s_transport::ConnectionManager;
 use shitspeak_state::ChannelRepository;
+
+const CLIENT_PROJECTION_RECOVERY_REASON_COUNT: usize = 5;
+const CLIENT_PROJECTION_RECOVERY_OUTCOME_COUNT: usize = 2;
+const CLIENT_PROJECTION_LAG_SOURCE_COUNT: usize = 2;
+const CLIENT_PROJECTION_DISCONNECT_REASON_COUNT: usize = 2;
+
+static CLIENT_PROJECTION_RECOVERIES: [AtomicU64;
+    CLIENT_PROJECTION_RECOVERY_REASON_COUNT * CLIENT_PROJECTION_RECOVERY_OUTCOME_COUNT] =
+    [const { AtomicU64::new(0) };
+        CLIENT_PROJECTION_RECOVERY_REASON_COUNT * CLIENT_PROJECTION_RECOVERY_OUTCOME_COUNT];
+static CLIENT_PROJECTION_RECOVERY_DURATION_MICROS: [AtomicU64;
+    CLIENT_PROJECTION_RECOVERY_REASON_COUNT] =
+    [const { AtomicU64::new(0) }; CLIENT_PROJECTION_RECOVERY_REASON_COUNT];
+static CLIENT_PROJECTION_RECOVERY_USERS: [AtomicU64; CLIENT_PROJECTION_RECOVERY_REASON_COUNT] =
+    [const { AtomicU64::new(0) }; CLIENT_PROJECTION_RECOVERY_REASON_COUNT];
+static CLIENT_PROJECTION_LAGGED_EVENTS: [AtomicU64; CLIENT_PROJECTION_LAG_SOURCE_COUNT] =
+    [const { AtomicU64::new(0) }; CLIENT_PROJECTION_LAG_SOURCE_COUNT];
+static CLIENT_PROJECTION_DISCONNECTS: [AtomicU64; CLIENT_PROJECTION_DISCONNECT_REASON_COUNT] =
+    [const { AtomicU64::new(0) }; CLIENT_PROJECTION_DISCONNECT_REASON_COUNT];
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ClientProjectionRecoveryReason {
+    Registration,
+    RouterLag,
+    ShardLag,
+    EpochChange,
+    SnapshotFloor,
+}
+
+impl ClientProjectionRecoveryReason {
+    const ALL: [Self; CLIENT_PROJECTION_RECOVERY_REASON_COUNT] = [
+        Self::Registration,
+        Self::RouterLag,
+        Self::ShardLag,
+        Self::EpochChange,
+        Self::SnapshotFloor,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Registration => "registration",
+            Self::RouterLag => "router_lag",
+            Self::ShardLag => "shard_lag",
+            Self::EpochChange => "epoch_change",
+            Self::SnapshotFloor => "snapshot_floor",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ClientProjectionRecoveryOutcome {
+    Recovered,
+    Failed,
+}
+
+impl ClientProjectionRecoveryOutcome {
+    const ALL: [Self; CLIENT_PROJECTION_RECOVERY_OUTCOME_COUNT] = [Self::Recovered, Self::Failed];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Recovered => "recovered",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ClientProjectionDisconnectReason {
+    WriterQueueFull,
+    WriterQueueClosed,
+}
+
+impl ClientProjectionDisconnectReason {
+    const ALL: [Self; CLIENT_PROJECTION_DISCONNECT_REASON_COUNT] =
+        [Self::WriterQueueFull, Self::WriterQueueClosed];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::WriterQueueFull => "writer_queue_full",
+            Self::WriterQueueClosed => "writer_queue_closed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ClientProjectionLagSource {
+    Router,
+    Shard,
+}
+
+impl ClientProjectionLagSource {
+    const ALL: [Self; CLIENT_PROJECTION_LAG_SOURCE_COUNT] = [Self::Router, Self::Shard];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Router => "router",
+            Self::Shard => "shard",
+        }
+    }
+}
+
+pub(crate) fn record_client_projection_recovery(
+    reason: ClientProjectionRecoveryReason,
+    outcome: ClientProjectionRecoveryOutcome,
+    duration: Duration,
+    projected_users: usize,
+) {
+    let recovery_index =
+        reason.index() * CLIENT_PROJECTION_RECOVERY_OUTCOME_COUNT + outcome.index();
+    CLIENT_PROJECTION_RECOVERIES[recovery_index].fetch_add(1, Ordering::Relaxed);
+    CLIENT_PROJECTION_RECOVERY_DURATION_MICROS[reason.index()].fetch_add(
+        duration.as_micros().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+    CLIENT_PROJECTION_RECOVERY_USERS[reason.index()]
+        .fetch_add(projected_users as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn record_client_projection_lag(source: ClientProjectionLagSource, skipped: u64) {
+    CLIENT_PROJECTION_LAGGED_EVENTS[source.index()].fetch_add(skipped, Ordering::Relaxed);
+}
+
+pub(crate) fn record_client_projection_disconnect(reason: ClientProjectionDisconnectReason) {
+    CLIENT_PROJECTION_DISCONNECTS[reason.index()].fetch_add(1, Ordering::Relaxed);
+}
 
 #[async_trait]
 pub trait S2sMetricsSource: Send + Sync + 'static {
@@ -145,6 +287,10 @@ impl ServerMetricsSource {
         )
     }
 
+    fn client_projection_samples(&self) -> Vec<PrometheusSample> {
+        samples_with_node_label(client_projection_samples(), self.clients.local_node_id())
+    }
+
     fn build_info_samples(&self) -> Vec<PrometheusSample> {
         app_build_info_samples(self.clients.local_node_id())
     }
@@ -163,6 +309,7 @@ impl S2sMetricsSource for ServerMetricsSource {
         render_process_metrics_into(&mut body, &self.process_samples());
         render_consensus_metrics_into(&mut body, &self.consensus_samples().await);
         render_voice_metrics_into(&mut body, &self.voice_samples());
+        render_client_projection_metrics_into(&mut body, &self.client_projection_samples());
         Some(body)
     }
 
@@ -176,6 +323,7 @@ impl S2sMetricsSource for ServerMetricsSource {
         samples.extend(self.process_samples());
         samples.extend(self.consensus_samples().await);
         samples.extend(self.voice_samples());
+        samples.extend(self.client_projection_samples());
         let timestamp_ms = now_unix_ms();
         Some(remote_write_bodies(
             &samples,
@@ -407,6 +555,90 @@ const CONSENSUS_METRIC_HEADERS: &[(&str, &str)] = &[
     (
         "shitspeak_consensus_channels_by_server",
         "Materialized channels in the channel repository by server scope.",
+    ),
+];
+
+fn client_projection_samples() -> Vec<PrometheusSample> {
+    let mut samples = Vec::with_capacity(
+        CLIENT_PROJECTION_RECOVERY_REASON_COUNT * (CLIENT_PROJECTION_RECOVERY_OUTCOME_COUNT + 2)
+            + CLIENT_PROJECTION_LAG_SOURCE_COUNT
+            + CLIENT_PROJECTION_DISCONNECT_REASON_COUNT,
+    );
+
+    for reason in ClientProjectionRecoveryReason::ALL {
+        let reason_label = reason.label().to_owned();
+        for outcome in ClientProjectionRecoveryOutcome::ALL {
+            let recovery_index =
+                reason.index() * CLIENT_PROJECTION_RECOVERY_OUTCOME_COUNT + outcome.index();
+            samples.push(PrometheusSample::new(
+                "shitspeak_client_projection_recoveries_total",
+                vec![
+                    ("reason".to_owned(), reason_label.clone()),
+                    ("outcome".to_owned(), outcome.label().to_owned()),
+                ],
+                CLIENT_PROJECTION_RECOVERIES[recovery_index].load(Ordering::Relaxed) as f64,
+            ));
+        }
+        samples.push(PrometheusSample::new(
+            "shitspeak_client_projection_recovery_duration_seconds_total",
+            vec![("reason".to_owned(), reason_label.clone())],
+            CLIENT_PROJECTION_RECOVERY_DURATION_MICROS[reason.index()].load(Ordering::Relaxed)
+                as f64
+                / 1_000_000.0,
+        ));
+        samples.push(PrometheusSample::new(
+            "shitspeak_client_projection_recovery_users_total",
+            vec![("reason".to_owned(), reason_label)],
+            CLIENT_PROJECTION_RECOVERY_USERS[reason.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    for source in ClientProjectionLagSource::ALL {
+        samples.push(PrometheusSample::new(
+            "shitspeak_client_projection_lagged_events_total",
+            vec![("source".to_owned(), source.label().to_owned())],
+            CLIENT_PROJECTION_LAGGED_EVENTS[source.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    for reason in ClientProjectionDisconnectReason::ALL {
+        samples.push(PrometheusSample::new(
+            "shitspeak_client_projection_disconnects_total",
+            vec![("reason".to_owned(), reason.label().to_owned())],
+            CLIENT_PROJECTION_DISCONNECTS[reason.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+
+    samples
+}
+
+fn render_client_projection_metrics_into(out: &mut String, samples: &[PrometheusSample]) {
+    for (name, help) in CLIENT_PROJECTION_METRIC_HEADERS {
+        render_prometheus_header(out, name, help, "counter");
+    }
+    for sample in samples {
+        render_prometheus_sample(out, sample);
+    }
+}
+
+const CLIENT_PROJECTION_METRIC_HEADERS: &[(&str, &str)] = &[
+    (
+        "shitspeak_client_projection_recoveries_total",
+        "Client projection recovery completions by reason and outcome.",
+    ),
+    (
+        "shitspeak_client_projection_recovery_duration_seconds_total",
+        "Cumulative client projection recovery duration by reason.",
+    ),
+    (
+        "shitspeak_client_projection_recovery_users_total",
+        "Cumulative users projected during client projection recovery by reason.",
+    ),
+    (
+        "shitspeak_client_projection_lagged_events_total",
+        "Client projection broadcast events skipped because a router or shard lagged.",
+    ),
+    (
+        "shitspeak_client_projection_disconnects_total",
+        "Client projection disconnects caused by outbound writer queue backpressure or closure.",
     ),
 ];
 
@@ -1390,5 +1622,23 @@ mod tests {
         assert!(rendered.contains("# TYPE shitspeak_voice_udp_egress_datagrams_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_voice_queue_status gauge\n"));
         assert!(rendered.contains("# TYPE shitspeak_voice_queue_enqueues_total counter\n"));
+    }
+
+    #[test]
+    fn client_projection_metrics_have_bounded_reason_and_source_labels() {
+        let samples = client_projection_samples();
+        let mut rendered = String::new();
+        render_client_projection_metrics_into(&mut rendered, &samples);
+
+        assert!(rendered.contains("# TYPE shitspeak_client_projection_recoveries_total counter\n"));
+        assert!(rendered.contains(
+            "shitspeak_client_projection_recoveries_total{reason=\"router_lag\",outcome=\"recovered\"}"
+        ));
+        assert!(
+            rendered.contains("shitspeak_client_projection_lagged_events_total{source=\"shard\"}")
+        );
+        assert!(rendered.contains(
+            "shitspeak_client_projection_disconnects_total{reason=\"writer_queue_full\"}"
+        ));
     }
 }

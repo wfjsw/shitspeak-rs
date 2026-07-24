@@ -13,7 +13,6 @@ use super::sharded_subscriber::{
 };
 
 const CLIENT_PROJECTION_SHARDS: usize = 8;
-const CLIENT_PROJECTION_EVENT_CAPACITY: usize = 2048;
 
 pub(crate) struct ClientProjectionPool {
     pool: ShardedSubscriberPool<ClientProjectionEvent, ClientProjectionState>,
@@ -27,8 +26,9 @@ impl ClientProjectionPool {
         client_rx: broadcast::Receiver<Arc<ClientStateBroadcastPayload>>,
         channel_rx: broadcast::Receiver<Arc<ChannelOperation>>,
         visibility_reload_rx: broadcast::Receiver<()>,
+        event_capacity: usize,
     ) -> Result<Self, PoolBuildError> {
-        let (event_tx, _) = broadcast::channel(CLIENT_PROJECTION_EVENT_CAPACITY);
+        let (event_tx, _) = broadcast::channel(event_capacity.max(1));
         let pool = ShardedSubscriberPool::new(&event_tx, CLIENT_PROJECTION_SHARDS)?;
         let (router_health_tx, router_health_rx) = watch::channel(true);
         let router_event_tx = event_tx.clone();
@@ -159,6 +159,10 @@ async fn run_projection_router(
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "client projection router lagged on channel log");
+                        crate::observability::record_client_projection_lag(
+                            crate::observability::ClientProjectionLagSource::Router,
+                            skipped,
+                        );
                         let _ = event_tx.send(ClientProjectionEvent::ChannelLagged(skipped));
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
@@ -174,6 +178,10 @@ async fn run_projection_router(
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "client projection router lagged on client log");
+                        crate::observability::record_client_projection_lag(
+                            crate::observability::ClientProjectionLagSource::Router,
+                            skipped,
+                        );
                         let _ = event_tx.send(ClientProjectionEvent::ClientLagged(skipped));
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
@@ -209,6 +217,10 @@ fn drain_ready_channels(
                 tracing::warn!(
                     skipped,
                     "client projection router lagged while draining channel log"
+                );
+                crate::observability::record_client_projection_lag(
+                    crate::observability::ClientProjectionLagSource::Router,
+                    skipped,
                 );
                 let _ = event_tx.send(ClientProjectionEvent::ChannelLagged(skipped));
                 break;
@@ -276,6 +288,7 @@ mod tests {
             client_rx,
             channel_rx,
             visibility_rx,
+            8,
         )
         .expect("pool starts");
         let mut health = pool.router_health_rx.clone();

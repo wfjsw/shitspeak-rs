@@ -381,7 +381,7 @@ pub async fn handle_authenticate(
     // connection-level UDP crypto has already been established.
 
     let visibility_generation = server.visibility_generation();
-    let (all_clients, all_versions, client_state_rx) = server
+    let (all_clients, all_versions, all_epochs, client_state_rx) = server
         .get_clients()
         .published_snapshot_with_versions_and_subscription_in_server(&server_id)
         .await;
@@ -440,6 +440,11 @@ pub async fn handle_authenticate(
             if viewer_independent_user_state {
                 session_channel_shadow
                     .insert(client.get_session_id(), client.get_current_channel_id());
+                user_visibility.remember_projected_user(
+                    client.get_session_id(),
+                    client.get_current_channel_id(),
+                    client.get_listening_channel_ids(),
+                );
                 push_burst(client.build_user_state_for_broadcast().into());
             } else {
                 let us: Message = client.build_user_state_for_broadcast().into();
@@ -463,6 +468,11 @@ pub async fn handle_authenticate(
     {
         session_channel_shadow.insert(session_id, sender.get_current_channel_id());
         if viewer_independent_user_state {
+            user_visibility.remember_projected_user(
+                session_id,
+                sender.get_current_channel_id(),
+                sender.get_listening_channel_ids(),
+            );
             push_burst(sender.build_user_state_for_broadcast().into());
         } else {
             let self_us: Message = sender.build_user_state_for_broadcast().into();
@@ -564,7 +574,9 @@ pub async fn handle_authenticate(
     }
 
     // ── Record last-seen versions so the client doesn't replay old entries ─
-    sender.update_last_client_versions(&all_versions).await;
+    sender
+        .set_last_client_cursors(all_versions, all_epochs)
+        .await;
 
     // Store Opus support flag for codec negotiation
     {

@@ -650,14 +650,34 @@ pub async fn initial_server_events(
     user_visibility: &mut UserVisibilityState,
 ) -> Vec<ServerEvent> {
     let server_id = client.server_id();
+    let channels = server.get_channels().ordered_snapshot_in_server(&server_id);
+    initial_server_events_with_channel_snapshot(
+        server,
+        client,
+        &channels,
+        channel_tree_shadow,
+        channel_shadow,
+        user_visibility,
+    )
+    .await
+}
+
+pub async fn initial_server_events_with_channel_snapshot(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channels: &shitspeak_state::OrderedChannelSnapshot,
+    channel_tree_shadow: &mut ChannelTreeShadow,
+    channel_shadow: &mut SessionChannelShadow,
+    user_visibility: &mut UserVisibilityState,
+) -> Vec<ServerEvent> {
+    let server_id = client.server_id();
     let mut events = Vec::new();
 
-    let channels = server.get_channels().ordered_snapshot_in_server(&server_id);
     for message in
         shitspeak_runtime::channel_handler::build_visible_ordered_channel_snapshot_messages(
             server,
             client,
-            &channels,
+            channels,
             channel_tree_shadow,
             server.get_send_permission_info(),
         )

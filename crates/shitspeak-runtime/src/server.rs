@@ -359,6 +359,7 @@ impl Server {
             server.clients.subscribe(),
             server.channels.subscribe(),
             server.subscribe_visibility_reload(),
+            server.clients.recommended_projection_event_capacity(),
         )?;
         server
             .client_projection_pool
@@ -1118,9 +1119,9 @@ impl Server {
                         continue;
                     }
                     Ok(crate::voice::codec::IncomingUdpPacket::Audio(decoded_audio)) => {
-                        if !client.is_authenticated() {
+                        if !client.is_authenticated() || !client.is_published() {
                             tracing::trace!(
-                                "UDP audio packet from {} matched unauthenticated client {:?}; dropping",
+                                "UDP audio packet from {} matched inactive client {:?}; dropping",
                                 src_addr,
                                 client.get_session_id()
                             );

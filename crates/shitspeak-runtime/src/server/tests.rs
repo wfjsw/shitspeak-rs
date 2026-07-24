@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::channel_handler::{ChannelPermissionShadow, ChannelTreeShadow, SessionChannelShadow};
+use crate::client::state_log::ClientStateOperation;
 use crate::client::{
     Client, client_session_identifier::ClientSessionIdentifier, visibility::UserVisibilityState,
 };
@@ -1438,12 +1439,14 @@ async fn stage_projection_parity_viewer(
         .await;
     viewer.set_authenticated(true);
 
-    let (published_clients, versions, client_state_rx) = server
+    let (published_clients, versions, epochs, client_state_rx) = server
         .clients
         .published_snapshot_with_versions_and_subscription_in_server(DEFAULT_SERVER_ID)
         .await;
     viewer.stage_client_state_subscription(client_state_rx);
-    viewer.update_last_client_versions(&versions).await;
+    viewer
+        .set_last_client_cursors(versions.clone(), epochs)
+        .await;
 
     let (channels, channel_version, channel_state_rx) = server
         .channels
@@ -1451,19 +1454,247 @@ async fn stage_projection_parity_viewer(
     viewer.stage_channel_state_subscription(channel_version, channel_state_rx);
 
     let mut session_shadow = SessionChannelShadow::new();
+    let mut user_visibility = UserVisibilityState::default();
+    for client in published_clients
+        .into_iter()
+        .filter(|client| client.is_authenticated())
+    {
+        session_shadow.insert(client.get_session_id(), client.get_current_channel_id());
+        user_visibility.remember_projected_user(
+            client.get_session_id(),
+            client.get_current_channel_id(),
+            client.get_listening_channel_ids(),
+        );
+    }
+    session_shadow.insert(viewer.get_session_id(), viewer.get_current_channel_id());
+    user_visibility.remember_projected_user(
+        viewer.get_session_id(),
+        viewer.get_current_channel_id(),
+        viewer.get_listening_channel_ids(),
+    );
+    viewer.stage_post_auth_baseline(crate::client::PostAuthBaseline::with_user_visibility(
+        session_shadow,
+        channels.iter().map(|channel| channel.id).collect(),
+        user_visibility,
+        server.visibility_generation(),
+    ));
+
+    (viewer, rx)
+}
+
+async fn allocate_published_projection_test_client(
+    server: &Arc<Box<Server>>,
+    peer_port: u16,
+    local_port: u16,
+) -> Arc<Box<Client>> {
+    let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), peer_port);
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), local_port);
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let client = server
+        .clients
+        .allocate_web_client_in_server(DEFAULT_SERVER_ID, peer.ip(), peer, local, tx)
+        .await;
+    client.set_authenticated(true);
+    server
+        .clients
+        .publish_client_in_server(DEFAULT_SERVER_ID, client.get_session_id())
+        .await;
+    client
+}
+
+#[tokio::test]
+async fn sharded_registration_rebases_after_local_log_pruning_and_stays_live() {
+    install_default_provider();
+    let mut config = test_config(Vec::new());
+    config.client_log_max_entries = 2;
+    let server = Server::new(config, TestAuthenticator)
+        .await
+        .expect("server");
+
+    let stale = allocate_published_projection_test_client(&server, 31301, 65001).await;
+    let stale_session = stale.get_session_id();
+    let (viewer, mut viewer_rx) = stage_projection_parity_viewer(&server, 31302, 65002).await;
+
+    server
+        .clients
+        .remove_client_in_server(DEFAULT_SERVER_ID, stale_session)
+        .await
+        .expect("stale client is removed");
+    let current = allocate_published_projection_test_client(&server, 31303, 65003).await;
+    let current_session = current.get_session_id();
+    let _pruning_client = allocate_published_projection_test_client(&server, 31304, 65004).await;
+
+    let mut projection_registration = None;
+    activate_client_projection(&server, &viewer, &mut projection_registration)
+        .await
+        .expect("registration recovers from a pruned local cursor");
+
+    let live = allocate_published_projection_test_client(&server, 31305, 65005).await;
+    let live_session = live.get_session_id();
+    let (saw_stale_remove, saw_current, saw_live) =
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut saw_stale_remove = false;
+            let mut saw_current = false;
+            let mut saw_live = false;
+            while !(saw_stale_remove && saw_current && saw_live) {
+                match viewer_rx
+                    .recv()
+                    .await
+                    .expect("projection writer remains open")
+                {
+                    Message::UserRemove(remove) if remove.session == u32::from(stale_session) => {
+                        saw_stale_remove = true;
+                    }
+                    Message::UserState(user)
+                        if user.session == Some(u32::from(current_session)) =>
+                    {
+                        saw_current = true;
+                    }
+                    Message::UserState(user) if user.session == Some(u32::from(live_session)) => {
+                        saw_live = true;
+                    }
+                    _ => {}
+                }
+            }
+            (saw_stale_remove, saw_current, saw_live)
+        })
+        .await
+        .expect("registration rebase and subsequent live add are delivered");
+
+    assert!(saw_stale_remove);
+    assert!(saw_current);
+    assert!(saw_live);
+    assert!(projection_registration.is_some());
+}
+
+#[tokio::test]
+async fn sharded_registration_rebase_refreshes_the_viewers_own_state() {
+    install_default_provider();
+    let mut config = test_config(Vec::new());
+    config.client_log_max_entries = 2;
+    let server = Server::new(config, TestAuthenticator)
+        .await
+        .expect("server");
+
+    let (viewer, mut viewer_rx) = stage_projection_parity_viewer(&server, 31401, 65101).await;
+    let viewer_session = viewer.get_session_id();
+    {
+        let mut state = viewer.write_global_state_direct();
+        state.set_display_name(Some("after-pruning".to_owned()));
+    }
+    let _first_pruning_client =
+        allocate_published_projection_test_client(&server, 31402, 65102).await;
+    let _second_pruning_client =
+        allocate_published_projection_test_client(&server, 31403, 65103).await;
+    let _third_pruning_client =
+        allocate_published_projection_test_client(&server, 31404, 65104).await;
+
+    let mut projection_registration = None;
+    activate_client_projection(&server, &viewer, &mut projection_registration)
+        .await
+        .expect("registration recovers the viewer's pruned state");
+
+    let own_state = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(message) = viewer_rx.recv().await {
+            if let Message::UserState(user) = message
+                && user.session == Some(u32::from(viewer_session))
+                && user.name.as_deref() == Some("after-pruning")
+            {
+                return user;
+            }
+        }
+        panic!("projection writer closed before authoritative self state");
+    })
+    .await
+    .expect("authoritative self state is delivered during rebase");
+
+    assert_eq!(own_state.name.as_deref(), Some("after-pruning"));
+    assert_eq!(own_state.mute, Some(false));
+    assert_eq!(own_state.deaf, Some(false));
+    assert!(projection_registration.is_some());
+}
+
+#[tokio::test]
+async fn failed_projection_registration_has_a_balanced_published_lifecycle() {
+    install_default_provider();
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("server");
+
+    let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31501);
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 65201);
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let viewer = server
+        .clients
+        .allocate_web_client_in_server(DEFAULT_SERVER_ID, peer.ip(), peer, local, tx)
+        .await;
+    viewer.set_authenticated(true);
+    let viewer_session = viewer.get_session_id();
+
+    let (published_clients, versions, epochs, client_state_rx) = server
+        .clients
+        .published_snapshot_with_versions_and_subscription_in_server(DEFAULT_SERVER_ID)
+        .await;
+    viewer.stage_client_state_subscription(client_state_rx);
+    viewer.set_last_client_cursors(versions, epochs).await;
+    let (channels, channel_version, channel_state_rx) = server
+        .channels
+        .snapshot_with_version_and_subscription_in_server(DEFAULT_SERVER_ID);
+    viewer.stage_channel_state_subscription(channel_version, channel_state_rx);
+    let mut session_shadow = SessionChannelShadow::new();
     session_shadow.extend(
         published_clients
             .into_iter()
-            .filter(|client| client.is_authenticated())
             .map(|client| (client.get_session_id(), client.get_current_channel_id())),
     );
-    session_shadow.insert(viewer.get_session_id(), viewer.get_current_channel_id());
+    session_shadow.insert(viewer_session, viewer.get_current_channel_id());
     viewer.stage_post_auth_baseline(crate::client::PostAuthBaseline::new(
         session_shadow,
         channels.iter().map(|channel| channel.id).collect(),
     ));
 
-    (viewer, rx)
+    let _missed = allocate_published_projection_test_client(&server, 31502, 65202).await;
+    viewer
+        .write_proto_message(&Message::TextMessage(
+            TextMessage {
+                actor: None,
+                session: Vec::new(),
+                channel_id: Vec::new(),
+                tree_id: Vec::new(),
+                message: "prefill".to_owned(),
+            }
+            .into(),
+        ))
+        .await
+        .expect("prefill viewer queue");
+    let mut client_log_rx = server.clients.subscribe();
+
+    let mut projection_registration = None;
+    assert!(
+        activate_client_projection(&server, &viewer, &mut projection_registration)
+            .await
+            .is_err(),
+        "a full writer queue must reject registration catch-up"
+    );
+
+    assert!(projection_registration.is_none());
+    assert!(viewer.is_published());
+    server
+        .clients
+        .remove_client_in_server(DEFAULT_SERVER_ID, viewer_session)
+        .await
+        .expect("failed activation cleanup removes viewer");
+
+    let added = client_log_rx.recv().await.expect("viewer AddClient");
+    let removed = client_log_rx.recv().await.expect("viewer RemoveClient");
+    assert!(matches!(
+        &added.entry.op,
+        ClientStateOperation::AddClient { session_id, .. } if *session_id == viewer_session
+    ));
+    assert!(matches!(
+        &removed.entry.op,
+        ClientStateOperation::RemoveClient { session_id, .. } if *session_id == viewer_session
+    ));
 }
 
 async fn activate_legacy_projection_for_parity(
@@ -1679,7 +1910,7 @@ async fn sharded_visibility_reload_is_ordered_and_does_not_wait_for_full_writer(
         .clients
         .published_snapshot_with_versions_in_server(DEFAULT_SERVER_ID)
         .await;
-    let (published, client_versions) = snapshot.into_parts();
+    let (published, client_versions, client_epochs) = snapshot.into_projection_parts();
     let (channels, channel_version, channel_rx) = server
         .channels
         .snapshot_with_version_and_subscription_in_server(DEFAULT_SERVER_ID);
@@ -1702,6 +1933,7 @@ async fn sharded_visibility_reload_is_ordered_and_does_not_wait_for_full_writer(
             session_shadow.clone(),
             UserVisibilityState::default(),
             client_versions.clone(),
+            client_epochs.clone(),
             channel_version,
         )
     };

@@ -1,15 +1,19 @@
 //! Channel CRUD scenarios.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow, replay_channel_log_gap};
 use crate::client::visibility::UserVisibilityState;
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
+use crate::server::client_projection::ClientProjectionState;
+use crate::server::sharded_subscriber::{LagAction, ShardedSubscriber};
 use crate::types::DEFAULT_SERVER_ID;
 use shitspeak_messages::messages::Message;
 use shitspeak_messages::messages::encoder::{ChannelState, DenyType};
-use shitspeak_state::Channel;
 use shitspeak_state::{ACL, ACLPermissions};
+use shitspeak_state::{Channel, ChannelRootConfig};
 
 async fn create_channel_and_wait(
     client: &TestClient,
@@ -852,6 +856,72 @@ async fn temp_channel_lagged_replay_when_already_current_is_recoverable() {
     assert!(
         !alice.recv_closed(Duration::from_millis(200)).await,
         "lagged replay after temporary-channel activity should not disconnect the client"
+    );
+}
+
+#[tokio::test]
+async fn shard_lag_recovery_reemits_current_root_name_without_a_new_version() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let server_client = server
+        .server
+        .get_clients()
+        .get_client_in_server(DEFAULT_SERVER_ID, alice.server_session)
+        .await
+        .expect("server-side alice client");
+    let current_version = server
+        .server
+        .get_channels()
+        .current_version_in_server(DEFAULT_SERVER_ID);
+
+    server
+        .server
+        .get_channels()
+        .update_root_channel_config(ChannelRootConfig::new("Renamed Root"))
+        .await;
+    assert_eq!(
+        server
+            .server
+            .get_channels()
+            .current_version_in_server(DEFAULT_SERVER_ID),
+        current_version,
+        "root config updates intentionally reuse the current channel version"
+    );
+
+    let mut channel_tree_shadow = ChannelTreeShadow::default();
+    channel_tree_shadow.insert(0);
+    let mut session_channel_shadow = SessionChannelShadow::new();
+    session_channel_shadow.insert(alice.server_session, 0);
+    let mut projection = ClientProjectionState::new(
+        Arc::downgrade(&server.server),
+        server_client,
+        channel_tree_shadow,
+        session_channel_shadow,
+        UserVisibilityState::default(),
+        HashMap::new(),
+        HashMap::new(),
+        current_version,
+    );
+
+    assert_eq!(projection.on_lag(1), LagAction::Keep);
+    let recovered = projection
+        .recover_lag()
+        .await
+        .expect("lag recovery succeeds")
+        .expect("root reconciliation emits a message")
+        .into_messages();
+    assert!(
+        recovered.iter().any(|message| matches!(
+            message,
+            Message::ChannelState(state)
+                if state.channel_id == Some(0) && state.name.as_deref() == Some("Renamed Root")
+        )),
+        "lag recovery must reconcile a root rename absent from versioned replay history"
     );
 }
 
