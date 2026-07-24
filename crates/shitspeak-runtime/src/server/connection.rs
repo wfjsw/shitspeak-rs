@@ -325,7 +325,7 @@ async fn replay_client_log_entries_since(
     client_session_id: ClientSessionIdentifier,
     last_seen: HashMap<u16, u64>,
 ) -> Result<(), HandleIncomingConnectionError> {
-    let (missed, new_versions) = server
+    let catch_up = server
         .clients
         .replay_entries_since_in_server_for_client(
             server_id,
@@ -333,10 +333,48 @@ async fn replay_client_log_entries_since(
             client.get_session_id(),
             client.client_instance_id(),
         )
-        .await
-        .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
+        .await;
+    let (rebases, missed, target_versions) = catch_up.into_parts();
 
     let mut out = Vec::new();
+    let mut rebase_versions = Vec::with_capacity(rebases.len());
+    for rebase in rebases {
+        let (origin, version, entries) = rebase.into_parts();
+        append_client_origin_reset_messages(
+            server,
+            client,
+            user_visibility,
+            session_channel_shadow,
+            server_id,
+            origin,
+            &mut out,
+        )
+        .await;
+        for entry in entries {
+            if should_skip_client_add_entry(
+                &entry.op,
+                client.get_session_id(),
+                client.client_instance_id(),
+                session_channel_shadow,
+            ) {
+                continue;
+            }
+            append_client_log_entry_messages(
+                server,
+                client,
+                client_session_id,
+                channel_tree_shadow,
+                channel_permission_shadow,
+                user_visibility,
+                session_channel_shadow,
+                server_id,
+                &entry,
+                &mut out,
+            )
+            .await?;
+        }
+        rebase_versions.push((origin, version));
+    }
     for entry in missed {
         if should_skip_client_add_entry(
             &entry.op,
@@ -364,7 +402,10 @@ async fn replay_client_log_entries_since(
         .write_proto_message_batch(&out)
         .await
         .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-    client.update_last_client_versions(&new_versions).await;
+    for (origin, version) in rebase_versions {
+        client.set_last_client_version(origin, version).await;
+    }
+    client.update_last_client_versions(&target_versions).await;
     Ok(())
 }
 
@@ -988,28 +1029,16 @@ async fn append_client_log_broadcast_messages(
                 // it before the server-id filter and explicitly evict every
                 // shadowed session from that origin. This also makes a reused
                 // numeric session accept the replacement AddClient.
-                let sessions =
-                    take_origin_sessions_from_shadow(session_channel_shadow, entry.node_id);
-                for session in sessions {
-                    let removal: Message = shitspeak_messages::messages::encoder::UserRemove {
-                        session: u32::from(session),
-                        actor: None,
-                        reason: None,
-                        ban: Some(false),
-                    }
-                    .into();
-                    out.extend(
-                        crate::client::visibility::project_message_with_shadow(
-                            server,
-                            client,
-                            user_visibility,
-                            session_channel_shadow,
-                            client_server_id,
-                            &removal,
-                        )
-                        .await,
-                    );
-                }
+                append_client_origin_reset_messages(
+                    server,
+                    client,
+                    user_visibility,
+                    session_channel_shadow,
+                    client_server_id,
+                    entry.node_id,
+                    out,
+                )
+                .await;
                 client.remove_last_client_version(entry.node_id).await;
                 return Ok(());
             }
@@ -1132,6 +1161,42 @@ fn take_origin_sessions_from_shadow(
         shadow.remove(session);
     }
     sessions
+}
+
+async fn append_client_origin_reset_messages(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    user_visibility: &mut UserVisibilityState,
+    session_channel_shadow: &mut SessionChannelShadow,
+    client_server_id: &str,
+    origin: u16,
+    out: &mut Vec<Message>,
+) {
+    let sessions = take_origin_sessions_from_shadow(session_channel_shadow, origin);
+    for session in sessions {
+        if session == client.get_session_id() {
+            session_channel_shadow.insert(session, client.get_current_channel_id());
+            continue;
+        }
+        let removal: Message = shitspeak_messages::messages::encoder::UserRemove {
+            session: u32::from(session),
+            actor: None,
+            reason: None,
+            ban: Some(false),
+        }
+        .into();
+        out.extend(
+            crate::client::visibility::project_message_with_shadow(
+                server,
+                client,
+                user_visibility,
+                session_channel_shadow,
+                client_server_id,
+                &removal,
+            )
+            .await,
+        );
+    }
 }
 
 async fn apply_client_snapshot_end_vector(client: &Arc<Box<Client>>, versions: &HashMap<u16, u64>) {

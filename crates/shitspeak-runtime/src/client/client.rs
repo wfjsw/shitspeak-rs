@@ -970,6 +970,19 @@ impl Client {
         self.last_client_version.lock().remove(&node_id);
     }
 
+    /// Set one origin cursor to an exact materialized version. Unlike
+    /// `update_last_client_versions`, this deliberately permits a lower value
+    /// after an origin changes epoch and the client projection rebases from a
+    /// new snapshot.
+    pub(crate) async fn set_last_client_version(&self, node_id: u16, version: u64) {
+        let mut map = self.last_client_version.lock();
+        if version == 0 {
+            map.remove(&node_id);
+        } else {
+            map.insert(node_id, version);
+        }
+    }
+
     /// Get the last channel-state version seen.
     pub async fn get_last_channel_version(&self) -> u64 {
         *self.last_channel_version.lock()

@@ -179,6 +179,65 @@ impl ClientSnapshotWithVersions {
     }
 }
 
+pub(crate) struct ClientOriginRebase {
+    origin: u16,
+    version: u64,
+    entries: Vec<Arc<ClientStateLogEntry>>,
+}
+
+impl ClientOriginRebase {
+    pub(crate) fn origin(&self) -> u16 {
+        self.origin
+    }
+
+    #[cfg(test)]
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> &[Arc<ClientStateLogEntry>] {
+        &self.entries
+    }
+
+    pub(crate) fn into_parts(self) -> (u16, u64, Vec<Arc<ClientStateLogEntry>>) {
+        (self.origin, self.version, self.entries)
+    }
+}
+
+pub(crate) struct ClientProjectionCatchUp {
+    rebases: Vec<ClientOriginRebase>,
+    entries: Vec<Arc<ClientStateLogEntry>>,
+    target_versions: HashMap<u16, u64>,
+}
+
+impl ClientProjectionCatchUp {
+    #[cfg(test)]
+    pub(crate) fn rebases(&self) -> &[ClientOriginRebase] {
+        &self.rebases
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> &[Arc<ClientStateLogEntry>] {
+        &self.entries
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_versions(&self) -> &HashMap<u16, u64> {
+        &self.target_versions
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<ClientOriginRebase>,
+        Vec<Arc<ClientStateLogEntry>>,
+        HashMap<u16, u64>,
+    ) {
+        (self.rebases, self.entries, self.target_versions)
+    }
+}
+
 struct DeferredClientCommit {
     op: ClientStateOperation,
     channel_version_dep: Option<u64>,
@@ -2490,31 +2549,19 @@ impl ClientRepository {
         .await
     }
 
-    pub async fn replay_entries_since_in_server_for_client(
+    pub(crate) async fn replay_entries_since_in_server_for_client(
         &self,
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
         viewer_session_id: ClientSessionIdentifier,
         viewer_client_instance_id: ClientInstanceId,
-    ) -> Result<(Vec<Arc<ClientStateLogEntry>>, HashMap<u16, u64>), ()> {
-        let entries = self
-            .replay_entries_since_in_server(server_id, last_seen)
-            .await?;
-        let mut new_versions: HashMap<u16, u64> = HashMap::new();
-
-        let mut filtered = Vec::with_capacity(entries.len());
-        for entry in entries {
-            if is_own_replayed_add_client(&entry.op, viewer_session_id, viewer_client_instance_id) {
-                let cur = new_versions.entry(entry.node_id).or_insert(0);
-                *cur = (*cur).max(entry.version);
-                continue;
-            }
-            let cur = new_versions.entry(entry.node_id).or_insert(0);
-            *cur = (*cur).max(entry.version);
-            filtered.push(entry);
-        }
-
-        Ok((filtered, new_versions))
+    ) -> ClientProjectionCatchUp {
+        self.client_projection_catch_up(
+            server_id,
+            last_seen,
+            Some((viewer_session_id, viewer_client_instance_id)),
+        )
+        .await
     }
 
     async fn replay_since_in_server_filtered(
@@ -2529,12 +2576,17 @@ impl ClientRepository {
         ),
         (),
     > {
-        let entries = self
-            .replay_entries_since_in_server(server_id, last_seen)
-            .await?;
-
-        // Track the max version seen per node
-        let mut new_versions: HashMap<u16, u64> = HashMap::new();
+        let plan = self
+            .client_projection_catch_up(server_id, last_seen, None)
+            .await;
+        let (rebases, entries, target_versions) = plan.into_parts();
+        if !rebases.is_empty() {
+            tracing::error!(
+                origins = ?rebases.iter().map(ClientOriginRebase::origin).collect::<Vec<_>>(),
+                "Client log replay requires a materialized rebase"
+            );
+            return Err(());
+        }
 
         // Convert to messages
         let mut messages = Vec::with_capacity(entries.len());
@@ -2548,73 +2600,122 @@ impl ClientRepository {
             } else if let Some(msg) = entry.to_message(self).await {
                 messages.push(msg);
             }
-            let cur = new_versions.entry(entry.node_id).or_insert(0);
-            *cur = (*cur).max(entry.version);
         }
 
-        Ok((messages, new_versions))
+        Ok((messages, target_versions))
     }
 
-    async fn replay_entries_since_in_server(
+    async fn client_projection_catch_up(
         &self,
         server_id: &str,
         last_seen: &HashMap<u16, u64>,
-    ) -> Result<Vec<Arc<ClientStateLogEntry>>, ()> {
+        viewer: Option<(ClientSessionIdentifier, ClientInstanceId)>,
+    ) -> ClientProjectionCatchUp {
         let local_since = last_seen.get(&self.local_node_id).copied().unwrap_or(0);
         let mut entries: Vec<Arc<ClientStateLogEntry>> = Vec::new();
-        {
-            let register = self.register.read().await;
-
-            if local_since > 0 && local_since < register.version {
-                let next = register
-                    .local_log
-                    .iter()
-                    .find(|entry| entry.version > local_since);
-                if next.map(|entry| entry.version) != Some(local_since + 1) {
-                    tracing::error!(
-                        "Local log pruned past requested version: next={:?} requested={}",
-                        next.map(|entry| entry.version),
-                        local_since,
-                    );
-                    return Err(());
-                }
+        let mut rebases = Vec::new();
+        let mut target_versions = HashMap::new();
+        loop {
+            self.wait_for_deferred_commits().await;
+            // Local client state is mutated before its matching log commit.
+            // Fence deferred commits and hold the write guard while capturing
+            // a materialized rebase so state and target_version are one cut.
+            let register = self.register.write().await;
+            if self.deferred_commit_pending.load(Ordering::Acquire) > 0 {
+                drop(register);
+                tokio::task::yield_now().await;
+                continue;
             }
 
-            for entry in &register.local_log {
-                if entry.version > local_since && entry.op.server_id() == server_id {
-                    entries.push(Arc::clone(entry));
+            let target_version = register.version;
+            if local_since > target_version
+                || !Self::log_has_contiguous_suffix(
+                    &register.local_log,
+                    local_since,
+                    target_version,
+                )
+            {
+                let timestamp = chrono::Utc::now().timestamp_millis();
+                let mut snapshot_entries = register
+                    .local_clients()
+                    .filter(|client| client.server_id() == server_id)
+                    .filter(|client| client.is_published())
+                    .map(|client| {
+                        Self::projection_snapshot_entry(
+                            self.local_node_id,
+                            target_version,
+                            client,
+                            timestamp,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if self.deferred_commit_pending.load(Ordering::Acquire) > 0 {
+                    drop(register);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                snapshot_entries.sort_by(|a, b| Self::compare_snapshot_entries(a, b));
+                rebases.push(ClientOriginRebase {
+                    origin: self.local_node_id,
+                    version: target_version,
+                    entries: snapshot_entries.into_iter().map(Arc::new).collect(),
+                });
+            } else {
+                for entry in &register.local_log {
+                    if entry.version > local_since && entry.op.server_id() == server_id {
+                        entries.push(Arc::clone(entry));
+                    }
                 }
             }
+            target_versions.insert(self.local_node_id, target_version);
+            break;
         }
 
         for (node_id, remote_register) in self.remote_register_snapshots().await {
             let since = last_seen.get(&node_id).copied().unwrap_or(0);
             let register = remote_register.read().await;
-            if since < register.snapshot_history_floor {
-                tracing::error!(
-                    "Remote snapshot history for node {} starts at {} but requested version is {}",
-                    node_id,
-                    register.snapshot_history_floor,
-                    since,
-                );
-                return Err(());
-            }
-            if since > 0 && since < register.version {
-                let next = register.log.iter().find(|entry| entry.version > since);
-                if next.map(|entry| entry.version) != Some(since + 1) {
-                    tracing::error!(
-                        "Remote log for node {} pruned past requested version: next={:?} requested={}",
-                        node_id,
-                        next.map(|entry| entry.version),
-                        since,
-                    );
-                    return Err(());
+            let target_version = register.version;
+            target_versions.insert(node_id, target_version);
+            if since < register.snapshot_history_floor
+                || since > target_version
+                || !Self::log_has_contiguous_suffix(&register.log, since, target_version)
+            {
+                let timestamp = chrono::Utc::now().timestamp_millis();
+                let mut snapshot_entries = register
+                    .clients
+                    .values()
+                    .filter(|client| client.server_id() == server_id)
+                    .map(|client| {
+                        Self::projection_snapshot_entry(node_id, target_version, client, timestamp)
+                    })
+                    .collect::<Vec<_>>();
+                snapshot_entries.sort_by(|a, b| Self::compare_snapshot_entries(a, b));
+                rebases.push(ClientOriginRebase {
+                    origin: node_id,
+                    version: target_version,
+                    entries: snapshot_entries.into_iter().map(Arc::new).collect(),
+                });
+            } else {
+                for entry in &register.log {
+                    if entry.version > since && entry.op.server_id() == server_id {
+                        entries.push(Arc::clone(entry));
+                    }
                 }
             }
-            for entry in &register.log {
-                if entry.version > since && entry.op.server_id() == server_id {
-                    entries.push(Arc::clone(entry));
-                }
+        }
+
+        if let Some((viewer_session_id, viewer_client_instance_id)) = viewer {
+            entries.retain(|entry| {
+                !is_own_replayed_add_client(&entry.op, viewer_session_id, viewer_client_instance_id)
+            });
+            for rebase in &mut rebases {
+                rebase.entries.retain(|entry| {
+                    !is_own_replayed_add_client(
+                        &entry.op,
+                        viewer_session_id,
+                        viewer_client_instance_id,
+                    )
+                });
             }
         }
 
@@ -2625,8 +2726,43 @@ impl ClientRepository {
                 .then_with(|| a.node_id.cmp(&b.node_id))
                 .then_with(|| a.version.cmp(&b.version))
         });
+        rebases.sort_by_key(ClientOriginRebase::origin);
 
-        Ok(entries)
+        ClientProjectionCatchUp {
+            rebases,
+            entries,
+            target_versions,
+        }
+    }
+
+    fn log_has_contiguous_suffix(
+        log: &VecDeque<Arc<ClientStateLogEntry>>,
+        since: u64,
+        current: u64,
+    ) -> bool {
+        if since >= current {
+            return since == current;
+        }
+
+        let mut expected = since + 1;
+        for entry in log.iter().filter(|entry| entry.version > since) {
+            if entry.version != expected {
+                return false;
+            }
+            expected += 1;
+        }
+        expected == current + 1
+    }
+
+    fn projection_snapshot_entry(
+        origin: u16,
+        version: u64,
+        client: &Client,
+        timestamp: i64,
+    ) -> ClientStateLogEntry {
+        let mut entry = Self::snapshot_add_entry(origin, client, timestamp);
+        entry.version = version;
+        entry
     }
 
     /// Send `message` to a single client identified by `id`.
@@ -3715,7 +3851,7 @@ mod tests {
         )
         .await;
 
-        let (entries, versions) = repo
+        let (rebases, entries, versions) = repo
             .replay_entries_since_in_server_for_client(
                 "alpha",
                 &alpha_auth_versions,
@@ -3723,7 +3859,8 @@ mod tests {
                 700,
             )
             .await
-            .expect("global auth baseline remains replayable after old entries are pruned");
+            .into_parts();
+        assert!(rebases.is_empty());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].version, 3);
         assert_eq!(versions.get(&1), Some(&3));
@@ -3779,17 +3916,128 @@ mod tests {
             .await;
         assert!(clients.is_empty());
         assert_eq!(versions.get(&2), Some(&5));
-        assert!(
-            repo.replay_entries_since_in_server_for_client(
+        let plan = repo
+            .replay_entries_since_in_server_for_client(
                 "empty-scope",
                 &versions,
                 ClientSessionIdentifier::new(1, 1).unwrap(),
                 1,
             )
-            .await
-            .is_ok(),
-            "the baseline staged during authentication must not produce an unrecoverable log gap"
+            .await;
+        assert!(
+            plan.rebases().is_empty(),
+            "the baseline staged during authentication must not require a rebase"
         );
+    }
+
+    #[tokio::test]
+    async fn projection_catch_up_rebases_a_cursor_below_the_snapshot_floor() {
+        let repo = ClientRepository::new(1, 128);
+        let snapshot_entry = (*remote_add_entry_in_server("alpha", 2, 7, 0).await).clone();
+        assert_eq!(
+            repo.install_remote_client_snapshot(
+                2,
+                7,
+                5,
+                5,
+                vec![snapshot_entry],
+                &HashMap::from([("alpha".to_owned(), 0)]),
+            )
+            .await
+            .unwrap(),
+            ClientSnapshotInstallOutcome::Installed
+        );
+
+        let plan = repo
+            .replay_entries_since_in_server_for_client(
+                "alpha",
+                &HashMap::from([(2, 0)]),
+                ClientSessionIdentifier::new(1, 1).unwrap(),
+                1,
+            )
+            .await;
+
+        assert!(plan.entries().is_empty());
+        assert_eq!(plan.target_versions().get(&2), Some(&5));
+        assert_eq!(plan.rebases().len(), 1);
+        let rebase = &plan.rebases()[0];
+        assert_eq!(rebase.origin(), 2);
+        assert_eq!(rebase.version(), 5);
+        assert_eq!(rebase.entries().len(), 1);
+        assert_eq!(rebase.entries()[0].node_id, 2);
+        assert_eq!(rebase.entries()[0].version, 5);
+        assert_eq!(rebase.entries()[0].op.server_id(), "alpha");
+    }
+
+    #[tokio::test]
+    async fn projection_catch_up_advances_past_out_of_scope_only_suffix() {
+        let repo = ClientRepository::new(1, 128);
+        for version in 1..=2 {
+            repo.apply_remote_operation_with_epoch(
+                7,
+                remote_add_entry_in_server("beta", 2, version as u32, version).await,
+                0,
+            )
+            .await
+            .unwrap();
+        }
+
+        let plan = repo
+            .replay_entries_since_in_server_for_client(
+                "alpha",
+                &HashMap::from([(2, 0)]),
+                ClientSessionIdentifier::new(1, 1).unwrap(),
+                1,
+            )
+            .await;
+
+        assert!(plan.rebases().is_empty());
+        assert!(plan.entries().is_empty());
+        assert_eq!(plan.target_versions().get(&2), Some(&2));
+    }
+
+    #[tokio::test]
+    async fn projection_catch_up_rebases_empty_and_unrelated_snapshots_without_scoped_entries() {
+        for (node_id, snapshot_entries, scope_versions) in [
+            (2, Vec::new(), HashMap::new()),
+            (
+                3,
+                vec![(*remote_add_entry_in_server("beta", 3, 7, 0).await).clone()],
+                HashMap::from([("beta".to_owned(), 0)]),
+            ),
+        ] {
+            let repo = ClientRepository::new(1, 128);
+            assert_eq!(
+                repo.install_remote_client_snapshot(
+                    node_id,
+                    7,
+                    5,
+                    5,
+                    snapshot_entries,
+                    &scope_versions,
+                )
+                .await
+                .unwrap(),
+                ClientSnapshotInstallOutcome::Installed
+            );
+
+            let plan = repo
+                .replay_entries_since_in_server_for_client(
+                    "alpha",
+                    &HashMap::from([(node_id, 0)]),
+                    ClientSessionIdentifier::new(1, 1).unwrap(),
+                    1,
+                )
+                .await;
+
+            assert!(plan.entries().is_empty());
+            assert_eq!(plan.target_versions().get(&node_id), Some(&5));
+            assert_eq!(plan.rebases().len(), 1);
+            let rebase = &plan.rebases()[0];
+            assert_eq!(rebase.origin(), node_id);
+            assert_eq!(rebase.version(), 5);
+            assert!(rebase.entries().is_empty());
+        }
     }
 
     #[tokio::test]
@@ -4804,6 +5052,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn local_projection_rebase_waits_for_deferred_state_commit() {
+        let repo = Arc::new(ClientRepository::new(1, 1));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30005);
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64738);
+
+        let client = repo
+            .allocate_web_client_in_server("alpha", peer.ip(), peer, local, tx)
+            .await;
+        let session = client.get_session_id();
+        repo.publish_client_in_server("alpha", session).await;
+        {
+            let mut state = client.write_global_state(&repo);
+            state.set_display_name(Some("before-rebase".to_owned()));
+        }
+
+        let write_guard = repo.register.write().await;
+        {
+            let mut state = client.write_global_state(&repo);
+            state.set_current_channel_id(42);
+        }
+
+        let catch_up = tokio::spawn({
+            let repo = Arc::clone(&repo);
+            async move {
+                repo.replay_entries_since_in_server_for_client(
+                    "alpha",
+                    &HashMap::from([(1, 0)]),
+                    ClientSessionIdentifier::new(1, 999).unwrap(),
+                    999,
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !catch_up.is_finished(),
+            "catch-up must wait until the matching state commit is materialized"
+        );
+
+        drop(write_guard);
+        let plan = catch_up.await.unwrap();
+        assert_eq!(plan.target_versions().get(&1), Some(&3));
+        assert_eq!(plan.rebases().len(), 1);
+        let entries = plan.rebases()[0].entries();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].op {
+            ClientStateOperation::AddClient { initial_state, .. } => {
+                assert_eq!(initial_state.current_channel_id, Some(42));
+            }
+            other => panic!("expected AddClient, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn deferred_global_state_commits_keep_fifo_order_after_contention() {
         let repo = Arc::new(ClientRepository::new(1, 128));
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -4919,7 +5222,7 @@ mod tests {
         );
         assert_eq!(versions.get(&1), Some(&3));
 
-        let (entries, entry_versions) = repo
+        let (rebases, entries, entry_versions) = repo
             .replay_entries_since_in_server_for_client(
                 "alpha",
                 &last_seen,
@@ -4927,7 +5230,8 @@ mod tests {
                 new_client.client_instance_id(),
             )
             .await
-            .expect("replay succeeds");
+            .into_parts();
+        assert!(rebases.is_empty());
         for entry in &entries {
             let entry_messages = entry
                 .messages_for_client(&repo, session, new_client.client_instance_id())

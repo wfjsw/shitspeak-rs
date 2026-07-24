@@ -472,31 +472,8 @@ impl ClientProjectionState {
         if matches!(entry.op, ClientStateOperation::ResetNode { .. }) {
             match broadcast.versions.get(&entry.node_id).copied() {
                 Some(0) => {
-                    let sessions = take_origin_sessions_from_shadow(
-                        &mut self.session_channel_shadow,
-                        entry.node_id,
-                    );
-                    let server_id = self.client.server_id();
-                    for session in sessions {
-                        let removal: Message = shitspeak_messages::messages::encoder::UserRemove {
-                            session: u32::from(session),
-                            actor: None,
-                            reason: None,
-                            ban: Some(false),
-                        }
-                        .into();
-                        outbound.extend(
-                            crate::client::visibility::project_message_with_shadow(
-                                server,
-                                &self.client,
-                                &mut self.user_visibility,
-                                &mut self.session_channel_shadow,
-                                &server_id,
-                                &removal,
-                            )
-                            .await,
-                        );
-                    }
+                    self.append_origin_reset(server, entry.node_id, outbound)
+                        .await;
                     self.last_client_versions.remove(&entry.node_id);
                     return Ok(());
                 }
@@ -554,6 +531,41 @@ impl ClientProjectionState {
             .await?;
         merge_version_vector(&mut self.last_client_versions, &broadcast.versions);
         Ok(())
+    }
+
+    async fn append_origin_reset(
+        &mut self,
+        server: &Arc<Box<Server>>,
+        origin: u16,
+        outbound: &mut Vec<Message>,
+    ) {
+        let sessions = take_origin_sessions_from_shadow(&mut self.session_channel_shadow, origin);
+        let server_id = self.client.server_id();
+        for session in sessions {
+            if session == self.client.get_session_id() {
+                self.session_channel_shadow
+                    .insert(session, self.client.get_current_channel_id());
+                continue;
+            }
+            let removal: Message = shitspeak_messages::messages::encoder::UserRemove {
+                session: u32::from(session),
+                actor: None,
+                reason: None,
+                ban: Some(false),
+            }
+            .into();
+            outbound.extend(
+                crate::client::visibility::project_message_with_shadow(
+                    server,
+                    &self.client,
+                    &mut self.user_visibility,
+                    &mut self.session_channel_shadow,
+                    &server_id,
+                    &removal,
+                )
+                .await,
+            );
+        }
     }
 
     async fn append_client_entry(
@@ -632,7 +644,7 @@ impl ClientProjectionState {
         outbound: &mut Vec<Message>,
     ) -> Result<(), HandleIncomingConnectionError> {
         let server_id = self.client.server_id();
-        let (missed, new_versions) = server
+        let catch_up = server
             .clients
             .replay_entries_since_in_server_for_client(
                 &server_id,
@@ -640,8 +652,31 @@ impl ClientProjectionState {
                 self.client.get_session_id(),
                 self.client.client_instance_id(),
             )
-            .await
-            .map_err(|()| HandleIncomingConnectionError::ClientLogGapUnrecoverable)?;
+            .await;
+        let (rebases, missed, target_versions) = catch_up.into_parts();
+
+        let mut rebased_origins = std::collections::HashSet::with_capacity(rebases.len());
+        for rebase in rebases {
+            let (origin, version, entries) = rebase.into_parts();
+            rebased_origins.insert(origin);
+            self.append_origin_reset(server, origin, outbound).await;
+            for entry in entries {
+                if should_skip_client_add_entry(
+                    &entry.op,
+                    self.client.get_session_id(),
+                    self.client.client_instance_id(),
+                    &self.session_channel_shadow,
+                ) {
+                    continue;
+                }
+                self.append_client_entry(server, &entry, outbound).await?;
+            }
+            if version == 0 {
+                self.last_client_versions.remove(&origin);
+            } else {
+                self.last_client_versions.insert(origin, version);
+            }
+        }
 
         for entry in missed {
             if should_skip_client_add_entry(
@@ -654,7 +689,11 @@ impl ClientProjectionState {
             }
             self.append_client_entry(server, &entry, outbound).await?;
         }
-        merge_version_vector(&mut self.last_client_versions, &new_versions);
+        for (origin, version) in target_versions {
+            if !rebased_origins.contains(&origin) {
+                merge_one_version(&mut self.last_client_versions, origin, version);
+            }
+        }
         Ok(())
     }
 }
