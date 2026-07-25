@@ -951,6 +951,10 @@ pub struct TransportRoutingPolicy {
     voice_path_challenger_confirm_ms: u64,
     #[serde(default = "default_voice_path_idle_reset_ms")]
     voice_path_idle_reset_ms: u64,
+    #[serde(default = "default_conversational_path_effective_loss_suspect_ppm")]
+    conversational_path_effective_loss_suspect_ppm: u32,
+    #[serde(default = "default_conversational_path_effective_loss_recover_ppm")]
+    conversational_path_effective_loss_recover_ppm: u32,
     #[serde(default = "default_udp_family_min_samples")]
     udp_family_min_samples: u64,
     #[serde(default = "default_udp_family_probe_loss_block_count")]
@@ -994,6 +998,10 @@ impl Default for TransportRoutingPolicy {
             voice_path_min_hold_ms: default_voice_path_min_hold_ms(),
             voice_path_challenger_confirm_ms: default_voice_path_challenger_confirm_ms(),
             voice_path_idle_reset_ms: default_voice_path_idle_reset_ms(),
+            conversational_path_effective_loss_suspect_ppm:
+                default_conversational_path_effective_loss_suspect_ppm(),
+            conversational_path_effective_loss_recover_ppm:
+                default_conversational_path_effective_loss_recover_ppm(),
             udp_family_min_samples: default_udp_family_min_samples(),
             udp_family_probe_loss_block_count: default_udp_family_probe_loss_block_count(),
             udp_family_block_loss_ppm: default_udp_family_block_loss_ppm(),
@@ -1036,6 +1044,14 @@ impl TransportRoutingPolicy {
 
     pub fn voice_path_idle_reset(&self) -> Duration {
         Duration::from_millis(self.voice_path_idle_reset_ms)
+    }
+
+    pub fn conversational_path_effective_loss_suspect_ppm(&self) -> u32 {
+        self.conversational_path_effective_loss_suspect_ppm
+    }
+
+    pub fn conversational_path_effective_loss_recover_ppm(&self) -> u32 {
+        self.conversational_path_effective_loss_recover_ppm
     }
 
     pub fn udp_family_min_samples(&self) -> u64 {
@@ -1214,7 +1230,33 @@ impl TransportRoutingPolicy {
         self
     }
 
+    pub fn with_conversational_path_effective_loss_suspect_ppm(mut self, ppm: u32) -> Self {
+        self.conversational_path_effective_loss_suspect_ppm = ppm.min(1_000_000);
+        self
+    }
+
+    pub fn with_conversational_path_effective_loss_recover_ppm(mut self, ppm: u32) -> Self {
+        self.conversational_path_effective_loss_recover_ppm = ppm.min(1_000_000);
+        self
+    }
+
     fn validate(&self) -> Result<(), String> {
+        if self.conversational_path_effective_loss_suspect_ppm > 1_000_000
+            || self.conversational_path_effective_loss_recover_ppm > 1_000_000
+        {
+            return Err(
+                "s2s.transport conversational-path effective-loss thresholds must not exceed 1000000 ppm"
+                    .into(),
+            );
+        }
+        if self.conversational_path_effective_loss_recover_ppm
+            > self.conversational_path_effective_loss_suspect_ppm
+        {
+            return Err(
+                "s2s.transport.conversational_path_effective_loss_recover_ppm must not exceed conversational_path_effective_loss_suspect_ppm"
+                    .into(),
+            );
+        }
         if self.best_effort_datagram_effective_loss_suspect_ppm > 1_000_000
             || self.best_effort_datagram_effective_loss_recover_ppm > 1_000_000
         {
@@ -1619,6 +1661,12 @@ fn default_udp_family_block_loss_ppm() -> u32 {
 fn default_udp_family_loss_excess_over_tcp_ppm() -> u32 {
     50_000
 }
+fn default_conversational_path_effective_loss_suspect_ppm() -> u32 {
+    3_000
+}
+fn default_conversational_path_effective_loss_recover_ppm() -> u32 {
+    1_500
+}
 fn default_best_effort_datagram_effective_loss_suspect_ppm() -> u32 {
     5_000
 }
@@ -1839,6 +1887,14 @@ mod tests {
         assert_eq!(policy.udp_family_block_loss_ppm(), 250_000);
         assert_eq!(policy.udp_family_loss_excess_over_tcp_ppm(), 50_000);
         assert_eq!(
+            policy.conversational_path_effective_loss_suspect_ppm(),
+            3_000
+        );
+        assert_eq!(
+            policy.conversational_path_effective_loss_recover_ppm(),
+            1_500
+        );
+        assert_eq!(
             policy.best_effort_datagram_effective_loss_suspect_ppm(),
             5_000
         );
@@ -1885,6 +1941,8 @@ mod tests {
             .with_udp_family_probe_loss_block_count(4)
             .with_udp_family_block_loss_ppm(2_000_000)
             .with_udp_family_loss_excess_over_tcp_ppm(70_000)
+            .with_conversational_path_effective_loss_suspect_ppm(8_000)
+            .with_conversational_path_effective_loss_recover_ppm(3_000)
             .with_best_effort_datagram_effective_loss_suspect_ppm(12_000)
             .with_best_effort_datagram_effective_loss_recover_ppm(6_000)
             .with_best_effort_quic_datagram_health_suspect_ppm(150_000)
@@ -1907,6 +1965,14 @@ mod tests {
         assert_eq!(policy.udp_family_probe_loss_block_count(), 4);
         assert_eq!(policy.udp_family_block_loss_ppm(), 1_000_000);
         assert_eq!(policy.udp_family_loss_excess_over_tcp_ppm(), 70_000);
+        assert_eq!(
+            policy.conversational_path_effective_loss_suspect_ppm(),
+            8_000
+        );
+        assert_eq!(
+            policy.conversational_path_effective_loss_recover_ppm(),
+            3_000
+        );
         assert_eq!(
             policy.best_effort_datagram_effective_loss_suspect_ppm(),
             12_000
@@ -1974,6 +2040,8 @@ mod tests {
                     udp_family_probe_loss_block_count = 5
                     udp_family_block_loss_ppm = 200000
                     udp_family_loss_excess_over_tcp_ppm = 40000
+                    conversational_path_effective_loss_suspect_ppm = 7000
+                    conversational_path_effective_loss_recover_ppm = 3000
                     best_effort_datagram_effective_loss_suspect_ppm = 9000
                     best_effort_datagram_effective_loss_recover_ppm = 4000
                     best_effort_quic_datagram_health_suspect_ppm = 120000
@@ -2006,6 +2074,14 @@ mod tests {
         assert_eq!(policy.udp_family_probe_loss_block_count(), 5);
         assert_eq!(policy.udp_family_block_loss_ppm(), 200_000);
         assert_eq!(policy.udp_family_loss_excess_over_tcp_ppm(), 40_000);
+        assert_eq!(
+            policy.conversational_path_effective_loss_suspect_ppm(),
+            7_000
+        );
+        assert_eq!(
+            policy.conversational_path_effective_loss_recover_ppm(),
+            3_000
+        );
         assert_eq!(
             policy.best_effort_datagram_effective_loss_suspect_ppm(),
             9_000
@@ -2066,8 +2142,11 @@ mod tests {
     }
 
     #[test]
-    fn transport_tuning_rejects_invalid_datagram_effective_loss_thresholds() {
+    fn transport_tuning_rejects_invalid_effective_loss_thresholds() {
         for source in [
+            "conversational_path_effective_loss_suspect_ppm = 1000001",
+            "conversational_path_effective_loss_recover_ppm = 1000001",
+            "conversational_path_effective_loss_suspect_ppm = 4000\nconversational_path_effective_loss_recover_ppm = 5000",
             "best_effort_datagram_effective_loss_suspect_ppm = 1000001",
             "best_effort_datagram_effective_loss_recover_ppm = 1000001",
             "best_effort_datagram_effective_loss_suspect_ppm = 4000\nbest_effort_datagram_effective_loss_recover_ppm = 5000",

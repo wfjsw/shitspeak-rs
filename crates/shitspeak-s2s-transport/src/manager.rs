@@ -1708,6 +1708,67 @@ impl ConnectionManager {
             .map(|transport| send_queue_penalty(&peer, transport, level, class, options, now))
     }
 
+    /// Return the pressure for a conversational path. In addition to local
+    /// queue pressure, sustained loss on the selected path is a soft failure
+    /// so the overlay can select a cleaner relay.
+    pub fn best_conversational_path_pressure(
+        &self,
+        node: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        options: SendOptions,
+    ) -> Option<u8> {
+        let peer = self.inner.get_peer(node)?;
+        let now = Instant::now();
+        let policy = self.inner.cfg().routing_policy();
+        let mut ranked = pick_transports(
+            &peer,
+            level,
+            routing_metric,
+            class,
+            options,
+            0,
+            TransportSelectionConfig::from_config(self.inner.cfg()),
+        );
+        apply_voice_transport_stickiness(
+            &peer,
+            &mut ranked,
+            level,
+            routing_metric,
+            class,
+            options,
+            policy,
+            now,
+            false,
+        );
+        let selected = ranked.first().copied()?;
+        let queue_pressure = send_queue_penalty(&peer, selected, level, class, options, now);
+        if routing_metric != RoutingMetric::ConversationalQuality {
+            return Some(queue_pressure);
+        }
+
+        let snapshot = peer.metrics().snapshot_per_transport();
+        let quality_transport = if level == ServiceLevel::BestEffort {
+            preferred_conversational_datagram_path(&peer, &ranked, &snapshot, policy)
+                .map(DeliveryPath::transport)
+                .unwrap_or(selected)
+        } else {
+            selected
+        };
+        let quality_pressure = u8::from(
+            peer.observe_conversational_transport_loss(
+                quality_transport,
+                snapshot
+                    .get(&quality_transport)
+                    .map(LinkMetrics::effective_packet_loss_ppm),
+                policy.conversational_path_effective_loss_suspect_ppm(),
+                policy.conversational_path_effective_loss_recover_ppm(),
+            ),
+        ) * 2;
+        Some(queue_pressure.max(quality_pressure))
+    }
+
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         // Drop streams.
@@ -2280,6 +2341,32 @@ fn is_expiring_conversational_voice(
     options: SendOptions,
 ) -> bool {
     is_conversational_best_effort(level, routing_metric, class) && options.expires_at().is_some()
+}
+
+fn preferred_conversational_datagram_path(
+    peer: &PeerState,
+    ranked: &[TransportKind],
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    policy: TransportRoutingPolicy,
+) -> Option<DeliveryPath> {
+    for transport in ranked {
+        let path = match transport {
+            TransportKind::Udp if peer.try_get_stream(TransportKind::Udp).is_some() => {
+                DeliveryPath::UdpDatagram
+            }
+            TransportKind::Quic if peer.try_get_quic_v2_stream().is_some() => {
+                DeliveryPath::QuicDatagram
+            }
+            _ => continue,
+        };
+        if matches!(
+            udp_family_health(peer, &[path.transport()], snapshot, policy),
+            UdpFamilyHealth::Probing | UdpFamilyHealth::Viable
+        ) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn is_conversational_best_effort(
@@ -5221,6 +5308,65 @@ mod tests {
             peer.metrics().snapshot_count(),
             1,
             "selection and returned metrics must share one peer snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn conversational_path_pressure_promotes_confident_datagram_loss() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Udp]);
+        transport.record_peer_rtt(2, TransportKind::Udp, Duration::from_millis(40));
+        let peer = transport.inner.get_peer(2).expect("peer");
+        let policy = transport.routing_policy();
+        for _ in 0..policy.udp_family_min_samples() {
+            peer.metrics()
+                .record_native_loss_sample(TransportKind::Udp, 1_000, 10);
+        }
+
+        assert_eq!(
+            transport.best_conversational_path_pressure(
+                2,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+                MessageClass::HighPriority,
+                SendOptions::default(),
+            ),
+            Some(2),
+            "sustained datagram loss must expose a clean relay candidate"
+        );
+
+        assert!(peer.observe_conversational_transport_loss(
+            TransportKind::Udp,
+            Some(2_000),
+            policy.conversational_path_effective_loss_suspect_ppm(),
+            policy.conversational_path_effective_loss_recover_ppm(),
+        ));
+        assert!(!peer.observe_conversational_transport_loss(
+            TransportKind::Udp,
+            Some(1_400),
+            policy.conversational_path_effective_loss_suspect_ppm(),
+            policy.conversational_path_effective_loss_recover_ppm(),
+        ));
+
+        let (reliable_transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        reliable_transport.record_peer_rtt(2, TransportKind::Tcp, Duration::from_millis(40));
+        let reliable_peer = reliable_transport.inner.get_peer(2).expect("peer");
+        for _ in 0..policy.udp_family_min_samples() {
+            reliable_peer
+                .metrics()
+                .record_native_loss_sample(TransportKind::Tcp, 1_000, 10);
+        }
+        assert_eq!(
+            reliable_transport.best_conversational_path_pressure(
+                2,
+                ServiceLevel::Reliable,
+                RoutingMetric::ConversationalQuality,
+                MessageClass::Regular,
+                SendOptions::default(),
+            ),
+            Some(2),
+            "ConversationalQuality alone must enable the quality penalty"
         );
     }
 

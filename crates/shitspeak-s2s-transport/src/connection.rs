@@ -1420,6 +1420,10 @@ pub(crate) struct PeerState {
     transport_health_exclusions:
         Mutex<HashMap<(TransportKind, TransportHealthExclusionReason), u64>>,
     datagram_path_health: Mutex<HashMap<DeliveryPath, DatagramPathHealthObservation>>,
+    /// Long-lived conversational-path loss hysteresis. This intentionally
+    /// uses the effective-loss EWMA so sparse keepalive probes can still
+    /// protect realtime traffic.
+    conversational_transport_loss_suspect: Mutex<HashMap<TransportKind, bool>>,
     /// KCP is kept out of BestEffort selection after failaway/no-progress
     /// until the native KCP sampler observes a newer ACK-derived RTT sample.
     kcp_best_effort_recovery_after_rtt_samples: Mutex<Option<u64>>,
@@ -1462,6 +1466,7 @@ impl PeerState {
             expired_outbound_drops: ExpiredOutboundDropCounters::default(),
             transport_health_exclusions: Mutex::new(HashMap::new()),
             datagram_path_health: Mutex::new(HashMap::new()),
+            conversational_transport_loss_suspect: Mutex::new(HashMap::new()),
             kcp_best_effort_recovery_after_rtt_samples: Mutex::new(None),
             voice_transport_binding: Mutex::new(VoiceTransportBinding::default()),
             outbound_dispatch_notify: Notify::new(),
@@ -2183,6 +2188,26 @@ impl PeerState {
         let mut counters = self.transport_health_exclusions.lock();
         let counter = counters.entry((transport, reason)).or_insert(0);
         *counter = counter.saturating_add(1);
+    }
+
+    pub(crate) fn observe_conversational_transport_loss(
+        &self,
+        transport: TransportKind,
+        effective_loss_ppm: Option<u32>,
+        suspect_effective_loss_ppm: u32,
+        recover_effective_loss_ppm: u32,
+    ) -> bool {
+        let mut suspects = self.conversational_transport_loss_suspect.lock();
+        let previous = suspects.get(&transport).copied().unwrap_or(false);
+        let recover_effective_loss_ppm = recover_effective_loss_ppm.min(suspect_effective_loss_ppm);
+        let suspect = match effective_loss_ppm {
+            Some(loss) if loss >= suspect_effective_loss_ppm => true,
+            Some(loss) if previous && loss > recover_effective_loss_ppm => true,
+            Some(_) => false,
+            None => previous,
+        };
+        suspects.insert(transport, suspect);
+        suspect
     }
 
     #[allow(clippy::too_many_arguments)]

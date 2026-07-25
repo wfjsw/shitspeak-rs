@@ -2204,7 +2204,7 @@ fn tree_edge_candidates(
     let options = transport_options_for_overlay_data(data, Some(hop_ttl));
     let mut candidates = Vec::new();
     let direct_pressure =
-        transport.best_send_queue_pressure(child, level, metric, transport_class, options);
+        transport.best_conversational_path_pressure(child, level, metric, transport_class, options);
     if let Some(pressure) = direct_pressure {
         candidates.push(TreeEdgeCandidate::direct(pressure));
     }
@@ -2228,9 +2228,13 @@ fn tree_edge_candidates(
         if first_hop == child || visited.contains(&first_hop) {
             continue;
         }
-        if let Some(pressure) =
-            transport.best_send_queue_pressure(first_hop, level, metric, transport_class, options)
-        {
+        if let Some(pressure) = transport.best_conversational_path_pressure(
+            first_hop,
+            level,
+            metric,
+            transport_class,
+            options,
+        ) {
             candidates.push(TreeEdgeCandidate::legacy(first_hop, pressure, route_cost));
         }
     }
@@ -3085,7 +3089,7 @@ fn queue_pressure_alternate(
 ) -> Option<NodeIdentifier> {
     let transport = transport?;
     let current_pressure = transport
-        .best_send_queue_pressure(
+        .best_conversational_path_pressure(
             current_next_hop,
             level,
             routing_metric,
@@ -3093,7 +3097,9 @@ fn queue_pressure_alternate(
             send_options,
         )
         .unwrap_or(3);
-    let reroute_threshold = if send_options.expires_at().is_some() {
+    let reroute_threshold = if routing_metric == RoutingMetric::ConversationalQuality {
+        2
+    } else if send_options.expires_at().is_some() {
         2
     } else {
         3
@@ -3112,7 +3118,7 @@ fn queue_pressure_alternate(
     if alternate.next_hop == current_next_hop {
         return None;
     }
-    let alternate_pressure = transport.best_send_queue_pressure(
+    let alternate_pressure = transport.best_conversational_path_pressure(
         alternate.next_hop,
         level,
         routing_metric,
