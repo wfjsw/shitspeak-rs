@@ -242,7 +242,7 @@ async fn channel_history_status(repos: &[Arc<ChannelRepository>]) -> Vec<String>
             .get_all()
             .await
             .into_iter()
-            .map(|channel| (channel.id, channel.name))
+            .map(|channel| (channel.id, channel.name.clone()))
             .collect();
         channels.sort_by_key(|(id, _)| *id);
         out.push(format!(
@@ -1366,7 +1366,7 @@ async fn strict_channel_repository_split_heal_preserves_all_terminal_commits() {
                 tokio::runtime::Handle::current()
                     .block_on(repo.get_all())
                     .into_iter()
-                    .map(|channel| channel.name)
+                    .map(|channel| channel.name.clone())
                     .collect::<Vec<_>>()
             });
             names.sort();

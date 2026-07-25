@@ -68,7 +68,11 @@ pub async fn handle_voice_target(
     for channel in valid_channels {
         target.add_channel(channel);
     }
-    sender.set_voice_target(target_id, target);
+    if target.is_empty() {
+        sender.remove_voice_target(target_id);
+    } else {
+        sender.set_voice_target(target_id, target);
+    }
 
     Ok(())
 }

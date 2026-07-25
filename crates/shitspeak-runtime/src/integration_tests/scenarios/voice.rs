@@ -35,8 +35,7 @@ use crate::voice::metrics::{
 use shitspeak_messages::messages::Message;
 use shitspeak_messages::messages::encoder::{AudioTarget, ChanAcl, Ping, UserState, VoiceTarget};
 use shitspeak_proto::mumble_proto::voice_target::Target as VoiceTargetEntry;
-use shitspeak_state::ACLPermissions;
-use shitspeak_state::Channel;
+use shitspeak_state::{ACLPermissions, Channel, ChannelPatch};
 
 const VOICE_DEADLINE: Duration = Duration::from_secs(2);
 const NEGATIVE_WINDOW: Duration = Duration::from_millis(500);
@@ -98,6 +97,16 @@ fn voice_target_channel(
         group: group.map(str::to_owned),
         links: Some(links),
         children: Some(children),
+    }
+}
+
+fn channel_parent_patch(parent_id: u32) -> ChannelPatch {
+    ChannelPatch {
+        name: None,
+        position: None,
+        max_users: None,
+        description_hash: None,
+        parent_id: Some(Some(parent_id)),
     }
 }
 
@@ -827,6 +836,57 @@ async fn wait_for_voice_target_installed(
         assert!(
             tokio::time::Instant::now() < deadline,
             "voice target slot {slot} was not installed before shout"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_voice_target_channel_installed(
+    server: &crate::integration_tests::harness::TestServer,
+    client: &TestClient,
+    slot: u32,
+    expected_channel_id: u32,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let sender = server
+            .server
+            .get_clients()
+            .get_client(client.server_session)
+            .await
+            .expect("sender should remain connected");
+        if sender.voice_target(slot).is_some_and(|target| {
+            target.channels().len() == 1 && target.channels()[0].id() == expected_channel_id
+        }) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "voice target slot {slot} was not installed for channel {expected_channel_id} before shout"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_voice_target_removed(
+    server: &crate::integration_tests::harness::TestServer,
+    client: &TestClient,
+    slot: u32,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let sender = server
+            .server
+            .get_clients()
+            .get_client(client.server_session)
+            .await
+            .expect("sender should remain connected");
+        if sender.voice_target(slot).is_none() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "voice target slot {slot} was not removed"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1611,6 +1671,7 @@ async fn voice_target_channel_cache_tracks_client_moves() {
             vec![voice_target_channel(102, false, false, None)],
         ))
         .await;
+    wait_for_voice_target_installed(&server, &alice, 7).await;
     alice
         .send_voice_tcp(7, 42, Bytes::from_static(SAMPLE_OPUS))
         .await;
@@ -1647,6 +1708,428 @@ async fn voice_target_channel_cache_tracks_client_moves() {
     expect_no_voice(
         &bob,
         "Bob should not receive the second cached channel target packet after moving away",
+    )
+    .await;
+}
+
+/// Models the official client's relative-target behavior: when the sender
+/// moves, the client resolves the shortcut again and replaces the same slot
+/// with the new concrete channel ID.
+#[tokio::test]
+async fn voice_target_same_slot_replacement_after_sender_move_uses_new_channel() {
+    const VOICE_TARGET_SLOT: u32 = 7;
+    const PARENT_CHANNEL: u32 = 160;
+    const INITIAL_CHILD_CHANNEL: u32 = 161;
+    const SIBLING_CHANNEL: u32 = 162;
+
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let channels = server.server.get_channels();
+    channels
+        .create_channel(Channel::new(
+            PARENT_CHANNEL,
+            "Parent".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+    channels
+        .create_channel(Channel::new(
+            INITIAL_CHILD_CHANNEL,
+            "InitialChild".to_owned(),
+            0,
+            0,
+            Some(PARENT_CHANNEL),
+        ))
+        .await
+        .unwrap();
+    channels
+        .create_channel(Channel::new(
+            SIBLING_CHANNEL,
+            "Sibling".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    alice.move_to_channel(INITIAL_CHILD_CHANNEL).await;
+    bob.move_to_channel(INITIAL_CHILD_CHANNEL).await;
+    carol.move_to_channel(PARENT_CHANNEL).await;
+    expect_user_channel(
+        &alice,
+        INITIAL_CHILD_CHANNEL,
+        "Alice enters the initial child channel",
+    )
+    .await;
+    expect_user_channel(
+        &bob,
+        INITIAL_CHILD_CHANNEL,
+        "Bob enters the initial child channel",
+    )
+    .await;
+    expect_user_channel(&carol, PARENT_CHANNEL, "Carol enters the parent channel").await;
+    bob.drain_now().await;
+    carol.drain_now().await;
+
+    alice
+        .set_voice_target(voice_target(
+            VOICE_TARGET_SLOT,
+            vec![voice_target_channel(
+                INITIAL_CHILD_CHANNEL,
+                false,
+                false,
+                None,
+            )],
+        ))
+        .await;
+    wait_for_voice_target_channel_installed(
+        &server,
+        &alice,
+        VOICE_TARGET_SLOT,
+        INITIAL_CHILD_CHANNEL,
+    )
+    .await;
+
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 60, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(&bob, &alice, "Bob should hear the initial child target").await;
+    expect_no_voice(
+        &carol,
+        "Carol should not hear the target before the slot is replaced",
+    )
+    .await;
+
+    alice.move_to_channel(PARENT_CHANNEL).await;
+    expect_user_channel(
+        &alice,
+        PARENT_CHANNEL,
+        "Alice moves from the child to its parent",
+    )
+    .await;
+    alice
+        .set_voice_target(voice_target(
+            VOICE_TARGET_SLOT,
+            vec![voice_target_channel(PARENT_CHANNEL, false, false, None)],
+        ))
+        .await;
+    wait_for_voice_target_channel_installed(&server, &alice, VOICE_TARGET_SLOT, PARENT_CHANNEL)
+        .await;
+    bob.drain_now().await;
+    carol.drain_now().await;
+
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 61, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(
+        &carol,
+        &alice,
+        "Carol should hear the replacement parent target",
+    )
+    .await;
+    expect_no_voice(
+        &bob,
+        "Bob in the child must not receive the replaced non-recursive parent target",
+    )
+    .await;
+
+    bob.move_to_channel(SIBLING_CHANNEL).await;
+    expect_user_channel(
+        &bob,
+        SIBLING_CHANNEL,
+        "Bob moves to a sibling of Alice's current channel",
+    )
+    .await;
+    bob.drain_now().await;
+    carol.drain_now().await;
+
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 62, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(
+        &carol,
+        &alice,
+        "Carol should continue hearing the replacement parent target",
+    )
+    .await;
+    expect_no_voice(
+        &bob,
+        "Bob in the sibling must not receive audio from the replaced slot",
+    )
+    .await;
+
+    carol.move_to_channel(INITIAL_CHILD_CHANNEL).await;
+    expect_user_channel(
+        &carol,
+        INITIAL_CHILD_CHANNEL,
+        "Carol leaves the cached parent target for its child",
+    )
+    .await;
+    carol.drain_now().await;
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 63, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_no_voice(
+        &carol,
+        "Carol must stop hearing the non-recursive parent target after moving into its child",
+    )
+    .await;
+
+    carol.move_to_channel(SIBLING_CHANNEL).await;
+    expect_user_channel(
+        &carol,
+        SIBLING_CHANNEL,
+        "Carol moves from the child to a sibling of Alice's channel",
+    )
+    .await;
+    carol.drain_now().await;
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 64, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_no_voice(
+        &carol,
+        "Carol must remain excluded after moving into the sibling channel",
+    )
+    .await;
+
+    alice
+        .set_voice_target(voice_target(VOICE_TARGET_SLOT, Vec::new()))
+        .await;
+    wait_for_voice_target_removed(&server, &alice, VOICE_TARGET_SLOT).await;
+    carol.drain_now().await;
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 65, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_no_voice(
+        &carol,
+        "an empty VoiceTarget definition must remove the slot",
+    )
+    .await;
+}
+
+/// Checks that a warm recursive channel target follows a subtree when its
+/// root is reparented into and back out of the target hierarchy.
+#[tokio::test]
+async fn voice_target_channel_cache_tracks_reparented_subtrees() {
+    const VOICE_TARGET_SLOT: u32 = 7;
+
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(140, "Target".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(141, "MovingSubtree".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(142, "SubtreeLeaf".to_owned(), 0, 0, Some(141)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    bob.move_to_channel(142).await;
+    expect_user_channel(&bob, 142, "Bob enters the moving subtree").await;
+    bob.drain_now().await;
+
+    alice
+        .set_voice_target(voice_target(
+            VOICE_TARGET_SLOT,
+            vec![voice_target_channel(140, true, false, None)],
+        ))
+        .await;
+    wait_for_voice_target_installed(&server, &alice, VOICE_TARGET_SLOT).await;
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 50, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_no_voice(
+        &bob,
+        "Bob should not receive the warm recursive target while his subtree is outside it",
+    )
+    .await;
+
+    chans
+        .update_channel(141, channel_parent_patch(140))
+        .await
+        .unwrap();
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 51, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob should receive the same warm target after his subtree is reparented into it",
+    )
+    .await;
+
+    chans
+        .update_channel(141, channel_parent_patch(0))
+        .await
+        .unwrap();
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 52, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_no_voice(
+        &bob,
+        "Bob should stop receiving the same warm target after his subtree is reparented out",
+    )
+    .await;
+
+    chans
+        .create_channel(Channel::new(
+            143,
+            "NewTargetChild".to_owned(),
+            0,
+            0,
+            Some(140),
+        ))
+        .await
+        .unwrap();
+    bob.move_to_channel(143).await;
+    expect_user_channel(&bob, 143, "Bob enters the newly created target child").await;
+    bob.drain_now().await;
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 58, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob should receive the same warm target in a newly created child",
+    )
+    .await;
+}
+
+/// Checks that a warm recursive linked target follows link mutations on both
+/// the target channel and one of its children without Bob changing channels.
+#[tokio::test]
+async fn voice_target_channel_cache_tracks_target_and_child_link_mutations() {
+    const VOICE_TARGET_SLOT: u32 = 7;
+
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(150, "Target".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(151, "TargetChild".to_owned(), 0, 0, Some(150)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(152, "External".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    bob.move_to_channel(152).await;
+    expect_user_channel(&bob, 152, "Bob enters the external channel").await;
+    bob.drain_now().await;
+
+    alice
+        .set_voice_target(voice_target(
+            VOICE_TARGET_SLOT,
+            vec![voice_target_channel(150, true, true, None)],
+        ))
+        .await;
+    wait_for_voice_target_installed(&server, &alice, VOICE_TARGET_SLOT).await;
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 53, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_no_voice(
+        &bob,
+        "Bob should not receive the warm recursive linked target before a link exists",
+    )
+    .await;
+
+    chans.add_link(150, 152).await.unwrap();
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 54, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob should receive the same warm target after the target channel is linked to him",
+    )
+    .await;
+
+    chans.remove_link(150, 152).await.unwrap();
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 55, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_no_voice(
+        &bob,
+        "Bob should stop receiving the same warm target after the target link is removed",
+    )
+    .await;
+
+    chans.add_link(151, 152).await.unwrap();
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 56, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(
+        &bob,
+        &alice,
+        "Bob should receive the same warm target after a target child is linked to him",
+    )
+    .await;
+
+    chans.remove_link(151, 152).await.unwrap();
+    alice
+        .send_voice_tcp(VOICE_TARGET_SLOT, 57, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_no_voice(
+        &bob,
+        "Bob should stop receiving the same warm target after the target child link is removed",
     )
     .await;
 }

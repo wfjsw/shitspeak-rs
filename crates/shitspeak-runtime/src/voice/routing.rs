@@ -98,6 +98,7 @@ struct LocalFanoutWork {
     server_id: String,
     sender_id: ClientSessionIdentifier,
     sender_instance_id: ClientInstanceId,
+    voice_target_definition_id: Option<u64>,
     generation: LocalFanoutGeneration,
     route_kind: VoiceRouteKind,
     route_started_at: Instant,
@@ -115,7 +116,12 @@ struct LocalFanoutGeneration {
 }
 
 impl LocalFanoutGeneration {
-    fn capture(server: &Arc<Box<Server>>, sender: &Client, server_id: &str) -> Self {
+    fn capture(
+        server: &Arc<Box<Server>>,
+        sender: &Client,
+        server_id: &str,
+        sender_channel: u32,
+    ) -> Self {
         Self {
             channel_version: server.get_channels().current_version_in_server(server_id),
             channel_acl_generation: server.get_channels().channel_acl_generation(),
@@ -123,7 +129,7 @@ impl LocalFanoutGeneration {
                 .get_clients()
                 .voice_routing_generation_in_server(server_id),
             sender_acl_generation: sender.get_acl_generation(),
-            sender_channel: sender.get_current_channel_id(),
+            sender_channel,
         }
     }
 }
@@ -131,14 +137,39 @@ impl LocalFanoutGeneration {
 fn local_fanout_snapshot_is_current(
     expected_instance_id: ClientInstanceId,
     expected_generation: &LocalFanoutGeneration,
+    route_kind: VoiceRouteKind,
     current: Option<(ClientInstanceId, &LocalFanoutGeneration)>,
 ) -> bool {
     current.is_some_and(|(instance_id, generation)| {
         instance_id == expected_instance_id
+            && (!matches!(route_kind, VoiceRouteKind::Target)
+                || (generation.channel_version == expected_generation.channel_version
+                    && generation.voice_routing_generation
+                        == expected_generation.voice_routing_generation))
             && generation.channel_acl_generation == expected_generation.channel_acl_generation
             && generation.sender_acl_generation == expected_generation.sender_acl_generation
             && generation.sender_channel == expected_generation.sender_channel
     })
+}
+
+fn voice_target_definition_is_current(
+    route_kind: VoiceRouteKind,
+    expected_definition_id: Option<u64>,
+    current_definition_id: Option<u64>,
+) -> bool {
+    !matches!(route_kind, VoiceRouteKind::Target)
+        || expected_definition_id
+            .zip(current_definition_id)
+            .is_some_and(|(expected, current)| expected == current)
+}
+
+fn voice_target_definition_id(sender: &Client, target: &AudioTarget) -> Option<u64> {
+    match target {
+        AudioTarget::VoiceTarget(slot) => sender
+            .voice_target(*slot)
+            .map(|target| target.definition_id()),
+        _ => None,
+    }
 }
 
 struct LocalFanoutQueue {
@@ -1606,7 +1637,8 @@ async fn route_voice_inner(
         target = %audio.target,
         "routing voice packet"
     );
-    let local_fanout_generation = LocalFanoutGeneration::capture(server, sender, &server_id);
+    let local_fanout_generation =
+        LocalFanoutGeneration::capture(server, sender, &server_id, sender_channel);
 
     let (
         intent,
@@ -1724,6 +1756,7 @@ async fn route_voice_inner(
         (Some(vt), Some(target)) => authorized_target_intent(sender_channel, vt, target.channels()),
         _ => intent.clone(),
     };
+    let queued_voice_target_definition_id = voice_target.as_ref().map(VoiceTarget::definition_id);
 
     tracing::trace!(
         session = u32::from(sender_id),
@@ -1741,7 +1774,13 @@ async fn route_voice_inner(
 
     // Resolution can await repository and ACL work. Recheck immediately
     // before either delivery path so a newly applied suppression wins.
-    if client_voice_blocked(sender) {
+    if client_voice_blocked(sender)
+        || !voice_target_definition_is_current(
+            route_kind,
+            queued_voice_target_definition_id,
+            voice_target_definition_id(sender, &audio.target),
+        )
+    {
         return;
     }
 
@@ -1813,6 +1852,7 @@ async fn route_voice_inner(
                 server_id: server_id.clone(),
                 sender_id,
                 sender_instance_id: sender.client_instance_id(),
+                voice_target_definition_id: queued_voice_target_definition_id,
                 generation: local_fanout_generation,
                 route_kind,
                 route_started_at: started_at,
@@ -2439,11 +2479,17 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
                     &fanout_server,
                     &current_sender,
                     &work.server_id,
+                    current_sender.get_current_channel_id(),
                 );
                 if !local_fanout_snapshot_is_current(
                     work.sender_instance_id,
                     &work.generation,
+                    work.route_kind,
                     Some((current_sender.client_instance_id(), &current_generation)),
+                ) || !voice_target_definition_is_current(
+                    work.route_kind,
+                    work.voice_target_definition_id,
+                    voice_target_definition_id(&current_sender, &work.audio.target),
                 ) {
                     continue;
                 }
@@ -2460,12 +2506,21 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
                 else {
                     continue;
                 };
-                let latest_generation =
-                    LocalFanoutGeneration::capture(&fanout_server, &latest_sender, &work.server_id);
+                let latest_generation = LocalFanoutGeneration::capture(
+                    &fanout_server,
+                    &latest_sender,
+                    &work.server_id,
+                    latest_sender.get_current_channel_id(),
+                );
                 if !local_fanout_snapshot_is_current(
                     work.sender_instance_id,
                     &work.generation,
+                    work.route_kind,
                     Some((latest_sender.client_instance_id(), &latest_generation)),
+                ) || !voice_target_definition_is_current(
+                    work.route_kind,
+                    work.voice_target_definition_id,
+                    voice_target_definition_id(&latest_sender, &work.audio.target),
                 ) {
                     continue;
                 }
@@ -2670,10 +2725,16 @@ mod tests {
             sender_acl_generation: 4,
             sender_channel: 5,
         };
-        assert!(!local_fanout_snapshot_is_current(7, &expected, None));
         assert!(!local_fanout_snapshot_is_current(
             7,
             &expected,
+            VoiceRouteKind::Normal,
+            None,
+        ));
+        assert!(!local_fanout_snapshot_is_current(
+            7,
+            &expected,
+            VoiceRouteKind::Normal,
             Some((8, &expected)),
         ));
 
@@ -2682,6 +2743,7 @@ mod tests {
         assert!(!local_fanout_snapshot_is_current(
             7,
             &expected,
+            VoiceRouteKind::Normal,
             Some((7, &moved))
         ));
 
@@ -2690,6 +2752,7 @@ mod tests {
         assert!(!local_fanout_snapshot_is_current(
             7,
             &expected,
+            VoiceRouteKind::Normal,
             Some((7, &acl_changed)),
         ));
         let mut channel_acl_changed = LocalFanoutGeneration { ..expected };
@@ -2697,17 +2760,19 @@ mod tests {
         assert!(!local_fanout_snapshot_is_current(
             7,
             &expected,
+            VoiceRouteKind::Normal,
             Some((7, &channel_acl_changed)),
         ));
         assert!(local_fanout_snapshot_is_current(
             7,
             &expected,
+            VoiceRouteKind::Normal,
             Some((7, &expected)),
         ));
     }
 
     #[test]
-    fn local_fanout_generation_ignores_unrelated_routing_and_channel_changes() {
+    fn voice_target_fanout_generation_rejects_routing_and_channel_changes() {
         let expected = LocalFanoutGeneration {
             channel_version: 1,
             channel_acl_generation: 2,
@@ -2715,16 +2780,52 @@ mod tests {
             sender_acl_generation: 4,
             sender_channel: 5,
         };
-        let unrelated_changes = LocalFanoutGeneration {
-            channel_version: expected.channel_version + 1,
-            voice_routing_generation: expected.voice_routing_generation + 1,
-            ..expected
-        };
+        let mut channel_changed = LocalFanoutGeneration { ..expected };
+        channel_changed.channel_version += 1;
+        assert!(!local_fanout_snapshot_is_current(
+            7,
+            &expected,
+            VoiceRouteKind::Target,
+            Some((7, &channel_changed)),
+        ));
 
+        let mut routing_changed = LocalFanoutGeneration { ..expected };
+        routing_changed.voice_routing_generation += 1;
+        assert!(!local_fanout_snapshot_is_current(
+            7,
+            &expected,
+            VoiceRouteKind::Target,
+            Some((7, &routing_changed)),
+        ));
         assert!(local_fanout_snapshot_is_current(
             7,
             &expected,
-            Some((7, &unrelated_changes)),
+            VoiceRouteKind::Normal,
+            Some((7, &routing_changed)),
+        ));
+    }
+
+    #[test]
+    fn voice_target_fanout_rejects_replaced_slot_definition() {
+        assert!(voice_target_definition_is_current(
+            VoiceRouteKind::Target,
+            Some(10),
+            Some(10),
+        ));
+        assert!(!voice_target_definition_is_current(
+            VoiceRouteKind::Target,
+            Some(10),
+            Some(11),
+        ));
+        assert!(!voice_target_definition_is_current(
+            VoiceRouteKind::Target,
+            Some(10),
+            None,
+        ));
+        assert!(voice_target_definition_is_current(
+            VoiceRouteKind::Normal,
+            None,
+            None,
         ));
     }
 

@@ -1836,6 +1836,10 @@ impl Client {
         self.voice_targets.lock().insert(id, target);
     }
 
+    pub(crate) fn remove_voice_target(&self, id: u32) {
+        self.voice_targets.lock().remove(&id);
+    }
+
     pub fn voice_target(&self, id: u32) -> Option<VoiceTarget> {
         self.voice_targets.lock().get(&id).cloned()
     }

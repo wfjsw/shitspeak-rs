@@ -1,13 +1,19 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use parking_lot::RwLock;
 
 use super::{ClientInstanceId, client_session_identifier::ClientSessionIdentifier};
 use shitspeak_messages::messages::encoder::AudioContext;
 
+static NEXT_VOICE_TARGET_DEFINITION_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug, Clone)]
 pub struct VoiceTarget {
+    definition_id: u64,
     sessions: Vec<u32>,
     channels: Vec<VoiceTargetChannel>,
     resolved_channels: Arc<
@@ -254,6 +260,7 @@ impl ResolvedVoiceTargetRecipient {
 impl Default for VoiceTarget {
     fn default() -> Self {
         Self {
+            definition_id: NEXT_VOICE_TARGET_DEFINITION_ID.fetch_add(1, Ordering::Relaxed),
             sessions: Vec::new(),
             channels: Vec::new(),
             resolved_channels: Arc::new(RwLock::new(None)),
@@ -270,6 +277,10 @@ impl VoiceTarget {
 
     pub fn add_session(&mut self, session: u32) {
         self.sessions.push(session);
+    }
+
+    pub(crate) fn definition_id(&self) -> u64 {
+        self.definition_id
     }
 
     pub fn add_channel(&mut self, channel: VoiceTargetChannel) {
@@ -605,5 +616,15 @@ mod tests {
 
         assert!(target.cached_resolved_channels("default", 1, 10).is_none());
         assert!(target.cached_resolved_channels("default", 2, 20).is_some());
+    }
+
+    #[test]
+    fn voice_target_definition_identity_tracks_replacement_not_clones() {
+        let target = VoiceTarget::new();
+        let cloned = target.clone();
+        let replacement = VoiceTarget::new();
+
+        assert_eq!(target.definition_id(), cloned.definition_id());
+        assert_ne!(target.definition_id(), replacement.definition_id());
     }
 }
