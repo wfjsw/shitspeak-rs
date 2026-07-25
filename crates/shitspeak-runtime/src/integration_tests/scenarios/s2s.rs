@@ -479,12 +479,6 @@ async fn spawn_s2s_convergence_cluster() -> ConvergenceCluster {
     spawn_s2s_convergence_cluster_with_voice_options(true, None, None, None).await
 }
 
-async fn spawn_s2s_convergence_cluster_with_tree_delivery(
-    tree_delivery_enabled: bool,
-) -> ConvergenceCluster {
-    spawn_s2s_convergence_cluster_with_voice_options(tree_delivery_enabled, None, None, None).await
-}
-
 async fn spawn_s2s_convergence_cluster_with_voice_options(
     tree_delivery_enabled: bool,
     repair_max_extra_copies_per_frame: Option<usize>,
@@ -961,26 +955,6 @@ async fn wait_for_user_removes(
         }
     }
     remaining.is_empty().then(|| started.elapsed())
-}
-
-async fn wait_for_user_state_update(
-    observer: &TestClient,
-    session: u32,
-    deadline: Duration,
-    predicate: impl Fn(&shitspeak_proto::mumble_proto::UserState) -> bool,
-) -> Option<Duration> {
-    let started = Instant::now();
-    while started.elapsed() < deadline {
-        let Some(message) = observer.recv(Duration::from_millis(250)).await else {
-            continue;
-        };
-        if let Message::UserState(state) = message {
-            if state.session == Some(session) && predicate(&state) {
-                return Some(started.elapsed());
-            }
-        }
-    }
-    None
 }
 
 async fn observer_sees_user_churn(
@@ -1667,95 +1641,6 @@ async fn receive_s2s_shout_stream_with_loss_budget(
     S2SVoiceStreamDelivery {
         first_at: first_at.expect("voice stream should contain at least one frame"),
         last_at: last_at.expect("voice stream should contain at least one frame"),
-        received_at: received_times,
-        max_frame_gap,
-    }
-}
-
-async fn receive_s2s_shout_stream_udp_with_loss_budget(
-    client: &TestClient,
-    sender: &TestClient,
-    client_index: usize,
-    frames: &[(u64, Bytes)],
-) -> S2SVoiceStreamDelivery {
-    let allowed_loss = frames
-        .len()
-        .saturating_mul(S2S_SHOUT_LOSS_BUDGET_PERCENT)
-        .div_ceil(100);
-    let mut first_at = None;
-    let mut last_at = None;
-    let mut previous_receive_at = None;
-    let mut previous_offset = None;
-    let mut received_times = Vec::with_capacity(frames.len());
-    let mut max_frame_gap = Duration::ZERO;
-
-    loop {
-        let Some(audio) = client.recv_voice_udp(S2S_SHOUT_FRAME_LATENCY_BUDGET).await else {
-            break;
-        };
-        let received_at = Instant::now();
-        let offset = frames
-            .binary_search_by_key(&audio.frame_number, |(frame_number, _)| *frame_number)
-            .unwrap_or_else(|_| {
-                panic!(
-                    "remote UDP listener {client_index} received unexpected shout frame {}",
-                    audio.frame_number
-                )
-            });
-
-        assert_eq!(
-            audio.sender_session,
-            Some(sender.server_session),
-            "remote UDP listener {client_index} saw the wrong sender for frame {}",
-            audio.frame_number
-        );
-        assert!(
-            previous_offset.is_none_or(|previous| offset > previous),
-            "remote UDP listener {client_index} received reordered or duplicate shout frame {}",
-            audio.frame_number
-        );
-        assert_eq!(
-            opus_frame(&audio.audio_payload),
-            frames[offset].1.as_ref(),
-            "remote UDP listener {client_index} received corrupted shout payload"
-        );
-
-        if first_at.is_none() {
-            first_at = Some(received_at);
-        }
-        if let Some(previous) = previous_receive_at {
-            max_frame_gap = max_frame_gap.max(received_at.duration_since(previous));
-        }
-        previous_receive_at = Some(received_at);
-        previous_offset = Some(offset);
-        last_at = Some(received_at);
-        received_times.push((offset, received_at));
-
-        if offset + 1 == frames.len() {
-            break;
-        }
-    }
-
-    let missing_frames = frames
-        .iter()
-        .enumerate()
-        .filter_map(|(offset, (frame_number, _))| {
-            (!received_times
-                .iter()
-                .any(|(received_offset, _)| *received_offset == offset))
-            .then_some(*frame_number)
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        missing_frames.len() <= allowed_loss,
-        "remote UDP listener {client_index} lost {} of {} shout frames; budget is {allowed_loss}; missing={missing_frames:?}",
-        missing_frames.len(),
-        frames.len()
-    );
-
-    S2SVoiceStreamDelivery {
-        first_at: first_at.expect("voice UDP stream should contain at least one frame"),
-        last_at: last_at.expect("voice UDP stream should contain at least one frame"),
         received_at: received_times,
         max_frame_gap,
     }

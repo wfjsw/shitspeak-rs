@@ -11,7 +11,6 @@ pub(crate) enum ExpiredAuthenticationAction {
 }
 
 pub struct ClientLocalState {
-    synced: bool,
     authenticated: bool,
     supports_opus: bool,
     language: Language,
@@ -22,8 +21,6 @@ pub struct ClientLocalState {
     authentication_expiry_action: AuthenticationExpiryAction,
     reauthentication_in_progress: bool,
 
-    last_active_timestamp: Option<std::time::Instant>,
-
     release: Option<String>,
     os: Option<String>,
     os_version: Option<String>,
@@ -32,7 +29,6 @@ pub struct ClientLocalState {
 impl ClientLocalState {
     pub fn new() -> Self {
         ClientLocalState {
-            synced: false,
             authenticated: false,
             supports_opus: false,
             language: Language::default(),
@@ -42,8 +38,6 @@ impl ClientLocalState {
             authenticated_until: None,
             authentication_expiry_action: AuthenticationExpiryAction::Kick,
             reauthentication_in_progress: false,
-
-            last_active_timestamp: None,
 
             release: None,
             os: None,

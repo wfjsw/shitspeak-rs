@@ -327,6 +327,7 @@ where
         self.state.read().cache.clone()
     }
 
+    #[cfg(test)]
     fn current_max_capacity(&self) -> usize {
         self.state.read().current_max_capacity
     }

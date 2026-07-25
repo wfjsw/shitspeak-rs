@@ -80,11 +80,6 @@ impl ClientProjectionPool {
             router_health_rx: self.router_health_rx.clone(),
         })
     }
-
-    #[cfg(test)]
-    pub(crate) fn shard_count(&self) -> usize {
-        self.pool.shard_count()
-    }
 }
 
 pub(crate) struct ClientProjectionRegistration {
@@ -117,11 +112,6 @@ impl ClientProjectionRegistration {
                 }
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn shard_index(&self) -> usize {
-        self._registration.shard_index()
     }
 }
 

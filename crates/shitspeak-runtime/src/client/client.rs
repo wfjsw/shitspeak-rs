@@ -32,7 +32,6 @@ use crate::{
         client_stats::ClientStats,
         global_state_guard::GlobalStateWriteGuard,
         next_client_instance_id,
-        options::ClientOptions,
         user_info::UserInfoExtended,
         voice_target::VoiceTarget,
     },
@@ -228,6 +227,7 @@ pub(crate) struct PostAuthBaseline {
 }
 
 impl PostAuthBaseline {
+    #[cfg(test)]
     pub(crate) fn new(
         session_channel_shadow: crate::channel_handler::SessionChannelShadow,
         channel_tree_shadow: crate::channel_handler::ChannelTreeShadow,
@@ -413,8 +413,6 @@ pub struct Client {
     certificate_hash_projection_cache: ParkingMutex<CertificateHashProjectionCache>,
     certificate_chain: Vec<CertificateDer<'static>>,
     user_info_extended: ParkingMutex<Option<UserInfoExtended>>,
-
-    options: RwLock<ClientOptions>,
 
     local_state: ParkingRwLock<Option<ClientLocalState>>,
     global_state: ParkingRwLock<ClientGlobalState>,
@@ -616,7 +614,6 @@ impl Client {
             ),
             certificate_chain,
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
-            options: RwLock::new(ClientOptions::default()),
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             acl_permission_cache: scc::HashMap::new(),
@@ -787,7 +784,6 @@ impl Client {
             ),
             certificate_chain: Vec::new(),
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
-            options: RwLock::new(ClientOptions::default()),
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             acl_permission_cache: scc::HashMap::new(),
@@ -878,7 +874,6 @@ impl Client {
             ),
             certificate_chain: Vec::new(),
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
-            options: RwLock::new(ClientOptions::default()),
             local_state: ParkingRwLock::new(None),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             acl_permission_cache: scc::HashMap::new(),

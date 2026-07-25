@@ -436,17 +436,6 @@ impl VisibilityRefreshScope {
         self.channels.extend(channel_ids);
     }
 
-    fn include_listener_channel_removal(
-        &mut self,
-        session: ClientSessionIdentifier,
-        channel_ids: impl IntoIterator<Item = u32>,
-    ) {
-        self.listener_channel_removals
-            .entry(u32::from(session))
-            .or_default()
-            .extend(channel_ids);
-    }
-
     pub fn include_all_channels(&mut self) {
         self.include_all_channels = true;
     }
@@ -696,6 +685,7 @@ impl UserVisibilityState {
         true
     }
 
+    #[cfg(test)]
     fn known_sessions(&self) -> impl Iterator<Item = ClientSessionIdentifier> + '_ {
         self.known_session_ids().map(ClientSessionIdentifier::from)
     }
@@ -734,6 +724,7 @@ impl UserVisibilityState {
         sessions
     }
 
+    #[cfg(test)]
     fn sessions_in_current_channels(
         &self,
         channel_ids: &HashSet<u32>,
@@ -757,6 +748,7 @@ impl UserVisibilityState {
         sessions
     }
 
+    #[cfg(test)]
     fn sessions_listening_to_channels(
         &self,
         channel_ids: &HashSet<u32>,
@@ -767,6 +759,7 @@ impl UserVisibilityState {
             .collect()
     }
 
+    #[cfg(test)]
     fn session_ids_listening_to_channels(
         &self,
         channel_ids: &HashSet<u32>,
@@ -2235,14 +2228,6 @@ fn user_state_name_refresh_for_viewer(
     };
     project_user_state_fields_for_viewer(server, viewer, Some(target), &mut state);
     (!user_state_delta_empty(&state)).then(|| state.into())
-}
-
-async fn visible_actor(
-    server: &Arc<Box<Server>>,
-    viewer: &Arc<Box<Client>>,
-    actor: Option<ClientSessionIdentifier>,
-) -> Option<ClientSessionIdentifier> {
-    visible_actor_with_home(server, viewer, actor, None).await
 }
 
 async fn visible_actor_with_home(

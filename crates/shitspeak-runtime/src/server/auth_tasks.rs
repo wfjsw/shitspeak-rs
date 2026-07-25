@@ -306,7 +306,8 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(1), started_rx)
             .await
-            .expect("auth task should start");
+            .expect("auth task should start")
+            .expect("auth start signal sender should not be dropped");
 
         tokio::time::timeout(
             Duration::from_millis(250),

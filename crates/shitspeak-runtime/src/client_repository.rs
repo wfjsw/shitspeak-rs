@@ -175,6 +175,7 @@ pub(crate) struct ClientSnapshotWithVersions {
 }
 
 impl ClientSnapshotWithVersions {
+    #[cfg(test)]
     pub(crate) fn into_parts(self) -> (Vec<Arc<Box<Client>>>, HashMap<u16, u64>) {
         (self.clients, self.versions)
     }
@@ -1427,21 +1428,6 @@ impl ClientRepository {
         }
     }
 
-    async fn versions_snapshot(&self) -> HashMap<u16, u64> {
-        let mut versions = HashMap::new();
-        let local_version = self.register.read().await.version;
-        if local_version > 0 {
-            versions.insert(self.local_node_id, local_version);
-        }
-        for (node_id, remote_register) in self.remote_register_snapshots().await {
-            let version = remote_register.read().await.version;
-            if version > 0 {
-                versions.insert(node_id, version);
-            }
-        }
-        versions
-    }
-
     pub async fn get_client(&self, id: ClientSessionIdentifier) -> Option<Arc<Box<Client>>> {
         self.get_client_in_server(DEFAULT_SERVER_ID, id).await
     }
@@ -2147,6 +2133,7 @@ impl ClientRepository {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn snapshot_with_versions_and_subscription_in_server(
         &self,
         server_id: &str,

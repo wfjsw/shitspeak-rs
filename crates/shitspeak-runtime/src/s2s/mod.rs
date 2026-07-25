@@ -836,12 +836,16 @@ impl S2SManager {
             Err(e) => (None, Some(e)),
         };
 
-        let state = S2SRuntimeState::default();
         #[cfg(feature = "pre-release-workload")]
-        if pre_release_workload::enabled() {
+        let inbound_chaos = pre_release_workload::enabled().then(|| {
             let local_node = config.s2s.local_node_id().unwrap_or_default();
-            state.inbound_chaos = Some(pre_release_workload::configured_chaos(local_node));
-        }
+            pre_release_workload::configured_chaos(local_node)
+        });
+        let state = S2SRuntimeState {
+            #[cfg(feature = "pre-release-workload")]
+            inbound_chaos,
+            ..S2SRuntimeState::default()
+        };
 
         Self {
             enabled: config.s2s.is_enabled(),
@@ -989,6 +993,7 @@ impl S2SManager {
         self.state.read().overlay.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn transport(&self) -> Option<ConnectionManager> {
         self.state.read().transport.clone()
     }

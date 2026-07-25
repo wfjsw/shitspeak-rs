@@ -120,20 +120,8 @@ impl ClientProjectionState {
         }
     }
 
-    pub(crate) fn client(&self) -> &Arc<Box<Client>> {
-        &self.client
-    }
-
     pub(crate) fn client_instance_id(&self) -> ClientInstanceId {
         self.client.client_instance_id()
-    }
-
-    pub(crate) fn last_channel_version(&self) -> u64 {
-        self.last_channel_version
-    }
-
-    pub(crate) fn last_client_versions(&self) -> &HashMap<u16, u64> {
-        &self.last_client_versions
     }
 
     fn server(&self) -> Result<Arc<Box<Server>>, HandleIncomingConnectionError> {
@@ -143,66 +131,6 @@ impl ClientProjectionState {
                 "server stopped while client projection was registered",
             ))
         })
-    }
-
-    /// Process all channel work already ready in a shard before the client-log
-    /// event that woke it. This is the explicit channel-log-before-client-log
-    /// boundary used by the shard loop.
-    pub(crate) async fn handle_client_after_channels<'a>(
-        &mut self,
-        channels: impl IntoIterator<Item = &'a ChannelOperation>,
-        event: &ClientStateBroadcastPayload,
-    ) -> Result<OwnedMessageBatch, HandleIncomingConnectionError> {
-        let server = self.server()?;
-        let mut outbound = Vec::new();
-        for operation in channels {
-            self.append_channel_operation(&server, operation, &mut outbound)
-                .await?;
-        }
-        self.append_client_broadcast(&server, event, &mut outbound)
-            .await?;
-        Ok(OwnedMessageBatch::new(outbound))
-    }
-
-    pub(crate) async fn handle_channel_operation(
-        &mut self,
-        operation: &ChannelOperation,
-    ) -> Result<OwnedMessageBatch, HandleIncomingConnectionError> {
-        let server = self.server()?;
-        let mut outbound = Vec::new();
-        self.append_channel_operation(&server, operation, &mut outbound)
-            .await?;
-        Ok(OwnedMessageBatch::new(outbound))
-    }
-
-    pub(crate) async fn handle_client_broadcast(
-        &mut self,
-        event: &ClientStateBroadcastPayload,
-    ) -> Result<OwnedMessageBatch, HandleIncomingConnectionError> {
-        let server = self.server()?;
-        let mut outbound = Vec::new();
-        self.append_client_broadcast(&server, event, &mut outbound)
-            .await?;
-        Ok(OwnedMessageBatch::new(outbound))
-    }
-
-    pub(crate) async fn handle_visibility_reload(
-        &mut self,
-    ) -> Result<OwnedMessageBatch, HandleIncomingConnectionError> {
-        let server = self.server()?;
-        let messages = crate::client::visibility::visibility_config_reload_messages(
-            &server,
-            &self.client,
-            &mut self.user_visibility,
-            &mut self.channel_tree_shadow,
-            &mut self.session_channel_shadow,
-        )
-        .await;
-        let messages = crate::channel_handler::suppress_known_projected_permission_messages(
-            messages,
-            &mut self.channel_permission_shadow,
-        );
-        Ok(OwnedMessageBatch::new(messages))
     }
 
     async fn resynchronize(

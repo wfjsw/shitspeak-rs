@@ -73,11 +73,11 @@ fn channel_op_propose_failed(
 
 pub trait AsyncMessageHandlerExt {
     /// Dispatch a message to the appropriate handler.
-    async fn handle_message(
+    fn handle_message(
         &self,
         server: &Arc<Box<Server>>,
         message: Message,
-    ) -> Result<(), MessageHandlerError>;
+    ) -> impl std::future::Future<Output = Result<(), MessageHandlerError>> + Send;
 }
 
 pub(crate) use user_stats::ServerUserStatsResponder;

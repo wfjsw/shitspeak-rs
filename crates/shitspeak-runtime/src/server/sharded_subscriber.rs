@@ -23,6 +23,9 @@ const MAX_CONCURRENT_LAG_RECOVERIES: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeliverResult {
     Delivered,
+    // The production projection disconnects on queue pressure, but the
+    // generic pool deliberately supports subscribers that recover in place.
+    #[allow(dead_code)]
     Dropped,
     Remove,
 }
@@ -93,6 +96,7 @@ pub(crate) struct PoolHealth {
 }
 
 impl PoolHealth {
+    #[cfg(test)]
     pub(crate) fn is_healthy(&self) -> bool {
         self.shard_statuses
             .iter()
@@ -101,10 +105,6 @@ impl PoolHealth {
 
     pub(crate) fn shard_status(&self, shard_index: usize) -> Option<&ShardStatus> {
         self.shard_statuses.get(shard_index)
-    }
-
-    pub(crate) fn shard_statuses(&self) -> &[ShardStatus] {
-        &self.shard_statuses
     }
 }
 
@@ -200,10 +200,6 @@ where
         })
     }
 
-    pub(crate) fn shard_count(&self) -> usize {
-        self.shards.len()
-    }
-
     pub(crate) fn health(&self) -> watch::Receiver<PoolHealth> {
         self.health_rx.clone()
     }
@@ -272,14 +268,6 @@ pub(crate) struct Registration<Subscriber> {
 impl<Subscriber> Registration<Subscriber> {
     pub(crate) fn shard_index(&self) -> usize {
         self.shard_index
-    }
-
-    pub(crate) fn registration_id(&self) -> u64 {
-        self.registration_id
-    }
-
-    pub(crate) fn unregister(mut self) {
-        self.send_unregister();
     }
 
     fn send_unregister(&mut self) {

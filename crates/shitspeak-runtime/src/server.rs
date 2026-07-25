@@ -461,6 +461,7 @@ impl Server {
         *self.tls_acceptor.write() = tls_acceptor;
     }
 
+    #[cfg(test)]
     fn reload_c2s_tls_identity(
         &self,
         new_config: &Config,
@@ -1725,6 +1726,7 @@ impl Server {
         state.set_suppress(!current_permissions.contains(shitspeak_state::ACLPermissions::Speak));
     }
 
+    #[cfg(test)]
     async fn client_has_root_traverse(self: &Arc<Box<Self>>, client: &Arc<Box<Client>>) -> bool {
         client.is_superuser()
             || crate::client::acl::compute_permissions_for_client(self, client, 0)

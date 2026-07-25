@@ -33,6 +33,10 @@ impl ProxyProtocolConnectionInfo {
     pub fn client_address(&self) -> Option<ProxiedClientAddress> {
         self.client_address
     }
+
+    pub fn header_len(&self) -> usize {
+        self.header_len
+    }
 }
 
 pub fn convert_v1_addresses_to_ipaddr(addresses: ppp::v1::Addresses) -> Option<std::net::IpAddr> {

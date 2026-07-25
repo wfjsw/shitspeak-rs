@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,22 +10,26 @@ use tokio::task::JoinSet;
 use tokio_rustls::server::TlsStream;
 use tracing::Instrument;
 
+#[cfg(test)]
 use crate::channel_handler::{
-    ChannelPermissionShadow, ChannelReplayError, ChannelTreeShadow, SessionChannelShadow,
-    replay_channel_log_gap_with_permission_shadow,
+    ChannelPermissionShadow, ChannelReplayError, replay_channel_log_gap_with_permission_shadow,
+};
+use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
+#[cfg(test)]
+use crate::client::state_log::{
+    ClientStateBroadcastPayload, ClientStateLogEntry, ClientStateOperation,
 };
 use crate::client::{
-    AsyncMessageHandlerExt, Client, ClientInstanceId, ClientOutboundMessage,
-    client_session_identifier::ClientSessionIdentifier,
-    state_log::{ClientStateBroadcastPayload, ClientStateLogEntry, ClientStateOperation},
-    visibility::UserVisibilityState,
+    AsyncMessageHandlerExt, Client, ClientOutboundMessage,
+    client_session_identifier::ClientSessionIdentifier, visibility::UserVisibilityState,
 };
 use crate::errors::{HandleIncomingConnectionError, MessageHandlerError, WriteProtoMessageError};
 use crate::proxy_protocol::consume_proxy_protocol_connection_info;
 use crate::types::default_server_id;
 use shitspeak_messages::messages::encoder::Version;
 use shitspeak_messages::messages::{Message, WriteMessageExt};
-use shitspeak_state::{ChannelOp, ChannelOperation};
+#[cfg(test)]
+use shitspeak_state::ChannelOperation;
 
 use super::Server;
 use super::client_projection::ClientProjectionState;
@@ -31,17 +37,12 @@ use super::client_projection_pool::ClientProjectionRegistration;
 use super::entrypoints::normalize_sni_name;
 use super::extensions::{ALPN_MUMBLE, AlpnConnectionInfo};
 
+#[cfg(test)]
 type ClientLogReceiver = tokio::sync::broadcast::Receiver<Arc<ClientStateBroadcastPayload>>;
+#[cfg(test)]
 type ChannelLogReceiver = tokio::sync::broadcast::Receiver<Arc<ChannelOperation>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChannelLogReceiveOutcome {
-    Continue,
-    Closed,
-}
-
 const CLIENT_CONNECTION_QUEUE_DRAIN_LIMIT: usize = 64;
-const CLIENT_LOG_BROADCAST_DRAIN_LIMIT: usize = 4;
 const CLIENT_VOICE_TCP_QUEUE_DRAIN_LIMIT: usize = 64;
 const MIN_AUTHENTICATE_TIMEOUT_MS: u64 = 1;
 const PRE_AUTH_DEFERRED_MESSAGE_LIMIT: usize = 32;
@@ -80,6 +81,7 @@ fn map_handler_result(
     }
 }
 
+#[cfg(test)]
 fn map_channel_replay_error(error: ChannelReplayError) -> HandleIncomingConnectionError {
     match error {
         ChannelReplayError::ClientWriteFailed(error) => {
@@ -88,6 +90,7 @@ fn map_channel_replay_error(error: ChannelReplayError) -> HandleIncomingConnecti
     }
 }
 
+#[cfg(test)]
 pub(super) async fn activate_client_subscriptions(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -324,6 +327,7 @@ pub(super) async fn activate_client_projection(
     Ok(())
 }
 
+#[cfg(test)]
 async fn replay_client_log_entries_since(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -512,41 +516,13 @@ fn spawn_client_message_handler(
     });
 }
 
-fn is_own_client_log_entry(
-    op: &ClientStateOperation,
-    session_id: ClientSessionIdentifier,
-    client_instance_id: ClientInstanceId,
-) -> bool {
-    op.session_id() == Some(session_id) && op.client_instance_id() == client_instance_id
-}
-
 pub(super) fn sorted_channel_ids(channel_ids: &HashSet<u32>) -> Vec<u32> {
     let mut channel_ids: Vec<_> = channel_ids.iter().copied().collect();
     channel_ids.sort_unstable();
     channel_ids
 }
 
-async fn project_message_with_visibility_shadows(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    user_visibility: &mut UserVisibilityState,
-    session_channel_shadow: &mut SessionChannelShadow,
-    server_id: &str,
-    message: &Message,
-) -> Vec<Message> {
-    crate::channel_handler::project_message_with_visibility_shadows(
-        server,
-        client,
-        channel_tree_shadow,
-        user_visibility,
-        session_channel_shadow,
-        server_id,
-        message,
-    )
-    .await
-}
-
+#[cfg(test)]
 async fn append_client_log_entry_messages(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -722,419 +698,7 @@ fn spawn_native_client_writer_task(
     ))
 }
 
-async fn process_channel_log_result(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    client_session_id: ClientSessionIdentifier,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    channel_permission_shadow: &mut ChannelPermissionShadow,
-    session_channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
-    result: Option<Result<Arc<ChannelOperation>, tokio::sync::broadcast::error::RecvError>>,
-) -> Result<ChannelLogReceiveOutcome, HandleIncomingConnectionError> {
-    match result {
-        Some(Ok(op)) => {
-            if op.server_id != client.server_id() {
-                return Ok(ChannelLogReceiveOutcome::Continue);
-            }
-            let last = client.get_last_channel_version().await;
-            if op.version <= last && !op.is_root_name_config_update() {
-                return Ok(ChannelLogReceiveOutcome::Continue);
-            }
-            if op.version > last {
-                replay_channel_log_gap_with_permission_shadow(
-                    server,
-                    client,
-                    &server.channels,
-                    channel_tree_shadow,
-                    session_channel_shadow,
-                    user_visibility,
-                    channel_permission_shadow,
-                    client_session_id,
-                    last,
-                    op.version,
-                )
-                .await
-                .map_err(map_channel_replay_error)?;
-            }
-            let last_after_replay = client.get_last_channel_version().await;
-            if op.version <= last_after_replay && !op.is_root_name_config_update() {
-                return Ok(ChannelLogReceiveOutcome::Continue);
-            }
-            if matches!(&op.op, ChannelOp::InstallSnapshot { .. }) {
-                channel_permission_shadow.clear();
-            }
-
-            let acl_context = crate::channel_handler::ClientAclOperationContext::for_operation(
-                server,
-                client,
-                &server.channels,
-                &op,
-            )
-            .await;
-            let refresh_scope =
-                crate::client::visibility::visibility_refresh_scope_for_channel_operation_with_state_for_client(
-                    server,
-                    client,
-                    &op,
-                    user_visibility,
-                )
-                .await;
-            let channel_refresh =
-                crate::channel_handler::prepare_channel_visibility_refresh_with_acl_context(
-                    server,
-                    client,
-                    channel_tree_shadow,
-                    &refresh_scope,
-                    acl_context.as_ref(),
-                )
-                .await;
-            let messages =
-                crate::channel_handler::convert_channel_operation_to_messages_with_acl_context(
-                    server,
-                    client,
-                    &op,
-                    &server.channels,
-                    Some(session_channel_shadow),
-                    Some(channel_permission_shadow),
-                    acl_context.as_ref(),
-                )
-                .await;
-            let mut outbound = Vec::new();
-            let mut deferred_channel_removals = Vec::new();
-            for msg in messages {
-                if matches!(msg, Message::ChannelRemove(_)) {
-                    deferred_channel_removals.extend(
-                        crate::channel_handler::project_channel_message(
-                            server,
-                            client,
-                            channel_tree_shadow,
-                            &msg,
-                        )
-                        .await,
-                    );
-                    continue;
-                }
-                for projected in project_message_with_visibility_shadows(
-                    server,
-                    client,
-                    channel_tree_shadow,
-                    user_visibility,
-                    session_channel_shadow,
-                    &client.server_id(),
-                    &msg,
-                )
-                .await
-                {
-                    if matches!(&projected, Message::ChannelRemove(_)) {
-                        deferred_channel_removals.push(projected);
-                    } else {
-                        channel_permission_shadow.sync_message(&projected);
-                        outbound.push(projected);
-                    }
-                }
-            }
-
-            channel_refresh.apply_additions(channel_tree_shadow);
-            channel_refresh.append_additions_to(&mut outbound);
-            let projected =
-                crate::client::visibility::visibility_refresh_messages_with_shadow_and_acl_context(
-                    server,
-                    client,
-                    user_visibility,
-                    session_channel_shadow,
-                    &client.server_id(),
-                    refresh_scope,
-                    acl_context.as_ref(),
-                )
-                .await;
-            for msg in projected {
-                channel_tree_shadow.sync_message(&msg);
-                channel_permission_shadow.sync_message(&msg);
-                outbound.push(msg);
-            }
-            channel_refresh.apply_removals(channel_tree_shadow);
-            channel_refresh.apply_permission_removals(channel_permission_shadow);
-            channel_refresh.append_removals_to(&mut outbound);
-            for message in deferred_channel_removals {
-                if let Message::ChannelRemove(channel_remove) = &message {
-                    if !channel_tree_shadow.contains(&channel_remove.channel_id) {
-                        continue;
-                    }
-                }
-                channel_tree_shadow.sync_message(&message);
-                channel_permission_shadow.sync_message(&message);
-                outbound.push(message);
-            }
-            crate::channel_handler::remove_deleted_channels_from_shadow(
-                server.get_channels(),
-                &op,
-                channel_tree_shadow,
-            );
-            crate::channel_handler::remove_deleted_channel_permissions_from_shadow(
-                server.get_channels(),
-                &op,
-                channel_permission_shadow,
-            );
-            client
-                .write_proto_message_batch(&outbound)
-                .await
-                .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-            if op.version > last_after_replay {
-                client.set_last_channel_version(op.version).await;
-            }
-            Ok(ChannelLogReceiveOutcome::Continue)
-        }
-        Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
-            let last = client.get_last_channel_version().await;
-            replay_channel_log_gap_with_permission_shadow(
-                server,
-                client,
-                &server.channels,
-                channel_tree_shadow,
-                session_channel_shadow,
-                user_visibility,
-                channel_permission_shadow,
-                client_session_id,
-                last,
-                u64::MAX,
-            )
-            .await
-            .map_err(map_channel_replay_error)?;
-            Ok(ChannelLogReceiveOutcome::Continue)
-        }
-        Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-            Ok(ChannelLogReceiveOutcome::Closed)
-        }
-        None => Ok(ChannelLogReceiveOutcome::Continue),
-    }
-}
-
-async fn drain_ready_channel_log_before_client_log(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    client_session_id: ClientSessionIdentifier,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    channel_permission_shadow: &mut ChannelPermissionShadow,
-    session_channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
-    channel_log_rx: &mut Option<ChannelLogReceiver>,
-) -> Result<ChannelLogReceiveOutcome, HandleIncomingConnectionError> {
-    let Some(rx) = channel_log_rx.as_mut() else {
-        return Ok(ChannelLogReceiveOutcome::Continue);
-    };
-
-    for _ in 0..CLIENT_CONNECTION_QUEUE_DRAIN_LIMIT {
-        let result = match rx.try_recv() {
-            Ok(op) => Some(Ok(op)),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                Some(Err(tokio::sync::broadcast::error::RecvError::Closed))
-            }
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => Some(Err(
-                tokio::sync::broadcast::error::RecvError::Lagged(skipped),
-            )),
-        };
-
-        if process_channel_log_result(
-            server,
-            client,
-            client_session_id,
-            channel_tree_shadow,
-            channel_permission_shadow,
-            session_channel_shadow,
-            user_visibility,
-            result,
-        )
-        .await?
-            == ChannelLogReceiveOutcome::Closed
-        {
-            return Ok(ChannelLogReceiveOutcome::Closed);
-        }
-    }
-
-    Ok(ChannelLogReceiveOutcome::Continue)
-}
-
-async fn process_client_log_broadcasts(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    client_session_id: ClientSessionIdentifier,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    channel_permission_shadow: &mut ChannelPermissionShadow,
-    session_channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
-    first: Arc<ClientStateBroadcastPayload>,
-    rx: &mut ClientLogReceiver,
-) -> Result<(), HandleIncomingConnectionError> {
-    let mut broadcasts = Vec::with_capacity(CLIENT_LOG_BROADCAST_DRAIN_LIMIT);
-    broadcasts.push(first);
-    for _ in 1..CLIENT_LOG_BROADCAST_DRAIN_LIMIT {
-        match rx.try_recv() {
-            Ok(broadcast) => broadcasts.push(broadcast),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                replay_client_log_subscription_gap(
-                    server,
-                    client,
-                    client_session_id,
-                    channel_tree_shadow,
-                    channel_permission_shadow,
-                    session_channel_shadow,
-                    user_visibility,
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    }
-
-    let client_server_id = client.server_id();
-    let mut out = Vec::new();
-    for broadcast in broadcasts {
-        append_client_log_broadcast_messages(
-            server,
-            client,
-            client_session_id,
-            channel_tree_shadow,
-            channel_permission_shadow,
-            session_channel_shadow,
-            user_visibility,
-            &client_server_id,
-            broadcast,
-            &mut out,
-        )
-        .await?;
-    }
-
-    client
-        .write_proto_message_batch(&out)
-        .await
-        .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-    Ok(())
-}
-
-async fn append_client_log_broadcast_messages(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    client_session_id: ClientSessionIdentifier,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    channel_permission_shadow: &mut ChannelPermissionShadow,
-    session_channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
-    client_server_id: &str,
-    broadcast: Arc<ClientStateBroadcastPayload>,
-    out: &mut Vec<Message>,
-) -> Result<(), HandleIncomingConnectionError> {
-    tracing::trace!("Received client log broadcast: {:?}", broadcast);
-
-    let entry = &broadcast.entry;
-    if matches!(entry.op, ClientStateOperation::ResetNode { .. }) {
-        match broadcast.versions.get(&entry.node_id).copied() {
-            Some(0) => {
-                // Snapshot/reset start is global to an origin, whereas a
-                // connection shadow is scoped to one virtual server. Handle
-                // it before the server-id filter and explicitly evict every
-                // shadowed session from that origin. This also makes a reused
-                // numeric session accept the replacement AddClient.
-                append_client_origin_reset_messages(
-                    server,
-                    client,
-                    user_visibility,
-                    session_channel_shadow,
-                    client_server_id,
-                    entry.node_id,
-                    out,
-                )
-                .await;
-                client.remove_last_client_version(entry.node_id).await;
-                return Ok(());
-            }
-            Some(_) => {
-                // Snapshot/reset end: materialized AddClient entries have
-                // already rebuilt the shadow. Only publish the final owner
-                // vector; replaying ResetNode visibility here would disturb
-                // that freshly reconstructed state.
-                apply_client_snapshot_end_vector(client, &broadcast.versions).await;
-                return Ok(());
-            }
-            None => {}
-        }
-    }
-    if advance_client_log_vector_if_out_of_scope(client, client_server_id, &broadcast).await {
-        return Ok(());
-    }
-    let mut last_seen = client.get_last_client_versions().await;
-    let mut last_for_node = last_seen.get(&entry.node_id).copied().unwrap_or(0);
-    match broadcast.versions.get(&entry.node_id).copied() {
-        Some(0) => {
-            client.remove_last_client_version(entry.node_id).await;
-            last_seen.remove(&entry.node_id);
-            last_for_node = entry.version.saturating_sub(1);
-        }
-        Some(current) if current < last_for_node => {
-            client.remove_last_client_version(entry.node_id).await;
-            last_seen.remove(&entry.node_id);
-            last_for_node = 0;
-        }
-        _ => {}
-    }
-    if entry.version <= last_for_node {
-        return Ok(());
-    }
-    if entry.version > last_for_node + 1 {
-        client
-            .write_proto_message_batch(out)
-            .await
-            .map_err(HandleIncomingConnectionError::ClientWriteFailed)?;
-        out.clear();
-        replay_client_log_entries_since(
-            server,
-            client,
-            channel_tree_shadow,
-            channel_permission_shadow,
-            session_channel_shadow,
-            user_visibility,
-            client_server_id,
-            client_session_id,
-            last_seen,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    if should_skip_client_add_entry(
-        &entry.op,
-        client.get_session_id(),
-        client.client_instance_id(),
-        session_channel_shadow,
-    ) {
-        client
-            .update_last_client_versions(&broadcast.versions)
-            .await;
-        return Ok(());
-    }
-
-    append_client_log_entry_messages(
-        server,
-        client,
-        client_session_id,
-        channel_tree_shadow,
-        channel_permission_shadow,
-        user_visibility,
-        session_channel_shadow,
-        client_server_id,
-        entry,
-        out,
-    )
-    .await?;
-    client
-        .update_last_client_versions(&broadcast.versions)
-        .await;
-    Ok(())
-}
-
+#[cfg(test)]
 async fn advance_client_log_vector_if_out_of_scope(
     client: &Arc<Box<Client>>,
     client_server_id: &str,
@@ -1157,6 +721,7 @@ async fn advance_client_log_vector_if_out_of_scope(
     true
 }
 
+#[cfg(test)]
 fn take_origin_sessions_from_shadow(
     shadow: &mut SessionChannelShadow,
     origin: u16,
@@ -1172,6 +737,7 @@ fn take_origin_sessions_from_shadow(
     sessions
 }
 
+#[cfg(test)]
 async fn append_client_origin_reset_messages(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -1213,10 +779,12 @@ async fn append_client_origin_reset_messages(
     }
 }
 
+#[cfg(test)]
 async fn apply_client_snapshot_end_vector(client: &Arc<Box<Client>>, versions: &HashMap<u16, u64>) {
     client.update_last_client_versions(versions).await;
 }
 
+#[cfg(test)]
 fn should_skip_client_add_entry(
     op: &ClientStateOperation,
     viewer_session_id: ClientSessionIdentifier,
@@ -1232,31 +800,6 @@ fn should_skip_client_add_entry(
         } if *session_id == viewer_session_id && *client_instance_id == viewer_client_instance_id
             || session_channel_shadow.contains_key(session_id)
     )
-}
-
-async fn replay_client_log_subscription_gap(
-    server: &Arc<Box<Server>>,
-    client: &Arc<Box<Client>>,
-    client_session_id: ClientSessionIdentifier,
-    channel_tree_shadow: &mut ChannelTreeShadow,
-    channel_permission_shadow: &mut ChannelPermissionShadow,
-    session_channel_shadow: &mut SessionChannelShadow,
-    user_visibility: &mut UserVisibilityState,
-) -> Result<(), HandleIncomingConnectionError> {
-    let last_seen = client.get_last_client_versions().await;
-    let server_id = client.server_id();
-    replay_client_log_entries_since(
-        server,
-        client,
-        channel_tree_shadow,
-        channel_permission_shadow,
-        session_channel_shadow,
-        user_visibility,
-        &server_id,
-        client_session_id,
-        last_seen,
-    )
-    .await
 }
 
 impl Server {
@@ -1648,57 +1191,6 @@ impl Server {
         }
         result
     }
-}
-
-async fn replay_client_log_gap(
-    client: &Arc<Box<crate::client::Client>>,
-    repo: &crate::client_repository::ClientRepository,
-    session_id: crate::client::client_session_identifier::ClientSessionIdentifier,
-    node_id: u16,
-    last: u64,
-    current: u64,
-) -> Result<(), ()> {
-    if current <= last + 1 {
-        return Ok(());
-    }
-
-    tracing::warn!(
-        "Client {:?} missed client log entries: node={} last={} current={}",
-        session_id,
-        node_id,
-        last,
-        current,
-    );
-
-    let missed = repo.get_log_since_for_node(node_id, last).await;
-    if missed.is_empty() && last > 0 {
-        tracing::error!(
-            "Client {:?} client log gap unrecoverable (node={}, last={})",
-            session_id,
-            node_id,
-            last,
-        );
-        return Err(());
-    }
-
-    for entry in &missed {
-        if entry.version >= current {
-            break;
-        }
-        if is_own_client_log_entry(&entry.op, session_id, client.client_instance_id()) {
-            continue;
-        }
-        if let Some(msg) = entry.to_message(repo).await {
-            if client.write_proto_message(&msg).await.is_err() {
-                return Err(());
-            }
-        }
-        let mut ver = HashMap::new();
-        ver.insert(entry.node_id, entry.version);
-        client.update_last_client_versions(&ver).await;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

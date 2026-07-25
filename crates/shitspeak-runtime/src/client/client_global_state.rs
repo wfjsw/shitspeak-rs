@@ -7,7 +7,6 @@ use crate::client::state_log::ClientGlobalStateDelta;
 #[derive(Debug, Clone)]
 pub struct ClientGlobalState {
     current_channel_id: u32,
-    last_active_timestamp: Option<std::time::Instant>,
     listening_channel_id: HashSet<u32>,
 
     // ── Voice / moderation state ───────────────────────────────────────────
@@ -55,7 +54,6 @@ impl ClientGlobalState {
     pub fn new() -> Self {
         ClientGlobalState {
             current_channel_id: 0,
-            last_active_timestamp: None,
             listening_channel_id: HashSet::new(),
 
             mute: false,

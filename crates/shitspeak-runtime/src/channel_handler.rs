@@ -13,6 +13,8 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use crate::errors::WriteProtoMessageError;
 use crate::{
     client::{
         Client,
@@ -20,7 +22,6 @@ use crate::{
         state_log::{ClientStateLogEntry, ClientStateOperation},
         visibility::UserVisibilityState,
     },
-    errors::WriteProtoMessageError,
     messages::{Message, encoder::ChannelState},
     server::Server,
 };
@@ -1720,6 +1721,7 @@ impl IntoIterator for ChannelTreeShadow {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 pub(crate) enum ChannelReplayError {
     ClientWriteFailed(WriteProtoMessageError),
 }
@@ -2230,7 +2232,8 @@ fn synthetic_user_move(
 
 /// Replay missed channel log entries for a client between versions.
 /// Ensures clients catch up on channel state changes they missed due to network gaps.
-pub async fn replay_channel_log_gap(
+#[cfg(test)]
+pub(crate) async fn replay_channel_log_gap(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
     channels: &Arc<ChannelRepository>,
@@ -2256,6 +2259,7 @@ pub async fn replay_channel_log_gap(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn replay_channel_log_gap_with_permission_shadow(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -2283,6 +2287,7 @@ pub(crate) async fn replay_channel_log_gap_with_permission_shadow(
     .await
 }
 
+#[cfg(test)]
 async fn replay_channel_log_gap_inner(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -2477,6 +2482,7 @@ async fn replay_channel_log_gap_inner(
     Ok(())
 }
 
+#[cfg(test)]
 async fn replay_channel_snapshot(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
@@ -3636,6 +3642,7 @@ async fn build_scoped_permission_info_refresh_messages_for_channels(
     messages
 }
 
+#[cfg(test)]
 fn channels_with_home_channel_dependent_acls<C: AsRef<Channel>>(channels: Vec<C>) -> Vec<C> {
     let affected = ChannelTree::new(&channels).home_channel_dependent_acl_channel_ids();
 
@@ -3645,6 +3652,7 @@ fn channels_with_home_channel_dependent_acls<C: AsRef<Channel>>(channels: Vec<C>
         .collect()
 }
 
+#[cfg(test)]
 fn channels_affected_by_home_channel_move<C: AsRef<Channel>>(
     channels: Vec<C>,
     old_channel_id: u32,

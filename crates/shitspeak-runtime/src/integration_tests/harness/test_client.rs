@@ -251,8 +251,29 @@ pub enum ConnectError {
     Read(String),
     Write(String),
     Rejected(shitspeak_proto::mumble_proto::Reject),
-    NoCryptSetup,
     NoServerSync,
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "I/O error: {error}"),
+            Self::Tls(error) => write!(f, "TLS error: {error}"),
+            Self::Read(error) => write!(f, "protocol read error: {error}"),
+            Self::Write(error) => write!(f, "protocol write error: {error}"),
+            Self::Rejected(reject) => write!(f, "connection rejected: {reject:?}"),
+            Self::NoServerSync => f.write_str("connection closed before ServerSync"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 impl From<std::io::Error> for ConnectError {
