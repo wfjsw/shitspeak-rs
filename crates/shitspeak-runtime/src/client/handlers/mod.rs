@@ -56,19 +56,58 @@ fn channel_op_propose_failed(
     reason: Option<&str>,
 ) -> MessageHandlerError {
     let reason = reason
-        .map(|reason| format!("S2S channel operation failed: {reason}"))
+        .map(|reason| {
+            if reason.contains("timed out") || reason.contains("timeout") {
+                format!(
+                    "Channel operation timed out before its result was known and may still apply. Refresh the channel before retrying. Details: {reason}"
+                )
+            } else {
+                format!("S2S channel operation failed: {reason}")
+            }
+        })
         .unwrap_or_else(|| {
             "Channel operation failed because the S2S commit could not complete; please try again"
                 .to_owned()
         });
     MessageHandlerError::PermissionDenied(shitspeak_messages::messages::encoder::PermissionDenied {
-        r#type: shitspeak_messages::messages::encoder::DenyType::Permission,
+        // This is an operational failure, not an ACL decision. Mumble clients
+        // commonly render Permission denials as a generic "Permission denied"
+        // and hide the supplied reason; Text keeps the S2S failure visible.
+        r#type: shitspeak_messages::messages::encoder::DenyType::Text,
         session,
         channel_id,
         reason: Some(reason.into()),
         name: None,
         permission: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shitspeak_messages::messages::encoder::DenyType;
+
+    #[test]
+    fn channel_op_failure_is_reported_as_text_with_s2s_reason() {
+        let error = channel_op_propose_failed(
+            8,
+            Some(42),
+            Some("consensus timed out waiting for delivery"),
+        );
+
+        let MessageHandlerError::PermissionDenied(denied) = error else {
+            panic!("channel operation failures must produce a client response");
+        };
+        assert_eq!(denied.r#type, DenyType::Text);
+        assert_eq!(denied.channel_id, Some(42));
+        assert_eq!(
+            denied.reason.as_deref(),
+            Some(
+                "Channel operation timed out before its result was known and may still apply. Refresh the channel before retrying. Details: consensus timed out waiting for delivery"
+            )
+        );
+        assert_eq!(denied.permission, None);
+    }
 }
 
 pub trait AsyncMessageHandlerExt {

@@ -3305,10 +3305,22 @@ impl ChannelReplicationAdapter {
                 return s2s_replications::strict::StrictCommitApplyOutcome::Failed;
             }
         }
-        if let Some(server) = self.server.as_ref().and_then(Weak::upgrade) {
-            server
-                .reevaluate_speak_after_acl_change(&applied_operation)
-                .await;
+        if matches!(&applied_operation.op, ChannelOp::SetAcls { .. }) {
+            let server = self.server.as_ref().and_then(Weak::upgrade);
+            if let Some(server) =
+                server.filter(|server| server.get_reevaluate_speak_on_acl_change())
+            {
+                // ACL re-evaluation is client-facing projection work and may be
+                // expensive for a large affected subtree.  The strict repository
+                // apply is already durable at this point, so do not hold the
+                // replication delivery loop (and the proposer's completion
+                // waiter) behind per-client permission calculations.
+                tokio::spawn(async move {
+                    server
+                        .reevaluate_speak_after_acl_change(&applied_operation)
+                        .await;
+                });
+            }
         }
         if let (Some(server), Some((id, nonce, fallback))) = (
             self.server.as_ref().and_then(Weak::upgrade),
@@ -3481,10 +3493,20 @@ impl StrictReplicable for ChannelReplicationAdapter {
             warn!(error = ?e, "s2s channel operation apply failed");
             return;
         }
-        if let Some(server) = self.server.as_ref().and_then(Weak::upgrade) {
-            server
-                .reevaluate_speak_after_acl_change(&applied_operation)
-                .await;
+        if matches!(&applied_operation.op, ChannelOp::SetAcls { .. }) {
+            let server = self.server.as_ref().and_then(Weak::upgrade);
+            if let Some(server) =
+                server.filter(|server| server.get_reevaluate_speak_on_acl_change())
+            {
+                // Keep replicated state application independent of potentially
+                // slow per-client ACL projection work.  Suppression converges in
+                // the background from the committed repository state.
+                tokio::spawn(async move {
+                    server
+                        .reevaluate_speak_after_acl_change(&applied_operation)
+                        .await;
+                });
+            }
         }
         if let (Some(server), Some((id, nonce, fallback))) = (
             self.server.as_ref().and_then(Weak::upgrade),

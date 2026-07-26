@@ -952,7 +952,7 @@ fn simultaneous_terminal_starts_choose_one_direction_by_node_id() {
 }
 
 #[test]
-fn responder_direction_defers_clients_and_suppresses_new_probes() {
+fn responder_direction_defers_operation_bearing_work_but_allows_clock_probes() {
     let mut state = SyncV3State::default();
     let peer = PeerIncarnation::new(2, 22);
     let ttl = Duration::from_secs(30);
@@ -968,7 +968,10 @@ fn responder_direction_defers_clients_and_suppresses_new_probes() {
             .is_none()
     );
     assert!(state.client(peer).is_none());
-    assert!(state.record_clock_nonce(peer, ttl).is_none());
+    assert!(
+        state.record_clock_nonce(peer, ttl).is_some(),
+        "metadata-only clock evidence must not wait behind a terminal responder"
+    );
     assert!(
         state
             .record_history_nonce(peer, StrictCatchupReason::Admission as i32, ttl)

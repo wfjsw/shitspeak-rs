@@ -420,12 +420,12 @@ pub async fn handle_channel_state(
     Ok(())
 }
 
-enum AcceptedChannelOpCommit {
+pub(super) enum AcceptedChannelOpCommit {
     Completed(ChannelOpProposeResult),
     Pending(ChannelOpProposal),
 }
 
-async fn wait_accepted_channel_op_commit_grace(
+pub(super) async fn wait_accepted_channel_op_commit_grace(
     sender: &Arc<Box<Client>>,
     mut proposal: ChannelOpProposal,
 ) -> Result<AcceptedChannelOpCommit, MessageHandlerError> {
@@ -441,7 +441,7 @@ async fn wait_accepted_channel_op_commit_grace(
     }
 }
 
-fn spawn_channel_op_completion_log(
+pub(super) fn spawn_channel_op_completion_log(
     proposal: ChannelOpProposal,
     operation: &'static str,
     channel_id: u32,

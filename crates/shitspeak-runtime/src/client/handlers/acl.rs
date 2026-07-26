@@ -229,7 +229,7 @@ pub async fn handle_acl(
         }
         let proposed_s2s = server
             .s2s_manager()
-            .propose_channel_op(Some(&server_id), op.clone())
+            .start_channel_op_proposal(Some(&server_id), op.clone())
             .await;
         if proposed_s2s.should_apply_locally() {
             let committed = match server
@@ -253,12 +253,40 @@ pub async fn handle_acl(
                 return Ok(());
             };
             server.reevaluate_speak_after_acl_change(&committed).await;
-        } else if !proposed_s2s.is_proposed() {
-            return Err(super::channel_op_propose_failed(
-                u32::from(sender.get_session_id()),
-                Some(channel_id),
-                proposed_s2s.failure_reason(),
-            ));
+        } else {
+            let Some(mut proposal) = proposed_s2s.into_started() else {
+                return Err(super::channel_op_propose_failed(
+                    u32::from(sender.get_session_id()),
+                    Some(channel_id),
+                    None,
+                ));
+            };
+            let accepted = proposal.accepted().await;
+            if !accepted.is_proposed() {
+                return Err(super::channel_op_propose_failed(
+                    u32::from(sender.get_session_id()),
+                    Some(channel_id),
+                    accepted.failure_reason(),
+                ));
+            }
+            match super::channel_state::wait_accepted_channel_op_commit_grace(sender, proposal)
+                .await?
+            {
+                super::channel_state::AcceptedChannelOpCommit::Completed(result) => {
+                    if !result.is_proposed() {
+                        return Err(super::channel_op_propose_failed(
+                            u32::from(sender.get_session_id()),
+                            Some(channel_id),
+                            result.failure_reason(),
+                        ));
+                    }
+                }
+                super::channel_state::AcceptedChannelOpCommit::Pending(proposal) => {
+                    super::channel_state::spawn_channel_op_completion_log(
+                        proposal, "set_acls", channel_id,
+                    );
+                }
+            }
         }
 
         // Permission refresh fanout is handled in each client's channel-log

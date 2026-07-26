@@ -756,9 +756,13 @@ impl SyncV3State {
         ttl: Duration,
     ) -> Option<u64> {
         self.expire(Instant::now());
-        if self.clients.contains_key(&peer) || self.responders.contains_key(&peer) {
-            return None;
-        }
+        // Clock probes are authenticated, metadata-only liveness evidence
+        // with their own nonce. They neither read nor mutate terminal/history
+        // transfer cursors, so they may safely coexist with either transfer
+        // direction. Serializing them behind operation-bearing catch-up can
+        // deadlock strict delivery: a repeatedly expiring transfer leaves the
+        // peer admitted, while its last observed clock permanently pins the
+        // delivery watermark that is needed to drain new commits.
         if let Some(pending) = self.clock_nonces.get_mut(&peer) {
             // A probe is a replayable metadata request, not transfer work.
             // Keep one identity across retries so a delayed response remains

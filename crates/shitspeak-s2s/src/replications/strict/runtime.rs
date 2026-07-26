@@ -11080,9 +11080,6 @@ async fn request_terminal_repair_probe<R: StrictReplicable>(rt: &Arc<StrictRunti
         return false;
     }
     if rt.v3_repair_supported_by(dst) {
-        if rt.v3_periodic_work_active(dst) {
-            return false;
-        }
         let reason = if preferred_peer.is_some() {
             repl_proto::StrictCatchupReason::TerminalFence
         } else {
@@ -16207,6 +16204,47 @@ mod tests {
                     }),
                     ..
                 }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn v3_watermark_clock_probe_coexists_with_active_terminal_transfer() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        let peer = PeerIncarnation::new(2, 1);
+        assert!(
+            rt.v3_sync
+                .lock()
+                .begin_client(
+                    peer,
+                    repl_proto::StrictCatchupReason::TerminalFence as i32,
+                    rt.cfg.pending_propose_ttl(),
+                )
+                .is_some()
+        );
+        assert!(rt.v3_periodic_work_active(2));
+        {
+            let mut state = rt.state.lock();
+            state.clock = 20;
+            state.peer_clocks.insert(1, 20);
+            state.peer_clocks.insert(2, 1);
+            state.buffer_commit((1, 1), 10, Bytes::new());
+        }
+        net.drain_captures();
+
+        assert!(request_terminal_repair_probe(&rt).await);
+        assert!(net.drain_captures().iter().any(|frame| {
+            matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::ClockProbeReq(request),
+                    ..
+                } if request.reason
+                    == repl_proto::StrictCatchupReason::DeliveryWatermark as i32
             )
         }));
     }
