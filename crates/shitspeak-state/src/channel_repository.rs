@@ -32,6 +32,7 @@
 //! `acl.rs`; the repository maintains both cache lifecycles.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,6 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use async_trait::async_trait;
 use enumflags2::BitFlags;
 use parking_lot::{Mutex as ParkingMutex, RwLock as ParkingRwLock};
+use rustc_hash::FxHasher;
 use scc::HashCache;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
@@ -53,7 +55,7 @@ use shitspeak_core::{DEFAULT_SERVER_ID, StrictReplicationMetadata, default_serve
 use shitspeak_messages::messages::{Message, encoder};
 
 const TEMPORARY_CHANNEL_ID_BIT: u32 = 0x8000_0000;
-const EFFECTIVE_ACL_CACHE_FORMAT_VERSION: u32 = 1;
+const EFFECTIVE_ACL_CACHE_FORMAT_VERSION: u32 = 3;
 
 type ChannelMap = HashMap<u32, Arc<Channel>>;
 type ChannelsByServer = HashMap<String, ChannelMap>;
@@ -4596,23 +4598,29 @@ fn effective_acl_cache_snapshot(
 }
 
 fn effective_acl_state_fingerprint(channels: &ChannelMap) -> u64 {
-    let mut inputs: Vec<_> = channels
-        .values()
-        .map(|channel| {
-            (
-                channel.id,
-                channel.parent_id,
-                channel.inherit_acl,
-                &channel.acls,
-            )
-        })
-        .collect();
-    inputs.sort_unstable_by_key(|(channel_id, ..)| *channel_id);
-    let encoded = serde_json::to_vec(&inputs)
-        .expect("effective ACL fingerprint inputs must always serialize");
-    encoded.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
+    let mut channels: Vec<_> = channels.values().collect();
+    channels.sort_unstable_by_key(|channel| channel.id);
+
+    let mut fingerprint = FxHasher::default();
+    channels.len().hash(&mut fingerprint);
+    for channel in channels {
+        EffectiveAclSource(channel).hash(&mut fingerprint);
+    }
+    fingerprint.finish()
+}
+
+/// Hash view limited to fields that can change a channel's compiled effective
+/// ACL. A blanket `Hash for Channel` would either hash unrelated state or give
+/// `Channel` surprising partial-value hash semantics.
+struct EffectiveAclSource<'a>(&'a Channel);
+
+impl Hash for EffectiveAclSource<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.id.hash(state);
+        self.0.parent_id.hash(state);
+        self.0.inherit_acl.hash(state);
+        self.0.acls.hash(state);
+    }
 }
 
 async fn load_effective_acl_cache_checkpoint(

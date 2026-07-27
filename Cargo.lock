@@ -4568,6 +4568,7 @@ dependencies = [
  "rand 0.10.1",
  "rmp-serde",
  "rusqlite",
+ "rustc-hash",
  "scc",
  "serde",
  "serde_json",

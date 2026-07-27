@@ -28,7 +28,7 @@ pub(crate) fn effective_acl_compile_count() -> usize {
     EFFECTIVE_ACL_COMPILE_COUNT.get()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ACL {
     pub user_id: Option<i32>,
     pub group: Option<String>,

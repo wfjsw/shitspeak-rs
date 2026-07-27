@@ -13,6 +13,7 @@ hex = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }
+rustc-hash = { workspace = true }
 scc = { workspace = true }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
