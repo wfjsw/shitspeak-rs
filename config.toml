@@ -431,7 +431,8 @@ strict_max_catchup_bytes = 524288
 strict_max_snapshot_transfer_bytes = 67108864
 # Minimum spacing between strict startup/heal history-election attempts.
 strict_bootstrap_retry_interval_ms = 500
-# Periodic strict steady-state log catchup interval after history election.
+# Compatibility setting retained for older configurations. Steady-state strict
+# repair is now evidence-driven; there is no periodic history-catchup poll.
 strict_steady_state_catchup_interval_ms = 5000
 # Per-next-hop strict bulk pacing. Byte budgets are shared by all topics and
 # logical destinations whose current route uses the same first hop.
@@ -450,7 +451,8 @@ recovery_ttl_ms = 10000
 # Owner-mode catchup.
 # Suppress duplicate per-origin catchup requests within this window.
 owner_catchup_timeout_ms = 5000
-# Periodic owner-mode anti-entropy and response size/concurrency bounds.
+# Compatibility setting retained for older configurations. Owner repair is now
+# driven by bootstrap, membership changes, and observed version gaps.
 owner_anti_entropy_interval_ms = 30000
 # Cap on `CatchupOp`s returned per `OwnerCatchupResp` chunk.
 owner_max_catchup_ops = 256

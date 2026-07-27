@@ -92,6 +92,21 @@ async fn forward_neighbor_notifications<F>(
     }
 }
 
+async fn apply_ordering_membership_event(
+    ordering: &OverlayOrdering,
+    event: super::MembershipEvent,
+) {
+    match event {
+        // Restarted is emitted only after the observed boot epoch advances.
+        super::MembershipEvent::Restarted(node) => ordering.reset_peer(node.node_id()).await,
+        // Reachability changes do not end an incarnation. Keep ACK state so
+        // Reliable delivery resumes when the same boot epoch is online again.
+        super::MembershipEvent::Failed(_)
+        | super::MembershipEvent::Left(_)
+        | super::MembershipEvent::Joined(_) => {}
+    }
+}
+
 #[cfg(windows)]
 const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
 #[cfg(windows)]
@@ -759,12 +774,7 @@ impl OverlayInner {
                         _ = shutdown.cancelled() => return,
                         ev = events.recv() => {
                             match ev {
-                                Ok(super::MembershipEvent::Restarted(node))
-                                | Ok(super::MembershipEvent::Failed(node))
-                                | Ok(super::MembershipEvent::Left(node)) => {
-                                    ordering.reset_peer(node.node_id()).await;
-                                }
-                                Ok(super::MembershipEvent::Joined(_)) => {}
+                                Ok(event) => apply_ordering_membership_event(&ordering, event).await,
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                             }
@@ -857,7 +867,36 @@ pub(crate) async fn start_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU32;
     use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn ordering_state_survives_transient_loss_and_resets_on_new_boot_epoch() {
+        let ordering = OverlayOrdering::default();
+        let lane = super::super::LaneId::new(NonZeroU32::new(7).unwrap());
+        let peer = 9;
+
+        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 0);
+        apply_ordering_membership_event(
+            &ordering,
+            super::super::MembershipEvent::Failed(super::super::MemberIncarnation::new(peer, 7)),
+        )
+        .await;
+        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 1);
+        apply_ordering_membership_event(
+            &ordering,
+            super::super::MembershipEvent::Left(super::super::MemberIncarnation::new(peer, 7)),
+        )
+        .await;
+        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 2);
+
+        apply_ordering_membership_event(
+            &ordering,
+            super::super::MembershipEvent::Restarted(super::super::MemberIncarnation::new(peer, 8)),
+        )
+        .await;
+        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 0);
+    }
 
     struct NotificationForwarderHarness {
         on_change: Arc<tokio::sync::Notify>,

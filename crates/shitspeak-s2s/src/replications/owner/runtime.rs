@@ -6,6 +6,7 @@
 //! runtime never mints epochs.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -28,9 +29,16 @@ use super::super::proto::{
 use super::super::protocol::advertised_replication_capabilities;
 use super::super::topic::ErasedOwnerRuntime;
 use super::OwnerReplicable;
-use crate::overlay::{MembershipEvent, OverlayNetwork, OverlaySendOptions};
+use crate::overlay::{LaneId, MembershipEvent, OverlayNetwork, OverlaySendOptions};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
+
+/// End-to-end ACKed overlay lane reserved for owner replication. This keeps
+/// broadcast operations retained across connection replacement until every
+/// destination has acknowledged them, so a periodic repair loop is not needed
+/// to cover a missed tail.
+const OWNER_REPLICATION_LANE: LaneId =
+    LaneId::new(NonZeroU32::new(0x4f57_4e52).expect("owner replication lane id is non-zero"));
 
 #[async_trait]
 pub(crate) trait OwnerNet: Send + Sync + 'static {
@@ -99,8 +107,9 @@ impl OwnerNet for OverlayOwnerNet {
         );
         let bytes = encoded?;
         self.overlay
-            .send_unicast_with_options(
+            .send_unicast_on_lane_with_options(
                 dst,
+                OWNER_REPLICATION_LANE,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 MessageClass::Regular,
@@ -130,8 +139,9 @@ impl OwnerNet for OverlayOwnerNet {
             return Ok(());
         }
         self.overlay
-            .send_multicast(
+            .send_multicast_on_lane(
                 &dsts,
+                OWNER_REPLICATION_LANE,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 MessageClass::Regular,
@@ -162,8 +172,9 @@ impl OwnerNet for OverlayOwnerNet {
             .expire_after(retry_delay);
         let result = self
             .overlay
-            .send_unicast_with_options(
+            .send_unicast_on_lane_with_options(
                 dst,
+                OWNER_REPLICATION_LANE,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 MessageClass::Regular,
@@ -175,8 +186,9 @@ impl OwnerNet for OverlayOwnerNet {
             if replication_bulk_backpressure(&error) {
                 sleep(retry_delay).await;
                 self.overlay
-                    .send_unicast_with_options(
+                    .send_unicast_on_lane_with_options(
                         dst,
+                        OWNER_REPLICATION_LANE,
                         REPLICATION_SERVICE_TAG,
                         ServiceLevel::Reliable,
                         MessageClass::Regular,
@@ -242,6 +254,7 @@ struct OwnerCatchupAttempt {
     generation: u64,
     epoch: u64,
     since_version: u64,
+    gap_target_version: Option<u64>,
     chunk_token: u64,
     dst: NodeIdentifier,
 }
@@ -422,6 +435,7 @@ impl OwnerState {
         origin: NodeIdentifier,
         epoch: u64,
         since_version: u64,
+        gap_target_version: Option<u64>,
         chunk_token: u64,
         dst: NodeIdentifier,
     ) -> u64 {
@@ -433,11 +447,33 @@ impl OwnerState {
                 generation,
                 epoch,
                 since_version,
+                gap_target_version,
                 chunk_token,
                 dst,
             },
         );
         generation
+    }
+
+    /// Cancel a request watchdog once ordinary owner broadcasts have advanced
+    /// beyond the version it requested and left no unresolved gap behind.
+    /// Keep `catchup_in_flight` as the anti-entropy throttle timestamp.
+    fn cancel_satisfied_catchup_attempt(&mut self, origin: NodeIdentifier, epoch: u64) -> bool {
+        let Some(attempt) = self.catchup_attempts.get(&origin).copied() else {
+            return false;
+        };
+        let caught_up_by_broadcast = attempt.gap_target_version.is_some_and(|target| {
+            self.known
+                .get(&origin)
+                .is_some_and(|(known_epoch, known_version)| {
+                    *known_epoch == epoch && *known_version >= target
+                })
+        }) && !self.pending_buffers.contains_key(&origin)
+            && !self.inactive_origins.contains(&origin);
+        if caught_up_by_broadcast {
+            self.catchup_attempts.remove(&origin);
+        }
+        caught_up_by_broadcast
     }
 
     /// Should we issue a catchup for `origin`? Suppresses duplicates within
@@ -532,19 +568,6 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             runtime.bootstrap_catchup_alive_members().await;
-        });
-        let runtime = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(runtime.cfg.owner_anti_entropy_interval());
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = runtime.shutdown.cancelled() => return,
-                    _ = ticker.tick() => {
-                        runtime.catchup_alive_members().await;
-                    }
-                }
-            }
         });
     }
 
@@ -664,7 +687,18 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         let generation = {
             let mut state = self.state.lock();
             state.catchup_in_flight.insert(origin, Instant::now());
-            state.record_catchup_attempt(origin, epoch, since_version, chunk_token, dst)
+            let gap_target_version = state
+                .pending_buffers
+                .get(&origin)
+                .and_then(|pending| pending.keys().next_back().copied());
+            state.record_catchup_attempt(
+                origin,
+                epoch,
+                since_version,
+                gap_target_version,
+                chunk_token,
+                dst,
+            )
         };
         let timeout = self.cfg.owner_catchup_timeout();
         let weak = self.weak_self.lock().clone();
@@ -689,6 +723,9 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                 return;
             };
             if attempt.generation != generation {
+                return;
+            }
+            if state.cancel_satisfied_catchup_attempt(origin, attempt.epoch) {
                 return;
             }
             state.catchup_attempts.remove(&origin);
@@ -1246,6 +1283,9 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             s.record_applied(origin, epoch, v);
             prev_v = v;
         }
+        self.state
+            .lock()
+            .cancel_satisfied_catchup_attempt(origin, epoch);
         let _ = prev_v;
     }
 
@@ -1541,7 +1581,7 @@ fn node_from_u32(v: u32) -> Option<NodeIdentifier> {
 mod tests {
     use super::*;
     use crate::replications::proto::OwnerCatchupResp;
-    use crate::replications::test_support::{CountingOwnerRepo, MockNet};
+    use crate::replications::test_support::{CapturedFrame, CountingOwnerRepo, MockNet};
     use std::sync::atomic::AtomicBool;
 
     fn op(origin: u16, epoch: u64, ver: u64) -> OwnerOp {
@@ -1557,6 +1597,28 @@ mod tests {
     fn classify_first_sight_v1_applies() {
         let s = OwnerState::new();
         assert_eq!(s.classify_op(7, &op(7, 100, 1)), Classification::Apply);
+    }
+
+    #[test]
+    fn every_production_owner_enqueue_uses_end_to_end_ack_lane() {
+        const SOURCE: &str = include_str!("runtime.rs");
+        let production = SOURCE
+            .split("// ---------- Unit tests ----------")
+            .next()
+            .expect("owner runtime production section");
+        let lane_enqueues = production
+            .matches(".send_unicast_on_lane_with_options(")
+            .count()
+            + production.matches(".send_multicast_on_lane(").count();
+
+        assert_eq!(lane_enqueues, 4, "unexpected owner overlay enqueue added");
+        assert_eq!(
+            production.matches("OWNER_REPLICATION_LANE").count(),
+            lane_enqueues + 1,
+            "every owner overlay enqueue must use its ACK-retained lane"
+        );
+        assert!(!production.contains(".send_unicast_with_options("));
+        assert!(!production.contains(".send_multicast("));
     }
 
     #[test]
@@ -1662,6 +1724,123 @@ mod tests {
         s.wipe_origin(7);
         assert!(s.pending_buffers.get(&7).is_none());
         assert!(s.catchup_in_flight.get(&7).is_none());
+    }
+
+    #[test]
+    fn broadcast_progress_cancels_watchdog_only_after_gap_is_filled() {
+        let mut state = OwnerState::new();
+        state.known.insert(7, (100, 4));
+        let request_time = Instant::now();
+        state.catchup_in_flight.insert(7, request_time);
+        state.record_catchup_attempt(7, 100, 4, Some(6), 0, 7);
+        state.buffer_op(7, 6, Bytes::new());
+        state.record_applied(7, 100, 5);
+
+        assert!(!state.cancel_satisfied_catchup_attempt(7, 100));
+        assert!(state.catchup_attempts.contains_key(&7));
+
+        state.record_applied(7, 100, 6);
+        assert!(state.cancel_satisfied_catchup_attempt(7, 100));
+        assert!(!state.catchup_attempts.contains_key(&7));
+        assert_eq!(state.catchup_in_flight.get(&7), Some(&request_time));
+    }
+
+    #[test]
+    fn broadcast_progress_does_not_cancel_non_gap_catchup() {
+        let mut state = OwnerState::new();
+        state.known.insert(7, (100, 4));
+        state.record_catchup_attempt(7, 100, 4, None, 0, 7);
+        state.record_applied(7, 100, 5);
+
+        assert!(!state.cancel_satisfied_catchup_attempt(7, 100));
+        assert!(state.catchup_attempts.contains_key(&7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_runtime_does_not_emit_periodic_background_catchup() {
+        let net = MockNet::new(1, vec![1]);
+        let shutdown = CancellationToken::new();
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            1,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            shutdown.clone(),
+            Arc::new(
+                ReplicationConfig::default()
+                    .with_owner_anti_entropy_interval(Duration::from_millis(100)),
+            ),
+        );
+        runtime.start();
+        tokio::task::yield_now().await;
+
+        net.set_epoch(2, 200);
+        net.set_alive(vec![1, 2]);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            net.captured.lock().is_empty(),
+            "steady state must be driven by broadcasts rather than background catchup"
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn broadcasts_that_fill_gap_prevent_catchup_retry() {
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(2, 200);
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            1,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(
+                ReplicationConfig::default().with_owner_catchup_timeout(Duration::from_millis(30)),
+            ),
+        );
+        runtime
+            .recv_op(
+                2,
+                OwnerOp {
+                    origin_node: 2,
+                    origin_epoch: 200,
+                    origin_version: 2,
+                    op_msgpack: Bytes::from(rmp_serde::to_vec(&43u64).unwrap()),
+                },
+            )
+            .await;
+        runtime
+            .recv_op(
+                2,
+                OwnerOp {
+                    origin_node: 2,
+                    origin_epoch: 200,
+                    origin_version: 1,
+                    op_msgpack: Bytes::from(rmp_serde::to_vec(&42u64).unwrap()),
+                },
+            )
+            .await;
+
+        tokio::time::advance(Duration::from_millis(31)).await;
+        tokio::task::yield_now().await;
+        let requests = net
+            .captured
+            .lock()
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    frame,
+                    CapturedFrame::OwnerUnicast {
+                        body: OwnerBody::CatchupReq(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(requests, 1, "satisfied watchdog must not retry");
     }
 
     #[tokio::test]

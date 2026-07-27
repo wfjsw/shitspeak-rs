@@ -10853,17 +10853,6 @@ fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>
         let mut terminal_repair_ticker =
             tokio::time::interval_at(terminal_repair_start, terminal_repair_interval);
         terminal_repair_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let steady_state_interval = rt.cfg.strict_steady_state_catchup_interval();
-        let steady_state_start = tokio::time::Instant::now()
-            + strict_timer_start_jitter(
-                rt.self_id,
-                &rt.topic,
-                StrictTimerLane::SteadyState,
-                steady_state_interval,
-            );
-        let mut steady_state_ticker =
-            tokio::time::interval_at(steady_state_start, steady_state_interval);
-        steady_state_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = rt.shutdown.cancelled() => return,
@@ -10874,9 +10863,6 @@ fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>
                     // cadence. This probe is metadata-only and safe to run
                     // independently of history catch-up.
                     let _ = request_terminal_repair_probe(&rt).await;
-                }
-                _ = steady_state_ticker.tick() => {
-                    request_steady_state_catchup(&rt).await;
                 }
             }
         }
@@ -10947,6 +10933,12 @@ async fn request_terminal_repair_probe<R: StrictReplicable>(rt: &Arc<StrictRunti
         .cfg
         .propose_ttl()
         .saturating_add(phase_two_completion_grace(&rt.cfg));
+    // A freshly buffered decision is expected to sit behind the delivery
+    // watermark until the ordinary clock-tick burst crosses its timestamp.
+    // Give that reliable broadcast path a complete cooldown window before
+    // treating the watermark as stuck and opening catchup traffic.
+    let watermark_repair_grace =
+        clock_tick_burst_cooldown(rt.current_clock_tick_interval(), &rt.cfg);
     let (candidates, preferred_peer, stale_pending): (
         Vec<(NodeIdentifier, Option<u64>)>,
         Option<NodeIdentifier>,
@@ -11026,19 +11018,17 @@ async fn request_terminal_repair_probe<R: StrictReplicable>(rt: &Arc<StrictRunti
             )
         } else {
             let watermark = delivery_watermark(&state, rt.self_id, &alive);
-            let pending_barrier = state
-                .earliest_uncommitted_proposal_ts()
-                .map(|ts| ts.saturating_sub(1));
-            let effective_high_water = pending_barrier
-                .map_or(watermark.high_water.saturating_sub(1), |barrier| {
-                    watermark.high_water.saturating_sub(1).min(barrier)
-                });
             (
                 state
                     .commit_buffer
                     .iter()
                     .next()
-                    .filter(|(_, buffered)| buffered.ts_final > effective_high_water)
+                    // Proposal barriers have their own terminal-repair path;
+                    // only a genuinely stale delivery watermark belongs here.
+                    .filter(|(_, buffered)| {
+                        buffered.ts_final > watermark.high_water.saturating_sub(1)
+                            && buffered.buffered_at.elapsed() >= watermark_repair_grace
+                    })
                     .filter(|_| watermark.low_water_node != rt.self_id)
                     .map(|_| vec![(watermark.low_water_node, None)])
                     .unwrap_or_default(),
@@ -11122,6 +11112,7 @@ async fn request_terminal_repair_probe<R: StrictReplicable>(rt: &Arc<StrictRunti
     }
 }
 
+#[cfg(test)]
 async fn request_steady_state_catchup<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     if !rt.can_originate_v2() {
         return;

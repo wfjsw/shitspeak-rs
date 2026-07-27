@@ -743,10 +743,14 @@ strict_max_catchup_bytes = 524288
 # Channel/Ban state, not just one snapshot.
 strict_max_snapshot_transfer_bytes = 67108864
 strict_bootstrap_retry_interval_ms = 500
+# Retained for configuration compatibility; periodic steady-state polling is
+# disabled in favor of evidence-driven repair.
 strict_steady_state_catchup_interval_ms = 5000
 pending_propose_ttl_ms = 20000
 recovery_ttl_ms = 10000
 owner_catchup_timeout_ms = 5000
+# Retained for configuration compatibility; periodic owner anti-entropy is
+# disabled in favor of bootstrap, membership, and observed-gap repair.
 owner_anti_entropy_interval_ms = 30000
 owner_max_catchup_ops = 256
 catchup_max_in_flight_total = 8
@@ -916,8 +920,11 @@ and neither may exceed 100. Configure `repair_max_extra_copies_per_frame` only
 in the supported `0..2` range.
 
 `strict_bootstrap_retry_interval_ms` gates strict startup and partition-heal
-history-election retries. `strict_steady_state_catchup_interval_ms` controls the
-periodic strict catchup interval used after history election has finished.
+history-election retries. `strict_steady_state_catchup_interval_ms` and
+`owner_anti_entropy_interval_ms` remain accepted for configuration
+compatibility, but no longer schedule background catchup. Steady-state repair
+is driven by observed gaps or stalls. Owner replication frames are retained on
+an end-to-end acknowledged overlay lane between those repair events.
 
 `transport_ttl_ms`, `repair_transport_ttl_ms`, and `repair_request_ttl_ms` are
 the remote S2S voice delivery budget. They are not a local listener playout

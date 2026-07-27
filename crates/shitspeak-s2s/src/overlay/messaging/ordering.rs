@@ -16,6 +16,8 @@ use shitspeak_core::NodeIdentifier;
 use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
 
+use super::super::proto::level_from_wire;
+
 const UNORDERED_DELIVERY_DEDUPE_CAP: usize = 4096;
 const UNORDERED_FORWARD_DEDUPE_CAP: usize = 16384;
 
@@ -379,8 +381,14 @@ impl OverlayOrdering {
             let mut expired = Vec::new();
             for (seq, packet) in packets.iter_mut() {
                 let age = now.saturating_duration_since(packet.first_sent_at);
-                let expired_by_age = age >= self.retry_max_age;
-                let expired_by_attempts = packet.retry_attempts >= self.retry_max_attempts;
+                // Plain Reliable is an end-to-end contract. Keep retrying
+                // until an ACK arrives or membership observes a replacement
+                // boot epoch; transport/session timeouts are not delivery.
+                let retain_until_ack =
+                    level_from_wire(packet.data.service_level) == Some(ServiceLevel::Reliable);
+                let expired_by_age = !retain_until_ack && age >= self.retry_max_age;
+                let expired_by_attempts =
+                    !retain_until_ack && packet.retry_attempts >= self.retry_max_attempts;
                 if expired_by_age || expired_by_attempts {
                     warn!(
                         dst = %key.dst,
@@ -732,6 +740,12 @@ mod tests {
         data_on_lane(seq, body, lane())
     }
 
+    fn reliable_low_latency_data(seq: u64, body: &'static [u8]) -> pb::OverlayData {
+        let mut data = data(seq, body);
+        data.service_level = 1;
+        data
+    }
+
     #[test]
     fn ordered_defaults_are_sensible() {
         let cfg = OverlayConfig::new(Vec::new());
@@ -828,7 +842,9 @@ mod tests {
         let cfg = OverlayConfig::new(Vec::new()).with_ordered_pending_window_packets(1);
         let ordering = OverlayOrdering::new(&cfg);
 
-        ordering.store_pending(lane(), data(0, b"pending")).await;
+        ordering
+            .store_pending(lane(), reliable_low_latency_data(0, b"pending"))
+            .await;
 
         assert_eq!(
             ordering.can_store_pending(&[1], lane()).await,
@@ -845,7 +861,9 @@ mod tests {
             .with_ordered_retry_max_age(Duration::from_secs(30))
             .with_ordered_retry_max_attempts(16);
         let ordering = OverlayOrdering::new(&cfg);
-        ordering.store_pending(lane(), data(0, b"pending")).await;
+        ordering
+            .store_pending(lane(), reliable_low_latency_data(0, b"pending"))
+            .await;
 
         let first_due = Instant::now() + Duration::from_millis(5);
         for attempt in 0..16 {
@@ -874,7 +892,9 @@ mod tests {
             .with_ordered_retry_max_age(Duration::from_millis(1))
             .with_ordered_retry_max_attempts(16);
         let ordering = OverlayOrdering::new(&cfg);
-        ordering.store_pending(lane(), data(0, b"pending")).await;
+        ordering
+            .store_pending(lane(), reliable_low_latency_data(0, b"pending"))
+            .await;
 
         assert!(
             ordering
@@ -901,6 +921,31 @@ mod tests {
                 .await
                 .is_empty()
         );
+        assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reliable_pending_ignores_retry_caps_until_ack_or_epoch_reset() {
+        let cfg = OverlayConfig::new(Vec::new())
+            .with_ordered_retry_initial(Duration::from_millis(1))
+            .with_ordered_retry_max(Duration::from_millis(1))
+            .with_ordered_retry_max_age(Duration::from_millis(1))
+            .with_ordered_retry_max_attempts(0);
+        let ordering = OverlayOrdering::new(&cfg);
+        ordering.store_pending(lane(), data(0, b"pending")).await;
+
+        assert_eq!(
+            ordering
+                .due_retransmits(Instant::now() + Duration::from_secs(1))
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(ordering.pending_range(1, lane(), 0, 0).await.len(), 1);
+
+        // `reset_peer` is invoked only for MembershipEvent::Restarted, which
+        // is the observed destination boot-epoch transition.
+        ordering.reset_peer(1).await;
         assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
     }
 
