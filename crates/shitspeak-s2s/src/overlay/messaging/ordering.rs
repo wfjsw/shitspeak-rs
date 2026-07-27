@@ -609,11 +609,17 @@ impl OverlayOrdering {
     }
 
     pub(crate) async fn reset_peer(&self, peer: NodeIdentifier) {
-        self.outbound_next
-            .lock()
-            .await
-            .retain(|key, _| key.dst != peer);
-        self.pending.lock().await.retain(|key, _| key.dst != peer);
+        {
+            // Serialize with originate/store so a packet cannot enter the
+            // pending map after the purge has already passed it.
+            let _outbound = self.outbound_send_guard().await;
+            self.outbound_next
+                .lock()
+                .await
+                .retain(|key, _| key.dst != peer);
+            self.pending.lock().await.retain(|key, _| key.dst != peer);
+            self.repair_cache.lock().await.retain_peer(peer);
+        }
         self.inbound
             .lock()
             .await
@@ -622,7 +628,6 @@ impl OverlayOrdering {
             .lock()
             .await
             .retain(|key, _| key.src != peer && key.dst != peer);
-        self.repair_cache.lock().await.retain_peer(peer);
     }
 }
 
@@ -953,8 +958,8 @@ mod tests {
         assert_eq!(ordering.pending_range(1, lane(), 0, 0).await.len(), 1);
         assert_eq!(ordering.pending_range(1, lane_with(2), 0, 0).await.len(), 1);
 
-        // `reset_peer` is invoked only for MembershipEvent::Restarted, which
-        // is the observed destination boot-epoch transition.
+        // Terminal membership decisions and boot-epoch replacement both end
+        // retention for the affected destination state.
         ordering.reset_peer(1).await;
         assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
         assert!(
@@ -966,13 +971,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_peer_clears_pending_packets() {
-        let ordering = OverlayOrdering::default();
-        ordering.store_pending(lane(), data(0, b"pending")).await;
+    async fn reset_peer_purges_incoming_and_outgoing_state_and_reclaims_capacity() {
+        let cfg = OverlayConfig::new(Vec::new()).with_ordered_pending_window_packets(1);
+        let ordering = OverlayOrdering::new(&cfg);
+        let peer: NodeIdentifier = 2;
+        let other: NodeIdentifier = 3;
+        let mut peer_outbound = data(0, b"peer-outbound");
+        peer_outbound.ordering_dst = u32::from(peer);
+        peer_outbound.dsts = vec![u32::from(peer)];
+        let mut other_outbound = data(0, b"other-outbound");
+        other_outbound.ordering_dst = u32::from(other);
+        other_outbound.dsts = vec![u32::from(other)];
+        ordering.store_pending(lane(), peer_outbound).await;
+        ordering.store_pending(lane(), other_outbound).await;
 
-        ordering.reset_peer(1).await;
+        let mut peer_inbound = data(1, b"peer-inbound");
+        peer_inbound.src = u32::from(peer);
+        peer_inbound.ordering_dst = 1;
+        let mut other_inbound = data(1, b"other-inbound");
+        other_inbound.src = u32::from(other);
+        other_inbound.ordering_dst = 1;
+        assert!(
+            ordering
+                .accept_inbound(
+                    1,
+                    &peer_inbound,
+                    ServiceLevel::Reliable,
+                    MessageClass::Regular,
+                )
+                .await
+                .is_some()
+        );
+        assert!(
+            ordering
+                .accept_inbound(
+                    1,
+                    &other_inbound,
+                    ServiceLevel::Reliable,
+                    MessageClass::Regular,
+                )
+                .await
+                .is_some()
+        );
 
-        assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
+        ordering.reset_peer(peer).await;
+
+        assert!(ordering.pending_range(peer, lane(), 0, 0).await.is_empty());
+        assert_eq!(ordering.pending_range(other, lane(), 0, 0).await.len(), 1);
+        assert_eq!(ordering.can_store_pending(&[peer], lane()).await, Ok(()));
+        assert_eq!(
+            ordering.can_store_pending(&[other], lane()).await,
+            Err((other, lane()))
+        );
+        let inbound = ordering.inbound.lock().await;
+        assert!(inbound.keys().all(|key| key.src != peer && key.dst != peer));
+        assert!(inbound.keys().any(|key| key.src == other));
     }
 
     #[tokio::test]

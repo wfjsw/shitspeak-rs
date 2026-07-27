@@ -1133,10 +1133,7 @@ impl ConnectionManager {
 
     pub async fn forget_node(&self, node: NodeIdentifier) {
         if let Some(peer) = self.inner.remove_peer(node) {
-            // Cancel any active streams.
-            for kind in peer.live_kinds() {
-                peer.drop_stream(kind);
-            }
+            peer.retire();
         }
     }
 
@@ -3219,7 +3216,7 @@ async fn run_peer_outbound_dispatcher(
     retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut scheduler = OutboundScheduler::default();
     loop {
-        if inner.shutdown().is_cancelled() {
+        if inner.shutdown().is_cancelled() || peer.retired().is_cancelled() {
             return;
         }
 
@@ -3269,6 +3266,7 @@ async fn run_peer_outbound_dispatcher(
         tokio::select! {
             biased;
             _ = inner.shutdown().cancelled() => return,
+            _ = peer.retired().cancelled() => return,
             queued = receiver.recv(), if !receiver.is_closed() => {
                 if let Some(queued) = queued {
                     scheduler.push(queued);
@@ -4965,6 +4963,95 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), transport.shutdown())
             .await
             .expect("shutdown should not wait for scheduler backlog");
+    }
+
+    #[tokio::test]
+    async fn forget_node_releases_queued_capacity_and_allows_fresh_peer() {
+        let (transport, mut receivers) = ConnectionManager::test_with_live_streams_bytes(
+            1,
+            2,
+            &[TransportKind::Tcp],
+            1024 * 1024,
+        );
+        let retired_peer = transport.inner.get_peer(2).expect("peer");
+
+        transport
+            .try_send(
+                2,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from(vec![1; 1024 * 1024 - 512]),
+            )
+            .await
+            .expect("fill stream handoff");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while retired_peer.outbound_queue_depth_bytes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first envelope should reach the stream handoff");
+        transport
+            .try_send(
+                2,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"held by dispatcher"),
+            )
+            .await
+            .expect("queue behind full stream handoff");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while retired_peer.outbound_queue_depth_bytes() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dispatcher should retain the blocked envelope");
+
+        transport.forget_node(2).await;
+        assert!(
+            !transport.inner.shutdown().is_cancelled(),
+            "peer retirement must not start manager shutdown"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while retired_peer.outbound_queue_depth_bytes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retiring the peer should release queued capacity");
+
+        assert!(receivers[0].recv().await.is_some());
+        assert!(
+            receivers[0].recv().await.is_none(),
+            "stream sender must close"
+        );
+
+        let mut fresh_receiver = transport.test_install_live_stream(2, TransportKind::Tcp);
+        let fresh_peer = transport.inner.get_peer(2).expect("fresh peer");
+        assert!(!Arc::ptr_eq(&retired_peer, &fresh_peer));
+        transport
+            .try_send(
+                2,
+                ServiceLevel::Reliable,
+                None,
+                MessageClass::Regular,
+                Bytes::from_static(b"fresh"),
+            )
+            .await
+            .expect("fresh peer accepts traffic");
+        assert_eq!(
+            &tokio::time::timeout(Duration::from_secs(1), fresh_receiver.recv())
+                .await
+                .expect("fresh dispatch timeout")
+                .expect("fresh stream closed")
+                .payload()[..],
+            b"fresh"
+        );
     }
 
     #[tokio::test]

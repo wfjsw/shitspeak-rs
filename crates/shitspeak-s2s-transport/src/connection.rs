@@ -1429,6 +1429,9 @@ pub(crate) struct PeerState {
     kcp_best_effort_recovery_after_rtt_samples: Mutex<Option<u64>>,
     voice_transport_binding: Mutex<VoiceTransportBinding>,
     outbound_dispatch_notify: Notify,
+    /// Peer-local lifetime. Retirement cancels only this peer's streams and
+    /// dispatcher; the manager-wide shutdown token remains untouched.
+    retired: CancellationToken,
     /// Set true while a connect attempt is in flight, to prevent duplicate
     /// dials racing inside the supervisor.
     connecting: AtomicBool,
@@ -1470,6 +1473,7 @@ impl PeerState {
             kcp_best_effort_recovery_after_rtt_samples: Mutex::new(None),
             voice_transport_binding: Mutex::new(VoiceTransportBinding::default()),
             outbound_dispatch_notify: Notify::new(),
+            retired: CancellationToken::new(),
             connecting: AtomicBool::new(false),
         })
     }
@@ -1496,6 +1500,22 @@ impl PeerState {
 
     pub fn outbound_queue_capacity_bytes(&self) -> usize {
         self.outbound_sender.capacity_bytes()
+    }
+
+    pub(crate) fn retired(&self) -> &CancellationToken {
+        &self.retired
+    }
+
+    pub(crate) fn retire(&self) {
+        self.retired.cancel();
+        {
+            let mut streams = self.streams.lock();
+            for stream in streams.values() {
+                stream.cancel();
+            }
+            streams.clear();
+        }
+        self.notify_outbound_dispatch();
     }
 
     pub(crate) fn udp_datagram_mtu(&self) -> usize {
@@ -1873,6 +1893,10 @@ impl PeerState {
     pub fn install_stream(&self, stream: ActiveStream) {
         let key = stream.key();
         let mut g = self.streams.lock();
+        if self.retired.is_cancelled() {
+            stream.cancel();
+            return;
+        }
         prune_dead_streams(&mut g);
         if stream.transport() == TransportKind::Udp {
             drop_udp_streams(&mut g);
@@ -1888,6 +1912,10 @@ impl PeerState {
     pub fn try_install_stream(&self, new_stream: ActiveStream) -> Result<(), ActiveStream> {
         let key = new_stream.key();
         let mut g = self.streams.lock();
+        if self.retired.is_cancelled() {
+            new_stream.cancel();
+            return Err(new_stream);
+        }
         prune_dead_streams(&mut g);
         if new_stream.transport() == TransportKind::Udp {
             drop_udp_streams(&mut g);

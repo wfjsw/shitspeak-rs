@@ -94,16 +94,27 @@ async fn forward_neighbor_notifications<F>(
 
 async fn apply_ordering_membership_event(
     ordering: &OverlayOrdering,
-    event: super::MembershipEvent,
-) {
+    event: &super::MembershipEvent,
+) -> Option<NodeIdentifier> {
     match event {
-        // Restarted is emitted only after the observed boot epoch advances.
-        super::MembershipEvent::Restarted(node) => ordering.reset_peer(node.node_id()).await,
-        // Reachability changes do not end an incarnation. Keep ACK state so
-        // Reliable delivery resumes when the same boot epoch is online again.
-        super::MembershipEvent::Failed(_)
-        | super::MembershipEvent::Left(_)
-        | super::MembershipEvent::Joined(_) => {}
+        // Failed and Left are terminal membership decisions for the observed
+        // incarnation. Purge its retained packets immediately so a dead peer
+        // cannot consume the ordered pending window indefinitely. Restarted
+        // likewise invalidates packets addressed to the previous boot epoch.
+        // This subscriber owns only overlay ordering state; replication
+        // membership subscribers still receive the event independently and
+        // retain responsibility for owner-origin shutdown/cleanup.
+        super::MembershipEvent::Failed(node) | super::MembershipEvent::Left(node) => {
+            ordering.reset_peer(node.node_id()).await;
+            Some(node.node_id())
+        }
+        // The replacement may already have a live transport session. Reset
+        // old epoch ordering state, but do not retire the new peer session.
+        super::MembershipEvent::Restarted(node) => {
+            ordering.reset_peer(node.node_id()).await;
+            None
+        }
+        super::MembershipEvent::Joined(_) => None,
     }
 }
 
@@ -767,6 +778,7 @@ impl OverlayInner {
         {
             let mut events = self.table.subscribe();
             let ordering = self.ordering.clone();
+            let transport = self.transport.clone();
             let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
                 loop {
@@ -774,7 +786,14 @@ impl OverlayInner {
                         _ = shutdown.cancelled() => return,
                         ev = events.recv() => {
                             match ev {
-                                Ok(event) => apply_ordering_membership_event(&ordering, event).await,
+                                Ok(event) => {
+                                    if let Some(node) = apply_ordering_membership_event(&ordering, &event).await {
+                                        // Retire only this peer's transport state. This drops
+                                        // its queued stream handoffs without cancelling global
+                                        // transport or replication cleanup tasks.
+                                        transport.forget_node(node).await;
+                                    }
+                                }
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                             }
@@ -871,31 +890,56 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[tokio::test]
-    async fn ordering_state_survives_transient_loss_and_resets_on_new_boot_epoch() {
-        let ordering = OverlayOrdering::default();
+    async fn terminal_membership_events_purge_only_the_affected_peer() {
         let lane = super::super::LaneId::new(NonZeroU32::new(7).unwrap());
-        let peer = 9;
 
-        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 0);
-        apply_ordering_membership_event(
-            &ordering,
-            super::super::MembershipEvent::Failed(super::super::MemberIncarnation::new(peer, 7)),
-        )
-        .await;
-        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 1);
-        apply_ordering_membership_event(
-            &ordering,
-            super::super::MembershipEvent::Left(super::super::MemberIncarnation::new(peer, 7)),
-        )
-        .await;
-        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 2);
+        for event in [
+            super::super::MembershipEvent::Failed(super::super::MemberIncarnation::new(9, 7)),
+            super::super::MembershipEvent::Left(super::super::MemberIncarnation::new(9, 7)),
+        ] {
+            let ordering = OverlayOrdering::default();
+            assert_eq!(ordering.next_outbound_seq(9, lane).await, 0);
+            assert_eq!(ordering.next_outbound_seq(10, lane).await, 0);
 
-        apply_ordering_membership_event(
-            &ordering,
-            super::super::MembershipEvent::Restarted(super::super::MemberIncarnation::new(peer, 8)),
-        )
-        .await;
-        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 0);
+            assert_eq!(
+                apply_ordering_membership_event(&ordering, &event).await,
+                Some(9)
+            );
+
+            assert_eq!(ordering.next_outbound_seq(9, lane).await, 0);
+            assert_eq!(ordering.next_outbound_seq(10, lane).await, 1);
+        }
+
+        let ordering = OverlayOrdering::default();
+        assert_eq!(ordering.next_outbound_seq(9, lane).await, 0);
+        assert_eq!(
+            apply_ordering_membership_event(
+                &ordering,
+                &super::super::MembershipEvent::Restarted(super::super::MemberIncarnation::new(
+                    9, 8
+                ),),
+            )
+            .await,
+            None,
+            "a replacement session must not be retired"
+        );
+        assert_eq!(ordering.next_outbound_seq(9, lane).await, 0);
+
+        let ordering = OverlayOrdering::default();
+        assert_eq!(ordering.next_outbound_seq(9, lane).await, 0);
+        assert_eq!(
+            apply_ordering_membership_event(
+                &ordering,
+                &super::super::MembershipEvent::Joined(super::super::MemberIncarnation::new(9, 7)),
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            ordering.next_outbound_seq(9, lane).await,
+            1,
+            "a live/same-epoch event must not discard retained delivery state"
+        );
     }
 
     struct NotificationForwarderHarness {
