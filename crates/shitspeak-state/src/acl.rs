@@ -1,5 +1,8 @@
 use std::{collections::BTreeSet, sync::Arc};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use enumflags2::BitFlags;
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +12,21 @@ use crate::{
 };
 
 pub use shitspeak_core::ACLPermissions;
+
+#[cfg(test)]
+thread_local! {
+    static EFFECTIVE_ACL_COMPILE_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_effective_acl_compile_count() {
+    EFFECTIVE_ACL_COMPILE_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn effective_acl_compile_count() -> usize {
+    EFFECTIVE_ACL_COMPILE_COUNT.get()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ACL {
@@ -330,7 +348,7 @@ fn root_only_permissions() -> BitFlags<ACLPermissions> {
         | ACLPermissions::ResetUserContent
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CompiledHierarchy {
     channel_id: u32,
     ancestors: Arc<[u32]>,
@@ -355,7 +373,7 @@ impl CompiledHierarchy {
 
 /// One ordered ACL operation with enough context to evaluate its raw
 /// principal expression without consulting the channel tree.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CompiledAclEntry {
     user_id: Option<i32>,
     group: Option<String>,
@@ -401,7 +419,7 @@ impl CompiledAclEntry {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CompiledPathStage {
     entries: Vec<CompiledAclEntry>,
 }
@@ -411,7 +429,7 @@ struct CompiledPathStage {
 /// `destination` is the flattened root-to-target rule stream. `path` contains
 /// a separate flattened stream for every actual ancestor, because Traverse is
 /// gated at each path segment rather than only at the destination.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CompiledEffectiveAcl {
     destination: Vec<CompiledAclEntry>,
     path: Vec<CompiledPathStage>,
@@ -448,6 +466,9 @@ pub(crate) fn compile_effective_acl<A: ChannelReference>(
     channel: &crate::Channel,
     ancestors: &[A],
 ) -> CompiledEffectiveAcl {
+    #[cfg(test)]
+    EFFECTIVE_ACL_COMPILE_COUNT.with(|count| count.set(count.get() + 1));
+
     let destination = compile_acl_chain(channel, ancestors, false);
     let path = (0..ancestors.len())
         .rev()

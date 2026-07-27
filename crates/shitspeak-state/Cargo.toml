@@ -14,7 +14,7 @@ parking_lot = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }
 scc = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 shitspeak-core = { workspace = true }
 shitspeak-messages = { workspace = true }

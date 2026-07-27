@@ -6,6 +6,8 @@
 //!
 //! * `<dir>/channels.snapshot.json` — full snapshot of the channel map.
 //! * `<dir>/channels.wal.jsonl`     — append-only newline-delimited JSON log.
+//! * `<dir>/channels.effective-acl-cache.json` — disposable, version-locked
+//!   checkpoint of the derived per-channel ACL programs.
 //!
 //! On startup the snapshot is loaded first, then any WAL entries whose
 //! `version` is greater than the snapshot version are replayed.  The WAL is
@@ -51,6 +53,7 @@ use shitspeak_core::{DEFAULT_SERVER_ID, StrictReplicationMetadata, default_serve
 use shitspeak_messages::messages::{Message, encoder};
 
 const TEMPORARY_CHANNEL_ID_BIT: u32 = 0x8000_0000;
+const EFFECTIVE_ACL_CACHE_FORMAT_VERSION: u32 = 1;
 
 type ChannelMap = HashMap<u32, Arc<Channel>>;
 type ChannelsByServer = HashMap<String, ChannelMap>;
@@ -488,6 +491,27 @@ struct Snapshot {
     /// remove the associated records, so this ledger is part of durable state.
     #[serde(default)]
     strict_applied_ops: Vec<StrictOperationKey>,
+}
+
+/// Disposable checkpoint of the derived per-channel ACL programs. The
+/// server-scoped repository versions bind the complete program view to the
+/// authoritative channel history without forcing unchanged programs to be
+/// recompiled at every version.
+#[derive(Serialize, Deserialize)]
+struct EffectiveAclCacheSnapshot {
+    format_version: u32,
+    versions: HashMap<String, u64>,
+    /// Fingerprints the authoritative ACL inputs, preventing an equal-version
+    /// checkpoint from a different repository timeline from being accepted.
+    state_fingerprints: HashMap<String, u64>,
+    channels: Vec<EffectiveAclCacheChannel>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EffectiveAclCacheChannel {
+    server_id: String,
+    channel_id: u32,
+    program: crate::acl::CompiledEffectiveAcl,
 }
 
 // ─── ChannelRepository ────────────────────────────────────────────────────────
@@ -1152,6 +1176,9 @@ pub struct ChannelRepository {
     /// Unix timestamp when the last snapshot compaction succeeded.
     last_snapshot_at: AtomicI64,
     history_freshness: ParkingRwLock<HashMap<String, i64>>,
+    /// Whether the versioned effective-ACL program view has advanced since
+    /// its last successful periodic checkpoint.
+    effective_acl_cache_dirty: AtomicBool,
 }
 
 // ─── public API ───────────────────────────────────────────────────────────────
@@ -1206,6 +1233,7 @@ impl ChannelRepository {
             observer: ParkingMutex::new(None),
             last_snapshot_at: AtomicI64::new(chrono::Utc::now().timestamp()),
             history_freshness: ParkingRwLock::new(HashMap::new()),
+            effective_acl_cache_dirty: AtomicBool::new(false),
         })
     }
 
@@ -1264,6 +1292,10 @@ impl ChannelRepository {
                 Err(e) => return Err(ChannelRepoError::WalIo(e)),
             };
 
+        let mut acl_cache_servers =
+            load_effective_acl_cache_checkpoint(storage_dir, &versions, &mut channels).await;
+        let mut effective_acl_cache_dirty = acl_cache_servers.len() != channels.len();
+
         // ── 2. Replay WAL ────────────────────────────────────────────────
         let wal_contents = match tokio::fs::read_to_string(&wal_path).await {
             Ok(s) => s,
@@ -1310,9 +1342,21 @@ impl ChannelRepository {
             if op.version <= base_version {
                 continue; // already reflected in snapshot
             }
+            if acl_cache_servers.contains(&op.server_id)
+                && op.version != base_version.saturating_add(1)
+            {
+                // The program checkpoint cannot be advanced safely across a
+                // missing repository operation. Rebuild this server once from
+                // final authoritative state after replay instead.
+                acl_cache_servers.remove(&op.server_id);
+            }
             let scoped_channels = channels.entry(op.server_id.clone()).or_default();
             ensure_root_channel(scoped_channels, &root_config);
             apply_op_to_map(scoped_channels, &op.op, op.node_id, &root_config);
+            if acl_cache_servers.contains(&op.server_id) {
+                rebuild_effective_acl_caches_for_op(scoped_channels, &op.op);
+            }
+            effective_acl_cache_dirty = true;
             versions
                 .entry(op.server_id.clone())
                 .and_modify(|version| *version = (*version).max(op.version))
@@ -1333,7 +1377,17 @@ impl ChannelRepository {
         for scoped_channels in channels.values_mut() {
             ensure_root_channel(scoped_channels, &root_config);
         }
-        rebuild_all_effective_acl_caches(&mut channels);
+        acl_cache_servers.retain(|server_id| {
+            channels
+                .get(server_id)
+                .is_some_and(effective_acl_caches_are_complete)
+        });
+        for (server_id, scoped_channels) in &mut channels {
+            if !acl_cache_servers.contains(server_id) {
+                rebuild_all_effective_acl_caches_in_map(scoped_channels);
+                effective_acl_cache_dirty = true;
+            }
+        }
         versions.entry(DEFAULT_SERVER_ID.to_owned()).or_insert(0);
         let link_topologies = rebuild_all_link_topologies(&mut channels);
         let ordered_channels = rebuild_all_ordered_channel_views(&channels);
@@ -1371,6 +1425,7 @@ impl ChannelRepository {
             observer: ParkingMutex::new(None),
             last_snapshot_at: AtomicI64::new(chrono::Utc::now().timestamp()),
             history_freshness: ParkingRwLock::new(history_freshness),
+            effective_acl_cache_dirty: AtomicBool::new(effective_acl_cache_dirty),
         }))
     }
 
@@ -3166,6 +3221,10 @@ impl ChannelRepository {
         let history_freshness = self.history_freshness.read().clone();
         let strict_applied_ops = self.strict_applied_ops.read().clone();
         let channels_by_server = self.channels.read().clone();
+        let effective_acl_cache_snapshot = self
+            .effective_acl_cache_dirty
+            .load(Ordering::Acquire)
+            .then(|| effective_acl_cache_snapshot(&versions, &channels_by_server));
         let snapshot = self.snapshot_from_state(
             versions,
             history_freshness,
@@ -3173,6 +3232,12 @@ impl ChannelRepository {
             channels_by_server,
         );
         self.write_snapshot_atomically(&snapshot).await?;
+        if let Some(effective_acl_cache_snapshot) = effective_acl_cache_snapshot {
+            self.write_effective_acl_cache_atomically(&effective_acl_cache_snapshot)
+                .await?;
+            self.effective_acl_cache_dirty
+                .store(false, Ordering::Release);
+        }
 
         // Compact WAL only when it has grown past the replay window.
         let wal_count = self.wal_entry_count.load(Ordering::Acquire);
@@ -3236,6 +3301,39 @@ impl ChannelRepository {
             }
         }
 
+        Ok(())
+    }
+
+    async fn write_effective_acl_cache_atomically(
+        &self,
+        snapshot: &EffectiveAclCacheSnapshot,
+    ) -> Result<(), ChannelRepoError> {
+        let Some(dir) = self.storage_dir.as_ref() else {
+            return Ok(());
+        };
+        let path = dir.join("channels.effective-acl-cache.json");
+        let tmp = dir.join("channels.effective-acl-cache.json.tmp");
+        let json = serde_json::to_vec(snapshot).map_err(|e| ChannelRepoError::WalCorrupt {
+            line: 0,
+            reason: format!("effective ACL cache serialisation error: {e}"),
+        })?;
+        {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)
+                .await?;
+            file.write_all(&json).await?;
+            file.sync_data().await?;
+        }
+        #[cfg(windows)]
+        replace_file_atomically(&tmp, &path)?;
+        #[cfg(not(windows))]
+        tokio::fs::rename(&tmp, &path).await?;
+        if let Some(parent) = path.parent() {
+            sync_parent_directory(parent)?;
+        }
         Ok(())
     }
 
@@ -3417,6 +3515,8 @@ impl ChannelRepository {
         if let Some(affected_acl_channels) = affected_acl_channels {
             self.invalidate_acl_cache_for_op_scope(&op.server_id, affected_acl_channels);
         }
+        self.effective_acl_cache_dirty
+            .store(true, Ordering::Release);
 
         let observer = { self.observer.lock().clone() };
         if let Some(observer) = observer {
@@ -3872,6 +3972,8 @@ impl ChannelRepository {
             .insert(server_id.to_owned(), freshness);
         self.channel_acl_generation.fetch_add(1, Ordering::AcqRel);
         self.acl_cache.clear_sync();
+        self.effective_acl_cache_dirty
+            .store(true, Ordering::Release);
 
         let _ = self.tx.send(Arc::new(ChannelOperation {
             server_id: server_id.to_owned(),
@@ -4206,6 +4308,12 @@ impl ChannelRepository {
             self.strict_applied_ops.write().insert(strict_operation_id);
         }
 
+        // Program content changes only for ACL/tree operations, but the
+        // aggregate cache checkpoint is locked to this repository version.
+        // Coalesce that version advance into the next periodic snapshot.
+        self.effective_acl_cache_dirty
+            .store(true, Ordering::Release);
+
         let committed_version = op.version;
         let committed_server_id = op.server_id.clone();
         let _ = self.tx.send(Arc::clone(&op));
@@ -4455,6 +4563,135 @@ fn apply_link_topology_effect(
     }
 }
 
+fn effective_acl_cache_snapshot(
+    versions: &HashMap<String, u64>,
+    channels_by_server: &ChannelsByServer,
+) -> EffectiveAclCacheSnapshot {
+    let channels = channels_by_server
+        .iter()
+        .flat_map(|(server_id, channels)| {
+            channels.values().filter_map(|channel| {
+                channel
+                    .effective_acl_cache
+                    .as_deref()
+                    .map(|program| EffectiveAclCacheChannel {
+                        server_id: server_id.clone(),
+                        channel_id: channel.id,
+                        program: program.clone(),
+                    })
+            })
+        })
+        .collect();
+    EffectiveAclCacheSnapshot {
+        format_version: EFFECTIVE_ACL_CACHE_FORMAT_VERSION,
+        versions: versions.clone(),
+        state_fingerprints: channels_by_server
+            .iter()
+            .map(|(server_id, channels)| {
+                (server_id.clone(), effective_acl_state_fingerprint(channels))
+            })
+            .collect(),
+        channels,
+    }
+}
+
+fn effective_acl_state_fingerprint(channels: &ChannelMap) -> u64 {
+    let mut inputs: Vec<_> = channels
+        .values()
+        .map(|channel| {
+            (
+                channel.id,
+                channel.parent_id,
+                channel.inherit_acl,
+                &channel.acls,
+            )
+        })
+        .collect();
+    inputs.sort_unstable_by_key(|(channel_id, ..)| *channel_id);
+    let encoded = serde_json::to_vec(&inputs)
+        .expect("effective ACL fingerprint inputs must always serialize");
+    encoded.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+async fn load_effective_acl_cache_checkpoint(
+    storage_dir: &Path,
+    authoritative_versions: &HashMap<String, u64>,
+    channels_by_server: &mut ChannelsByServer,
+) -> HashSet<String> {
+    let path = storage_dir.join("channels.effective-acl-cache.json");
+    let data = match tokio::fs::read(&path).await {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return HashSet::new(),
+        Err(error) => {
+            tracing::warn!(?path, %error, "failed to read effective ACL cache; rebuilding");
+            return HashSet::new();
+        }
+    };
+    let snapshot: EffectiveAclCacheSnapshot = match serde_json::from_slice(&data) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(?path, %error, "invalid effective ACL cache; rebuilding");
+            return HashSet::new();
+        }
+    };
+    if snapshot.format_version != EFFECTIVE_ACL_CACHE_FORMAT_VERSION {
+        tracing::info!(
+            ?path,
+            cache_format = snapshot.format_version,
+            expected_format = EFFECTIVE_ACL_CACHE_FORMAT_VERSION,
+            "effective ACL cache format changed; rebuilding"
+        );
+        return HashSet::new();
+    }
+
+    let mut programs: HashMap<String, HashMap<u32, crate::acl::CompiledEffectiveAcl>> =
+        HashMap::new();
+    let mut duplicate = HashSet::new();
+    for scoped in snapshot.channels {
+        if programs
+            .entry(scoped.server_id.clone())
+            .or_default()
+            .insert(scoped.channel_id, scoped.program)
+            .is_some()
+        {
+            duplicate.insert(scoped.server_id);
+        }
+    }
+
+    let mut loaded = HashSet::new();
+    for (server_id, channels) in channels_by_server.iter_mut() {
+        if duplicate.contains(server_id)
+            || snapshot.versions.get(server_id) != authoritative_versions.get(server_id)
+            || snapshot.state_fingerprints.get(server_id)
+                != Some(&effective_acl_state_fingerprint(channels))
+        {
+            continue;
+        }
+        let Some(server_programs) = programs.remove(server_id) else {
+            continue;
+        };
+        if server_programs.len() != channels.len()
+            || channels.iter().any(|(channel_id, channel)| {
+                !server_programs
+                    .get(channel_id)
+                    .is_some_and(|program| program.is_current(channel))
+            })
+        {
+            continue;
+        }
+        for (channel_id, program) in server_programs {
+            let Some(channel) = channels.get_mut(&channel_id) else {
+                continue;
+            };
+            Arc::make_mut(channel).effective_acl_cache = Some(Arc::new(program));
+        }
+        loaded.insert(server_id.clone());
+    }
+    loaded
+}
+
 fn rebuild_all_effective_acl_caches(channels_by_server: &mut ChannelsByServer) {
     for channels in channels_by_server.values_mut() {
         rebuild_all_effective_acl_caches_in_map(channels);
@@ -4464,6 +4701,12 @@ fn rebuild_all_effective_acl_caches(channels_by_server: &mut ChannelsByServer) {
 fn rebuild_all_effective_acl_caches_in_map(channels: &mut ChannelMap) {
     let channel_ids: HashSet<u32> = channels.keys().copied().collect();
     rebuild_effective_acl_caches(channels, channel_ids);
+}
+
+fn effective_acl_caches_are_complete(channels: &ChannelMap) -> bool {
+    channels
+        .values()
+        .all(|channel| channel.has_effective_acl_cache())
 }
 
 fn rebuild_effective_acl_caches_for_subtree(channels: &mut ChannelMap, root_id: u32) {
@@ -4495,14 +4738,7 @@ fn rebuild_effective_acl_caches_for_op(channels: &mut ChannelMap, op: &ChannelOp
     }
 }
 
-fn rebuild_effective_acl_caches(channels: &mut ChannelMap, mut channel_ids: HashSet<u32>) {
-    channel_ids.extend(
-        channels
-            .values()
-            .filter(|channel| !channel.has_effective_acl_cache())
-            .map(|channel| channel.id),
-    );
-
+fn rebuild_effective_acl_caches(channels: &mut ChannelMap, channel_ids: HashSet<u32>) {
     for channel_id in channel_ids {
         let ancestors = ancestor_channels_in_map(channels, channel_id);
         let Some(current) = channels.get(&channel_id) else {
@@ -5098,7 +5334,11 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::{ChannelHierarchy, ClientMembershipQuery, evaluate_permission};
+    use crate::{
+        ChannelHierarchy, ClientMembershipQuery,
+        acl::{effective_acl_compile_count, reset_effective_acl_compile_count},
+        evaluate_permission,
+    };
 
     fn cached_permissions(depends_on_home_channel: bool) -> CachedAclPermissions {
         CachedAclPermissions {
@@ -5277,6 +5517,206 @@ mod tests {
         let leaf = reopened.get_channel(2).await.unwrap();
 
         assert!(cached_group_permissions(&leaf, &["staff"]).contains(ACLPermissions::Move));
+    }
+
+    #[tokio::test]
+    async fn persisted_effective_acl_cache_loads_without_recompiling() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+                .await
+                .unwrap();
+            repo.create_channel(Channel::new(1, "parent", 0, 0, Some(0)))
+                .await
+                .unwrap();
+            repo.create_channel(Channel::new(2, "leaf", 0, 0, Some(1)))
+                .await
+                .unwrap();
+            repo.save_snapshot().await.unwrap();
+        }
+
+        reset_effective_acl_compile_count();
+        let reopened = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+            .await
+            .unwrap();
+
+        assert_eq!(effective_acl_compile_count(), 0);
+        assert!(
+            reopened
+                .get_channel(2)
+                .await
+                .unwrap()
+                .has_effective_acl_cache()
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_effective_acl_cache_replays_only_changed_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+                .await
+                .unwrap();
+            for channel in [
+                Channel::new(1, "parent", 0, 0, Some(0)),
+                Channel::new(2, "leaf", 0, 0, Some(1)),
+                Channel::new(3, "sibling", 0, 0, Some(0)),
+            ] {
+                repo.create_channel(channel).await.unwrap();
+            }
+            repo.save_snapshot().await.unwrap();
+            repo.set_acls(1, true, vec![test_acl("staff")])
+                .await
+                .unwrap();
+        }
+
+        reset_effective_acl_compile_count();
+        let reopened = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+            .await
+            .unwrap();
+
+        assert_eq!(effective_acl_compile_count(), 2);
+        assert!(
+            reopened
+                .get_channel(3)
+                .await
+                .unwrap()
+                .has_effective_acl_cache()
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_wal_versions_reuse_persisted_effective_acl_programs() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+                .await
+                .unwrap();
+            repo.create_channel(Channel::new(1, "before", 0, 0, Some(0)))
+                .await
+                .unwrap();
+            repo.save_snapshot().await.unwrap();
+            repo.update_channel(
+                1,
+                ChannelPatch {
+                    name: Some("after".to_owned()),
+                    position: None,
+                    max_users: None,
+                    description_hash: None,
+                    parent_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        reset_effective_acl_compile_count();
+        let reopened = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+            .await
+            .unwrap();
+
+        assert_eq!(effective_acl_compile_count(), 0);
+        assert_eq!(reopened.get_channel(1).await.unwrap().name, "after");
+    }
+
+    #[tokio::test]
+    async fn effective_acl_cache_gap_falls_back_to_one_full_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+                .await
+                .unwrap();
+            for channel in [
+                Channel::new(1, "parent", 0, 0, Some(0)),
+                Channel::new(2, "leaf", 0, 0, Some(1)),
+                Channel::new(3, "sibling", 0, 0, Some(0)),
+            ] {
+                repo.create_channel(channel).await.unwrap();
+            }
+            repo.save_snapshot().await.unwrap();
+            let skipped_version = repo.current_version() + 2;
+            repo.apply_committed_operation(ChannelOperation {
+                server_id: DEFAULT_SERVER_ID.to_owned(),
+                version: skipped_version,
+                node_id: 2,
+                timestamp: chrono::Utc::now().timestamp(),
+                emits_client_message: true,
+                op: ChannelOp::SetAcls {
+                    channel_id: 1,
+                    inherit_acl: true,
+                    acls: vec![test_acl("staff")],
+                },
+            })
+            .await
+            .unwrap();
+        }
+
+        reset_effective_acl_compile_count();
+        let reopened = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+            .await
+            .unwrap();
+
+        assert_eq!(effective_acl_compile_count(), 4);
+        assert!(
+            reopened
+                .get_channel(2)
+                .await
+                .unwrap()
+                .has_effective_acl_cache()
+        );
+    }
+
+    #[tokio::test]
+    async fn mismatched_effective_acl_input_fingerprint_rebuilds_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+                .await
+                .unwrap();
+            repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+                .await
+                .unwrap();
+            repo.save_snapshot().await.unwrap();
+        }
+        let path = dir.path().join("channels.effective-acl-cache.json");
+        let mut checkpoint: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        checkpoint["state_fingerprints"][DEFAULT_SERVER_ID] = serde_json::json!(0);
+        tokio::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap())
+            .await
+            .unwrap();
+
+        reset_effective_acl_compile_count();
+        let reopened = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+            .await
+            .unwrap();
+
+        assert_eq!(effective_acl_compile_count(), 2);
+        assert!(
+            reopened
+                .get_channel(1)
+                .await
+                .unwrap()
+                .has_effective_acl_cache()
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_effective_acl_cache_checkpoint_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.save_snapshot().await.unwrap();
+        let path = dir.path().join("channels.effective-acl-cache.json");
+        let before = tokio::fs::read(&path).await.unwrap();
+
+        repo.save_snapshot().await.unwrap();
+
+        assert_eq!(tokio::fs::read(path).await.unwrap(), before);
     }
 
     #[tokio::test]
