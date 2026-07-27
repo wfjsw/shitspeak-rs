@@ -381,11 +381,14 @@ impl OverlayOrdering {
             let mut expired = Vec::new();
             for (seq, packet) in packets.iter_mut() {
                 let age = now.saturating_duration_since(packet.first_sent_at);
-                // Plain Reliable is an end-to-end contract. Keep retrying
-                // until an ACK arrives or membership observes a replacement
-                // boot epoch; transport/session timeouts are not delivery.
-                let retain_until_ack =
-                    level_from_wire(packet.data.service_level) == Some(ServiceLevel::Reliable);
+                // Both reliable service levels are an end-to-end contract.
+                // Keep retrying until an ACK arrives or membership observes a
+                // replacement boot epoch; transport/session timeouts are not
+                // delivery. Capacity admission remains bounded separately.
+                let retain_until_ack = matches!(
+                    level_from_wire(packet.data.service_level),
+                    Some(ServiceLevel::Reliable | ServiceLevel::ReliableLowLatency)
+                );
                 let expired_by_age = !retain_until_ack && age >= self.retry_max_age;
                 let expired_by_attempts =
                     !retain_until_ack && packet.retry_attempts >= self.retry_max_attempts;
@@ -746,6 +749,12 @@ mod tests {
         data
     }
 
+    fn best_effort_data(seq: u64, body: &'static [u8]) -> pb::OverlayData {
+        let mut data = data(seq, body);
+        data.service_level = 2;
+        data
+    }
+
     #[test]
     fn ordered_defaults_are_sensible() {
         let cfg = OverlayConfig::new(Vec::new());
@@ -862,7 +871,7 @@ mod tests {
             .with_ordered_retry_max_attempts(16);
         let ordering = OverlayOrdering::new(&cfg);
         ordering
-            .store_pending(lane(), reliable_low_latency_data(0, b"pending"))
+            .store_pending(lane(), best_effort_data(0, b"pending"))
             .await;
 
         let first_due = Instant::now() + Duration::from_millis(5);
@@ -893,7 +902,7 @@ mod tests {
             .with_ordered_retry_max_attempts(16);
         let ordering = OverlayOrdering::new(&cfg);
         ordering
-            .store_pending(lane(), reliable_low_latency_data(0, b"pending"))
+            .store_pending(lane(), best_effort_data(0, b"pending"))
             .await;
 
         assert!(
@@ -925,7 +934,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reliable_pending_ignores_retry_caps_until_ack_or_epoch_reset() {
+    async fn reliable_levels_ignore_retry_caps_until_ack_or_epoch_reset() {
         let cfg = OverlayConfig::new(Vec::new())
             .with_ordered_retry_initial(Duration::from_millis(1))
             .with_ordered_retry_max(Duration::from_millis(1))
@@ -933,20 +942,27 @@ mod tests {
             .with_ordered_retry_max_attempts(0);
         let ordering = OverlayOrdering::new(&cfg);
         ordering.store_pending(lane(), data(0, b"pending")).await;
+        ordering
+            .store_pending(lane_with(2), reliable_low_latency_data(0, b"pending"))
+            .await;
 
-        assert_eq!(
-            ordering
-                .due_retransmits(Instant::now() + Duration::from_secs(1))
-                .await
-                .len(),
-            1
-        );
+        let retransmits = ordering
+            .due_retransmits(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert_eq!(retransmits.len(), 2);
         assert_eq!(ordering.pending_range(1, lane(), 0, 0).await.len(), 1);
+        assert_eq!(ordering.pending_range(1, lane_with(2), 0, 0).await.len(), 1);
 
         // `reset_peer` is invoked only for MembershipEvent::Restarted, which
         // is the observed destination boot-epoch transition.
         ordering.reset_peer(1).await;
         assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
+        assert!(
+            ordering
+                .pending_range(1, lane_with(2), 0, 0)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

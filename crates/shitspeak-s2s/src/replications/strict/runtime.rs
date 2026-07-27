@@ -7,6 +7,7 @@
 //! [`OverlayStrictNet`], the test impl is in `test_support.rs`).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -59,7 +60,7 @@ use super::terminal_journal::{
     TerminalTransition,
 };
 use super::{HistoryMetadata, StrictCommitApplyOutcome, StrictLogMetadata, StrictReplicable};
-use crate::overlay::{MembershipEvent, OverlayNetwork, OverlaySendOptions};
+use crate::overlay::{LaneId, MembershipEvent, OverlayNetwork, OverlaySendOptions};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{MessageClass, OriginSignature, RoutingMetric, ServiceLevel};
 
@@ -85,6 +86,15 @@ pub(super) const STRICT_PROTOCOL_VERSION_V3: u32 =
 /// mandatory origin-proof material has separate certificate/signature bounds.
 pub(super) const STRICT_V3_CONTROL_MAX_ENCODED_BYTES: usize = 2 * 1024;
 const STRICT_REPLICATION_MESSAGE_CLASS: MessageClass = MessageClass::Regular;
+/// End-to-end ACKed lanes keep release/progress control independent from the
+/// operation-bearing pages it acknowledges. Route-diverse control copies use
+/// distinct ordering domains so loss of the primary cannot hold the alternate.
+const STRICT_CONTROL_LANE: LaneId =
+    LaneId::new(NonZeroU32::new(0x5354_5243).expect("strict replication lane id is non-zero"));
+const STRICT_CONTROL_ALTERNATE_LANE: LaneId =
+    LaneId::new(NonZeroU32::new(0x5354_5241).expect("strict alternate lane id is non-zero"));
+const STRICT_BULK_LANE: LaneId =
+    LaneId::new(NonZeroU32::new(0x5354_5242).expect("strict bulk lane id is non-zero"));
 const NORMAL_ACCEPT_BALLOT: u64 = 0;
 const OP_ID_BOOT_EPOCH_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
@@ -845,8 +855,9 @@ impl OverlayStrictNet {
         );
         let primary = self
             .overlay
-            .send_unicast_unordered_with_routing_metric_and_options(
+            .send_unicast_on_lane_with_routing_metric_and_options(
                 dst,
+                STRICT_CONTROL_LANE,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 RoutingMetric::ReliableCost,
@@ -877,8 +888,9 @@ impl OverlayStrictNet {
         // route redundancy rather than reporting one logical send.
         let alternate = self
             .overlay
-            .send_unicast_unordered_with_routing_metric_and_options(
+            .send_unicast_on_lane_with_routing_metric_and_options(
                 dst,
+                STRICT_CONTROL_ALTERNATE_LANE,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 RoutingMetric::ReliableCost,
@@ -957,8 +969,9 @@ impl OverlayStrictNet {
             };
             let result = self
                 .overlay
-                .send_unicast_unordered_with_routing_metric_and_options(
+                .send_unicast_on_lane_with_routing_metric_and_options(
                     dst,
+                    STRICT_BULK_LANE,
                     REPLICATION_SERVICE_TAG,
                     ServiceLevel::Reliable,
                     RoutingMetric::ReliableCost,
@@ -1216,8 +1229,9 @@ impl StrictNet for OverlayStrictNet {
         );
         let bytes = encoded?;
         self.overlay
-            .send_unicast_unordered_with_routing_metric_and_options(
+            .send_unicast_on_lane_with_routing_metric_and_options(
                 dst,
+                STRICT_CONTROL_LANE,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 RoutingMetric::ReliableCost,
@@ -1304,8 +1318,9 @@ impl StrictNet for OverlayStrictNet {
         );
         let bytes = encoded?;
         self.overlay
-            .send_multicast_unordered_with_routing_metric_and_options(
+            .send_multicast_on_lane_with_routing_metric_and_options(
                 dsts,
+                STRICT_CONTROL_LANE,
                 REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 RoutingMetric::ReliableCost,
@@ -12360,8 +12375,8 @@ mod tests {
     fn every_production_overlay_enqueue_uses_the_strict_transport_policy() {
         const SOURCE: &str = include_str!("runtime.rs");
         const ENQUEUE_METHODS: [&str; 2] = [
-            ".send_unicast_unordered_with_routing_metric_and_options(",
-            ".send_multicast_unordered_with_routing_metric_and_options(",
+            ".send_unicast_on_lane_with_routing_metric_and_options(",
+            ".send_multicast_on_lane_with_routing_metric_and_options(",
         ];
 
         let production = SOURCE
@@ -12399,6 +12414,16 @@ mod tests {
                 assert!(
                     invocation.contains("STRICT_REPLICATION_MESSAGE_CLASS"),
                     "strict overlay enqueue bypasses the shared Regular queue policy: {invocation}"
+                );
+                assert!(
+                    [
+                        "STRICT_CONTROL_LANE",
+                        "STRICT_CONTROL_ALTERNATE_LANE",
+                        "STRICT_BULK_LANE",
+                    ]
+                    .iter()
+                    .any(|lane| invocation.contains(lane)),
+                    "strict overlay enqueue bypasses end-to-end ACK retention: {invocation}"
                 );
                 assert!(
                     invocation.contains("strict_replication_transport_options("),
