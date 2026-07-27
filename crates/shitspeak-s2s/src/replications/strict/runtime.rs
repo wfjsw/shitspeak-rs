@@ -9048,10 +9048,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             return false;
         }
         let local = self.repo.history_metadata();
-        if tick.repository_version != local.version || tick.history_freshness == local.freshness {
+        if tick.repository_version != local.version || tick.history_freshness <= local.freshness {
             return false;
         }
-        self.state.lock().request_history_election();
+        {
+            let mut state = self.state.lock();
+            if state.history_election_blocks_steady_state() {
+                return false;
+            }
+            state.request_history_election();
+        }
         self.wake_clock_tick_loop();
         true
     }
@@ -17385,6 +17391,65 @@ mod tests {
         assert!(rt.clock_tick_needed());
     }
 
+    #[test]
+    fn repeated_clock_rank_divergence_does_not_restart_an_active_history_election() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        let metadata = rt.repo.history_metadata();
+        let tick = StrictClockTick {
+            src_node: 2,
+            repository_version: metadata.version,
+            history_freshness: metadata.freshness.saturating_add(1),
+            ..Default::default()
+        };
+
+        assert!(rt.request_history_election_for_clock_rank_divergence(2, 1, &tick));
+        rt.state.lock().begin_history_election([2]);
+        assert!(matches!(
+            rt.state.lock().history_election_phase,
+            HistoryElectionPhase::Probing { .. }
+        ));
+
+        assert!(
+            !rt.request_history_election_for_clock_rank_divergence(2, 1, &tick),
+            "an already-active election must suppress duplicate divergence wakeups"
+        );
+        assert!(matches!(
+            rt.state.lock().history_election_phase,
+            HistoryElectionPhase::Probing { .. }
+        ));
+
+        let newer_tick = StrictClockTick {
+            history_freshness: tick.history_freshness.saturating_add(1),
+            ..tick.clone()
+        };
+        assert!(
+            !rt.request_history_election_for_clock_rank_divergence(2, 1, &newer_tick),
+            "an active election must suppress divergence wakeups for every rank"
+        );
+        assert!(matches!(
+            rt.state.lock().history_election_phase,
+            HistoryElectionPhase::Probing { .. }
+        ));
+
+        rt.state.lock().finish_history_election();
+        let older_tick = StrictClockTick {
+            history_freshness: metadata.freshness.saturating_sub(1),
+            ..tick.clone()
+        };
+        assert!(
+            !rt.request_history_election_for_clock_rank_divergence(2, 1, &older_tick),
+            "a stale peer must not make the fresher replica request a pull election"
+        );
+        assert!(!rt.state.lock().history_election_blocks_steady_state());
+        assert!(
+            rt.request_history_election_for_clock_rank_divergence(2, 1, &tick),
+            "divergence must request another election after the active one finishes"
+        );
+    }
+
     #[tokio::test]
     async fn malformed_clock_source_cannot_acknowledge_or_probe_head_evidence() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
@@ -17632,9 +17697,9 @@ mod tests {
         let (rt, net, _repo) = v1_runtime(
             ReplicationConfig::default().with_strict_steady_state_catchup_interval(interval),
         );
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
         net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
         spawn_steady_state_catchup_loop(rt.clone());
         tokio::task::yield_now().await;
         net.drain_captures();
