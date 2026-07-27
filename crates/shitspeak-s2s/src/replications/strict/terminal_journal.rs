@@ -1148,15 +1148,15 @@ impl TerminalJournal {
             .and_then(TerminalJournalRecord::delivery_version)
     }
 
-    /// Install the S2S-owned delivery ledger paired with a replacement
-    /// repository snapshot. Terminal sync precedes history sync, so every
-    /// non-retired id must already have a local terminal record.
-    pub(crate) fn install_delivery_checkpoint(
+    /// Import delivery evidence from the legacy repository ledger without
+    /// disturbing delivery markers already owned by the terminal journal.
+    pub(crate) fn merge_legacy_delivery_checkpoint(
         &mut self,
         repository_version: u64,
         delivered: &BTreeMap<TerminalJournalOpId, u64>,
     ) -> Result<(), TerminalJournalError> {
         let mut candidate = self.records.clone();
+        let mut changed = false;
         for (op_id, record) in &mut candidate {
             if !matches!(
                 record.terminal_decision(),
@@ -1164,22 +1164,29 @@ impl TerminalJournal {
             ) {
                 continue;
             }
-            match delivered.get(op_id).copied() {
-                Some(version) if version <= repository_version => {
-                    record.delivery_version = Some(version);
-                    record.delivered = true;
-                }
-                Some(_) => {
-                    return Err(TerminalJournalError::ConflictingDeliveryVersion {
-                        op_id_hi: op_id.0,
-                        op_id_lo: op_id.1,
-                    });
-                }
-                None => {
-                    record.delivery_version = None;
-                    record.delivered = false;
-                }
+            let Some(version) = delivered.get(op_id).copied() else {
+                continue;
+            };
+            if version > repository_version {
+                return Err(TerminalJournalError::ConflictingDeliveryVersion {
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                });
             }
+            if record
+                .delivery_version()
+                .is_some_and(|existing| existing <= repository_version)
+            {
+                changed |= !record.is_delivered();
+                record.delivered = true;
+                continue;
+            }
+            record.delivery_version = Some(version);
+            record.delivered = true;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
         }
         let cut = self.terminal_cut();
         if let Some(store) = self.store.as_mut() {

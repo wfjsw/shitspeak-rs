@@ -58,6 +58,48 @@ fn delivery_intent_recovery_uses_the_durable_repository_version() {
 }
 
 #[test]
+fn legacy_delivery_migration_preserves_s2s_delivery_markers() {
+    let root = TempDir::new().unwrap();
+    let legacy = (0x0001_0000_0000_0011, 1);
+    let legacy_with_intent = (0x0001_0000_0000_0011, 2);
+    let s2s_owned = (0x0002_0000_0000_0022, 2);
+
+    {
+        let mut journal =
+            TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+        commit(&mut journal, legacy, 7);
+        commit(&mut journal, legacy_with_intent, 8);
+        assert_eq!(
+            journal.begin_delivery(legacy_with_intent, 8).unwrap(),
+            DeliveryDisposition::Apply
+        );
+        commit_and_finish(&mut journal, s2s_owned, 9);
+
+        journal
+            .merge_legacy_delivery_checkpoint(
+                10,
+                &BTreeMap::from([(legacy, 10), (legacy_with_intent, 10)]),
+            )
+            .unwrap();
+
+        assert_eq!(journal.delivery_version(legacy), Some(10));
+        assert_eq!(journal.delivery_version(legacy_with_intent), Some(8));
+        assert_eq!(journal.delivery_version(s2s_owned), Some(9));
+        assert!(journal.get(legacy).unwrap().is_delivered());
+        assert!(journal.get(legacy_with_intent).unwrap().is_delivered());
+        assert!(journal.get(s2s_owned).unwrap().is_delivered());
+    }
+
+    let reloaded = TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+    assert_eq!(reloaded.delivery_version(legacy), Some(10));
+    assert_eq!(reloaded.delivery_version(legacy_with_intent), Some(8));
+    assert_eq!(reloaded.delivery_version(s2s_owned), Some(9));
+    assert!(reloaded.get(legacy).unwrap().is_delivered());
+    assert!(reloaded.get(legacy_with_intent).unwrap().is_delivered());
+    assert!(reloaded.get(s2s_owned).unwrap().is_delivered());
+}
+
+#[test]
 fn checkpoint_refuses_to_trim_unresolved_records() {
     let mut journal = TerminalJournal::in_memory("channels");
     let applied = (0x0001_0000_0000_0022, 1);

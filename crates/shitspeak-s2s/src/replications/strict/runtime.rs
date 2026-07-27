@@ -3463,8 +3463,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .map(|op_id| (op_id, durable_repository_version))
             .collect::<BTreeMap<_, _>>();
         if !legacy_delivered.is_empty() {
-            if let Err(error) =
-                journal.install_delivery_checkpoint(durable_repository_version, &legacy_delivered)
+            if let Err(error) = journal
+                .merge_legacy_delivery_checkpoint(durable_repository_version, &legacy_delivered)
             {
                 error!(topic = %topic, error = %error, "strict legacy delivery ledger migration failed");
                 net.disable_strict_replication_protocol();
