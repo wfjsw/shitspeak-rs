@@ -5,6 +5,7 @@
 //! record and the resulting terminal cut in a SQLite transaction.
 
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     fs::{self, File, OpenOptions, TryLockError},
     io,
@@ -619,6 +620,17 @@ pub(crate) struct TerminalJournal {
     terminal_chain_digest: [u8; DIGEST_LEN],
     terminal_set_digest: [u8; DIGEST_LEN],
     generation_index: BTreeMap<u64, TerminalJournalOpId>,
+    terminal_set_digest_cache: RefCell<BTreeMap<u64, [u8; DIGEST_LEN]>>,
+}
+
+fn initial_terminal_set_digest_cache(
+    generation: u64,
+    digest: [u8; DIGEST_LEN],
+) -> RefCell<BTreeMap<u64, [u8; DIGEST_LEN]>> {
+    let empty_digest = compute_terminal_set_digest(&BTreeMap::new());
+    let mut cache = BTreeMap::from([(0, empty_digest)]);
+    cache.insert(generation, digest);
+    RefCell::new(cache)
 }
 
 impl TerminalJournal {
@@ -642,6 +654,10 @@ impl TerminalJournal {
                 terminal_chain_digest: EMPTY_CHAIN_DIGEST,
                 terminal_set_digest,
                 generation_index: BTreeMap::new(),
+                terminal_set_digest_cache: initial_terminal_set_digest_cache(
+                    0,
+                    terminal_set_digest,
+                ),
             });
         };
 
@@ -726,12 +742,17 @@ impl TerminalJournal {
             terminal_chain_digest: loaded.terminal_chain_digest,
             terminal_set_digest: loaded.terminal_set_digest,
             generation_index: loaded.generation_index,
+            terminal_set_digest_cache: initial_terminal_set_digest_cache(
+                loaded.terminal_decision_generation,
+                loaded.terminal_set_digest,
+            ),
         })
     }
 
     pub(crate) fn in_memory(_topic: impl Into<String>) -> Self {
         let journal_id = generate_journal_id()
             .expect("the system random generator must provide a terminal journal id");
+        let terminal_set_digest = compute_terminal_set_digest(&BTreeMap::new());
         Self {
             path: None,
             _lock_file: None,
@@ -740,8 +761,9 @@ impl TerminalJournal {
             journal_id,
             terminal_decision_generation: 0,
             terminal_chain_digest: EMPTY_CHAIN_DIGEST,
-            terminal_set_digest: compute_terminal_set_digest(&BTreeMap::new()),
+            terminal_set_digest,
             generation_index: BTreeMap::new(),
+            terminal_set_digest_cache: initial_terminal_set_digest_cache(0, terminal_set_digest),
         }
     }
 
@@ -806,11 +828,22 @@ impl TerminalJournal {
                 .and_then(|op_id| self.records.get(op_id))
                 .and_then(TerminalJournalRecord::terminal_chain_digest)?
         };
+        let terminal_set_digest = {
+            let cache = self.terminal_set_digest_cache.borrow();
+            cache.get(&generation).copied()
+        }
+        .unwrap_or_else(|| {
+            let digest = compute_terminal_set_digest_through(&self.records, generation);
+            self.terminal_set_digest_cache
+                .borrow_mut()
+                .insert(generation, digest);
+            digest
+        });
         Some(TerminalCut::new(
             self.journal_id,
             generation,
             chain_digest,
-            compute_terminal_set_digest_through(&self.records, generation),
+            terminal_set_digest,
         ))
     }
 
@@ -1313,23 +1346,74 @@ impl TerminalJournal {
                 .records
                 .get(&op_id)
                 .is_some_and(TerminalJournalRecord::is_terminal);
-        if became_terminal {
-            let generation = self
-                .terminal_decision_generation
-                .checked_add(1)
-                .ok_or(TerminalJournalError::DecisionGenerationExhausted);
-            let generation = match generation {
-                Ok(generation) => generation,
-                Err(error) => {
+        if !became_terminal && !had_terminal_decision {
+            let cut = self.terminal_cut();
+            if let Some(store) = self.store.as_mut() {
+                let record = self
+                    .records
+                    .get(&op_id)
+                    .expect("changed journal record remains present");
+                if let Err(error) = store.upsert_record(op_id, record, &cut) {
                     restore_record(&mut self.records, op_id, previous_record);
-                    return Err(error);
+                    return Err(error.into());
+                }
+            }
+            return Ok(true);
+        }
+
+        if became_terminal {
+            let generation = match self.terminal_decision_generation.checked_add(1) {
+                Some(generation) => generation,
+                None => {
+                    restore_record(&mut self.records, op_id, previous_record);
+                    return Err(TerminalJournalError::DecisionGenerationExhausted);
                 }
             };
-            self.records
-                .get_mut(&op_id)
-                .expect("changed journal record remains present")
-                .terminal_generation = Some(generation);
+            let chain_digest = {
+                let record = self
+                    .records
+                    .get_mut(&op_id)
+                    .expect("changed journal record remains present");
+                record.terminal_generation = Some(generation);
+                let chain_digest = terminal_chain_digest(
+                    self.journal_id,
+                    self.terminal_chain_digest,
+                    generation,
+                    canonical_terminal_decision_digest(op_id, record),
+                );
+                record.terminal_chain_digest = Some(chain_digest);
+                chain_digest
+            };
+            let terminal_set_digest = compute_terminal_set_digest(&self.records);
+            let cut = TerminalCut::new(
+                self.journal_id,
+                generation,
+                chain_digest,
+                terminal_set_digest,
+            );
+            if let Some(store) = self.store.as_mut() {
+                let record = self
+                    .records
+                    .get(&op_id)
+                    .expect("changed journal record remains present");
+                if let Err(error) = store.upsert_record(op_id, record, &cut) {
+                    restore_record(&mut self.records, op_id, previous_record);
+                    return Err(error.into());
+                }
+            }
+            self.terminal_decision_generation = generation;
+            self.terminal_chain_digest = chain_digest;
+            self.terminal_set_digest = terminal_set_digest;
+            self.generation_index.insert(generation, op_id);
+            self.terminal_set_digest_cache
+                .borrow_mut()
+                .insert(generation, terminal_set_digest);
+            return Ok(true);
         }
+
+        let changed_generation = previous_record
+            .as_ref()
+            .and_then(TerminalJournalRecord::terminal_generation);
         let derived = match derive_terminal_state(&mut self.records, self.journal_id) {
             Ok(derived) => derived,
             Err(reason) => {
@@ -1360,6 +1444,14 @@ impl TerminalJournal {
         self.terminal_chain_digest = derived.terminal_chain_digest;
         self.terminal_set_digest = derived.terminal_set_digest;
         self.generation_index = derived.generation_index;
+        if let Some(changed_generation) = changed_generation {
+            self.terminal_set_digest_cache
+                .borrow_mut()
+                .retain(|generation, _| *generation < changed_generation);
+        }
+        self.terminal_set_digest_cache
+            .borrow_mut()
+            .insert(self.terminal_decision_generation, self.terminal_set_digest);
         Ok(true)
     }
 }
@@ -1664,6 +1756,8 @@ fn derive_terminal_state(
     records: &mut BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
     journal_id: [u8; JOURNAL_ID_LEN],
 ) -> Result<DerivedTerminalState, &'static str> {
+    #[cfg(test)]
+    TERMINAL_STATE_DERIVATIONS.with(|count| count.set(count.get() + 1));
     let mut generation_index = BTreeMap::new();
     for (op_id, record) in records.iter() {
         if record.is_terminal() {
@@ -1730,6 +1824,8 @@ fn compute_terminal_set_digest_through(
     records: &BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
     through_generation: u64,
 ) -> [u8; DIGEST_LEN] {
+    #[cfg(test)]
+    TERMINAL_SET_DIGEST_DERIVATIONS.with(|count| count.set(count.get() + 1));
     let included = |record: &&TerminalJournalRecord| {
         record
             .terminal_generation()
@@ -1747,6 +1843,22 @@ fn compute_terminal_set_digest_through(
         image.extend_from_slice(&canonical_terminal_decision_digest(*op_id, record));
     }
     sha256(&image)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TERMINAL_STATE_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TERMINAL_SET_DIGEST_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_terminal_state_derivations() -> usize {
+    TERMINAL_STATE_DERIVATIONS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+fn take_terminal_set_digest_derivations() -> usize {
+    TERMINAL_SET_DIGEST_DERIVATIONS.with(|count| count.replace(0))
 }
 
 fn canonical_terminal_decision_digest(
@@ -2143,6 +2255,7 @@ mod tests {
 
     use super::{
         FrozenTarget, TerminalDecision, TerminalJournal, TerminalJournalError, TerminalResolver,
+        take_terminal_set_digest_derivations, take_terminal_state_derivations,
     };
 
     #[test]
@@ -2791,6 +2904,29 @@ mod tests {
         assert_eq!(page.entries().len(), 1);
         assert_eq!(page.entries()[0].generation(), 2);
         assert!(!page.has_more());
+    }
+
+    #[test]
+    fn nonterminal_mutation_does_not_rederive_terminal_cached_state() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        journal.upsert_abort_decision((1, 1), 1).unwrap();
+        take_terminal_state_derivations();
+        take_terminal_set_digest_derivations();
+
+        assert!(journal.upsert_promise((2, 2), 7).unwrap());
+        assert_eq!(take_terminal_state_derivations(), 0);
+        assert_eq!(take_terminal_set_digest_derivations(), 0);
+    }
+
+    #[test]
+    fn terminal_cut_at_uses_the_cached_set_digest() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        journal.upsert_abort_decision((1, 1), 1).unwrap();
+        journal.upsert_abort_decision((2, 2), 1).unwrap();
+        take_terminal_set_digest_derivations();
+
+        assert!(journal.terminal_cut_at(1).is_some());
+        assert_eq!(take_terminal_set_digest_derivations(), 0);
     }
 
     #[test]
