@@ -46,6 +46,34 @@ impl Default for V3RetryState {
 }
 
 impl V3RetryState {
+    /// Whether any correlated V3 transmission can still be retried with a
+    /// cut, cursor, or snapshot identity captured before a checkpoint.
+    pub(super) fn has_checkpoint_blocking_work(&self, now: Instant) -> bool {
+        self.requests
+            .values()
+            .any(|pending| pending.expires_at > now)
+            || self
+                .final_acks
+                .values()
+                .any(|pending| pending.expires_at > now)
+            || self
+                .history_requests
+                .values()
+                .any(|pending| pending.expires_at > now)
+            || self
+                .history_final_acks
+                .values()
+                .any(|pending| pending.expires_at > now)
+            || self
+                .clock_probes
+                .values()
+                .any(|pending| pending.expires_at > now)
+            || self
+                .history_probes
+                .values()
+                .any(|pending| pending.expires_at > now)
+    }
+
     pub(super) fn register_request(
         &mut self,
         peer: PeerIncarnation,
@@ -598,6 +626,27 @@ mod tests {
             assert!(delay >= Duration::from_millis(750));
             assert!(delay <= Duration::from_millis(1_250));
         }
+    }
+
+    #[test]
+    fn live_retry_blocks_checkpoint_but_expired_retry_does_not() {
+        let peer = PeerIncarnation::new(7, 70);
+        let mut state = V3RetryState::default();
+        let now = Instant::now();
+        state.register_request(
+            peer,
+            StrictTerminalSyncReq {
+                request_nonce: 1,
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            0,
+            0,
+        );
+
+        assert!(state.has_checkpoint_blocking_work(now));
+        assert!(!state.has_checkpoint_blocking_work(now + Duration::from_secs(31)));
     }
 
     #[test]

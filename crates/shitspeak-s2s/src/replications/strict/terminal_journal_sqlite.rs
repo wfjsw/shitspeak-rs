@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use super::terminal_journal::{TerminalCut, TerminalJournalOpId, TerminalJournalRecord};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 #[derive(Debug, Error)]
 pub(crate) enum SqliteTerminalJournalError {
     #[error("strict terminal journal SQLite failed at {path:?}: {source}")]
@@ -48,6 +48,9 @@ pub(crate) enum SqliteTerminalJournalError {
 pub(crate) struct LoadedSqliteTerminalJournal {
     records: BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
     cut: TerminalCut,
+    checkpoint_epoch: u64,
+    checkpoint_repository_version: u64,
+    retired_origins: BTreeMap<u64, u64>,
 }
 
 impl LoadedSqliteTerminalJournal {
@@ -56,8 +59,17 @@ impl LoadedSqliteTerminalJournal {
     ) -> (
         BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
         TerminalCut,
+        u64,
+        u64,
+        BTreeMap<u64, u64>,
     ) {
-        (self.records, self.cut)
+        (
+            self.records,
+            self.cut,
+            self.checkpoint_epoch,
+            self.checkpoint_repository_version,
+            self.retired_origins,
+        )
     }
 }
 
@@ -82,7 +94,8 @@ impl SqliteTerminalJournalStore {
     }
 
     fn open_inner(path: PathBuf, topic: String) -> Result<Self, SqliteTerminalJournalError> {
-        let connection = Connection::open(&path).map_err(|source| sqlite_error(&path, source))?;
+        let mut connection =
+            Connection::open(&path).map_err(|source| sqlite_error(&path, source))?;
         connection
             .busy_timeout(Duration::from_millis(250))
             .map_err(|source| sqlite_error(&path, source))?;
@@ -98,28 +111,14 @@ impl SqliteTerminalJournalStore {
         let version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| sqlite_error(&path, source))?;
-        if version != 0 && version != SCHEMA_VERSION {
-            return Err(SqliteTerminalJournalError::UnsupportedSchema { path, version });
+        match version {
+            0 => create_schema_v2(&path, &mut connection)?,
+            1 => migrate_schema_v1_to_v2(&path, &mut connection)?,
+            SCHEMA_VERSION => {}
+            version => {
+                return Err(SqliteTerminalJournalError::UnsupportedSchema { path, version });
+            }
         }
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS journal_metadata (
-                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                     topic TEXT NOT NULL,
-                     journal_id BLOB NOT NULL CHECK (length(journal_id) = 16),
-                     generation BLOB NOT NULL CHECK (length(generation) = 8),
-                     chain_digest BLOB NOT NULL CHECK (length(chain_digest) = 32),
-                     terminal_set_digest BLOB NOT NULL CHECK (length(terminal_set_digest) = 32)
-                 ) STRICT;
-                 CREATE TABLE IF NOT EXISTS journal_records (
-                     op_id_hi BLOB NOT NULL CHECK (length(op_id_hi) = 8),
-                     op_id_lo BLOB NOT NULL CHECK (length(op_id_lo) = 8),
-                     record BLOB NOT NULL,
-                     PRIMARY KEY (op_id_hi, op_id_lo)
-                 ) WITHOUT ROWID, STRICT;
-                 PRAGMA user_version = 1;",
-            )
-            .map_err(|source| sqlite_error(&path, source))?;
 
         Ok(Self {
             path,
@@ -159,6 +158,23 @@ impl SqliteTerminalJournalStore {
             .map_err(|source| sqlite_error(&self.path, source))?;
         let Some((topic, journal_id, generation, chain_digest, terminal_set_digest)) = metadata
         else {
+            let orphaned_rows = self
+                .connection
+                .query_row(
+                    "SELECT
+                         (SELECT count(*) FROM journal_records) +
+                         (SELECT count(*) FROM journal_checkpoint) +
+                         (SELECT count(*) FROM retired_origins)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            if orphaned_rows != 0 {
+                return Err(SqliteTerminalJournalError::InvalidData {
+                    path: self.path.clone(),
+                    reason: "journal rows exist without journal metadata",
+                });
+            }
             return Ok(None);
         };
         if topic != self.topic {
@@ -203,7 +219,73 @@ impl SqliteTerminalJournalStore {
                 rmp_serde::from_slice(&encoded).map_err(SqliteTerminalJournalError::Decode)?;
             records.insert(op_id, record);
         }
-        Ok(Some(LoadedSqliteTerminalJournal { records, cut }))
+        let checkpoint = self
+            .connection
+            .query_row(
+                "SELECT epoch, repository_version FROM journal_checkpoint WHERE singleton = 1",
+                [],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let has_checkpoint = checkpoint.is_some();
+        let (checkpoint_epoch, checkpoint_repository_version) = match checkpoint {
+            Some((epoch, version)) => (
+                decode_u64(&self.path, &epoch, "checkpoint epoch has invalid length")?,
+                decode_u64(
+                    &self.path,
+                    &version,
+                    "checkpoint repository version has invalid length",
+                )?,
+            ),
+            None => (0, 0),
+        };
+        let mut statement = self
+            .connection
+            .prepare("SELECT op_id_hi, max_counter FROM retired_origins ORDER BY op_id_hi")
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let mut retired_origins = BTreeMap::new();
+        for row in rows {
+            let (origin, counter) = row.map_err(|source| sqlite_error(&self.path, source))?;
+            retired_origins.insert(
+                decode_u64(&self.path, &origin, "retired origin has invalid length")?,
+                decode_u64(&self.path, &counter, "retired counter has invalid length")?,
+            );
+        }
+        if !retired_origins.is_empty() && !has_checkpoint {
+            return Err(SqliteTerminalJournalError::InvalidData {
+                path: self.path.clone(),
+                reason: "retired origins exist without checkpoint metadata",
+            });
+        }
+        if records.keys().any(|op_id| {
+            let node = op_id.0 >> 48;
+            let lower = node << 48;
+            let upper = lower | 0x0000_FFFF_FFFF_FFFF;
+            retired_origins
+                .range(lower..=upper)
+                .next_back()
+                .is_some_and(|(origin, counter)| {
+                    op_id.0 < *origin || (op_id.0 == *origin && op_id.1 <= *counter)
+                })
+        }) {
+            return Err(SqliteTerminalJournalError::InvalidData {
+                path: self.path.clone(),
+                reason: "retained journal record is covered by a retired origin",
+            });
+        }
+        Ok(Some(LoadedSqliteTerminalJournal {
+            records,
+            cut,
+            checkpoint_epoch,
+            checkpoint_repository_version,
+            retired_origins,
+        }))
     }
 
     /// Atomically upserts one record and the terminal cut produced by that
@@ -279,6 +361,122 @@ impl SqliteTerminalJournalStore {
             .commit()
             .map_err(|source| sqlite_error(&self.path, source))
     }
+
+    pub(crate) fn checkpoint(
+        &mut self,
+        epoch: u64,
+        repository_version: u64,
+        retired_origins: &BTreeMap<u64, u64>,
+        cut: &TerminalCut,
+    ) -> Result<(), SqliteTerminalJournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        transaction
+            .execute("DELETE FROM journal_records", [])
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        transaction
+            .execute("DELETE FROM retired_origins", [])
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        {
+            let mut statement = transaction
+                .prepare("INSERT INTO retired_origins (op_id_hi, max_counter) VALUES (?1, ?2)")
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            for (origin, counter) in retired_origins {
+                statement
+                    .execute(params![
+                        origin.to_be_bytes().as_slice(),
+                        counter.to_be_bytes().as_slice()
+                    ])
+                    .map_err(|source| sqlite_error(&self.path, source))?;
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO journal_checkpoint (singleton, epoch, repository_version)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(singleton) DO UPDATE SET
+                     epoch = excluded.epoch,
+                     repository_version = excluded.repository_version",
+                params![
+                    epoch.to_be_bytes().as_slice(),
+                    repository_version.to_be_bytes().as_slice()
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        write_metadata(&transaction, &self.topic, cut)
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
+}
+
+fn create_schema_v2(
+    path: &Path,
+    connection: &mut Connection,
+) -> Result<(), SqliteTerminalJournalError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| sqlite_error(path, source))?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE journal_metadata (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 topic TEXT NOT NULL,
+                 journal_id BLOB NOT NULL CHECK (length(journal_id) = 16),
+                 generation BLOB NOT NULL CHECK (length(generation) = 8),
+                 chain_digest BLOB NOT NULL CHECK (length(chain_digest) = 32),
+                 terminal_set_digest BLOB NOT NULL CHECK (length(terminal_set_digest) = 32)
+             ) STRICT;
+             CREATE TABLE journal_records (
+                 op_id_hi BLOB NOT NULL CHECK (length(op_id_hi) = 8),
+                 op_id_lo BLOB NOT NULL CHECK (length(op_id_lo) = 8),
+                 record BLOB NOT NULL,
+                 PRIMARY KEY (op_id_hi, op_id_lo)
+             ) WITHOUT ROWID, STRICT;
+             CREATE TABLE journal_checkpoint (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 epoch BLOB NOT NULL CHECK (length(epoch) = 8),
+                 repository_version BLOB NOT NULL CHECK (length(repository_version) = 8)
+             ) STRICT;
+             CREATE TABLE retired_origins (
+                 op_id_hi BLOB PRIMARY KEY CHECK (length(op_id_hi) = 8),
+                 max_counter BLOB NOT NULL CHECK (length(max_counter) = 8)
+             ) WITHOUT ROWID, STRICT;
+             PRAGMA user_version = 2;",
+        )
+        .map_err(|source| sqlite_error(path, source))?;
+    transaction
+        .commit()
+        .map_err(|source| sqlite_error(path, source))
+}
+
+fn migrate_schema_v1_to_v2(
+    path: &Path,
+    connection: &mut Connection,
+) -> Result<(), SqliteTerminalJournalError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| sqlite_error(path, source))?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS journal_checkpoint (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 epoch BLOB NOT NULL CHECK (length(epoch) = 8),
+                 repository_version BLOB NOT NULL CHECK (length(repository_version) = 8)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS retired_origins (
+                 op_id_hi BLOB PRIMARY KEY CHECK (length(op_id_hi) = 8),
+                 max_counter BLOB NOT NULL CHECK (length(max_counter) = 8)
+             ) WITHOUT ROWID, STRICT;
+             PRAGMA user_version = 2;",
+        )
+        .map_err(|source| sqlite_error(path, source))?;
+    transaction
+        .commit()
+        .map_err(|source| sqlite_error(path, source))
 }
 
 fn encode_records(
@@ -411,7 +609,7 @@ mod tests {
                 .unwrap();
         }
         let store = SqliteTerminalJournalStore::open(&path, "topic").unwrap();
-        let (records, cut) = store.load().unwrap().unwrap().into_parts();
+        let (records, cut, _, _, _) = store.load().unwrap().unwrap().into_parts();
         assert_eq!(records.get(&(u64::MAX, 42)), Some(&record));
         assert_eq!(cut, resulting);
     }
@@ -427,7 +625,7 @@ mod tests {
         ]);
         let mut store = SqliteTerminalJournalStore::open(&path, "topic").unwrap();
         store.replace_all(records.iter(), &cut).unwrap();
-        let (loaded, loaded_cut) = store.load().unwrap().unwrap().into_parts();
+        let (loaded, loaded_cut, _, _, _) = store.load().unwrap().unwrap().into_parts();
         assert_eq!(loaded, records);
         assert_eq!(loaded_cut, cut);
     }

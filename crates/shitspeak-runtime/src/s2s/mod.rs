@@ -3283,7 +3283,7 @@ impl ChannelReplicationAdapter {
         let applied_operation = op.clone();
         let outcome = match self
             .repo
-            .apply_strict_operation_once(op, strict_log_metadata_to_repo(metadata))
+            .apply_s2s_strict_operation(op, strict_log_metadata_to_repo(metadata))
             .await
         {
             Ok(outcome) => outcome,
@@ -3395,11 +3395,19 @@ impl StrictReplicable for ChannelReplicationAdapter {
         }
     }
 
+    fn legacy_applied_operation_ids(&self) -> Vec<(u64, u64)> {
+        self.repo
+            .strict_operation_ids_in_server(&self.server_id)
+            .into_iter()
+            .map(|id| (id.op_id_hi(), id.op_id_lo()))
+            .collect()
+    }
+
     fn snapshot(&self) -> Result<(u64, Bytes), s2s_replications::strict::StrictSnapshotError> {
         let repo = self.repo.clone();
         let server_id = self.server_id.clone();
         let strict_snapshot = block_in_place_or_current(|handle| {
-            handle.block_on(repo.strict_snapshot_in_server(&server_id))
+            handle.block_on(repo.s2s_snapshot_in_server(&server_id))
         })
         .ok_or_else(|| {
             s2s_replications::strict::StrictSnapshotError::new(
@@ -3410,6 +3418,8 @@ impl StrictReplicable for ChannelReplicationAdapter {
         let bytes = rmp_serde::to_vec(&ChannelSnapshot {
             channels,
             freshness,
+            // Frozen compatibility ledger for pre-v5 receivers. New applied
+            // operation ownership lives in the S2S checkpoint envelope.
             strict_operation_ids,
         })
         .map(Bytes::from)
@@ -3569,12 +3579,11 @@ impl StrictReplicable for ChannelReplicationAdapter {
             ))
         })?;
         self.repo
-            .install_s2s_snapshot_with_strict_operation_ids_in_server(
+            .install_s2s_checkpoint_snapshot_in_server(
                 &self.server_id,
                 version,
                 decoded.channels,
                 decoded.freshness,
-                decoded.strict_operation_ids,
             )
             .await
             .map_err(|error| {
@@ -3695,8 +3704,17 @@ impl StrictReplicable for BanReplicationAdapter {
         }
     }
 
+    fn legacy_applied_operation_ids(&self) -> Vec<(u64, u64)> {
+        self.repo
+            .strict_operation_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| (id.op_id_hi(), id.op_id_lo()))
+            .collect()
+    }
+
     fn snapshot(&self) -> Result<(u64, Bytes), s2s_replications::strict::StrictSnapshotError> {
-        let strict_snapshot = self.repo.strict_snapshot().map_err(|error| {
+        let strict_snapshot = self.repo.strict_snapshot_v5().map_err(|error| {
             let message = format!("s2s ban snapshot capture failed: {error}");
             if self.repo.strict_durability_failure_observed() {
                 s2s_replications::strict::StrictSnapshotError::durability_failure(message)
@@ -3708,6 +3726,7 @@ impl StrictReplicable for BanReplicationAdapter {
         let bytes = rmp_serde::to_vec(&BanSnapshot {
             entries,
             freshness,
+            // Frozen compatibility ledger for pre-v5 snapshot decoders.
             strict_operation_ids,
         })
         .map(Bytes::from)
@@ -3784,7 +3803,7 @@ impl StrictReplicable for BanReplicationAdapter {
         op.version = version;
         match self
             .repo
-            .apply_strict_operation_once(Arc::new(op), strict_log_metadata_to_repo(metadata))
+            .apply_strict_operation_v5(Arc::new(op), strict_log_metadata_to_repo(metadata))
             .await
         {
             Ok(StrictOperationApplyOutcome::Applied) => {
@@ -3818,12 +3837,7 @@ impl StrictReplicable for BanReplicationAdapter {
             ))
         })?;
         self.repo
-            .install_s2s_snapshot_with_strict_operation_ids(
-                version,
-                decoded.entries,
-                decoded.freshness,
-                decoded.strict_operation_ids,
-            )
+            .install_s2s_snapshot_v5(version, decoded.entries, decoded.freshness)
             .await
             .map_err(|error| {
                 let message = format!("s2s ban snapshot install failed: {error}");
@@ -4612,8 +4626,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_production_adapters_reject_equal_version_snapshots_missing_local_operation_ids()
-    {
+    async fn v5_snapshot_adapters_preserve_legacy_repository_ledgers() {
         let channels = test_channel_repo(1);
         let channel_adapter = ChannelReplicationAdapter::new(
             DEFAULT_SERVER_ID.to_owned(),
@@ -4644,17 +4657,12 @@ mod tests {
             strict_operation_ids: vec![StrictOperationId::new(903, 904)],
         })
         .expect("encode channel snapshot");
-        assert!(
-            channel_adapter
-                .install_snapshot(1, Bytes::from(channel_snapshot))
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            channels.get_channel(70).await.unwrap().name,
-            "strict-snapshot"
-        );
-        assert!(channels.get_channel(71).await.is_none());
+        channel_adapter
+            .install_snapshot(1, Bytes::from(channel_snapshot))
+            .await
+            .unwrap();
+        assert!(channels.get_channel(70).await.is_none());
+        assert_eq!(channels.get_channel(71).await.unwrap().name, "replacement");
         assert_eq!(
             channels.strict_operation_ids(),
             vec![StrictOperationId::new(901, 902)]
@@ -4687,17 +4695,15 @@ mod tests {
             strict_operation_ids: vec![StrictOperationId::new(907, 908)],
         })
         .expect("encode ban snapshot");
-        assert!(
-            ban_adapter
-                .install_snapshot(1, Bytes::from(ban_snapshot))
-                .await
-                .is_err()
-        );
+        ban_adapter
+            .install_snapshot(1, Bytes::from(ban_snapshot))
+            .await
+            .unwrap();
         let active_bans = bans.get_active_bans().await;
         assert_eq!(active_bans.len(), 1);
         assert_eq!(
             active_bans[0].address,
-            "203.0.113.90".parse::<std::net::IpAddr>().unwrap()
+            "203.0.113.91".parse::<std::net::IpAddr>().unwrap()
         );
         assert_eq!(
             bans.strict_operation_ids().unwrap(),
@@ -4884,7 +4890,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn channel_strict_snapshot_transfer_survives_restart_and_suppresses_replay() {
+    async fn channel_v5_snapshot_transfer_survives_restart_without_repository_ledger_growth() {
         let source_dir = tempfile::tempdir().expect("source tempdir");
         let source_repo = ChannelRepository::open(
             1,
@@ -4907,12 +4913,16 @@ mod tests {
 
         assert_eq!(
             source
-                .apply_committed_once(1, op.clone(), strict_log_metadata(71, 72, 73))
+                .apply_committed_once(1, op, strict_log_metadata(71, 72, 73))
                 .await,
             s2s_replications::strict::StrictCommitApplyOutcome::Applied
         );
-        let (version, bytes) = source.snapshot().expect("channel snapshot captures ledger");
+        assert!(source_repo.strict_operation_ids().is_empty());
+        let (version, bytes) = source.snapshot().expect("capture channel snapshot");
         assert_eq!(version, 1);
+        let decoded: ChannelSnapshot =
+            rmp_serde::from_slice(&bytes).expect("decode channel snapshot");
+        assert!(decoded.strict_operation_ids.is_empty());
 
         let sink_dir = tempfile::tempdir().expect("sink tempdir");
         {
@@ -4952,13 +4962,17 @@ mod tests {
             Arc::clone(&recovered_repo),
             None,
         );
+        assert_eq!(recovered_repo.current_version(), version);
+        assert!(recovered_repo.strict_operation_ids().is_empty());
+        let next = strict_channel_create_op(72);
         assert_eq!(
             recovered
-                .apply_committed_once(2, op, strict_log_metadata(71, 72, 73))
+                .apply_committed_once(2, next, strict_log_metadata(74, 75, 76))
                 .await,
-            s2s_replications::strict::StrictCommitApplyOutcome::AlreadyApplied
+            s2s_replications::strict::StrictCommitApplyOutcome::Applied
         );
-        assert_eq!(recovered_repo.current_version(), version);
+        assert_eq!(recovered_repo.current_version(), 2);
+        assert!(recovered_repo.strict_operation_ids().is_empty());
         assert_eq!(
             recovered_repo
                 .get_channel(71)
@@ -4970,7 +4984,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ban_strict_snapshot_transfer_survives_restart_and_suppresses_replay() {
+    async fn ban_v5_snapshot_transfer_survives_restart_without_repository_ledger_growth() {
         let source_dir = tempfile::tempdir().expect("source tempdir");
         let source_repo = BanRepository::open(1, source_dir.path())
             .await
@@ -4988,8 +5002,11 @@ mod tests {
                 .await,
             s2s_replications::strict::StrictCommitApplyOutcome::Applied
         );
-        let (version, bytes) = source.snapshot().expect("ban snapshot captures ledger");
+        assert!(source_repo.strict_operation_ids().unwrap().is_empty());
+        let (version, bytes) = source.snapshot().expect("capture ban snapshot");
         assert_eq!(version, 1);
+        let decoded: BanSnapshot = rmp_serde::from_slice(&bytes).expect("decode ban snapshot");
+        assert!(decoded.strict_operation_ids.is_empty());
 
         let sink_dir = tempfile::tempdir().expect("sink tempdir");
         {
@@ -5011,14 +5028,20 @@ mod tests {
             .await
             .expect("reopen sink ban repo");
         let recovered = BanReplicationAdapter::new(Arc::clone(&recovered_repo));
-        assert_eq!(
-            recovered
-                .apply_committed_once(2, op, strict_log_metadata(81, 82, 83))
-                .await,
-            s2s_replications::strict::StrictCommitApplyOutcome::AlreadyApplied
-        );
         assert_eq!(recovered_repo.current_version(), version);
         assert_eq!(recovered_repo.get_active_bans().await.len(), 1);
+        assert!(recovered_repo.strict_operation_ids().unwrap().is_empty());
+
+        let next = strict_ban_add_op("203.0.113.72");
+        assert_eq!(
+            recovered
+                .apply_committed_once(2, next, strict_log_metadata(84, 85, 86))
+                .await,
+            s2s_replications::strict::StrictCommitApplyOutcome::Applied
+        );
+        assert_eq!(recovered_repo.current_version(), 2);
+        assert_eq!(recovered_repo.get_active_bans().await.len(), 2);
+        assert!(recovered_repo.strict_operation_ids().unwrap().is_empty());
     }
 
     async fn make_published_web_client(

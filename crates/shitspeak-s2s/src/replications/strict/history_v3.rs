@@ -151,6 +151,7 @@ mod tests {
         ));
         assert!(state.cache_server_response(peer, &request, StrictCatchupResp::default()));
         assert!(state.has_server_transfer(peer));
+        assert!(state.has_checkpoint_blocking_work(Instant::now()));
 
         let final_ack = StrictHistoryTransferReq {
             transfer_id: request.transfer_id,
@@ -162,6 +163,7 @@ mod tests {
         assert!(state.acknowledge_server_final(peer, &final_ack));
         assert!(!state.has_server_transfer(peer));
         assert!(!state.has_any_transfer(peer));
+        assert!(!state.has_checkpoint_blocking_work(Instant::now()));
     }
 
     #[test]
@@ -313,6 +315,16 @@ fn reason_priority(reason: StrictCatchupReason) -> u8 {
 }
 
 impl HistoryV3State {
+    /// Whether a repository transfer still owns a fixed cursor/image whose
+    /// accompanying terminal lineage must not be rotated underneath it.
+    pub(super) fn has_checkpoint_blocking_work(&self, now: Instant) -> bool {
+        self.clients.values().any(|client| client.expires_at > now)
+            || self
+                .server_pages
+                .values()
+                .any(|page| !page.acknowledged && page.expires_at > now)
+    }
+
     fn next_id(&mut self) -> u64 {
         let id = self.next_id.max(1);
         self.next_id = id.wrapping_add(1).max(1);

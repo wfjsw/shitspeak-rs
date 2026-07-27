@@ -21,8 +21,10 @@ pub(crate) const STRICT_PROTOCOL_VERSION_V2: u32 = 2;
 pub(crate) const STRICT_PROTOCOL_VERSION_V3: u32 = 3;
 /// Explicit incarnation-bound durable repository-head acknowledgement.
 pub(crate) const STRICT_PROTOCOL_VERSION_V4: u32 = 4;
+/// Replication-owned delivery checkpoints and bounded terminal-journal epochs.
+pub(crate) const STRICT_PROTOCOL_VERSION_V5: u32 = 5;
 /// Maximum strict participant capability advertised by this binary.
-pub(crate) const STRICT_PROTOCOL_VERSION_CURRENT: u32 = STRICT_PROTOCOL_VERSION_V4;
+pub(crate) const STRICT_PROTOCOL_VERSION_CURRENT: u32 = STRICT_PROTOCOL_VERSION_V5;
 
 /// Replication service participation advertised by one upper-layer endpoint.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -333,7 +335,8 @@ mod tests {
         assert_eq!(STRICT_PROTOCOL_VERSION_V2, 2);
         assert_eq!(STRICT_PROTOCOL_VERSION_V3, 3);
         assert_eq!(STRICT_PROTOCOL_VERSION_V4, 4);
-        assert_eq!(STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V4);
+        assert_eq!(STRICT_PROTOCOL_VERSION_V5, 5);
+        assert_eq!(STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V5);
     }
 
     #[test]

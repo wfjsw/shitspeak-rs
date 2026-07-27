@@ -442,6 +442,17 @@ impl Default for SyncV3State {
 }
 
 impl SyncV3State {
+    /// Whether rotating the local terminal-journal lineage could invalidate
+    /// correlated terminal work that still names the current lineage.
+    pub(super) fn has_checkpoint_blocking_work(&self) -> bool {
+        self.sessions.values().any(|session| !session.is_idle())
+            || !self.clients.is_empty()
+            || !self.finalizing_clients.is_empty()
+            || !self.responders.is_empty()
+            || !self.deferred_clients.is_empty()
+            || !self.expired_deferred_clients.is_empty()
+    }
+
     /// Commit one pure session transition and return the I/O work it selected.
     ///
     /// A stale incarnation is ignored before a state entry can be created. A

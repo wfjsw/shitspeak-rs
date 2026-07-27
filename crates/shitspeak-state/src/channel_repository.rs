@@ -350,13 +350,27 @@ struct ChannelWalRecord {
     op: ChannelOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     strict_metadata: Option<StrictReplicationMetadata>,
+    /// New strict replication owns delivery deduplication in its terminal
+    /// journal. Keep the metadata for catchup, but do not rebuild the legacy
+    /// repository op-id ledger from these records during startup.
+    #[serde(default, skip_serializing_if = "is_false")]
+    strict_id_owned_by_s2s: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ChannelWalRecord {
-    fn new(op: &ChannelOperation, strict_metadata: Option<StrictReplicationMetadata>) -> Self {
+    fn new(
+        op: &ChannelOperation,
+        strict_metadata: Option<StrictReplicationMetadata>,
+        strict_id_owned_by_s2s: bool,
+    ) -> Self {
         Self {
             op: op.clone(),
             strict_metadata,
+            strict_id_owned_by_s2s,
         }
     }
 }
@@ -1325,7 +1339,7 @@ impl ChannelRepository {
             };
             let op = record.op;
             let strict_metadata = record.strict_metadata;
-            if let Some(metadata) = strict_metadata {
+            if let Some(metadata) = strict_metadata.filter(|_| !record.strict_id_owned_by_s2s) {
                 strict_applied_ops.insert(StrictOperationKey::new(&op.server_id, metadata));
             }
             wal_entry_count += 1;
@@ -1495,6 +1509,40 @@ impl ChannelRepository {
             .unwrap_or(0);
         let operation_ids = self.strict_operation_ids_in_server(server_id);
 
+        ChannelStrictSnapshot {
+            version,
+            channels,
+            freshness,
+            operation_ids,
+        }
+    }
+
+    /// Capture an atomic S2S repository snapshot. The frozen legacy ledger is
+    /// included only for rolling compatibility with pre-v5 receivers; new v5
+    /// applications no longer add entries to it.
+    pub async fn s2s_snapshot_in_server(&self, server_id: &str) -> ChannelStrictSnapshot {
+        let _write_transaction = self.strict_apply_lock.lock().await;
+        let root_config = self.root_config.read().clone();
+        let all_channels = self.channels.read();
+        let channels = all_channels
+            .get(server_id)
+            .map(|channels| {
+                self.ordered_channel_view_in_server(server_id, channels)
+                    .as_ref()
+                    .iter()
+                    .map(|channel| channel.as_ref().clone())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![root_channel(&root_config)]);
+        let version = self.versions.read().get(server_id).copied().unwrap_or(0);
+        let freshness = self
+            .history_freshness
+            .read()
+            .get(server_id)
+            .copied()
+            .unwrap_or(0);
+
+        let operation_ids = self.strict_operation_ids_in_server(server_id);
         ChannelStrictSnapshot {
             version,
             channels,
@@ -3602,7 +3650,8 @@ impl ChannelRepository {
         }
 
         let op = self.prepare_strict_operation_for_wal(op);
-        self.append_wal_record(&op, Some(strict_metadata)).await?;
+        self.append_wal_record(&op, Some(strict_metadata), false)
+            .await?;
         let committed = self
             .apply_committed_operation_inner(
                 op,
@@ -3612,6 +3661,31 @@ impl ChannelRepository {
             )
             .await?;
         Ok((StrictOperationApplyOutcome::Applied, committed))
+    }
+
+    /// Apply an S2S strict operation with durable WAL metadata. The strict
+    /// replication terminal journal has already performed exact operation-id
+    /// deduplication, so this path neither reads nor grows the legacy
+    /// repository-owned operation-id ledger.
+    pub async fn apply_s2s_strict_operation(
+        self: &Arc<Self>,
+        mut op: ChannelOperation,
+        strict_metadata: StrictReplicationMetadata,
+    ) -> Result<StrictOperationApplyOutcome, ChannelRepoError> {
+        if op.server_id.is_empty() {
+            op.server_id = default_server_id();
+        }
+        let _strict_apply_guard = self.strict_apply_lock.lock().await;
+        if op.version <= self.current_version_in_server(&op.server_id) {
+            return Ok(StrictOperationApplyOutcome::VersionConflict);
+        }
+
+        let op = self.prepare_strict_operation_for_wal(op);
+        self.append_wal_record(&op, Some(strict_metadata), true)
+            .await?;
+        self.apply_committed_operation_inner(op, Some(strict_metadata), None, true)
+            .await?;
+        Ok(StrictOperationApplyOutcome::Applied)
     }
 
     async fn apply_committed_operation_inner(
@@ -3815,6 +3889,47 @@ impl ChannelRepository {
         freshness: i64,
         strict_operation_ids: Vec<StrictOperationId>,
     ) -> Result<(), ChannelRepoError> {
+        self.install_s2s_snapshot_candidate_in_server(
+            server_id,
+            version,
+            channels_snapshot,
+            freshness,
+            strict_operation_ids,
+            true,
+        )
+        .await
+    }
+
+    /// Install repository state paired with an S2S-owned delivery checkpoint.
+    /// The existing legacy ledger is preserved on disk but is neither
+    /// consulted nor expanded by this path.
+    pub async fn install_s2s_checkpoint_snapshot_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        version: u64,
+        channels_snapshot: Vec<Channel>,
+        freshness: i64,
+    ) -> Result<(), ChannelRepoError> {
+        self.install_s2s_snapshot_candidate_in_server(
+            server_id,
+            version,
+            channels_snapshot,
+            freshness,
+            Vec::new(),
+            false,
+        )
+        .await
+    }
+
+    async fn install_s2s_snapshot_candidate_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        version: u64,
+        channels_snapshot: Vec<Channel>,
+        freshness: i64,
+        strict_operation_ids: Vec<StrictOperationId>,
+        require_legacy_id_superset: bool,
+    ) -> Result<(), ChannelRepoError> {
         let _strict_apply_guard = self.strict_apply_lock.lock().await;
         let current_version = self.current_version_in_server(server_id);
         if version < current_version {
@@ -3826,20 +3941,22 @@ impl ChannelRepository {
             );
             return Ok(());
         }
-        let incoming_operation_ids: HashSet<_> = strict_operation_ids.iter().cloned().collect();
-        let missing_operation_ids = self
-            .strict_applied_ops
-            .read()
-            .iter()
-            .filter(|operation| {
-                operation.server_id == server_id
-                    && !incoming_operation_ids.contains(&operation.operation_id)
-            })
-            .count();
-        if missing_operation_ids != 0 {
-            return Err(ChannelRepoError::StrictSnapshotOperationIdsIncomplete {
-                missing: missing_operation_ids,
-            });
+        if require_legacy_id_superset {
+            let incoming_operation_ids: HashSet<_> = strict_operation_ids.iter().cloned().collect();
+            let missing_operation_ids = self
+                .strict_applied_ops
+                .read()
+                .iter()
+                .filter(|operation| {
+                    operation.server_id == server_id
+                        && !incoming_operation_ids.contains(&operation.operation_id)
+                })
+                .count();
+            if missing_operation_ids != 0 {
+                return Err(ChannelRepoError::StrictSnapshotOperationIdsIncomplete {
+                    missing: missing_operation_ids,
+                });
+            }
         }
         self.persist_s2s_snapshot_candidate(
             server_id,
@@ -4185,6 +4302,7 @@ impl ChannelRepository {
         &self,
         op: &ChannelOperation,
         strict_metadata: Option<StrictReplicationMetadata>,
+        strict_id_owned_by_s2s: bool,
     ) -> Result<(), ChannelRepoError> {
         let Some(wal_mutex) = self.wal_file.as_ref() else {
             return Ok(());
@@ -4196,7 +4314,7 @@ impl ChannelRepository {
             )));
         }
 
-        let record = ChannelWalRecord::new(op, strict_metadata);
+        let record = ChannelWalRecord::new(op, strict_metadata, strict_id_owned_by_s2s);
         let mut line =
             serde_json::to_string(&record).map_err(|e| ChannelRepoError::WalCorrupt {
                 line: 0,
@@ -4300,7 +4418,7 @@ impl ChannelRepository {
             .or_insert(op.timestamp);
 
         if !wal_already_persisted {
-            self.append_wal_record(&op, strict_metadata).await?;
+            self.append_wal_record(&op, strict_metadata, false).await?;
         }
 
         // The WAL has been synced (or this repository is explicitly
@@ -7601,6 +7719,87 @@ mod tests {
                 .any(|channel| channel.id == 9 && channel.name == "strict")
         );
         assert_eq!(snapshot.operation_ids(), &[StrictOperationId::new(31, 32)]);
+    }
+
+    #[tokio::test]
+    async fn s2s_snapshot_preserves_the_frozen_legacy_compatibility_ledger() {
+        let repo = repo();
+        let op = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 1,
+            node_id: 1,
+            timestamp: 456,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(9, "strict", 0, 0, Some(0)),
+            },
+        };
+        repo.apply_strict_operation_once(op, StrictReplicationMetadata::new(31, 32, 33))
+            .await
+            .unwrap();
+
+        let snapshot = repo.s2s_snapshot_in_server(DEFAULT_SERVER_ID).await;
+        assert_eq!(snapshot.version(), 1);
+        assert_eq!(snapshot.operation_ids(), &[StrictOperationId::new(31, 32)]);
+        assert_eq!(
+            repo.strict_operation_ids(),
+            vec![StrictOperationId::new(31, 32)]
+        );
+    }
+
+    #[tokio::test]
+    async fn s2s_strict_apply_does_not_grow_legacy_ledger_even_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+                .await
+                .unwrap();
+            let op = ChannelOperation {
+                server_id: DEFAULT_SERVER_ID.to_owned(),
+                version: 1,
+                node_id: 1,
+                timestamp: 456,
+                emits_client_message: true,
+                op: ChannelOp::CreateChannel {
+                    channel: Channel::new(9, "strict", 0, 0, Some(0)),
+                },
+            };
+            assert_eq!(
+                repo.apply_s2s_strict_operation(op, StrictReplicationMetadata::new(31, 32, 33),)
+                    .await
+                    .unwrap(),
+                StrictOperationApplyOutcome::Applied
+            );
+            assert!(repo.strict_operation_ids().is_empty());
+        }
+
+        let reopened = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        assert_eq!(reopened.current_version(), 1);
+        assert_eq!(reopened.get_channel(9).await.unwrap().name, "strict");
+        assert!(reopened.strict_operation_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn s2s_checkpoint_snapshot_preserves_but_does_not_require_legacy_ledger() {
+        let repo = repo();
+        let legacy_operation_id = StrictOperationId::new(31, 32);
+        repo.merge_strict_operation_ids(vec![legacy_operation_id.clone()])
+            .await
+            .unwrap();
+
+        repo.install_s2s_checkpoint_snapshot_in_server(
+            DEFAULT_SERVER_ID,
+            1,
+            vec![Channel::new(9, "replacement", 0, 0, Some(0))],
+            456,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(repo.get_channel(9).await.unwrap().name, "replacement");
+        assert_eq!(repo.strict_operation_ids(), vec![legacy_operation_id]);
     }
 
     #[tokio::test]

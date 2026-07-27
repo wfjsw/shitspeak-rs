@@ -1183,6 +1183,7 @@ fn active_terminal_responder_allows_one_bounded_clock_probe() {
         peer,
         ResponderSession::new(9, None, target, StrictTerminalPageKind::Checkpoint, 10, ttl),
     );
+    assert!(state.has_checkpoint_blocking_work());
 
     assert!(
         state
@@ -1218,6 +1219,7 @@ fn active_terminal_client_allows_one_bounded_clock_probe() {
             .begin_client(peer, StrictCatchupReason::TerminalFence as i32, ttl)
             .is_some()
     );
+    assert!(state.has_checkpoint_blocking_work());
     assert!(state.record_clock_nonce(peer, ttl).is_some());
     for _ in 0..100 {
         assert!(

@@ -17,6 +17,8 @@ pub(crate) mod terminal_journal;
 pub(crate) mod terminal_journal_sqlite;
 
 #[cfg(test)]
+mod checkpoint_design_tests;
+#[cfg(test)]
 mod sync_v3_tests;
 #[cfg(test)]
 mod terminal_journal_sqlite_tests;
@@ -160,6 +162,12 @@ pub trait StrictReplicable: Send + Sync + 'static {
     /// into that contract.
     fn strict_replication_protocol_version(&self) -> u32 {
         0
+    }
+
+    /// Legacy repository-owned operation ids used once while upgrading the
+    /// delivery ledger into durable S2S journal records.
+    fn legacy_applied_operation_ids(&self) -> Vec<(u64, u64)> {
+        Vec::new()
     }
 
     /// Latest applied version.

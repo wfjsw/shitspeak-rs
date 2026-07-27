@@ -57,9 +57,9 @@ use super::sync_v3::{
     cut_to_wire, source_cut_covers,
 };
 use super::terminal_journal::{
-    FrozenTarget, TerminalCut, TerminalDecision as JournalTerminalDecision, TerminalJournal,
-    TerminalJournalError, TerminalJournalRecord, TerminalJournalSnapshotEntry, TerminalResolver,
-    TerminalTransition,
+    DeliveryDisposition, FrozenTarget, TerminalCut, TerminalDecision as JournalTerminalDecision,
+    TerminalJournal, TerminalJournalError, TerminalJournalRecord, TerminalJournalSnapshotEntry,
+    TerminalResolver, TerminalTransition,
 };
 use super::{HistoryMetadata, StrictCommitApplyOutcome, StrictLogMetadata, StrictReplicable};
 use crate::overlay::{LaneId, MembershipEvent, OverlayNetwork, OverlaySendOptions};
@@ -78,6 +78,7 @@ const CLOCK_TICK_ACTIVE_BURST_TICKS: usize = 3;
 const CLOCK_TICK_BURST_COOLDOWN_MULTIPLIER: u32 = 4;
 pub(super) const STRICT_REPLICATION_SLOW_STAGE: Duration = Duration::from_secs(1);
 const STRICT_DELIVERY_BLOCKED_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const STRICT_TERMINAL_CHECKPOINT_RECORDS: usize = 4096;
 const STRICT_PROTOCOL_VERSION_V1: u32 = 1;
 pub(super) const STRICT_PROTOCOL_VERSION_V2: u32 =
     super::super::protocol::STRICT_PROTOCOL_VERSION_V2;
@@ -85,6 +86,8 @@ pub(super) const STRICT_PROTOCOL_VERSION_V3: u32 =
     super::super::protocol::STRICT_PROTOCOL_VERSION_V3;
 pub(super) const STRICT_PROTOCOL_VERSION_V4: u32 =
     super::super::protocol::STRICT_PROTOCOL_VERSION_V4;
+pub(super) const STRICT_PROTOCOL_VERSION_V5: u32 =
+    super::super::protocol::STRICT_PROTOCOL_VERSION_V5;
 /// Hard ceiling for pairwise-v3 metadata carried on the redundant regular
 /// control path. This bounds the strict envelope and nested protobuf body;
 /// mandatory origin-proof material has separate certificate/signature bounds.
@@ -1860,6 +1863,11 @@ pub(crate) struct StrictState {
     /// with the original `ts_final` even after the commit_buffer entry
     /// has been drained.
     pub committed_ts_final: HashMap<OpId, u64>,
+    /// Durable S2S-owned repository delivery slots mirrored from the terminal
+    /// journal for snapshot capture without blocking on SQLite.
+    pub(super) applied_operations: HashMap<OpId, u64>,
+    /// Per-origin counter floors retired by a repository-paired checkpoint.
+    pub(super) retired_operations: BTreeMap<u64, u64>,
     /// True when startup or partition-heal convergence still needs election.
     history_election_requested: bool,
     history_election_phase: HistoryElectionPhase,
@@ -1942,6 +1950,8 @@ impl StrictState {
             terminal_decision_identities: HashMap::new(),
             committed_ids: HashSet::new(),
             committed_ts_final: HashMap::new(),
+            applied_operations: HashMap::new(),
+            retired_operations: BTreeMap::new(),
             history_election_requested: true,
             history_election_phase: HistoryElectionPhase::Idle,
             history_alive_peers: HashSet::new(),
@@ -3207,26 +3217,223 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// independent per-peer allowance.
     pub(super) snapshot_receivers: Mutex<HashMap<NodeIdentifier, SnapshotReceiveTransfer>>,
     pub(super) snapshot_transfer_counter: AtomicU64,
+    snapshot_captures_in_progress: AtomicU64,
+    checkpoint_in_progress: AtomicBool,
     terminal_protocol_storage_healthy: AtomicBool,
+    terminal_checkpoint_requires_v5: AtomicBool,
+}
+
+pub(super) struct SnapshotCaptureGuard<'a> {
+    captures: &'a AtomicU64,
+}
+
+impl Drop for SnapshotCaptureGuard<'_> {
+    fn drop(&mut self) {
+        self.captures.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct CheckpointBarrierGuard<'a> {
+    active: &'a AtomicBool,
+}
+
+impl Drop for CheckpointBarrierGuard<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 impl<R: StrictReplicable> StrictRuntime<R> {
-    async fn with_terminal_journal_mutation<T, F>(&self, operation: F) -> T
+    pub(super) fn begin_snapshot_capture(&self) -> Option<SnapshotCaptureGuard<'_>> {
+        if self.checkpoint_in_progress.load(Ordering::Acquire) {
+            return None;
+        }
+        self.snapshot_captures_in_progress
+            .fetch_add(1, Ordering::AcqRel);
+        if self.checkpoint_in_progress.load(Ordering::Acquire) {
+            self.snapshot_captures_in_progress
+                .fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(SnapshotCaptureGuard {
+            captures: &self.snapshot_captures_in_progress,
+        })
+    }
+
+    pub(super) async fn with_terminal_journal_mutation<T, F>(&self, operation: F) -> T
     where
         T: Send + 'static,
         F: FnOnce(&mut TerminalJournal) -> T + Send + 'static,
     {
         if !self.terminal_journal_durable {
             let mut journal = self.terminal_journal.lock().await;
-            return operation(&mut journal);
+            let result = operation(&mut journal);
+            if journal.checkpoint_epoch() > 0 {
+                self.terminal_checkpoint_requires_v5
+                    .store(true, Ordering::Release);
+            }
+            return result;
         }
         let journal = Arc::clone(&self.terminal_journal);
-        tokio::task::spawn_blocking(move || {
+        let (result, checkpointed) = tokio::task::spawn_blocking(move || {
             let mut journal = journal.blocking_lock();
-            operation(&mut journal)
+            let result = operation(&mut journal);
+            (result, journal.checkpoint_epoch() > 0)
         })
         .await
-        .expect("strict terminal journal blocking task panicked")
+        .expect("strict terminal journal blocking task panicked");
+        if checkpointed {
+            self.terminal_checkpoint_requires_v5
+                .store(true, Ordering::Release);
+        }
+        result
+    }
+
+    async fn maybe_checkpoint_terminal_journal(&self) {
+        if self
+            .checkpoint_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let _checkpoint_guard = CheckpointBarrierGuard {
+            active: &self.checkpoint_in_progress,
+        };
+        if self.snapshot_captures_in_progress.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        if self.terminal_journal.lock().await.record_count() < STRICT_TERMINAL_CHECKPOINT_RECORDS {
+            return;
+        }
+        {
+            let state = self.state.lock();
+            if !state.commit_buffer.is_empty()
+                || !state.delivering_commits.is_empty()
+                || !state.proposals.is_empty()
+                || !state.pending_proposes.is_empty()
+            {
+                return;
+            }
+        }
+        if !self.snapshot_transfers.lock().is_empty() || !self.snapshot_receivers.lock().is_empty()
+        {
+            return;
+        }
+        let now = Instant::now();
+        {
+            let mut sync = self.v3_sync.lock();
+            sync.expire(now);
+            if sync.has_checkpoint_blocking_work() {
+                return;
+            }
+        }
+        if self.v3_history.lock().has_checkpoint_blocking_work(now)
+            || self.v3_retries.lock().has_checkpoint_blocking_work(now)
+        {
+            return;
+        }
+        let alive_members = self.net.alive_members();
+        let live_peers: Vec<_> = alive_members
+            .iter()
+            .copied()
+            .filter(|node| *node != self.self_id)
+            .filter_map(|node| {
+                (self.net.peer_strict_replication_protocol_version(node)
+                    >= STRICT_PROTOCOL_VERSION_V5)
+                    .then(|| {
+                        self.net
+                            .member_boot_epoch(node)
+                            .map(|epoch| PeerIncarnation::new(node, epoch))
+                    })
+                    .flatten()
+            })
+            .collect();
+        if alive_members.into_iter().any(|node| {
+            node != self.self_id
+                && (self.net.peer_strict_replication_protocol_version(node)
+                    < STRICT_PROTOCOL_VERSION_V5
+                    || self.net.member_boot_epoch(node).is_none())
+        }) {
+            return;
+        }
+        let metadata = self.repo.history_metadata();
+        let current_cut = self.terminal_journal.lock().await.terminal_cut();
+        let identity = HeadEvidenceIdentity {
+            repository_version: metadata.version,
+            history_freshness: metadata.freshness,
+            terminal_set_digest: *current_cut.terminal_set_digest(),
+        };
+        if !self.head_evidence.lock().as_ref().is_some_and(|evidence| {
+            evidence.identity == identity
+                && live_peers
+                    .iter()
+                    .all(|peer| evidence.acknowledged_by.contains(peer))
+        }) {
+            return;
+        }
+        let checkpoint = self
+            .with_terminal_journal_mutation(move |journal| journal.checkpoint(metadata.version))
+            .await;
+        match checkpoint {
+            Ok(checkpoint) => {
+                self.terminal_checkpoint_requires_v5
+                    .store(true, Ordering::Release);
+                let (cut, retired) = {
+                    let journal = self.terminal_journal.lock().await;
+                    (journal.terminal_cut(), journal.retired_origins())
+                };
+                {
+                    let mut state = self.state.lock();
+                    let is_retired = |op_id: &OpId| {
+                        let node = op_id.0 >> 48;
+                        let lower = node << 48;
+                        let upper = lower | 0x0000_FFFF_FFFF_FFFF;
+                        retired
+                            .range(lower..=upper)
+                            .next_back()
+                            .is_some_and(|(origin, counter)| {
+                                op_id.0 < *origin || (op_id.0 == *origin && op_id.1 <= *counter)
+                            })
+                    };
+                    state
+                        .applied_operations
+                        .retain(|op_id, _| !is_retired(op_id));
+                    state
+                        .terminal_decisions
+                        .retain(|op_id, _| !is_retired(op_id));
+                    state
+                        .terminal_decision_identities
+                        .retain(|op_id, _| !is_retired(op_id));
+                    state.committed_ids.retain(|op_id| !is_retired(op_id));
+                    state
+                        .committed_ts_final
+                        .retain(|op_id, _| !is_retired(op_id));
+                    state
+                        .recovery_promises
+                        .retain(|op_id, _| !is_retired(op_id));
+                    state
+                        .resolution_promises
+                        .retain(|op_id, _| !is_retired(op_id));
+                    state.accepted_values.retain(|op_id, _| !is_retired(op_id));
+                    state.retired_operations = retired;
+                }
+                self.remember_advertised_head(metadata, cut);
+                self.wake_clock_tick_loop();
+                debug!(
+                    topic = %self.topic,
+                    checkpoint_epoch = checkpoint.epoch(),
+                    repository_version = checkpoint.repository_version(),
+                    "strict terminal journal checkpoint committed"
+                );
+            }
+            Err(
+                TerminalJournalError::CheckpointHasUnresolvedRecords
+                | TerminalJournalError::CheckpointHasUndeliveredCommits
+                | TerminalJournalError::CheckpointHasOperationGaps,
+            ) => {}
+            Err(error) => self.record_terminal_journal_failure(&error),
+        }
     }
 
     pub(crate) fn new(
@@ -3240,7 +3447,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     ) -> Arc<Self> {
         let propose_semaphore = Arc::new(Semaphore::new(cfg.propose_semaphore_size()));
         let mut strict_protocol_disabled = false;
-        let journal = match TerminalJournal::load(net.strict_protocol_state_dir(), &topic) {
+        let mut journal = match TerminalJournal::load(net.strict_protocol_state_dir(), &topic) {
             Ok(journal) => journal,
             Err(error) => {
                 error!(topic = %topic, error = %error, "strict terminal journal unavailable; v1 resolution remains disabled");
@@ -3249,7 +3456,28 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 TerminalJournal::in_memory(topic.clone())
             }
         };
+        let durable_repository_version = repo.current_version();
+        let legacy_delivered = repo
+            .legacy_applied_operation_ids()
+            .into_iter()
+            .map(|op_id| (op_id, durable_repository_version))
+            .collect::<BTreeMap<_, _>>();
+        if !legacy_delivered.is_empty() {
+            if let Err(error) =
+                journal.install_delivery_checkpoint(durable_repository_version, &legacy_delivered)
+            {
+                error!(topic = %topic, error = %error, "strict legacy delivery ledger migration failed");
+                net.disable_strict_replication_protocol();
+                strict_protocol_disabled = true;
+            }
+        }
+        if let Err(error) = journal.recover_delivery_intents(durable_repository_version) {
+            error!(topic = %topic, error = %error, "strict delivery checkpoint recovery failed");
+            net.disable_strict_replication_protocol();
+            strict_protocol_disabled = true;
+        }
         let terminal_journal_durable = journal.durable_persistence_enabled();
+        let terminal_checkpoint_requires_v5 = journal.checkpoint_epoch() > 0;
         let terminal_protocol_storage_healthy =
             terminal_journal_durable || cfg!(any(test, feature = "test-support"));
         if !terminal_protocol_storage_healthy && !strict_protocol_disabled {
@@ -3325,7 +3553,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             snapshot_transfers: Mutex::new(HashMap::new()),
             snapshot_receivers: Mutex::new(HashMap::new()),
             snapshot_transfer_counter: AtomicU64::new(1),
+            snapshot_captures_in_progress: AtomicU64::new(0),
+            checkpoint_in_progress: AtomicBool::new(false),
             terminal_protocol_storage_healthy: AtomicBool::new(terminal_protocol_storage_healthy),
+            terminal_checkpoint_requires_v5: AtomicBool::new(terminal_checkpoint_requires_v5),
         });
         if let Some(violation) = arc.first_terminal_record_exceeding_catchup_budget() {
             // The journal remains authoritative for local delivery, but a
@@ -3631,13 +3862,13 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // containing an older peer therefore stays at v0. Old payloads may
         // decode for wire compatibility, but this binary never originates a
         // new legacy round.
-        let ready = negotiated_version >= STRICT_PROTOCOL_VERSION_V2
+        let ready = negotiated_version >= STRICT_PROTOCOL_VERSION_V5
             && self.strict_v2_advertisement_prerequisites_ready();
         metrics::set_strict_replication_protocol_status(
             negotiated_version,
             ready,
             self.net
-                .unsupported_active_protocol_peers(STRICT_PROTOCOL_VERSION_V2),
+                .unsupported_active_protocol_peers(STRICT_PROTOCOL_VERSION_V5),
         );
         if ready { STRICT_PROTOCOL_VERSION_V2 } else { 0 }
     }
@@ -4152,7 +4383,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .collect()
     }
 
-    fn record_terminal_journal_failure(&self, error: &TerminalJournalError) {
+    pub(super) fn record_terminal_journal_failure(&self, error: &TerminalJournalError) {
         if matches!(
             error,
             TerminalJournalError::Io { .. }
@@ -4483,51 +4714,63 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     fn restore_terminal_journal(&self) {
-        let records = self
-            .terminal_journal
-            .try_lock()
-            .expect("new terminal journal cannot be contended")
-            .snapshot();
-        if records.is_empty() {
+        let (records, retired_operations) = {
+            let journal = self
+                .terminal_journal
+                .try_lock()
+                .expect("new terminal journal cannot be contended");
+            (journal.snapshot(), journal.retired_origins())
+        };
+        if records.is_empty() && retired_operations.is_empty() {
             return;
         }
-        let mut restored_commits = false;
-        let mut state = self.state.lock();
-        for entry in records {
-            let (op_id, record) = entry.into_parts();
-            let hydrate_v2_pending = record.frozen_targets().is_none_or(|targets| {
-                FrozenTarget::find_in_canonical(targets, self.self_id)
-                    .is_some_and(|target| target.boot_epoch() == self.boot_epoch)
-            });
-            hydrate_terminal_journal_record(&mut state, op_id, &record, hydrate_v2_pending);
-            restored_commits |= enqueue_terminal_commit_for_delivery(&mut state, op_id, &record);
-            if record.frozen_targets().is_none()
-                && record.terminal_decision().is_none()
-                && !state.pending_proposes.contains_key(&op_id)
-            {
-                if let Some(accepted) = record.accepted_commit() {
-                    if let Some(coord_node) = node_from_op_id(op_id) {
-                        // A crash after v1 Accept but before Decision must
-                        // resume resolution after restart. Age the
-                        // reconstructed pending entry so the normal
-                        // deterministic resolver runs promptly.
-                        state.record_pending_propose_with_protocol(
-                            op_id,
-                            coord_node,
-                            accepted.op_msgpack_bytes(),
-                            accepted.ts_final(),
-                            Instant::now() - self.cfg.pending_propose_ttl(),
-                            STRICT_PROTOCOL_VERSION_V1,
-                        );
+        let restored_commits = {
+            let mut restored_commits = false;
+            let mut state = self.state.lock();
+            state.retired_operations = retired_operations;
+            for entry in records {
+                let (op_id, record) = entry.into_parts();
+                let hydrate_v2_pending = record.frozen_targets().is_none_or(|targets| {
+                    FrozenTarget::find_in_canonical(targets, self.self_id)
+                        .is_some_and(|target| target.boot_epoch() == self.boot_epoch)
+                });
+                hydrate_terminal_journal_record(&mut state, op_id, &record, hydrate_v2_pending);
+                if record.is_delivered() {
+                    if let Some(version) = record.delivery_version() {
+                        state.applied_operations.insert(op_id, version);
+                    }
+                } else {
+                    restored_commits |=
+                        enqueue_terminal_commit_for_delivery(&mut state, op_id, &record);
+                }
+                if record.frozen_targets().is_none()
+                    && record.terminal_decision().is_none()
+                    && !state.pending_proposes.contains_key(&op_id)
+                {
+                    if let Some(accepted) = record.accepted_commit() {
+                        if let Some(coord_node) = node_from_op_id(op_id) {
+                            // A crash after v1 Accept but before Decision must
+                            // resume resolution after restart. Age the
+                            // reconstructed pending entry so the normal
+                            // deterministic resolver runs promptly.
+                            state.record_pending_propose_with_protocol(
+                                op_id,
+                                coord_node,
+                                accepted.op_msgpack_bytes(),
+                                accepted.ts_final(),
+                                Instant::now() - self.cfg.pending_propose_ttl(),
+                                STRICT_PROTOCOL_VERSION_V1,
+                            );
+                        }
                     }
                 }
             }
-        }
-        if state.clock > 0 {
-            let clock = state.clock;
-            state.peer_clocks.insert(self.self_id, clock);
-        }
-        drop(state);
+            if state.clock > 0 {
+                let clock = state.clock;
+                state.peer_clocks.insert(self.self_id, clock);
+            }
+            restored_commits
+        };
         if restored_commits {
             // Startup history election remains an ordering fence. Once it
             // completes, the normal delivery loop will replay these durable
@@ -8895,12 +9138,19 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             history_freshness: ack.history_freshness,
             terminal_set_digest,
         };
-        if let Some(current) = self.head_evidence.lock().as_mut()
-            && current.identity == identity
-        {
-            current
-                .acknowledged_by
-                .insert(PeerIncarnation::new(from, origin_boot_epoch));
+        let inserted = {
+            let mut evidence = self.head_evidence.lock();
+            evidence.as_mut().is_some_and(|current| {
+                current.identity == identity
+                    && current
+                        .acknowledged_by
+                        .insert(PeerIncarnation::new(from, origin_boot_epoch))
+            })
+        };
+        if inserted && let Some(runtime) = self.weak_self.lock().as_ref().and_then(Weak::upgrade) {
+            tokio::spawn(async move {
+                runtime.maybe_checkpoint_terminal_journal().await;
+            });
         }
     }
 
@@ -9837,6 +10087,16 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
             metrics::record_strict_fence_rejection();
             return;
         }
+        // A compacted journal can no longer serve the per-operation image
+        // expected by V2-V4 peers. Once a checkpoint has ever committed,
+        // keep V5 as a permanent per-topic compatibility floor, including
+        // when an older member was offline during the checkpoint.
+        if self.terminal_checkpoint_requires_v5.load(Ordering::Acquire)
+            && self.net.peer_strict_replication_protocol_version(from) < STRICT_PROTOCOL_VERSION_V5
+        {
+            metrics::record_strict_fence_rejection();
+            return;
+        }
         // The proof binds the asserted epoch, but a valid proof from a
         // previous incarnation is still replayable. Only accept it while the
         // authenticated origin matches the current known membership
@@ -10428,7 +10688,46 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
             ReplicationPipelineStage::MsgpackDecode,
             decode_started_at.elapsed(),
         );
-        let version = rt.repo.current_version() + 1;
+        let durable_repository_version = rt.repo.current_version();
+        let delivery_op_id = buf.op_id;
+        let delivery_ts_final = buf.ts_final;
+        let delivery_op_msgpack = buf.op_msgpack.clone();
+        let delivery = rt
+            .with_terminal_journal_mutation(move |journal| {
+                journal.recover_delivery_intents(durable_repository_version)?;
+                if journal.get(delivery_op_id).is_none() && !journal.is_retired(delivery_op_id) {
+                    journal.upsert_commit_decision_bytes(
+                        delivery_op_id,
+                        0,
+                        delivery_ts_final,
+                        delivery_op_msgpack,
+                    )?;
+                }
+                let version = journal
+                    .delivery_version(delivery_op_id)
+                    .unwrap_or_else(|| durable_repository_version.saturating_add(1));
+                let disposition = journal.begin_delivery(delivery_op_id, version)?;
+                Ok::<_, TerminalJournalError>((version, disposition))
+            })
+            .await;
+        let (version, disposition) = match delivery {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                rt.record_terminal_journal_failure(&error);
+                warn!(
+                    topic = %rt.topic,
+                    op_id_hi = buf.op_id.0,
+                    op_id_lo = buf.op_id.1,
+                    %error,
+                    "strict delivery intent could not be persisted"
+                );
+                let mut state = rt.state.lock();
+                state.finish_delivering_commit(buf.op_id);
+                state.request_history_election();
+                state.buffer_commit(buf.op_id, buf.ts_final, buf.op_msgpack);
+                continue;
+            }
+        };
         debug!(
             topic = %rt.topic,
             op_id_hi = buf.op_id.0,
@@ -10440,18 +10739,22 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
             "strict delivery applying committed op"
         );
         let apply_started = Instant::now();
-        let apply_outcome = rt
-            .repo
-            .apply_committed_once(
-                version,
-                op,
-                StrictLogMetadata {
-                    op_id_hi: buf.op_id.0,
-                    op_id_lo: buf.op_id.1,
-                    ts_final: buf.ts_final,
-                },
-            )
-            .await;
+        let apply_outcome = match disposition {
+            DeliveryDisposition::AlreadyApplied => StrictCommitApplyOutcome::AlreadyApplied,
+            DeliveryDisposition::Apply => {
+                rt.repo
+                    .apply_committed_once(
+                        version,
+                        op,
+                        StrictLogMetadata {
+                            op_id_hi: buf.op_id.0,
+                            op_id_lo: buf.op_id.1,
+                            ts_final: buf.ts_final,
+                        },
+                    )
+                    .await
+            }
+        };
         let apply_elapsed = apply_started.elapsed();
         metrics::record_pipeline_stage(
             ReplicationPipelineKind::Strict,
@@ -10485,6 +10788,29 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
             });
             continue;
         }
+        if disposition == DeliveryDisposition::Apply {
+            let delivery_op_id = buf.op_id;
+            let delivery_result = rt
+                .with_terminal_journal_mutation(move |journal| {
+                    journal.finish_delivery(delivery_op_id, version)
+                })
+                .await;
+            if let Err(error) = delivery_result {
+                rt.record_terminal_journal_failure(&error);
+                warn!(
+                    topic = %rt.topic,
+                    op_id_hi = buf.op_id.0,
+                    op_id_lo = buf.op_id.1,
+                    %error,
+                    "strict delivery completion could not be persisted"
+                );
+                let mut state = rt.state.lock();
+                state.finish_delivering_commit(buf.op_id);
+                state.request_history_election();
+                state.buffer_commit(buf.op_id, buf.ts_final, buf.op_msgpack);
+                continue;
+            }
+        }
         if apply_outcome == StrictCommitApplyOutcome::AlreadyApplied {
             debug!(
                 topic = %rt.topic,
@@ -10497,6 +10823,7 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
         let (waker, local_proposal_elapsed) = {
             let mut s = rt.state.lock();
             s.finish_delivering_commit(buf.op_id);
+            s.applied_operations.insert(buf.op_id, version);
             if buf.ts_final > s.delivered_high_water {
                 s.delivered_high_water = buf.ts_final;
             }
@@ -10518,6 +10845,7 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
             apply_elapsed,
             local_proposal_elapsed,
         );
+        rt.maybe_checkpoint_terminal_journal().await;
         if let Some(w) = waker {
             let _ = w.send(Ok(version));
         }
@@ -11710,7 +12038,7 @@ fn hydrate_terminal_journal_record(
 }
 
 /// Queue a terminal commit restored from durable state for normal ordered
-/// delivery. The journal intentionally has no "delivered" marker: recording
+/// delivery when its S2S-owned delivery marker is not complete. Recording
 /// one after repository application would reintroduce the crash window this
 /// protocol closes. Replaying through `StrictReplicable::apply_committed_once`
 /// is safe whether the repository write completed before the crash or not.

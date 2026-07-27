@@ -11,13 +11,14 @@
 //! are correlated and retained through their continuation or final ACK so a
 //! lost response can be replayed without branching the cursor chain.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use aws_lc_rs::digest::{SHA256, digest};
 use bytes::Bytes;
 use prost::Message as _;
+use serde::{Deserialize, Serialize};
 use tracing::{trace, warn};
 
 use super::super::error::ReplicationError;
@@ -35,9 +36,10 @@ use super::super::proto::{
 use super::history_v3::HistoryServerRequest;
 use super::runtime::{
     BulkPageIdentity, HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryProbeResponseOutcome, HistoryRank,
-    HistorySnapshotResponseOutcome, STRICT_PROTOCOL_VERSION_V2, SnapshotReceiveTransfer,
-    SnapshotTransfer, StrictRuntime, TerminalCommitProof, TerminalDecisionIdentity, node_from_u32,
-    replication_bulk_backpressure, terminal_identity_from_wire, validate_v3_metadata_control,
+    HistorySnapshotResponseOutcome, STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V5,
+    SnapshotReceiveTransfer, SnapshotTransfer, StrictRuntime, TerminalCommitProof,
+    TerminalDecisionIdentity, node_from_u32, replication_bulk_backpressure,
+    terminal_identity_from_wire, validate_v3_metadata_control,
 };
 use super::session_reducer::{
     Cursor as SessionCursor, CursorKind as SessionCursorKind, Effect as SessionEffect,
@@ -61,6 +63,94 @@ use shitspeak_s2s_transport::ServiceLevel;
 /// Opt out of terminal-fence transfer for steady-state probes. Startup and
 /// membership-heal catchup begin at zero and paginate the stable journal.
 pub(crate) const TERMINAL_STATE_CURSOR_SKIP: u64 = u64::MAX;
+
+const S2S_SNAPSHOT_ENVELOPE_VERSION: u32 = 1;
+
+#[cfg(test)]
+#[path = "catchup_snapshot_tests.rs"]
+mod checkpoint_snapshot_tests;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct S2sSnapshotEnvelope {
+    version: u32,
+    repository_snapshot: Vec<u8>,
+    applied_operations: Vec<S2sAppliedOperation>,
+    retired_operations: Vec<S2sRetiredOperation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct S2sAppliedOperation {
+    op_id_hi: u64,
+    op_id_lo: u64,
+    repository_version: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct S2sRetiredOperation {
+    op_id_hi: u64,
+    max_counter: u64,
+}
+
+fn encode_s2s_snapshot_envelope<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    snapshot_version: u64,
+    repository_snapshot: Bytes,
+) -> Result<Bytes, rmp_serde::encode::Error> {
+    let state = rt.state.lock();
+    let applied_operations = state
+        .applied_operations
+        .iter()
+        .filter_map(|(op_id, version)| {
+            (*version <= snapshot_version).then_some(S2sAppliedOperation {
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                repository_version: *version,
+            })
+        })
+        .collect();
+    let retired_operations = state
+        .retired_operations
+        .iter()
+        .map(|(op_id_hi, max_counter)| S2sRetiredOperation {
+            op_id_hi: *op_id_hi,
+            max_counter: *max_counter,
+        })
+        .collect();
+    rmp_serde::to_vec_named(&S2sSnapshotEnvelope {
+        version: S2S_SNAPSHOT_ENVELOPE_VERSION,
+        repository_snapshot: repository_snapshot.to_vec(),
+        applied_operations,
+        retired_operations,
+    })
+    .map(Bytes::from)
+}
+
+fn decode_s2s_snapshot_envelope(
+    bytes: Bytes,
+) -> Result<(Bytes, HashMap<(u64, u64), u64>, BTreeMap<u64, u64>), rmp_serde::decode::Error> {
+    let envelope: S2sSnapshotEnvelope = rmp_serde::from_slice(&bytes)?;
+    if envelope.version != S2S_SNAPSHOT_ENVELOPE_VERSION {
+        return Err(rmp_serde::decode::Error::Syntax(
+            "unsupported S2S snapshot envelope version".into(),
+        ));
+    }
+    let applied = envelope
+        .applied_operations
+        .into_iter()
+        .map(|operation| {
+            (
+                (operation.op_id_hi, operation.op_id_lo),
+                operation.repository_version,
+            )
+        })
+        .collect();
+    let retired = envelope
+        .retired_operations
+        .into_iter()
+        .map(|origin| (origin.op_id_hi, origin.max_counter))
+        .collect();
+    Ok((Bytes::from(envelope.repository_snapshot), applied, retired))
+}
 
 fn history_transfer_response<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
@@ -453,22 +543,32 @@ fn pinned_snapshot_transfer<R: StrictReplicable>(
     terminal_decision_generation: u64,
 ) -> Result<(SnapshotTransfer, usize), ()> {
     let now = Instant::now();
-    {
-        let mut transfers = rt.snapshot_transfers.lock();
-        let mut receivers = rt.snapshot_receivers.lock();
-        expire_stale_snapshot_images(
-            &mut transfers,
-            &mut receivers,
-            now,
-            rt.cfg.pending_propose_ttl(),
-        );
-        if let Some(transfer) = transfers.get_mut(&from) {
-            transfer.last_used_at = now;
-            return Ok((transfer.clone(), snapshot_transfer_cursor(transfer, req)));
-        }
+    // Keep the transfer lock held through repository capture and envelope
+    // construction. Checkpoint rotation uses the same lock as its barrier,
+    // preventing a newer retired floor from being paired with older snapshot
+    // bytes.
+    let mut transfers = rt.snapshot_transfers.lock();
+    let mut receivers = rt.snapshot_receivers.lock();
+    expire_stale_snapshot_images(
+        &mut transfers,
+        &mut receivers,
+        now,
+        rt.cfg.pending_propose_ttl(),
+    );
+    if let Some(transfer) = transfers.get_mut(&from) {
+        transfer.last_used_at = now;
+        return Ok((transfer.clone(), snapshot_transfer_cursor(transfer, req)));
     }
 
-    let (version, snapshot_msgpack) = match rt.repo.snapshot() {
+    let Some(_snapshot_capture) = rt.begin_snapshot_capture() else {
+        trace!(
+            from,
+            "strict snapshot capture deferred by checkpoint barrier"
+        );
+        return Err(());
+    };
+
+    let (version, mut snapshot_msgpack) = match rt.repo.snapshot() {
         Ok(snapshot) => snapshot,
         Err(error) => {
             let capability_withdrawn = snapshot_error_withdraws_repository_capability(rt, &error);
@@ -482,6 +582,12 @@ fn pinned_snapshot_transfer<R: StrictReplicable>(
             return Err(());
         }
     };
+    if rt.net.peer_strict_replication_protocol_version(from) >= STRICT_PROTOCOL_VERSION_V5 {
+        snapshot_msgpack =
+            encode_s2s_snapshot_envelope(rt, version, snapshot_msgpack).map_err(|error| {
+                warn!(from, %error, "strict S2S snapshot envelope encoding failed");
+            })?;
+    }
     if snapshot_msgpack.len() > rt.cfg.strict_max_snapshot_transfer_bytes() {
         warn!(
             from,
@@ -502,18 +608,6 @@ fn pinned_snapshot_transfer<R: StrictReplicable>(
         terminal_decision_generation,
         last_used_at: now,
     };
-    let mut transfers = rt.snapshot_transfers.lock();
-    let mut receivers = rt.snapshot_receivers.lock();
-    expire_stale_snapshot_images(
-        &mut transfers,
-        &mut receivers,
-        now,
-        rt.cfg.pending_propose_ttl(),
-    );
-    if let Some(existing) = transfers.get_mut(&from) {
-        existing.last_used_at = now;
-        return Ok((existing.clone(), snapshot_transfer_cursor(existing, req)));
-    }
     let Some(retained_bytes) = retained_snapshot_bytes(&transfers, &receivers) else {
         warn!(
             from,
@@ -1564,9 +1658,25 @@ async fn install_snapshot_candidate<R: StrictReplicable>(
         return;
     }
     let installed_version = winner.snapshot_version;
+    let (repository_snapshot, applied_checkpoint) =
+        if rt.net.peer_strict_replication_protocol_version(from) >= STRICT_PROTOCOL_VERSION_V5 {
+            match decode_s2s_snapshot_envelope(winner.snapshot_msgpack) {
+                Ok((snapshot, applied, retired)) => (
+                    snapshot,
+                    Some((applied.into_iter().collect::<BTreeMap<_, _>>(), retired)),
+                ),
+                Err(error) => {
+                    warn!(from, %error, "strict S2S snapshot envelope decode failed");
+                    rearm_history_election(rt);
+                    return;
+                }
+            }
+        } else {
+            (winner.snapshot_msgpack, None)
+        };
     let install_result = rt
         .repo
-        .install_snapshot(installed_version, winner.snapshot_msgpack)
+        .install_snapshot(installed_version, repository_snapshot)
         .await;
     metrics::record_pipeline_stage(
         ReplicationPipelineKind::Strict,
@@ -1575,6 +1685,31 @@ async fn install_snapshot_candidate<R: StrictReplicable>(
     );
     match install_result {
         Ok(()) => {
+            if let Some((applied_checkpoint, retired_checkpoint)) = applied_checkpoint {
+                let applied_for_journal = applied_checkpoint.clone();
+                let retired_for_journal = retired_checkpoint.clone();
+                let merged_retired = match rt
+                    .with_terminal_journal_mutation(move |journal| {
+                        journal.install_repository_checkpoint(
+                            installed_version,
+                            &applied_for_journal,
+                            &retired_for_journal,
+                        )
+                    })
+                    .await
+                {
+                    Ok(retired) => retired,
+                    Err(error) => {
+                        rt.record_terminal_journal_failure(&error);
+                        warn!(from, %error, "strict delivery checkpoint install failed");
+                        rearm_history_election(rt);
+                        return;
+                    }
+                };
+                let mut state = rt.state.lock();
+                state.applied_operations.clear();
+                state.retired_operations = merged_retired;
+            }
             rt.state.lock().finish_history_election();
             request_history_after_snapshot(rt, from, installed_version, correlated_peer).await;
         }

@@ -4,7 +4,126 @@ use bytes::Bytes;
 use rusqlite::Connection;
 use tempfile::TempDir;
 
-use super::terminal_journal::{FrozenTarget, TerminalJournal, TerminalResolver};
+use super::{
+    terminal_journal::{
+        FrozenTarget, TerminalCut, TerminalJournal, TerminalJournalRecord, TerminalResolver,
+    },
+    terminal_journal_sqlite::{SqliteTerminalJournalError, SqliteTerminalJournalStore},
+};
+
+#[test]
+fn schema_v1_migration_preserves_records_and_cut() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("journal.sqlite3");
+    let op_id = (7, 9);
+    let record = TerminalJournalRecord::default();
+    let cut = TerminalCut::new([3; 16], 0, [4; 32], [5; 32]);
+
+    {
+        let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        store.replace_all([(&op_id, &record)], &cut).unwrap();
+    }
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE journal_checkpoint;
+                 DROP TABLE retired_origins;
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+    }
+
+    {
+        let store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        let (records, loaded_cut, epoch, repository_version, retired) =
+            store.load().unwrap().unwrap().into_parts();
+        assert_eq!(records.get(&op_id), Some(&record));
+        assert_eq!(loaded_cut, cut);
+        assert_eq!(epoch, 0);
+        assert_eq!(repository_version, 0);
+        assert!(retired.is_empty());
+    }
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    for table in ["journal_checkpoint", "retired_origins"] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn sqlite_rejects_rows_without_journal_metadata() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("journal.sqlite3");
+    {
+        let _store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+    }
+
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO journal_records (op_id_hi, op_id_lo, record) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    1_u64.to_be_bytes().as_slice(),
+                    2_u64.to_be_bytes().as_slice(),
+                    rmp_serde::to_vec_named(&TerminalJournalRecord::default()).unwrap(),
+                ],
+            )
+            .unwrap();
+    }
+
+    let store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+    assert!(matches!(
+        store.load(),
+        Err(SqliteTerminalJournalError::InvalidData { .. })
+    ));
+}
+
+#[test]
+fn sqlite_rejects_retired_origins_without_checkpoint_metadata() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("journal.sqlite3");
+    let cut = TerminalCut::new([6; 16], 0, [0; 32], [7; 32]);
+    {
+        let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        store.replace_all(std::iter::empty(), &cut).unwrap();
+    }
+
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO retired_origins (op_id_hi, max_counter) VALUES (?1, ?2)",
+                rusqlite::params![
+                    11_u64.to_be_bytes().as_slice(),
+                    12_u64.to_be_bytes().as_slice(),
+                ],
+            )
+            .unwrap();
+    }
+
+    let store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+    assert!(matches!(
+        store.load(),
+        Err(SqliteTerminalJournalError::InvalidData { .. })
+    ));
+}
 
 #[test]
 fn sqlite_reload_preserves_records_terminal_cuts_and_generation_order() {

@@ -341,6 +341,10 @@ pub(crate) struct TerminalJournalRecord {
     terminal_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_chain_digest: Option<[u8; DIGEST_LEN]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_version: Option<u64>,
+    #[serde(default)]
+    delivered: bool,
 }
 
 impl TerminalJournalRecord {
@@ -378,6 +382,36 @@ impl TerminalJournalRecord {
 
     pub(crate) fn terminal_chain_digest(&self) -> Option<&[u8; DIGEST_LEN]> {
         self.terminal_chain_digest.as_ref()
+    }
+
+    pub(crate) fn delivery_version(&self) -> Option<u64> {
+        self.delivery_version
+    }
+
+    pub(crate) fn is_delivered(&self) -> bool {
+        self.delivered
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryDisposition {
+    Apply,
+    AlreadyApplied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalCheckpoint {
+    epoch: u64,
+    repository_version: u64,
+}
+
+impl TerminalCheckpoint {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub(crate) fn repository_version(&self) -> u64 {
+        self.repository_version
     }
 }
 
@@ -595,6 +629,27 @@ pub(crate) enum TerminalJournalError {
     ConflictingPendingProposal { op_id_hi: u64, op_id_lo: u64 },
     #[error("strict terminal journal terminal-decision generation is exhausted")]
     DecisionGenerationExhausted,
+    #[error("strict terminal journal checkpoint epoch is exhausted")]
+    CheckpointEpochExhausted,
+    #[error("strict operation ({op_id_hi}, {op_id_lo}) is retired by checkpoint")]
+    RetiredOperation { op_id_hi: u64, op_id_lo: u64 },
+    #[error("strict operation ({op_id_hi}, {op_id_lo}) has no committed terminal decision")]
+    DeliveryRequiresCommit { op_id_hi: u64, op_id_lo: u64 },
+    #[error("strict operation ({op_id_hi}, {op_id_lo}) has conflicting delivery version")]
+    ConflictingDeliveryVersion { op_id_hi: u64, op_id_lo: u64 },
+    #[error("strict terminal journal cannot checkpoint while unresolved records remain")]
+    CheckpointHasUnresolvedRecords,
+    #[error("strict terminal journal cannot checkpoint before every commit is delivered")]
+    CheckpointHasUndeliveredCommits,
+    #[error("strict terminal journal cannot checkpoint across an operation-id counter gap")]
+    CheckpointHasOperationGaps,
+    #[error(
+        "strict terminal journal repository checkpoint version {repository_version} regresses below {current_version}"
+    )]
+    CheckpointVersionRegression {
+        repository_version: u64,
+        current_version: u64,
+    },
     #[error("strict terminal journal could not generate a journal lineage identifier")]
     JournalIdGeneration,
     #[error("invalid strict terminal journal metadata at {path:?}: {reason}")]
@@ -619,18 +674,220 @@ pub(crate) struct TerminalJournal {
     terminal_decision_generation: u64,
     terminal_chain_digest: [u8; DIGEST_LEN],
     terminal_set_digest: [u8; DIGEST_LEN],
+    terminal_set_commitment: TerminalSetCommitment,
+    retired_set_digest: [u8; DIGEST_LEN],
     generation_index: BTreeMap<u64, TerminalJournalOpId>,
     terminal_set_digest_cache: RefCell<BTreeMap<u64, [u8; DIGEST_LEN]>>,
+    checkpoint_epoch: u64,
+    checkpoint_repository_version: u64,
+    retired_origins: BTreeMap<u64, u64>,
+}
+
+/// Canonical sparse-Merkle commitment to the latest terminal set.
+///
+/// Operation ids address leaves directly, so insertion order cannot affect
+/// the root. Only non-empty nodes are retained and one append updates the 128
+/// nodes on its path rather than walking the terminal-record map.
+struct TerminalSetCommitment {
+    nodes: BTreeMap<(u8, u128), [u8; DIGEST_LEN]>,
+    terminal_count: u64,
+}
+
+impl TerminalSetCommitment {
+    fn empty() -> Self {
+        Self {
+            nodes: BTreeMap::new(),
+            terminal_count: 0,
+        }
+    }
+
+    fn from_records(
+        records: &BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+        through_generation: u64,
+    ) -> Self {
+        let mut commitment = Self::empty();
+        for (op_id, record) in records {
+            #[cfg(test)]
+            TERMINAL_SET_DIGEST_RECORD_VISITS.with(|count| count.set(count.get() + 1));
+            if record
+                .terminal_generation()
+                .is_some_and(|generation| generation <= through_generation)
+            {
+                commitment.insert(*op_id, canonical_terminal_decision_digest(*op_id, record));
+            }
+        }
+        commitment
+    }
+
+    fn preview_insert(
+        &self,
+        op_id: TerminalJournalOpId,
+        decision_digest: [u8; DIGEST_LEN],
+    ) -> TerminalSetCommitmentPatch {
+        let key = (u128::from(op_id.0) << 64) | u128::from(op_id.1);
+        let empty = terminal_set_empty_hashes();
+        let mut current = terminal_set_leaf_digest(key, decision_digest);
+        let mut replacements = Vec::with_capacity(129);
+        replacements.push(((128, key), current));
+        for level in (1_u8..=128).rev() {
+            let prefix = key >> (128 - u32::from(level));
+            #[cfg(test)]
+            TERMINAL_SET_PREVIEW_NODE_READS.with(|count| count.set(count.get() + 1));
+            let sibling = self
+                .nodes
+                .get(&(level, prefix ^ 1))
+                .copied()
+                .unwrap_or(empty[usize::from(level)]);
+            current = if prefix & 1 == 0 {
+                terminal_set_node_digest(level - 1, current, sibling)
+            } else {
+                terminal_set_node_digest(level - 1, sibling, current)
+            };
+            replacements.push(((level - 1, prefix >> 1), current));
+        }
+        let terminal_count = self
+            .terminal_count
+            .checked_add(1)
+            .expect("terminal generation bounds terminal set size");
+        TerminalSetCommitmentPatch {
+            replacements,
+            terminal_count,
+            root: current,
+        }
+    }
+
+    fn insert(&mut self, op_id: TerminalJournalOpId, decision_digest: [u8; DIGEST_LEN]) {
+        let patch = self.preview_insert(op_id, decision_digest);
+        self.apply_patch(patch);
+    }
+
+    fn apply_patch(&mut self, patch: TerminalSetCommitmentPatch) {
+        debug_assert_eq!(patch.terminal_count, self.terminal_count + 1);
+        self.nodes.extend(patch.replacements);
+        self.terminal_count = patch.terminal_count;
+    }
+
+    fn digest(&self) -> [u8; DIGEST_LEN] {
+        let root = self
+            .nodes
+            .get(&(0, 0))
+            .copied()
+            .unwrap_or_else(|| terminal_set_empty_hashes()[0]);
+        terminal_set_digest(self.terminal_count, root)
+    }
+}
+
+struct TerminalSetCommitmentPatch {
+    replacements: Vec<((u8, u128), [u8; DIGEST_LEN])>,
+    terminal_count: u64,
+    root: [u8; DIGEST_LEN],
+}
+
+impl TerminalSetCommitmentPatch {
+    fn digest(&self) -> [u8; DIGEST_LEN] {
+        terminal_set_digest(self.terminal_count, self.root)
+    }
+}
+
+fn terminal_set_digest(terminal_count: u64, root: [u8; DIGEST_LEN]) -> [u8; DIGEST_LEN] {
+    let mut image = Vec::with_capacity(33 + 8 + DIGEST_LEN);
+    image.extend_from_slice(b"shitspeak-terminal-set-v3\0");
+    image.extend_from_slice(&terminal_count.to_be_bytes());
+    image.extend_from_slice(&root);
+    sha256(&image)
 }
 
 fn initial_terminal_set_digest_cache(
     generation: u64,
-    digest: [u8; DIGEST_LEN],
+    latest_digest: [u8; DIGEST_LEN],
+    generation_zero_digest: [u8; DIGEST_LEN],
 ) -> RefCell<BTreeMap<u64, [u8; DIGEST_LEN]>> {
-    let empty_digest = compute_terminal_set_digest(&BTreeMap::new());
-    let mut cache = BTreeMap::from([(0, empty_digest)]);
-    cache.insert(generation, digest);
+    let mut cache = BTreeMap::from([(0, generation_zero_digest)]);
+    cache.insert(generation, latest_digest);
     RefCell::new(cache)
+}
+
+fn rebuild_terminal_set_digest_cache(
+    records: &BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+    generation_index: &BTreeMap<u64, TerminalJournalOpId>,
+    retired_set_digest: [u8; DIGEST_LEN],
+) -> RefCell<BTreeMap<u64, [u8; DIGEST_LEN]>> {
+    let mut commitment = TerminalSetCommitment::empty();
+    let mut cache = BTreeMap::from([(
+        0,
+        combined_terminal_set_digest(retired_set_digest, commitment.digest()),
+    )]);
+    for (generation, op_id) in generation_index {
+        let record = records
+            .get(op_id)
+            .expect("terminal generation index references a retained record");
+        commitment.insert(*op_id, canonical_terminal_decision_digest(*op_id, record));
+        cache.insert(
+            *generation,
+            combined_terminal_set_digest(retired_set_digest, commitment.digest()),
+        );
+    }
+    RefCell::new(cache)
+}
+
+fn compute_retired_set_digest(retired: &BTreeMap<u64, u64>) -> [u8; DIGEST_LEN] {
+    let mut image = Vec::with_capacity(40 + retired.len() * 16);
+    image.extend_from_slice(b"shitspeak-terminal-retired-set-v5\0");
+    image.extend_from_slice(&(retired.len() as u64).to_be_bytes());
+    for (origin, counter) in retired {
+        image.extend_from_slice(&origin.to_be_bytes());
+        image.extend_from_slice(&counter.to_be_bytes());
+    }
+    sha256(&image)
+}
+
+fn retirement_floors_cover_records<'a>(
+    base: &BTreeMap<u64, u64>,
+    records: impl IntoIterator<Item = &'a TerminalJournalOpId>,
+) -> Result<BTreeMap<u64, u64>, TerminalJournalError> {
+    let mut floors = base.clone();
+    for &(origin, counter) in records {
+        let floor = floors.entry(origin).or_insert(0);
+        if counter <= *floor {
+            continue;
+        }
+        let expected = floor
+            .checked_add(1)
+            .ok_or(TerminalJournalError::CheckpointHasOperationGaps)?;
+        if counter != expected {
+            return Err(TerminalJournalError::CheckpointHasOperationGaps);
+        }
+        *floor = counter;
+    }
+    Ok(floors)
+}
+
+fn compact_retired_origins_by_node(retired: BTreeMap<u64, u64>) -> BTreeMap<u64, u64> {
+    let mut compacted = BTreeMap::new();
+    for (origin, counter) in retired {
+        let node = origin >> 48;
+        let lower = node << 48;
+        let upper = lower | 0x0000_FFFF_FFFF_FFFF;
+        if let Some((&newest, _)) = compacted.range(lower..=upper).next_back() {
+            if newest >= origin {
+                continue;
+            }
+            compacted.remove(&newest);
+        }
+        compacted.insert(origin, counter);
+    }
+    compacted
+}
+
+fn combined_terminal_set_digest(
+    retired_digest: [u8; DIGEST_LEN],
+    active_digest: [u8; DIGEST_LEN],
+) -> [u8; DIGEST_LEN] {
+    let mut image = Vec::with_capacity(31 + DIGEST_LEN * 2);
+    image.extend_from_slice(b"shitspeak-terminal-state-v5\0");
+    image.extend_from_slice(&retired_digest);
+    image.extend_from_slice(&active_digest);
+    sha256(&image)
 }
 
 impl TerminalJournal {
@@ -643,7 +900,10 @@ impl TerminalJournal {
         let path = journal_path(root.as_deref(), &topic);
         let Some(path) = path else {
             let journal_id = generate_journal_id()?;
-            let terminal_set_digest = compute_terminal_set_digest(&BTreeMap::new());
+            let terminal_set_commitment = TerminalSetCommitment::empty();
+            let retired_set_digest = compute_retired_set_digest(&BTreeMap::new());
+            let terminal_set_digest =
+                combined_terminal_set_digest(retired_set_digest, terminal_set_commitment.digest());
             return Ok(Self {
                 path: None,
                 _lock_file: None,
@@ -653,11 +913,17 @@ impl TerminalJournal {
                 terminal_decision_generation: 0,
                 terminal_chain_digest: EMPTY_CHAIN_DIGEST,
                 terminal_set_digest,
+                terminal_set_commitment,
+                retired_set_digest,
                 generation_index: BTreeMap::new(),
                 terminal_set_digest_cache: initial_terminal_set_digest_cache(
                     0,
                     terminal_set_digest,
+                    terminal_set_digest,
                 ),
+                checkpoint_epoch: 0,
+                checkpoint_repository_version: 0,
+                retired_origins: BTreeMap::new(),
             });
         };
 
@@ -701,37 +967,93 @@ impl TerminalJournal {
         }
 
         let mut store = SqliteTerminalJournalStore::open(&path, topic.clone())?;
-        let loaded = if let Some(loaded) = store.load()? {
-            let (mut records, cut) = loaded.into_parts();
-            let derived = validate_loaded_sqlite(&path, &mut records, &cut)?;
-            LoadedTerminalJournal::from_derived(records, *cut.journal_id(), derived)
-        } else {
-            let legacy_path = legacy_journal_path(&path);
-            let loaded = match fs::read(&legacy_path) {
-                Ok(bytes) => load_records(&legacy_path, &topic, &bytes)?,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    LoadedTerminalJournal::empty(generate_journal_id()?)
-                }
-                Err(source) => {
-                    return Err(TerminalJournalError::Io {
-                        path: legacy_path,
-                        source,
+        let (loaded, checkpoint_epoch, checkpoint_repository_version, retired_origins) =
+            if let Some(loaded) = store.load()? {
+                let (
+                    mut records,
+                    cut,
+                    checkpoint_epoch,
+                    checkpoint_repository_version,
+                    retired_origins,
+                ) = loaded.into_parts();
+                let active_digest = compute_terminal_set_digest(&records);
+                let retired_digest = compute_retired_set_digest(&retired_origins);
+                let combined_digest = combined_terminal_set_digest(retired_digest, active_digest);
+                let legacy_digest = compute_legacy_terminal_set_digest(&records);
+                let is_pre_checkpoint = checkpoint_epoch == 0
+                    && checkpoint_repository_version == 0
+                    && retired_origins.is_empty();
+                if cut.terminal_set_digest() != &active_digest
+                    && cut.terminal_set_digest() != &combined_digest
+                    && !(is_pre_checkpoint && cut.terminal_set_digest() == &legacy_digest)
+                {
+                    return Err(TerminalJournalError::InvalidMetadata {
+                        path,
+                        reason: "persisted terminal set digest does not match active records and checkpoint floors",
                     });
                 }
+                let validation_cut = TerminalCut::new(
+                    *cut.journal_id(),
+                    cut.generation(),
+                    *cut.chain_digest(),
+                    active_digest,
+                );
+                let derived = validate_loaded_sqlite(&path, &mut records, &validation_cut)?;
+                (
+                    LoadedTerminalJournal::from_derived(records, *cut.journal_id(), derived),
+                    checkpoint_epoch,
+                    checkpoint_repository_version,
+                    retired_origins,
+                )
+            } else {
+                let legacy_path = legacy_journal_path(&path);
+                let loaded = match fs::read(&legacy_path) {
+                    Ok(bytes) => load_records(&legacy_path, &topic, &bytes)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        LoadedTerminalJournal::empty(generate_journal_id()?)
+                    }
+                    Err(source) => {
+                        return Err(TerminalJournalError::Io {
+                            path: legacy_path,
+                            source,
+                        });
+                    }
+                };
+                let cut = TerminalCut::new(
+                    loaded.journal_id,
+                    loaded.terminal_decision_generation,
+                    loaded.terminal_chain_digest,
+                    loaded.terminal_set_digest,
+                );
+                // The legacy JSON remains in place as a rollback artifact. Once
+                // this transaction commits SQLite is the sole authoritative
+                // journal and subsequent startups never consult the JSON file.
+                store.replace_all(loaded.records.iter(), &cut)?;
+                (loaded, 0, 0, BTreeMap::new())
             };
-            let cut = TerminalCut::new(
+
+        let mut loaded = loaded;
+        let terminal_set_commitment =
+            TerminalSetCommitment::from_records(&loaded.records, u64::MAX);
+        let retired_set_digest = compute_retired_set_digest(&retired_origins);
+        let combined_digest =
+            combined_terminal_set_digest(retired_set_digest, terminal_set_commitment.digest());
+        if loaded.terminal_set_digest != combined_digest {
+            loaded.terminal_set_digest = combined_digest;
+            let migrated_cut = TerminalCut::new(
                 loaded.journal_id,
                 loaded.terminal_decision_generation,
                 loaded.terminal_chain_digest,
-                loaded.terminal_set_digest,
+                combined_digest,
             );
-            // The legacy JSON remains in place as a rollback artifact. Once
-            // this transaction commits SQLite is the sole authoritative
-            // journal and subsequent startups never consult the JSON file.
-            store.replace_all(loaded.records.iter(), &cut)?;
-            loaded
-        };
-
+            store.replace_all(loaded.records.iter(), &migrated_cut)?;
+        }
+        debug_assert_eq!(combined_digest, loaded.terminal_set_digest);
+        let terminal_set_digest_cache = rebuild_terminal_set_digest_cache(
+            &loaded.records,
+            &loaded.generation_index,
+            retired_set_digest,
+        );
         Ok(Self {
             path: Some(path),
             _lock_file: Some(lock_file),
@@ -741,18 +1063,23 @@ impl TerminalJournal {
             terminal_decision_generation: loaded.terminal_decision_generation,
             terminal_chain_digest: loaded.terminal_chain_digest,
             terminal_set_digest: loaded.terminal_set_digest,
+            terminal_set_commitment,
+            retired_set_digest,
             generation_index: loaded.generation_index,
-            terminal_set_digest_cache: initial_terminal_set_digest_cache(
-                loaded.terminal_decision_generation,
-                loaded.terminal_set_digest,
-            ),
+            terminal_set_digest_cache,
+            checkpoint_epoch,
+            checkpoint_repository_version,
+            retired_origins,
         })
     }
 
     pub(crate) fn in_memory(_topic: impl Into<String>) -> Self {
         let journal_id = generate_journal_id()
             .expect("the system random generator must provide a terminal journal id");
-        let terminal_set_digest = compute_terminal_set_digest(&BTreeMap::new());
+        let terminal_set_commitment = TerminalSetCommitment::empty();
+        let retired_set_digest = compute_retired_set_digest(&BTreeMap::new());
+        let terminal_set_digest =
+            combined_terminal_set_digest(retired_set_digest, terminal_set_commitment.digest());
         Self {
             path: None,
             _lock_file: None,
@@ -762,8 +1089,17 @@ impl TerminalJournal {
             terminal_decision_generation: 0,
             terminal_chain_digest: EMPTY_CHAIN_DIGEST,
             terminal_set_digest,
+            terminal_set_commitment,
+            retired_set_digest,
             generation_index: BTreeMap::new(),
-            terminal_set_digest_cache: initial_terminal_set_digest_cache(0, terminal_set_digest),
+            terminal_set_digest_cache: initial_terminal_set_digest_cache(
+                0,
+                terminal_set_digest,
+                terminal_set_digest,
+            ),
+            checkpoint_epoch: 0,
+            checkpoint_repository_version: 0,
+            retired_origins: BTreeMap::new(),
         }
     }
 
@@ -779,6 +1115,339 @@ impl TerminalJournal {
 
     pub(crate) fn get(&self, op_id: TerminalJournalOpId) -> Option<&TerminalJournalRecord> {
         self.records.get(&op_id)
+    }
+
+    pub(crate) fn is_retired(&self, op_id: TerminalJournalOpId) -> bool {
+        let node = op_id.0 >> 48;
+        let lower = node << 48;
+        let upper = lower | 0x0000_FFFF_FFFF_FFFF;
+        self.retired_origins
+            .range(lower..=upper)
+            .next_back()
+            .is_some_and(|(retired_origin, counter)| {
+                op_id.0 < *retired_origin || (op_id.0 == *retired_origin && op_id.1 <= *counter)
+            })
+    }
+
+    pub(crate) fn retired_origins(&self) -> BTreeMap<u64, u64> {
+        self.retired_origins.clone()
+    }
+
+    pub(crate) fn checkpoint_epoch(&self) -> u64 {
+        self.checkpoint_epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_repository_version(&self) -> u64 {
+        self.checkpoint_repository_version
+    }
+
+    pub(crate) fn delivery_version(&self, op_id: TerminalJournalOpId) -> Option<u64> {
+        self.records
+            .get(&op_id)
+            .and_then(TerminalJournalRecord::delivery_version)
+    }
+
+    /// Install the S2S-owned delivery ledger paired with a replacement
+    /// repository snapshot. Terminal sync precedes history sync, so every
+    /// non-retired id must already have a local terminal record.
+    pub(crate) fn install_delivery_checkpoint(
+        &mut self,
+        repository_version: u64,
+        delivered: &BTreeMap<TerminalJournalOpId, u64>,
+    ) -> Result<(), TerminalJournalError> {
+        let mut candidate = self.records.clone();
+        for (op_id, record) in &mut candidate {
+            if !matches!(
+                record.terminal_decision(),
+                Some(TerminalDecision::Commit { .. })
+            ) {
+                continue;
+            }
+            match delivered.get(op_id).copied() {
+                Some(version) if version <= repository_version => {
+                    record.delivery_version = Some(version);
+                    record.delivered = true;
+                }
+                Some(_) => {
+                    return Err(TerminalJournalError::ConflictingDeliveryVersion {
+                        op_id_hi: op_id.0,
+                        op_id_lo: op_id.1,
+                    });
+                }
+                None => {
+                    record.delivery_version = None;
+                    record.delivered = false;
+                }
+            }
+        }
+        let cut = self.terminal_cut();
+        if let Some(store) = self.store.as_mut() {
+            store.replace_all(candidate.iter(), &cut)?;
+        }
+        self.records = candidate;
+        Ok(())
+    }
+
+    /// Replace the delivery ledger and rotate the terminal journal in the
+    /// same SQLite transaction after a repository snapshot is installed.
+    /// Incoming retirement floors belong to that snapshot; local floors are
+    /// deliberately not unioned because the replacement image may not cover
+    /// their effects.
+    pub(crate) fn install_repository_checkpoint(
+        &mut self,
+        repository_version: u64,
+        delivered: &BTreeMap<TerminalJournalOpId, u64>,
+        incoming_retired: &BTreeMap<u64, u64>,
+    ) -> Result<BTreeMap<u64, u64>, TerminalJournalError> {
+        let mut candidate = self.records.clone();
+        for (op_id, record) in &mut candidate {
+            if !record.is_terminal() {
+                return Err(TerminalJournalError::CheckpointHasUnresolvedRecords);
+            }
+            if !matches!(
+                record.terminal_decision(),
+                Some(TerminalDecision::Commit { .. })
+            ) {
+                continue;
+            }
+            let Some(version) = delivered.get(op_id).copied() else {
+                return Err(TerminalJournalError::CheckpointHasUndeliveredCommits);
+            };
+            if version > repository_version {
+                return Err(TerminalJournalError::ConflictingDeliveryVersion {
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                });
+            }
+            record.delivery_version = Some(version);
+            record.delivered = true;
+        }
+
+        let epoch = self
+            .checkpoint_epoch
+            .checked_add(1)
+            .ok_or(TerminalJournalError::CheckpointEpochExhausted)?;
+        let retired_origins = compact_retired_origins_by_node(retirement_floors_cover_records(
+            incoming_retired,
+            candidate.keys(),
+        )?);
+        let journal_id = generate_journal_id()?;
+        let commitment = TerminalSetCommitment::empty();
+        let retired_set_digest = compute_retired_set_digest(&retired_origins);
+        let digest = combined_terminal_set_digest(retired_set_digest, commitment.digest());
+        let cut = TerminalCut::new(journal_id, 0, EMPTY_CHAIN_DIGEST, digest);
+        if let Some(store) = self.store.as_mut() {
+            store.checkpoint(epoch, repository_version, &retired_origins, &cut)?;
+        }
+
+        self.records.clear();
+        self.journal_id = journal_id;
+        self.terminal_decision_generation = 0;
+        self.terminal_chain_digest = EMPTY_CHAIN_DIGEST;
+        self.terminal_set_digest = digest;
+        self.terminal_set_commitment = commitment;
+        self.retired_set_digest = retired_set_digest;
+        self.generation_index.clear();
+        self.terminal_set_digest_cache = initial_terminal_set_digest_cache(0, digest, digest);
+        self.checkpoint_epoch = epoch;
+        self.checkpoint_repository_version = repository_version;
+        self.retired_origins = retired_origins.clone();
+        Ok(retired_origins)
+    }
+
+    pub(crate) fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Persist the stable repository slot before application. Startup can
+    /// then resolve the intent against the repository's durable version,
+    /// closing both possible cross-database crash windows.
+    pub(crate) fn begin_delivery(
+        &mut self,
+        op_id: TerminalJournalOpId,
+        repository_version: u64,
+    ) -> Result<DeliveryDisposition, TerminalJournalError> {
+        if self.is_retired(op_id) {
+            return Ok(DeliveryDisposition::AlreadyApplied);
+        }
+        let previous = self.records.get(&op_id).cloned().ok_or(
+            TerminalJournalError::DeliveryRequiresCommit {
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+            },
+        )?;
+        if !matches!(
+            previous.terminal_decision(),
+            Some(TerminalDecision::Commit { .. })
+        ) {
+            return Err(TerminalJournalError::DeliveryRequiresCommit {
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+            });
+        }
+        if previous.is_delivered() {
+            return (previous.delivery_version() == Some(repository_version))
+                .then_some(DeliveryDisposition::AlreadyApplied)
+                .ok_or(TerminalJournalError::ConflictingDeliveryVersion {
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                });
+        }
+        if previous
+            .delivery_version()
+            .is_some_and(|version| version != repository_version)
+        {
+            return Err(TerminalJournalError::ConflictingDeliveryVersion {
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+            });
+        }
+        if previous.delivery_version() == Some(repository_version) {
+            return Ok(DeliveryDisposition::Apply);
+        }
+        let mut next = previous.clone();
+        next.delivery_version = Some(repository_version);
+        self.persist_record_replacement(op_id, previous, next)?;
+        Ok(DeliveryDisposition::Apply)
+    }
+
+    pub(crate) fn finish_delivery(
+        &mut self,
+        op_id: TerminalJournalOpId,
+        repository_version: u64,
+    ) -> Result<(), TerminalJournalError> {
+        if self.is_retired(op_id) {
+            return Ok(());
+        }
+        let previous = self.records.get(&op_id).cloned().ok_or(
+            TerminalJournalError::DeliveryRequiresCommit {
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+            },
+        )?;
+        if previous.delivery_version() != Some(repository_version) {
+            return Err(TerminalJournalError::ConflictingDeliveryVersion {
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+            });
+        }
+        if previous.is_delivered() {
+            return Ok(());
+        }
+        let mut next = previous.clone();
+        next.delivered = true;
+        self.persist_record_replacement(op_id, previous, next)
+    }
+
+    /// Resolve intents immediately after loading the repository and before
+    /// any snapshot replacement can advance its version for another reason.
+    pub(crate) fn recover_delivery_intents(
+        &mut self,
+        durable_repository_version: u64,
+    ) -> Result<(), TerminalJournalError> {
+        let mut candidate = self.records.clone();
+        let mut changed = false;
+        for record in candidate.values_mut() {
+            let Some(version) = record.delivery_version else {
+                continue;
+            };
+            if version <= durable_repository_version {
+                changed |= !record.delivered;
+                record.delivered = true;
+            } else {
+                record.delivery_version = None;
+                record.delivered = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        let cut = self.terminal_cut();
+        if let Some(store) = self.store.as_mut() {
+            store.replace_all(candidate.iter(), &cut)?;
+        }
+        self.records = candidate;
+        Ok(())
+    }
+
+    /// Atomically rotate to a new empty journal epoch after the application
+    /// checkpoint covers every commit and all acceptor state is terminal.
+    pub(crate) fn checkpoint(
+        &mut self,
+        repository_version: u64,
+    ) -> Result<TerminalCheckpoint, TerminalJournalError> {
+        if repository_version < self.checkpoint_repository_version {
+            return Err(TerminalJournalError::CheckpointVersionRegression {
+                repository_version,
+                current_version: self.checkpoint_repository_version,
+            });
+        }
+        if self.records.values().any(|record| !record.is_terminal()) {
+            return Err(TerminalJournalError::CheckpointHasUnresolvedRecords);
+        }
+        if self.records.values().any(|record| {
+            matches!(
+                record.terminal_decision(),
+                Some(TerminalDecision::Commit { .. })
+            ) && (!record.is_delivered()
+                || record
+                    .delivery_version()
+                    .is_none_or(|version| version > repository_version))
+        }) {
+            return Err(TerminalJournalError::CheckpointHasUndeliveredCommits);
+        }
+        let epoch = self
+            .checkpoint_epoch
+            .checked_add(1)
+            .ok_or(TerminalJournalError::CheckpointEpochExhausted)?;
+        let retired_origins = compact_retired_origins_by_node(retirement_floors_cover_records(
+            &self.retired_origins,
+            self.records.keys(),
+        )?);
+        let journal_id = generate_journal_id()?;
+        let commitment = TerminalSetCommitment::empty();
+        let retired_set_digest = compute_retired_set_digest(&retired_origins);
+        let digest = combined_terminal_set_digest(retired_set_digest, commitment.digest());
+        let cut = TerminalCut::new(journal_id, 0, EMPTY_CHAIN_DIGEST, digest);
+        if let Some(store) = self.store.as_mut() {
+            store.checkpoint(epoch, repository_version, &retired_origins, &cut)?;
+        }
+        self.records.clear();
+        self.journal_id = journal_id;
+        self.terminal_decision_generation = 0;
+        self.terminal_chain_digest = EMPTY_CHAIN_DIGEST;
+        self.terminal_set_digest = digest;
+        self.terminal_set_commitment = commitment;
+        self.retired_set_digest = retired_set_digest;
+        self.generation_index.clear();
+        self.terminal_set_digest_cache = initial_terminal_set_digest_cache(0, digest, digest);
+        self.checkpoint_epoch = epoch;
+        self.checkpoint_repository_version = repository_version;
+        self.retired_origins = retired_origins;
+        Ok(TerminalCheckpoint {
+            epoch,
+            repository_version,
+        })
+    }
+
+    fn persist_record_replacement(
+        &mut self,
+        op_id: TerminalJournalOpId,
+        previous: TerminalJournalRecord,
+        next: TerminalJournalRecord,
+    ) -> Result<(), TerminalJournalError> {
+        let cut = self.terminal_cut();
+        if let Some(store) = self.store.as_mut() {
+            store.upsert_record(op_id, &next, &cut)?;
+        }
+        debug_assert_eq!(
+            canonical_terminal_decision_digest(op_id, &previous),
+            canonical_terminal_decision_digest(op_id, &next)
+        );
+        self.records.insert(op_id, next);
+        Ok(())
     }
 
     /// Return a stable, operation-id-sorted copy suitable for catchup.
@@ -833,7 +1502,10 @@ impl TerminalJournal {
             cache.get(&generation).copied()
         }
         .unwrap_or_else(|| {
-            let digest = compute_terminal_set_digest_through(&self.records, generation);
+            let digest = combined_terminal_set_digest(
+                self.retired_set_digest,
+                compute_terminal_set_digest_through(&self.records, generation),
+            );
             self.terminal_set_digest_cache
                 .borrow_mut()
                 .insert(generation, digest);
@@ -1325,6 +1997,12 @@ impl TerminalJournal {
         op_id: TerminalJournalOpId,
         mutate: impl FnOnce(&mut TerminalJournalRecord) -> Result<bool, TerminalJournalError>,
     ) -> Result<bool, TerminalJournalError> {
+        if self.is_retired(op_id) {
+            return Err(TerminalJournalError::RetiredOperation {
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+            });
+        }
         let previous_record = self.records.get(&op_id).cloned();
         let had_terminal_decision = previous_record
             .as_ref()
@@ -1384,7 +2062,17 @@ impl TerminalJournal {
                 record.terminal_chain_digest = Some(chain_digest);
                 chain_digest
             };
-            let terminal_set_digest = compute_terminal_set_digest(&self.records);
+            let decision_digest = canonical_terminal_decision_digest(
+                op_id,
+                self.records
+                    .get(&op_id)
+                    .expect("changed journal record remains present"),
+            );
+            let terminal_set_patch = self
+                .terminal_set_commitment
+                .preview_insert(op_id, decision_digest);
+            let terminal_set_digest =
+                combined_terminal_set_digest(self.retired_set_digest, terminal_set_patch.digest());
             let cut = TerminalCut::new(
                 self.journal_id,
                 generation,
@@ -1404,6 +2092,7 @@ impl TerminalJournal {
             self.terminal_decision_generation = generation;
             self.terminal_chain_digest = chain_digest;
             self.terminal_set_digest = terminal_set_digest;
+            self.terminal_set_commitment.apply_patch(terminal_set_patch);
             self.generation_index.insert(generation, op_id);
             self.terminal_set_digest_cache
                 .borrow_mut()
@@ -1428,7 +2117,7 @@ impl TerminalJournal {
             self.journal_id,
             derived.terminal_decision_generation,
             derived.terminal_chain_digest,
-            derived.terminal_set_digest,
+            combined_terminal_set_digest(self.retired_set_digest, derived.terminal_set_digest),
         );
         if let Some(store) = self.store.as_mut() {
             let record = self
@@ -1442,7 +2131,9 @@ impl TerminalJournal {
         }
         self.terminal_decision_generation = derived.terminal_decision_generation;
         self.terminal_chain_digest = derived.terminal_chain_digest;
-        self.terminal_set_digest = derived.terminal_set_digest;
+        self.terminal_set_digest =
+            combined_terminal_set_digest(self.retired_set_digest, derived.terminal_set_digest);
+        self.terminal_set_commitment = TerminalSetCommitment::from_records(&self.records, u64::MAX);
         self.generation_index = derived.generation_index;
         if let Some(changed_generation) = changed_generation {
             self.terminal_set_digest_cache
@@ -1820,35 +2511,73 @@ fn compute_terminal_set_digest(
     compute_terminal_set_digest_through(records, u64::MAX)
 }
 
+/// Digest used by durable v2 journals before the sparse commitment cutover.
+/// This is retained only to validate and rewrite existing journals at startup.
+fn compute_legacy_terminal_set_digest(
+    records: &BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+) -> [u8; DIGEST_LEN] {
+    let terminal_count = records
+        .values()
+        .filter(|record| record.is_terminal())
+        .count() as u64;
+    let mut image = Vec::with_capacity(40 + terminal_count as usize * DIGEST_LEN);
+    image.extend_from_slice(b"shitspeak-terminal-set-v2\0");
+    image.extend_from_slice(&terminal_count.to_be_bytes());
+    for (op_id, record) in records.iter().filter(|(_, record)| record.is_terminal()) {
+        image.extend_from_slice(&canonical_terminal_decision_digest(*op_id, record));
+    }
+    sha256(&image)
+}
+
 fn compute_terminal_set_digest_through(
     records: &BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
     through_generation: u64,
 ) -> [u8; DIGEST_LEN] {
     #[cfg(test)]
     TERMINAL_SET_DIGEST_DERIVATIONS.with(|count| count.set(count.get() + 1));
-    let included = |record: &&TerminalJournalRecord| {
-        record
-            .terminal_generation()
-            .is_some_and(|generation| generation <= through_generation)
-    };
-    let terminal_count = records.values().filter(included).count() as u64;
-    let mut image = Vec::with_capacity(40 + terminal_count as usize * DIGEST_LEN);
-    image.extend_from_slice(b"shitspeak-terminal-set-v2\0");
-    image.extend_from_slice(&terminal_count.to_be_bytes());
-    for (op_id, record) in records.iter().filter(|(_, record)| {
-        record
-            .terminal_generation()
-            .is_some_and(|generation| generation <= through_generation)
-    }) {
-        image.extend_from_slice(&canonical_terminal_decision_digest(*op_id, record));
-    }
+    TerminalSetCommitment::from_records(records, through_generation).digest()
+}
+
+fn terminal_set_leaf_digest(key: u128, decision_digest: [u8; DIGEST_LEN]) -> [u8; DIGEST_LEN] {
+    let mut image = Vec::with_capacity(29 + 16 + DIGEST_LEN);
+    image.extend_from_slice(b"shitspeak-terminal-set-leaf-v3\0");
+    image.extend_from_slice(&key.to_be_bytes());
+    image.extend_from_slice(&decision_digest);
     sha256(&image)
+}
+
+fn terminal_set_node_digest(
+    level: u8,
+    left: [u8; DIGEST_LEN],
+    right: [u8; DIGEST_LEN],
+) -> [u8; DIGEST_LEN] {
+    let mut image = Vec::with_capacity(29 + 1 + DIGEST_LEN * 2);
+    image.extend_from_slice(b"shitspeak-terminal-set-node-v3\0");
+    image.push(level);
+    image.extend_from_slice(&left);
+    image.extend_from_slice(&right);
+    sha256(&image)
+}
+
+fn terminal_set_empty_hashes() -> [[u8; DIGEST_LEN]; 129] {
+    let mut empty = [[0; DIGEST_LEN]; 129];
+    empty[128] = sha256(b"shitspeak-terminal-set-empty-leaf-v3\0");
+    for level in (0_u8..128).rev() {
+        empty[usize::from(level)] = terminal_set_node_digest(
+            level,
+            empty[usize::from(level + 1)],
+            empty[usize::from(level + 1)],
+        );
+    }
+    empty
 }
 
 #[cfg(test)]
 thread_local! {
     static TERMINAL_STATE_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TERMINAL_SET_DIGEST_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TERMINAL_SET_DIGEST_RECORD_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TERMINAL_SET_PREVIEW_NODE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1859,6 +2588,16 @@ fn take_terminal_state_derivations() -> usize {
 #[cfg(test)]
 fn take_terminal_set_digest_derivations() -> usize {
     TERMINAL_SET_DIGEST_DERIVATIONS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+fn take_terminal_set_digest_record_visits() -> usize {
+    TERMINAL_SET_DIGEST_RECORD_VISITS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+fn take_terminal_set_preview_node_reads() -> usize {
+    TERMINAL_SET_PREVIEW_NODE_READS.with(|count| count.replace(0))
 }
 
 fn canonical_terminal_decision_digest(
@@ -2033,9 +2772,11 @@ fn load_records(
             reason,
         }
     })?;
+    let persisted_digest_is_valid = payload.terminal_set_digest == derived.terminal_set_digest
+        || payload.terminal_set_digest == compute_legacy_terminal_set_digest(&records);
     if payload.terminal_decision_generation != derived.terminal_decision_generation
         || payload.terminal_chain_digest != derived.terminal_chain_digest
-        || payload.terminal_set_digest != derived.terminal_set_digest
+        || !persisted_digest_is_valid
     {
         return Err(TerminalJournalError::InvalidMetadata {
             path: path.to_path_buf(),
@@ -2140,6 +2881,21 @@ fn validate_record(
     if record.terminal_decision().is_none() && record.terminal_resolver().is_some() {
         return Err(invalid(
             "nonterminal record retains a terminal resolver identity",
+        ));
+    }
+    if record.delivered && record.delivery_version.is_none() {
+        return Err(invalid(
+            "delivered commit is missing its repository version",
+        ));
+    }
+    if (record.delivery_version.is_some() || record.delivered)
+        && !matches!(
+            record.terminal_decision(),
+            Some(TerminalDecision::Commit { .. })
+        )
+    {
+        return Err(invalid(
+            "delivery metadata is only valid on a terminal commit",
         ));
     }
 
@@ -2255,7 +3011,8 @@ mod tests {
 
     use super::{
         FrozenTarget, TerminalDecision, TerminalJournal, TerminalJournalError, TerminalResolver,
-        take_terminal_set_digest_derivations, take_terminal_state_derivations,
+        take_terminal_set_digest_derivations, take_terminal_set_digest_record_visits,
+        take_terminal_set_preview_node_reads, take_terminal_state_derivations,
     };
 
     #[test]
@@ -2947,6 +3704,39 @@ mod tests {
             left.terminal_cut().chain_digest(),
             right.terminal_cut().chain_digest()
         );
+    }
+
+    #[test]
+    fn appending_terminal_decision_does_not_scan_cached_terminal_records() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        for op in 0..64 {
+            journal.upsert_abort_decision((op, op), op + 1).unwrap();
+        }
+        take_terminal_set_digest_record_visits();
+        take_terminal_set_preview_node_reads();
+
+        journal.upsert_abort_decision((64, 64), 65).unwrap();
+
+        assert_eq!(take_terminal_set_digest_record_visits(), 0);
+        assert_eq!(take_terminal_set_preview_node_reads(), 128);
+    }
+
+    #[test]
+    fn reload_preserves_generation_zero_digest_after_checkpoint_and_append() {
+        let root = TempDir::new().unwrap();
+        let generation_zero = {
+            let mut journal =
+                TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+            journal.upsert_abort_decision((1, 1), 1).unwrap();
+            journal.checkpoint(0).unwrap();
+            let generation_zero = journal.terminal_cut();
+            journal.upsert_abort_decision((2, 1), 2).unwrap();
+            assert_ne!(journal.terminal_cut(), generation_zero);
+            generation_zero
+        };
+
+        let reloaded = TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+        assert_eq!(reloaded.terminal_cut_at(0), Some(generation_zero));
     }
 
     #[test]
