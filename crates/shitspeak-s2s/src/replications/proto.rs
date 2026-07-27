@@ -15,15 +15,16 @@ pub use pb::{
     OwnerCatchupResp, OwnerMessage, OwnerOp, ReplicationMessage, StrictAccept, StrictAcceptAck,
     StrictAcceptedValue, StrictCatchupReason, StrictCatchupReq, StrictCatchupResp,
     StrictClockProbeReq, StrictClockProbeResp, StrictClockTick, StrictCommit, StrictDecision,
-    StrictDecisionAbort, StrictDecisionCommit, StrictFrozenTarget, StrictHistoryProbeReq,
-    StrictHistoryProbeResp, StrictHistoryTransferReq, StrictHistoryTransferResp, StrictMessage,
-    StrictOriginAuth, StrictPendingValue, StrictPropose, StrictProposeAck, StrictProposeV1,
-    StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq, StrictResolutionAck,
-    StrictResolutionHint, StrictResolutionPrepare, StrictTerminalCut, StrictTerminalDelta,
-    StrictTerminalPageKind, StrictTerminalState, StrictTerminalSyncAck, StrictTerminalSyncPage,
-    StrictTerminalSyncReq, StrictTerminalSyncStatus, blob_message::Body as BlobBody,
-    owner_message::Body as OwnerBody, replication_message::Body as ReplBody,
-    strict_decision::Outcome as StrictDecisionOutcome, strict_message::Body as StrictBody,
+    StrictDecisionAbort, StrictDecisionCommit, StrictFrozenTarget, StrictHeadAck,
+    StrictHistoryProbeReq, StrictHistoryProbeResp, StrictHistoryTransferReq,
+    StrictHistoryTransferResp, StrictMessage, StrictOriginAuth, StrictPendingValue, StrictPropose,
+    StrictProposeAck, StrictProposeV1, StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq,
+    StrictResolutionAck, StrictResolutionHint, StrictResolutionPrepare, StrictTerminalCut,
+    StrictTerminalDelta, StrictTerminalPageKind, StrictTerminalState, StrictTerminalSyncAck,
+    StrictTerminalSyncPage, StrictTerminalSyncReq, StrictTerminalSyncStatus,
+    blob_message::Body as BlobBody, owner_message::Body as OwnerBody,
+    replication_message::Body as ReplBody, strict_decision::Outcome as StrictDecisionOutcome,
+    strict_message::Body as StrictBody,
     strict_resolution_ack::Observed as StrictResolutionObserved,
     strict_terminal_state::Outcome as StrictTerminalOutcome,
 };
@@ -431,6 +432,7 @@ mod tests {
         let body = StrictBody::ClockTick(StrictClockTick {
             src_node: 7,
             src_clock: 41,
+            ..Default::default()
         });
         let auth = StrictOriginAuth {
             origin_node: 7,
@@ -796,6 +798,21 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_strict_v4_head_ack_binds_both_incarnations_and_head() {
+        let body = StrictBody::HeadAck(StrictHeadAck {
+            src_node: 3,
+            src_boot_epoch: 18,
+            expected_target_node: 7,
+            expected_target_boot_epoch: 24,
+            repository_version: 55,
+            terminal_set_digest: Bytes::from_static(b"set-55"),
+            history_freshness: 13,
+        });
+
+        assert_eq!(roundtrip_strict_body(body.clone()), body);
+    }
+
+    #[test]
     fn roundtrip_strict_propose_ack() {
         let msg = wrap_strict(
             "bans",
@@ -857,6 +874,7 @@ mod tests {
             StrictBody::ClockTick(StrictClockTick {
                 src_node: 1,
                 src_clock: 999,
+                ..Default::default()
             }),
         );
         let bytes = encode(&tick).unwrap();

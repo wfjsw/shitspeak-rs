@@ -57,6 +57,10 @@ message StrictMessage {
     StrictTerminalSyncReq    terminal_sync_req    = 22;
     StrictTerminalSyncPage   terminal_sync_page   = 23;
     StrictTerminalSyncAck    terminal_sync_ack    = 24;
+    // Explicit v4 convergence evidence. Both endpoint incarnations are
+    // bound so a delayed acknowledgement cannot clear evidence for a
+    // replacement process at either node.
+    StrictHeadAck            head_ack             = 25;
   }
   // End-to-end origin proof for routed strict traffic. The signature binds
   // the topic, oneof body, logical source node, and source boot epoch; it is
@@ -125,8 +129,24 @@ message StrictCommit {
 }
 
 message StrictClockTick {
-  uint32 src_node  = 1;
-  uint64 src_clock = 2;
+  uint32 src_node                = 1;
+  uint64 src_clock               = 2;
+  uint64 repository_version      = 3;
+  StrictTerminalCut terminal_cut = 4;
+  int64 history_freshness        = 5;
+}
+
+// Acknowledges that `src_node` durably observes the target incarnation's
+// advertised repository head. This is source-level protocol evidence, not an
+// overlay delivery acknowledgement.
+message StrictHeadAck {
+  uint32 src_node                   = 1;
+  uint64 src_boot_epoch             = 2;
+  uint32 expected_target_node       = 3;
+  uint64 expected_target_boot_epoch = 4;
+  uint64 repository_version         = 5;
+  bytes  terminal_set_digest        = 6;
+  int64  history_freshness           = 7;
 }
 
 // ------- Strict pairwise repair (v3) -------

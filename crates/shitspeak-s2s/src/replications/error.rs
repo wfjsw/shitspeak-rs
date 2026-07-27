@@ -40,4 +40,6 @@ pub enum ReplicationError {
         encoded_bytes: usize,
         max_bytes: usize,
     },
+    #[error("strict bulk admission is busy; retry after {retry_after:?}")]
+    StrictBulkAdmissionBusy { retry_after: std::time::Duration },
 }

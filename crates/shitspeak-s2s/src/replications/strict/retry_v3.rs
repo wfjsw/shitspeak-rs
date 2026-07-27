@@ -7,7 +7,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::super::proto::{StrictCatchupReq, StrictTerminalSyncAck, StrictTerminalSyncReq};
+use super::super::proto::{
+    StrictCatchupReq, StrictClockProbeReq, StrictHistoryProbeReq, StrictTerminalSyncAck,
+    StrictTerminalSyncReq,
+};
 use super::sync_v3::PeerIncarnation;
 use shitspeak_core::NodeIdentifier;
 
@@ -25,6 +28,8 @@ pub(super) struct V3RetryState {
     final_acks: HashMap<(PeerIncarnation, u64), Scheduled<StrictTerminalSyncAck>>,
     history_requests: HashMap<PeerIncarnation, Scheduled<StrictCatchupReq>>,
     history_final_acks: HashMap<(PeerIncarnation, u64), Scheduled<StrictCatchupReq>>,
+    clock_probes: HashMap<PeerIncarnation, Scheduled<StrictClockProbeReq>>,
+    history_probes: HashMap<PeerIncarnation, Scheduled<StrictHistoryProbeReq>>,
 }
 
 impl Default for V3RetryState {
@@ -34,6 +39,8 @@ impl Default for V3RetryState {
             final_acks: HashMap::new(),
             history_requests: HashMap::new(),
             history_final_acks: HashMap::new(),
+            clock_probes: HashMap::new(),
+            history_probes: HashMap::new(),
         }
     }
 }
@@ -156,6 +163,82 @@ impl V3RetryState {
         );
     }
 
+    pub(super) fn register_history_probe(
+        &mut self,
+        peer: PeerIncarnation,
+        request: StrictHistoryProbeReq,
+        initial_delay: Duration,
+        ttl: Duration,
+        jitter_pct: u32,
+        salt: u64,
+    ) {
+        let now = Instant::now();
+        let next_at = now
+            + jittered(
+                initial_delay,
+                jitter_pct,
+                identity_salt(peer, 0, request.request_nonce, 0, salt),
+            );
+        self.history_probes.insert(
+            peer,
+            Scheduled {
+                message: request,
+                delay: initial_delay,
+                next_at,
+                expires_at: now + ttl,
+                attempt: 0,
+            },
+        );
+    }
+
+    pub(super) fn register_clock_probe(
+        &mut self,
+        peer: PeerIncarnation,
+        request: StrictClockProbeReq,
+        initial_delay: Duration,
+        ttl: Duration,
+        jitter_pct: u32,
+        salt: u64,
+    ) {
+        let now = Instant::now();
+        let next_at = now
+            + jittered(
+                initial_delay,
+                jitter_pct,
+                identity_salt(peer, 0, request.request_nonce, 0, salt),
+            );
+        self.clock_probes.insert(
+            peer,
+            Scheduled {
+                message: request,
+                delay: initial_delay,
+                next_at,
+                expires_at: now + ttl,
+                attempt: 0,
+            },
+        );
+    }
+
+    pub(super) fn complete_clock_probe(&mut self, peer: PeerIncarnation, nonce: u64) {
+        if self
+            .clock_probes
+            .get(&peer)
+            .is_some_and(|pending| pending.message.request_nonce == nonce)
+        {
+            self.clock_probes.remove(&peer);
+        }
+    }
+
+    pub(super) fn complete_history_probe(&mut self, peer: PeerIncarnation, nonce: u64) {
+        if self
+            .history_probes
+            .get(&peer)
+            .is_some_and(|pending| pending.message.request_nonce == nonce)
+        {
+            self.history_probes.remove(&peer);
+        }
+    }
+
     pub(super) fn complete_history_request(&mut self, peer: PeerIncarnation, nonce: u64) {
         if self.history_requests.get(&peer).is_some_and(|pending| {
             pending
@@ -215,6 +298,7 @@ impl V3RetryState {
         Vec<(PeerIncarnation, StrictTerminalSyncAck)>,
         Vec<(PeerIncarnation, StrictCatchupReq)>,
         Vec<(PeerIncarnation, StrictCatchupReq)>,
+        Vec<(PeerIncarnation, StrictHistoryProbeReq)>,
     ) {
         self.expire(now);
         let mut requests = Vec::new();
@@ -287,7 +371,66 @@ impl V3RetryState {
             );
             advance_schedule(pending, now, max_delay, jitter_pct, schedule_salt);
         }
-        (requests, final_acks, history_requests, history_final_acks)
+        let mut history_probes = Vec::new();
+        for (peer, pending) in &mut self.history_probes {
+            if pending.next_at > now {
+                continue;
+            }
+            history_probes.push((*peer, pending.message.clone()));
+            let schedule_salt = identity_salt(
+                *peer,
+                0,
+                pending.message.request_nonce,
+                pending.attempt.saturating_add(1),
+                salt,
+            );
+            advance_schedule(pending, now, max_delay, jitter_pct, schedule_salt);
+        }
+        (
+            requests,
+            final_acks,
+            history_requests,
+            history_final_acks,
+            history_probes,
+        )
+    }
+
+    pub(super) fn due_clock_probes(
+        &mut self,
+        now: Instant,
+        max_delay: Duration,
+        jitter_pct: u32,
+        salt: u64,
+    ) -> Vec<(PeerIncarnation, StrictClockProbeReq)> {
+        self.clock_probes
+            .retain(|_, pending| pending.expires_at > now);
+        let mut probes = Vec::new();
+        for (peer, pending) in &mut self.clock_probes {
+            if pending.next_at > now {
+                continue;
+            }
+            probes.push((*peer, pending.message.clone()));
+            let schedule_salt = identity_salt(
+                *peer,
+                0,
+                pending.message.request_nonce,
+                pending.attempt.saturating_add(1),
+                salt,
+            );
+            advance_schedule(pending, now, max_delay, jitter_pct, schedule_salt);
+        }
+        probes
+    }
+
+    pub(super) fn clock_probe_is_current(
+        &self,
+        peer: PeerIncarnation,
+        request: &StrictClockProbeReq,
+    ) -> bool {
+        self.clock_probes.get(&peer).is_some_and(|pending| {
+            pending.message.request_nonce == request.request_nonce
+                && pending.message.reason == request.reason
+        })
     }
 
     pub(super) fn request_is_current(
@@ -360,12 +503,25 @@ impl V3RetryState {
             })
     }
 
+    pub(super) fn history_probe_is_current(
+        &self,
+        peer: PeerIncarnation,
+        request: &StrictHistoryProbeReq,
+    ) -> bool {
+        self.history_probes.get(&peer).is_some_and(|pending| {
+            pending.message.request_nonce == request.request_nonce
+                && pending.message.reason == request.reason
+        })
+    }
+
     pub(super) fn discard_peer(&mut self, node: NodeIdentifier) {
         self.requests.retain(|peer, _| peer.node() != node);
         self.final_acks.retain(|(peer, _), _| peer.node() != node);
         self.history_requests.retain(|peer, _| peer.node() != node);
         self.history_final_acks
             .retain(|(peer, _), _| peer.node() != node);
+        self.clock_probes.retain(|peer, _| peer.node() != node);
+        self.history_probes.retain(|peer, _| peer.node() != node);
     }
 
     fn expire(&mut self, now: Instant) {
@@ -375,6 +531,10 @@ impl V3RetryState {
         self.history_requests
             .retain(|_, pending| pending.expires_at > now);
         self.history_final_acks
+            .retain(|_, pending| pending.expires_at > now);
+        self.clock_probes
+            .retain(|_, pending| pending.expires_at > now);
+        self.history_probes
             .retain(|_, pending| pending.expires_at > now);
     }
 }
@@ -424,7 +584,9 @@ fn jittered(delay: Duration, jitter_pct: u32, salt: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{PeerIncarnation, V3RetryState, jittered};
-    use crate::replications::proto::{StrictTerminalSyncAck, StrictTerminalSyncReq};
+    use crate::replications::proto::{
+        StrictClockProbeReq, StrictHistoryProbeReq, StrictTerminalSyncAck, StrictTerminalSyncReq,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -456,7 +618,7 @@ mod tests {
             25,
             1,
         );
-        let (due, _, _, _) = state.due(Instant::now(), Duration::from_secs(5), 25, 1);
+        let (due, _, _, _, _) = state.due(Instant::now(), Duration::from_secs(5), 25, 1);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].1, initial);
 
@@ -478,6 +640,92 @@ mod tests {
         assert!(state.request_is_current(peer, &continuation));
         state.complete_request(peer, continuation.request_nonce);
         assert!(!state.request_is_current(peer, &continuation));
+    }
+
+    #[test]
+    fn history_probe_retries_one_identity_until_response() {
+        let peer = PeerIncarnation::new(7, 70);
+        let mut state = V3RetryState::default();
+        let request = StrictHistoryProbeReq {
+            request_nonce: 31,
+            reason: 7,
+            ..Default::default()
+        };
+        state.register_history_probe(
+            peer,
+            request.clone(),
+            Duration::ZERO,
+            Duration::from_secs(30),
+            0,
+            1,
+        );
+
+        let (_, _, _, _, due) = state.due(Instant::now(), Duration::from_secs(5), 0, 1);
+        assert_eq!(due, vec![(peer, request.clone())]);
+        assert!(state.history_probe_is_current(peer, &request));
+        state.complete_history_probe(peer, request.request_nonce);
+        assert!(!state.history_probe_is_current(peer, &request));
+    }
+
+    #[test]
+    fn clock_probe_retry_keeps_identity_and_doubles_to_the_bound() {
+        let peer = PeerIncarnation::new(7, 70);
+        let mut state = V3RetryState::default();
+        let request = StrictClockProbeReq {
+            request_nonce: 41,
+            reason: 5,
+            ..Default::default()
+        };
+        let registered_at = Instant::now();
+        state.register_clock_probe(
+            peer,
+            request.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            0,
+            1,
+        );
+
+        assert!(
+            state
+                .due_clock_probes(
+                    registered_at + Duration::from_millis(900),
+                    Duration::from_secs(2),
+                    0,
+                    1,
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            state.due_clock_probes(
+                registered_at + Duration::from_millis(1_100),
+                Duration::from_secs(2),
+                0,
+                1,
+            ),
+            vec![(peer, request.clone())]
+        );
+        assert!(
+            state
+                .due_clock_probes(
+                    registered_at + Duration::from_millis(3_000),
+                    Duration::from_secs(2),
+                    0,
+                    1,
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            state.due_clock_probes(
+                registered_at + Duration::from_millis(3_101),
+                Duration::from_secs(2),
+                0,
+                1,
+            ),
+            vec![(peer, request.clone())]
+        );
+        state.complete_clock_probe(peer, request.request_nonce);
+        assert!(!state.clock_probe_is_current(peer, &request));
     }
 
     #[test]

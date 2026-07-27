@@ -19,8 +19,10 @@ const REPLICATION_CAPABILITIES_FORMAT_VERSION: u32 = 1;
 pub(crate) const STRICT_PROTOCOL_VERSION_V2: u32 = 2;
 /// Pairwise correlated probes and terminal delta synchronization.
 pub(crate) const STRICT_PROTOCOL_VERSION_V3: u32 = 3;
+/// Explicit incarnation-bound durable repository-head acknowledgement.
+pub(crate) const STRICT_PROTOCOL_VERSION_V4: u32 = 4;
 /// Maximum strict participant capability advertised by this binary.
-pub(crate) const STRICT_PROTOCOL_VERSION_CURRENT: u32 = STRICT_PROTOCOL_VERSION_V3;
+pub(crate) const STRICT_PROTOCOL_VERSION_CURRENT: u32 = STRICT_PROTOCOL_VERSION_V4;
 
 /// Replication service participation advertised by one upper-layer endpoint.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -330,7 +332,8 @@ mod tests {
     fn current_participant_capability_does_not_change_v2_proposal_version() {
         assert_eq!(STRICT_PROTOCOL_VERSION_V2, 2);
         assert_eq!(STRICT_PROTOCOL_VERSION_V3, 3);
-        assert_eq!(STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V3);
+        assert_eq!(STRICT_PROTOCOL_VERSION_V4, 4);
+        assert_eq!(STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V4);
     }
 
     #[test]

@@ -745,11 +745,11 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
             };
             let peer = PeerIncarnation::new(from, epoch);
             if transfer.final_ack {
-                if rt
+                let accepted = rt
                     .v3_history
                     .lock()
-                    .acknowledge_server_final(peer, transfer)
-                {
+                    .acknowledge_server_final(peer, transfer);
+                if accepted {
                     rt.net.acknowledge_bulk_unicast(
                         from,
                         &rt.topic,
@@ -758,11 +758,16 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
                             transfer.acknowledged_request_nonce,
                         ),
                     );
+                    resume_deferred_v3_terminal_sync(rt, peer).await;
                 }
                 return;
             }
             if rt.v3_sync.lock().has_periodic_work(peer) {
-                return;
+                let yielded_nonce = rt.v3_sync.lock().yield_terminal_client_for_history(peer);
+                let Some(yielded_nonce) = yielded_nonce else {
+                    return;
+                };
+                rt.v3_retries.lock().complete_request(peer, yielded_nonce);
             }
             match rt.v3_history.lock().begin_server_request(
                 peer,
@@ -2547,36 +2552,43 @@ pub(super) async fn request_v3_clock_probe<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     dst: NodeIdentifier,
     reason: StrictCatchupReason,
-) {
+) -> bool {
     let Some(epoch) = rt.net.member_boot_epoch(dst) else {
-        return;
+        return false;
     };
     if !rt.v3_repair_supported_by(dst) {
-        return;
+        return false;
     }
     let Some(nonce) = rt.v3_sync.lock().record_clock_nonce(
         PeerIncarnation::new(dst, epoch),
         rt.cfg.pending_propose_ttl(),
     ) else {
-        return;
+        return false;
     };
     let peer = PeerIncarnation::new(dst, epoch);
-    let result = send_v3_metadata_control(
+    let request = StrictClockProbeReq {
+        src_node: rt.self_id as u32,
+        expected_responder_boot_epoch: epoch,
+        request_nonce: nonce,
+        reason: reason as i32,
+    };
+    rt.v3_retries.lock().register_clock_probe(
+        peer,
+        request.clone(),
+        rt.cfg.bulk_retry_delay(),
+        rt.cfg.pending_propose_ttl(),
+        rt.cfg.strict_bulk_retry_jitter_pct(),
+        v3_retry_salt(rt.self_id, &rt.topic),
+    );
+    send_v3_metadata_control(
         rt,
         dst,
-        StrictBody::ClockProbeReq(StrictClockProbeReq {
-            src_node: rt.self_id as u32,
-            expected_responder_boot_epoch: epoch,
-            request_nonce: nonce,
-            reason: reason as i32,
-        }),
+        StrictBody::ClockProbeReq(request),
         CatchupReason::from_v3_wire(reason as i32).unwrap_or(CatchupReason::DeliveryWatermark),
         CatchupPhase::Metadata,
     )
-    .await;
-    if result.is_err() {
-        rt.v3_sync.lock().cancel_clock_nonce(peer, nonce);
-    }
+    .await
+    .is_ok()
 }
 
 pub(super) async fn recv_v3_clock_probe_req<R: StrictReplicable>(
@@ -2630,7 +2642,70 @@ pub(super) fn recv_v3_clock_probe_resp<R: StrictReplicable>(
     {
         return;
     }
+    rt.v3_retries
+        .lock()
+        .complete_clock_probe(peer, resp.request_nonce);
     rt.accept_v3_clock_probe(from, epoch, resp.src_clock);
+}
+
+pub(super) struct PreparedHistoryProbe {
+    dst: NodeIdentifier,
+    body: StrictBody,
+    reason: CatchupReason,
+}
+
+pub(super) fn prepare_v3_history_probe<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    dst: NodeIdentifier,
+    reason: StrictCatchupReason,
+) -> Option<PreparedHistoryProbe> {
+    let Some(epoch) = rt.net.member_boot_epoch(dst) else {
+        return None;
+    };
+    if !rt.v3_repair_supported_by(dst) {
+        return None;
+    }
+    let Some(nonce) = rt.v3_sync.lock().record_history_nonce(
+        PeerIncarnation::new(dst, epoch),
+        reason as i32,
+        rt.cfg.pending_propose_ttl(),
+    ) else {
+        return None;
+    };
+    let request = StrictHistoryProbeReq {
+        src_node: rt.self_id as u32,
+        expected_responder_boot_epoch: epoch,
+        request_nonce: nonce,
+        reason: reason as i32,
+    };
+    rt.v3_retries.lock().register_history_probe(
+        PeerIncarnation::new(dst, epoch),
+        request.clone(),
+        rt.cfg.bulk_retry_delay(),
+        rt.cfg.pending_propose_ttl(),
+        rt.cfg.strict_bulk_retry_jitter_pct(),
+        v3_retry_salt(rt.self_id, &rt.topic),
+    );
+    Some(PreparedHistoryProbe {
+        dst,
+        body: StrictBody::HistoryProbeReq(request),
+        reason: CatchupReason::from_v3_wire(reason as i32)
+            .unwrap_or(CatchupReason::HistoryElection),
+    })
+}
+
+pub(super) async fn send_prepared_v3_history_probe<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    prepared: PreparedHistoryProbe,
+) {
+    let _ = send_v3_metadata_control(
+        rt,
+        prepared.dst,
+        prepared.body,
+        prepared.reason,
+        CatchupPhase::Metadata,
+    )
+    .await;
 }
 
 pub(super) async fn request_v3_history_probe<R: StrictReplicable>(
@@ -2638,36 +2713,10 @@ pub(super) async fn request_v3_history_probe<R: StrictReplicable>(
     dst: NodeIdentifier,
     reason: StrictCatchupReason,
 ) {
-    let Some(epoch) = rt.net.member_boot_epoch(dst) else {
+    let Some(prepared) = prepare_v3_history_probe(rt, dst, reason) else {
         return;
     };
-    if !rt.v3_repair_supported_by(dst) {
-        return;
-    }
-    let Some(nonce) = rt.v3_sync.lock().record_history_nonce(
-        PeerIncarnation::new(dst, epoch),
-        reason as i32,
-        rt.cfg.pending_propose_ttl(),
-    ) else {
-        return;
-    };
-    let peer = PeerIncarnation::new(dst, epoch);
-    let result = send_v3_metadata_control(
-        rt,
-        dst,
-        StrictBody::HistoryProbeReq(StrictHistoryProbeReq {
-            src_node: rt.self_id as u32,
-            expected_responder_boot_epoch: epoch,
-            request_nonce: nonce,
-            reason: reason as i32,
-        }),
-        CatchupReason::from_v3_wire(reason as i32).unwrap_or(CatchupReason::HistoryElection),
-        CatchupPhase::Metadata,
-    )
-    .await;
-    if result.is_err() {
-        rt.v3_sync.lock().cancel_history_nonce(peer, nonce);
-    }
+    send_prepared_v3_history_probe(rt, prepared).await;
 }
 
 pub(super) async fn recv_v3_history_probe_req<R: StrictReplicable>(
@@ -2708,6 +2757,70 @@ pub(super) async fn recv_v3_history_probe_req<R: StrictReplicable>(
     .await;
 }
 
+/// Admission is reciprocal: installing a peer's source cut locally does not
+/// prove that the peer covers the terminal fences required by this node.
+/// While this incarnation is awaiting history proof, only an advertised
+/// terminal set equal to the current local set may satisfy that proof.
+async fn accept_v3_history_metadata_if_admissible<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    peer: PeerIncarnation,
+    rank: HistoryRank,
+    advertised_cut: TerminalCut,
+) {
+    let awaits_admission_proof = rt
+        .state
+        .lock()
+        .peer_incarnation_awaits_history_proof(peer.node(), peer.boot_epoch());
+    if awaits_admission_proof
+        && advertised_cut.terminal_set_digest()
+            != rt
+                .terminal_journal
+                .lock()
+                .await
+                .terminal_cut()
+                .terminal_set_digest()
+    {
+        return;
+    }
+    rt.accept_v3_history_metadata(peer.node(), peer.boot_epoch(), rank);
+}
+
+/// Preserve repair evidence independently from a concurrent history election.
+/// The election may select another repository source, but it cannot erase a
+/// divergent terminal tail or repository gap owned by this exact peer.
+async fn preserve_v3_history_probe_obligation<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    peer: PeerIncarnation,
+    rank: HistoryRank,
+    source_cut: TerminalCut,
+    reason: StrictCatchupReason,
+) {
+    let terminal_equal = source_cut.terminal_set_digest()
+        == rt
+            .terminal_journal
+            .lock()
+            .await
+            .terminal_cut()
+            .terminal_set_digest();
+    let source_known = rt
+        .v3_sync
+        .lock()
+        .known_source_cut(peer)
+        .is_some_and(|known| source_cut_covers(known, source_cut));
+    if terminal_equal || source_known || source_cut.generation() == 0 {
+        rt.v3_sync.lock().remember_source_cut(peer, source_cut);
+        // The same response still belongs to the active election. Its winner
+        // owns repository history, so never launch a competing history client
+        // from this side obligation. Only a divergent terminal tail is
+        // independent enough to repair immediately.
+        return;
+    }
+    rt.v3_history
+        .lock()
+        .defer_until_terminal(peer, rank, source_cut, reason);
+    request_v3_terminal_sync_toward(rt, peer.node(), reason, Some(source_cut)).await;
+}
+
 pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     from: NodeIdentifier,
@@ -2732,7 +2845,11 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
     else {
         return;
     };
+    rt.v3_retries
+        .lock()
+        .complete_history_probe(peer, resp.request_nonce);
     let effective_reason = accepted_probe.reason();
+    let election_pending = accepted_probe.election_pending();
     let Some(mut reason) = StrictCatchupReason::try_from(effective_reason).ok() else {
         return;
     };
@@ -2763,35 +2880,37 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         node_id: from,
     };
     let response_cut = valid_cut.expect("validated terminal cut");
-    if reason == StrictCatchupReason::HistoryElection && accepted_probe.admission_pending() {
-        // Admission and election metadata share one nonce, but not one data
-        // transfer. Preserve the admission evidence until the election has
-        // completely stood down; repository history remains sourced only
-        // from the elected candidate.
-        rt.v3_history
-            .lock()
-            .defer_admission(peer, rank, response_cut);
+    let repair_reason = accepted_probe
+        .repair_reason()
+        .or_else(|| {
+            (election_pending
+                && !matches!(
+                    reason,
+                    StrictCatchupReason::HistoryElection | StrictCatchupReason::Admission
+                ))
+            .then_some(reason as i32)
+        })
+        .and_then(|value| StrictCatchupReason::try_from(value).ok());
+    if let Some(repair_reason) = repair_reason {
+        preserve_v3_history_probe_obligation(rt, peer, rank, response_cut, repair_reason).await;
+    }
+    let election_requested = reason == StrictCatchupReason::HistoryElection || election_pending;
+    if election_requested {
+        if accepted_probe.admission_pending() || reason == StrictCatchupReason::Admission {
+            // Admission remains an independent reciprocal obligation even
+            // while the same metadata response feeds the election collector.
+            rt.v3_history
+                .lock()
+                .defer_admission(peer, rank, response_cut);
+        }
+        reason = StrictCatchupReason::HistoryElection;
     }
     if reason == StrictCatchupReason::HistoryElection {
         // Startup election and admission often overlap. Metadata from an
         // election candidate is also a valid admission proof only when its
         // terminal fence is already known complete locally. A divergent cut
         // remains metadata-only until the elected source is synchronized.
-        let response_terminal_equal = response_cut.terminal_set_digest()
-            == rt
-                .terminal_journal
-                .lock()
-                .await
-                .terminal_cut()
-                .terminal_set_digest();
-        let response_source_known = rt
-            .v3_sync
-            .lock()
-            .known_source_cut(peer)
-            .is_some_and(|known| source_cut_covers(known, response_cut));
-        if response_terminal_equal || response_source_known {
-            rt.accept_v3_history_metadata(from, epoch, rank);
-        }
+        accept_v3_history_metadata_if_admissible(rt, peer, rank, response_cut).await;
     }
     let (source_peer, rank, source_cut) = if reason == StrictCatchupReason::HistoryElection {
         let Some(selected) = rt.record_v3_history_election_rank(peer, rank, response_cut) else {
@@ -2808,7 +2927,6 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         return;
     }
     let source_node = source_peer.node();
-    let source_epoch = source_peer.boot_epoch();
     let terminal_equal = source_cut.terminal_set_digest()
         == rt
             .terminal_journal
@@ -2838,7 +2956,7 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
             start_v3_repository_after_terminal(rt, source_peer, None).await;
             return;
         }
-        rt.accept_v3_history_metadata(source_node, source_epoch, rank);
+        accept_v3_history_metadata_if_admissible(rt, source_peer, rank, source_cut).await;
         if reason == StrictCatchupReason::HistoryElection {
             rt.state.lock().finish_history_election();
         }
@@ -2919,7 +3037,7 @@ pub(super) async fn resume_deferred_v3_admissions<R: StrictReplicable>(rt: &Stri
                 start_v3_repository_after_terminal(rt, peer, None).await;
                 continue;
             }
-            rt.accept_v3_history_metadata(peer.node(), peer.boot_epoch(), rank);
+            accept_v3_history_metadata_if_admissible(rt, peer, rank, source_cut).await;
             continue;
         }
         rt.v3_history.lock().defer_until_terminal(
@@ -2963,7 +3081,7 @@ async fn start_v3_repository_after_terminal<R: StrictReplicable>(
             .defer_until_terminal(peer, rank, source_cut, reason);
         return false;
     }
-    rt.accept_v3_history_metadata(peer.node(), peer.boot_epoch(), rank);
+    accept_v3_history_metadata_if_admissible(rt, peer, rank, source_cut).await;
     if matches!(
         reason,
         StrictCatchupReason::TerminalFence | StrictCatchupReason::DeliveryWatermark
@@ -3113,6 +3231,9 @@ fn record_terminal_send_result<R: StrictReplicable>(
     result: &Result<(), ReplicationError>,
 ) {
     let Some(event) = result.as_ref().err().map(|error| match error {
+        ReplicationError::StrictBulkAdmissionBusy { .. } => {
+            SessionEvent::SendBackpressured { wire }
+        }
         ReplicationError::Overlay(error) if replication_bulk_backpressure(error) => {
             SessionEvent::SendBackpressured { wire }
         }
@@ -3126,7 +3247,7 @@ fn record_terminal_send_result<R: StrictReplicable>(
     rt.v3_sync.lock().transition_session(peer, event);
 }
 
-async fn request_v3_terminal_sync_toward<R: StrictReplicable>(
+pub(super) async fn request_v3_terminal_sync_toward<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     dst: NodeIdentifier,
     reason: StrictCatchupReason,
@@ -3167,7 +3288,7 @@ async fn request_v3_terminal_sync_toward<R: StrictReplicable>(
         // source cut is validated and retained by the payload coordinator.
         // Align them before every new/coalesced trigger so direct decisions
         // and a prior completed transfer become the exact delta baseline.
-        if let Some(known) = sync.known_source_cut(peer) {
+        if let Some(known) = sync.reusable_source_cut(peer) {
             sync.transition_session(
                 peer,
                 SessionEvent::SourceCutObserved {
@@ -3225,10 +3346,10 @@ async fn start_reducer_owned_terminal_client<R: StrictReplicable>(
     let set_digest = Bytes::copy_from_slice(
         rt.terminal_journal
             .lock()
+            .await
             .terminal_cut()
             .terminal_set_digest(),
     );
-            .await
     let request = StrictTerminalSyncReq {
         src_node: rt.self_id as u32,
         expected_responder_boot_epoch: peer.boot_epoch(),
@@ -3327,12 +3448,40 @@ pub(super) async fn retry_v3_terminal_transmissions<R: StrictReplicable>(rt: &St
         }
     }
     let salt = v3_retry_salt(rt.self_id, &rt.topic);
-    let (requests, final_acks, history_requests, history_final_acks) = rt.v3_retries.lock().due(
+    let (requests, final_acks, history_requests, history_final_acks, history_probes) =
+        rt.v3_retries.lock().due(
+            now,
+            rt.cfg.strict_bulk_retry_max_delay(),
+            rt.cfg.strict_bulk_retry_jitter_pct(),
+            salt,
+        );
+    let clock_probes = rt.v3_retries.lock().due_clock_probes(
         now,
         rt.cfg.strict_bulk_retry_max_delay(),
         rt.cfg.strict_bulk_retry_jitter_pct(),
         salt,
     );
+    for (peer, request) in clock_probes {
+        if v3_peer(rt, peer.node(), peer.boot_epoch()).is_none()
+            || !rt.v3_retries.lock().clock_probe_is_current(peer, &request)
+            || !rt
+                .v3_sync
+                .lock()
+                .clock_nonce_is_current(peer, request.request_nonce)
+        {
+            continue;
+        }
+        let reason =
+            CatchupReason::from_v3_wire(request.reason).unwrap_or(CatchupReason::DeliveryWatermark);
+        let _ = retry_v3_metadata_control(
+            rt,
+            peer.node(),
+            StrictBody::ClockProbeReq(request),
+            reason,
+            CatchupPhase::Metadata,
+        )
+        .await;
+    }
     for (peer, request) in requests {
         if v3_peer(rt, peer.node(), peer.boot_epoch()).is_none()
             || !rt.v3_retries.lock().request_is_current(peer, &request)
@@ -3452,6 +3601,30 @@ pub(super) async fn retry_v3_terminal_transmissions<R: StrictReplicable>(rt: &St
             )
             .await;
     }
+    for (peer, request) in history_probes {
+        if v3_peer(rt, peer.node(), peer.boot_epoch()).is_none()
+            || !rt
+                .v3_retries
+                .lock()
+                .history_probe_is_current(peer, &request)
+            || !rt
+                .v3_sync
+                .lock()
+                .history_nonce_is_current(peer, request.request_nonce)
+        {
+            continue;
+        }
+        let reason =
+            CatchupReason::from_v3_wire(request.reason).unwrap_or(CatchupReason::RepositoryGap);
+        let _ = retry_v3_metadata_control(
+            rt,
+            peer.node(),
+            StrictBody::HistoryProbeReq(request),
+            reason,
+            CatchupPhase::Metadata,
+        )
+        .await;
+    }
     for (peer, reason, desired_cut) in expired_deferred {
         if v3_peer(rt, peer.node(), peer.boot_epoch()).is_none() {
             continue;
@@ -3489,10 +3662,10 @@ fn v3_error_page<R: StrictReplicable>(
 
 fn render_v3_page<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
+    journal: &TerminalJournal,
     session: &ResponderSession,
     nonce: u64,
     epoch: u64,
-    journal: &TerminalJournal,
 ) -> Option<(StrictTerminalSyncPage, u64, Option<TerminalCut>)> {
     let limit = rt.cfg.strict_max_catchup_ops().max(1);
     let byte_limit = rt.strict_catchup_response_budget();
@@ -3940,10 +4113,10 @@ pub(super) async fn recv_v3_terminal_sync_req<R: StrictReplicable>(
     };
     let now = Instant::now();
     let ttl = rt.cfg.pending_propose_ttl();
+    let journal = rt.terminal_journal.lock().await;
     let response = {
         let mut sync = rt.v3_sync.lock();
         sync.expire(now);
-    let journal = rt.terminal_journal.lock().await;
 
         (|| -> Option<(StrictTerminalSyncPage, Option<BulkPageIdentity>, bool)> {
             if req.transfer_id != 0 {
@@ -4101,6 +4274,7 @@ pub(super) async fn recv_v3_terminal_sync_req<R: StrictReplicable>(
             Some((page, None, true))
         })()
     };
+    drop(journal);
 
     let Some((page, acknowledged_bulk_page, record_logical)) = response else {
         return;
@@ -4576,9 +4750,6 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
                 client.reason(),
             )
         };
-        let request = StrictTerminalSyncReq {
-            src_node: rt.self_id as u32,
-            expected_responder_boot_epoch: epoch,
         let known_source_cut = rt.v3_sync.lock().known_source_cut(peer).map(cut_to_wire);
         let requester_terminal_set_digest = Bytes::copy_from_slice(
             rt.terminal_journal
@@ -4587,6 +4758,9 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
                 .terminal_cut()
                 .terminal_set_digest(),
         );
+        let request = StrictTerminalSyncReq {
+            src_node: rt.self_id as u32,
+            expected_responder_boot_epoch: epoch,
             reason,
             known_source_cut,
             requester_terminal_set_digest,

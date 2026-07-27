@@ -590,6 +590,7 @@ mod tests {
             StrictBody::ClockTick(StrictClockTick {
                 src_node: 1,
                 src_clock: 9,
+                ..Default::default()
             }),
         );
         let payload = repl_proto::encode(&repl).unwrap();

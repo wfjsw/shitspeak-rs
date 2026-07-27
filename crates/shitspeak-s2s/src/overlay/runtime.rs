@@ -97,14 +97,16 @@ async fn apply_ordering_membership_event(
     event: &super::MembershipEvent,
 ) -> Option<NodeIdentifier> {
     match event {
-        // Failed and Left are terminal membership decisions for the observed
-        // incarnation. Purge its retained packets immediately so a dead peer
-        // cannot consume the ordered pending window indefinitely. Restarted
-        // likewise invalidates packets addressed to the previous boot epoch.
+        // Left is a terminal membership decision for the observed
+        // incarnation. Purge its retained packets immediately so a departed
+        // peer cannot consume the ordered pending window indefinitely.
+        // Restarted likewise invalidates packets addressed to the previous
+        // boot epoch. Failed is only reachability suspicion: the same boot
+        // epoch must retain ordered and transport state across partition heal.
         // This subscriber owns only overlay ordering state; replication
         // membership subscribers still receive the event independently and
         // retain responsibility for owner-origin shutdown/cleanup.
-        super::MembershipEvent::Failed(node) | super::MembershipEvent::Left(node) => {
+        super::MembershipEvent::Left(node) => {
             ordering.reset_peer(node.node_id()).await;
             Some(node.node_id())
         }
@@ -114,7 +116,7 @@ async fn apply_ordering_membership_event(
             ordering.reset_peer(node.node_id()).await;
             None
         }
-        super::MembershipEvent::Joined(_) => None,
+        super::MembershipEvent::Failed(_) | super::MembershipEvent::Joined(_) => None,
     }
 }
 
@@ -890,13 +892,12 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[tokio::test]
-    async fn terminal_membership_events_purge_only_the_affected_peer() {
+    async fn terminal_left_event_purges_only_the_affected_peer() {
         let lane = super::super::LaneId::new(NonZeroU32::new(7).unwrap());
 
-        for event in [
-            super::super::MembershipEvent::Failed(super::super::MemberIncarnation::new(9, 7)),
-            super::super::MembershipEvent::Left(super::super::MemberIncarnation::new(9, 7)),
-        ] {
+        for event in [super::super::MembershipEvent::Left(
+            super::super::MemberIncarnation::new(9, 7),
+        )] {
             let ordering = OverlayOrdering::default();
             assert_eq!(ordering.next_outbound_seq(9, lane).await, 0);
             assert_eq!(ordering.next_outbound_seq(10, lane).await, 0);
@@ -939,6 +940,27 @@ mod tests {
             ordering.next_outbound_seq(9, lane).await,
             1,
             "a live/same-epoch event must not discard retained delivery state"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_failure_preserves_same_incarnation_ordering_and_transport() {
+        let ordering = OverlayOrdering::default();
+        let lane = super::super::LaneId::new(NonZeroU32::new(7).unwrap());
+        let peer = 9;
+        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 0);
+
+        let retire = apply_ordering_membership_event(
+            &ordering,
+            &super::super::MembershipEvent::Failed(super::super::MemberIncarnation::new(peer, 7)),
+        )
+        .await;
+
+        assert_eq!(retire, None, "failure suspicion is not incarnation death");
+        assert_eq!(
+            ordering.next_outbound_seq(peer, lane).await,
+            1,
+            "same-epoch heal must continue the ordered sequence"
         );
     }
 

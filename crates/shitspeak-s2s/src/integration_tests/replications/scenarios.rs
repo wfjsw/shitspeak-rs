@@ -1263,7 +1263,20 @@ async fn strict_channel_repository_split_heal_preserves_all_terminal_commits() {
                 .unwrap(),
         );
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            cluster
+                .managers
+                .iter()
+                .all(|manager| manager.strict_capability_activation_ready())
+                && strict_protocol_floors(&cluster)
+                    .iter()
+                    .all(|(_, version)| *version == STRICT_PROTOCOL_VERSION_CURRENT)
+        })
+        .await,
+        "split-heal requires v3 head evidence before divergence: floors={:?}",
+        strict_protocol_floors(&cluster),
+    );
 
     for channel_id in [10, 11] {
         handles[0]
@@ -1354,8 +1367,12 @@ async fn strict_channel_repository_split_heal_preserves_all_terminal_commits() {
     let healed = wait_for_converged_channel_history(&repos, Duration::from_secs(45)).await;
     if !healed {
         panic!(
-            "healed cluster did not converge on all terminal channel commits: {:?}",
-            channel_history_status(&repos).await
+            "healed cluster did not converge on all terminal channel commits: histories={:?} states={:?}",
+            channel_history_status(&repos).await,
+            handles
+                .iter()
+                .map(|handle| handle.debug_state())
+                .collect::<Vec<_>>()
         );
     }
 

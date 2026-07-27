@@ -14,6 +14,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use aws_lc_rs::digest::{SHA256, digest};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use prost::Message as _;
@@ -27,15 +28,15 @@ use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
 use super::super::metrics::{
     self, CatchupMode, CatchupPhase, CatchupReason, ReplicationPipelineKind,
-    ReplicationPipelineStage, StrictCatchupBackpressureEvent, StrictCatchupLane,
-    StrictCatchupSendOutcome, StrictCatchupSessionOutcome,
+    ReplicationPipelineStage, StrictCatchupLane, StrictCatchupSendOutcome,
+    StrictCatchupSessionOutcome,
 };
 use super::super::proto::{
     self as repl_proto, REPLICATION_SERVICE_TAG, StrictAccept, StrictAcceptAck,
     StrictAcceptedValue, StrictBody, StrictCatchupReq, StrictCatchupResp, StrictClockTick,
     StrictCommit, StrictDecision, StrictDecisionAbort, StrictDecisionCommit, StrictDecisionOutcome,
-    StrictFrozenTarget, StrictOriginAuth, StrictPendingValue, StrictPropose, StrictProposeAck,
-    StrictProposeV1, StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq,
+    StrictFrozenTarget, StrictHeadAck, StrictOriginAuth, StrictPendingValue, StrictPropose,
+    StrictProposeAck, StrictProposeV1, StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq,
     StrictResolutionAck, StrictResolutionHint, StrictResolutionObserved, StrictResolutionPrepare,
     StrictTerminalCut, StrictTerminalOutcome, StrictTerminalState,
 };
@@ -53,6 +54,7 @@ use super::session_reducer::{
 };
 use super::sync_v3::{
     PeerIncarnation, SourceTransitionOutcome, SyncV3State, cut_from_wire, cut_to_reducer,
+    cut_to_wire, source_cut_covers,
 };
 use super::terminal_journal::{
     FrozenTarget, TerminalCut, TerminalDecision as JournalTerminalDecision, TerminalJournal,
@@ -81,6 +83,8 @@ pub(super) const STRICT_PROTOCOL_VERSION_V2: u32 =
     super::super::protocol::STRICT_PROTOCOL_VERSION_V2;
 pub(super) const STRICT_PROTOCOL_VERSION_V3: u32 =
     super::super::protocol::STRICT_PROTOCOL_VERSION_V3;
+pub(super) const STRICT_PROTOCOL_VERSION_V4: u32 =
+    super::super::protocol::STRICT_PROTOCOL_VERSION_V4;
 /// Hard ceiling for pairwise-v3 metadata carried on the redundant regular
 /// control path. This bounds the strict envelope and nested protobuf body;
 /// mandatory origin-proof material has separate certificate/signature bounds.
@@ -114,6 +118,17 @@ fn strict_replication_transport_options(
     } else {
         options
     }
+}
+
+/// Stable identity for one logical strict protocol transmission. The ordered
+/// overlay owns retransmission after accepting this identity, so protocol
+/// retries reuse that ownership instead of allocating another retained seq.
+fn strict_retained_logical_send(topic: &str, body: &StrictBody) -> [u8; 32] {
+    let encoded = repl_proto::wrap_strict(topic, body.clone()).encode_to_vec();
+    let hash = digest(&SHA256, &encoded);
+    let mut identity = [0; 32];
+    identity.copy_from_slice(hash.as_ref());
+    identity
 }
 
 /// Independent salts keep the periodic strict-repair lanes from lining up
@@ -597,8 +612,6 @@ pub(crate) struct OverlayStrictNet {
     overlay: OverlayNetwork,
     participant_capability: Arc<StrictParticipantCapability>,
     bulk_pacer: Arc<BulkPacer>,
-    bulk_retry_max_delay: Duration,
-    bulk_retry_jitter_pct: u32,
     bulk_reservation_ttl: Duration,
     consensus_rtt_margin: Duration,
     transport_ttl_min: Duration,
@@ -722,8 +735,6 @@ impl OverlayStrictNet {
                 cfg.strict_bulk_max_in_flight_bytes_per_next_hop(),
                 cfg.strict_bulk_rate_bytes_per_second_per_next_hop(),
             ),
-            bulk_retry_max_delay: cfg.strict_bulk_retry_max_delay(),
-            bulk_retry_jitter_pct: cfg.strict_bulk_retry_jitter_pct(),
             bulk_reservation_ttl: cfg.pending_propose_ttl(),
             consensus_rtt_margin: cfg.strict_consensus_rtt_margin(),
             transport_ttl_min: cfg.strict_transport_ttl_min(),
@@ -830,6 +841,7 @@ impl OverlayStrictNet {
         body: StrictBody,
         catchup_metric: Option<(CatchupReason, CatchupPhase)>,
     ) -> Result<(), ReplicationError> {
+        let retained_logical_send = strict_retained_logical_send(topic, &body);
         let v3_metadata_len = is_v3_metadata_control(&body)
             .then(|| repl_proto::wrap_strict(topic, body.clone()).encoded_len());
         let bytes = self.encode_strict_payload(topic, body)?;
@@ -863,7 +875,8 @@ impl OverlayStrictNet {
                 RoutingMetric::ReliableCost,
                 STRICT_REPLICATION_MESSAGE_CLASS,
                 bytes.clone(),
-                strict_replication_transport_options(false, self.transport_ttl(&[dst])),
+                strict_replication_transport_options(false, self.transport_ttl(&[dst]))
+                    .retain_logical_send(retained_logical_send),
             )
             .await;
         if let Some((reason, phase)) = catchup_metric {
@@ -897,6 +910,7 @@ impl OverlayStrictNet {
                 STRICT_REPLICATION_MESSAGE_CLASS,
                 bytes,
                 strict_replication_transport_options(false, self.transport_ttl(&[dst]))
+                    .retain_logical_send(retained_logical_send)
                     .avoid_first_hop(primary_next_hop),
             )
             .await;
@@ -924,9 +938,10 @@ impl OverlayStrictNet {
         dst: NodeIdentifier,
         topic: &str,
         body: StrictBody,
-        retry_delay: Duration,
+        _retry_delay: Duration,
         catchup_metric: Option<(CatchupReason, CatchupPhase)>,
     ) -> Result<(), ReplicationError> {
+        let retained_logical_send = strict_retained_logical_send(topic, &body);
         let page_identity = bulk_page_identity(&body);
         let encode_started_at = Instant::now();
         let encoded = self.encode_strict_payload(topic, body);
@@ -937,127 +952,83 @@ impl OverlayStrictNet {
         );
         let bytes = encoded?;
         let encoded_len = bytes.len();
-        let min_delay = Duration::from_millis(1);
-        let max_delay = self.bulk_retry_max_delay.max(min_delay);
-        let mut backoff = retry_delay.max(min_delay).min(max_delay);
-        let mut retry_attempt = 0u32;
-        let mut attempted_max_delay = false;
-
-        loop {
-            let next_hop = self.overlay.route_to_with_metric(
+        let next_hop = self.overlay.route_to_with_metric(
+            dst,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+        );
+        if next_hop.is_none() {
+            return Err(ReplicationError::Overlay(
+                crate::overlay::OverlayError::Send(
+                    shitspeak_s2s_transport::SendError::NoSuitableTransport { node: dst },
+                ),
+            ));
+        }
+        // Only v3 pages have a correlated requester/reducer that can safely
+        // re-drive a nonblocking Busy result. Legacy v1/v2 responses rely on
+        // the ordered Reliable lane itself once accepted and must not be
+        // abandoned by a pacer rejection with no cached-page owner.
+        let reservation = if page_identity != BulkPageIdentity::Legacy
+            && let Some(next_hop) = next_hop
+        {
+            Some(
+                self.bulk_pacer
+                    .try_reserve(dst, topic, page_identity, next_hop, encoded_len)
+                    .map_err(|error| match error {
+                        BulkAdmissionError::Busy { retry_after } => {
+                            ReplicationError::StrictBulkAdmissionBusy { retry_after }
+                        }
+                        BulkAdmissionError::FrameTooLarge {
+                            encoded_bytes,
+                            max_bytes,
+                        } => ReplicationError::StrictBulkFrameTooLarge {
+                            encoded_bytes,
+                            max_bytes,
+                        },
+                    })?,
+            )
+        } else {
+            None
+        };
+        let result = self
+            .overlay
+            .send_unicast_on_lane_with_routing_metric_and_options(
                 dst,
+                STRICT_BULK_LANE,
+                REPLICATION_SERVICE_TAG,
                 ServiceLevel::Reliable,
                 RoutingMetric::ReliableCost,
-            );
-            let reservation = if let Some(next_hop) = next_hop {
-                Some(
-                    self.bulk_pacer
-                        .reserve(dst, topic, page_identity, next_hop, encoded_len)
-                        .await
-                        .map_err(|error| match error {
-                            BulkAdmissionError::FrameTooLarge {
-                                encoded_bytes,
-                                max_bytes,
-                            } => ReplicationError::StrictBulkFrameTooLarge {
-                                encoded_bytes,
-                                max_bytes,
-                            },
-                        })?,
-                )
+                STRICT_REPLICATION_MESSAGE_CLASS,
+                bytes.clone(),
+                strict_replication_transport_options(true, self.transport_ttl(&[dst]))
+                    .retain_logical_send(retained_logical_send),
+            )
+            .await;
+
+        if let Some((reason, phase)) = catchup_metric {
+            let outcome = if result.is_ok() {
+                StrictCatchupSendOutcome::Enqueued
+            } else if result.as_ref().is_err_and(replication_bulk_backpressure) {
+                StrictCatchupSendOutcome::Backpressured
             } else {
-                None
+                StrictCatchupSendOutcome::Rejected
             };
-            let result = self
-                .overlay
-                .send_unicast_on_lane_with_routing_metric_and_options(
-                    dst,
-                    STRICT_BULK_LANE,
-                    REPLICATION_SERVICE_TAG,
-                    ServiceLevel::Reliable,
-                    RoutingMetric::ReliableCost,
-                    STRICT_REPLICATION_MESSAGE_CLASS,
-                    bytes.clone(),
-                    strict_replication_transport_options(true, self.transport_ttl(&[dst])),
-                )
-                .await;
-
-            let backpressured = result.as_ref().is_err_and(replication_bulk_backpressure);
-            if let Some((reason, phase)) = catchup_metric {
-                let outcome = if result.is_ok() {
-                    if retry_attempt == 0 {
-                        StrictCatchupSendOutcome::Enqueued
-                    } else {
-                        StrictCatchupSendOutcome::RetryEnqueued
-                    }
-                } else if backpressured && attempted_max_delay {
-                    StrictCatchupSendOutcome::Exhausted
-                } else if backpressured {
-                    StrictCatchupSendOutcome::Backpressured
-                } else {
-                    StrictCatchupSendOutcome::Rejected
-                };
-                metrics::record_strict_catchup_send_attempt(
-                    reason,
-                    phase,
-                    StrictCatchupLane::Bulk,
-                    outcome,
-                    encoded_len,
-                );
-            }
-
-            match result {
-                Ok(()) => {
-                    if let Some(reservation) = reservation {
-                        reservation.retain_until(self.bulk_reservation_ttl);
-                    }
-                    return Ok(());
+            metrics::record_strict_catchup_send_attempt(
+                reason,
+                phase,
+                StrictCatchupLane::Bulk,
+                outcome,
+                encoded_len,
+            );
+        }
+        match result {
+            Ok(()) => {
+                if let Some(reservation) = reservation {
+                    reservation.retain_until(self.bulk_reservation_ttl);
                 }
-                Err(error) if replication_bulk_backpressure(&error) => {
-                    drop(reservation);
-                    if attempted_max_delay {
-                        if let Some((reason, phase)) = catchup_metric {
-                            metrics::record_strict_catchup_backpressure(
-                                reason,
-                                phase,
-                                StrictCatchupBackpressureEvent::ExhaustedRetry,
-                                Duration::ZERO,
-                            );
-                        }
-                        return Err(error.into());
-                    }
-                    metrics::record_strict_catchup_throttled(
-                        metrics::StrictCatchupThrottleReason::Backoff,
-                    );
-                    let delay = strict_bulk_retry_delay_with_jitter(
-                        backoff,
-                        self.bulk_retry_jitter_pct,
-                        self.overlay.local_node_id(),
-                        dst,
-                        topic,
-                        retry_attempt,
-                    );
-                    if let Some((reason, phase)) = catchup_metric {
-                        metrics::record_strict_catchup_backpressure(
-                            reason,
-                            phase,
-                            if retry_attempt == 0 {
-                                StrictCatchupBackpressureEvent::Backpressured
-                            } else {
-                                StrictCatchupBackpressureEvent::Retry
-                            },
-                            delay,
-                        );
-                    }
-                    sleep(delay).await;
-                    retry_attempt = retry_attempt.saturating_add(1);
-                    if backoff >= max_delay {
-                        attempted_max_delay = true;
-                    } else {
-                        backoff = backoff.saturating_mul(2).min(max_delay);
-                    }
-                }
-                Err(error) => return Err(error.into()),
+                Ok(())
             }
+            Err(error) => Err(error.into()),
         }
     }
 }
@@ -1219,6 +1190,7 @@ impl StrictNet for OverlayStrictNet {
         topic: &str,
         body: StrictBody,
     ) -> Result<(), ReplicationError> {
+        let retained_logical_send = strict_retained_logical_send(topic, &body);
         let allow_l1_compression = matches!(&body, StrictBody::CatchupResp(_));
         let encode_started_at = Instant::now();
         let encoded = self.encode_strict_payload(topic, body);
@@ -1240,7 +1212,8 @@ impl StrictNet for OverlayStrictNet {
                 strict_replication_transport_options(
                     allow_l1_compression,
                     self.transport_ttl(&[dst]),
-                ),
+                )
+                .retain_logical_send(retained_logical_send),
             )
             .await?;
         Ok(())
@@ -1309,6 +1282,7 @@ impl StrictNet for OverlayStrictNet {
         if dsts.is_empty() {
             return Ok(());
         }
+        let retained_logical_send = strict_retained_logical_send(topic, &body);
         let encode_started_at = Instant::now();
         let encoded = self.encode_strict_payload(topic, body);
         metrics::record_pipeline_stage(
@@ -1326,7 +1300,8 @@ impl StrictNet for OverlayStrictNet {
                 RoutingMetric::ReliableCost,
                 STRICT_REPLICATION_MESSAGE_CLASS,
                 bytes,
-                strict_replication_transport_options(false, self.transport_ttl(dsts)),
+                strict_replication_transport_options(false, self.transport_ttl(dsts))
+                    .retain_logical_send(retained_logical_send),
             )
             .await?;
         Ok(())
@@ -1469,38 +1444,6 @@ pub(super) fn replication_bulk_backpressure(error: &crate::overlay::OverlayError
         error,
         crate::overlay::OverlayError::Send(shitspeak_s2s_transport::SendError::Backpressure { .. })
     )
-}
-
-fn strict_bulk_retry_delay_with_jitter(
-    base: Duration,
-    jitter_pct: u32,
-    source: NodeIdentifier,
-    destination: NodeIdentifier,
-    topic: &str,
-    attempt: u32,
-) -> Duration {
-    let pct = jitter_pct.min(100) as u64;
-    if pct == 0 {
-        return base;
-    }
-
-    // Stable FNV-1a input makes admission/retry timing reproducible while
-    // ensuring nodes and topics healed on the same tick do not synchronize.
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in source
-        .to_le_bytes()
-        .into_iter()
-        .chain(destination.to_le_bytes())
-        .chain(attempt.to_le_bytes())
-        .chain(topic.as_bytes().iter().copied())
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let width = pct.saturating_mul(2).saturating_add(1);
-    let factor = 100u64.saturating_sub(pct) + hash % width;
-    let nanos = base.as_nanos().saturating_mul(u128::from(factor)) / 100;
-    Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
 }
 
 // ---------- State machine ----------
@@ -2634,10 +2577,8 @@ impl StrictState {
         self.history_alive_peers = peers;
         if expanded && !self.history_election_requested && !self.history_election_active() {
             self.request_history_election();
-            true
-        } else {
-            false
         }
+        expanded
     }
 
     /// Reconcile an in-flight history election with the currently usable
@@ -3165,6 +3106,19 @@ fn phase_two_completion_grace(cfg: &ReplicationConfig) -> Duration {
 
 // ---------- Generic runtime ----------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeadEvidenceIdentity {
+    repository_version: u64,
+    history_freshness: i64,
+    terminal_set_digest: [u8; 32],
+}
+
+#[derive(Debug)]
+struct LocalHeadEvidence {
+    identity: HeadEvidenceIdentity,
+    acknowledged_by: HashSet<PeerIncarnation>,
+}
+
 pub struct StrictRuntime<R: StrictReplicable> {
     pub(super) repo: Arc<R>,
     pub(super) self_id: NodeIdentifier,
@@ -3205,24 +3159,6 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// operation. Duplicate Propose frames continue to receive targeted
     /// redundant ACKs without repeatedly flooding the overlay.
     propose_ack_broadcasts: Mutex<HashSet<OpId>>,
-    async fn with_terminal_journal_mutation<T, F>(&self, operation: F) -> T
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut TerminalJournal) -> T + Send + 'static,
-    {
-        if !self.terminal_journal_durable {
-            let mut journal = self.terminal_journal.lock().await;
-            return operation(&mut journal);
-        }
-        let journal = Arc::clone(&self.terminal_journal);
-        tokio::task::spawn_blocking(move || {
-            let mut journal = journal.blocking_lock();
-            operation(&mut journal)
-        })
-        .await
-        .expect("strict terminal journal blocking task panicked")
-    }
-
     /// Limit the broadcast fallback to the first positive ACK for one
     /// operation. Later Accept retransmissions use targeted route diversity.
     accept_ack_broadcasts: Mutex<HashSet<OpId>>,
@@ -3243,13 +3179,17 @@ pub struct StrictRuntime<R: StrictReplicable> {
     last_admission_probe_at: Mutex<HashMap<NodeIdentifier, Instant>>,
     delivery_blocked_log: Mutex<DeliveryBlockedLogState>,
     pub(super) shutdown: CancellationToken,
-        let terminal_journal_durable = journal.durable_persistence_enabled();
     pub(super) cfg: Arc<ReplicationConfig>,
     pub(super) terminal_journal: Arc<AsyncMutex<TerminalJournal>>,
     terminal_journal_durable: bool,
     pub(super) v3_sync: Mutex<SyncV3State>,
     pub(super) v3_retries: Mutex<V3RetryState>,
     pub(super) v3_history: Mutex<HistoryV3State>,
+    /// The latest durable repository/terminal head advertised by this
+    /// runtime and the exact live peer incarnations that have subsequently
+    /// advertised the same head. Overlay ACKs are intentionally insufficient:
+    /// they precede strict handler delivery and durable repository apply.
+    head_evidence: Mutex<Option<LocalHeadEvidence>>,
     terminal_catchup_snapshots: Mutex<HashMap<NodeIdentifier, TerminalCatchupSnapshot>>,
     /// Latest complete terminal fence cut learned from each v2 source. A
     /// restart deliberately loses this cache, causing the next catchup to
@@ -3271,6 +3211,24 @@ pub struct StrictRuntime<R: StrictReplicable> {
 }
 
 impl<R: StrictReplicable> StrictRuntime<R> {
+    async fn with_terminal_journal_mutation<T, F>(&self, operation: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut TerminalJournal) -> T + Send + 'static,
+    {
+        if !self.terminal_journal_durable {
+            let mut journal = self.terminal_journal.lock().await;
+            return operation(&mut journal);
+        }
+        let journal = Arc::clone(&self.terminal_journal);
+        tokio::task::spawn_blocking(move || {
+            let mut journal = journal.blocking_lock();
+            operation(&mut journal)
+        })
+        .await
+        .expect("strict terminal journal blocking task panicked")
+    }
+
     pub(crate) fn new(
         repo: Arc<R>,
         self_id: NodeIdentifier,
@@ -3291,6 +3249,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 TerminalJournal::in_memory(topic.clone())
             }
         };
+        let terminal_journal_durable = journal.durable_persistence_enabled();
         let terminal_protocol_storage_healthy =
             terminal_journal_durable || cfg!(any(test, feature = "test-support"));
         if !terminal_protocol_storage_healthy && !strict_protocol_disabled {
@@ -3317,6 +3276,15 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             // lacks its complete repository capability contract.
             net.report_strict_replication_repository_capability_loss();
         }
+        let initial_history_metadata = repo.history_metadata();
+        let initial_head_evidence = LocalHeadEvidence {
+            identity: HeadEvidenceIdentity {
+                repository_version: initial_history_metadata.version,
+                history_freshness: initial_history_metadata.freshness,
+                terminal_set_digest: *journal.terminal_cut().terminal_set_digest(),
+            },
+            acknowledged_by: HashSet::new(),
+        };
         let arc = Arc::new(Self {
             repo,
             self_id,
@@ -3351,6 +3319,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             v3_sync: Mutex::new(SyncV3State::default()),
             v3_retries: Mutex::new(V3RetryState::default()),
             v3_history: Mutex::new(HistoryV3State::default()),
+            head_evidence: Mutex::new(Some(initial_head_evidence)),
             terminal_catchup_snapshots: Mutex::new(HashMap::new()),
             terminal_catchup_generations: Mutex::new(HashMap::new()),
             snapshot_transfers: Mutex::new(HashMap::new()),
@@ -3570,12 +3539,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // subset win merely because the true winner already had periodic
         // repair in flight.
         let peers = bootstrap_reachable_peers(self.net.as_ref(), self.self_id);
-        {
+        let (history_membership_expanded, can_start) = {
             let mut state = self.state.lock();
-            state.observe_history_alive_peers(peers.iter().copied());
-            if !state.can_start_history_election() {
-                return;
-            }
+            let expanded = state.observe_history_alive_peers(peers.iter().copied());
+            (expanded, state.can_start_history_election())
+        };
+        if history_membership_expanded {
+            self.wake_clock_tick_loop();
+        }
+        if !can_start {
+            return;
         }
         if peers.is_empty() {
             self.state.lock().finish_history_election();
@@ -3726,6 +3699,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             && self.net.member_boot_epoch(peer).is_some()
     }
 
+    fn head_evidence_supported_by(&self, peer: NodeIdentifier) -> bool {
+        self.v3_repair_supported_by(peer)
+            && self.net.local_strict_replication_protocol_version() >= STRICT_PROTOCOL_VERSION_V4
+            && self.net.peer_strict_replication_protocol_version(peer) >= STRICT_PROTOCOL_VERSION_V4
+    }
+
     fn decision_has_complete_v3_repair_coverage(
         &self,
         dsts: &[NodeIdentifier],
@@ -3807,6 +3786,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             StrictClockTick {
                 src_node: from as u32,
                 src_clock,
+                ..Default::default()
             },
         );
     }
@@ -3821,7 +3801,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let previous = transition.previous_cut();
         let cut = transition.resulting_cut();
         (
-            .await
             Bytes::copy_from_slice(cut.journal_id()),
             cut.generation(),
             Bytes::copy_from_slice(previous.chain_digest()),
@@ -3869,6 +3848,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if self
             .terminal_journal
             .lock()
+            .await
             .terminal_set_matches(resulting.terminal_set_digest())
         {
             self.v3_sync.lock().remember_source_cut(peer, resulting);
@@ -4155,7 +4135,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             self.observed_frozen_target_epoch_matches(from, origin_boot_epoch, target.boot_epoch())
         })
     }
-            .await
 
     fn frozen_resolution_owner(&self, targets: &[FrozenTarget]) -> Option<NodeIdentifier> {
         targets
@@ -4194,7 +4173,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if let Some(targets) = self
             .state
             .lock()
-            .await
             .pending_proposes
             .get(&op_id)
             .filter(|pending| pending.protocol_version == STRICT_PROTOCOL_VERSION_V2)
@@ -4243,6 +4221,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     pub(crate) async fn has_unresolved_v2_terminal_fence(&self, op_id: OpId) -> bool {
         self.terminal_journal
             .lock()
+            .await
             .get(op_id)
             .is_some_and(|record| {
                 record.frozen_targets().is_some() && record.terminal_decision().is_none()
@@ -4252,6 +4231,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     pub(super) async fn has_v2_terminal_descriptor(&self, op_id: OpId) -> bool {
         self.terminal_journal
             .lock()
+            .await
             .get(op_id)
             .is_some_and(|record| record.frozen_targets().is_some())
     }
@@ -4400,7 +4380,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // caller into an unbounded reliable-queue fanout.
         if !self.deferred_v2_resolution_hints.lock().insert(op_id) {
             return;
-            .await
         }
         self.send_v2_resolution_hint_for_op(op_id).await;
         let weak = self.weak_self.lock().clone();
@@ -4448,6 +4427,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .await;
         self.terminal_journal
             .lock()
+            .await
             .get(op_id)
             .is_some_and(|record| {
                 matches!(
@@ -4518,7 +4498,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let hydrate_v2_pending = record.frozen_targets().is_none_or(|targets| {
                 FrozenTarget::find_in_canonical(targets, self.self_id)
                     .is_some_and(|target| target.boot_epoch() == self.boot_epoch)
-            .await
             });
             hydrate_terminal_journal_record(&mut state, op_id, &record, hydrate_v2_pending);
             restored_commits |= enqueue_terminal_commit_for_delivery(&mut state, op_id, &record);
@@ -4566,6 +4545,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         op_msgpack: Bytes,
     ) -> bool {
         self.apply_terminal_commit_with_descriptor(op_id, ballot, ts_final, op_msgpack, None)
+            .await
             .accepted()
     }
 
@@ -4673,7 +4653,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let mut state_changed = false;
         {
             let mut state = self.state.lock();
-            .await
             let decision = TerminalDecision::Commit(AcceptedValue {
                 ballot,
                 ts_final,
@@ -4721,6 +4700,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     #[cfg(test)]
     async fn apply_terminal_abort(&self, op_id: OpId, ballot: u64) -> bool {
         self.apply_terminal_abort_with_descriptor(op_id, ballot, None)
+            .await
             .accepted()
     }
 
@@ -4777,7 +4757,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 );
                 metrics::record_strict_fence_rejection();
                 return TerminalInstallResult::Rejected;
-            .await
             }
         };
         if !journal_changed {
@@ -4825,6 +4804,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let (fresh_terminal_decision_generation, fresh_records) = self
             .terminal_journal
             .lock()
+            .await
             .snapshot_with_terminal_decision_generation();
         let now = Instant::now();
         let (records, terminal_decision_generation, effective_cursor) = {
@@ -5049,7 +5029,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         frozen_targets: &[FrozenTarget],
         op_msgpack: Bytes,
     ) -> bool {
-            .await
         self.v2_terminal_state_fits_catchup_budget(op_id, frozen_targets, |_| {
             StrictTerminalOutcome::Commit(StrictDecisionCommit {
                 ts_final: u64::MAX,
@@ -5097,6 +5076,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     #[cfg(test)]
     pub(crate) async fn terminal_states_for_catchup(&self) -> Vec<StrictTerminalState> {
         self.terminal_states_for_catchup_page(self.self_id, 0, usize::MAX, usize::MAX)
+            .await
             .states
     }
 
@@ -5129,7 +5109,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 advertised_coord = coord_node,
                 "strict terminal catchup state coordinator does not match op id"
             );
-                    .await
             return None;
         }
         let identity = match terminal_identity_from_wire(
@@ -5143,7 +5122,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             Ok(identity) => identity,
             Err(()) => {
                 metrics::record_strict_fence_rejection();
-            .await
                 return None;
             }
         };
@@ -5178,6 +5156,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
             Some(StrictTerminalOutcome::Abort(_)) => {
                 self.apply_terminal_abort_with_descriptor(op_id, terminal.ballot, identity.as_ref())
+                    .await
             }
             None => {
                 warn!(
@@ -5191,6 +5170,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let transition = install.transition()?;
         self.terminal_journal
             .lock()
+            .await
             .get(op_id)
             .is_some_and(|record| {
                 let outcome_matches = match (record.terminal_decision(), &expected_outcome) {
@@ -7990,7 +7970,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 return;
             }
             let decision = choose_resolution_decision(
-                    .await
                 resolution.coord_node,
                 resolution.ballot,
                 resolution
@@ -8025,7 +8004,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     resolver: TerminalResolver::new(self.self_id, self.boot_epoch),
                     frozen_targets: frozen_targets.clone(),
                 },
-                    .await
             ),
         };
         let src_clock = self.state.lock().clock;
@@ -8039,6 +8017,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                         value.op_msgpack.clone(),
                         Some(&terminal_identity),
                     )
+                    .await
                     .transition()
                 else {
                     return;
@@ -8073,6 +8052,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             TerminalDecision::Abort { ballot } => {
                 let Some(terminal_transition) = self
                     .apply_terminal_abort_with_descriptor(op_id, *ballot, Some(&terminal_identity))
+                    .await
                     .transition()
                 else {
                     return;
@@ -8733,7 +8713,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     pub fn recv_clock_tick(&self, from: NodeIdentifier, t: StrictClockTick) {
-        self.recv_clock_tick_with_origin_epoch(
+        let _ = self.recv_clock_tick_with_origin_epoch(
             from,
             self.direct_inbound_origin_boot_epoch(from),
             t,
@@ -8745,10 +8725,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         from: NodeIdentifier,
         origin_boot_epoch: u64,
         t: StrictClockTick,
-    ) {
+    ) -> bool {
         if node_from_u32(t.src_node) != Some(from) {
             metrics::record_strict_fence_rejection();
-            return;
+            return false;
         }
         let _ = self.reconcile_peer_admissions();
         let diagnostics = {
@@ -8776,6 +8756,152 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         );
         // Tick may unblock delivery.
         self.deliver_signal.notify_one();
+        true
+    }
+
+    fn prepare_clock_tick_evidence(
+        &self,
+        from: NodeIdentifier,
+        origin_boot_epoch: u64,
+        tick: &StrictClockTick,
+    ) -> Option<super::catchup::PreparedHistoryProbe> {
+        if node_from_u32(tick.src_node) != Some(from)
+            || !self.head_evidence_supported_by(from)
+            || self.net.member_boot_epoch(from) != Some(origin_boot_epoch)
+        {
+            return None;
+        }
+        let Some(remote_cut) = tick.terminal_cut.as_ref().and_then(cut_from_wire) else {
+            return None;
+        };
+        let peer = PeerIncarnation::new(from, origin_boot_epoch);
+        let repository_ahead = tick.repository_version > self.repo.current_version();
+        let terminal_ahead = !self
+            .v3_sync
+            .lock()
+            .known_source_cut(peer)
+            .is_some_and(|known| source_cut_covers(known, remote_cut));
+        if !repository_ahead && !terminal_ahead {
+            return None;
+        }
+        let reason = if repository_ahead {
+            repl_proto::StrictCatchupReason::RepositoryGap
+        } else {
+            repl_proto::StrictCatchupReason::TerminalFence
+        };
+        super::catchup::prepare_v3_history_probe(self, from, reason)
+    }
+
+    fn request_history_election_for_clock_rank_divergence(
+        &self,
+        from: NodeIdentifier,
+        origin_boot_epoch: u64,
+        tick: &StrictClockTick,
+    ) -> bool {
+        if node_from_u32(tick.src_node) != Some(from)
+            || !self.head_evidence_supported_by(from)
+            || self.net.member_boot_epoch(from) != Some(origin_boot_epoch)
+        {
+            return false;
+        }
+        let local = self.repo.history_metadata();
+        if tick.repository_version != local.version || tick.history_freshness == local.freshness {
+            return false;
+        }
+        self.state.lock().request_history_election();
+        self.wake_clock_tick_loop();
+        true
+    }
+
+    fn remember_advertised_head(
+        &self,
+        history_metadata: HistoryMetadata,
+        terminal_cut: TerminalCut,
+    ) {
+        let identity = HeadEvidenceIdentity {
+            repository_version: history_metadata.version,
+            history_freshness: history_metadata.freshness,
+            terminal_set_digest: *terminal_cut.terminal_set_digest(),
+        };
+        let mut evidence = self.head_evidence.lock();
+        if evidence
+            .as_ref()
+            .is_some_and(|current| current.identity == identity)
+        {
+            return;
+        }
+        *evidence = Some(LocalHeadEvidence {
+            identity,
+            acknowledged_by: HashSet::new(),
+        });
+    }
+
+    fn prepare_head_ack(
+        &self,
+        from: NodeIdentifier,
+        origin_boot_epoch: u64,
+        tick: &StrictClockTick,
+    ) -> Option<StrictHeadAck> {
+        if node_from_u32(tick.src_node) != Some(from)
+            || !self.head_evidence_supported_by(from)
+            || self.net.member_boot_epoch(from) != Some(origin_boot_epoch)
+        {
+            return None;
+        }
+        let Some(remote_cut) = tick.terminal_cut.as_ref().and_then(cut_from_wire) else {
+            return None;
+        };
+        let remote_identity = HeadEvidenceIdentity {
+            repository_version: tick.repository_version,
+            history_freshness: tick.history_freshness,
+            terminal_set_digest: *remote_cut.terminal_set_digest(),
+        };
+        if !self
+            .head_evidence
+            .lock()
+            .as_ref()
+            .is_some_and(|current| current.identity == remote_identity)
+        {
+            return None;
+        }
+        Some(StrictHeadAck {
+            src_node: self.self_id as u32,
+            src_boot_epoch: self.boot_epoch,
+            expected_target_node: from as u32,
+            expected_target_boot_epoch: origin_boot_epoch,
+            repository_version: remote_identity.repository_version,
+            terminal_set_digest: Bytes::copy_from_slice(&remote_identity.terminal_set_digest),
+            history_freshness: remote_identity.history_freshness,
+        })
+    }
+
+    fn recv_head_ack(&self, from: NodeIdentifier, origin_boot_epoch: u64, ack: StrictHeadAck) {
+        if node_from_u32(ack.src_node) != Some(from)
+            || ack.src_boot_epoch != origin_boot_epoch
+            || node_from_u32(ack.expected_target_node) != Some(self.self_id)
+            || ack.expected_target_boot_epoch != self.boot_epoch
+            || !self.head_evidence_supported_by(from)
+            || self.net.member_boot_epoch(from) != Some(origin_boot_epoch)
+        {
+            metrics::record_strict_fence_rejection();
+            return;
+        }
+        let Ok(terminal_set_digest) = ack.terminal_set_digest.as_ref().try_into() else {
+            metrics::record_strict_fence_rejection();
+            return;
+        };
+        let identity = HeadEvidenceIdentity {
+            repository_version: ack.repository_version,
+            history_freshness: ack.history_freshness,
+            terminal_set_digest,
+        };
+        if let Some(current) = self.head_evidence.lock().as_mut()
+            && current.identity == identity
+        {
+            current
+                .acknowledged_by
+                .insert(PeerIncarnation::new(from, origin_boot_epoch));
+        }
     }
 
     /// Reply to a valid terminal-only v2 probe with one fresh directed tick.
@@ -8796,6 +8922,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let tick = StrictBody::ClockTick(StrictClockTick {
             src_node: self.self_id as u32,
             src_clock,
+            ..Default::default()
         });
         if let Err(error) = self
             .net
@@ -9410,6 +9537,13 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             transition,
             MembershipTransition::Removed | MembershipTransition::Restarted
         );
+        if peer_removed {
+            if let Some(evidence) = self.head_evidence.lock().as_mut() {
+                evidence
+                    .acknowledged_by
+                    .retain(|peer| peer.node() != member.node_id());
+            }
+        }
         {
             let mut state = self.state.lock();
             if peer_removed {
@@ -9557,6 +9691,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             MembershipTransition::Joined | MembershipTransition::Restarted
         );
         if peer_added {
+            // Evidence acknowledgement is exact-incarnation scoped and must
+            // be re-driven on every membership expansion, even if the idle
+            // bootstrap poll observed this peer before its Joined event.
+            self.wake_clock_tick_loop();
             // Do not discard an active probe merely because the same live
             // incarnation was announced again. A true rejoin/restart was
             // removed from `history_alive_peers` above, so it still rearms a
@@ -9574,7 +9712,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 // A restarted source must never receive a snapshot request
                 // selected for its previous incarnation.
                 history_snapshot_request = None;
-                self.wake_clock_tick_loop();
                 let weak = self.weak_self.lock().clone();
                 if let Some(weak) = weak {
                     tokio::spawn(async move {
@@ -9736,7 +9873,49 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
             }
             StrictBody::Commit(c) => self.recv_commit(from, c).await,
             StrictBody::ClockTick(t) => {
-                self.recv_clock_tick_with_origin_epoch(from, origin_boot_epoch, t)
+                if !self.recv_clock_tick_with_origin_epoch(from, origin_boot_epoch, t.clone()) {
+                    return;
+                }
+                let head_ack = self.prepare_head_ack(from, origin_boot_epoch, &t);
+                let history_probe = self.prepare_clock_tick_evidence(from, origin_boot_epoch, &t);
+                let history_election = self.request_history_election_for_clock_rank_divergence(
+                    from,
+                    origin_boot_epoch,
+                    &t,
+                );
+                if (head_ack.is_some() || history_probe.is_some() || history_election)
+                    && let Some(weak) = self.weak_self.lock().clone()
+                {
+                    tokio::spawn(async move {
+                        if let Some(runtime) = weak.upgrade() {
+                            if let Some(ack) = head_ack
+                                && let Err(error) = runtime
+                                    .net
+                                    .send_redundant_unicast(
+                                        from,
+                                        &runtime.topic,
+                                        StrictBody::HeadAck(ack),
+                                    )
+                                    .await
+                            {
+                                trace!(%error, dst = from, "strict head acknowledgement send failed");
+                            }
+                            if let Some(prepared) = history_probe {
+                                super::catchup::send_prepared_v3_history_probe(
+                                    runtime.as_ref(),
+                                    prepared,
+                                )
+                                .await;
+                            }
+                            if history_election {
+                                runtime.try_bootstrap_catchup().await;
+                            }
+                        }
+                    });
+                }
+            }
+            StrictBody::HeadAck(ack) => {
+                self.recv_head_ack(from, origin_boot_epoch, ack);
             }
             StrictBody::CatchupReq(r) => {
                 if self.net.peer_strict_replication_protocol_version(from)
@@ -10327,6 +10506,10 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
             (waker, elapsed)
         };
         let _ = rt.reconcile_peer_admissions();
+        // Advertise the repository version only after the durable apply. The
+        // pre-delivery tick may have carried the old head after the commit
+        // buffer was drained.
+        rt.wake_clock_tick_loop();
         log_delivery_applied(
             &rt.topic,
             &buf,
@@ -10717,8 +10900,37 @@ impl<R: StrictReplicable> StrictRuntime<R> {
 
     fn clock_tick_needed(&self) -> bool {
         let alive = self.reconcile_peer_admissions();
-        let state = self.state.lock();
-        clock_tick_needed_for_state(&state, self.self_id, &alive)
+        if clock_tick_needed_for_state(&self.state.lock(), self.self_id, &alive) {
+            return true;
+        }
+        !self.unacknowledged_head_peers().is_empty()
+    }
+
+    fn unacknowledged_head_peers(&self) -> Vec<NodeIdentifier> {
+        let live_v4_peers: Vec<_> = self
+            .net
+            .alive_members()
+            .into_iter()
+            .filter(|node| {
+                *node != self.self_id
+                    && self.head_evidence_supported_by(*node)
+                    && self.net.has_live_route(*node, ServiceLevel::Reliable)
+            })
+            .filter_map(|node| {
+                self.net
+                    .member_boot_epoch(node)
+                    .map(|epoch| PeerIncarnation::new(node, epoch))
+            })
+            .collect();
+        let evidence = self.head_evidence.lock();
+        let Some(current) = evidence.as_ref() else {
+            return Vec::new();
+        };
+        live_v4_peers
+            .into_iter()
+            .filter(|peer| !current.acknowledged_by.contains(peer))
+            .map(PeerIncarnation::node)
+            .collect()
     }
 }
 
@@ -10799,18 +11011,48 @@ async fn emit_clock_tick<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
         let mut s = rt.state.lock();
         advance_clock_for_tick(&mut s, rt.self_id)
     };
-    let body = StrictBody::ClockTick(StrictClockTick {
+    let terminal_cut =
+        if rt.net.local_strict_replication_protocol_version() >= STRICT_PROTOCOL_VERSION_V4 {
+            Some(rt.terminal_journal.lock().await.terminal_cut())
+        } else {
+            None
+        };
+    let history_metadata = rt.repo.history_metadata();
+    if let Some(cut) = terminal_cut {
+        rt.remember_advertised_head(history_metadata, cut);
+    }
+    let base_body = StrictBody::ClockTick(StrictClockTick {
         src_node: rt.self_id as u32,
         src_clock: clock,
+        ..Default::default()
     });
     let dsts: Vec<_> = rt
         .net
         .alive_members()
         .into_iter()
-        .filter(|node| *node != rt.self_id)
+        .filter(|node| *node != rt.self_id && rt.net.has_live_route(*node, ServiceLevel::Reliable))
         .collect();
-    if let Err(e) = rt.net.send_multicast(&dsts, &rt.topic, body).await {
+    if let Err(e) = rt.net.send_multicast(&dsts, &rt.topic, base_body).await {
         trace!(error=%e, "clock tick broadcast failed");
+    }
+    let Some(terminal_cut) = terminal_cut else {
+        return;
+    };
+    let evidence_body = StrictBody::ClockTick(StrictClockTick {
+        src_node: rt.self_id as u32,
+        src_clock: clock,
+        repository_version: history_metadata.version,
+        terminal_cut: Some(cut_to_wire(terminal_cut)),
+        history_freshness: history_metadata.freshness,
+    });
+    for dst in rt.unacknowledged_head_peers() {
+        if let Err(error) = rt
+            .net
+            .send_redundant_unicast(dst, &rt.topic, evidence_body.clone())
+            .await
+        {
+            trace!(%error, dst, "strict head evidence send failed");
+        }
     }
 }
 
@@ -10857,9 +11099,9 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
         }
         loop {
             let peers = bootstrap_reachable_peers(rt.net.as_ref(), rt.self_id);
-            let (should_probe, snapshot_request) = {
+            let (should_probe, snapshot_request, history_membership_expanded) = {
                 let mut state = rt.state.lock();
-                state.observe_history_alive_peers(peers.iter().copied());
+                let expanded = state.observe_history_alive_peers(peers.iter().copied());
                 let snapshot_request =
                     state.reconcile_history_election_reachability(peers.iter().copied());
                 if state.history_election_timed_out(Instant::now(), interval.saturating_mul(5)) {
@@ -10871,8 +11113,15 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
                     // schedule another one.
                     state.finish_history_election();
                 }
-                (state.can_start_history_election(), snapshot_request)
+                (
+                    state.can_start_history_election(),
+                    snapshot_request,
+                    expanded,
+                )
             };
+            if history_membership_expanded {
+                rt.wake_clock_tick_loop();
+            }
             if let Some(request) = snapshot_request {
                 if let Err(error) = rt.send_history_snapshot_request(request).await {
                     debug!(
@@ -10987,6 +11236,16 @@ fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>
         let mut terminal_repair_ticker =
             tokio::time::interval_at(terminal_repair_start, terminal_repair_interval);
         terminal_repair_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let steady_interval = rt.cfg.strict_steady_state_catchup_interval();
+        let steady_start = tokio::time::Instant::now()
+            + strict_timer_start_jitter(
+                rt.self_id,
+                &rt.topic,
+                StrictTimerLane::SteadyState,
+                steady_interval,
+            );
+        let mut steady_ticker = tokio::time::interval_at(steady_start, steady_interval);
+        steady_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = rt.shutdown.cancelled() => return,
@@ -10997,6 +11256,9 @@ fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>
                     // cadence. This probe is metadata-only and safe to run
                     // independently of history catch-up.
                     let _ = request_terminal_repair_probe(&rt).await;
+                }
+                _ = steady_ticker.tick() => {
+                    request_steady_state_catchup(&rt).await;
                 }
             }
         }
@@ -11209,7 +11471,7 @@ async fn request_terminal_repair_probe<R: StrictReplicable>(rt: &Arc<StrictRunti
         } else {
             repl_proto::StrictCatchupReason::DeliveryWatermark
         };
-        super::catchup::request_v3_clock_probe(rt, dst, reason).await;
+        let clock_probe_started = super::catchup::request_v3_clock_probe(rt, dst, reason).await;
         if preferred_peer.is_some() {
             super::catchup::request_v3_terminal_sync(
                 rt,
@@ -11218,7 +11480,7 @@ async fn request_terminal_repair_probe<R: StrictReplicable>(rt: &Arc<StrictRunti
             )
             .await;
         }
-        return true;
+        return preferred_peer.is_some() || clock_probe_started;
     }
     let req = StrictCatchupReq {
         src_node: rt.self_id as u32,
@@ -11246,9 +11508,11 @@ async fn request_terminal_repair_probe<R: StrictReplicable>(rt: &Arc<StrictRunti
     }
 }
 
-#[cfg(test)]
 async fn request_steady_state_catchup<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     if !rt.can_originate_v2() {
+        return;
+    }
+    if rt.net.strict_replication_protocol_version() >= STRICT_PROTOCOL_VERSION_V4 {
         return;
     }
     if rt.state.lock().history_election_blocks_steady_state() {
@@ -11260,6 +11524,7 @@ async fn request_steady_state_catchup<R: StrictReplicable>(rt: &Arc<StrictRuntim
         .filter(|node| {
             *node != rt.self_id
                 && rt.net.has_route(*node, ServiceLevel::Reliable)
+                && !rt.head_evidence_supported_by(*node)
                 && (!rt.v3_repair_supported_by(*node) || !rt.v3_periodic_work_active(*node))
         })
         .collect();
@@ -11713,6 +11978,53 @@ fn choose_resolution_decision<'a>(
     }
     if let Some((ts_final, op_msgpack, _protocol_version)) = pending {
         // A terminal resolver has already persisted a fresh quorum ballot.
+        // With no stronger accepted/terminal value to preserve, choosing the
+        // prepared request is deterministic and makes the v1 liveness repair
+        // automatic rather than dependent on a local rollout toggle.
+        return ResolutionDecision::Fresh(TerminalDecision::Commit(AcceptedValue {
+            ballot,
+            ts_final,
+            op_msgpack,
+        }));
+    }
+    ResolutionDecision::Fresh(TerminalDecision::Abort { ballot })
+}
+
+// ---------- Unit tests ----------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replications::test_support::{
+        CapturedFrame, CountingStrictRepo, MockNet, StrictSendLane, StrictSendOutcome,
+        StrictSendTarget,
+    };
+
+    fn v1_runtime(
+        cfg: ReplicationConfig,
+    ) -> (
+        Arc<StrictRuntime<CountingStrictRepo>>,
+        Arc<MockNet>,
+        Arc<CountingStrictRepo>,
+    ) {
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo.clone(),
+            1,
+            1,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(cfg),
+        );
+        rt.finish_history_election_for_test();
+        (rt, net, repo)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn durable_terminal_journal_mutation_does_not_block_the_async_worker() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -11791,53 +12103,6 @@ fn choose_resolution_decision<'a>(
         tokio::task::spawn_blocking(move || writer.join().unwrap())
             .await
             .unwrap();
-    }
-
-        // With no stronger accepted/terminal value to preserve, choosing the
-        // prepared request is deterministic and makes the v1 liveness repair
-        // automatic rather than dependent on a local rollout toggle.
-        return ResolutionDecision::Fresh(TerminalDecision::Commit(AcceptedValue {
-            ballot,
-            ts_final,
-            op_msgpack,
-        }));
-    }
-    ResolutionDecision::Fresh(TerminalDecision::Abort { ballot })
-}
-
-// ---------- Unit tests ----------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::replications::test_support::{
-        CapturedFrame, CountingStrictRepo, MockNet, StrictSendLane, StrictSendOutcome,
-        StrictSendTarget,
-    };
-
-    fn v1_runtime(
-        cfg: ReplicationConfig,
-    ) -> (
-        Arc<StrictRuntime<CountingStrictRepo>>,
-        Arc<MockNet>,
-        Arc<CountingStrictRepo>,
-    ) {
-        let net = MockNet::new(1, vec![1, 2]);
-        net.set_epoch(1, 1);
-        net.set_epoch(2, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
-        let repo = CountingStrictRepo::new();
-        let rt = StrictRuntime::new(
-            repo.clone(),
-            1,
-            1,
-            "channels".to_owned(),
-            net.clone(),
-            CancellationToken::new(),
-            Arc::new(cfg),
-        );
-        rt.finish_history_election_for_test();
-        (rt, net, repo)
     }
 
     #[test]
@@ -13001,7 +13266,6 @@ mod tests {
             HistoryMetadata {
                 version: 14,
                 freshness: 41,
-            .await
             }
         ));
         assert_eq!(
@@ -13028,7 +13292,6 @@ mod tests {
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&777u64).unwrap());
         let identity = TerminalDecisionIdentity {
             resolver: TerminalResolver::new(1, 1),
-            .await
             frozen_targets: vec![FrozenTarget::new(1, 1)],
         };
 
@@ -13040,6 +13303,7 @@ mod tests {
                 op_msgpack.clone(),
                 Some(&identity),
             )
+            .await
             .accepted()
         );
         assert_eq!(
@@ -13066,6 +13330,7 @@ mod tests {
                 op_msgpack,
                 Some(&identity),
             )
+            .await
             .accepted()
         );
         assert_eq!(rt.state.lock().peer_admissions[&2].phase, progressed);
@@ -13236,6 +13501,7 @@ mod tests {
             StrictBody::ClockTick(StrictClockTick {
                 src_node: 2,
                 src_clock: 80_000,
+                ..Default::default()
             }),
         )
         .await;
@@ -15326,6 +15592,7 @@ mod tests {
             StrictBody::ClockTick(StrictClockTick {
                 src_node: 2,
                 src_clock: u64::MAX,
+                ..Default::default()
             }),
         )
         .await;
@@ -15416,6 +15683,7 @@ mod tests {
             StrictBody::ClockTick(StrictClockTick {
                 src_node: 2,
                 src_clock: u64::MAX,
+                ..Default::default()
             }),
         )
         .await;
@@ -16432,7 +16700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v3_watermark_clock_probe_coexists_with_active_terminal_transfer() {
+    async fn v3_watermark_clock_probe_is_bounded_during_active_terminal_transfer() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
         net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
@@ -16455,21 +16723,599 @@ mod tests {
             state.peer_clocks.insert(1, 20);
             state.peer_clocks.insert(2, 1);
             state.buffer_commit((1, 1), 10, Bytes::new());
+            state
+                .commit_buffer
+                .values_mut()
+                .next()
+                .expect("buffered commit")
+                .buffered_at = Instant::now()
+                - clock_tick_burst_cooldown(rt.current_clock_tick_interval(), &rt.cfg)
+                - Duration::from_millis(1);
         }
         net.drain_captures();
 
         assert!(request_terminal_repair_probe(&rt).await);
-        assert!(net.drain_captures().iter().any(|frame| {
+        for _ in 1..100 {
+            assert!(!request_terminal_repair_probe(&rt).await);
+        }
+        let probes = net
+            .drain_captures()
+            .into_iter()
+            .filter(|frame| {
+                matches!(
+                    frame,
+                    CapturedFrame::StrictUnicast {
+                        dst: 2,
+                        body: StrictBody::ClockProbeReq(request),
+                        ..
+                    } if request.reason
+                        == repl_proto::StrictCatchupReason::DeliveryWatermark as i32
+                )
+            })
+            .count();
+        assert_eq!(probes, 1, "periodic repair must remain bounded");
+    }
+
+    #[tokio::test]
+    async fn v3_clock_head_evidence_coalesces_one_repository_probe() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        rt.v3_sync
+            .lock()
+            .remember_source_cut(PeerIncarnation::new(2, 1), cut);
+        let tick = StrictClockTick {
+            src_node: 2,
+            src_clock: 10,
+            repository_version: rt.repo.current_version().saturating_add(1),
+            terminal_cut: Some(cut_to_wire(cut)),
+            history_freshness: 0,
+        };
+
+        assert!(rt.prepare_clock_tick_evidence(2, 1, &tick).is_some());
+        for _ in 0..100 {
+            assert!(rt.prepare_clock_tick_evidence(2, 1, &tick).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn covered_v3_clock_head_emits_no_probe() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        rt.v3_sync
+            .lock()
+            .remember_source_cut(PeerIncarnation::new(2, 1), cut);
+        let tick = StrictClockTick {
+            src_node: 2,
+            src_clock: 10,
+            repository_version: rt.repo.current_version(),
+            terminal_cut: Some(cut_to_wire(cut)),
+            history_freshness: 0,
+        };
+
+        assert!(rt.prepare_clock_tick_evidence(2, 1, &tick).is_none());
+    }
+
+    #[tokio::test]
+    async fn local_head_evidence_remains_dirty_until_explicit_peer_ack() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        let repository_version = rt.repo.current_version();
+        rt.remember_advertised_head(rt.repo.history_metadata(), cut);
+
+        assert!(rt.clock_tick_needed());
+        rt.recv_head_ack(
+            2,
+            1,
+            StrictHeadAck {
+                src_node: 2,
+                src_boot_epoch: 1,
+                expected_target_node: 1,
+                expected_target_boot_epoch: 1,
+                repository_version,
+                terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
+                history_freshness: 0,
+            },
+        );
+        assert!(!rt.clock_tick_needed());
+    }
+
+    #[tokio::test]
+    async fn duplicate_matching_head_evidence_receives_a_directed_ack_each_time() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        let repository_version = rt.repo.current_version();
+        rt.remember_advertised_head(rt.repo.history_metadata(), cut);
+        let tick = StrictClockTick {
+            src_node: 2,
+            src_clock: 1,
+            repository_version,
+            terminal_cut: Some(cut_to_wire(cut)),
+            history_freshness: 0,
+        };
+
+        for _ in 0..2 {
+            rt.dispatch(2, 1, true, StrictBody::ClockTick(tick.clone()))
+                .await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if net.drain_captures().into_iter().any(|frame| {
+                        matches!(
+                            frame,
+                            CapturedFrame::StrictUnicast {
+                                dst: 2,
+                                body: StrictBody::HeadAck(_),
+                                ..
+                            }
+                        )
+                    }) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("every repeated head advertisement needs an application-level ack");
+        }
+        assert!(
+            rt.clock_tick_needed(),
+            "peer evidence is not an acknowledgement of our advertisement"
+        );
+    }
+
+    #[tokio::test]
+    async fn receiving_head_ack_does_not_echo_another_ack() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        let repository_version = rt.repo.current_version();
+        rt.remember_advertised_head(rt.repo.history_metadata(), cut);
+        net.drain_captures();
+
+        rt.dispatch(
+            2,
+            1,
+            true,
+            StrictBody::HeadAck(StrictHeadAck {
+                src_node: 2,
+                src_boot_epoch: 1,
+                expected_target_node: 1,
+                expected_target_boot_epoch: 1,
+                repository_version,
+                terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
+                history_freshness: 0,
+            }),
+        )
+        .await;
+        tokio::task::yield_now().await;
+
+        assert!(!rt.clock_tick_needed());
+        assert!(net.drain_captures().is_empty(), "head ACKs must not echo");
+    }
+
+    #[tokio::test]
+    async fn unrouted_alive_peer_does_not_drive_retained_head_tick_backlog() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        net.set_live_reliable_routes([1]);
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        rt.remember_advertised_head(rt.repo.history_metadata(), cut);
+
+        assert!(
+            !rt.clock_tick_needed(),
+            "head evidence cannot make progress before a reliable route exists"
+        );
+        net.set_live_reliable_routes([1, 2]);
+        assert!(
+            rt.clock_tick_needed(),
+            "route appearance must expose the unacknowledged peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_clock_ticks_never_target_an_alive_unrouted_peer() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        net.set_live_reliable_routes([1]);
+        rt.state
+            .lock()
+            .buffer_commit((1, 1), 10, Bytes::from_static(b"pending"));
+        net.drain_captures();
+
+        for _ in 0..5 {
+            emit_clock_tick(&rt).await;
+        }
+        assert!(net.drain_captures().into_iter().all(|frame| match frame {
+            CapturedFrame::StrictMulticast { dsts, .. } => !dsts.contains(&2),
+            CapturedFrame::StrictUnicast { dst, .. } => dst != 2,
+            _ => true,
+        }));
+
+        net.set_live_reliable_routes([1, 2]);
+        emit_clock_tick(&rt).await;
+        assert!(net.drain_captures().into_iter().any(|frame| match frame {
+            CapturedFrame::StrictMulticast { dsts, .. } => dsts.contains(&2),
+            CapturedFrame::StrictUnicast { dst, .. } => dst == 2,
+            _ => false,
+        }));
+    }
+
+    #[tokio::test]
+    async fn different_head_does_not_acknowledge_local_evidence() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        let repository_version = rt.repo.current_version();
+        rt.remember_advertised_head(rt.repo.history_metadata(), cut);
+
+        rt.recv_head_ack(
+            2,
+            1,
+            StrictHeadAck {
+                src_node: 2,
+                src_boot_epoch: 1,
+                expected_target_node: 1,
+                expected_target_boot_epoch: 1,
+                repository_version: repository_version.saturating_add(1),
+                terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
+                history_freshness: 0,
+            },
+        );
+        assert!(rt.clock_tick_needed());
+    }
+
+    #[tokio::test]
+    async fn equal_version_and_terminal_digest_with_different_freshness_does_not_acknowledge() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        let metadata = HistoryMetadata {
+            version: rt.repo.current_version(),
+            freshness: 7,
+        };
+        rt.remember_advertised_head(metadata, cut);
+        rt.v3_sync
+            .lock()
+            .remember_source_cut(PeerIncarnation::new(2, 1), cut);
+        net.drain_captures();
+
+        rt.dispatch(
+            2,
+            1,
+            true,
+            StrictBody::ClockTick(StrictClockTick {
+                src_node: 2,
+                src_clock: 1,
+                repository_version: metadata.version,
+                terminal_cut: Some(cut_to_wire(cut)),
+                history_freshness: 8,
+            }),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if net.drain_captures().into_iter().any(|frame| {
+                    matches!(
+                        frame,
+                        CapturedFrame::StrictUnicast {
+                            dst: 2,
+                            body: StrictBody::HistoryProbeReq(request),
+                            ..
+                        } if request.reason
+                            == repl_proto::StrictCatchupReason::HistoryElection as i32
+                    )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("equal-version freshness divergence must start history election");
+
+        rt.recv_head_ack(
+            2,
+            1,
+            StrictHeadAck {
+                src_node: 2,
+                src_boot_epoch: 1,
+                expected_target_node: 1,
+                expected_target_boot_epoch: 1,
+                repository_version: metadata.version,
+                terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
+                history_freshness: 8,
+            },
+        );
+
+        assert!(rt.clock_tick_needed());
+    }
+
+    #[tokio::test]
+    async fn malformed_clock_source_cannot_acknowledge_or_probe_head_evidence() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        let repository_version = rt.repo.current_version();
+        rt.remember_advertised_head(rt.repo.history_metadata(), cut);
+        net.drain_captures();
+
+        rt.dispatch(
+            2,
+            1,
+            true,
+            StrictBody::ClockTick(StrictClockTick {
+                src_node: 3,
+                src_clock: 1,
+                repository_version: repository_version.saturating_add(1),
+                terminal_cut: Some(cut_to_wire(cut)),
+                history_freshness: 0,
+            }),
+        )
+        .await;
+
+        assert!(rt.clock_tick_needed());
+        tokio::task::yield_now().await;
+        assert!(
+            !net.drain_captures().iter().any(|frame| matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::HistoryProbeReq(_),
+                    ..
+                }
+            )),
+            "a rejected clock source must not start evidence repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn lower_version_divergent_head_survives_overlapping_history_election() {
+        let (rt, net, repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        repo.state.lock().0 = 5;
+        let mut remote_journal = TerminalJournal::in_memory("remote");
+        remote_journal.upsert_abort_decision((2, 9), 1).unwrap();
+        let remote_cut = remote_journal.terminal_cut();
+
+        rt.dispatch(
+            2,
+            1,
+            true,
+            StrictBody::ClockTick(StrictClockTick {
+                src_node: 2,
+                src_clock: 10,
+                repository_version: 3,
+                terminal_cut: Some(cut_to_wire(remote_cut)),
+                history_freshness: 0,
+            }),
+        )
+        .await;
+        let history_request = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(request) =
+                    net.drain_captures()
+                        .into_iter()
+                        .find_map(|frame| match frame {
+                            CapturedFrame::StrictUnicast {
+                                dst: 2,
+                                body: StrictBody::HistoryProbeReq(request),
+                                ..
+                            } => Some(request),
+                            _ => None,
+                        })
+                {
+                    break request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("divergent clock head must start one correlated history probe");
+        {
+            let mut state = rt.state.lock();
+            state.request_history_election();
+            state.begin_history_election([2]);
+        }
+        assert_eq!(
+            rt.v3_sync.lock().record_history_nonce(
+                PeerIncarnation::new(2, 1),
+                repl_proto::StrictCatchupReason::HistoryElection as i32,
+                rt.cfg.pending_propose_ttl(),
+            ),
+            None,
+            "history election shares retry ownership without re-enqueueing the correlated probe"
+        );
+
+        rt.dispatch(
+            2,
+            1,
+            true,
+            StrictBody::HistoryProbeResp(repl_proto::StrictHistoryProbeResp {
+                responder_node: 2,
+                expected_requester_boot_epoch: rt.boot_epoch,
+                request_nonce: history_request.request_nonce,
+                repository_version: 3,
+                history_freshness: 0,
+                runtime_started_at: 1,
+                history_node: 2,
+                terminal_cut: Some(cut_to_wire(remote_cut)),
+                reason: repl_proto::StrictCatchupReason::HistoryElection as i32,
+            }),
+        )
+        .await;
+
+        let captures = net.drain_captures();
+        assert!(captures.iter().any(|frame| {
             matches!(
                 frame,
                 CapturedFrame::StrictUnicast {
                     dst: 2,
-                    body: StrictBody::ClockProbeReq(request),
+                    body: StrictBody::TerminalSyncReq(_),
                     ..
-                } if request.reason
-                    == repl_proto::StrictCatchupReason::DeliveryWatermark as i32
+                }
             )
         }));
+        assert!(
+            captures.iter().all(|frame| !matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::CatchupReq(StrictCatchupReq {
+                        history_transfer: Some(_),
+                        ..
+                    }),
+                    ..
+                }
+            )),
+            "the evidence peer must not start a competing repository client while election owns source selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_peer_must_acknowledge_head_as_new_incarnation() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        let repository_version = rt.repo.current_version();
+        let ack = |src_boot_epoch| StrictHeadAck {
+            src_node: 2,
+            src_boot_epoch,
+            expected_target_node: 1,
+            expected_target_boot_epoch: 1,
+            repository_version,
+            terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
+            history_freshness: 0,
+        };
+        rt.remember_advertised_head(rt.repo.history_metadata(), cut);
+        rt.recv_head_ack(2, 1, ack(1));
+        assert!(!rt.clock_tick_needed());
+
+        net.set_epoch(2, 2);
+        assert!(rt.clock_tick_needed());
+        rt.recv_head_ack(2, 1, ack(1));
+        assert!(rt.clock_tick_needed());
+        rt.recv_head_ack(2, 2, ack(2));
+        assert!(!rt.clock_tick_needed());
+    }
+
+    #[tokio::test]
+    async fn joined_peer_wakes_head_evidence_after_poll_observed_expansion_first() {
+        use crate::overlay::MemberIncarnation;
+
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V4);
+        net.set_epoch(3, 1);
+        net.set_alive(vec![1]);
+        // Reproduce the heal race: idle bootstrap polling sees node 3 before
+        // the membership event, so the event must wake head evidence even
+        // though it no longer needs to rearm the history election.
+        rt.state.lock().history_alive_peers.insert(3);
+        spawn_clock_tick_loop(rt.clone());
+        net.drain_captures();
+
+        net.set_alive(vec![1, 3]);
+        rt.on_membership_change(&MembershipEvent::Joined(MemberIncarnation::new(3, 1)));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if net.drain_captures().into_iter().any(|frame| {
+                    matches!(
+                        frame,
+                        CapturedFrame::StrictMulticast {
+                            body: StrictBody::ClockTick(_),
+                            ..
+                        }
+                    )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("joined v3 peer must wake durable head advertisement");
+        rt.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn v3_peer_uses_steady_fallback_without_becoming_pending_head_evidence() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        rt.remember_advertised_head(rt.repo.history_metadata(), cut);
+
+        assert!(
+            !rt.clock_tick_needed(),
+            "a d578-era v3 peer cannot supply v4 head acknowledgement"
+        );
+        request_steady_state_catchup(&rt).await;
+
+        assert!(net.drain_captures().into_iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(request),
+                ..
+            } if request.reason == repl_proto::StrictCatchupReason::SteadyState as i32
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn converged_runtime_emits_no_periodic_history_catchup() {
+        let interval = Duration::from_millis(100);
+        let (rt, net, _repo) = v1_runtime(
+            ReplicationConfig::default().with_strict_steady_state_catchup_interval(interval),
+        );
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        spawn_steady_state_catchup_loop(rt.clone());
+        tokio::task::yield_now().await;
+        net.drain_captures();
+
+        tokio::time::advance(interval.saturating_mul(10)).await;
+        tokio::task::yield_now().await;
+
+        assert!(net.drain_captures().is_empty());
+        rt.shutdown.cancel();
     }
 
     #[tokio::test]
@@ -16559,7 +17405,7 @@ mod tests {
                 frame,
                 CapturedFrame::StrictUnicast {
                     dst: 2,
-                    body: StrictBody::ClockTick(StrictClockTick { src_node: 1, src_clock }),
+                    body: StrictBody::ClockTick(StrictClockTick { src_node: 1, src_clock, .. }),
                     ..
                 } if *src_clock > 0
             )
@@ -16601,7 +17447,6 @@ mod tests {
 
         let op_id = make_op_id(1, 1, 139);
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&139u64).unwrap());
-                .await
         let identity = TerminalDecisionIdentity {
             resolver: TerminalResolver::new(1, 1),
             frozen_targets: v2_frozen_targets(),
@@ -16615,6 +17460,7 @@ mod tests {
                     op_msgpack.clone(),
                     Some(&identity),
                 )
+                .await
                 .accepted()
         );
         {
@@ -17536,7 +18382,6 @@ mod tests {
         // legacy recovery protocol nor start a fresh terminal ballot that a
         // relay might not carry.
         net.set_alive(vec![1, 3]);
-                .await
         net.set_strict_replication_protocol_version(0);
         rt.maybe_initiate_recovery(2).await;
         rt.resume_lost_v2_coordinator_resolutions().await;
@@ -17550,6 +18395,7 @@ mod tests {
         assert!(
             rt.terminal_journal
                 .lock()
+                .await
                 .get(op_id)
                 .is_some_and(|record| record.accepted_commit().is_some())
         );
@@ -17758,7 +18604,6 @@ mod tests {
                 op_id_hi: op_id.0,
                 op_id_lo: op_id.1,
                 ts_propose: 39,
-            .await
                 op_msgpack: op_msgpack.clone(),
                 src_clock: 39,
                 protocol_version: STRICT_PROTOCOL_VERSION_V2,
@@ -17772,6 +18617,7 @@ mod tests {
         let record = rt
             .terminal_journal
             .lock()
+            .await
             .get(op_id)
             .cloned()
             .expect("retransmit must durably restore its pending descriptor");
@@ -18079,7 +18925,6 @@ mod tests {
         };
 
         rt.recv_decision_with_origin_epoch(2, 2, decision.clone())
-                .await
             .await;
         assert!(!rt.state.lock().terminal_decisions.contains_key(&op_id));
 
@@ -18093,6 +18938,7 @@ mod tests {
         assert_eq!(
             rt.terminal_journal
                 .lock()
+                .await
                 .get(op_id)
                 .and_then(TerminalJournalRecord::frozen_targets),
             Some(v2_frozen_targets().as_slice())
@@ -18137,7 +18983,6 @@ mod tests {
 
         net.set_epoch(1, 2);
         let recovered = StrictRuntime::new(
-                .await
             CountingStrictRepo::new(),
             1,
             2,
@@ -18151,6 +18996,7 @@ mod tests {
             recovered
                 .terminal_journal
                 .lock()
+                .await
                 .get(op_id)
                 .is_some_and(|record| record.pending_proposal().is_some())
         );
@@ -18178,7 +19024,6 @@ mod tests {
                 1,
                 StrictResolutionPrepare {
                     resolver_node: 2,
-                .await
                     ballot: 56,
                     coord_node: 2,
                     op_id_hi: op_id.0,
@@ -18192,6 +19037,7 @@ mod tests {
             recovered
                 .terminal_journal
                 .lock()
+                .await
                 .get(op_id)
                 .map(TerminalJournalRecord::promise_ballot),
             Some(0)
@@ -18226,7 +19072,6 @@ mod tests {
                     coord_node: 2,
                     op_id_hi: op_id.0,
                     op_id_lo: op_id.1,
-                .await
                     ts_local: 42,
                     op_msgpack: op_msgpack.clone(),
                     src_clock: 42,
@@ -18240,6 +19085,7 @@ mod tests {
             let record = rt
                 .terminal_journal
                 .lock()
+                .await
                 .get(op_id)
                 .cloned()
                 .expect("hinted operation must enter the durable terminal journal");
@@ -18323,7 +19169,6 @@ mod tests {
             matches!(
                 frame,
                 CapturedFrame::StrictUnicast {
-                .await
                     dst: 3,
                     body: StrictBody::ResolutionAck(StrictResolutionAck {
                         ballot: 44,
@@ -18337,6 +19182,7 @@ mod tests {
         assert_eq!(
             rt.terminal_journal
                 .lock()
+                .await
                 .get(op_id)
                 .map(TerminalJournalRecord::promise_ballot),
             Some(0)
@@ -18815,6 +19661,7 @@ mod tests {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
+        net.set_live_reliable_routes([1, 2]);
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
         net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
         {
@@ -18827,6 +19674,16 @@ mod tests {
                 CancellationToken::new(),
                 Arc::new(cfg.clone()),
             );
+            {
+                let mut state = rt.state.lock();
+                state.admission_tracking_started = true;
+                state.begin_peer_admission(2, 1);
+                state
+                    .peer_admissions
+                    .get_mut(&2)
+                    .expect("peer admission exists")
+                    .phase = PeerAdmissionPhase::Admitted;
+            }
             rt.recv_propose_v1(
                 2,
                 StrictProposeV1 {
@@ -18841,6 +19698,10 @@ mod tests {
                 },
             )
             .await;
+            assert!(
+                rt.state.lock().pending_proposes.contains_key(&op_id),
+                "admitted v2 proposal must be retained before restart"
+            );
             rt.recv_accept(
                 2,
                 StrictAccept {
@@ -18854,6 +19715,24 @@ mod tests {
                 },
             )
             .await;
+            assert!(
+                rt.state.lock().accepted_values.contains_key(&op_id),
+                "v2 accepted value must reach the durable restart source"
+            );
+            {
+                let journal = rt.terminal_journal.lock().await;
+                let record = journal.get(op_id).expect("v2 journal record");
+                assert!(record.frozen_targets().is_some(), "descriptor must persist");
+                assert!(record.accepted_commit().is_some(), "accept must persist");
+            }
+            rt.shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while Arc::strong_count(&rt) > 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("accept ACK retry worker must release the runtime on shutdown");
         }
 
         let recovered = StrictRuntime::new(
@@ -18866,6 +19745,10 @@ mod tests {
             Arc::new(cfg.clone()),
         );
         recovered.finish_history_election_for_test();
+        assert!(
+            recovered.state.lock().accepted_values.contains_key(&op_id),
+            "accepted value must reload before pending reconstruction"
+        );
         assert!(matches!(
             recovered.state.lock().pending_proposes.get(&op_id),
             Some(PendingPropose { protocol_version, .. })

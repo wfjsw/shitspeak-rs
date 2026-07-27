@@ -71,6 +71,7 @@ struct UnorderedForwardKey {
 #[derive(Debug, Clone)]
 struct PendingPacket {
     data: pb::OverlayData,
+    retained_logical_send: Option<[u8; 32]>,
     first_sent_at: Instant,
     next_retry_at: Instant,
     retry_delay: Duration,
@@ -307,7 +308,17 @@ impl OverlayOrdering {
         current
     }
 
+    #[cfg(test)]
     pub(crate) async fn store_pending(&self, lane: LaneId, data: pb::OverlayData) {
+        self.store_pending_with_identity(lane, data, None).await;
+    }
+
+    pub(crate) async fn store_pending_with_identity(
+        &self,
+        lane: LaneId,
+        data: pb::OverlayData,
+        retained_logical_send: Option<[u8; 32]>,
+    ) {
         let Ok(dst) = NodeIdentifier::try_from(data.ordering_dst) else {
             return;
         };
@@ -319,12 +330,30 @@ impl OverlayOrdering {
             data.ordering_seq,
             PendingPacket {
                 data,
+                retained_logical_send,
                 first_sent_at: now,
                 next_retry_at: now + self.retry_initial,
                 retry_delay: self.retry_initial,
                 retry_attempts: 0,
             },
         );
+    }
+
+    pub(crate) async fn owns_retained_logical_send(
+        &self,
+        dst: NodeIdentifier,
+        lane: LaneId,
+        identity: [u8; 32],
+    ) -> bool {
+        self.pending
+            .lock()
+            .await
+            .get(&OutboundKey { dst, lane })
+            .is_some_and(|packets| {
+                packets
+                    .values()
+                    .any(|packet| packet.retained_logical_send == Some(identity))
+            })
     }
 
     pub(crate) async fn apply_ack(&self, final_dst: NodeIdentifier, lane: LaneId, next_seq: u64) {
@@ -936,6 +965,27 @@ mod tests {
                 .is_empty()
         );
         assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retained_logical_send_ownership_ends_at_ack() {
+        let ordering = OverlayOrdering::default();
+        let identity = [9; 32];
+        ordering
+            .store_pending_with_identity(lane(), data(0, b"pending"), Some(identity))
+            .await;
+
+        assert!(
+            ordering
+                .owns_retained_logical_send(1, lane(), identity)
+                .await
+        );
+        ordering.apply_ack(1, lane(), 1).await;
+        assert!(
+            !ordering
+                .owns_retained_logical_send(1, lane(), identity)
+                .await
+        );
     }
 
     #[tokio::test]

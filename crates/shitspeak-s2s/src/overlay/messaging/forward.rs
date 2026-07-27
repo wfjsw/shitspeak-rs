@@ -335,18 +335,45 @@ pub(crate) async fn originate_with_attachments(
 
     let _send_guard = ordering.outbound_send_guard().await;
     ordering.activate_local_lane(lane).await;
-    preflight_routes(routing, self_id, &dsts, level, routing_metric)?;
-    ordering
-        .can_store_pending(&dsts, lane)
-        .await
-        .map_err(|(dst, lane)| OverlayError::OrderedWindowFull {
-            dst,
-            lane: lane.get(),
-        })?;
-
     let message_id = ordering.next_origin_message_id();
-    let mut first_err = None;
+    let retained_logical_send = options.retained_logical_send();
+    let mut ownership_err = None;
+    let mut physical_err = None;
     for dst in dsts {
+        if level == ServiceLevel::Reliable
+            && let Some(identity) = retained_logical_send
+            && ordering
+                .owns_retained_logical_send(dst, lane, identity)
+                .await
+        {
+            continue;
+        }
+        // Admission and routing are destination-local. One unavailable or
+        // full destination must not prevent independent multicast copies from
+        // transferring into ownership for healthy destinations.
+        if level != ServiceLevel::Reliable
+            && let Err(error) = preflight_routes(
+                routing,
+                self_id,
+                std::slice::from_ref(&dst),
+                level,
+                routing_metric,
+            )
+        {
+            if ownership_err.is_none() {
+                ownership_err = Some(error);
+            }
+            continue;
+        }
+        if let Err((dst, lane)) = ordering.can_store_pending(&[dst], lane).await {
+            if ownership_err.is_none() {
+                ownership_err = Some(OverlayError::OrderedWindowFull {
+                    dst,
+                    lane: lane.get(),
+                });
+            }
+            continue;
+        }
         let seq = ordering.next_outbound_seq(dst, lane).await;
         let data = pb::OverlayData {
             src: node_to_wire(self_id),
@@ -377,7 +404,9 @@ pub(crate) async fn originate_with_attachments(
             distribution_deadline_unix_us: None,
             inline_attachments: attachments_to_proto(&attachments),
         };
-        ordering.store_pending(lane, data.clone()).await;
+        ordering
+            .store_pending_with_identity(lane, data.clone(), retained_logical_send)
+            .await;
         ordering.cache_ordered_packet(&data).await;
         if let Err(err) = forward_pb_as(
             transport,
@@ -391,13 +420,23 @@ pub(crate) async fn originate_with_attachments(
         )
         .await
         {
-            if first_err.is_none() {
-                first_err = Some(err);
+            if physical_err.is_none() {
+                physical_err = Some(err);
             }
         }
     }
 
-    if let Some(err) = first_err {
+    // Once an ordered Reliable packet is in `ordering.pending`, the overlay
+    // owns its end-to-end delivery and will retry it until ACK/incarnation
+    // reset. A failed first physical forward is therefore not a rejection:
+    // reporting it as one makes protocol callers enqueue duplicate retained
+    // packets for the same logical operation.
+    if let Some(err) = ownership_err {
+        return Err(err);
+    }
+    if level != ServiceLevel::Reliable
+        && let Some(err) = physical_err
+    {
         return Err(err);
     }
     Ok(())
@@ -3130,6 +3169,8 @@ fn queue_pressure_alternate(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use super::super::super::proto::decode_message;
     use super::super::super::routing::{RouteEntry, dijkstra::EdgeCost, new_handle};
     use super::super::{OverlayInboundMessage, ServiceInbound};
@@ -4478,6 +4519,168 @@ mod tests {
         assert_eq!(data.origin_boot_epoch, 1234);
         assert_ne!(data.origin_message_id, 0);
         assert!(!data.distribution_repair);
+    }
+
+    #[tokio::test]
+    async fn ordered_reliable_send_is_accepted_once_retained_despite_first_forward_backpressure() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
+        fill_outbound_queue(&transport, 4).await;
+        let routing = routing_with_route(4, 4);
+        let ordering = OverlayOrdering::default();
+        let lane = LaneId::new(NonZeroU32::new(7).unwrap());
+
+        originate(
+            &transport,
+            &routing,
+            1,
+            1234,
+            &ordering,
+            vec![4],
+            7,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            MessageClass::Regular,
+            Bytes::from_static(b"retained"),
+            Some(lane),
+            false,
+            OverlaySendOptions::default(),
+        )
+        .await
+        .expect("ordered Reliable ownership transfers before first physical retry");
+
+        assert_eq!(ordering.pending_range(4, lane, 0, 0).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ordered_reliable_control_is_retained_until_a_route_appears() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
+        let routing = new_handle();
+        let ordering = OverlayOrdering::default();
+        let lane = LaneId::new(NonZeroU32::new(8).unwrap());
+
+        originate(
+            &transport,
+            &routing,
+            1,
+            1234,
+            &ordering,
+            vec![4],
+            7,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            MessageClass::Regular,
+            Bytes::from_static(b"head-evidence"),
+            Some(lane),
+            false,
+            OverlaySendOptions::default(),
+        )
+        .await
+        .expect("ordered Reliable control must transfer into local retention");
+
+        assert_eq!(ordering.pending_range(4, lane, 0, 0).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ordered_reliable_retry_reuses_owned_logical_send() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 4, &[TransportKind::Tcp]);
+        let routing = new_handle();
+        let ordering = OverlayOrdering::default();
+        let lane = LaneId::new(NonZeroU32::new(9).unwrap());
+        let options = OverlaySendOptions::default().retain_logical_send([7; 32]);
+
+        for _ in 0..2 {
+            originate(
+                &transport,
+                &routing,
+                1,
+                1234,
+                &ordering,
+                vec![4],
+                7,
+                ServiceLevel::Reliable,
+                RoutingMetric::ReliableCost,
+                MessageClass::Regular,
+                Bytes::from_static(b"same-logical-send"),
+                Some(lane),
+                false,
+                options,
+            )
+            .await
+            .expect("an already-owned logical retry is successful");
+        }
+
+        assert_eq!(
+            ordering.pending_range(4, lane, 0, 1).await.len(),
+            1,
+            "the overlay must remain the sole delivery owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_ordered_destination_does_not_poison_healthy_multicast_destination() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 5, &[TransportKind::Tcp]);
+        let mut healthy_rx = receivers.pop().unwrap();
+        let routing = routing_with_routes(&[(4, 4), (5, 5)]);
+        let ordering = OverlayOrdering::new(
+            &OverlayConfig::new(Vec::new()).with_ordered_pending_window_packets(1),
+        );
+        let lane = LaneId::new(NonZeroU32::new(10).unwrap());
+
+        originate(
+            &transport,
+            &routing,
+            1,
+            1234,
+            &ordering,
+            vec![4],
+            7,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            MessageClass::Regular,
+            Bytes::from_static(b"fill-failed-peer"),
+            Some(lane),
+            false,
+            OverlaySendOptions::default(),
+        )
+        .await
+        .expect("first destination owns its retained packet");
+
+        let error = originate(
+            &transport,
+            &routing,
+            1,
+            1234,
+            &ordering,
+            vec![4, 5],
+            7,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            MessageClass::Regular,
+            Bytes::from_static(b"multicast"),
+            Some(lane),
+            false,
+            OverlaySendOptions::default(),
+        )
+        .await
+        .expect_err("the full destination must still report rejection");
+        assert!(matches!(
+            error,
+            OverlayError::OrderedWindowFull { dst: 4, .. }
+        ));
+
+        let forwarded = timeout(Duration::from_millis(50), healthy_rx.recv())
+            .await
+            .expect("healthy destination must receive its independent copy")
+            .expect("healthy receiver remains open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay data");
+        let Some(OverlayBody::Data(data)) = decoded.body else {
+            panic!("not overlay data");
+        };
+        assert_eq!(data.dsts, vec![node_to_wire(5)]);
     }
 
     #[tokio::test]

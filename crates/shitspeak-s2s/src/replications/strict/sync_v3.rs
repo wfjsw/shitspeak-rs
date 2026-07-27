@@ -83,6 +83,8 @@ struct ProbeNonce {
     value: u64,
     reason: i32,
     admission_pending: bool,
+    election_pending: bool,
+    repair_reason: Option<i32>,
     expires_at: Instant,
 }
 
@@ -90,6 +92,8 @@ struct ProbeNonce {
 pub(super) struct AcceptedHistoryProbe {
     reason: i32,
     admission_pending: bool,
+    election_pending: bool,
+    repair_reason: Option<i32>,
 }
 
 impl AcceptedHistoryProbe {
@@ -99,6 +103,14 @@ impl AcceptedHistoryProbe {
 
     pub(super) fn admission_pending(self) -> bool {
         self.admission_pending
+    }
+
+    pub(super) fn election_pending(self) -> bool {
+        self.election_pending
+    }
+
+    pub(super) fn repair_reason(self) -> Option<i32> {
+        self.repair_reason
     }
 }
 
@@ -555,7 +567,7 @@ impl SyncV3State {
     // A reusable cut is safe to offer to a replacement as an untrusted
     // baseline. It must not escape through `known_source_cut`, whose callers
     // use exact-incarnation knowledge for no-transfer fast paths.
-    fn reusable_source_cut(&self, peer: PeerIncarnation) -> Option<TerminalCut> {
+    pub(super) fn reusable_source_cut(&self, peer: PeerIncarnation) -> Option<TerminalCut> {
         self.known_source_cuts
             .get(&peer)
             .copied()
@@ -756,19 +768,12 @@ impl SyncV3State {
         ttl: Duration,
     ) -> Option<u64> {
         self.expire(Instant::now());
-        // Clock probes are authenticated, metadata-only liveness evidence
-        // with their own nonce. They neither read nor mutate terminal/history
-        // transfer cursors, so they may safely coexist with either transfer
-        // direction. Serializing them behind operation-bearing catch-up can
-        // deadlock strict delivery: a repeatedly expiring transfer leaves the
-        // peer admitted, while its last observed clock permanently pins the
-        // delivery watermark that is needed to drain new commits.
-        if let Some(pending) = self.clock_nonces.get_mut(&peer) {
-            // A probe is a replayable metadata request, not transfer work.
-            // Keep one identity across retries so a delayed response remains
-            // correlated without allocating a second outstanding nonce.
-            pending.expires_at = Instant::now() + ttl;
-            return Some(pending.value);
+        // One outstanding clock request is enough to break a delivery-watermark
+        // dependency, including while terminal/history work is active. Do not
+        // refresh its lifetime or retransmit it on every periodic trigger: a
+        // lost request is retried with a new nonce only after the bounded TTL.
+        if self.clock_nonces.contains_key(&peer) {
+            return None;
         }
         let nonce = self.next_id();
         self.clock_nonces.insert(
@@ -777,6 +782,8 @@ impl SyncV3State {
                 value: nonce,
                 reason: StrictCatchupReason::DeliveryWatermark as i32,
                 admission_pending: false,
+                election_pending: false,
+                repair_reason: None,
                 expires_at: Instant::now() + ttl,
             },
         );
@@ -795,6 +802,12 @@ impl SyncV3State {
         if self.clock_nonces.get(&peer).map(|pending| pending.value) == Some(nonce) {
             self.clock_nonces.remove(&peer);
         }
+    }
+
+    pub(super) fn clock_nonce_is_current(&self, peer: PeerIncarnation, nonce: u64) -> bool {
+        self.clock_nonces
+            .get(&peer)
+            .is_some_and(|pending| pending.value == nonce)
     }
 
     pub(super) fn record_history_nonce(
@@ -816,20 +829,39 @@ impl SyncV3State {
         }
         if let Some(pending) = self.history_nonces.get_mut(&peer) {
             pending.admission_pending |= reason == StrictCatchupReason::Admission as i32;
-            // Admission and history election share a session priority tier,
-            // but the election collector must own this response. Promote (or
-            // reissue after a rearm) the existing probe while preserving its
-            // nonce, so a lost older attempt cannot suppress a candidate.
-            if reason == StrictCatchupReason::HistoryElection as i32
-                || reason_priority(reason) > reason_priority(pending.reason)
-            {
+            let requested_election = reason == StrictCatchupReason::HistoryElection as i32;
+            let primary_was_election =
+                pending.reason == StrictCatchupReason::HistoryElection as i32;
+            if requested_election {
+                // Election is an additional metadata consumer, not a reason
+                // to replace or resend the existing request. The correlated
+                // response can feed both the collector and the repair owner.
+                if !primary_was_election {
+                    pending.election_pending = true;
+                }
+                return None;
+            }
+            if primary_was_election {
+                // Preserve operation-bearing evidence independently while
+                // the election remains the primary response consumer.
+                if reason != StrictCatchupReason::Admission as i32
+                    && pending
+                        .repair_reason
+                        .is_none_or(|current| reason_priority(reason) > reason_priority(current))
+                {
+                    pending.repair_reason = Some(reason);
+                }
+                return None;
+            }
+            if reason_priority(reason) > reason_priority(pending.reason) {
+                // Metadata is identical across reasons. Promote the retained
+                // obligation in place; the existing retry schedule owns the
+                // one wire identity and must not be reset by another trigger.
                 pending.reason = reason;
             }
-            // Retry the same request identity even when this trigger has no
-            // higher priority. This repairs a request that was enqueued
-            // before the remote topic existed without branching the probe.
-            pending.expires_at = Instant::now() + ttl;
-            return Some(pending.value);
+            // The outstanding fixed-TTL identity owns retry suppression.
+            // Periodic triggers do not enqueue duplicates or extend its life.
+            return None;
         }
         let nonce = self.next_id();
         self.history_nonces.insert(
@@ -838,6 +870,8 @@ impl SyncV3State {
                 value: nonce,
                 reason,
                 admission_pending: reason == StrictCatchupReason::Admission as i32,
+                election_pending: false,
+                repair_reason: None,
                 expires_at: Instant::now() + ttl,
             },
         );
@@ -857,7 +891,15 @@ impl SyncV3State {
             .map(|pending| AcceptedHistoryProbe {
                 reason: pending.reason,
                 admission_pending: pending.admission_pending,
+                election_pending: pending.election_pending,
+                repair_reason: pending.repair_reason,
             })
+    }
+
+    pub(super) fn history_nonce_is_current(&self, peer: PeerIncarnation, nonce: u64) -> bool {
+        self.history_nonces
+            .get(&peer)
+            .is_some_and(|pending| pending.value == nonce)
     }
 
     pub(super) fn cancel_history_nonce(&mut self, peer: PeerIncarnation, nonce: u64) {
@@ -1040,6 +1082,38 @@ impl SyncV3State {
             StrictCatchupSessionOutcome::Cancelled,
         );
         InboundTerminalSyncDisposition::Yielded { cancelled_nonce }
+    }
+
+    /// Repository history has priority over an opposing outbound terminal
+    /// client. Without one shared ordering, each endpoint can reject the
+    /// other's request forever: terminal rejects behind active history while
+    /// history rejects behind active terminal. Retain the terminal intent so
+    /// the history server's final ACK can resume it.
+    pub(super) fn yield_terminal_client_for_history(
+        &mut self,
+        peer: PeerIncarnation,
+    ) -> Option<u64> {
+        if self.finalizing_clients.contains_key(&peer) || self.responders.contains_key(&peer) {
+            return None;
+        }
+        let session = self.clients.remove(&peer)?;
+        let cancelled_nonce = session.pending_nonce;
+        let active_wire = self.sessions.get(&peer).and_then(SessionState::active_wire);
+        self.defer_client(peer, session.reason, session.desired_cut);
+        record_ended_client(
+            session.started_reason,
+            StrictCatchupSessionOutcome::Cancelled,
+        );
+        if let Some(wire) = active_wire {
+            self.transition_session(
+                peer,
+                SessionEvent::TransferExpired {
+                    epoch: PeerEpoch::new(peer.boot_epoch),
+                    wire,
+                },
+            );
+        }
+        Some(cancelled_nonce)
     }
 
     pub(super) fn take_deferred_client(

@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tokio::sync::Notify;
 use tokio::time::sleep;
 
 use super::super::metrics::{self, StrictCatchupThrottleReason};
@@ -80,16 +79,13 @@ struct BulkPacerState {
 
 #[derive(Debug)]
 pub(super) enum BulkAdmissionError {
+    Busy {
+        retry_after: Duration,
+    },
     FrameTooLarge {
         encoded_bytes: usize,
         max_bytes: usize,
     },
-}
-
-enum TryReserve {
-    Admitted(BulkReservation),
-    Wait(Duration),
-    FrameTooLarge,
 }
 
 /// Cross-topic, per-next-hop byte and rate scheduler.
@@ -97,7 +93,6 @@ pub(super) struct BulkPacer {
     max_in_flight_bytes: usize,
     rate_bytes_per_second: u64,
     state: Mutex<BulkPacerState>,
-    changed: Notify,
 }
 
 impl BulkPacer {
@@ -106,7 +101,6 @@ impl BulkPacer {
             max_in_flight_bytes: max_in_flight_bytes.max(1),
             rate_bytes_per_second: rate_bytes_per_second.max(1),
             state: Mutex::new(BulkPacerState::default()),
-            changed: Notify::new(),
         })
     }
 
@@ -114,7 +108,7 @@ impl BulkPacer {
     /// physical first hop. A retained replay of this exact protocol page is
     /// replaced here; reservations for earlier or later pages remain until
     /// their own correlated continuation, ACK, cancellation, or TTL.
-    pub(super) async fn reserve(
+    pub(super) fn try_reserve(
         self: &Arc<Self>,
         destination: NodeIdentifier,
         topic: &str,
@@ -127,56 +121,24 @@ impl BulkPacer {
             topic: topic.to_owned(),
             page,
         };
-        loop {
-            let notified = self.changed.notified();
-            match self.try_reserve(key.clone(), next_hop, encoded_bytes) {
-                TryReserve::Admitted(reservation) => return Ok(reservation),
-                TryReserve::FrameTooLarge => {
-                    return Err(BulkAdmissionError::FrameTooLarge {
-                        encoded_bytes,
-                        max_bytes: self.max_in_flight_bytes,
-                    });
-                }
-                TryReserve::Wait(delay) => {
-                    metrics::record_strict_catchup_throttled(
-                        StrictCatchupThrottleReason::NextHopBytes,
-                    );
-                    tokio::select! {
-                        _ = notified => {}
-                        _ = sleep(delay) => {}
-                    }
-                }
-            }
-        }
-    }
-
-    fn try_reserve(
-        self: &Arc<Self>,
-        key: LogicalPageKey,
-        next_hop: NodeIdentifier,
-        encoded_bytes: usize,
-    ) -> TryReserve {
         if encoded_bytes > self.max_in_flight_bytes {
-            return TryReserve::FrameTooLarge;
+            return Err(BulkAdmissionError::FrameTooLarge {
+                encoded_bytes,
+                max_bytes: self.max_in_flight_bytes,
+            });
         }
 
         let now = Instant::now();
         let mut state = self.state.lock();
 
-        // A retained copy of this exact page is replaced by a cached replay.
-        // A copy still being enqueued is not: concurrent duplicate responders
-        // must wait rather than temporarily under-accounting the first hop.
-        if let Some(existing_id) = state.outstanding_by_key.get(&key).copied() {
-            let retained = state
-                .reservations
-                .get(&existing_id)
-                .is_some_and(|record| record.retained);
-            if retained {
-                Self::release_locked(&mut state, existing_id);
-                self.changed.notify_waiters();
-            } else {
-                return TryReserve::Wait(Duration::from_millis(10));
-            }
+        // The ordered overlay already owns a retained copy of this exact page.
+        // Do not enqueue or account a duplicate: its physical retry is owned
+        // by the overlay, while the requester keeps the correlated protocol
+        // session alive until the page arrives.
+        if state.outstanding_by_key.contains_key(&key) {
+            return Err(BulkAdmissionError::Busy {
+                retry_after: Duration::from_millis(10),
+            });
         }
 
         let hop = state.entry_or_insert_hop(next_hop, self.max_in_flight_bytes, now);
@@ -188,17 +150,22 @@ impl BulkPacer {
         );
 
         let Some(new_in_flight) = hop.in_flight_bytes.checked_add(encoded_bytes) else {
-            return TryReserve::Wait(Duration::from_millis(10));
+            return Err(BulkAdmissionError::Busy {
+                retry_after: Duration::from_millis(10),
+            });
         };
         if new_in_flight > self.max_in_flight_bytes {
-            return TryReserve::Wait(Duration::from_millis(100));
+            metrics::record_strict_catchup_throttled(StrictCatchupThrottleReason::NextHopBytes);
+            return Err(BulkAdmissionError::Busy {
+                retry_after: Duration::from_millis(100),
+            });
         }
         if hop.rate_tokens < encoded_bytes as f64 {
             let missing = encoded_bytes as f64 - hop.rate_tokens;
             let seconds = missing / self.rate_bytes_per_second as f64;
-            return TryReserve::Wait(
-                Duration::from_secs_f64(seconds).max(Duration::from_millis(1)),
-            );
+            return Err(BulkAdmissionError::Busy {
+                retry_after: Duration::from_secs_f64(seconds).max(Duration::from_millis(1)),
+            });
         }
 
         hop.in_flight_bytes = new_in_flight;
@@ -215,7 +182,7 @@ impl BulkPacer {
         );
         state.outstanding_by_key.insert(key, id);
         metrics::record_strict_catchup_bulk_in_flight_bytes_delta(encoded_bytes as isize);
-        TryReserve::Admitted(BulkReservation {
+        Ok(BulkReservation {
             pacer: Arc::clone(self),
             id,
             release_on_drop: true,
@@ -246,7 +213,6 @@ impl BulkPacer {
                 .is_some_and(|record| record.retained);
             if retained {
                 Self::release_locked(&mut state, id);
-                self.changed.notify_waiters();
             }
         }
     }
@@ -262,20 +228,14 @@ impl BulkPacer {
                 (key.destination == destination && key.topic == topic).then_some(*id)
             })
             .collect();
-        let mut released = false;
         for id in ids {
-            released |= Self::release_locked(&mut state, id);
-        }
-        if released {
-            self.changed.notify_waiters();
+            Self::release_locked(&mut state, id);
         }
     }
 
     fn release(&self, id: u64) {
         let mut state = self.state.lock();
-        if Self::release_locked(&mut state, id) {
-            self.changed.notify_waiters();
-        }
+        Self::release_locked(&mut state, id);
     }
 
     fn retain(&self, id: u64) -> bool {
@@ -375,40 +335,29 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn shared_first_hop_cap_applies_across_topics_and_destinations() {
+    async fn shared_first_hop_cap_returns_busy_without_blocking() {
         let pacer = BulkPacer::new(64 * 1024, 1024 * 1024 * 1024);
         for (destination, topic) in [(10, "a"), (11, "b"), (12, "c"), (13, "d")] {
             pacer
-                .reserve(destination, topic, BulkPageIdentity::Legacy, 2, 16 * 1024)
-                .await
+                .try_reserve(destination, topic, BulkPageIdentity::Legacy, 2, 16 * 1024)
                 .expect("page should fit")
                 .retain_until(Duration::from_secs(10));
         }
 
-        let blocked = tokio::time::timeout(
-            Duration::from_millis(20),
-            pacer.reserve(14, "e", BulkPageIdentity::Legacy, 2, 16 * 1024),
-        )
-        .await;
-        assert!(blocked.is_err(), "the fifth shared-hop page must wait");
+        let busy = pacer.try_reserve(14, "e", BulkPageIdentity::Legacy, 2, 16 * 1024);
+        assert!(matches!(busy, Err(BulkAdmissionError::Busy { .. })));
 
         pacer.acknowledge(10, "a", BulkPageIdentity::Legacy);
-        let fifth = tokio::time::timeout(
-            Duration::from_millis(100),
-            pacer.reserve(14, "e", BulkPageIdentity::Legacy, 2, 16 * 1024),
-        )
-        .await
-        .expect("ACK should wake shared-hop admission")
-        .expect("page should fit after refund");
+        let fifth = pacer
+            .try_reserve(14, "e", BulkPageIdentity::Legacy, 2, 16 * 1024)
+            .expect("page should fit after refund");
         drop(fifth);
     }
 
-    #[tokio::test]
-    async fn one_frame_cannot_exceed_the_next_hop_cap() {
+    #[test]
+    fn one_frame_cannot_exceed_the_next_hop_cap() {
         let pacer = BulkPacer::new(1024, 1024);
-        let result = pacer
-            .reserve(10, "topic", BulkPageIdentity::Legacy, 2, 1025)
-            .await;
+        let result = pacer.try_reserve(10, "topic", BulkPageIdentity::Legacy, 2, 1025);
         assert!(matches!(
             result,
             Err(BulkAdmissionError::FrameTooLarge {
@@ -425,14 +374,12 @@ mod tests {
         let second = BulkPageIdentity::terminal(7, 102);
 
         pacer
-            .reserve(10, "topic", first, 2, 8 * 1024)
-            .await
+            .try_reserve(10, "topic", first, 2, 8 * 1024)
             .expect("first page should fit")
             .retain_until(Duration::from_secs(10));
         pacer.acknowledge(10, "topic", first);
         pacer
-            .reserve(10, "topic", second, 2, 12 * 1024)
-            .await
+            .try_reserve(10, "topic", second, 2, 12 * 1024)
             .expect("second page should fit")
             .retain_until(Duration::from_secs(10));
 
@@ -460,14 +407,12 @@ mod tests {
         let second = BulkPageIdentity::history(9, 202);
 
         pacer
-            .reserve(10, "topic", first, 2, 8 * 1024)
-            .await
+            .try_reserve(10, "topic", first, 2, 8 * 1024)
             .expect("first page should fit")
             .retain_until(Duration::from_secs(10));
         pacer.acknowledge(10, "topic", first);
         pacer
-            .reserve(10, "topic", second, 2, 12 * 1024)
-            .await
+            .try_reserve(10, "topic", second, 2, 12 * 1024)
             .expect("second page should fit")
             .retain_until(Duration::from_secs(10));
 

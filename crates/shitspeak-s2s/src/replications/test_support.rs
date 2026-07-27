@@ -1213,6 +1213,7 @@ mod e2e_tests {
             super::super::proto::StrictClockTick {
                 src_node: 2,
                 src_clock: ts_propose + 2,
+                ..Default::default()
             },
         );
         rt.recv_accept_ack(

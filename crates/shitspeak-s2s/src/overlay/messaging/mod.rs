@@ -177,6 +177,7 @@ pub struct OverlaySendOptions {
     transport_ttl: Option<std::time::Duration>,
     avoid_first_hop: Option<NodeIdentifier>,
     distribution_repair: bool,
+    retained_logical_send: Option<[u8; 32]>,
 }
 
 impl OverlaySendOptions {
@@ -219,6 +220,17 @@ impl OverlaySendOptions {
 
     pub fn is_distribution_repair(&self) -> bool {
         self.distribution_repair
+    }
+
+    /// Identify one logical ordered Reliable send whose delivery is already
+    /// owned by the overlay until its end-to-end ACK arrives.
+    pub(crate) fn retain_logical_send(mut self, identity: [u8; 32]) -> Self {
+        self.retained_logical_send = Some(identity);
+        self
+    }
+
+    pub(crate) fn retained_logical_send(&self) -> Option<[u8; 32]> {
+        self.retained_logical_send
     }
 }
 
