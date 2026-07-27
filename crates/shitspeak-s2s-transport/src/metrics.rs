@@ -1493,6 +1493,13 @@ impl QueueWatermark {
             self.full_samples,
         )
     }
+
+    pub(crate) fn snapshot_at(&self, now: Instant) -> QueueStatusSnapshot {
+        if now.duration_since(self.last_report) >= QUEUE_WATERMARK_LOG_INTERVAL {
+            return QueueStatusSnapshot::default();
+        }
+        self.snapshot()
+    }
 }
 
 pub fn apply_packet_loss_penalty(cost: f64, packet_loss_ppm: u32) -> f64 {
@@ -3505,6 +3512,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_watermark_expires_when_queue_is_idle() {
+        let start = Instant::now();
+        let mut watermark = QueueWatermark::new(start);
+        watermark.record(start, 8, 16, false);
+
+        let fresh = watermark.snapshot_at(start + Duration::from_secs(1));
+        assert_eq!(fresh.high_depth(), 8);
+
+        let expired = watermark.snapshot_at(start + QUEUE_WATERMARK_LOG_INTERVAL);
+        assert_eq!(expired.high_depth(), 0);
+        assert_eq!(expired.depth(), 0);
+        assert_eq!(expired.capacity(), 0);
+        assert_eq!(expired.samples(), 0);
+        assert_eq!(expired.full_samples(), 0);
+    }
 
     #[test]
     fn datagram_evidence_keeps_enqueue_and_writer_denominators_separate() {

@@ -1981,7 +1981,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"depth\"})",
+          "expr": "max by (job, source, peer, direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"depth\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -1993,7 +1993,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"high_watermark\"})",
+          "expr": "max by (job, source, peer, direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"high_watermark\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -2005,7 +2005,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"capacity\"})",
+          "expr": "max by (job, source, peer, direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"capacity\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -2017,7 +2017,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"full_samples\"})",
+          "expr": "max by (job, source, peer, direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"full_samples\"})",
           "format": "table",
           "instant": true,
           "range": false,
@@ -2029,14 +2029,14 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"samples\"})",
+          "expr": "max by (job, source, peer, direction, transport, class) (shitspeak_s2s_queue_status{job=~\"$job\",metric=\"samples\"})",
           "format": "table",
           "instant": true,
           "range": false,
           "refId": "E"
         }
       ],
-      "title": "S2S Queue Status",
+      "title": "S2S Queue Status (bytes)",
       "transformations": [
         {
           "id": "merge",
@@ -4995,7 +4995,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (direction, transport, metric) (shitspeak_s2s_queue_status{job=~\"$job\",direction=\"outgoing\"})",
+          "expr": "max by (job, source, peer, direction, transport, class, metric) (shitspeak_s2s_queue_status{job=~\"$job\",direction=\"outgoing\"})",
           "range": false,
           "refId": "A",
           "format": "table",
@@ -5007,14 +5007,14 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (direction, class, metric) (shitspeak_s2s_queue_status{job=~\"$job\",direction=\"incoming\"})",
+          "expr": "max by (job, source, peer, direction, transport, class, metric) (shitspeak_s2s_queue_status{job=~\"$job\",direction=\"incoming\"})",
           "range": false,
           "refId": "B",
           "format": "table",
           "instant": true
         }
       ],
-      "title": "S2S Split Queue Status",
+      "title": "S2S Split Queue Status (bytes)",
       "transformations": [
         {
           "id": "merge",

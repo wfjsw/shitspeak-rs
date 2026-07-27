@@ -2102,10 +2102,11 @@ impl PeerState {
 
     pub fn outbound_queue_status(&self) -> Vec<OutboundQueueStatusSnapshot> {
         let mut out = Vec::new();
+        let now = Instant::now();
         let routed_status = self
             .outbound_queue_watermark
             .lock()
-            .snapshot()
+            .snapshot_at(now)
             .with_current(
                 self.outbound_queue_depth_bytes(),
                 self.outbound_queue_capacity_bytes(),
@@ -2140,7 +2141,7 @@ impl PeerState {
         out.extend(transports.into_iter().map(|transport| {
             let mut status = watermarks
                 .get(&transport)
-                .map(QueueWatermark::snapshot)
+                .map(|watermark| watermark.snapshot_at(now))
                 .unwrap_or_default();
             if let Some((depth, capacity)) = current_by_transport.get(&transport).copied() {
                 status = status.with_current(depth, capacity);
@@ -2169,7 +2170,7 @@ impl PeerState {
             .outbound_stream_queue_watermarks
             .lock()
             .get(&transport)
-            .map(QueueWatermark::snapshot)
+            .map(|watermark| watermark.snapshot_at(Instant::now()))
             .unwrap_or_default();
         if let Some((depth, capacity)) = current {
             status = status.with_current(depth, capacity);

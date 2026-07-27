@@ -332,7 +332,10 @@ impl InboundDispatch {
         .into_iter()
         .map(|(class, sender, watermark)| {
             let (depth, capacity) = sender_queue_depth(sender);
-            let status = watermark.lock().snapshot().with_current(depth, capacity);
+            let status = watermark
+                .lock()
+                .snapshot_at(Instant::now())
+                .with_current(depth, capacity);
             InboundQueueStatusSnapshot::new(class, status)
         })
         .collect()
