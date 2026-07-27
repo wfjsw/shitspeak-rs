@@ -185,12 +185,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             );
             (ts_propose, s.clock)
         };
-        if !self.persist_v2_pending_descriptor(
-            op_id,
-            ts_propose,
-            op_msgpack.clone(),
-            &frozen_targets,
-        ) {
+        if !self
+            .persist_v2_pending_descriptor(op_id, ts_propose, op_msgpack.clone(), &frozen_targets)
+            .await
+        {
             let waker = {
                 let mut state = self.state.lock();
                 state.pending_proposes.remove(&op_id);

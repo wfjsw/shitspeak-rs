@@ -113,7 +113,7 @@ fn terminal_request(frame: CapturedFrame) -> StrictTerminalSyncReq {
     request
 }
 
-fn initial_sync_request(
+async fn initial_sync_request(
     source: &StrictRuntime<CountingStrictRepo>,
     nonce: u64,
     known_generation: u64,
@@ -122,6 +122,7 @@ fn initial_sync_request(
     let known_source_cut = source
         .terminal_journal
         .lock()
+        .await
         .terminal_cut_at(known_generation)
         .map(cut_to_wire);
     StrictTerminalSyncReq {
@@ -157,7 +158,7 @@ async fn delivery_watermark_clock_probe_is_bounded_control_only() {
 #[tokio::test]
 async fn every_operation_free_v3_control_shape_stays_under_the_encoded_limit() {
     let (rt, net) = runtime(1, ReplicationConfig::default());
-    let cut = cut_to_wire(rt.terminal_journal.lock().terminal_cut());
+    let cut = cut_to_wire(rt.terminal_journal.lock().await.terminal_cut());
     let controls = vec![
         StrictBody::ClockProbeReq(StrictClockProbeReq {
             src_node: 1,
@@ -288,16 +289,21 @@ async fn v3_probe_is_not_dispatched_to_a_v2_peer() {
 async fn equal_terminal_set_digest_returns_one_metadata_page_without_a_transfer() {
     let (source, net) = runtime(1, ReplicationConfig::default());
     for sequence in 1..=32 {
-        assert!(source.apply_catchup_terminal_state(terminal_abort(sequence)));
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(sequence))
+                .await
+        );
     }
     let digest = Bytes::copy_from_slice(
         source
             .terminal_journal
             .lock()
+            .await
             .terminal_cut()
             .terminal_set_digest(),
     );
-    let request = initial_sync_request(&source, 101, 0, digest);
+    let request = initial_sync_request(&source, 101, 0, digest).await;
 
     recv_v3_terminal_sync_req(&source, 2, 22, request).await;
 
@@ -330,9 +336,13 @@ async fn equal_terminal_set_digest_returns_one_metadata_page_without_a_transfer(
 async fn already_known_source_cut_returns_up_to_date_without_allocating_transfer() {
     let (source, net) = runtime(1, ReplicationConfig::default());
     for sequence in 1..=3 {
-        assert!(source.apply_catchup_terminal_state(terminal_abort(sequence)));
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(sequence))
+                .await
+        );
     }
-    let request = initial_sync_request(&source, 151, 3, Bytes::from_static(&[0x55; 32]));
+    let request = initial_sync_request(&source, 151, 3, Bytes::from_static(&[0x55; 32])).await;
 
     recv_v3_terminal_sync_req(&source, 2, 22, request).await;
 
@@ -356,7 +366,7 @@ async fn already_known_source_cut_returns_up_to_date_without_allocating_transfer
 #[tokio::test]
 async fn unrecognized_higher_restart_cut_cannot_claim_a_restored_responder_is_up_to_date() {
     let (source, net) = runtime(1, ReplicationConfig::default());
-    let target = source.terminal_journal.lock().terminal_cut();
+    let target = source.terminal_journal.lock().await.terminal_cut();
     let stale_higher_cut = TerminalCut::new(
         *target.journal_id(),
         target.generation().saturating_add(1),
@@ -648,9 +658,13 @@ async fn recognized_cut_pages_only_missing_generations_over_bulk() {
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
     let (source, net) = runtime(1, config);
     for sequence in 1..=10 {
-        assert!(source.apply_catchup_terminal_state(terminal_abort(sequence)));
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(sequence))
+                .await
+        );
     }
-    let request = initial_sync_request(&source, 202, 7, Bytes::from_static(&[1; 32]));
+    let request = initial_sync_request(&source, 202, 7, Bytes::from_static(&[1; 32])).await;
 
     recv_v3_terminal_sync_req(&source, 2, 22, request).await;
 
@@ -674,9 +688,13 @@ async fn duplicate_initial_request_replays_the_byte_identical_page() {
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(2);
     let (source, net) = runtime(1, config);
     for sequence in 1..=4 {
-        assert!(source.apply_catchup_terminal_state(terminal_abort(sequence)));
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(sequence))
+                .await
+        );
     }
-    let request = initial_sync_request(&source, 303, 0, Bytes::from_static(&[1; 32]));
+    let request = initial_sync_request(&source, 303, 0, Bytes::from_static(&[1; 32])).await;
 
     recv_v3_terminal_sync_req(&source, 2, 22, request.clone()).await;
     recv_v3_terminal_sync_req(&source, 2, 22, request).await;
@@ -694,7 +712,11 @@ async fn duplicate_final_page_is_suppressed_without_another_ack_or_continuation(
     let (source, source_net) = runtime(1, config.clone());
     let (sink, sink_net) = runtime(2, config);
     for sequence in 1..=4 {
-        assert!(source.apply_catchup_terminal_state(terminal_abort(sequence)));
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(sequence))
+                .await
+        );
     }
 
     request_v3_terminal_sync(&sink, 1, StrictCatchupReason::SteadyState).await;
@@ -729,7 +751,11 @@ async fn delayed_duplicate_page_does_not_block_the_active_continuation() {
     let (source, source_net) = runtime(1, config.clone());
     let (sink, sink_net) = runtime(2, config);
     for sequence in 1..=3 {
-        assert!(source.apply_catchup_terminal_state(terminal_abort(sequence)));
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(sequence))
+                .await
+        );
     }
 
     request_v3_terminal_sync(&sink, 1, StrictCatchupReason::SteadyState).await;
@@ -770,8 +796,8 @@ async fn checkpoint_completes_when_requester_has_additional_local_fences() {
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
     let (source, source_net) = runtime(1, config.clone());
     let (sink, sink_net) = runtime(2, config);
-    assert!(source.apply_catchup_terminal_state(terminal_abort(1)));
-    assert!(sink.apply_catchup_terminal_state(terminal_abort(2)));
+    assert!(source.apply_catchup_terminal_state(terminal_abort(1)).await);
+    assert!(sink.apply_catchup_terminal_state(terminal_abort(2)).await);
 
     request_v3_terminal_sync(&sink, 1, StrictCatchupReason::SteadyState).await;
     let request = terminal_request(sink_net.drain_captures().pop().expect("initial request"));
@@ -804,6 +830,7 @@ async fn checkpoint_completes_when_requester_has_additional_local_fences() {
     assert_ne!(
         sink.terminal_journal
             .lock()
+            .await
             .terminal_cut()
             .terminal_set_digest(),
         target.terminal_set_digest(),
@@ -818,13 +845,17 @@ async fn expired_continuation_is_explicit_and_never_restarts_at_zero() {
         .with_pending_propose_ttl(Duration::ZERO);
     let (source, net) = runtime(1, config);
     for sequence in 1..=3 {
-        assert!(source.apply_catchup_terminal_state(terminal_abort(sequence)));
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(sequence))
+                .await
+        );
     }
     recv_v3_terminal_sync_req(
         &source,
         2,
         22,
-        initial_sync_request(&source, 404, 0, Bytes::from_static(&[1; 32])),
+        initial_sync_request(&source, 404, 0, Bytes::from_static(&[1; 32])).await,
     )
     .await;
     let first = terminal_page(net.drain_captures().pop().expect("first page"));
@@ -1177,7 +1208,7 @@ async fn collision_resource_limit_keeps_exact_outbound_request_active() {
     );
     assert!(rt.v3_retries.lock().request_is_current(peer, &request));
 
-    let target = rt.terminal_journal.lock().terminal_cut();
+    let target = rt.terminal_journal.lock().await.terminal_cut();
     rt.v3_sync.lock().client_mut(peer).unwrap().accept_manifest(
         71,
         target,
@@ -1329,7 +1360,10 @@ async fn production_catchup_decisions_cannot_fanout_or_dirty_the_owner_session()
     net.drain_strict_send_observations();
 
     for sequence in 1..=32 {
-        assert!(rt.apply_v3_catchup_terminal_state(peer, terminal_abort(sequence)));
+        assert!(
+            rt.apply_v3_catchup_terminal_state(peer, terminal_abort(sequence))
+                .await
+        );
     }
 
     assert!(rt.v3_sync.lock().has_session_work(peer));
@@ -1338,7 +1372,10 @@ async fn production_catchup_decisions_cannot_fanout_or_dirty_the_owner_session()
 
     // A delayed catchup duplicate remains an install/idempotency event. It
     // cannot allocate a continuation or emit transport work either.
-    assert!(rt.apply_v3_catchup_terminal_state(peer, terminal_abort(1)));
+    assert!(
+        rt.apply_v3_catchup_terminal_state(peer, terminal_abort(1))
+            .await
+    );
     assert!(net.drain_captures().is_empty());
     assert!(net.drain_strict_send_observations().is_empty());
 }
@@ -1346,9 +1383,9 @@ async fn production_catchup_decisions_cannot_fanout_or_dirty_the_owner_session()
 #[tokio::test]
 async fn production_backpressure_replays_one_cached_page_without_branching_transfer() {
     let (source, net) = runtime(1, ReplicationConfig::default());
-    assert!(source.apply_catchup_terminal_state(terminal_abort(1)));
+    assert!(source.apply_catchup_terminal_state(terminal_abort(1)).await);
     let peer = PeerIncarnation::new(2, 22);
-    let request = initial_sync_request(&source, 71, 0, Bytes::from_static(&[0; 32]));
+    let request = initial_sync_request(&source, 71, 0, Bytes::from_static(&[0; 32])).await;
 
     net.script_bulk_send_outcomes([MockBulkSendOutcome::Backpressure]);
     recv_v3_terminal_sync_req(&source, 2, 22, request.clone()).await;
@@ -1564,7 +1601,7 @@ async fn equal_cut_history_election_response_also_satisfies_admission_history() 
             _ => None,
         })
         .expect("history-election request");
-    let local_cut = cut_to_wire(rt.terminal_journal.lock().terminal_cut());
+    let local_cut = cut_to_wire(rt.terminal_journal.lock().await.terminal_cut());
     recv_v3_history_probe_resp(
         &rt,
         2,

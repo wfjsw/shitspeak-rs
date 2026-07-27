@@ -26,6 +26,7 @@ prost = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true, optional = true }
 rmp-serde = { workspace = true }
+rusqlite = { workspace = true }
 rustls = { workspace = true, optional = true }
 scc = { workspace = true }
 serde = { workspace = true }

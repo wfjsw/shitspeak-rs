@@ -675,7 +675,7 @@ async fn respond_with_snapshot_transfer<R: StrictReplicable>(
     // If a terminal decision landed after the image capture, the peer must
     // re-page the new fence cut before it receives any image that could
     // include the decision's repository delivery.
-    if transfer.terminal_decision_generation != rt.terminal_decision_generation() {
+    if transfer.terminal_decision_generation != rt.terminal_decision_generation().await {
         rt.snapshot_transfers.lock().remove(&from);
         warn!(
             from,
@@ -875,7 +875,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     // ordinary history to them after any terminal decision would let a later
     // catchup erase the fence, so retain inbound compatibility but fail the
     // unsafe repair request closed.
-    if !v2_terminal_catchup && rt.has_any_terminal_decision() {
+    if !v2_terminal_catchup && rt.has_any_terminal_decision().await {
         warn!(
             from,
             "strict catchup declined because requester cannot prove a complete terminal fence sync"
@@ -903,7 +903,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     // before it processes ordinary history. Page them independently from the
     // repository-version cursor so a long-lived journal cannot inflate every
     // catchup response beyond the transport frame cap.
-    let current_terminal_decision_generation = rt.terminal_decision_generation();
+    let current_terminal_decision_generation = rt.terminal_decision_generation().await;
     let must_restart_terminal_sync = !correlated_v3_history
         && v2_terminal_catchup
         && req.terminal_state_cursor == TERMINAL_STATE_CURSOR_SKIP
@@ -925,12 +925,14 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         } else {
             req.terminal_state_cursor
         };
-        let terminal_page = rt.terminal_states_for_catchup_page(
-            from,
-            terminal_cursor,
-            rt.cfg.strict_max_catchup_ops(),
-            rt.strict_catchup_response_budget(),
-        );
+        let terminal_page = rt
+            .terminal_states_for_catchup_page(
+                from,
+                terminal_cursor,
+                rt.cfg.strict_max_catchup_ops(),
+                rt.strict_catchup_response_budget(),
+            )
+            .await;
         terminal_decision_generation = terminal_page.terminal_decision_generation;
         if terminal_page.oversized {
             warn!(
@@ -1209,11 +1211,14 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
                 let (strict_op_id_hi, strict_op_id_lo, strict_ts_final, terminal_proof) =
                     match entry.metadata {
                         Some(metadata) => {
-                            let terminal_proof = match rt.terminal_commit_proof_for_catchup(
-                                (metadata.op_id_hi, metadata.op_id_lo),
-                                metadata.ts_final,
-                                &op_msgpack,
-                            ) {
+                            let terminal_proof = match rt
+                                .terminal_commit_proof_for_catchup(
+                                    (metadata.op_id_hi, metadata.op_id_lo),
+                                    metadata.ts_final,
+                                    &op_msgpack,
+                                )
+                                .await
+                            {
                                 Ok(proof) => proof,
                                 Err(()) => {
                                     warn!(
@@ -1355,7 +1360,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     // completed cut), so an abort committed in the gap cannot be missed.
     if !correlated_v3_history
         && terminal_state_cursor == TERMINAL_STATE_CURSOR_SKIP
-        && terminal_decision_generation != rt.terminal_decision_generation()
+        && terminal_decision_generation != rt.terminal_decision_generation().await
     {
         if !v2_terminal_catchup {
             warn!(
@@ -1371,12 +1376,14 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         }
         rt.reset_terminal_catchup_snapshot(from);
         rt.snapshot_transfers.lock().remove(&from);
-        let terminal_page = rt.terminal_states_for_catchup_page(
-            from,
-            0,
-            rt.cfg.strict_max_catchup_ops(),
-            rt.strict_catchup_response_budget(),
-        );
+        let terminal_page = rt
+            .terminal_states_for_catchup_page(
+                from,
+                0,
+                rt.cfg.strict_max_catchup_ops(),
+                rt.strict_catchup_response_budget(),
+            )
+            .await;
         if terminal_page.oversized || (!terminal_page.has_more && terminal_page.states.is_empty()) {
             warn!(
                 from,
@@ -2032,7 +2039,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     // but before considering ordinary history. A joining replica must not
     // revive a delayed v1 proposal while replaying validated catchup.
     for terminal in resp.terminal_states.clone() {
-        if !rt.apply_catchup_terminal_state(terminal) {
+        if !rt.apply_catchup_terminal_state(terminal).await {
             metrics::record_strict_fence_rejection();
             metrics::record_pipeline_stage(
                 ReplicationPipelineKind::Strict,
@@ -2336,12 +2343,15 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             );
             let op_id = (metadata.metadata.op_id_hi, metadata.metadata.op_id_lo);
             if let Some(proof) = metadata.terminal_proof {
-                if !rt.apply_catchup_terminal_commit_proof(
-                    op_id,
-                    metadata.metadata.ts_final,
-                    op_msgpack,
-                    proof,
-                ) {
+                if !rt
+                    .apply_catchup_terminal_commit_proof(
+                        op_id,
+                        metadata.metadata.ts_final,
+                        op_msgpack,
+                        proof,
+                    )
+                    .await
+                {
                     metrics::record_strict_fence_rejection();
                     metrics::record_pipeline_stage(
                         ReplicationPipelineKind::Strict,
@@ -2352,9 +2362,9 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                 }
                 continue;
             }
-            if rt.has_v2_terminal_descriptor(op_id) {
+            if rt.has_v2_terminal_descriptor(op_id).await {
                 metrics::record_strict_fence_rejection();
-                if rt.has_unresolved_v2_terminal_fence(op_id) {
+                if rt.has_unresolved_v2_terminal_fence(op_id).await {
                     rt.defer_descriptorless_v2_commit(op_id).await;
                 }
                 metrics::record_pipeline_stage(
@@ -2677,7 +2687,7 @@ pub(super) async fn recv_v3_history_probe_req<R: StrictReplicable>(
         return;
     }
     let rank = rt.v3_history_rank();
-    let cut = cut_to_wire(rt.terminal_journal.lock().terminal_cut());
+    let cut = cut_to_wire(rt.terminal_journal.lock().await.terminal_cut());
     let _ = send_v3_metadata_control(
         rt,
         from,
@@ -2771,6 +2781,7 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
             == rt
                 .terminal_journal
                 .lock()
+                .await
                 .terminal_cut()
                 .terminal_set_digest();
         let response_source_known = rt
@@ -2802,6 +2813,7 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         == rt
             .terminal_journal
             .lock()
+            .await
             .terminal_cut()
             .terminal_set_digest();
     let source_already_known = rt
@@ -2885,6 +2897,7 @@ pub(super) async fn resume_deferred_v3_admissions<R: StrictReplicable>(rt: &Stri
             == rt
                 .terminal_journal
                 .lock()
+                .await
                 .terminal_cut()
                 .terminal_set_digest();
         let source_known = rt
@@ -3215,6 +3228,7 @@ async fn start_reducer_owned_terminal_client<R: StrictReplicable>(
             .terminal_cut()
             .terminal_set_digest(),
     );
+            .await
     let request = StrictTerminalSyncReq {
         src_node: rt.self_id as u32,
         expected_responder_boot_epoch: peer.boot_epoch(),
@@ -3478,10 +3492,10 @@ fn render_v3_page<R: StrictReplicable>(
     session: &ResponderSession,
     nonce: u64,
     epoch: u64,
+    journal: &TerminalJournal,
 ) -> Option<(StrictTerminalSyncPage, u64, Option<TerminalCut>)> {
     let limit = rt.cfg.strict_max_catchup_ops().max(1);
     let byte_limit = rt.strict_catchup_response_budget();
-    let journal = rt.terminal_journal.lock();
     match session.kind() {
         StrictTerminalPageKind::Delta => {
             let base = session.cursor_cut().or(session.base_cut())?;
@@ -3844,7 +3858,7 @@ pub(super) async fn recv_v3_terminal_sync_req<R: StrictReplicable>(
     // transfer state; its cost is independent of retained journal length.
     if req.transfer_id == 0 {
         let (target, offered_cut_is_current) = {
-            let journal = rt.terminal_journal.lock();
+            let journal = rt.terminal_journal.lock().await;
             let target = journal.terminal_cut();
             let offered_cut_is_current = req
                 .known_source_cut
@@ -3929,6 +3943,7 @@ pub(super) async fn recv_v3_terminal_sync_req<R: StrictReplicable>(
     let response = {
         let mut sync = rt.v3_sync.lock();
         sync.expire(now);
+    let journal = rt.terminal_journal.lock().await;
 
         (|| -> Option<(StrictTerminalSyncPage, Option<BulkPageIdentity>, bool)> {
             if req.transfer_id != 0 {
@@ -3960,7 +3975,7 @@ pub(super) async fn recv_v3_terminal_sync_req<R: StrictReplicable>(
                     ));
                 }
                 let Some((page, next, progress)) =
-                    render_v3_page(rt, &session, req.request_nonce, epoch)
+                    render_v3_page(rt, &journal, &session, req.request_nonce, epoch)
                 else {
                     sync.remove_responder(peer);
                     if let Some(wire) = reducer_request {
@@ -4032,7 +4047,6 @@ pub(super) async fn recv_v3_terminal_sync_req<R: StrictReplicable>(
 
             let known = req.known_source_cut.as_ref().and_then(cut_from_wire);
             let (target, kind) = {
-                let journal = rt.terminal_journal.lock();
                 let target = journal.terminal_cut();
                 let kind = if known
                     .as_ref()
@@ -4048,7 +4062,7 @@ pub(super) async fn recv_v3_terminal_sync_req<R: StrictReplicable>(
             let id = request.transfer().get();
             let session = ResponderSession::new(id, known, target, kind, req.request_nonce, ttl);
             let Some((page, next, progress)) =
-                render_v3_page(rt, &session, req.request_nonce, epoch)
+                render_v3_page(rt, &journal, &session, req.request_nonce, epoch)
             else {
                 sync.transition_session(
                     peer,
@@ -4410,7 +4424,7 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
                     );
                 }
                 for state in validated {
-                    if !rt.apply_v3_catchup_terminal_state(peer, state) {
+                    if !rt.apply_v3_catchup_terminal_state(peer, state).await {
                         rt.v3_sync.lock().transition_session(
                             peer,
                             SessionEvent::ApplyFailed {
@@ -4504,7 +4518,7 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
                     );
                 }
                 for state in validated {
-                    if !rt.apply_v3_catchup_terminal_state(peer, state) {
+                    if !rt.apply_v3_catchup_terminal_state(peer, state).await {
                         rt.v3_sync.lock().transition_session(
                             peer,
                             SessionEvent::ApplyFailed {
@@ -4565,14 +4579,17 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
         let request = StrictTerminalSyncReq {
             src_node: rt.self_id as u32,
             expected_responder_boot_epoch: epoch,
+        let known_source_cut = rt.v3_sync.lock().known_source_cut(peer).map(cut_to_wire);
+        let requester_terminal_set_digest = Bytes::copy_from_slice(
+            rt.terminal_journal
+                .lock()
+                .await
+                .terminal_cut()
+                .terminal_set_digest(),
+        );
             reason,
-            known_source_cut: rt.v3_sync.lock().known_source_cut(peer).map(cut_to_wire),
-            requester_terminal_set_digest: Bytes::copy_from_slice(
-                rt.terminal_journal
-                    .lock()
-                    .terminal_cut()
-                    .terminal_set_digest(),
-            ),
+            known_source_cut,
+            requester_terminal_set_digest,
             transfer_id,
             request_nonce: nonce,
             expected_cursor: page.next_cursor,
@@ -5042,8 +5059,12 @@ mod tests {
         let (source, source_net, _) = test_runtime(1, cfg);
         let first_id = make_op_id(1, 1, 1);
         let second_id = make_op_id(1, 1, 2);
-        source.apply_catchup_terminal_state(terminal_abort(first_id));
-        source.apply_catchup_terminal_state(terminal_abort(second_id));
+        source
+            .apply_catchup_terminal_state(terminal_abort(first_id))
+            .await;
+        source
+            .apply_catchup_terminal_state(terminal_abort(second_id))
+            .await;
 
         respond_to_request(
             &source,
@@ -5115,7 +5136,9 @@ mod tests {
     async fn oversized_terminal_state_is_declined_before_send() {
         let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(1);
         let (source, source_net, _) = test_runtime(1, cfg);
-        source.apply_catchup_terminal_state(terminal_abort(make_op_id(1, 1, 99)));
+        source
+            .apply_catchup_terminal_state(terminal_abort(make_op_id(1, 1, 99)))
+            .await;
 
         respond_to_request(
             &source,
@@ -5146,7 +5169,9 @@ mod tests {
         let cfg = ReplicationConfig::default().with_strict_max_catchup_ops(1);
         let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
         let terminal_id = make_op_id(1, 1, 31);
-        source.apply_catchup_terminal_state(terminal_abort(terminal_id));
+        source
+            .apply_catchup_terminal_state(terminal_abort(terminal_id))
+            .await;
         {
             let mut state = source_repo.state.lock();
             state.0 = 3;
@@ -6001,7 +6026,9 @@ mod tests {
         let (source, source_net, _) = test_runtime(1, ReplicationConfig::default());
         source_net.set_peer_strict_replication_protocol_version(2, 0);
         let terminal_id = make_op_id(1, 1, 5);
-        source.apply_catchup_terminal_state(terminal_abort(terminal_id));
+        source
+            .apply_catchup_terminal_state(terminal_abort(terminal_id))
+            .await;
 
         respond_to_request(
             &source,

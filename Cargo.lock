@@ -4498,6 +4498,7 @@ dependencies = [
  "rand 0.10.1",
  "rcgen 0.13.2",
  "rmp-serde",
+ "rusqlite",
  "rustls",
  "scc",
  "serde",

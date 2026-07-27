@@ -1,16 +1,14 @@
 //! Durable state for strict protocol terminal-resolution records.
 //!
 //! The strict runtime owns one journal per topic and calls these synchronous
-//! methods while holding its state lock. Each successful mutation is first
-//! written to a temporary file and atomically replaced into place, so a crash
-//! cannot leave a partially written journal visible on the next startup.
+//! methods while holding its state lock. Durable mutations commit one encoded
+//! record and the resulting terminal cut in a SQLite transaction.
 
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions, TryLockError},
-    io::{self, Write},
+    io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use aws_lc_rs::{
@@ -21,29 +19,14 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::terminal_journal_sqlite::{SqliteTerminalJournalError, SqliteTerminalJournalStore};
+
 const JOURNAL_DIRECTORY: &str = "strict-terminal-journal";
 const JOURNAL_VERSION: u32 = 2;
 const LEGACY_JOURNAL_VERSION: u32 = 1;
 const JOURNAL_ID_LEN: usize = 16;
 const DIGEST_LEN: usize = 32;
 const EMPTY_CHAIN_DIGEST: [u8; DIGEST_LEN] = [0; DIGEST_LEN];
-
-static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(windows)]
-const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
-#[cfg(windows)]
-const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-
-#[cfg(windows)]
-#[link(name = "Kernel32")]
-unsafe extern "system" {
-    fn MoveFileExW(
-        existing_file_name: *const u16,
-        new_file_name: *const u16,
-        move_flags: u32,
-    ) -> i32;
-}
 
 /// An operation identifier encoded by strict protocol messages as `(hi, lo)`.
 pub(crate) type TerminalJournalOpId = (u64, u64);
@@ -514,6 +497,8 @@ impl TerminalJournalCheckpointPage {
 /// Persistence or invariant failure from the terminal-resolution journal.
 #[derive(Debug, Error)]
 pub(crate) enum TerminalJournalError {
+    #[error(transparent)]
+    Sqlite(#[from] SqliteTerminalJournalError),
     #[error("strict terminal journal I/O failed at {path:?}: {source}")]
     Io {
         path: PathBuf,
@@ -621,10 +606,10 @@ pub(crate) enum TerminalJournalError {
 /// in-memory. This supports tests and keeps the caller responsible for
 /// refusing the durable protocol version when persistence is unavailable.
 pub(crate) struct TerminalJournal {
-    topic: String,
     path: Option<PathBuf>,
-    // Retains the stable sidecar lock while the journal JSON is replaced.
+    // Retains the stable per-topic sidecar lock for this process lifetime.
     _lock_file: Option<File>,
+    store: Option<SqliteTerminalJournalStore>,
     records: BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
     journal_id: [u8; JOURNAL_ID_LEN],
     // Persisted monotonic fence-cut identifier. Catchup peers echo this only
@@ -648,9 +633,9 @@ impl TerminalJournal {
             let journal_id = generate_journal_id()?;
             let terminal_set_digest = compute_terminal_set_digest(&BTreeMap::new());
             return Ok(Self {
-                topic,
                 path: None,
                 _lock_file: None,
+                store: None,
                 records: BTreeMap::new(),
                 journal_id,
                 terminal_decision_generation: 0,
@@ -699,49 +684,58 @@ impl TerminalJournal {
             }
         }
 
-        let loaded = match fs::read(&path) {
-            Ok(bytes) => load_records(&path, &topic, &bytes)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                LoadedTerminalJournal::empty(generate_journal_id()?, true)
-            }
-            Err(source) => {
-                return Err(TerminalJournalError::Io {
-                    path: path.clone(),
-                    source,
-                });
-            }
+        let mut store = SqliteTerminalJournalStore::open(&path, topic.clone())?;
+        let loaded = if let Some(loaded) = store.load()? {
+            let (mut records, cut) = loaded.into_parts();
+            let derived = validate_loaded_sqlite(&path, &mut records, &cut)?;
+            LoadedTerminalJournal::from_derived(records, *cut.journal_id(), derived)
+        } else {
+            let legacy_path = legacy_journal_path(&path);
+            let loaded = match fs::read(&legacy_path) {
+                Ok(bytes) => load_records(&legacy_path, &topic, &bytes)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    LoadedTerminalJournal::empty(generate_journal_id()?)
+                }
+                Err(source) => {
+                    return Err(TerminalJournalError::Io {
+                        path: legacy_path,
+                        source,
+                    });
+                }
+            };
+            let cut = TerminalCut::new(
+                loaded.journal_id,
+                loaded.terminal_decision_generation,
+                loaded.terminal_chain_digest,
+                loaded.terminal_set_digest,
+            );
+            // The legacy JSON remains in place as a rollback artifact. Once
+            // this transaction commits SQLite is the sole authoritative
+            // journal and subsequent startups never consult the JSON file.
+            store.replace_all(loaded.records.iter(), &cut)?;
+            loaded
         };
 
-        let needs_rewrite = loaded.needs_rewrite;
-        let journal = Self {
-            topic,
+        Ok(Self {
             path: Some(path),
             _lock_file: Some(lock_file),
+            store: Some(store),
             records: loaded.records,
             journal_id: loaded.journal_id,
             terminal_decision_generation: loaded.terminal_decision_generation,
             terminal_chain_digest: loaded.terminal_chain_digest,
             terminal_set_digest: loaded.terminal_set_digest,
             generation_index: loaded.generation_index,
-        };
-        if needs_rewrite {
-            journal.persist(
-                &journal.records,
-                journal.terminal_decision_generation,
-                journal.terminal_chain_digest,
-                journal.terminal_set_digest,
-            )?;
-        }
-        Ok(journal)
+        })
     }
 
-    pub(crate) fn in_memory(topic: impl Into<String>) -> Self {
+    pub(crate) fn in_memory(_topic: impl Into<String>) -> Self {
         let journal_id = generate_journal_id()
             .expect("the system random generator must provide a terminal journal id");
         Self {
-            topic: topic.into(),
             path: None,
             _lock_file: None,
+            store: None,
             records: BTreeMap::new(),
             journal_id,
             terminal_decision_generation: 0,
@@ -1298,109 +1292,90 @@ impl TerminalJournal {
         op_id: TerminalJournalOpId,
         mutate: impl FnOnce(&mut TerminalJournalRecord) -> Result<bool, TerminalJournalError>,
     ) -> Result<bool, TerminalJournalError> {
-        let had_terminal_decision = self
-            .records
-            .get(&op_id)
+        let previous_record = self.records.get(&op_id).cloned();
+        let had_terminal_decision = previous_record
+            .as_ref()
             .is_some_and(TerminalJournalRecord::is_terminal);
-        let mut records = self.records.clone();
-        let record = records.entry(op_id).or_default();
-        let changed = mutate(record)?;
+        let changed = match mutate(self.records.entry(op_id).or_default()) {
+            Ok(changed) => changed,
+            Err(error) => {
+                restore_record(&mut self.records, op_id, previous_record);
+                return Err(error);
+            }
+        };
         if !changed {
+            restore_record(&mut self.records, op_id, previous_record);
             return Ok(false);
         }
 
-        let terminal_decision_generation = if !had_terminal_decision && record.is_terminal() {
+        let became_terminal = !had_terminal_decision
+            && self
+                .records
+                .get(&op_id)
+                .is_some_and(TerminalJournalRecord::is_terminal);
+        if became_terminal {
             let generation = self
                 .terminal_decision_generation
                 .checked_add(1)
-                .ok_or(TerminalJournalError::DecisionGenerationExhausted)?;
-            record.terminal_generation = Some(generation);
-            generation
-        } else {
-            self.terminal_decision_generation
-        };
-        let derived = derive_terminal_state(&mut records, self.journal_id).map_err(|reason| {
-            TerminalJournalError::InvalidMetadata {
-                path: self.path.clone().unwrap_or_default(),
-                reason,
+                .ok_or(TerminalJournalError::DecisionGenerationExhausted);
+            let generation = match generation {
+                Ok(generation) => generation,
+                Err(error) => {
+                    restore_record(&mut self.records, op_id, previous_record);
+                    return Err(error);
+                }
+            };
+            self.records
+                .get_mut(&op_id)
+                .expect("changed journal record remains present")
+                .terminal_generation = Some(generation);
+        }
+        let derived = match derive_terminal_state(&mut self.records, self.journal_id) {
+            Ok(derived) => derived,
+            Err(reason) => {
+                restore_record(&mut self.records, op_id, previous_record);
+                return Err(TerminalJournalError::InvalidMetadata {
+                    path: self.path.clone().unwrap_or_default(),
+                    reason,
+                });
             }
-        })?;
-        debug_assert_eq!(
-            derived.terminal_decision_generation,
-            terminal_decision_generation
-        );
-        self.persist(
-            &records,
+        };
+        let cut = TerminalCut::new(
+            self.journal_id,
             derived.terminal_decision_generation,
             derived.terminal_chain_digest,
             derived.terminal_set_digest,
-        )?;
-        self.records = records;
+        );
+        if let Some(store) = self.store.as_mut() {
+            let record = self
+                .records
+                .get(&op_id)
+                .expect("changed journal record remains present");
+            if let Err(error) = store.upsert_record(op_id, record, &cut) {
+                restore_record(&mut self.records, op_id, previous_record);
+                return Err(error.into());
+            }
+        }
         self.terminal_decision_generation = derived.terminal_decision_generation;
         self.terminal_chain_digest = derived.terminal_chain_digest;
         self.terminal_set_digest = derived.terminal_set_digest;
         self.generation_index = derived.generation_index;
         Ok(true)
     }
+}
 
-    fn persist(
-        &self,
-        records: &BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
-        terminal_decision_generation: u64,
-        terminal_chain_digest: [u8; DIGEST_LEN],
-        terminal_set_digest: [u8; DIGEST_LEN],
-    ) -> Result<(), TerminalJournalError> {
-        let Some(path) = self.path.as_ref() else {
-            return Ok(());
-        };
-        let payload = PersistedTerminalJournal {
-            version: JOURNAL_VERSION,
-            topic: self.topic.clone(),
-            journal_id: self.journal_id,
-            terminal_decision_generation,
-            terminal_chain_digest,
-            terminal_set_digest,
-            records: records
-                .iter()
-                .map(
-                    |((op_id_hi, op_id_lo), record)| PersistedTerminalJournalRecord {
-                        op_id_hi: *op_id_hi,
-                        op_id_lo: *op_id_lo,
-                        record: record.clone(),
-                    },
-                )
-                .collect(),
-        };
-        let bytes =
-            serde_json::to_vec_pretty(&payload).map_err(|source| TerminalJournalError::Json {
-                path: path.clone(),
-                source,
-            })?;
-
-        let parent = path.parent().expect("journal path always has a parent");
-        fs::create_dir_all(parent).map_err(|source| TerminalJournalError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-
-        let temporary_path = temporary_path(path);
-        let write_result = write_temporary_file(&temporary_path, &bytes)
-            .and_then(|()| replace_file_atomically(&temporary_path, path))
-            .map_err(|source| TerminalJournalError::Io {
-                path: if temporary_path.exists() {
-                    temporary_path.clone()
-                } else {
-                    path.clone()
-                },
-                source,
-            });
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&temporary_path);
-            return Err(error);
+fn restore_record(
+    records: &mut BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+    op_id: TerminalJournalOpId,
+    previous: Option<TerminalJournalRecord>,
+) {
+    match previous {
+        Some(previous) => {
+            records.insert(op_id, previous);
         }
-
-        sync_parent_directory(parent)?;
-        Ok(())
+        None => {
+            records.remove(&op_id);
+        }
     }
 }
 
@@ -1639,11 +1614,10 @@ struct LoadedTerminalJournal {
     terminal_chain_digest: [u8; DIGEST_LEN],
     terminal_set_digest: [u8; DIGEST_LEN],
     generation_index: BTreeMap<u64, TerminalJournalOpId>,
-    needs_rewrite: bool,
 }
 
 impl LoadedTerminalJournal {
-    fn empty(journal_id: [u8; JOURNAL_ID_LEN], needs_rewrite: bool) -> Self {
+    fn empty(journal_id: [u8; JOURNAL_ID_LEN]) -> Self {
         Self {
             records: BTreeMap::new(),
             journal_id,
@@ -1651,7 +1625,6 @@ impl LoadedTerminalJournal {
             terminal_chain_digest: EMPTY_CHAIN_DIGEST,
             terminal_set_digest: compute_terminal_set_digest(&BTreeMap::new()),
             generation_index: BTreeMap::new(),
-            needs_rewrite,
         }
     }
 
@@ -1659,7 +1632,6 @@ impl LoadedTerminalJournal {
         records: BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
         journal_id: [u8; JOURNAL_ID_LEN],
         derived: DerivedTerminalState,
-        needs_rewrite: bool,
     ) -> Self {
         Self {
             records,
@@ -1668,7 +1640,6 @@ impl LoadedTerminalJournal {
             terminal_chain_digest: derived.terminal_chain_digest,
             terminal_set_digest: derived.terminal_set_digest,
             generation_index: derived.generation_index,
-            needs_rewrite,
         }
     }
 }
@@ -1859,8 +1830,12 @@ fn journal_path(root: Option<&Path>, topic: &str) -> Option<PathBuf> {
     let root = root.filter(|root| !root.as_os_str().is_empty())?;
     Some(
         root.join(JOURNAL_DIRECTORY)
-            .join(format!("topic-{}.json", hex::encode(topic.as_bytes()))),
+            .join(format!("topic-{}.sqlite3", hex::encode(topic.as_bytes()))),
     )
+}
+
+fn legacy_journal_path(sqlite_path: &Path) -> PathBuf {
+    sqlite_path.with_extension("json")
 }
 
 fn journal_lock_path(path: &Path) -> PathBuf {
@@ -1921,7 +1896,7 @@ fn load_records(
             }
         })?;
         return Ok(LoadedTerminalJournal::from_derived(
-            records, journal_id, derived, true,
+            records, journal_id, derived,
         ));
     }
 
@@ -1970,8 +1945,60 @@ fn load_records(
         records,
         payload.journal_id,
         derived,
-        false,
     ))
+}
+
+fn validate_loaded_sqlite(
+    path: &Path,
+    records: &mut BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+    cut: &TerminalCut,
+) -> Result<DerivedTerminalState, TerminalJournalError> {
+    if cut.journal_id() == &[0; JOURNAL_ID_LEN] {
+        return Err(TerminalJournalError::InvalidMetadata {
+            path: path.to_path_buf(),
+            reason: "journal lineage identifier is missing or all zero",
+        });
+    }
+    for (op_id, record) in records.iter() {
+        validate_record(path, *op_id, record)?;
+    }
+    let persisted_record_metadata = records
+        .iter()
+        .filter_map(|(op_id, record)| {
+            record.is_terminal().then_some((
+                *op_id,
+                (record.terminal_generation, record.terminal_chain_digest),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let derived = derive_terminal_state(records, *cut.journal_id()).map_err(|reason| {
+        TerminalJournalError::InvalidMetadata {
+            path: path.to_path_buf(),
+            reason,
+        }
+    })?;
+    if cut.generation() != derived.terminal_decision_generation
+        || cut.chain_digest() != &derived.terminal_chain_digest
+        || cut.terminal_set_digest() != &derived.terminal_set_digest
+    {
+        return Err(TerminalJournalError::InvalidMetadata {
+            path: path.to_path_buf(),
+            reason: "persisted terminal cut does not match the terminal records",
+        });
+    }
+    if persisted_record_metadata.iter().any(|(op_id, metadata)| {
+        let derived_record = records
+            .get(op_id)
+            .expect("derived SQLite journal retains every record");
+        metadata.0 != derived_record.terminal_generation
+            || metadata.1 != derived_record.terminal_chain_digest
+    }) {
+        return Err(TerminalJournalError::InvalidMetadata {
+            path: path.to_path_buf(),
+            reason: "persisted terminal generation or chain digest is invalid",
+        });
+    }
+    Ok(derived)
 }
 
 fn validate_record(
@@ -2054,45 +2081,7 @@ fn validate_record(
     }
 }
 
-fn temporary_path(path: &Path) -> PathBuf {
-    let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-    path.with_extension(format!("json.{}.{}.tmp", std::process::id(), id))
-}
-
-fn write_temporary_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
-}
-
-#[cfg(not(windows))]
-fn replace_file_atomically(temporary_path: &Path, path: &Path) -> io::Result<()> {
-    fs::rename(temporary_path, path)
-}
-
-#[cfg(windows)]
-fn replace_file_atomically(temporary_path: &Path, path: &Path) -> io::Result<()> {
-    let temporary_wide = windows_api_path(temporary_path)?;
-    let path_wide = windows_api_path(path)?;
-
-    // The temporary journal lives beside its destination, so this is a
-    // same-volume replacement. `MOVEFILE_WRITE_THROUGH` is supported here
-    // and makes `MoveFileExW` wait until the move reaches disk.
-    let moved = unsafe {
-        MoveFileExW(
-            temporary_wide.as_ptr(),
-            path_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved != 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn windows_api_path(path: &Path) -> io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
 
@@ -2136,8 +2125,7 @@ fn sync_parent_directory(parent: &Path) -> Result<(), TerminalJournalError> {
 
 #[cfg(windows)]
 fn sync_parent_directory(_parent: &Path) -> Result<(), TerminalJournalError> {
-    // Windows does not expose a directory fsync through `std`. The replacement
-    // call above uses `MOVEFILE_WRITE_THROUGH` and waits for the move to disk.
+    // Windows does not expose a directory fsync through `std`.
     Ok(())
 }
 
@@ -2878,7 +2866,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_journal_is_atomically_migrated_to_valid_v2_metadata() {
+    fn legacy_journal_is_migrated_to_sqlite_and_retained_for_rollback() {
         let root = TempDir::new().unwrap();
         let topic = "channels";
         let directory = root.path().join("strict-terminal-journal");
@@ -2894,10 +2882,16 @@ mod tests {
         assert_eq!(journal.terminal_cut().generation(), 1);
         assert_ne!(journal.terminal_cut().journal_id(), &[0; 16]);
         assert_eq!(journal.get((1, 2)).unwrap().terminal_generation(), Some(1));
-        let migrated: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(migrated["version"], 2);
-        assert!(migrated["journal_id"].is_array());
-        assert!(migrated["terminal_chain_digest"].is_array());
-        assert!(migrated["terminal_set_digest"].is_array());
+        assert_eq!(
+            journal.persistence_path().unwrap().extension().unwrap(),
+            "sqlite3"
+        );
+        let retained: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(retained["version"], 1);
+        drop(journal);
+
+        let reloaded = TerminalJournal::load(Some(root.path().to_path_buf()), topic).unwrap();
+        assert_eq!(reloaded.terminal_cut().generation(), 1);
+        assert_eq!(reloaded.get((1, 2)).unwrap().terminal_generation(), Some(1));
     }
 }

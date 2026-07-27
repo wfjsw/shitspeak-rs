@@ -14,9 +14,12 @@ pub mod runtime;
 pub(crate) mod session_reducer;
 pub(crate) mod sync_v3;
 pub(crate) mod terminal_journal;
+pub(crate) mod terminal_journal_sqlite;
 
 #[cfg(test)]
 mod sync_v3_tests;
+#[cfg(test)]
+mod terminal_journal_sqlite_tests;
 
 use std::sync::Arc;
 

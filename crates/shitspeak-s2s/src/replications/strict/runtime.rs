@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use prost::Message as _;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
@@ -3190,6 +3190,24 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// operation. Duplicate Propose frames continue to receive targeted
     /// redundant ACKs without repeatedly flooding the overlay.
     propose_ack_broadcasts: Mutex<HashSet<OpId>>,
+    async fn with_terminal_journal_mutation<T, F>(&self, operation: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut TerminalJournal) -> T + Send + 'static,
+    {
+        if !self.terminal_journal_durable {
+            let mut journal = self.terminal_journal.lock().await;
+            return operation(&mut journal);
+        }
+        let journal = Arc::clone(&self.terminal_journal);
+        tokio::task::spawn_blocking(move || {
+            let mut journal = journal.blocking_lock();
+            operation(&mut journal)
+        })
+        .await
+        .expect("strict terminal journal blocking task panicked")
+    }
+
     /// Limit the broadcast fallback to the first positive ACK for one
     /// operation. Later Accept retransmissions use targeted route diversity.
     accept_ack_broadcasts: Mutex<HashSet<OpId>>,
@@ -3210,8 +3228,10 @@ pub struct StrictRuntime<R: StrictReplicable> {
     last_admission_probe_at: Mutex<HashMap<NodeIdentifier, Instant>>,
     delivery_blocked_log: Mutex<DeliveryBlockedLogState>,
     pub(super) shutdown: CancellationToken,
+        let terminal_journal_durable = journal.durable_persistence_enabled();
     pub(super) cfg: Arc<ReplicationConfig>,
-    pub(super) terminal_journal: Mutex<TerminalJournal>,
+    pub(super) terminal_journal: Arc<AsyncMutex<TerminalJournal>>,
+    terminal_journal_durable: bool,
     pub(super) v3_sync: Mutex<SyncV3State>,
     pub(super) v3_retries: Mutex<V3RetryState>,
     pub(super) v3_history: Mutex<HistoryV3State>,
@@ -3257,7 +3277,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
         };
         let terminal_protocol_storage_healthy =
-            journal.durable_persistence_enabled() || cfg!(any(test, feature = "test-support"));
+            terminal_journal_durable || cfg!(any(test, feature = "test-support"));
         if !terminal_protocol_storage_healthy && !strict_protocol_disabled {
             net.disable_strict_replication_protocol();
             strict_protocol_disabled = true;
@@ -3311,7 +3331,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             delivery_blocked_log: Mutex::new(DeliveryBlockedLogState::default()),
             shutdown,
             cfg,
-            terminal_journal: Mutex::new(journal),
+            terminal_journal: Arc::new(AsyncMutex::new(journal)),
+            terminal_journal_durable,
             v3_sync: Mutex::new(SyncV3State::default()),
             v3_retries: Mutex::new(V3RetryState::default()),
             v3_history: Mutex::new(HistoryV3State::default()),
@@ -3785,6 +3806,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let previous = transition.previous_cut();
         let cut = transition.resulting_cut();
         (
+            .await
             Bytes::copy_from_slice(cut.journal_id()),
             cut.generation(),
             Bytes::copy_from_slice(previous.chain_digest()),
@@ -4118,6 +4140,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             self.observed_frozen_target_epoch_matches(from, origin_boot_epoch, target.boot_epoch())
         })
     }
+            .await
 
     fn frozen_resolution_owner(&self, targets: &[FrozenTarget]) -> Option<NodeIdentifier> {
         targets
@@ -4138,7 +4161,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     fn record_terminal_journal_failure(&self, error: &TerminalJournalError) {
         if matches!(
             error,
-            TerminalJournalError::Io { .. } | TerminalJournalError::Json { .. }
+            TerminalJournalError::Io { .. }
+                | TerminalJournalError::Json { .. }
+                | TerminalJournalError::Sqlite(_)
         ) && self
             .terminal_protocol_storage_healthy
             .swap(false, Ordering::AcqRel)
@@ -4150,10 +4175,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// Return the frozen v2 descriptor known for an operation, whether it is
     /// still pending in memory or only retained by the terminal journal.
     /// Descriptor-less legacy terminal traffic must never mutate such an op.
-    fn v2_frozen_targets_for_op(&self, op_id: OpId) -> Option<Vec<FrozenTarget>> {
+    async fn v2_frozen_targets_for_op(&self, op_id: OpId) -> Option<Vec<FrozenTarget>> {
         if let Some(targets) = self
             .state
             .lock()
+            .await
             .pending_proposes
             .get(&op_id)
             .filter(|pending| pending.protocol_version == STRICT_PROTOCOL_VERSION_V2)
@@ -4163,18 +4189,19 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         }
         self.terminal_journal
             .lock()
+            .await
             .get(op_id)
             .and_then(TerminalJournalRecord::frozen_targets)
             .map(ToOwned::to_owned)
     }
 
-    pub(crate) fn terminal_commit_proof_for_catchup(
+    pub(crate) async fn terminal_commit_proof_for_catchup(
         &self,
         op_id: OpId,
         ts_final: u64,
         op_msgpack: &Bytes,
     ) -> Result<Option<TerminalCommitProof>, ()> {
-        let journal = self.terminal_journal.lock();
+        let journal = self.terminal_journal.lock().await;
         let Some(record) = journal.get(op_id) else {
             return Ok(None);
         };
@@ -4198,7 +4225,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         }))
     }
 
-    pub(crate) fn has_unresolved_v2_terminal_fence(&self, op_id: OpId) -> bool {
+    pub(crate) async fn has_unresolved_v2_terminal_fence(&self, op_id: OpId) -> bool {
         self.terminal_journal
             .lock()
             .get(op_id)
@@ -4207,22 +4234,30 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             })
     }
 
-    pub(super) fn has_v2_terminal_descriptor(&self, op_id: OpId) -> bool {
+    pub(super) async fn has_v2_terminal_descriptor(&self, op_id: OpId) -> bool {
         self.terminal_journal
             .lock()
             .get(op_id)
             .is_some_and(|record| record.frozen_targets().is_some())
     }
 
-    pub(super) fn has_any_terminal_decision(&self) -> bool {
-        self.terminal_journal.lock().snapshot().iter().any(|entry| {
-            let (_, record) = entry.clone().into_parts();
-            record.terminal_decision().is_some()
-        })
+    pub(super) async fn has_any_terminal_decision(&self) -> bool {
+        self.terminal_journal
+            .lock()
+            .await
+            .snapshot()
+            .iter()
+            .any(|entry| {
+                let (_, record) = entry.clone().into_parts();
+                record.terminal_decision().is_some()
+            })
     }
 
-    pub(super) fn terminal_decision_generation(&self) -> u64 {
-        self.terminal_journal.lock().terminal_decision_generation()
+    pub(super) async fn terminal_decision_generation(&self) -> u64 {
+        self.terminal_journal
+            .lock()
+            .await
+            .terminal_decision_generation()
     }
 
     pub(super) fn remembered_terminal_decision_generation(&self, peer: NodeIdentifier) -> u64 {
@@ -4247,7 +4282,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.terminal_catchup_snapshots.lock().remove(&peer);
     }
 
-    fn v2_resolution_hint_for_op(
+    async fn v2_resolution_hint_for_op(
         &self,
         op_id: OpId,
     ) -> Option<(NodeIdentifier, StrictResolutionHint)> {
@@ -4279,7 +4314,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 pending
             } else {
                 let (coord_node, ts_local, op_msgpack, frozen_targets) = {
-                    let journal = self.terminal_journal.lock();
+                    let journal = self.terminal_journal.lock().await;
                     let record = journal.get(op_id)?;
                     if record.terminal_decision().is_some() {
                         return None;
@@ -4326,7 +4361,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     async fn send_v2_resolution_hint_for_op(&self, op_id: OpId) {
-        let Some((owner, hint)) = self.v2_resolution_hint_for_op(op_id) else {
+        let Some((owner, hint)) = self.v2_resolution_hint_for_op(op_id).await else {
             return;
         };
         if owner == self.self_id {
@@ -4341,7 +4376,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     pub(crate) async fn defer_descriptorless_v2_commit(&self, op_id: OpId) {
-        if !self.has_unresolved_v2_terminal_fence(op_id) {
+        if !self.has_unresolved_v2_terminal_fence(op_id).await {
             return;
         }
         // Claim the per-operation retry worker before its first send. Several
@@ -4350,6 +4385,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // caller into an unbounded reliable-queue fanout.
         if !self.deferred_v2_resolution_hints.lock().insert(op_id) {
             return;
+            .await
         }
         self.send_v2_resolution_hint_for_op(op_id).await;
         let weak = self.weak_self.lock().clone();
@@ -4366,7 +4402,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     _ = runtime.shutdown.cancelled() => return,
                     _ = tokio::time::sleep(interval) => {}
                 }
-                if !runtime.has_unresolved_v2_terminal_fence(op_id) {
+                if !runtime.has_unresolved_v2_terminal_fence(op_id).await {
                     runtime.deferred_v2_resolution_hints.lock().remove(&op_id);
                     return;
                 }
@@ -4375,7 +4411,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         });
     }
 
-    pub(crate) fn apply_catchup_terminal_commit_proof(
+    pub(crate) async fn apply_catchup_terminal_commit_proof(
         &self,
         op_id: OpId,
         ts_final: u64,
@@ -4386,13 +4422,15 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             metrics::record_strict_fence_rejection();
             return false;
         }
-        let _ = self.apply_terminal_commit_with_descriptor(
-            op_id,
-            proof.ballot,
-            ts_final,
-            op_msgpack.clone(),
-            Some(&proof.identity),
-        );
+        let _ = self
+            .apply_terminal_commit_with_descriptor(
+                op_id,
+                proof.ballot,
+                ts_final,
+                op_msgpack.clone(),
+                Some(&proof.identity),
+            )
+            .await;
         self.terminal_journal
             .lock()
             .get(op_id)
@@ -4407,7 +4445,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             })
     }
 
-    pub(super) fn persist_v2_pending_descriptor(
+    pub(super) async fn persist_v2_pending_descriptor(
         &self,
         op_id: OpId,
         ts_local: u64,
@@ -4415,8 +4453,18 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         frozen_targets: &[FrozenTarget],
     ) -> bool {
         let persisted = {
-            let mut journal = self.terminal_journal.lock();
-            match journal.upsert_v2_pending_bytes(op_id, frozen_targets, ts_local, op_msgpack) {
+            let frozen_targets_owned = frozen_targets.to_vec();
+            match self
+                .with_terminal_journal_mutation(move |journal| {
+                    journal.upsert_v2_pending_bytes(
+                        op_id,
+                        &frozen_targets_owned,
+                        ts_local,
+                        op_msgpack,
+                    )
+                })
+                .await
+            {
                 Ok(_) => true,
                 Err(error) => {
                     self.record_terminal_journal_failure(&error);
@@ -4440,7 +4488,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     fn restore_terminal_journal(&self) {
-        let records = self.terminal_journal.lock().snapshot();
+        let records = self
+            .terminal_journal
+            .try_lock()
+            .expect("new terminal journal cannot be contended")
+            .snapshot();
         if records.is_empty() {
             return;
         }
@@ -4451,6 +4503,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let hydrate_v2_pending = record.frozen_targets().is_none_or(|targets| {
                 FrozenTarget::find_in_canonical(targets, self.self_id)
                     .is_some_and(|target| target.boot_epoch() == self.boot_epoch)
+            .await
             });
             hydrate_terminal_journal_record(&mut state, op_id, &record, hydrate_v2_pending);
             restored_commits |= enqueue_terminal_commit_for_delivery(&mut state, op_id, &record);
@@ -4490,7 +4543,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     #[cfg(test)]
-    fn apply_terminal_commit(
+    async fn apply_terminal_commit(
         &self,
         op_id: OpId,
         ballot: u64,
@@ -4501,8 +4554,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .accepted()
     }
 
-    fn requeue_terminal_journal_commit(&self, op_id: OpId) -> bool {
-        let Some(record) = self.terminal_journal.lock().get(op_id).cloned() else {
+    async fn requeue_terminal_journal_commit(&self, op_id: OpId) -> bool {
+        let Some(record) = self.terminal_journal.lock().await.get(op_id).cloned() else {
             return false;
         };
         if !matches!(
@@ -4522,7 +4575,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         state_changed
     }
 
-    fn apply_terminal_commit_with_descriptor(
+    async fn apply_terminal_commit_with_descriptor(
         &self,
         op_id: OpId,
         ballot: u64,
@@ -4546,47 +4599,49 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 return TerminalInstallResult::Rejected;
             }
         }
-        let (journal_changed, record, transition) = {
-            let mut journal = self.terminal_journal.lock();
-            let result = match identity {
-                Some(identity) => journal.upsert_v2_commit_decision_bytes(
-                    op_id,
-                    &identity.frozen_targets,
-                    identity.resolver,
-                    ballot,
-                    ts_final,
-                    op_msgpack.clone(),
-                ),
-                None => journal.upsert_commit_decision_bytes(
-                    op_id,
-                    ballot,
-                    ts_final,
-                    op_msgpack.clone(),
-                ),
-            };
-            match result {
-                Ok(changed) => {
-                    let record = journal
-                        .get(op_id)
-                        .cloned()
-                        .expect("terminal commit must have a journal record");
-                    let transition = journal
-                        .terminal_transition(op_id)
-                        .expect("terminal commit must have an assigned transition");
-                    (changed, record, transition)
-                }
-                Err(error) => {
-                    self.record_terminal_journal_failure(&error);
-                    warn!(
-                        topic = %self.topic,
-                        op_id_hi = op_id.0,
-                        op_id_lo = op_id.1,
-                        error = %error,
-                        "strict terminal commit rejected by durable journal"
-                    );
-                    metrics::record_strict_fence_rejection();
-                    return TerminalInstallResult::Rejected;
-                }
+        let identity_owned = identity.cloned();
+        let op_msgpack_for_journal = op_msgpack.clone();
+        let result = self
+            .with_terminal_journal_mutation(move |journal| {
+                let changed = match identity_owned.as_ref() {
+                    Some(identity) => journal.upsert_v2_commit_decision_bytes(
+                        op_id,
+                        &identity.frozen_targets,
+                        identity.resolver,
+                        ballot,
+                        ts_final,
+                        op_msgpack_for_journal.clone(),
+                    ),
+                    None => journal.upsert_commit_decision_bytes(
+                        op_id,
+                        ballot,
+                        ts_final,
+                        op_msgpack_for_journal,
+                    ),
+                }?;
+                let record = journal
+                    .get(op_id)
+                    .cloned()
+                    .expect("terminal commit must have a journal record");
+                let transition = journal
+                    .terminal_transition(op_id)
+                    .expect("terminal commit must have an assigned transition");
+                Ok((changed, record, transition))
+            })
+            .await;
+        let (journal_changed, record, transition) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.record_terminal_journal_failure(&error);
+                warn!(
+                    topic = %self.topic,
+                    op_id_hi = op_id.0,
+                    op_id_lo = op_id.1,
+                    error = %error,
+                    "strict terminal commit rejected by durable journal"
+                );
+                metrics::record_strict_fence_rejection();
+                return TerminalInstallResult::Rejected;
             }
         };
         if !journal_changed {
@@ -4603,6 +4658,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let mut state_changed = false;
         {
             let mut state = self.state.lock();
+            .await
             let decision = TerminalDecision::Commit(AcceptedValue {
                 ballot,
                 ts_final,
@@ -4648,12 +4704,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     #[cfg(test)]
-    fn apply_terminal_abort(&self, op_id: OpId, ballot: u64) -> bool {
+    async fn apply_terminal_abort(&self, op_id: OpId, ballot: u64) -> bool {
         self.apply_terminal_abort_with_descriptor(op_id, ballot, None)
             .accepted()
     }
 
-    fn apply_terminal_abort_with_descriptor(
+    async fn apply_terminal_abort_with_descriptor(
         &self,
         op_id: OpId,
         ballot: u64,
@@ -4671,40 +4727,42 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 return TerminalInstallResult::Rejected;
             }
         }
-        let (journal_changed, record, transition) = {
-            let mut journal = self.terminal_journal.lock();
-            let result = match identity {
-                Some(identity) => journal.upsert_v2_abort_decision(
-                    op_id,
-                    &identity.frozen_targets,
-                    identity.resolver,
-                    ballot,
-                ),
-                None => journal.upsert_abort_decision(op_id, ballot),
-            };
-            match result {
-                Ok(changed) => {
-                    let record = journal
-                        .get(op_id)
-                        .cloned()
-                        .expect("terminal abort must have a journal record");
-                    let transition = journal
-                        .terminal_transition(op_id)
-                        .expect("terminal abort must have an assigned transition");
-                    (changed, record, transition)
-                }
-                Err(error) => {
-                    self.record_terminal_journal_failure(&error);
-                    warn!(
-                        topic = %self.topic,
-                        op_id_hi = op_id.0,
-                        op_id_lo = op_id.1,
-                        error = %error,
-                        "strict terminal abort rejected by durable journal"
-                    );
-                    metrics::record_strict_fence_rejection();
-                    return TerminalInstallResult::Rejected;
-                }
+        let identity_owned = identity.cloned();
+        let result = self
+            .with_terminal_journal_mutation(move |journal| {
+                let changed = match identity_owned.as_ref() {
+                    Some(identity) => journal.upsert_v2_abort_decision(
+                        op_id,
+                        &identity.frozen_targets,
+                        identity.resolver,
+                        ballot,
+                    ),
+                    None => journal.upsert_abort_decision(op_id, ballot),
+                }?;
+                let record = journal
+                    .get(op_id)
+                    .cloned()
+                    .expect("terminal abort must have a journal record");
+                let transition = journal
+                    .terminal_transition(op_id)
+                    .expect("terminal abort must have an assigned transition");
+                Ok((changed, record, transition))
+            })
+            .await;
+        let (journal_changed, record, transition) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.record_terminal_journal_failure(&error);
+                warn!(
+                    topic = %self.topic,
+                    op_id_hi = op_id.0,
+                    op_id_lo = op_id.1,
+                    error = %error,
+                    "strict terminal abort rejected by durable journal"
+                );
+                metrics::record_strict_fence_rejection();
+                return TerminalInstallResult::Rejected;
+            .await
             }
         };
         if !journal_changed {
@@ -4742,7 +4800,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         TerminalInstallResult::Applied(transition)
     }
 
-    pub(crate) fn terminal_states_for_catchup_page(
+    pub(crate) async fn terminal_states_for_catchup_page(
         &self,
         peer: NodeIdentifier,
         cursor: u64,
@@ -4915,7 +4973,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     ) -> Option<TerminalCatchupBudgetViolation> {
         let budget = self.strict_catchup_response_budget();
         self.terminal_journal
-            .lock()
+            .try_lock()
+            .expect("new terminal journal cannot be contended")
             .snapshot()
             .into_iter()
             .find_map(|entry| {
@@ -4975,6 +5034,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         frozen_targets: &[FrozenTarget],
         op_msgpack: Bytes,
     ) -> bool {
+            .await
         self.v2_terminal_state_fits_catchup_budget(op_id, frozen_targets, |_| {
             StrictTerminalOutcome::Commit(StrictDecisionCommit {
                 ts_final: u64::MAX,
@@ -5020,16 +5080,18 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     #[cfg(test)]
-    pub(crate) fn terminal_states_for_catchup(&self) -> Vec<StrictTerminalState> {
+    pub(crate) async fn terminal_states_for_catchup(&self) -> Vec<StrictTerminalState> {
         self.terminal_states_for_catchup_page(self.self_id, 0, usize::MAX, usize::MAX)
             .states
     }
 
-    pub(crate) fn apply_catchup_terminal_state(&self, terminal: StrictTerminalState) -> bool {
-        self.install_catchup_terminal_state(terminal).is_some()
+    pub(crate) async fn apply_catchup_terminal_state(&self, terminal: StrictTerminalState) -> bool {
+        self.install_catchup_terminal_state(terminal)
+            .await
+            .is_some()
     }
 
-    fn install_catchup_terminal_state(
+    async fn install_catchup_terminal_state(
         &self,
         terminal: StrictTerminalState,
     ) -> Option<TerminalTransition> {
@@ -5052,6 +5114,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 advertised_coord = coord_node,
                 "strict terminal catchup state coordinator does not match op id"
             );
+                    .await
             return None;
         }
         let identity = match terminal_identity_from_wire(
@@ -5065,6 +5128,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             Ok(identity) => identity,
             Err(()) => {
                 metrics::record_strict_fence_rejection();
+            .await
                 return None;
             }
         };
@@ -5072,25 +5136,31 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             metrics::record_strict_fence_rejection();
             return None;
         }
-        if self.v2_frozen_targets_for_op(op_id).is_some_and(|known| {
-            identity
-                .as_ref()
-                .is_none_or(|identity| identity.frozen_targets != known)
-        }) {
+        if self
+            .v2_frozen_targets_for_op(op_id)
+            .await
+            .is_some_and(|known| {
+                identity
+                    .as_ref()
+                    .is_none_or(|identity| identity.frozen_targets != known)
+            })
+        {
             metrics::record_strict_fence_rejection();
             return None;
         }
         let expected_outcome = terminal.outcome.clone();
         let outcome = terminal.outcome;
         let install = match outcome {
-            Some(StrictTerminalOutcome::Commit(commit)) => self
-                .apply_terminal_commit_with_descriptor(
+            Some(StrictTerminalOutcome::Commit(commit)) => {
+                self.apply_terminal_commit_with_descriptor(
                     op_id,
                     terminal.ballot,
                     commit.ts_final,
                     commit.op_msgpack,
                     identity.as_ref(),
-                ),
+                )
+                .await
+            }
             Some(StrictTerminalOutcome::Abort(_)) => {
                 self.apply_terminal_abort_with_descriptor(op_id, terminal.ballot, identity.as_ref())
             }
@@ -5140,12 +5210,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// Install a terminal fence carried by a correlated v3 page. Catchup
     /// origin is explicit so applying the page cannot create decision fanout
     /// or recursively dirty the session that owns the page.
-    pub(super) fn apply_v3_catchup_terminal_state(
+    pub(super) async fn apply_v3_catchup_terminal_state(
         &self,
         peer: PeerIncarnation,
         terminal: StrictTerminalState,
     ) -> bool {
-        let Some(transition) = self.install_catchup_terminal_state(terminal) else {
+        let Some(transition) = self.install_catchup_terminal_state(terminal).await else {
             return false;
         };
         let effects =
@@ -5362,7 +5432,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         };
         let earliest_pending_promise_ballot = earliest_pending.and_then(|(op_id, _, _)| {
             self.terminal_journal
-                .lock()
+                .try_lock()
+                .expect("debug journal access cannot be contended")
                 .get(op_id)
                 .map(TerminalJournalRecord::promise_ballot)
         });
@@ -5994,7 +6065,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 return;
             }
         }
-        if protocol_version < STRICT_PROTOCOL_VERSION_V2 && self.has_v2_terminal_descriptor(op_id) {
+        if protocol_version < STRICT_PROTOCOL_VERSION_V2
+            && self.has_v2_terminal_descriptor(op_id).await
+        {
             metrics::record_strict_fence_rejection();
             return;
         }
@@ -6091,7 +6164,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             s.peer_clocks.insert(self.self_id, local_clock_after);
         }
         if let Some((targets, pending_bytes)) = v2_pending_to_persist {
-            if !self.persist_v2_pending_descriptor(op_id, ts_local, pending_bytes, &targets) {
+            if !self
+                .persist_v2_pending_descriptor(op_id, ts_local, pending_bytes, &targets)
+                .await
+            {
                 let mut state = self.state.lock();
                 if state.pending_proposes.get(&op_id).is_some_and(|pending| {
                     pending.protocol_version == STRICT_PROTOCOL_VERSION_V2
@@ -6617,7 +6693,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             metrics::record_strict_fence_rejection();
             return;
         }
-        if let Some(frozen_targets) = self.v2_frozen_targets_for_op(op_id) {
+        if let Some(frozen_targets) = self.v2_frozen_targets_for_op(op_id).await {
             if !self.local_v2_participation_ready() {
                 metrics::record_strict_fence_rejection();
                 self.send_accept_ack(coord, op_id, accept.ballot, false)
@@ -6674,30 +6750,34 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         };
         let accepted = if eligible {
             let record = {
-                let mut journal = self.terminal_journal.lock();
-                let result = if let Some(frozen_targets) = frozen_targets.as_deref() {
-                    journal.upsert_v2_accepted_bytes(
-                        op_id,
-                        frozen_targets,
-                        accept.ballot,
-                        accept.ts_final,
-                        accept.op_msgpack.clone(),
-                    )
-                } else {
-                    journal.upsert_accepted_bytes(
-                        op_id,
-                        accept.ballot,
-                        accept.ts_final,
-                        accept.op_msgpack.clone(),
-                    )
-                };
-                match result {
-                    Ok(_) => Some(
-                        journal
+                let frozen_targets_for_journal = frozen_targets.clone();
+                let accept_for_journal = accept.clone();
+                let result = self
+                    .with_terminal_journal_mutation(move |journal| {
+                        if let Some(frozen_targets) = frozen_targets_for_journal.as_deref() {
+                            journal.upsert_v2_accepted_bytes(
+                                op_id,
+                                frozen_targets,
+                                accept_for_journal.ballot,
+                                accept_for_journal.ts_final,
+                                accept_for_journal.op_msgpack.clone(),
+                            )
+                        } else {
+                            journal.upsert_accepted_bytes(
+                                op_id,
+                                accept_for_journal.ballot,
+                                accept_for_journal.ts_final,
+                                accept_for_journal.op_msgpack.clone(),
+                            )
+                        }?;
+                        Ok(journal
                             .get(op_id)
                             .cloned()
-                            .expect("accepted strict value must have a journal record"),
-                    ),
+                            .expect("accepted strict value must have a journal record"))
+                    })
+                    .await;
+                match result {
+                    Ok(record) => Some(record),
                     Err(error) => {
                         self.record_terminal_journal_failure(&error);
                         warn!(
@@ -7172,15 +7252,17 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     resolver: TerminalResolver::new(self.self_id, self.boot_epoch),
                     frozen_targets: frozen_targets.clone(),
                 });
-        let install = self.apply_terminal_commit_with_descriptor(
-            op_id,
-            NORMAL_ACCEPT_BALLOT,
-            ts_final,
-            op_msgpack.clone(),
-            terminal_identity.as_ref(),
-        );
+        let install = self
+            .apply_terminal_commit_with_descriptor(
+                op_id,
+                NORMAL_ACCEPT_BALLOT,
+                ts_final,
+                op_msgpack.clone(),
+                terminal_identity.as_ref(),
+            )
+            .await;
         let Some(terminal_transition) = install.transition() else {
-            if !self.requeue_terminal_journal_commit(op_id) {
+            if !self.requeue_terminal_journal_commit(op_id).await {
                 {
                     let mut state = self.state.lock();
                     if !state.committed_ids.contains(&op_id) {
@@ -7296,7 +7378,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             );
             return;
         }
-        let known_frozen_targets = self.v2_frozen_targets_for_op(op_id);
+        let known_frozen_targets = self.v2_frozen_targets_for_op(op_id).await;
         let v2_frozen_targets = if decision.frozen_targets.is_empty() {
             if known_frozen_targets.is_some() || decision.resolver_boot_epoch != 0 {
                 metrics::record_strict_fence_rejection();
@@ -7362,19 +7444,24 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // cannot preserve a different resolver's authority. The resolver's
         // own fanout/retries and durable terminal catchup provide repair.
         let install = match decision.outcome {
-            Some(StrictDecisionOutcome::Commit(commit)) => self
-                .apply_terminal_commit_with_descriptor(
+            Some(StrictDecisionOutcome::Commit(commit)) => {
+                self.apply_terminal_commit_with_descriptor(
                     op_id,
                     decision.ballot,
                     commit.ts_final,
                     commit.op_msgpack,
                     terminal_identity.as_ref(),
-                ),
-            Some(StrictDecisionOutcome::Abort(_)) => self.apply_terminal_abort_with_descriptor(
-                op_id,
-                decision.ballot,
-                terminal_identity.as_ref(),
-            ),
+                )
+                .await
+            }
+            Some(StrictDecisionOutcome::Abort(_)) => {
+                self.apply_terminal_abort_with_descriptor(
+                    op_id,
+                    decision.ballot,
+                    terminal_identity.as_ref(),
+                )
+                .await
+            }
             None => {
                 warn!(
                     op_id_hi = op_id.0,
@@ -7602,7 +7689,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
             Some(targets)
         };
-        if frozen_targets.is_none() && self.v2_frozen_targets_for_op(op_id).is_some() {
+        if frozen_targets.is_none() && self.v2_frozen_targets_for_op(op_id).await.is_some() {
             // A descriptor-less prepare belongs to the inbound-compatibility
             // v1 protocol. It cannot promise over a v2 operation, whose
             // original membership is an immutable part of the fence.
@@ -7651,14 +7738,20 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             return;
         }
         let record = {
-            let mut journal = self.terminal_journal.lock();
-            let result = if let Some(frozen_targets) = frozen_targets.as_deref() {
-                journal.upsert_v2_promise(op_id, frozen_targets, prepare.ballot)
-            } else {
-                journal.upsert_promise(op_id, prepare.ballot)
-            };
+            let frozen_targets_for_journal = frozen_targets.clone();
+            let ballot = prepare.ballot;
+            let result = self
+                .with_terminal_journal_mutation(move |journal| {
+                    if let Some(frozen_targets) = frozen_targets_for_journal.as_deref() {
+                        journal.upsert_v2_promise(op_id, frozen_targets, ballot)
+                    } else {
+                        journal.upsert_promise(op_id, ballot)
+                    }?;
+                    Ok(journal.get(op_id).cloned())
+                })
+                .await;
             match result {
-                Ok(_) => journal.get(op_id).cloned(),
+                Ok(record) => record,
                 Err(error) => {
                     self.record_terminal_journal_failure(&error);
                     warn!(
@@ -7882,6 +7975,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 return;
             }
             let decision = choose_resolution_decision(
+                    .await
                 resolution.coord_node,
                 resolution.ballot,
                 resolution
@@ -7916,6 +8010,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     resolver: TerminalResolver::new(self.self_id, self.boot_epoch),
                     frozen_targets: frozen_targets.clone(),
                 },
+                    .await
             ),
         };
         let src_clock = self.state.lock().clock;
@@ -8088,12 +8183,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             _ => None,
         };
         if let Some((ts_local, op_msgpack)) = hinted_pending_to_persist {
-            if !self.persist_v2_pending_descriptor(
-                op_id,
-                ts_local,
-                op_msgpack.clone(),
-                &frozen_targets,
-            ) {
+            if !self
+                .persist_v2_pending_descriptor(op_id, ts_local, op_msgpack.clone(), &frozen_targets)
+                .await
+            {
                 let mut state = self.state.lock();
                 if state.pending_proposes.get(&op_id).is_some_and(|pending| {
                     pending.coord_node == coord
@@ -8143,26 +8236,39 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if self.resolutions.lock().contains_key(&op_id) {
             return;
         }
-        let (ballot, record) = {
-            let mut journal = self.terminal_journal.lock();
-            if journal
-                .get(op_id)
-                .is_some_and(|record| record.terminal_decision().is_some())
-            {
-                return;
-            }
-            let prior_ballot = journal
-                .get(op_id)
-                .map(|record| record.promise_ballot())
-                .unwrap_or(0);
-            let attempt = self
-                .resolution_attempt_counter
-                .fetch_add(1, Ordering::Relaxed);
-            // A resolver can restart or replace a higher-numbered departed
-            // resolver. Preserve the node/attempt ordering for the normal
-            // case, but always move above a durable promise when needed.
-            let ballot = make_ballot(self.self_id, attempt).max(prior_ballot.saturating_add(1));
-            if let Err(error) = journal.upsert_v2_promise(op_id, &frozen_targets, ballot) {
+        let attempt = self
+            .resolution_attempt_counter
+            .fetch_add(1, Ordering::Relaxed);
+        let self_id = self.self_id;
+        let frozen_targets_for_journal = frozen_targets.clone();
+        let promise_result = self
+            .with_terminal_journal_mutation(move |journal| {
+                if journal
+                    .get(op_id)
+                    .is_some_and(|record| record.terminal_decision().is_some())
+                {
+                    return Ok(None);
+                }
+                let prior_ballot = journal
+                    .get(op_id)
+                    .map(|record| record.promise_ballot())
+                    .unwrap_or(0);
+                // A resolver can restart or replace a higher-numbered departed
+                // resolver. Preserve the node/attempt ordering for the normal
+                // case, but always move above a durable promise when needed.
+                let ballot = make_ballot(self_id, attempt).max(prior_ballot.saturating_add(1));
+                journal.upsert_v2_promise(op_id, &frozen_targets_for_journal, ballot)?;
+                let record = journal
+                    .get(op_id)
+                    .cloned()
+                    .expect("strict resolution promise must have a journal record");
+                Ok(Some((ballot, record)))
+            })
+            .await;
+        let (ballot, record) = match promise_result {
+            Ok(Some(result)) => result,
+            Ok(None) => return,
+            Err(error) => {
                 self.record_terminal_journal_failure(&error);
                 warn!(
                     topic = %self.topic,
@@ -8173,11 +8279,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 );
                 return;
             }
-            let record = journal
-                .get(op_id)
-                .cloned()
-                .expect("strict resolution promise must have a journal record");
-            (ballot, record)
         };
         let self_observed = {
             let mut state = self.state.lock();
@@ -8515,7 +8616,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     #[allow(dead_code)]
     async fn recv_legacy_commit_observed(&self, from: NodeIdentifier, c: StrictCommit) {
         let op_id: OpId = (c.op_id_hi, c.op_id_lo);
-        if self.has_v2_terminal_descriptor(op_id) {
+        if self.has_v2_terminal_descriptor(op_id).await {
             metrics::record_strict_fence_rejection();
             self.defer_descriptorless_v2_commit(op_id).await;
             return;
@@ -8773,7 +8874,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// it as our new promise.
     pub async fn recv_recovery_req(&self, from: NodeIdentifier, req: StrictRecoveryReq) {
         let op_id: OpId = (req.op_id_hi, req.op_id_lo);
-        if self.has_v2_terminal_descriptor(op_id) {
+        if self.has_v2_terminal_descriptor(op_id).await {
             metrics::record_strict_fence_rejection();
             self.defer_descriptorless_v2_commit(op_id).await;
             return;
@@ -9048,7 +9149,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// Phase 2 (Accept-and-Commit): apply if our promise still allows it.
     pub async fn recv_recovery_commit(&self, from: NodeIdentifier, c: StrictRecoveryCommit) {
         let op_id: OpId = (c.op_id_hi, c.op_id_lo);
-        if self.has_v2_terminal_descriptor(op_id) {
+        if self.has_v2_terminal_descriptor(op_id).await {
             metrics::record_strict_fence_rejection();
             self.defer_descriptorless_v2_commit(op_id).await;
             return;
@@ -9501,7 +9602,7 @@ struct PendingProposeSnapshot {
 }
 
 impl<R: StrictReplicable> StrictRuntime<R> {
-    fn operation_requires_v2_origin_proof(&self, op_id: OpId) -> bool {
+    async fn operation_requires_v2_origin_proof(&self, op_id: OpId) -> bool {
         let state_requires_proof = {
             let state = self.state.lock();
             state
@@ -9515,21 +9616,23 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         };
         state_requires_proof
             || self.resolutions.lock().contains_key(&op_id)
-            || self.has_v2_terminal_descriptor(op_id)
+            || self.has_v2_terminal_descriptor(op_id).await
     }
 
-    fn origin_is_admissible_for_frozen_operation(
+    async fn origin_is_admissible_for_frozen_operation(
         &self,
         from: NodeIdentifier,
         origin_boot_epoch: u64,
         op_id: OpId,
     ) -> bool {
-        self.v2_frozen_targets_for_op(op_id).is_some_and(|targets| {
-            self.origin_matches_frozen_target(from, origin_boot_epoch, &targets)
-        })
+        self.v2_frozen_targets_for_op(op_id)
+            .await
+            .is_some_and(|targets| {
+                self.origin_matches_frozen_target(from, origin_boot_epoch, &targets)
+            })
     }
 
-    fn origin_is_admissible_for_body(
+    async fn origin_is_admissible_for_body(
         &self,
         from: NodeIdentifier,
         origin_boot_epoch: u64,
@@ -9552,9 +9655,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
             _ => None,
         };
-        op_id.is_some_and(|op_id| {
+        if let Some(op_id) = op_id {
             self.origin_is_admissible_for_frozen_operation(from, origin_boot_epoch, op_id)
-        })
+                .await
+        } else {
+            false
+        }
     }
 
     fn reject_untrusted_v2_origin(&self) {
@@ -9584,7 +9690,10 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
         // authenticated origin matches the current known membership
         // incarnation. A transient unreachable event must not discard a
         // durable response from the frozen incarnation.
-        if !self.origin_is_admissible_for_body(from, origin_boot_epoch, &body) {
+        if !self
+            .origin_is_admissible_for_body(from, origin_boot_epoch, &body)
+            .await
+        {
             metrics::record_strict_fence_rejection();
             return;
         }
@@ -9599,7 +9708,9 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                     .await
             }
             StrictBody::ProposeAck(a) => {
-                if self.operation_requires_v2_origin_proof((a.op_id_hi, a.op_id_lo))
+                if self
+                    .operation_requires_v2_origin_proof((a.op_id_hi, a.op_id_lo))
+                    .await
                     && !origin_authenticated
                 {
                     self.reject_untrusted_v2_origin();
@@ -9686,7 +9797,9 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                 metrics::record_strict_fence_rejection();
             }
             StrictBody::Accept(a) => {
-                if self.operation_requires_v2_origin_proof((a.op_id_hi, a.op_id_lo))
+                if self
+                    .operation_requires_v2_origin_proof((a.op_id_hi, a.op_id_lo))
+                    .await
                     && !origin_authenticated
                 {
                     self.reject_untrusted_v2_origin();
@@ -9696,7 +9809,9 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                     .await
             }
             StrictBody::AcceptAck(a) => {
-                if self.operation_requires_v2_origin_proof((a.op_id_hi, a.op_id_lo))
+                if self
+                    .operation_requires_v2_origin_proof((a.op_id_hi, a.op_id_lo))
+                    .await
                     && !origin_authenticated
                 {
                     self.reject_untrusted_v2_origin();
@@ -9722,7 +9837,9 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                     .await
             }
             StrictBody::ResolutionAck(a) => {
-                if self.operation_requires_v2_origin_proof((a.op_id_hi, a.op_id_lo))
+                if self
+                    .operation_requires_v2_origin_proof((a.op_id_hi, a.op_id_lo))
+                    .await
                     && !origin_authenticated
                 {
                     self.reject_untrusted_v2_origin();
@@ -9733,7 +9850,9 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
             }
             StrictBody::Decision(d) => {
                 if (!d.frozen_targets.is_empty()
-                    || self.operation_requires_v2_origin_proof((d.op_id_hi, d.op_id_lo)))
+                    || self
+                        .operation_requires_v2_origin_proof((d.op_id_hi, d.op_id_lo))
+                        .await)
                     && !origin_authenticated
                 {
                     self.reject_untrusted_v2_origin();
@@ -11579,6 +11698,86 @@ fn choose_resolution_decision<'a>(
     }
     if let Some((ts_final, op_msgpack, _protocol_version)) = pending {
         // A terminal resolver has already persisted a fresh quorum ballot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn durable_terminal_journal_mutation_does_not_block_the_async_worker() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let net = MockNet::new(1, vec![1]);
+        net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
+        let runtime = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        assert!(runtime.terminal_journal_durable);
+        let journal_path = runtime
+            .terminal_journal
+            .lock()
+            .await
+            .persistence_path()
+            .unwrap()
+            .to_path_buf();
+
+        let (writer_locked_tx, writer_locked_rx) = oneshot::channel();
+        let (release_writer_tx, release_writer_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let connection = rusqlite::Connection::open(journal_path).unwrap();
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            writer_locked_tx.send(()).unwrap();
+            release_writer_rx.recv().unwrap();
+            connection.execute_batch("COMMIT").unwrap();
+        });
+        writer_locked_rx.await.unwrap();
+
+        let stop_heartbeat = Arc::new(AtomicBool::new(false));
+        let heartbeat_count = Arc::new(AtomicU64::new(0));
+        let heartbeat = tokio::spawn({
+            let stop_heartbeat = Arc::clone(&stop_heartbeat);
+            let heartbeat_count = Arc::clone(&heartbeat_count);
+            async move {
+                while !stop_heartbeat.load(Ordering::Relaxed) {
+                    sleep(Duration::from_millis(5)).await;
+                    heartbeat_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+
+        let mutation = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move {
+                runtime
+                    .with_terminal_journal_mutation(|journal| journal.upsert_promise((1, 1), 1))
+                    .await
+            }
+        });
+
+        sleep(Duration::from_millis(75)).await;
+        assert!(
+            heartbeat_count.load(Ordering::Relaxed) >= 1,
+            "SQLite lock contention blocked the only async worker"
+        );
+        assert!(
+            !mutation.is_finished(),
+            "journal mutation unexpectedly completed while the SQLite writer lock was held"
+        );
+
+        release_writer_tx.send(()).unwrap();
+        let mutation_result = tokio::time::timeout(Duration::from_secs(1), mutation)
+            .await
+            .expect("journal mutation did not complete after releasing the SQLite writer lock")
+            .unwrap();
+        assert_eq!(mutation_result.unwrap(), true);
+
+        stop_heartbeat.store(true, Ordering::Relaxed);
+        heartbeat.await.unwrap();
+        tokio::task::spawn_blocking(move || writer.join().unwrap())
+            .await
+            .unwrap();
+    }
+
         // With no stronger accepted/terminal value to preserve, choosing the
         // prepared request is deterministic and makes the v1 liveness repair
         // automatic rather than dependent on a local rollout toggle.
@@ -12777,6 +12976,7 @@ mod tests {
             HistoryMetadata {
                 version: 14,
                 freshness: 41,
+            .await
             }
         ));
         assert_eq!(
@@ -12790,8 +12990,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn terminal_descriptor_does_not_revoke_uninvolved_peer_admission() {
+    #[tokio::test]
+    async fn terminal_descriptor_does_not_revoke_uninvolved_peer_admission() {
         let (rt, _net, _repo) = v1_runtime(ReplicationConfig::default());
         {
             let mut state = rt.state.lock();
@@ -12803,6 +13003,7 @@ mod tests {
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&777u64).unwrap());
         let identity = TerminalDecisionIdentity {
             resolver: TerminalResolver::new(1, 1),
+            .await
             frozen_targets: vec![FrozenTarget::new(1, 1)],
         };
 
@@ -14322,7 +14523,10 @@ mod tests {
                 false,
             );
         }
-        assert!(rt.persist_v2_pending_descriptor(old_op, 12, op_msgpack, &frozen_targets));
+        assert!(
+            rt.persist_v2_pending_descriptor(old_op, 12, op_msgpack, &frozen_targets)
+                .await
+        );
 
         rt.on_membership_change(&MembershipEvent::Restarted(MemberIncarnation::new(2, 8)));
 
@@ -14509,7 +14713,10 @@ mod tests {
                 false,
             );
         }
-        assert!(rt.persist_v2_pending_descriptor(op_id, 1, op_msgpack, &frozen_targets));
+        assert!(
+            rt.persist_v2_pending_descriptor(op_id, 1, op_msgpack, &frozen_targets)
+                .await
+        );
 
         rt.on_membership_change(&MembershipEvent::Restarted(MemberIncarnation::new(2, 8)));
         {
@@ -16262,7 +16469,10 @@ mod tests {
             Some(frozen_targets.clone()),
             false,
         );
-        assert!(rt.persist_v2_pending_descriptor(op_id, 10, op_msgpack.clone(), &frozen_targets,));
+        assert!(
+            rt.persist_v2_pending_descriptor(op_id, 10, op_msgpack.clone(), &frozen_targets,)
+                .await
+        );
         net.drain_captures();
 
         assert!(request_terminal_repair_probe(&rt).await);
@@ -16366,6 +16576,7 @@ mod tests {
 
         let op_id = make_op_id(1, 1, 139);
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&139u64).unwrap());
+                .await
         let identity = TerminalDecisionIdentity {
             resolver: TerminalResolver::new(1, 1),
             frozen_targets: v2_frozen_targets(),
@@ -17300,6 +17511,7 @@ mod tests {
         // legacy recovery protocol nor start a fresh terminal ballot that a
         // relay might not carry.
         net.set_alive(vec![1, 3]);
+                .await
         net.set_strict_replication_protocol_version(0);
         rt.maybe_initiate_recovery(2).await;
         rt.resume_lost_v2_coordinator_resolutions().await;
@@ -17521,6 +17733,7 @@ mod tests {
                 op_id_hi: op_id.0,
                 op_id_lo: op_id.1,
                 ts_propose: 39,
+            .await
                 op_msgpack: op_msgpack.clone(),
                 src_clock: 39,
                 protocol_version: STRICT_PROTOCOL_VERSION_V2,
@@ -17631,7 +17844,7 @@ mod tests {
             },
         )
         .await;
-        assert!(rt.terminal_journal.lock().get(op_id).is_none());
+        assert!(rt.terminal_journal.lock().await.get(op_id).is_none());
 
         rt.recv_resolution_prepare_with_origin_epoch(
             2,
@@ -17661,7 +17874,7 @@ mod tests {
                 }
             )
         }));
-        assert!(rt.terminal_journal.lock().get(op_id).is_none());
+        assert!(rt.terminal_journal.lock().await.get(op_id).is_none());
     }
 
     #[tokio::test]
@@ -17841,6 +18054,7 @@ mod tests {
         };
 
         rt.recv_decision_with_origin_epoch(2, 2, decision.clone())
+                .await
             .await;
         assert!(!rt.state.lock().terminal_decisions.contains_key(&op_id));
 
@@ -17898,6 +18112,7 @@ mod tests {
 
         net.set_epoch(1, 2);
         let recovered = StrictRuntime::new(
+                .await
             CountingStrictRepo::new(),
             1,
             2,
@@ -17938,6 +18153,7 @@ mod tests {
                 1,
                 StrictResolutionPrepare {
                     resolver_node: 2,
+                .await
                     ballot: 56,
                     coord_node: 2,
                     op_id_hi: op_id.0,
@@ -17985,6 +18201,7 @@ mod tests {
                     coord_node: 2,
                     op_id_hi: op_id.0,
                     op_id_lo: op_id.1,
+                .await
                     ts_local: 42,
                     op_msgpack: op_msgpack.clone(),
                     src_clock: 42,
@@ -18081,6 +18298,7 @@ mod tests {
             matches!(
                 frame,
                 CapturedFrame::StrictUnicast {
+                .await
                     dst: 3,
                     body: StrictBody::ResolutionAck(StrictResolutionAck {
                         ballot: 44,
@@ -18183,8 +18401,12 @@ mod tests {
                 CancellationToken::new(),
                 Arc::new(ReplicationConfig::default()),
             );
-            assert!(source.apply_terminal_abort(abort_id, 8));
-            assert!(source.apply_terminal_commit(commit_id, 9, 12, commit_bytes.clone()));
+            assert!(source.apply_terminal_abort(abort_id, 8).await);
+            assert!(
+                source
+                    .apply_terminal_commit(commit_id, 9, 12, commit_bytes.clone())
+                    .await
+            );
         }
 
         let source = StrictRuntime::new(
@@ -18196,7 +18418,7 @@ mod tests {
             CancellationToken::new(),
             Arc::new(ReplicationConfig::default()),
         );
-        let terminal_states = source.terminal_states_for_catchup();
+        let terminal_states = source.terminal_states_for_catchup().await;
         assert_eq!(terminal_states.len(), 2);
         assert!(matches!(
             source.state.lock().terminal_decisions.get(&abort_id),
@@ -18296,7 +18518,7 @@ mod tests {
                 CancellationToken::new(),
                 Arc::new(ReplicationConfig::default()),
             );
-            assert!(source.apply_terminal_commit(op_id, 7, 12, op_msgpack));
+            assert!(source.apply_terminal_commit(op_id, 7, 12, op_msgpack).await);
         }
         assert_eq!(net.strict_protocol_disable_reports(), 0);
 
@@ -18404,7 +18626,11 @@ mod tests {
                 Arc::new(ReplicationConfig::default()),
             );
             runtime.finish_history_election_for_test();
-            assert!(runtime.apply_terminal_commit(op_id, 7, 12, op_msgpack.clone()));
+            assert!(
+                runtime
+                    .apply_terminal_commit(op_id, 7, 12, op_msgpack.clone())
+                    .await
+            );
             {
                 let mut state = runtime.state.lock();
                 state.clock = 20;
@@ -18440,10 +18666,12 @@ mod tests {
             v1_runtime(ReplicationConfig::default().with_strict_max_catchup_ops(1));
         let first = make_op_id(1, 1, 1);
         let third = make_op_id(1, 1, 3);
-        assert!(runtime.apply_terminal_abort(first, 1));
-        assert!(runtime.apply_terminal_abort(third, 1));
+        assert!(runtime.apply_terminal_abort(first, 1).await);
+        assert!(runtime.apply_terminal_abort(third, 1).await);
 
-        let first_page = runtime.terminal_states_for_catchup_page(2, 0, 1, usize::MAX);
+        let first_page = runtime
+            .terminal_states_for_catchup_page(2, 0, 1, usize::MAX)
+            .await;
         assert_eq!(first_page.states.len(), 1);
         assert_eq!(first_page.states[0].op_id_lo, 1);
         assert!(first_page.has_more);
@@ -18452,16 +18680,19 @@ mod tests {
         // transfer using the live index would resend or skip a terminal
         // fence; the existing peer snapshot must continue with `third`.
         let second = make_op_id(1, 1, 2);
-        assert!(runtime.apply_terminal_abort(second, 1));
-        let second_page =
-            runtime.terminal_states_for_catchup_page(2, first_page.next_cursor, 1, usize::MAX);
+        assert!(runtime.apply_terminal_abort(second, 1).await);
+        let second_page = runtime
+            .terminal_states_for_catchup_page(2, first_page.next_cursor, 1, usize::MAX)
+            .await;
         assert_eq!(second_page.states.len(), 1);
         assert_eq!(second_page.states[0].op_id_lo, 3);
         assert!(!second_page.has_more);
 
         // A later sync starts a fresh snapshot and picks up the concurrent
         // terminal fence without relying on the old live index.
-        let refreshed = runtime.terminal_states_for_catchup_page(2, 0, usize::MAX, usize::MAX);
+        let refreshed = runtime
+            .terminal_states_for_catchup_page(2, 0, usize::MAX, usize::MAX)
+            .await;
         let ids: Vec<_> = refreshed
             .states
             .iter()
@@ -18477,19 +18708,22 @@ mod tests {
         let second_promise = make_op_id(1, 1, 22);
         let terminal = make_op_id(1, 1, 23);
         {
-            let mut journal = runtime.terminal_journal.lock();
+            let mut journal = runtime.terminal_journal.lock().await;
             journal.upsert_promise(first_promise, 1).unwrap();
             journal.upsert_promise(second_promise, 1).unwrap();
         }
-        assert!(runtime.apply_terminal_abort(terminal, 1));
+        assert!(runtime.apply_terminal_abort(terminal, 1).await);
 
-        let first_page = runtime.terminal_states_for_catchup_page(2, 0, 2, usize::MAX);
+        let first_page = runtime
+            .terminal_states_for_catchup_page(2, 0, 2, usize::MAX)
+            .await;
         assert!(first_page.states.is_empty());
         assert_eq!(first_page.next_cursor, 2);
         assert!(first_page.has_more);
 
-        let second_page =
-            runtime.terminal_states_for_catchup_page(2, first_page.next_cursor, 2, usize::MAX);
+        let second_page = runtime
+            .terminal_states_for_catchup_page(2, first_page.next_cursor, 2, usize::MAX)
+            .await;
         assert_eq!(second_page.states.len(), 1);
         assert_eq!(second_page.states[0].op_id_lo, 23);
         assert!(!second_page.has_more);
