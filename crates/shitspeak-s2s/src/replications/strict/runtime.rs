@@ -2655,12 +2655,19 @@ impl StrictState {
         };
     }
 
-    pub fn history_election_timed_out(&self, now: Instant, timeout: Duration) -> bool {
+    pub fn history_election_timed_out(
+        &self,
+        now: Instant,
+        probe_timeout: Duration,
+        snapshot_timeout: Duration,
+    ) -> bool {
         self.history_election_requested
             && match self.history_election_phase {
-                HistoryElectionPhase::Probing { started_at, .. }
-                | HistoryElectionPhase::FetchingSnapshot { started_at, .. } => {
-                    now.duration_since(started_at) >= timeout
+                HistoryElectionPhase::Probing { started_at, .. } => {
+                    now.duration_since(started_at) >= probe_timeout
+                }
+                HistoryElectionPhase::FetchingSnapshot { started_at, .. } => {
+                    now.duration_since(started_at) >= snapshot_timeout
                 }
                 HistoryElectionPhase::Idle | HistoryElectionPhase::Installing => false,
             }
@@ -11716,7 +11723,11 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
                 let expanded = state.observe_history_alive_peers(peers.iter().copied());
                 let snapshot_request =
                     state.reconcile_history_election_reachability(peers.iter().copied());
-                if state.history_election_timed_out(Instant::now(), interval.saturating_mul(5)) {
+                if state.history_election_timed_out(
+                    Instant::now(),
+                    interval.saturating_mul(5),
+                    rt.cfg.pending_propose_ttl(),
+                ) {
                     // A probe may be accepted by the transport while its
                     // response is lost on a transient route. Re-arming the
                     // request in the same loop would keep every node in an
@@ -15128,6 +15139,44 @@ mod tests {
         s.finish_history_election();
         assert!(!s.history_election_pending());
         assert!(!s.history_election_installing());
+    }
+
+    #[test]
+    fn history_election_uses_a_longer_timeout_for_snapshot_transfer() {
+        let mut state = StrictState::new();
+        state.begin_history_election([2]);
+        assert!(state.history_election_timed_out(
+            Instant::now() + Duration::from_millis(600),
+            Duration::from_millis(500),
+            Duration::from_secs(20),
+        ));
+        let local_rank = HistoryRank {
+            version: 8,
+            freshness: 0,
+            runtime_started_at: 100,
+            node_id: 1,
+            terminal_repository_base_version: 0,
+        };
+        let remote_rank = HistoryRank {
+            version: 9,
+            freshness: 1,
+            runtime_started_at: 200,
+            node_id: 2,
+            terminal_repository_base_version: 0,
+        };
+        assert!(matches!(
+            state.record_history_probe_response(2, remote_rank, local_rank),
+            HistoryProbeResponseOutcome::FetchSnapshot(_)
+        ));
+
+        assert!(
+            !state.history_election_timed_out(
+                Instant::now() + Duration::from_millis(600),
+                Duration::from_millis(500),
+                Duration::from_secs(20),
+            ),
+            "terminal synchronization and snapshot transfer need a longer timeout than probing"
+        );
     }
 
     #[test]

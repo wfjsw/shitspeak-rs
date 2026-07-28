@@ -17,8 +17,8 @@ use super::{
     catchup::{
         recv_v3_clock_probe_resp, recv_v3_history_probe_resp, recv_v3_terminal_sync_page,
         recv_v3_terminal_sync_req, request_v3_clock_probe, request_v3_history_probe,
-        request_v3_terminal_sync, respond_to_request, retry_v3_terminal_transmissions,
-        send_v3_metadata_control,
+        request_v3_terminal_sync, respond_to_request, resume_deferred_v3_admissions,
+        retry_v3_terminal_transmissions, send_v3_metadata_control,
     },
     runtime::{
         HistoryRank, STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V3,
@@ -2385,6 +2385,144 @@ async fn equal_cut_history_election_response_also_satisfies_admission_history() 
         )),
         "equal-cut admission must not start an operation-bearing transfer"
     );
+}
+
+#[tokio::test]
+async fn newer_admission_metadata_starts_repository_catchup() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+    rt.seed_membership_snapshot([MemberIncarnation::new(1, 11), MemberIncarnation::new(2, 22)]);
+    assert!(!rt.peer_incarnation_is_admitted(2, 22));
+
+    request_v3_history_probe(&rt, 2, StrictCatchupReason::Admission).await;
+    let request_nonce = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(request),
+                ..
+            } => Some(request.request_nonce),
+            _ => None,
+        })
+        .expect("admission history request");
+    let source_cut = rt.terminal_journal.lock().await.terminal_cut();
+
+    recv_v3_history_probe_resp(
+        &rt,
+        2,
+        22,
+        StrictHistoryProbeResp {
+            responder_node: 2,
+            expected_requester_boot_epoch: 11,
+            request_nonce,
+            repository_version: 1,
+            terminal_repository_base_version: 0,
+            history_freshness: 1,
+            runtime_started_at: 22,
+            history_node: 2,
+            terminal_cut: Some(cut_to_wire(source_cut)),
+            reason: StrictCatchupReason::Admission as i32,
+        },
+    )
+    .await;
+
+    assert!(net.drain_captures().into_iter().any(|frame| matches!(
+        frame,
+        CapturedFrame::StrictUnicast {
+            dst: 2,
+            body: StrictBody::CatchupReq(StrictCatchupReq {
+                history_probe_only: false,
+                force_snapshot: false,
+                history_transfer: Some(_),
+                ..
+            }),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn newer_promoted_admission_metadata_resumes_after_election_closes() {
+    let net = MockNet::new(1, vec![1, 2, 3]);
+    net.set_epoch(1, 11);
+    net.set_epoch(2, 22);
+    net.set_epoch(3, 33);
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V3);
+    let rt = StrictRuntime::new(
+        CountingStrictRepo::new(),
+        1,
+        11,
+        "channels".to_owned(),
+        net.clone(),
+        CancellationToken::new(),
+        Arc::new(ReplicationConfig::default()),
+    );
+    rt.finish_history_election_for_test();
+    rt.seed_membership_snapshot([
+        MemberIncarnation::new(1, 11),
+        MemberIncarnation::new(2, 22),
+        MemberIncarnation::new(3, 33),
+    ]);
+
+    request_v3_history_probe(&rt, 2, StrictCatchupReason::Admission).await;
+    let admission_request = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("admission history request");
+    {
+        let mut state = rt.state.lock();
+        state.request_history_election();
+        state.begin_history_election([2, 3]);
+    }
+    request_v3_history_probe(&rt, 2, StrictCatchupReason::HistoryElection).await;
+    let remote_cut = TerminalCut::new([7; 16], 1, [8; 32], [9; 32]);
+    recv_v3_history_probe_resp(
+        &rt,
+        2,
+        22,
+        StrictHistoryProbeResp {
+            responder_node: 2,
+            expected_requester_boot_epoch: 11,
+            request_nonce: admission_request.request_nonce,
+            repository_version: 1,
+            terminal_repository_base_version: 0,
+            history_freshness: 1,
+            runtime_started_at: 22,
+            history_node: 2,
+            terminal_cut: Some(cut_to_wire(remote_cut)),
+            reason: StrictCatchupReason::Admission as i32,
+        },
+    )
+    .await;
+    assert!(
+        net.drain_captures().is_empty(),
+        "incomplete election defers repair"
+    );
+
+    rt.finish_history_election_for_test();
+    assert!(!rt.peer_incarnation_is_admitted(2, 22));
+    resume_deferred_v3_admissions(&rt).await;
+
+    assert!(net.drain_captures().into_iter().any(|frame| matches!(
+        frame,
+        CapturedFrame::StrictUnicast {
+            dst: 2,
+            body: StrictBody::TerminalSyncReq(_),
+            ..
+        }
+    )));
 }
 
 #[tokio::test]

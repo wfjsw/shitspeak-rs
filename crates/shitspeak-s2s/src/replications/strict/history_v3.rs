@@ -187,7 +187,7 @@ mod tests {
         };
         assert!(matches!(
             state.begin_server_request(peer, &first, Duration::from_secs(30)),
-            HistoryServerRequest::Build
+            HistoryServerRequest::Build { .. }
         ));
         let competing = StrictHistoryTransferReq {
             transfer_id: 11,
@@ -197,6 +197,49 @@ mod tests {
         assert!(matches!(
             state.begin_server_request(peer, &competing, Duration::from_secs(30)),
             HistoryServerRequest::Reject
+        ));
+    }
+
+    #[test]
+    fn history_election_server_transfer_preempts_stale_admission_page() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let admission = StrictHistoryTransferReq {
+            transfer_id: 10,
+            request_nonce: 20,
+            reason: StrictCatchupReason::Admission as i32,
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.begin_server_request(peer, &admission, Duration::from_secs(30)),
+            HistoryServerRequest::Build { .. }
+        ));
+        assert!(state.cache_server_response(peer, &admission, StrictCatchupResp::default()));
+
+        let election = StrictHistoryTransferReq {
+            transfer_id: 11,
+            request_nonce: 21,
+            reason: StrictCatchupReason::HistoryElection as i32,
+            ..Default::default()
+        };
+        let HistoryServerRequest::Build { preempted_pages } =
+            state.begin_server_request(peer, &election, Duration::from_secs(30))
+        else {
+            panic!("history election should preempt the stale admission page");
+        };
+        assert_eq!(preempted_pages, vec![(10, 20)]);
+        assert!(matches!(
+            state.begin_server_request(peer, &admission, Duration::from_secs(30)),
+            HistoryServerRequest::Suppress
+        ));
+        let election_response = StrictCatchupResp {
+            history_version: 7,
+            ..Default::default()
+        };
+        assert!(state.cache_server_response(peer, &election, election_response));
+        assert!(matches!(
+            state.begin_server_request(peer, &election, Duration::from_secs(30)),
+            HistoryServerRequest::Replay(response) if response.history_version == 7
         ));
     }
 
@@ -211,7 +254,7 @@ mod tests {
         };
         assert!(matches!(
             state.begin_server_request(peer, &request, Duration::from_secs(30)),
-            HistoryServerRequest::Build
+            HistoryServerRequest::Build { .. }
         ));
         assert!(state.cache_server_response(peer, &request, StrictCatchupResp::default()));
         assert!(state.has_server_transfer(peer));
@@ -241,7 +284,7 @@ mod tests {
         };
         assert!(matches!(
             state.begin_server_request(peer, &request, Duration::ZERO),
-            HistoryServerRequest::Build
+            HistoryServerRequest::Build { .. }
         ));
         assert!(!state.has_server_transfer(peer));
         assert!(!state.has_any_transfer(peer));
@@ -326,13 +369,14 @@ struct HistoryClient {
 #[derive(Clone)]
 struct HistoryServerPage {
     response: Option<StrictCatchupResp>,
+    reason: StrictCatchupReason,
     acknowledged: bool,
     expires_at: Instant,
 }
 
 #[derive(Clone)]
 pub(super) enum HistoryServerRequest {
-    Build,
+    Build { preempted_pages: Vec<(u64, u64)> },
     Replay(StrictCatchupResp),
     Suppress,
     Reject,
@@ -713,6 +757,9 @@ impl HistoryV3State {
     ) -> HistoryServerRequest {
         let now = Instant::now();
         self.server_pages.retain(|_, page| page.expires_at > now);
+        let Some(reason) = StrictCatchupReason::try_from(request.reason).ok() else {
+            return HistoryServerRequest::Reject;
+        };
         let key = (peer, request.transfer_id, request.request_nonce);
         if let Some(page) = self.server_pages.get(&key) {
             return if page.acknowledged {
@@ -726,6 +773,7 @@ impl HistoryV3State {
         if request.final_ack {
             return HistoryServerRequest::Reject;
         }
+        let mut preempted_pages = Vec::new();
         if request.acknowledged_request_nonce != 0 {
             let previous = (
                 peer,
@@ -739,22 +787,30 @@ impl HistoryV3State {
                 return HistoryServerRequest::Reject;
             }
             page.acknowledged = true;
-        } else if self
-            .server_pages
-            .keys()
-            .any(|(known_peer, _, _)| *known_peer == peer)
-        {
-            return HistoryServerRequest::Reject;
+        } else {
+            let can_preempt = self.server_pages.iter().all(|((known_peer, _, _), page)| {
+                *known_peer != peer || page.acknowledged || transfer_preempts(reason, page.reason)
+            });
+            if !can_preempt {
+                return HistoryServerRequest::Reject;
+            }
+            for ((known_peer, transfer_id, request_nonce), page) in &mut self.server_pages {
+                if *known_peer == peer && !page.acknowledged {
+                    page.acknowledged = true;
+                    preempted_pages.push((*transfer_id, *request_nonce));
+                }
+            }
         }
         self.server_pages.insert(
             key,
             HistoryServerPage {
                 response: None,
+                reason,
                 acknowledged: false,
                 expires_at: now + ttl,
             },
         );
-        HistoryServerRequest::Build
+        HistoryServerRequest::Build { preempted_pages }
     }
 
     pub(super) fn cache_server_response(
@@ -766,10 +822,12 @@ impl HistoryV3State {
         self.server_pages
             .get_mut(&(peer, request.transfer_id, request.request_nonce))
             .is_some_and(|page| {
-                if page.acknowledged || page.response.is_some() {
+                if page.acknowledged {
                     return false;
                 }
-                page.response = Some(response);
+                if page.response.is_none() {
+                    page.response = Some(response);
+                }
                 true
             })
     }

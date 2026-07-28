@@ -268,11 +268,13 @@ async fn send_v3_history_response<R: StrictReplicable>(
     if let (Some(epoch), Some(transfer)) =
         (rt.net.member_boot_epoch(dst), req.history_transfer.as_ref())
     {
-        rt.v3_history.lock().cache_server_response(
+        if !rt.v3_history.lock().cache_server_response(
             PeerIncarnation::new(dst, epoch),
             transfer,
             response.clone(),
-        );
+        ) {
+            return Ok(());
+        }
     }
     metrics::record_catchup_response_detail(
         CatchupMode::Strict,
@@ -869,7 +871,16 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
                 transfer,
                 rt.cfg.pending_propose_ttl(),
             ) {
-                HistoryServerRequest::Build => history_server_peer = Some(peer),
+                HistoryServerRequest::Build { preempted_pages } => {
+                    for (transfer_id, request_nonce) in preempted_pages {
+                        rt.net.acknowledge_bulk_unicast(
+                            from,
+                            &rt.topic,
+                            BulkPageIdentity::history(transfer_id, request_nonce),
+                        );
+                    }
+                    history_server_peer = Some(peer);
+                }
                 HistoryServerRequest::Replay(response) => {
                     metrics::record_strict_catchup_duplicate(
                         StrictCatchupDuplicateOutcome::CachedReplay,
