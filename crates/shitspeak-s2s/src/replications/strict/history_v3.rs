@@ -483,6 +483,13 @@ impl HistoryV3State {
         self.pending.remove(&peer)
     }
 
+    pub(super) fn pending_after_terminal(
+        &self,
+        peer: PeerIncarnation,
+    ) -> Option<PendingHistoryIntent> {
+        self.pending.get(&peer).copied()
+    }
+
     pub(super) fn begin_transfer(
         &mut self,
         peer: PeerIncarnation,

@@ -54,7 +54,8 @@ use super::sync_v3::{
     cut_to_reducer, cut_to_wire, source_cut_covers,
 };
 use super::terminal_journal::{
-    CommitCandidate, TerminalCut, TerminalDecision as JournalTerminalDecision, TerminalJournal,
+    CommitCandidate, StagedTerminalDecision, TerminalCut,
+    TerminalDecision as JournalTerminalDecision, TerminalJournal,
 };
 use super::{HistoryMetadata, LogSlice, StrictLogMetadata, StrictReplicable, StrictSnapshotError};
 use shitspeak_core::NodeIdentifier;
@@ -1609,11 +1610,27 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
 }
 
 fn rearm_history_election<R: StrictReplicable>(rt: &StrictRuntime<R>) {
-    let mut state = rt.state.lock();
-    state.finish_history_election();
-    state.request_history_election();
-    drop(state);
+    {
+        let mut state = rt.state.lock();
+        state.finish_history_election();
+        state.request_history_election();
+    }
     rt.wake_clock_tick_loop();
+}
+
+fn request_history_election_if_inactive<R: StrictReplicable>(rt: &StrictRuntime<R>) {
+    let requested = {
+        let mut state = rt.state.lock();
+        if state.history_election_active() {
+            false
+        } else {
+            state.request_history_election();
+            true
+        }
+    };
+    if requested {
+        rt.wake_clock_tick_loop();
+    }
 }
 
 pub(super) async fn install_snapshot_candidate<R: StrictReplicable>(
@@ -1668,6 +1685,27 @@ pub(super) async fn install_snapshot_candidate<R: StrictReplicable>(
         return;
     }
     let installed_version = winner.snapshot_version;
+    let staged_checkpoint = correlated_peer
+        .filter(|peer| peer.node() == from)
+        .and_then(|peer| {
+            rt.v3_sync
+                .lock()
+                .staged_checkpoint_for_repository(peer, installed_version)
+                .map(|checkpoint| (peer, checkpoint))
+        });
+    if staged_checkpoint.is_some() && installed_version <= rt.repo.current_version() {
+        warn!(
+            from,
+            snapshot_version = installed_version,
+            repository_version = rt.repo.current_version(),
+            "strict foreign terminal checkpoint requires a strictly newer repository image"
+        );
+        if let Some(peer) = correlated_peer {
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+        }
+        rearm_history_election(rt);
+        return;
+    }
     let peer_protocol_version = rt.net.peer_strict_replication_protocol_version(from);
     if rt.repository_base_required() && peer_protocol_version < STRICT_PROTOCOL_VERSION_V5 {
         warn!(
@@ -1709,6 +1747,22 @@ pub(super) async fn install_snapshot_candidate<R: StrictReplicable>(
         } else {
             (winner.snapshot_msgpack, None)
         };
+    let staged_decisions = match staged_checkpoint.as_ref() {
+        Some((_, checkpoint)) => match checkpoint
+            .states()
+            .iter()
+            .map(staged_terminal_decision)
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(decisions) => Some(decisions),
+            None => {
+                warn!(from, "strict staged terminal checkpoint became invalid");
+                rearm_history_election(rt);
+                return;
+            }
+        },
+        None => None,
+    };
     let prepared_checkpoint =
         if let Some((applied_checkpoint, retired_checkpoint)) = applied_checkpoint {
             // Persist the cross-store intent before replacing the repository. If
@@ -1717,13 +1771,27 @@ pub(super) async fn install_snapshot_candidate<R: StrictReplicable>(
             rt.require_repository_base(installed_version);
             let applied_for_journal = applied_checkpoint.clone();
             let retired_for_journal = retired_checkpoint.clone();
+            let staged_for_journal = staged_checkpoint.clone();
+            let staged_decisions_for_journal = staged_decisions.clone();
             let installed_retired = match rt
                 .with_terminal_journal_mutation(move |journal| {
-                    journal.install_repository_checkpoint(
-                        installed_version,
-                        &applied_for_journal,
-                        &retired_for_journal,
-                    )
+                    if let Some((_, staged)) = staged_for_journal {
+                        journal.install_staged_repository_checkpoint(
+                            installed_version,
+                            staged.target_cut(),
+                            staged_decisions_for_journal
+                                .as_deref()
+                                .expect("staged decisions validated before journal mutation"),
+                            &applied_for_journal,
+                            &retired_for_journal,
+                        )
+                    } else {
+                        journal.install_repository_checkpoint(
+                            installed_version,
+                            &applied_for_journal,
+                            &retired_for_journal,
+                        )
+                    }
                 })
                 .await
             {
@@ -1735,7 +1803,21 @@ pub(super) async fn install_snapshot_candidate<R: StrictReplicable>(
                     return;
                 }
             };
-            Some((applied_checkpoint, installed_retired))
+            if let Some((peer, staged)) = &staged_checkpoint {
+                rt.replace_runtime_terminal_checkpoint(
+                    applied_checkpoint.clone(),
+                    installed_retired.clone(),
+                )
+                .await;
+                rt.v3_sync
+                    .lock()
+                    .remove_staged_checkpoint(*peer, staged.target_cut());
+            }
+            Some((
+                applied_checkpoint,
+                installed_retired,
+                staged_checkpoint.is_some(),
+            ))
         } else {
             None
         };
@@ -1750,7 +1832,10 @@ pub(super) async fn install_snapshot_candidate<R: StrictReplicable>(
     );
     match install_result {
         Ok(()) => {
-            if let Some((applied_checkpoint, installed_retired)) = prepared_checkpoint {
+            if let Some((applied_checkpoint, installed_retired, source_replaced)) =
+                prepared_checkpoint
+                && !source_replaced
+            {
                 rt.state
                     .lock()
                     .install_repository_checkpoint(applied_checkpoint, installed_retired);
@@ -2328,6 +2413,27 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         node_id: remote_node,
         terminal_repository_base_version: 0,
     };
+    if let Some(peer) = correlated_v3_history.filter(|_| {
+        resp.too_old_use_snapshot
+            && !resp.request_force_snapshot
+            && (resp.snapshot_transfer_rejected || resp.snapshot_transfer_id != 0)
+    }) {
+        // Incremental admission and repository-gap transfers do not carry a
+        // ranked snapshot authorization. A compacted source may fall back to
+        // an image, but installing it directly would bypass history election.
+        // End the doomed transfer at its first chunk and request a ranked
+        // election when one is not already active, instead of downloading and
+        // rejecting the same image forever.
+        rt.snapshot_receivers.lock().remove(&from);
+        finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+        request_history_election_if_inactive(rt);
+        metrics::record_pipeline_stage(
+            ReplicationPipelineKind::Strict,
+            ReplicationPipelineStage::CatchupApply,
+            apply_started_at.elapsed(),
+        );
+        return None;
+    }
     if resp.snapshot_transfer_rejected || resp.snapshot_transfer_id != 0 {
         apply_snapshot_transfer_response(
             rt,
@@ -3349,6 +3455,9 @@ async fn start_v3_repository_after_terminal<R: StrictReplicable>(
         }
         return false;
     }
+    rt.v3_sync
+        .lock()
+        .bind_staged_checkpoint_to_repository(peer, source_cut, rank.version);
     let force_snapshot = reason == StrictCatchupReason::HistoryElection;
     let cursor = if force_snapshot {
         0
@@ -4594,6 +4703,21 @@ fn validated_v3_terminal_state(
     Some((op_id, identity, decision))
 }
 
+fn staged_terminal_decision(
+    terminal: &super::super::proto::StrictTerminalState,
+) -> Option<StagedTerminalDecision> {
+    let (op_id, identity, decision) = validated_v3_terminal_state(terminal)?;
+    let (frozen_targets, resolver) = identity
+        .map(|identity| (Some(identity.frozen_targets), Some(identity.resolver)))
+        .unwrap_or((None, None));
+    Some(StagedTerminalDecision::new(
+        op_id,
+        frozen_targets,
+        resolver,
+        decision,
+    ))
+}
+
 pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     from: NodeIdentifier,
@@ -4964,8 +5088,26 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
                         rt.cfg.pending_propose_ttl(),
                     );
                 }
-                for state in validated {
-                    if !rt.apply_v3_catchup_terminal_state(peer, state).await {
+                let elected_newer_source = {
+                    rt.v3_history
+                        .lock()
+                        .pending_after_terminal(peer)
+                        .is_some_and(|intent| {
+                            intent.reason() == StrictCatchupReason::HistoryElection
+                                && intent.rank().version > rt.repo.current_version()
+                                && intent.source_cut() == target
+                        })
+                };
+                let stage_for_newer_repository = elected_newer_source
+                    && rt.v3_sync.lock().client(peer).is_some_and(|client| {
+                        StrictCatchupReason::try_from(client.started_reason()).ok()
+                            == Some(StrictCatchupReason::HistoryElection)
+                    });
+                if stage_for_newer_repository {
+                    let staged = rt.v3_sync.lock().client_mut(peer).is_some_and(|client| {
+                        client.stage_checkpoint_page(target, validated.clone())
+                    });
+                    if !staged {
                         rt.v3_sync.lock().transition_session(
                             peer,
                             SessionEvent::ApplyFailed {
@@ -4974,6 +5116,19 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
                             },
                         );
                         return;
+                    }
+                } else {
+                    for state in validated {
+                        if !rt.apply_v3_catchup_terminal_state(peer, state).await {
+                            rt.v3_sync.lock().transition_session(
+                                peer,
+                                SessionEvent::ApplyFailed {
+                                    epoch: SessionPeerEpoch::new(epoch),
+                                    wire: reducer_wire,
+                                },
+                            );
+                            return;
+                        }
                     }
                 }
                 if let Some(client) = rt.v3_sync.lock().client_mut(peer) {
@@ -5075,6 +5230,7 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
 
     let completed = {
         let mut sync = rt.v3_sync.lock();
+        sync.publish_staged_checkpoint(peer, target);
         sync.remember_source_cut(peer, target);
         sync.begin_client_finalization(peer)
     };
@@ -5368,9 +5524,13 @@ mod tests {
         config::ReplicationConfig,
         proto::{
             CatchupOp, StrictBody, StrictCatchupReq, StrictCatchupResp, StrictDecisionAbort,
-            StrictResolutionPrepare, StrictTerminalOutcome, StrictTerminalState,
+            StrictHistoryTransferResp, StrictResolutionPrepare, StrictTerminalOutcome,
+            StrictTerminalState,
         },
-        strict::runtime::{StrictRuntime, make_op_id},
+        strict::{
+            runtime::{STRICT_PROTOCOL_VERSION_V3, StrictRuntime, make_op_id},
+            sync_v3::PeerIncarnation,
+        },
         test_support::{CapturedFrame, CountingStrictRepo, MockNet},
     };
     use shitspeak_core::NodeIdentifier;
@@ -5843,6 +6003,227 @@ mod tests {
 
         assert_eq!(sink_repo.current_version(), 96);
         assert_eq!(sink_repo.log(), source_repo.log());
+    }
+
+    #[tokio::test]
+    async fn admission_fallback_snapshot_received_while_idle_rearms_history_election() {
+        let (sink, sink_net, sink_repo) = test_runtime(2, ReplicationConfig::default());
+        sink_net.set_epoch(1, 11);
+        sink_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V3);
+        let peer = PeerIncarnation::new(1, 11);
+        let request = sink
+            .v3_history
+            .lock()
+            .begin_transfer(
+                peer,
+                5,
+                0,
+                crate::replications::proto::StrictCatchupReason::Admission,
+                sink.cfg.pending_propose_ttl(),
+                false,
+                crate::replications::proto::StrictCatchupReason::Admission,
+            )
+            .expect("correlated admission history transfer")
+            .into_parts()
+            .0;
+        {
+            let state = sink.state.lock();
+            assert!(!state.history_election_pending());
+            assert!(!state.history_election_active());
+        }
+
+        let source_repo = CountingStrictRepo::new();
+        populate_repo(&source_repo, 5, 1_000);
+        let (snapshot_version, snapshot) = source_repo.snapshot().expect("source snapshot");
+        let snapshot_len = snapshot.len() as u64;
+        apply_response(
+            &sink,
+            1,
+            StrictCatchupResp {
+                snapshot_version,
+                snapshot_msgpack: snapshot.clone(),
+                ops: Vec::new(),
+                has_more: false,
+                next_chunk_token: snapshot_version,
+                too_old_use_snapshot: true,
+                history_version: snapshot_version,
+                history_freshness: 0,
+                runtime_started_at: 11,
+                history_node: 1,
+                terminal_states: Vec::new(),
+                next_terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
+                terminal_states_has_more: false,
+                terminal_sync_only: false,
+                request_force_snapshot: false,
+                request_history_probe_only: false,
+                terminal_decision_generation: 0,
+                snapshot_transfer_id: 700,
+                snapshot_chunk_cursor: 0,
+                snapshot_next_cursor: snapshot_len,
+                snapshot_total_bytes: snapshot_len,
+                snapshot_sha256: super::snapshot_sha256(&snapshot),
+                snapshot_has_more: false,
+                snapshot_transfer_rejected: false,
+                history_transfer: Some(StrictHistoryTransferResp {
+                    expected_requester_boot_epoch: sink.boot_epoch,
+                    transfer_id: request.transfer_id,
+                    request_nonce: request.request_nonce,
+                    cursor: request.expected_cursor,
+                    target_version: request.target_version,
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            sink_repo.current_version(),
+            0,
+            "an unsolicited fallback image must not install while the election is idle"
+        );
+        assert!(
+            !sink.v3_history.lock().has_active_transfer(peer),
+            "the rejected correlated admission client must finish"
+        );
+        assert!(
+            sink.state.lock().history_election_pending(),
+            "rejecting the compacted-source fallback must rearm recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_admission_fallback_snapshot_preserves_active_history_election() {
+        #[derive(Clone, Copy, Debug)]
+        enum ActivePhase {
+            Probing,
+            Fetching,
+            Installing,
+        }
+
+        for phase in [
+            ActivePhase::Probing,
+            ActivePhase::Fetching,
+            ActivePhase::Installing,
+        ] {
+            let (sink, sink_net, sink_repo) = test_runtime(2, ReplicationConfig::default());
+            sink_net.set_epoch(1, 11);
+            sink_net
+                .set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+            sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V3);
+            let stale_peer = PeerIncarnation::new(1, 11);
+            let request = sink
+                .v3_history
+                .lock()
+                .begin_transfer(
+                    stale_peer,
+                    5,
+                    0,
+                    crate::replications::proto::StrictCatchupReason::Admission,
+                    sink.cfg.pending_propose_ttl(),
+                    false,
+                    crate::replications::proto::StrictCatchupReason::Admission,
+                )
+                .expect("correlated stale admission history transfer")
+                .into_parts()
+                .0;
+
+            let election_rank = super::HistoryRank {
+                version: 6,
+                freshness: 0,
+                runtime_started_at: 12,
+                node_id: 3,
+                terminal_repository_base_version: 0,
+            };
+            let local_rank = super::HistoryRank::local(&sink);
+            {
+                let mut state = sink.state.lock();
+                state.request_history_election();
+                state.begin_history_election([3]);
+                if matches!(phase, ActivePhase::Fetching | ActivePhase::Installing) {
+                    assert!(matches!(
+                        state.record_history_probe_response(3, election_rank, local_rank),
+                        super::HistoryProbeResponseOutcome::FetchSnapshot(_)
+                    ));
+                }
+                if matches!(phase, ActivePhase::Installing) {
+                    assert!(matches!(
+                        state.record_history_snapshot_response(
+                            3,
+                            election_rank,
+                            local_rank,
+                            election_rank.version,
+                            Bytes::from_static(b"ranked snapshot"),
+                        ),
+                        super::HistorySnapshotResponseOutcome::Install(_)
+                    ));
+                }
+            }
+
+            let fallback = Bytes::from_static(b"stale unranked fallback");
+            let fallback_len = fallback.len() as u64;
+            apply_response(
+                &sink,
+                1,
+                StrictCatchupResp {
+                    snapshot_version: 5,
+                    snapshot_msgpack: fallback.clone(),
+                    ops: Vec::new(),
+                    has_more: false,
+                    next_chunk_token: 5,
+                    too_old_use_snapshot: true,
+                    history_version: 5,
+                    history_freshness: 0,
+                    runtime_started_at: 11,
+                    history_node: 1,
+                    terminal_states: Vec::new(),
+                    next_terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
+                    terminal_states_has_more: false,
+                    terminal_sync_only: false,
+                    request_force_snapshot: false,
+                    request_history_probe_only: false,
+                    terminal_decision_generation: 0,
+                    snapshot_transfer_id: 701,
+                    snapshot_chunk_cursor: 0,
+                    snapshot_next_cursor: fallback_len,
+                    snapshot_total_bytes: fallback_len,
+                    snapshot_sha256: super::snapshot_sha256(&fallback),
+                    snapshot_has_more: false,
+                    snapshot_transfer_rejected: false,
+                    history_transfer: Some(StrictHistoryTransferResp {
+                        expected_requester_boot_epoch: sink.boot_epoch,
+                        transfer_id: request.transfer_id,
+                        request_nonce: request.request_nonce,
+                        cursor: request.expected_cursor,
+                        target_version: request.target_version,
+                    }),
+                },
+            )
+            .await;
+
+            assert_eq!(sink_repo.current_version(), 0);
+            assert!(!sink.v3_history.lock().has_active_transfer(stale_peer));
+            let state = sink.state.lock();
+            assert!(
+                state.history_election_active(),
+                "stale fallback reset the {phase:?} election"
+            );
+            match phase {
+                ActivePhase::Probing => {
+                    assert!(state.history_election_fetching_snapshot().is_none());
+                    assert!(!state.history_election_installing());
+                }
+                ActivePhase::Fetching => {
+                    assert_eq!(
+                        state
+                            .history_election_fetching_snapshot()
+                            .expect("fetching election retained")
+                            .peer(),
+                        3
+                    );
+                }
+                ActivePhase::Installing => assert!(state.history_election_installing()),
+            }
+        }
     }
 
     #[tokio::test]

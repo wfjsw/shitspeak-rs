@@ -2561,6 +2561,27 @@ impl StrictState {
         self.retired_operations = retired;
     }
 
+    fn replace_repository_checkpoint(
+        &mut self,
+        applied: BTreeMap<OpId, u64>,
+        retired: BTreeMap<u64, u64>,
+    ) {
+        debug_assert!(self.proposals.is_empty());
+        debug_assert!(self.pending_proposes.is_empty());
+        debug_assert!(self.delivering_commits.is_empty());
+        self.commit_buffer.clear();
+        self.delivering_commits.clear();
+        self.recovery_promises.clear();
+        self.resolution_promises.clear();
+        self.accepted_values.clear();
+        self.terminal_decisions.clear();
+        self.terminal_decision_identities.clear();
+        self.committed_ids.clear();
+        self.committed_ts_final.clear();
+        self.applied_operations = applied.into_iter().collect();
+        self.retired_operations = retired;
+    }
+
     pub fn can_start_history_election(&self) -> bool {
         self.can_bootstrap_catchup()
             && matches!(self.history_election_phase, HistoryElectionPhase::Idle)
@@ -4958,6 +4979,20 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .collect::<Vec<_>>();
         for op_id in pending {
             self.requeue_terminal_journal_commit(op_id).await;
+        }
+    }
+
+    pub(super) async fn replace_runtime_terminal_checkpoint(
+        &self,
+        applied: BTreeMap<OpId, u64>,
+        retired: BTreeMap<u64, u64>,
+    ) {
+        let records = self.terminal_journal.lock().await.snapshot();
+        let mut state = self.state.lock();
+        state.replace_repository_checkpoint(applied, retired);
+        for entry in records {
+            let (op_id, record) = entry.into_parts();
+            hydrate_terminal_journal_record(&mut state, op_id, &record, true);
         }
     }
 
@@ -12572,6 +12607,8 @@ fn choose_resolution_decision<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::overlay::MemberIncarnation;
+    use crate::replications::proto::{StrictCatchupReason, StrictTerminalPageKind};
     use crate::replications::test_support::{
         CapturedFrame, CountingStrictRepo, MockNet, StrictSendLane, StrictSendOutcome,
         StrictSendTarget,
@@ -20709,6 +20746,359 @@ mod tests {
         );
         run_delivery_pass(&recovered).await;
         assert_eq!(reset_repo.log(), vec![(1, 101), (2, 202), (3, 303)]);
+    }
+
+    #[tokio::test]
+    async fn newer_snapshot_replaces_retired_prefix_with_elected_source_terminal_checkpoint() {
+        const SOURCE_VERSION_BEFORE_SUFFIX: u64 = 9_538;
+        const SOURCE_VERSION: u64 = 9_540;
+        const SINK_VERSION: u64 = 9_525;
+
+        let source_dir = tempfile::TempDir::new().unwrap();
+        let source_net = MockNet::new(1, vec![1, 8]);
+        source_net.set_epoch(1, 11);
+        source_net.set_epoch(8, 88);
+        source_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        source_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
+        source_net.set_peer_strict_replication_protocol_version(8, STRICT_PROTOCOL_VERSION_V5);
+        source_net.set_strict_protocol_state_dir(Some(source_dir.path().to_path_buf()));
+        source_net.set_alive(vec![1]);
+        let source_repo = CountingStrictRepo::new();
+        *source_repo.state.lock() = (
+            SOURCE_VERSION_BEFORE_SUFFIX,
+            vec![(SOURCE_VERSION_BEFORE_SUFFIX, 9_538, None)],
+        );
+        let source = StrictRuntime::new(
+            source_repo.clone(),
+            1,
+            11,
+            "channels".to_owned(),
+            source_net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        source.finish_history_election_for_test();
+
+        let source_prefix = make_op_id(1, 10, 1);
+        let source_suffix = make_op_id(1, 10, 2);
+        let source_identity = TerminalDecisionIdentity {
+            resolver: TerminalResolver::new(1, 10),
+            frozen_targets: vec![FrozenTarget::new(1, 10)],
+        };
+        assert!(
+            source
+                .apply_terminal_commit_with_descriptor(
+                    source_prefix,
+                    NORMAL_ACCEPT_BALLOT,
+                    10,
+                    Bytes::from(rmp_serde::to_vec(&9_539u64).unwrap()),
+                    Some(&source_identity),
+                )
+                .await
+                .accepted()
+        );
+        assert!(
+            source
+                .apply_terminal_commit_with_descriptor(
+                    source_suffix,
+                    NORMAL_ACCEPT_BALLOT,
+                    11,
+                    Bytes::from(rmp_serde::to_vec(&9_540u64).unwrap()),
+                    Some(&source_identity),
+                )
+                .await
+                .accepted()
+        );
+        {
+            let mut state = source.state.lock();
+            state.clock = 100;
+            state.peer_clocks.insert(1, 100);
+        }
+        run_delivery_pass(&source).await;
+        assert_eq!(source_repo.current_version(), SOURCE_VERSION);
+        let source_cut = source.terminal_journal.lock().await.terminal_cut();
+        let (snapshot_version, snapshot_envelope) = {
+            let (snapshot_version, snapshot) = source_repo.snapshot().unwrap();
+            let envelope = super::super::catchup::encode_s2s_snapshot_envelope(
+                &source,
+                snapshot_version,
+                snapshot,
+            )
+            .unwrap();
+            (snapshot_version, envelope)
+        };
+        assert_eq!(snapshot_version, SOURCE_VERSION);
+        source_net.set_alive(vec![1, 8]);
+
+        let sink_dir = tempfile::TempDir::new().unwrap();
+        let sink_retired_prefix = make_op_id(1, 20, 28);
+        {
+            let mut journal =
+                TerminalJournal::load(Some(sink_dir.path().to_path_buf()), "channels").unwrap();
+            for counter in 1..=sink_retired_prefix.1 {
+                let retired = make_op_id(1, 20, counter);
+                journal
+                    .upsert_commit_decision(
+                        retired,
+                        NORMAL_ACCEPT_BALLOT,
+                        counter,
+                        rmp_serde::to_vec(&counter).unwrap(),
+                    )
+                    .unwrap();
+                journal.begin_delivery(retired, SINK_VERSION).unwrap();
+                journal.finish_delivery(retired, SINK_VERSION).unwrap();
+            }
+            journal.checkpoint(SINK_VERSION).unwrap();
+            assert_eq!(journal.terminal_cut().generation(), 0);
+            assert_eq!(journal.record_count(), 0);
+            assert!(journal.is_retired(source_prefix));
+        }
+
+        let sink_net = MockNet::new(8, vec![1, 8]);
+        sink_net.set_epoch(1, 11);
+        sink_net.set_epoch(8, 88);
+        sink_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        sink_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
+        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V5);
+        sink_net.set_strict_protocol_state_dir(Some(sink_dir.path().to_path_buf()));
+        let sink_repo = CountingStrictRepo::new();
+        *sink_repo.state.lock() = (SINK_VERSION, vec![(SINK_VERSION, 9_525, None)]);
+        let sink = StrictRuntime::new(
+            sink_repo.clone(),
+            8,
+            88,
+            "channels".to_owned(),
+            sink_net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        {
+            let journal = sink.terminal_journal.lock().await;
+            assert_eq!(journal.checkpoint_repository_version(), SINK_VERSION);
+            assert_eq!(journal.terminal_cut().generation(), 0);
+            assert_eq!(journal.record_count(), 0);
+            assert!(journal.is_retired(source_prefix));
+        }
+
+        {
+            let mut state = sink.state.lock();
+            state.begin_history_election([1]);
+        }
+        super::super::catchup::request_v3_history_probe(
+            &sink,
+            1,
+            StrictCatchupReason::HistoryElection,
+        )
+        .await;
+        let history_request = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::HistoryProbeReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("DFW history election metadata request");
+        super::super::catchup::recv_v3_history_probe_req(&source, 8, 88, history_request).await;
+        let history_response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 8,
+                    body: StrictBody::HistoryProbeResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("node 1 history election metadata response");
+        let source_rank = HistoryRank {
+            version: history_response.repository_version,
+            freshness: history_response.history_freshness,
+            runtime_started_at: history_response.runtime_started_at,
+            node_id: 1,
+            terminal_repository_base_version: history_response.terminal_repository_base_version,
+        };
+        super::super::catchup::recv_v3_history_probe_resp(&sink, 1, 11, history_response).await;
+
+        let terminal_request = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::TerminalSyncReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("history winner terminal checkpoint request");
+        super::super::catchup::recv_v3_terminal_sync_req(&source, 8, 88, terminal_request).await;
+        let terminal_page = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 8,
+                    body: StrictBody::TerminalSyncPage(page),
+                    ..
+                } => Some(page),
+                _ => None,
+            })
+            .expect("node 1 terminal checkpoint page");
+        assert_eq!(
+            StrictTerminalPageKind::try_from(terminal_page.kind).ok(),
+            Some(StrictTerminalPageKind::Checkpoint)
+        );
+        assert_eq!(terminal_page.checkpoint_states.len(), 2);
+        assert!(!terminal_page.has_more);
+        assert!(sink.repository_base_required());
+        assert_eq!(
+            sink.v3_sync
+                .lock()
+                .client(PeerIncarnation::new(1, 11))
+                .map(|client| client.started_reason()),
+            Some(StrictCatchupReason::HistoryElection as i32)
+        );
+        super::super::catchup::recv_v3_terminal_sync_page(&sink, 1, 11, terminal_page).await;
+
+        let terminal_ack = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::TerminalSyncAck(ack),
+                    ..
+                } => Some(ack),
+                _ => None,
+            })
+            .expect("retired source prefix must not prevent terminal checkpoint ACK");
+        super::super::catchup::recv_v3_terminal_sync_ack(&source, 8, 88, terminal_ack).await;
+        let terminal_confirmation = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 8,
+                    body: StrictBody::TerminalSyncAck(ack),
+                    ..
+                } => Some(ack),
+                _ => None,
+            })
+            .expect("terminal checkpoint ACK confirmation");
+        super::super::catchup::recv_v3_terminal_sync_ack(&sink, 1, 11, terminal_confirmation).await;
+        assert!(
+            sink.v3_sync
+                .lock()
+                .staged_checkpoint_for_repository(PeerIncarnation::new(1, 11), snapshot_version)
+                .is_some()
+        );
+
+        sink_repo.fail_snapshot_installs("injected post-journal snapshot failure");
+        super::super::catchup::install_snapshot_candidate(
+            &sink,
+            1,
+            source_rank,
+            snapshot_version,
+            snapshot_envelope.clone(),
+            Instant::now(),
+            Some(PeerIncarnation::new(1, 11)),
+        )
+        .await;
+
+        assert_eq!(sink_repo.current_version(), SINK_VERSION);
+        assert!(sink.repository_base_required());
+        assert_eq!(
+            sink.terminal_journal.lock().await.terminal_cut(),
+            source_cut
+        );
+        assert!(
+            sink.state
+                .lock()
+                .terminal_decisions
+                .contains_key(&source_prefix)
+        );
+
+        sink_repo.allow_snapshot_installs();
+        {
+            let mut state = sink.state.lock();
+            state.begin_history_election([1]);
+            assert!(matches!(
+                state.record_history_probe_response(1, source_rank, HistoryRank::local(&sink)),
+                HistoryProbeResponseOutcome::FetchSnapshot(_)
+            ));
+        }
+        super::super::catchup::install_snapshot_candidate(
+            &sink,
+            1,
+            source_rank,
+            snapshot_version,
+            snapshot_envelope,
+            Instant::now(),
+            Some(PeerIncarnation::new(1, 11)),
+        )
+        .await;
+
+        assert_eq!(sink_repo.current_version(), SOURCE_VERSION);
+        let sink_cut = sink.terminal_journal.lock().await.terminal_cut();
+        assert_eq!(sink_cut, source_cut);
+        assert!(!sink.terminal_journal.lock().await.is_retired(source_prefix));
+        assert!(
+            sink.state
+                .lock()
+                .applied_operations
+                .contains_key(&source_prefix)
+        );
+        assert!(
+            sink.state
+                .lock()
+                .applied_operations
+                .contains_key(&source_suffix)
+        );
+
+        sink.seed_membership_snapshot([
+            MemberIncarnation::new(1, 11),
+            MemberIncarnation::new(8, 88),
+        ]);
+        sink.reconcile_peer_admissions();
+        {
+            let mut state = sink.state.lock();
+            state.freeze_ready_admission_cuts(sink_repo.history_metadata());
+            state.observe_admission_clock(1, 11, u64::MAX);
+        }
+        super::super::catchup::request_v3_history_probe(&sink, 1, StrictCatchupReason::Admission)
+            .await;
+        let admission_request = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::HistoryProbeReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("post-recovery admission metadata request");
+        super::super::catchup::recv_v3_history_probe_req(&source, 8, 88, admission_request).await;
+        let admission_response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 8,
+                    body: StrictBody::HistoryProbeResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("post-recovery admission metadata response");
+        super::super::catchup::recv_v3_history_probe_resp(&sink, 1, 11, admission_response).await;
+        assert!(sink.peer_incarnation_is_admitted(1, 11));
     }
 
     #[tokio::test]

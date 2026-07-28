@@ -1304,6 +1304,37 @@ fn reason_only_session_triggers_coalesce_without_marking_dirty() {
 }
 
 #[test]
+fn staged_checkpoint_accumulates_pages_until_the_repository_is_bound() {
+    let mut state = SyncV3State::default();
+    let peer = PeerIncarnation::new(1, 11);
+    let target = TerminalCut::new([1; 16], 2, [2; 32], [3; 32]);
+    state
+        .begin_client(
+            peer,
+            StrictCatchupReason::HistoryElection as i32,
+            Duration::from_secs(30),
+        )
+        .expect("terminal client");
+    let client = state.client_mut(peer).expect("active terminal client");
+    client.accept_manifest(
+        7,
+        target,
+        StrictTerminalPageKind::Checkpoint,
+        Duration::from_secs(30),
+    );
+    assert!(client.stage_checkpoint_page(target, vec![terminal_abort(1)]));
+    assert!(client.stage_checkpoint_page(target, vec![terminal_abort(2)]));
+    assert!(state.publish_staged_checkpoint(peer, target));
+    assert!(state.bind_staged_checkpoint_to_repository(peer, target, 9_540));
+
+    let staged = state
+        .staged_checkpoint_for_repository(peer, 9_540)
+        .expect("bound staged checkpoint");
+    assert_eq!(staged.target_cut(), target);
+    assert_eq!(staged.states().len(), 2);
+}
+
+#[test]
 fn simultaneous_terminal_starts_choose_one_direction_by_node_id() {
     let peer = PeerIncarnation::new(2, 22);
     let ttl = Duration::from_secs(30);

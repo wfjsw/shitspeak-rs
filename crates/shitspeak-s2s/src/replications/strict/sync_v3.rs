@@ -13,7 +13,8 @@ use super::super::metrics::{
     self, CatchupReason, StrictCatchupSessionEvent, StrictCatchupSessionOutcome,
 };
 use super::super::proto::{
-    StrictCatchupReason, StrictTerminalCut, StrictTerminalPageKind, StrictTerminalSyncPage,
+    StrictCatchupReason, StrictTerminalCut, StrictTerminalPageKind, StrictTerminalState,
+    StrictTerminalSyncPage,
 };
 use super::session_reducer::{
     self, Cut as ReducerCut, Effect as SessionEffect, Event as SessionEvent, PeerEpoch,
@@ -59,7 +60,25 @@ pub(super) struct ClientSession {
     started_reason: i32,
     reason: i32,
     dirty: bool,
+    staged_checkpoint_states: Option<Vec<StrictTerminalState>>,
     expires_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct StagedTerminalCheckpoint {
+    target_cut: TerminalCut,
+    states: Vec<StrictTerminalState>,
+    repository_version: Option<u64>,
+}
+
+impl StagedTerminalCheckpoint {
+    pub(super) fn target_cut(&self) -> TerminalCut {
+        self.target_cut
+    }
+
+    pub(super) fn states(&self) -> &[StrictTerminalState] {
+        &self.states
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -289,6 +308,22 @@ impl ClientSession {
         self.pending_nonce = nonce;
         self.next_cursor = next_cursor;
     }
+
+    pub(super) fn stage_checkpoint_page(
+        &mut self,
+        target_cut: TerminalCut,
+        states: Vec<StrictTerminalState>,
+    ) -> bool {
+        if self.target_cut != Some(target_cut)
+            || self.kind != Some(StrictTerminalPageKind::Checkpoint)
+        {
+            return false;
+        }
+        self.staged_checkpoint_states
+            .get_or_insert_with(Vec::new)
+            .extend(states);
+        true
+    }
 }
 
 impl ResponderSession {
@@ -418,6 +453,7 @@ pub(super) struct SyncV3State {
     deferred_clients: HashMap<PeerIncarnation, DeferredClientIntent>,
     expired_deferred_clients: HashSet<PeerIncarnation>,
     completed_responders: HashMap<PeerIncarnation, CompletedResponder>,
+    staged_checkpoints: HashMap<PeerIncarnation, StagedTerminalCheckpoint>,
 }
 
 impl Default for SyncV3State {
@@ -437,6 +473,7 @@ impl Default for SyncV3State {
             deferred_clients: HashMap::new(),
             expired_deferred_clients: HashSet::new(),
             completed_responders: HashMap::new(),
+            staged_checkpoints: HashMap::new(),
         }
     }
 }
@@ -614,6 +651,72 @@ impl SyncV3State {
         };
         if remove_pending {
             self.pending_source_transitions.remove(&peer);
+        }
+    }
+
+    pub(super) fn publish_staged_checkpoint(
+        &mut self,
+        peer: PeerIncarnation,
+        target_cut: TerminalCut,
+    ) -> bool {
+        let Some(states) = self
+            .clients
+            .get(&peer)
+            .filter(|client| client.target_cut == Some(target_cut))
+            .and_then(|client| client.staged_checkpoint_states.clone())
+        else {
+            return false;
+        };
+        self.staged_checkpoints.insert(
+            peer,
+            StagedTerminalCheckpoint {
+                target_cut,
+                states,
+                repository_version: None,
+            },
+        );
+        true
+    }
+
+    pub(super) fn bind_staged_checkpoint_to_repository(
+        &mut self,
+        peer: PeerIncarnation,
+        target_cut: TerminalCut,
+        repository_version: u64,
+    ) -> bool {
+        let Some(checkpoint) = self
+            .staged_checkpoints
+            .get_mut(&peer)
+            .filter(|checkpoint| checkpoint.target_cut == target_cut)
+        else {
+            return false;
+        };
+        checkpoint.repository_version = Some(repository_version);
+        true
+    }
+
+    pub(super) fn staged_checkpoint_for_repository(
+        &self,
+        peer: PeerIncarnation,
+        repository_version: u64,
+    ) -> Option<StagedTerminalCheckpoint> {
+        self.staged_checkpoints
+            .get(&peer)
+            .filter(|checkpoint| checkpoint.repository_version == Some(repository_version))
+            .cloned()
+    }
+
+    pub(super) fn remove_staged_checkpoint(
+        &mut self,
+        peer: PeerIncarnation,
+        target_cut: TerminalCut,
+    ) {
+        if self
+            .staged_checkpoints
+            .get(&peer)
+            .is_some_and(|checkpoint| checkpoint.target_cut == target_cut)
+        {
+            self.staged_checkpoints.remove(&peer);
         }
     }
 
@@ -1012,6 +1115,7 @@ impl SyncV3State {
                 started_reason: reason,
                 reason,
                 dirty: false,
+                staged_checkpoint_states: None,
                 expires_at: Instant::now() + ttl,
             },
         );
@@ -1043,6 +1147,7 @@ impl SyncV3State {
                 started_reason: reason,
                 reason,
                 dirty: false,
+                staged_checkpoint_states: None,
                 expires_at: Instant::now() + ttl,
             },
         );
@@ -1363,6 +1468,7 @@ impl SyncV3State {
             .retain(|peer| peer.node != node);
         self.completed_responders
             .retain(|peer, _| peer.node != node);
+        self.staged_checkpoints.retain(|peer, _| peer.node != node);
     }
 
     pub(super) fn cancel_clients(&mut self) {
@@ -1380,6 +1486,7 @@ impl SyncV3State {
         }
         self.deferred_clients.clear();
         self.expired_deferred_clients.clear();
+        self.staged_checkpoints.clear();
         self.sessions.clear();
     }
 }

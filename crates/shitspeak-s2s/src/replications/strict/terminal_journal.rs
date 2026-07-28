@@ -432,6 +432,33 @@ pub(crate) struct TerminalJournalSnapshotEntry {
     record: TerminalJournalRecord,
 }
 
+/// One authenticated terminal decision staged from a foreign checkpoint.
+/// It remains detached from the active journal until the matching elected
+/// repository image is ready to install.
+#[derive(Clone, Debug)]
+pub(crate) struct StagedTerminalDecision {
+    op_id: TerminalJournalOpId,
+    frozen_targets: Option<Vec<FrozenTarget>>,
+    resolver: Option<TerminalResolver>,
+    decision: TerminalDecision,
+}
+
+impl StagedTerminalDecision {
+    pub(crate) fn new(
+        op_id: TerminalJournalOpId,
+        frozen_targets: Option<Vec<FrozenTarget>>,
+        resolver: Option<TerminalResolver>,
+        decision: TerminalDecision,
+    ) -> Self {
+        Self {
+            op_id,
+            frozen_targets,
+            resolver,
+            decision,
+        }
+    }
+}
+
 impl TerminalJournalSnapshotEntry {
     pub(crate) fn into_parts(self) -> (TerminalJournalOpId, TerminalJournalRecord) {
         (self.op_id, self.record)
@@ -1279,7 +1306,83 @@ impl TerminalJournal {
         delivered: &BTreeMap<TerminalJournalOpId, u64>,
         incoming_retired: &BTreeMap<u64, u64>,
     ) -> Result<BTreeMap<u64, u64>, TerminalJournalError> {
-        let mut candidate = self.records.clone();
+        self.install_repository_checkpoint_records(
+            repository_version,
+            self.records.clone(),
+            self.journal_id,
+            self.terminal_decision_generation,
+            self.terminal_chain_digest,
+            self.generation_index.clone(),
+            None,
+            delivered,
+            incoming_retired,
+        )
+    }
+
+    /// Atomically replace a locally checkpointed lineage with the exact
+    /// terminal image paired with a strictly newer elected repository image.
+    pub(crate) fn install_staged_repository_checkpoint(
+        &mut self,
+        repository_version: u64,
+        source_cut: TerminalCut,
+        staged: &[StagedTerminalDecision],
+        delivered: &BTreeMap<TerminalJournalOpId, u64>,
+        incoming_retired: &BTreeMap<u64, u64>,
+    ) -> Result<BTreeMap<u64, u64>, TerminalJournalError> {
+        let mut source = Self::in_memory("staged-terminal-checkpoint");
+        source.journal_id = *source_cut.journal_id();
+        for entry in staged {
+            match (&entry.frozen_targets, entry.resolver) {
+                (Some(targets), Some(resolver)) => source.upsert_v2_decision(
+                    entry.op_id,
+                    targets,
+                    resolver,
+                    entry.decision.clone(),
+                    None,
+                )?,
+                (None, None) => source.upsert_decision(entry.op_id, entry.decision.clone())?,
+                _ => {
+                    return Err(TerminalJournalError::InvalidMetadata {
+                        path: self.path.clone().unwrap_or_default(),
+                        reason: "staged terminal identity is incomplete",
+                    });
+                }
+            };
+        }
+        if source.terminal_decision_generation != source_cut.generation()
+            || source.terminal_chain_digest != *source_cut.chain_digest()
+        {
+            return Err(TerminalJournalError::InvalidMetadata {
+                path: self.path.clone().unwrap_or_default(),
+                reason: "staged terminal checkpoint does not match its source chain",
+            });
+        }
+        self.install_repository_checkpoint_records(
+            repository_version,
+            source.records,
+            *source_cut.journal_id(),
+            source_cut.generation(),
+            *source_cut.chain_digest(),
+            source.generation_index,
+            Some(*source_cut.terminal_set_digest()),
+            delivered,
+            incoming_retired,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_repository_checkpoint_records(
+        &mut self,
+        repository_version: u64,
+        mut candidate: BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
+        journal_id: [u8; JOURNAL_ID_LEN],
+        generation: u64,
+        chain_digest: [u8; DIGEST_LEN],
+        generation_index: BTreeMap<u64, TerminalJournalOpId>,
+        expected_terminal_set_digest: Option<[u8; DIGEST_LEN]>,
+        delivered: &BTreeMap<TerminalJournalOpId, u64>,
+        incoming_retired: &BTreeMap<u64, u64>,
+    ) -> Result<BTreeMap<u64, u64>, TerminalJournalError> {
         for (op_id, record) in &mut candidate {
             if !record.is_terminal() {
                 return Err(TerminalJournalError::CheckpointHasUnresolvedRecords);
@@ -1349,12 +1452,13 @@ impl TerminalJournal {
         let commitment = TerminalSetCommitment::from_records(&candidate, u64::MAX);
         let retired_set_digest = compute_retired_set_digest(&retired_origins);
         let digest = combined_terminal_set_digest(retired_set_digest, commitment.digest());
-        let cut = TerminalCut::new(
-            self.journal_id,
-            self.terminal_decision_generation,
-            self.terminal_chain_digest,
-            digest,
-        );
+        if expected_terminal_set_digest.is_some_and(|expected| expected != digest) {
+            return Err(TerminalJournalError::InvalidMetadata {
+                path: self.path.clone().unwrap_or_default(),
+                reason: "staged terminal checkpoint does not match its source terminal set",
+            });
+        }
+        let cut = TerminalCut::new(journal_id, generation, chain_digest, digest);
         if let Some(store) = self.store.as_mut() {
             store.install_repository_base(
                 candidate.iter(),
@@ -1366,9 +1470,13 @@ impl TerminalJournal {
         }
 
         self.records = candidate;
+        self.journal_id = journal_id;
+        self.terminal_decision_generation = generation;
+        self.terminal_chain_digest = chain_digest;
         self.terminal_set_digest = digest;
         self.terminal_set_commitment = commitment;
         self.retired_set_digest = retired_set_digest;
+        self.generation_index = generation_index;
         self.terminal_set_digest_cache = rebuild_terminal_set_digest_cache(
             &self.records,
             &self.generation_index,
@@ -3213,9 +3321,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        FrozenTarget, TerminalDecision, TerminalJournal, TerminalJournalError, TerminalResolver,
-        take_terminal_set_digest_derivations, take_terminal_set_digest_record_visits,
-        take_terminal_set_preview_node_reads, take_terminal_state_derivations,
+        FrozenTarget, StagedTerminalDecision, TerminalDecision, TerminalJournal,
+        TerminalJournalError, TerminalResolver, take_terminal_set_digest_derivations,
+        take_terminal_set_digest_record_visits, take_terminal_set_preview_node_reads,
+        take_terminal_state_derivations,
     };
 
     #[test]
@@ -3462,6 +3571,51 @@ mod tests {
         assert!(!reloaded.get(pending_op).unwrap().is_delivered());
         assert_eq!(reloaded.checkpoint_repository_version(), 7);
         assert_eq!(reloaded.repository_base_required_version(), 7);
+    }
+
+    #[test]
+    fn staged_repository_checkpoint_durably_replaces_the_local_lineage() {
+        let root = TempDir::new().unwrap();
+        let committed = (0x0001_0000_0000_000a, 1);
+        let aborted = (0x0001_0000_0000_000a, 2);
+        let mut source = TerminalJournal::in_memory("source");
+        source
+            .upsert_commit_decision(committed, 1, 10, b"commit".to_vec())
+            .unwrap();
+        source.upsert_abort_decision(aborted, 2).unwrap();
+        let source_cut = source.terminal_cut();
+        let staged = vec![
+            StagedTerminalDecision::new(
+                committed,
+                None,
+                None,
+                TerminalDecision::commit_bytes(1, 10, Bytes::from_static(b"commit")),
+            ),
+            StagedTerminalDecision::new(aborted, None, None, TerminalDecision::abort(2)),
+        ];
+
+        {
+            let mut journal =
+                TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+            journal
+                .install_staged_repository_checkpoint(
+                    9_540,
+                    source_cut,
+                    &staged,
+                    &BTreeMap::from([(committed, 9_540)]),
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+            assert_eq!(journal.terminal_cut(), source_cut);
+            assert_eq!(journal.checkpoint_repository_version(), 9_540);
+            assert!(journal.get(committed).unwrap().is_delivered());
+            assert!(!journal.get(aborted).unwrap().is_delivered());
+        }
+
+        let reloaded = TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+        assert_eq!(reloaded.terminal_cut(), source_cut);
+        assert_eq!(reloaded.checkpoint_repository_version(), 9_540);
+        assert_eq!(reloaded.repository_base_required_version(), 9_540);
     }
 
     #[test]

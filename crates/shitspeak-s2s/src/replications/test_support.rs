@@ -674,6 +674,10 @@ impl CountingStrictRepo {
         *self.snapshot_install_failure.lock() = Some(message.into());
     }
 
+    pub fn allow_snapshot_installs(&self) {
+        *self.snapshot_install_failure.lock() = None;
+    }
+
     pub fn fail_snapshot_installs_durably(&self, message: impl Into<String>) {
         *self.snapshot_install_durability_failure.lock() = Some(message.into());
     }
