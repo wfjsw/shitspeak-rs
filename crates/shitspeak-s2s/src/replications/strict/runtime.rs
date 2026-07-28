@@ -5766,11 +5766,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             )
         };
         let earliest_pending_promise_ballot = earliest_pending.and_then(|(op_id, _, _)| {
-            self.terminal_journal
-                .try_lock()
-                .expect("debug journal access cannot be contended")
-                .get(op_id)
-                .map(TerminalJournalRecord::promise_ballot)
+            self.terminal_journal.try_lock().ok().and_then(|journal| {
+                journal
+                    .get(op_id)
+                    .map(TerminalJournalRecord::promise_ballot)
+            })
         });
         let active_recoveries = self.recoveries.lock().len();
         super::StrictDebugState {
@@ -11947,9 +11947,6 @@ async fn request_steady_state_catchup<R: StrictReplicable>(rt: &Arc<StrictRuntim
     if !rt.can_originate_v2() {
         return;
     }
-    if rt.net.strict_replication_protocol_version() >= STRICT_PROTOCOL_VERSION_V4 {
-        return;
-    }
     if rt.state.lock().history_election_blocks_steady_state() {
         return;
     }
@@ -12445,7 +12442,7 @@ mod tests {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo.clone(),
@@ -12458,6 +12455,20 @@ mod tests {
         );
         rt.finish_history_election_for_test();
         (rt, net, repo)
+    }
+
+    fn enable_v5_floor_with_v2_endpoints(
+        net: &MockNet,
+        peers: impl IntoIterator<Item = NodeIdentifier>,
+    ) {
+        // Fresh strict origination requires the cumulative V5 cluster floor,
+        // while these compatibility fixtures intentionally exercise V2
+        // endpoint behavior and wire records.
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V2));
+        for peer in peers {
+            net.set_peer_strict_replication_protocol_version(peer, STRICT_PROTOCOL_VERSION_V2);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -14386,7 +14397,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_catchup_only_targets_reliably_routable_peers() {
         let net = MockNet::new(1, vec![1, 2, 3]);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
         // Node 2 remains in the logical routing table, but its first-hop
@@ -14553,7 +14564,7 @@ mod tests {
     #[tokio::test]
     async fn strict_catchup_followup_uses_response_token_when_repo_version_lags() {
         let net = MockNet::new(1, vec![1, 2]);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        enable_v5_floor_with_v2_endpoints(&net, [2]);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo.clone(),
@@ -14893,7 +14904,7 @@ mod tests {
     #[tokio::test]
     async fn strict_history_election_fetches_only_best_snapshot() {
         let net = MockNet::new(1, vec![1, 2, 3]);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
         let repo = CountingStrictRepo::new();
@@ -14958,7 +14969,7 @@ mod tests {
     #[tokio::test]
     async fn strict_history_election_local_best_requests_no_snapshot() {
         let net = MockNet::new(1, vec![1, 2, 3]);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
         let repo = CountingStrictRepo::new();
@@ -14988,7 +14999,7 @@ mod tests {
     #[tokio::test]
     async fn strict_history_election_ignores_non_winning_snapshot_response() {
         let net = MockNet::new(1, vec![1, 2, 3]);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
         let repo = CountingStrictRepo::new();
@@ -15035,7 +15046,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_send_failures_keep_retry_throttle() {
         let net = MockNet::new(1, vec![1, 2, 3]);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
         net.fail_strict_unicasts_to([2, 3]);
@@ -15382,7 +15393,7 @@ mod tests {
         use crate::overlay::MemberIncarnation;
 
         let net = MockNet::new(1, vec![1, 2, 3, 4]);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         net.set_epoch(2, 8);
         net.set_epoch(3, 3);
         net.set_epoch(4, 4);
@@ -15819,7 +15830,7 @@ mod tests {
     #[tokio::test]
     async fn delivery_in_flight_blocks_bootstrap_until_repository_apply_completes() {
         let net = MockNet::new(1, vec![1, 2]);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        enable_v5_floor_with_v2_endpoints(&net, [2]);
         net.set_epoch(2, 1);
         let repo = BlockingStrictRepo::new();
         let rt = StrictRuntime::new(
@@ -15987,7 +15998,7 @@ mod tests {
         assert!(rt.state.lock().proposals.is_empty());
         assert!(net.drain_captures().is_empty());
 
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         task.await.unwrap().unwrap();
 
         let frames = net.drain_captures();
@@ -16312,7 +16323,7 @@ mod tests {
         for node in 1..=4 {
             net.set_epoch(node, 1);
         }
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -16531,7 +16542,7 @@ mod tests {
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
         net.set_route_rtt(2, Duration::from_millis(400));
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo,
@@ -16681,7 +16692,7 @@ mod tests {
         net.set_route_rtt(2, Duration::from_millis(100));
         net.set_route_rtt(3, Duration::from_millis(100));
         net.set_route_rtt(4, Duration::from_millis(400));
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -16816,7 +16827,7 @@ mod tests {
         net.set_epoch(3, 1);
         net.set_route_rtt(2, Duration::from_millis(200));
         net.set_route_rtt(3, Duration::from_millis(200));
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -16942,8 +16953,7 @@ mod tests {
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V2));
+        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -17011,7 +17021,7 @@ mod tests {
             "a legacy floor must not receive a v2 phase-two frame"
         );
 
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         rt.resume_v2_accept_from_phase_one_quorum(op_id).await;
         tokio::task::yield_now().await;
 
@@ -17090,6 +17100,7 @@ mod tests {
     #[tokio::test]
     async fn durable_v2_pending_fence_uses_terminal_only_repair_while_election_is_idle() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V2);
         let op_id = make_op_id(2, 1, 138);
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&138u64).unwrap());
         {
@@ -17137,7 +17148,7 @@ mod tests {
     #[tokio::test]
     async fn v3_watermark_clock_probe_is_bounded_during_active_terminal_transfer() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
         net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
         let peer = PeerIncarnation::new(2, 1);
@@ -17369,7 +17380,7 @@ mod tests {
     #[tokio::test]
     async fn active_clock_ticks_never_target_an_alive_unrouted_peer() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
         net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         net.set_live_reliable_routes([1]);
@@ -17426,7 +17437,7 @@ mod tests {
     #[tokio::test]
     async fn equal_version_and_terminal_digest_with_different_freshness_does_not_acknowledge() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
         net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         rt.state.lock().peer_clocks.insert(2, 1);
@@ -17730,7 +17741,7 @@ mod tests {
         use crate::overlay::MemberIncarnation;
 
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
         net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V4);
         net.set_epoch(3, 1);
@@ -17769,7 +17780,7 @@ mod tests {
     #[tokio::test]
     async fn v3_peer_uses_steady_fallback_without_becoming_pending_head_evidence() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
         net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
         rt.state.lock().peer_clocks.insert(2, 1);
@@ -17816,6 +17827,7 @@ mod tests {
     async fn live_v2_pending_fence_starts_resolution_after_phase_two_grace() {
         let cfg = ReplicationConfig::default();
         let (rt, net, _repo) = v1_runtime(cfg.clone());
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V2);
         net.set_live_reliable_routes([1]);
         let op_id = make_op_id(2, 1, 140);
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&140u64).unwrap());
@@ -17911,7 +17923,7 @@ mod tests {
         let source_net = MockNet::new(1, vec![1, 2]);
         source_net.set_epoch(1, 1);
         source_net.set_epoch(2, 1);
-        source_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        enable_v5_floor_with_v2_endpoints(&source_net, [2]);
         let source = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -17926,7 +17938,7 @@ mod tests {
         let sink_net = MockNet::new(2, vec![1, 2]);
         sink_net.set_epoch(1, 1);
         sink_net.set_epoch(2, 1);
-        sink_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        enable_v5_floor_with_v2_endpoints(&sink_net, [1]);
         let sink_repo = CountingStrictRepo::new();
         let sink = StrictRuntime::new(
             sink_repo.clone(),
@@ -18023,7 +18035,7 @@ mod tests {
         let cfg = ReplicationConfig::default().with_propose_ttl(propose_ttl);
         let net = MockNet::new(1, vec![1]);
         net.set_epoch(1, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -18079,7 +18091,7 @@ mod tests {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -18131,7 +18143,7 @@ mod tests {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -18824,7 +18836,7 @@ mod tests {
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -18905,10 +18917,10 @@ mod tests {
             )
         }));
 
-        // Once the cumulative floor returns to v2, the same durable barrier
+        // Once the cumulative floor returns to v5, the same durable barrier
         // immediately re-drives terminal resolution against the remaining
         // old-configuration cohort.
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         rt.resume_lost_v2_coordinator_resolutions().await;
         let prepare = net
             .drain_captures()
@@ -18951,7 +18963,7 @@ mod tests {
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -19544,7 +19556,7 @@ mod tests {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
         let op_id = make_op_id(2, 1, 41);
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&141u64).unwrap());
@@ -20307,7 +20319,7 @@ mod tests {
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
         net.set_live_reliable_routes([1, 2]);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
         {
             let rt = StrictRuntime::new(

@@ -1104,6 +1104,7 @@ mod e2e_tests {
     use super::super::proto::{
         CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp, OwnerOp, StrictBody,
     };
+    use super::super::protocol::STRICT_PROTOCOL_VERSION_CURRENT;
     use super::super::strict::runtime::{StrictRuntime, make_op_id};
     use super::*;
     use std::time::Duration;
@@ -1131,9 +1132,7 @@ mod e2e_tests {
     #[tokio::test]
     async fn strict_single_node_propose_end_to_end() {
         let net = MockNet::new(1, vec![1]);
-        net.set_strict_replication_protocol_version(
-            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
-        );
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_CURRENT);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo.clone(),
@@ -1160,9 +1159,7 @@ mod e2e_tests {
     #[tokio::test]
     async fn strict_propose_accepts_at_quorum_decision() {
         let net = MockNet::new(1, vec![1, 2]);
-        net.set_strict_replication_protocol_version(
-            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
-        );
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_CURRENT);
         net.set_epoch(2, 1);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
@@ -1413,9 +1410,7 @@ mod e2e_tests {
                 .with_propose_ttl(Duration::from_secs(5)),
         );
         let net = MockNet::new(1, vec![1, 2, 3]);
-        net.set_strict_replication_protocol_version(
-            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
-        );
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_CURRENT);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
         net.set_route_rtt(3, Duration::from_millis(100));

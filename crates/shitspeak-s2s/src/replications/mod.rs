@@ -993,8 +993,11 @@ mod membership_reconciliation_tests {
     #[tokio::test]
     async fn lagged_manager_subscriber_reconciles_restart_into_strict_runtime() {
         let net = MockNet::new(1, vec![1, 2]);
+        // Fresh strict work is gated on the cumulative protocol floor. The
+        // overlay's baseline constant intentionally remains at the legacy
+        // wire floor and therefore is not a valid modern-runtime fixture.
         net.set_strict_replication_protocol_version(
-            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+            crate::replications::protocol::STRICT_PROTOCOL_VERSION_CURRENT,
         );
         net.set_epoch(2, 8);
         let runtime = StrictRuntime::new(
@@ -1045,9 +1048,9 @@ mod membership_reconciliation_tests {
                         frame,
                         CapturedFrame::StrictUnicast {
                             dst: 2,
-                            body: StrictBody::CatchupReq(request),
+                            body: StrictBody::HistoryProbeReq(_),
                             ..
-                        } if request.history_probe_only
+                        }
                     )
                 }) {
                     break;

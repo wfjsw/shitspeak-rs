@@ -5281,7 +5281,18 @@ mod tests {
         Arc<CountingStrictRepo>,
     ) {
         let net = MockNet::new(self_id, vec![1, 2]);
-        net.set_strict_replication_protocol_version(2);
+        // New rounds require a v5 cluster floor even when the repository
+        // exercises the v2 terminal/snapshot contract. Keep this shared
+        // fixture modern-capable; individual legacy tests explicitly lower
+        // the relevant peer advertisement below.
+        net.set_strict_replication_protocol_version(super::STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(super::STRICT_PROTOCOL_VERSION_V2));
+        for peer in [1, 2, 3] {
+            net.set_peer_strict_replication_protocol_version(
+                peer,
+                super::STRICT_PROTOCOL_VERSION_V2,
+            );
+        }
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo.clone(),

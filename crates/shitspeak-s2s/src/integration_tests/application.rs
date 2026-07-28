@@ -634,7 +634,11 @@ async fn s2s_tree_voice_long_haul_repair_is_delivered_without_server_pacing() {
     );
 
     let app_8 = ApplicationLayer::new(node_8.overlay.clone(), ApplicationConfig::default());
-    let app_1 = ApplicationLayer::new(node_1.overlay.clone(), ApplicationConfig::default());
+    let mut destination_config = ApplicationConfig::default();
+    destination_config.voice.reorder_max_delay_ms = 500;
+    destination_config.voice.adaptive_jitter_min_delay_ms = 500;
+    destination_config.voice.adaptive_jitter_max_delay_ms = 500;
+    let app_1 = ApplicationLayer::new(node_1.overlay.clone(), destination_config);
     wait_for_tree_voice_forwarding(app_8.as_ref(), 8, 1).await;
 
     let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -657,38 +661,26 @@ async fn s2s_tree_voice_long_haul_repair_is_delivered_without_server_pacing() {
     let repair_handler = app_1.voice().inbound_handler();
     let sender_epoch = node_8.overlay.local_boot_epoch();
     let repair_payload = frames[LONG_HAUL_REPAIR_FRAME_OFFSET].clone();
-    let (repair_tx, repair_rx) = tokio::sync::oneshot::channel::<u64>();
-    let repair_task = tokio::spawn(async move {
-        let missing_s2s_seq = repair_rx.await.expect("missing sequence signal");
-        // Let the following tree original open the receiver-side gap before
-        // supplying the same frame through the marked repair ingress path.
-        // Stay inside the shaped path's 104 +/- 4 ms route-delay hint plus
-        // the reorder deadline. At 140 ms this races the deadline and can
-        // flush the suffix before the injected repair arrives.
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        let body = proto::encode_voice(&repair_frame(
-            sender_session,
-            sender_epoch,
-            missing_s2s_seq,
-            repair_payload,
-        ))
-        .expect("encode injected repair frame");
-        repair_handler.handle(
-            OverlayInboundMessage::new(
-                8,
-                ServiceLevel::BestEffort,
-                MessageClass::HighPriority,
-                body,
-            )
-            .with_distribution_repair(true),
-        );
-    });
+    let receive_labels = [
+        ("source", "1"),
+        ("origin_node", "8"),
+        ("from_immediate", "8"),
+    ];
+    let gap_buffered_before = prometheus_total(
+        node_1,
+        "shitspeak_s2s_voice_receive_events_total",
+        &[
+            receive_labels[0],
+            receive_labels[1],
+            receive_labels[2],
+            ("result", "gap_buffered"),
+        ],
+    );
 
     let tree_original_before = tree_original_sent_count(8, 1);
     let send_task = async {
         let mut sent_at = Vec::with_capacity(frames.len());
         let mut missing_s2s_seq = None;
-        let mut repair_tx = Some(repair_tx);
         for (offset, payload) in frames.iter().enumerate() {
             sent_at.push(Instant::now());
             if offset == LONG_HAUL_REPAIR_FRAME_OFFSET {
@@ -705,11 +697,42 @@ async fn s2s_tree_voice_long_haul_repair_is_delivered_without_server_pacing() {
                     .await
                     .expect("send long-haul tree voice frame");
                 if offset == LONG_HAUL_REPAIR_FRAME_OFFSET + 1 {
-                    repair_tx
-                        .take()
-                        .expect("single repair signal")
-                        .send(missing_s2s_seq.expect("reserved repair sequence"))
-                        .expect("repair task should await signal");
+                    assert!(
+                        wait_until_with(
+                            SHOUT_FRAME_LATENCY_BUDGET,
+                            Duration::from_millis(1),
+                            || {
+                                prometheus_total(
+                                    node_1,
+                                    "shitspeak_s2s_voice_receive_events_total",
+                                    &[
+                                        receive_labels[0],
+                                        receive_labels[1],
+                                        receive_labels[2],
+                                        ("result", "gap_buffered"),
+                                    ],
+                                ) > gap_buffered_before
+                            },
+                        )
+                        .await,
+                        "node 1 did not buffer the measured long-haul gap"
+                    );
+                    let body = proto::encode_voice(&repair_frame(
+                        sender_session,
+                        sender_epoch,
+                        missing_s2s_seq.expect("reserved repair sequence"),
+                        repair_payload.clone(),
+                    ))
+                    .expect("encode injected repair frame");
+                    repair_handler.handle(
+                        OverlayInboundMessage::new(
+                            8,
+                            ServiceLevel::BestEffort,
+                            MessageClass::HighPriority,
+                            body,
+                        )
+                        .with_distribution_repair(true),
+                    );
                 }
             }
             if offset + 1 != frames.len() {
@@ -727,7 +750,6 @@ async fn s2s_tree_voice_long_haul_repair_is_delivered_without_server_pacing() {
             SHOUT_FRAME_LATENCY_BUDGET,
         )
     );
-    repair_task.await.expect("repair task should not panic");
 
     let tree_original_delta = tree_original_sent_count(8, 1).saturating_sub(tree_original_before);
     let max_latency = deliveries

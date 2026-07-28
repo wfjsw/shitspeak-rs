@@ -632,7 +632,12 @@ async fn history_election_promotes_an_existing_periodic_probe_without_omitting_i
     net.set_epoch(1, 11);
     net.set_epoch(2, 22);
     net.set_epoch(3, 33);
-    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+    // New rounds require the cumulative V5 cluster floor. Keep the endpoint
+    // advertisements at V3 so this remains a focused V3 repair-coordinator
+    // test rather than accidentally disabling bootstrap origination.
+    net.set_strict_replication_protocol_version(
+        crate::replications::protocol::STRICT_PROTOCOL_VERSION_CURRENT,
+    );
     net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
     net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
     net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V3);

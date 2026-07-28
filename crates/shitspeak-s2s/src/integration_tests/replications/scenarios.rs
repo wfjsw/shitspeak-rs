@@ -1142,7 +1142,10 @@ async fn owner_late_join_catches_up_via_log() {
 /// safety rule for replicated Mumble/shitspeak state.
 #[tokio::test]
 async fn strict_quorum_lost_on_partition() {
-    let cluster = ReplCluster::build_full_mesh_fast_failure(&[1, 2, 3, 4]).await;
+    let cfg = ReplicationConfig::default()
+        .with_propose_ttl(Duration::from_secs(30))
+        .with_pending_propose_ttl(Duration::from_secs(45));
+    let cluster = ReplCluster::build_full_mesh_fast_failure_with_config(&[1, 2, 3, 4], cfg).await;
     let repos: Vec<Arc<CountingStrictRepo>> = (0..4).map(|_| CountingStrictRepo::new()).collect();
     let mut handles = Vec::new();
     for (i, repo) in repos.iter().enumerate() {
@@ -1154,16 +1157,43 @@ async fn strict_quorum_lost_on_partition() {
     }
     assert!(
         wait_until(Duration::from_secs(10), || {
-            handles.iter().all(|handle| {
-                let state = handle.debug_state();
-                state.admitted_peers() == 3 && !state.election_pending() && !state.election_active()
-            })
+            cluster
+                .managers
+                .iter()
+                .all(|manager| manager.strict_capability_activation_ready())
+                && strict_protocol_floors(&cluster)
+                    .iter()
+                    .all(|(_, version)| *version == STRICT_PROTOCOL_VERSION_CURRENT)
+                && handles.iter().all(|handle| {
+                    let state = handle.debug_state();
+                    state.admitted_peers() == 3
+                        && !state.election_pending()
+                        && !state.election_active()
+                })
         })
         .await,
-        "four-node strict admission did not converge: states={:?}",
+        "four-node strict protocol and admission did not converge: floors={:?}, states={:?}",
+        strict_protocol_floors(&cluster),
         handles
             .iter()
             .map(|handle| handle.debug_state())
+            .collect::<Vec<_>>()
+    );
+
+    // Complete one proposal before injecting ACK faults. Besides proving the
+    // current four-node view is usable, this latches local coordination so
+    // the fault rule cannot delay the admission evidence needed to start the
+    // proposal under test.
+    handles[0].propose(7000u64).await.unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            repos.iter().all(|repo| repo.current_version() == 1)
+        })
+        .await,
+        "warm-up proposal did not converge before partition test: versions={:?}",
+        repos
+            .iter()
+            .map(|repo| repo.current_version())
             .collect::<Vec<_>>()
     );
 
@@ -1189,8 +1219,13 @@ async fn strict_quorum_lost_on_partition() {
             )
         })
         .await,
-        "proposal did not freeze the four-node target set: state={:?}",
-        handles[0].debug_state()
+        "proposal did not freeze the four-node target set: state={:?}, versions={:?}, task_finished={}",
+        handles[0].debug_state(),
+        repos
+            .iter()
+            .map(|repo| repo.current_version())
+            .collect::<Vec<_>>(),
+        task.is_finished(),
     );
 
     // Block all inbound from 3,4 on node 1 (and symmetrically on node 2).
@@ -1199,7 +1234,7 @@ async fn strict_quorum_lost_on_partition() {
     // shrunk to the surviving side.
     cluster.cluster.partition(&[1, 2], &[3, 4]);
 
-    let result = timeout(Duration::from_secs(20), task).await;
+    let result = timeout(Duration::from_secs(40), task).await;
     for selector in held_acks {
         coordinator.chaos.release(selector);
     }
