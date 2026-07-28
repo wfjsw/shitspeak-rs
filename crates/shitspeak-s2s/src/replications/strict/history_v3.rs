@@ -42,7 +42,9 @@ mod tests {
                 false,
                 StrictCatchupReason::RepositoryGap,
             )
-            .expect("first request");
+            .expect("first request")
+            .into_parts()
+            .0;
         assert_eq!(first.acknowledged_request_nonce, 0);
 
         assert!(state.claim_response(
@@ -81,6 +83,41 @@ mod tests {
     }
 
     #[test]
+    fn history_election_transfer_preempts_overlapping_admission_transfer() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let admission = state
+            .begin_transfer(
+                peer,
+                95,
+                90,
+                StrictCatchupReason::Admission,
+                Duration::from_secs(30),
+                false,
+                StrictCatchupReason::Admission,
+            )
+            .expect("admission transfer")
+            .into_parts()
+            .0;
+
+        let election = state.begin_transfer(
+            peer,
+            100,
+            0,
+            StrictCatchupReason::HistoryElection,
+            Duration::from_secs(30),
+            false,
+            StrictCatchupReason::HistoryElection,
+        );
+
+        let (election, preempted) = election
+            .expect("the winning snapshot must preempt an incremental admission client")
+            .into_parts();
+        assert_eq!(preempted, Some(StrictCatchupReason::Admission));
+        assert_ne!(election.transfer_id, admission.transfer_id);
+    }
+
+    #[test]
     fn response_claim_is_atomic_and_final_page_has_explicit_ack() {
         let peer = PeerIncarnation::new(2, 11);
         let mut state = HistoryV3State::default();
@@ -94,7 +131,9 @@ mod tests {
                 false,
                 StrictCatchupReason::RepositoryGap,
             )
-            .expect("request");
+            .expect("request")
+            .into_parts()
+            .0;
         let response = StrictHistoryTransferResp {
             expected_requester_boot_epoch: 77,
             transfer_id: request.transfer_id,
@@ -280,6 +319,17 @@ pub(super) struct FinishedHistoryClient {
     final_ack: Option<StrictCatchupReq>,
 }
 
+pub(super) struct StartedHistoryTransfer {
+    request: StrictHistoryTransferReq,
+    preempted_metric_reason: Option<StrictCatchupReason>,
+}
+
+impl StartedHistoryTransfer {
+    pub(super) fn into_parts(self) -> (StrictHistoryTransferReq, Option<StrictCatchupReason>) {
+        (self.request, self.preempted_metric_reason)
+    }
+}
+
 impl FinishedHistoryClient {
     pub(super) fn peer(&self) -> PeerIncarnation {
         self.peer
@@ -313,6 +363,12 @@ fn reason_priority(reason: StrictCatchupReason) -> u8 {
         | StrictCatchupReason::LegacyV2 => 1,
         StrictCatchupReason::DeliveryWatermark | StrictCatchupReason::Unspecified => 0,
     }
+}
+
+fn transfer_preempts(candidate: StrictCatchupReason, current: StrictCatchupReason) -> bool {
+    reason_priority(candidate) > reason_priority(current)
+        || (candidate == StrictCatchupReason::HistoryElection
+            && current == StrictCatchupReason::Admission)
 }
 
 impl HistoryV3State {
@@ -436,9 +492,16 @@ impl HistoryV3State {
         ttl: Duration,
         _inherited_session: bool,
         metric_reason: StrictCatchupReason,
-    ) -> Option<StrictHistoryTransferReq> {
-        if self.clients.contains_key(&peer) {
-            return None;
+    ) -> Option<StartedHistoryTransfer> {
+        let preempted_metric_reason = match self.clients.get(&peer) {
+            Some(current) if transfer_preempts(reason, current.reason) => {
+                Some(current.metric_reason)
+            }
+            Some(_) => return None,
+            None => None,
+        };
+        if preempted_metric_reason.is_some() {
+            self.clients.remove(&peer);
         }
         let transfer_id = self.next_id();
         let pending_nonce = self.next_id();
@@ -455,15 +518,18 @@ impl HistoryV3State {
                 expires_at: Instant::now() + ttl,
             },
         );
-        Some(StrictHistoryTransferReq {
-            expected_responder_boot_epoch: peer.boot_epoch(),
-            transfer_id,
-            request_nonce: pending_nonce,
-            expected_cursor: cursor,
-            target_version,
-            reason: reason as i32,
-            acknowledged_request_nonce: 0,
-            final_ack: false,
+        Some(StartedHistoryTransfer {
+            request: StrictHistoryTransferReq {
+                expected_responder_boot_epoch: peer.boot_epoch(),
+                transfer_id,
+                request_nonce: pending_nonce,
+                expected_cursor: cursor,
+                target_version,
+                reason: reason as i32,
+                acknowledged_request_nonce: 0,
+                final_ack: false,
+            },
+            preempted_metric_reason,
         })
     }
 

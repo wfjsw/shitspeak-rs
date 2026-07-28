@@ -72,6 +72,7 @@ struct UnorderedForwardKey {
 struct PendingPacket {
     data: pb::OverlayData,
     retained_logical_send: Option<[u8; 32]>,
+    transport_ttl: Option<Duration>,
     first_sent_at: Instant,
     next_retry_at: Instant,
     retry_delay: Duration,
@@ -82,6 +83,26 @@ struct PendingPacket {
 struct InboundState {
     next_seq: u64,
     buffered: BTreeMap<u64, OrderedDelivery>,
+    last_nack: Option<PendingNack>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingNack {
+    first_seq: u64,
+    last_seq: u64,
+    emitted_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingRetransmit {
+    data: pb::OverlayData,
+    transport_ttl: Option<Duration>,
+}
+
+impl PendingRetransmit {
+    pub(crate) fn into_parts(self) -> (pb::OverlayData, Option<Duration>) {
+        (self.data, self.transport_ttl)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -313,11 +334,23 @@ impl OverlayOrdering {
         self.store_pending_with_identity(lane, data, None).await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn store_pending_with_identity(
         &self,
         lane: LaneId,
         data: pb::OverlayData,
         retained_logical_send: Option<[u8; 32]>,
+    ) {
+        self.store_pending_with_identity_and_ttl(lane, data, retained_logical_send, None)
+            .await;
+    }
+
+    pub(crate) async fn store_pending_with_identity_and_ttl(
+        &self,
+        lane: LaneId,
+        data: pb::OverlayData,
+        retained_logical_send: Option<[u8; 32]>,
+        transport_ttl: Option<Duration>,
     ) {
         let Ok(dst) = NodeIdentifier::try_from(data.ordering_dst) else {
             return;
@@ -331,6 +364,7 @@ impl OverlayOrdering {
             PendingPacket {
                 data,
                 retained_logical_send,
+                transport_ttl,
                 first_sent_at: now,
                 next_retry_at: now + self.retry_initial,
                 retry_delay: self.retry_initial,
@@ -402,7 +436,7 @@ impl OverlayOrdering {
         self.reorder_buffer_packets
     }
 
-    pub(crate) async fn due_retransmits(&self, now: Instant) -> Vec<pb::OverlayData> {
+    pub(crate) async fn due_retransmits(&self, now: Instant) -> Vec<PendingRetransmit> {
         let mut pending = self.pending.lock().await;
         let mut due = Vec::new();
         let mut empty_keys = Vec::new();
@@ -438,7 +472,10 @@ impl OverlayOrdering {
                     continue;
                 }
                 if now >= packet.next_retry_at {
-                    due.push(packet.data.clone());
+                    due.push(PendingRetransmit {
+                        data: packet.data.clone(),
+                        transport_ttl: packet.transport_ttl,
+                    });
                     packet.retry_attempts = packet.retry_attempts.saturating_add(1);
                     packet.retry_delay = packet.retry_delay.saturating_mul(2).min(self.retry_max);
                     packet.next_retry_at = now + packet.retry_delay;
@@ -526,7 +563,21 @@ impl OverlayOrdering {
             data.payload.clone(),
         );
         let mut inbound = self.inbound.lock().await;
+        let fresh_lane = !inbound.contains_key(&key);
         let state = inbound.entry(key).or_default();
+
+        if fresh_lane
+            && usize::try_from(data.ordering_seq)
+                .map_or(true, |seq| seq > self.reorder_buffer_packets)
+        {
+            // A sender cannot normally advance beyond the bounded pending
+            // window without ACKs from this destination. On a fresh receiver
+            // lane, such a sequence therefore follows history accepted by the
+            // receiver's prior process/incarnation. Establish a baseline so
+            // current catch-up traffic is not trapped behind unavailable
+            // overlay history.
+            state.next_seq = data.ordering_seq;
+        }
 
         if data.ordering_seq < state.next_seq {
             return Some(AcceptOutcome {
@@ -548,15 +599,35 @@ impl OverlayOrdering {
             if state.buffered.len() < self.reorder_buffer_packets {
                 state.buffered.entry(data.ordering_seq).or_insert(delivery);
             }
+            let first_seq = state.next_seq;
+            let last_seq = state
+                .buffered
+                .first_key_value()
+                .map_or(data.ordering_seq, |(seq, _)| *seq)
+                .saturating_sub(1);
+            let now = Instant::now();
+            let emit_nack = state.last_nack.is_none_or(|last| {
+                last.first_seq != first_seq
+                    || last.last_seq != last_seq
+                    || now.saturating_duration_since(last.emitted_at) >= self.retry_initial
+            });
+            if emit_nack {
+                state.last_nack = Some(PendingNack {
+                    first_seq,
+                    last_seq,
+                    emitted_at: now,
+                });
+            }
             return Some(AcceptOutcome {
                 ready: Vec::new(),
                 ack_next_seq: state.next_seq,
-                nack: Some((state.next_seq, data.ordering_seq.saturating_sub(1))),
+                nack: emit_nack.then_some((first_seq, last_seq)),
             });
         }
 
         let mut ready = vec![delivery];
         state.next_seq = state.next_seq.saturating_add(1);
+        state.last_nack = None;
         while let Some(delivery) = state.buffered.remove(&state.next_seq) {
             ready.push(delivery);
             state.next_seq = state.next_seq.saturating_add(1);
@@ -834,6 +905,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_out_of_order_packet_coalesces_identical_missing_range() {
+        let ordering = OverlayOrdering::new(
+            &OverlayConfig::new(Vec::new()).with_ordered_retry_initial(Duration::from_millis(10)),
+        );
+        let out_of_order = data(2, b"third");
+
+        let first = ordering
+            .accept_inbound(
+                1,
+                &out_of_order,
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.nack, Some((0, 1)));
+
+        let duplicate = ordering
+            .accept_inbound(
+                1,
+                &out_of_order,
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert!(duplicate.ready.is_empty());
+        assert_eq!(duplicate.ack_next_seq, 0);
+        assert_eq!(
+            duplicate.nack, None,
+            "an unchanged gap must not emit another identical repair request"
+        );
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let retry = ordering
+            .accept_inbound(
+                1,
+                &out_of_order,
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retry.nack,
+            Some((0, 1)),
+            "a lost repair request must be retried after the bounded interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn expanding_out_of_order_suffix_does_not_expand_duplicate_nacks() {
+        let ordering = OverlayOrdering::default();
+
+        let first = ordering
+            .accept_inbound(
+                1,
+                &data(1, b"second"),
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.nack, Some((0, 0)));
+
+        let next = ordering
+            .accept_inbound(
+                1,
+                &data(2, b"third"),
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            next.nack, None,
+            "buffered suffix growth must not request an overlapping superset"
+        );
+    }
+
+    #[tokio::test]
     async fn outbound_sequence_is_per_destination_lane() {
         let ordering = OverlayOrdering::default();
 
@@ -989,6 +1141,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordered_retransmit_preserves_transport_ttl_without_dropping_logical_pending() {
+        let cfg = OverlayConfig::new(Vec::new())
+            .with_ordered_retry_initial(Duration::from_millis(1))
+            .with_ordered_retry_max(Duration::from_millis(1));
+        let ordering = OverlayOrdering::new(&cfg);
+        let transport_ttl = Duration::from_millis(37);
+        ordering
+            .store_pending_with_identity_and_ttl(
+                lane(),
+                data(0, b"pending"),
+                Some([7; 32]),
+                Some(transport_ttl),
+            )
+            .await;
+
+        let retransmits = ordering
+            .due_retransmits(Instant::now() + Duration::from_millis(5))
+            .await;
+        assert_eq!(retransmits.len(), 1);
+        let (_, retained_ttl) = retransmits.into_iter().next().unwrap().into_parts();
+        assert_eq!(retained_ttl, Some(transport_ttl));
+        assert_eq!(
+            ordering.pending_range(1, lane(), 0, 0).await.len(),
+            1,
+            "physical TTL must not discard the logical ordered sequence"
+        );
+    }
+
+    #[tokio::test]
     async fn reliable_levels_ignore_retry_caps_until_ack_or_epoch_reset() {
         let cfg = OverlayConfig::new(Vec::new())
             .with_ordered_retry_initial(Duration::from_millis(1))
@@ -1079,7 +1260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_sequence_gap_does_not_request_unbounded_repair() {
+    async fn fresh_lane_establishes_a_baseline_beyond_the_reorder_window() {
         let cfg = OverlayConfig::new(Vec::new()).with_ordered_reorder_buffer_packets(2);
         let ordering = OverlayOrdering::new(&cfg);
 
@@ -1093,9 +1274,63 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(outcome.ready.is_empty());
-        assert_eq!(outcome.ack_next_seq, 0);
+        assert_eq!(outcome.ready.len(), 1);
+        assert_eq!(&outcome.ready[0].body()[..], b"too-far-ahead");
+        assert_eq!(outcome.ack_next_seq, 11);
         assert_eq!(outcome.nack, None);
+
+        let next = ordering
+            .accept_inbound(
+                1,
+                &data(11, b"next"),
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.ready.len(), 1);
+        assert_eq!(next.ack_next_seq, 12);
+
+        let late = ordering
+            .accept_inbound(
+                1,
+                &data(9, b"late"),
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert!(late.ready.is_empty());
+        assert_eq!(late.ack_next_seq, 12);
+    }
+
+    #[tokio::test]
+    async fn established_lane_never_rebases_across_an_oversized_gap() {
+        let cfg = OverlayConfig::new(Vec::new()).with_ordered_reorder_buffer_packets(2);
+        let ordering = OverlayOrdering::new(&cfg);
+        let first = ordering
+            .accept_inbound(
+                1,
+                &data(0, b"first"),
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.ack_next_seq, 1);
+
+        let far = ordering
+            .accept_inbound(
+                1,
+                &data(10, b"far"),
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert!(far.ready.is_empty());
+        assert_eq!(far.ack_next_seq, 1);
+        assert_eq!(far.nack, None);
     }
 
     #[tokio::test]

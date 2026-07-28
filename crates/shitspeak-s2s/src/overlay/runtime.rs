@@ -11,6 +11,7 @@
 //!   * `ServiceRegistry` dispatches inbound `OverlayData` by tag.
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions, TryLockError};
@@ -44,6 +45,28 @@ static LAST_PROCESS_BOOT_EPOCH: AtomicU64 = AtomicU64::new(0);
 static LOCAL_BOOT_EPOCH_PROCESS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 static NEXT_LOCAL_BOOT_EPOCH_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 const HELLO_ACK_METRIC_DEBOUNCE: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+struct OrderingPeerEpochs {
+    highest: HashMap<NodeIdentifier, u64>,
+    failed: HashSet<NodeIdentifier>,
+}
+
+impl OrderingPeerEpochs {
+    fn observe(&mut self, node: super::MemberIncarnation) -> bool {
+        match self.highest.get_mut(&node.node_id()) {
+            Some(highest) if node.incarnation() > *highest => {
+                *highest = node.incarnation();
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.highest.insert(node.node_id(), node.incarnation());
+                false
+            }
+        }
+    }
+}
 
 async fn forward_neighbor_notifications<F>(
     on_change: Arc<tokio::sync::Notify>,
@@ -94,6 +117,7 @@ async fn forward_neighbor_notifications<F>(
 
 async fn apply_ordering_membership_event(
     ordering: &OverlayOrdering,
+    peer_epochs: &mut OrderingPeerEpochs,
     event: &super::MembershipEvent,
 ) -> Option<NodeIdentifier> {
     match event {
@@ -107,16 +131,56 @@ async fn apply_ordering_membership_event(
         // membership subscribers still receive the event independently and
         // retain responsibility for owner-origin shutdown/cleanup.
         super::MembershipEvent::Left(node) => {
+            peer_epochs.observe(*node);
+            peer_epochs.failed.remove(&node.node_id());
             ordering.reset_peer(node.node_id()).await;
             Some(node.node_id())
         }
         // The replacement may already have a live transport session. Reset
         // old epoch ordering state, but do not retire the new peer session.
         super::MembershipEvent::Restarted(node) => {
-            ordering.reset_peer(node.node_id()).await;
+            let unseen = !peer_epochs.highest.contains_key(&node.node_id());
+            peer_epochs.failed.remove(&node.node_id());
+            if unseen || peer_epochs.observe(*node) {
+                ordering.reset_peer(node.node_id()).await;
+            }
             None
         }
-        super::MembershipEvent::Failed(_) | super::MembershipEvent::Joined(_) => None,
+        super::MembershipEvent::Failed(node) => {
+            peer_epochs.observe(*node);
+            peer_epochs.failed.insert(node.node_id());
+            None
+        }
+        super::MembershipEvent::Joined(node) => {
+            let healed = peer_epochs.failed.remove(&node.node_id());
+            let restarted = peer_epochs.observe(*node);
+            if healed || restarted {
+                ordering.reset_peer(node.node_id()).await;
+            }
+            None
+        }
+    }
+}
+
+async fn reconcile_ordering_peer_epochs(
+    ordering: &OverlayOrdering,
+    peer_epochs: &mut OrderingPeerEpochs,
+    members: &[super::MemberSnapshot],
+) {
+    for member in members {
+        reconcile_ordering_peer_epoch(ordering, peer_epochs, member.member_incarnation()).await;
+    }
+}
+
+async fn reconcile_ordering_peer_epoch(
+    ordering: &OverlayOrdering,
+    peer_epochs: &mut OrderingPeerEpochs,
+    node: super::MemberIncarnation,
+) {
+    let healed = peer_epochs.failed.remove(&node.node_id());
+    let restarted = peer_epochs.observe(node);
+    if healed || restarted {
+        ordering.reset_peer(node.node_id()).await;
     }
 }
 
@@ -780,6 +844,11 @@ impl OverlayInner {
         {
             let mut events = self.table.subscribe();
             let ordering = self.ordering.clone();
+            let table = self.table.clone();
+            let mut peer_epochs = OrderingPeerEpochs::default();
+            for member in table.snapshot() {
+                peer_epochs.observe(member.member_incarnation());
+            }
             let transport = self.transport.clone();
             let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
@@ -789,14 +858,24 @@ impl OverlayInner {
                         ev = events.recv() => {
                             match ev {
                                 Ok(event) => {
-                                    if let Some(node) = apply_ordering_membership_event(&ordering, &event).await {
+                                    if let Some(node) = apply_ordering_membership_event(
+                                        &ordering,
+                                        &mut peer_epochs,
+                                        &event,
+                                    ).await {
                                         // Retire only this peer's transport state. This drops
                                         // its queued stream handoffs without cancelling global
                                         // transport or replication cleanup tasks.
                                         transport.forget_node(node).await;
                                     }
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    reconcile_ordering_peer_epochs(
+                                        &ordering,
+                                        &mut peer_epochs,
+                                        &table.snapshot(),
+                                    ).await;
+                                }
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                             }
                         }
@@ -899,11 +978,12 @@ mod tests {
             super::super::MemberIncarnation::new(9, 7),
         )] {
             let ordering = OverlayOrdering::default();
+            let mut peer_epochs = OrderingPeerEpochs::default();
             assert_eq!(ordering.next_outbound_seq(9, lane).await, 0);
             assert_eq!(ordering.next_outbound_seq(10, lane).await, 0);
 
             assert_eq!(
-                apply_ordering_membership_event(&ordering, &event).await,
+                apply_ordering_membership_event(&ordering, &mut peer_epochs, &event).await,
                 Some(9)
             );
 
@@ -912,10 +992,12 @@ mod tests {
         }
 
         let ordering = OverlayOrdering::default();
+        let mut peer_epochs = OrderingPeerEpochs::default();
         assert_eq!(ordering.next_outbound_seq(9, lane).await, 0);
         assert_eq!(
             apply_ordering_membership_event(
                 &ordering,
+                &mut peer_epochs,
                 &super::super::MembershipEvent::Restarted(super::super::MemberIncarnation::new(
                     9, 8
                 ),),
@@ -927,10 +1009,12 @@ mod tests {
         assert_eq!(ordering.next_outbound_seq(9, lane).await, 0);
 
         let ordering = OverlayOrdering::default();
+        let mut peer_epochs = OrderingPeerEpochs::default();
         assert_eq!(ordering.next_outbound_seq(9, lane).await, 0);
         assert_eq!(
             apply_ordering_membership_event(
                 &ordering,
+                &mut peer_epochs,
                 &super::super::MembershipEvent::Joined(super::super::MemberIncarnation::new(9, 7)),
             )
             .await,
@@ -944,23 +1028,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_failure_preserves_same_incarnation_ordering_and_transport() {
+    async fn same_epoch_join_after_failure_resets_ordering() {
         let ordering = OverlayOrdering::default();
+        let mut peer_epochs = OrderingPeerEpochs::default();
         let lane = super::super::LaneId::new(NonZeroU32::new(7).unwrap());
         let peer = 9;
         assert_eq!(ordering.next_outbound_seq(peer, lane).await, 0);
 
         let retire = apply_ordering_membership_event(
             &ordering,
+            &mut peer_epochs,
             &super::super::MembershipEvent::Failed(super::super::MemberIncarnation::new(peer, 7)),
         )
         .await;
 
         assert_eq!(retire, None, "failure suspicion is not incarnation death");
         assert_eq!(
+            apply_ordering_membership_event(
+                &ordering,
+                &mut peer_epochs,
+                &super::super::MembershipEvent::Joined(super::super::MemberIncarnation::new(
+                    peer, 7,
+                )),
+            )
+            .await,
+            None
+        );
+        assert_eq!(
             ordering.next_outbound_seq(peer, lane).await,
-            1,
-            "same-epoch heal must continue the ordered sequence"
+            0,
+            "a healed transport session must not inherit sequence holes from the failed route"
+        );
+    }
+
+    #[tokio::test]
+    async fn higher_epoch_join_after_failure_resets_ordering() {
+        let ordering = OverlayOrdering::default();
+        let mut peer_epochs = OrderingPeerEpochs::default();
+        let lane = super::super::LaneId::new(NonZeroU32::new(7).unwrap());
+        let peer = 9;
+        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 0);
+
+        assert_eq!(
+            apply_ordering_membership_event(
+                &ordering,
+                &mut peer_epochs,
+                &super::super::MembershipEvent::Failed(super::super::MemberIncarnation::new(
+                    peer, 7,
+                )),
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            apply_ordering_membership_event(
+                &ordering,
+                &mut peer_epochs,
+                &super::super::MembershipEvent::Joined(super::super::MemberIncarnation::new(
+                    peer, 8,
+                )),
+            )
+            .await,
+            None
+        );
+
+        assert_eq!(
+            ordering.next_outbound_seq(peer, lane).await,
+            0,
+            "a replacement incarnation reported as Joined must discard the previous lane"
+        );
+    }
+
+    #[tokio::test]
+    async fn membership_snapshot_reconciles_a_missed_restart_event() {
+        let ordering = OverlayOrdering::default();
+        let mut peer_epochs = OrderingPeerEpochs::default();
+        let lane = super::super::LaneId::new(NonZeroU32::new(7).unwrap());
+        let peer = 9;
+        peer_epochs.observe(super::super::MemberIncarnation::new(peer, 7));
+        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 0);
+
+        reconcile_ordering_peer_epoch(
+            &ordering,
+            &mut peer_epochs,
+            super::super::MemberIncarnation::new(peer, 8),
+        )
+        .await;
+
+        assert_eq!(
+            ordering.next_outbound_seq(peer, lane).await,
+            0,
+            "snapshot reconciliation must reset state after a lagged restart event"
         );
     }
 

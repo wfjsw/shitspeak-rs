@@ -37,7 +37,7 @@ use super::{
 use crate::overlay::MemberIncarnation;
 use crate::replications::{
     config::ReplicationConfig,
-    metrics::{CatchupPhase, CatchupReason},
+    metrics::{CatchupMode, CatchupPhase, CatchupReason},
     proto::{
         StrictBody, StrictCatchupReason, StrictCatchupReq, StrictClockProbeReq,
         StrictClockProbeResp, StrictDecisionAbort, StrictDecisionCommit, StrictFrozenTarget,
@@ -461,6 +461,163 @@ async fn already_known_source_cut_returns_up_to_date_without_allocating_transfer
             .lock()
             .responder(PeerIncarnation::new(2, 22))
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn satisfied_terminal_cut_latches_repository_base_before_snapshot_fetch() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+    let peer = PeerIncarnation::new(2, 22);
+    let source_cut = rt.terminal_journal.lock().await.terminal_cut();
+    {
+        let mut state = rt.state.lock();
+        state.request_history_election();
+        state.begin_history_election([2]);
+    }
+
+    request_v3_history_probe(&rt, 2, StrictCatchupReason::HistoryElection).await;
+    let request_nonce = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(request),
+                ..
+            } => Some(request.request_nonce),
+            _ => None,
+        })
+        .expect("history probe request");
+
+    recv_v3_history_probe_resp(
+        &rt,
+        2,
+        22,
+        StrictHistoryProbeResp {
+            responder_node: 2,
+            expected_requester_boot_epoch: 11,
+            request_nonce,
+            repository_version: 9_525,
+            // Pre-field V5 peers decode with zero here. Their complete head
+            // is the conservative base when it exceeds the terminal lineage.
+            terminal_repository_base_version: 0,
+            history_freshness: 9_525,
+            runtime_started_at: 22,
+            history_node: 2,
+            terminal_cut: Some(cut_to_wire(source_cut)),
+            reason: StrictCatchupReason::HistoryElection as i32,
+        },
+    )
+    .await;
+
+    assert!(
+        rt.repository_base_required(),
+        "an already-satisfied terminal cut must not bypass the repository-base fence"
+    );
+    assert!(rt.state.lock().can_bootstrap_catchup());
+    assert!(
+        rt.v3_sync
+            .lock()
+            .known_source_cut(peer)
+            .is_some_and(|known| known == source_cut)
+    );
+    assert!(net.drain_captures().into_iter().any(|frame| matches!(
+        frame,
+        CapturedFrame::StrictUnicast {
+            dst: 2,
+            body: StrictBody::CatchupReq(StrictCatchupReq {
+                force_snapshot: true,
+                ..
+            }),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn abort_heavy_terminal_cut_still_latches_legacy_repository_base() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+    let source_cut = TerminalCut::new([2; 16], 10_000, [2; 32], [3; 32]);
+    {
+        let mut state = rt.state.lock();
+        state.request_history_election();
+        state.begin_history_election([2]);
+    }
+
+    request_v3_history_probe(&rt, 2, StrictCatchupReason::HistoryElection).await;
+    let request_nonce = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(request),
+                ..
+            } => Some(request.request_nonce),
+            _ => None,
+        })
+        .expect("history probe request");
+
+    recv_v3_history_probe_resp(
+        &rt,
+        2,
+        22,
+        StrictHistoryProbeResp {
+            responder_node: 2,
+            expected_requester_boot_epoch: 11,
+            request_nonce,
+            repository_version: 9_525,
+            terminal_repository_base_version: 0,
+            history_freshness: 9_525,
+            runtime_started_at: 22,
+            history_node: 2,
+            terminal_cut: Some(cut_to_wire(source_cut)),
+            reason: StrictCatchupReason::HistoryElection as i32,
+        },
+    )
+    .await;
+
+    assert!(
+        rt.repository_base_required(),
+        "an omitted V5 base field must conservatively require the source head even when terminal generation is higher"
+    );
+}
+
+#[tokio::test]
+async fn newer_admission_probe_rearms_election_without_reciprocal_gap_request() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+
+    respond_to_request(
+        &rt,
+        2,
+        StrictCatchupReq {
+            src_node: 2,
+            since_version: 9_525,
+            chunk_token: 9_525,
+            force_snapshot: false,
+            history_probe_only: true,
+            terminal_state_cursor: u64::MAX,
+            terminal_decision_generation: 0,
+            snapshot_transfer_id: 0,
+            snapshot_chunk_cursor: 0,
+            history_transfer: None,
+        },
+    )
+    .await;
+
+    assert!(rt.state.lock().history_election_pending());
+    assert!(
+        !net.drain_captures().into_iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::CatchupReq(StrictCatchupReq {
+                    history_probe_only: false,
+                    ..
+                }),
+                ..
+            }
+        )),
+        "the ranked history election owns repair; a reciprocal legacy gap request duplicates it"
     );
 }
 
@@ -1182,6 +1339,63 @@ fn simultaneous_terminal_starts_choose_one_direction_by_node_id() {
     );
 }
 
+#[tokio::test]
+async fn yielded_reverse_terminal_sync_resumes_when_responder_admission_is_busy() {
+    let config = ReplicationConfig::default()
+        .with_catchup_max_in_flight_total(1)
+        .with_catchup_max_in_flight_per_peer(1);
+    let (rt, net) = runtime(2, config);
+    request_v3_terminal_sync(&rt, 1, StrictCatchupReason::Admission).await;
+    let initial = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("higher-node outbound request");
+    let _permit = rt
+        .cfg
+        .try_begin_catchup(CatchupMode::Strict, "occupied", 1)
+        .expect("occupy the sole catchup permit");
+
+    recv_v3_terminal_sync_req(
+        &rt,
+        1,
+        11,
+        StrictTerminalSyncReq {
+            src_node: 1,
+            expected_responder_boot_epoch: 22,
+            reason: StrictCatchupReason::Admission as i32,
+            known_source_cut: None,
+            requester_terminal_set_digest: Bytes::from(vec![9; 32]),
+            transfer_id: 0,
+            request_nonce: 700,
+            expected_cursor: 0,
+        },
+    )
+    .await;
+
+    assert!(
+        net.drain_captures().into_iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 1,
+                body: StrictBody::TerminalSyncReq(StrictTerminalSyncReq {
+                    transfer_id: 0,
+                    request_nonce,
+                    ..
+                }),
+                ..
+            } if request_nonce != initial.request_nonce
+        )),
+        "a rejected responder direction must immediately resume the retained reverse client"
+    );
+}
+
 #[test]
 fn active_terminal_responder_allows_one_bounded_clock_probe() {
     let mut state = SyncV3State::default();
@@ -1208,7 +1422,14 @@ fn active_terminal_responder_allows_one_bounded_clock_probe() {
     assert!(
         state
             .record_history_nonce(peer, StrictCatchupReason::Admission as i32, ttl)
-            .is_none()
+            .is_some(),
+        "reciprocal admission metadata must not wait for the responder TTL"
+    );
+    assert!(
+        state
+            .record_history_nonce(peer, StrictCatchupReason::Admission as i32, ttl)
+            .is_none(),
+        "the active admission probe must still coalesce periodic duplicates"
     );
     assert_eq!(
         state.take_deferred_client(peer),

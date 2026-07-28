@@ -4299,6 +4299,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         origin_boot_epoch: u64,
         remote_rank: HistoryRank,
     ) {
+        if remote_rank.version > self.repo.current_version() {
+            // A remote head can prove that the peer covers our frozen cut,
+            // but admitting it now would stop the only periodic probes that
+            // retain the inverse obligation to pull its newer repository.
+            return;
+        }
         let diagnostics = {
             let mut state = self.state.lock();
             let _ = state.observe_admission_history(
@@ -5060,6 +5066,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if !journal_changed {
             let state_changed = {
                 let mut state = self.state.lock();
+                if let Some(required_version) = required_repository_base_version {
+                    state.require_repository_base(required_version);
+                }
                 hydrate_terminal_journal_record(&mut state, op_id, &record, true);
                 !state.repository_base_required()
                     && enqueue_terminal_commit_for_delivery(&mut state, op_id, &record)
@@ -5072,6 +5081,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let mut state_changed = false;
         {
             let mut state = self.state.lock();
+            if let Some(required_version) = required_repository_base_version {
+                // The journal already durably records this dependency. Raise
+                // the in-memory gate under the same lock before the imported
+                // commit can enter the delivery buffer.
+                state.require_repository_base(required_version);
+            }
             let decision = TerminalDecision::Commit(AcceptedValue {
                 ballot,
                 ts_final,
@@ -5503,6 +5518,22 @@ impl<R: StrictReplicable> StrictRuntime<R> {
 
     pub(crate) async fn apply_catchup_terminal_state(&self, terminal: StrictTerminalState) -> bool {
         self.install_catchup_terminal_state(terminal, self.repository_base_required_version())
+            .await
+            .is_some()
+    }
+
+    pub(super) async fn apply_catchup_terminal_commit_with_repository_base(
+        &self,
+        terminal: StrictTerminalState,
+        required_repository_base_version: u64,
+    ) -> bool {
+        if !matches!(
+            terminal.outcome.as_ref(),
+            Some(StrictTerminalOutcome::Commit(_))
+        ) {
+            return false;
+        }
+        self.install_catchup_terminal_state(terminal, Some(required_repository_base_version))
             .await
             .is_some()
     }
@@ -6406,11 +6437,15 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     .is_some_and(|pending| {
                         pending.coord_node == from
                             && pending.protocol_version == STRICT_PROTOCOL_VERSION_V2
-                            && pending.v2_descriptor_durable
                             && pending.frozen_targets.as_deref() == Some(targets.as_slice())
                             && pending.op_msgpack == p.op_msgpack
                     });
-                if !self.peer_incarnation_is_admitted(from, origin_boot_epoch)
+                let recovery_blocks_new_proposals = {
+                    let state = self.state.lock();
+                    state.history_election_blocks_steady_state() || state.repository_base_required()
+                };
+                if (!self.peer_incarnation_is_admitted(from, origin_boot_epoch)
+                    || recovery_blocks_new_proposals)
                     && !exact_durable_retry
                 {
                     metrics::record_strict_fence_rejection();
@@ -6419,7 +6454,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                         origin_boot_epoch,
                         op_id_hi = op_id.0,
                         op_id_lo = op_id.1,
-                        "strict v2 propose rejected: coordinator incarnation is awaiting admission"
+                        recovery_blocks_new_proposals,
+                        "strict v2 propose rejected while local participation is fenced"
                     );
                     // The joining/excluded coordinator owns admission repair.
                     // A rejected proposal is not repository metadata and must
@@ -6552,6 +6588,17 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 local_clock_after = s.clock;
                 v2_pending_to_persist = None;
             } else {
+                if protocol_version == STRICT_PROTOCOL_VERSION_V2
+                    && (s.history_election_blocks_steady_state() || s.repository_base_required())
+                {
+                    // Recovery can begin after the envelope-level admission
+                    // check. Recheck under the same lock that would insert
+                    // pending work so a raced proposal cannot make snapshot
+                    // installation inadmissible. Exact pending and terminal
+                    // retries were handled by the branches above.
+                    metrics::record_strict_fence_rejection();
+                    return;
+                }
                 ts_local = s.advance_clock(ts_propose);
                 local_clock_after = s.clock;
                 s.peer_clocks.insert(self.self_id, local_clock_after);
@@ -9197,6 +9244,15 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         {
             return None;
         }
+        {
+            let state = self.state.lock();
+            if state.history_election_blocks_steady_state() || state.repository_base_required() {
+                // The ranked history election is already converging on one
+                // source. Per-tick repository-gap probes would create a
+                // parallel repair session for every ahead clock sender.
+                return None;
+            }
+        }
         let Some(remote_cut) = tick.terminal_cut.as_ref().and_then(cut_from_wire) else {
             return None;
         };
@@ -11690,9 +11746,12 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
             continue;
         }
         if rt.v3_repair_supported_by(dst) {
-            if rt.v3_periodic_work_active(dst) || !rt.admission_probe_due(dst) {
+            if !rt.admission_probe_due(dst) {
                 continue;
             }
+            // Admission metadata is a bounded, nonce-coalesced proof pair and
+            // may coexist with a terminal responder. Suppressing it behind
+            // responder lifetime leaves the peer proof stuck at clock-only.
             super::catchup::request_v3_clock_probe(
                 rt,
                 dst,
@@ -14086,6 +14145,54 @@ mod tests {
         assert!(!rt.local_coordination_ready());
         rt.state.lock().peer_admissions.get_mut(&2).unwrap().phase = PeerAdmissionPhase::Admitted;
         assert!(rt.local_coordination_ready());
+    }
+
+    #[test]
+    fn ahead_v3_metadata_does_not_complete_admission_before_local_pull() {
+        use crate::overlay::MemberIncarnation;
+
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo.clone(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+        rt.finish_history_election_for_test();
+        rt.state.lock().peer_admissions.get_mut(&2).unwrap().phase =
+            PeerAdmissionPhase::AwaitingPeer {
+                required_history: HistoryMetadata {
+                    version: 0,
+                    freshness: 0,
+                },
+                clock_gt: 0,
+                history_ready: false,
+                clock_ready: true,
+            };
+
+        rt.accept_v3_history_metadata(
+            2,
+            1,
+            HistoryRank {
+                version: 1,
+                freshness: 1,
+                runtime_started_at: 1,
+                node_id: 2,
+                terminal_repository_base_version: 0,
+            },
+        );
+
+        assert!(
+            !rt.peer_incarnation_is_admitted(2, 1),
+            "an ahead peer must remain probe-eligible until its repository history is pulled"
+        );
     }
 
     #[tokio::test]
@@ -17503,6 +17610,12 @@ mod tests {
             history_freshness: 0,
         };
 
+        rt.state.lock().request_history_election();
+        assert!(
+            rt.prepare_clock_tick_evidence(2, 1, &tick).is_none(),
+            "the ranked election must own repair while it is unresolved"
+        );
+        rt.finish_history_election_for_test();
         assert!(rt.prepare_clock_tick_evidence(2, 1, &tick).is_some());
         for _ in 0..100 {
             assert!(rt.prepare_clock_tick_evidence(2, 1, &tick).is_none());
@@ -19428,6 +19541,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repository_base_recovery_rejects_new_v2_proposals_but_allows_durable_retries() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        let frozen_targets = v2_frozen_targets();
+        let retry_op_id = make_op_id(2, 1, 41);
+        let retry_op_msgpack = Bytes::from(rmp_serde::to_vec(&141u64).unwrap());
+        let retry = StrictProposeV1 {
+            coord_node: 2,
+            op_id_hi: retry_op_id.0,
+            op_id_lo: retry_op_id.1,
+            ts_propose: 41,
+            op_msgpack: retry_op_msgpack,
+            src_clock: 41,
+            protocol_version: STRICT_PROTOCOL_VERSION_V2,
+            frozen_targets: frozen_targets_to_wire(&frozen_targets),
+        };
+        rt.recv_propose_v1(2, retry.clone()).await;
+        assert!(rt.state.lock().pending_proposes[&retry_op_id].v2_descriptor_durable);
+        net.drain_captures();
+
+        let new_op_id = make_op_id(2, 1, 40);
+        let new_op_msgpack = Bytes::from(rmp_serde::to_vec(&140u64).unwrap());
+        rt.require_repository_base(9_525);
+
+        rt.recv_propose_v1(
+            2,
+            StrictProposeV1 {
+                coord_node: 2,
+                op_id_hi: new_op_id.0,
+                op_id_lo: new_op_id.1,
+                ts_propose: 40,
+                op_msgpack: new_op_msgpack,
+                src_clock: 40,
+                protocol_version: STRICT_PROTOCOL_VERSION_V2,
+                frozen_targets: frozen_targets_to_wire(&frozen_targets),
+            },
+        )
+        .await;
+
+        assert!(!rt.state.lock().pending_proposes.contains_key(&new_op_id));
+        assert!(!net.drain_captures().iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::ProposeAck(StrictProposeAck { op_id_hi, op_id_lo, .. }),
+                ..
+            } if (*op_id_hi, *op_id_lo) == new_op_id
+        )));
+
+        rt.recv_propose_v1(2, retry).await;
+        tokio::task::yield_now().await;
+
+        assert!(net.drain_captures().iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::ProposeAck(StrictProposeAck { op_id_hi, op_id_lo, .. }),
+                ..
+            } if (*op_id_hi, *op_id_lo) == retry_op_id
+        )));
+
+        assert!(rt.finish_repository_base_install(9_525));
+        {
+            let mut state = rt.state.lock();
+            state.pending_proposes.clear();
+            state.request_history_election();
+        }
+        let election_op_id = make_op_id(2, 1, 42);
+        rt.recv_propose_v1(
+            2,
+            StrictProposeV1 {
+                coord_node: 2,
+                op_id_hi: election_op_id.0,
+                op_id_lo: election_op_id.1,
+                ts_propose: 42,
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&142u64).unwrap()),
+                src_clock: 42,
+                protocol_version: STRICT_PROTOCOL_VERSION_V2,
+                frozen_targets: frozen_targets_to_wire(&frozen_targets),
+            },
+        )
+        .await;
+        assert!(
+            !rt.state
+                .lock()
+                .pending_proposes
+                .contains_key(&election_op_id),
+            "an unresolved history election must keep new traffic from blocking its snapshot"
+        );
+
+        rt.state.lock().begin_history_election([2]);
+        let raced_op_id = make_op_id(2, 1, 43);
+        rt.recv_propose_inner(
+            2,
+            2,
+            raced_op_id,
+            43,
+            Bytes::from(rmp_serde::to_vec(&143u64).unwrap()),
+            43,
+            STRICT_PROTOCOL_VERSION_V2,
+            Some(frozen_targets),
+        )
+        .await;
+        assert!(
+            !rt.state.lock().pending_proposes.contains_key(&raced_op_id),
+            "recovery must be rechecked in the state transaction that inserts pending work"
+        );
+    }
+
+    #[tokio::test]
     async fn v2_propose_rejects_a_restarted_coordinator_envelope() {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
@@ -19755,6 +19976,7 @@ mod tests {
                 CancellationToken::new(),
                 Arc::new(ReplicationConfig::default()),
             );
+            rt.finish_history_election_for_test();
             rt.recv_propose_v1(
                 2,
                 StrictProposeV1 {
@@ -19924,6 +20146,7 @@ mod tests {
             CancellationToken::new(),
             Arc::new(ReplicationConfig::default()),
         );
+        rt.finish_history_election_for_test();
         let op_id = make_op_id(2, 1, 43);
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&143u64).unwrap());
         rt.recv_propose_v1(
@@ -20041,6 +20264,127 @@ mod tests {
         rt.recv_catchup_resp(2, response).await;
 
         assert!(!rt.state.lock().terminal_decisions.contains_key(&op_id));
+    }
+
+    #[tokio::test]
+    async fn legacy_v5_terminal_suffix_persists_its_inferred_repository_base() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V5);
+        net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
+        let repo = CountingStrictRepo::new();
+        let op_id = make_op_id(2, 1, 72);
+        let response = StrictCatchupResp {
+            terminal_states: vec![StrictTerminalState {
+                coord_node: 2,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                ballot: 1,
+                outcome: Some(StrictTerminalOutcome::Commit(StrictDecisionCommit {
+                    ts_final: 72,
+                    op_msgpack: Bytes::from(rmp_serde::to_vec(&172u64).unwrap()),
+                })),
+                resolver_node: 0,
+                resolver_boot_epoch: 0,
+                frozen_targets: Vec::new(),
+            }],
+            next_terminal_state_cursor: 1,
+            // Generation counts terminal transitions, including aborts, so
+            // it may legitimately exceed the repository version.
+            terminal_decision_generation: 10_000,
+            history_version: 9_525,
+            history_freshness: 9_525,
+            runtime_started_at: 2,
+            history_node: 2,
+            ..Default::default()
+        };
+
+        {
+            let rt = StrictRuntime::new(
+                repo.clone(),
+                1,
+                1,
+                "channels".to_owned(),
+                net.clone(),
+                CancellationToken::new(),
+                Arc::new(ReplicationConfig::default()),
+            );
+            rt.finish_history_election_for_test();
+            rt.recv_catchup_resp(2, response).await;
+
+            assert!(rt.repository_base_required());
+            assert!(
+                !rt.state.lock().commit_buffer.contains_key(&(72, op_id)),
+                "the imported commit must be fenced before it can enter the delivery buffer"
+            );
+            assert_eq!(
+                rt.terminal_journal
+                    .lock()
+                    .await
+                    .get(op_id)
+                    .and_then(TerminalJournalRecord::required_repository_base_version),
+                Some(9_525)
+            );
+        }
+
+        let recovered = StrictRuntime::new(
+            repo,
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        assert!(recovered.repository_base_required());
+    }
+
+    #[tokio::test]
+    async fn legacy_v5_terminal_suffix_does_not_fence_an_already_current_repository() {
+        let (rt, net, repo) = v1_runtime(ReplicationConfig::default());
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V5);
+        repo.state.lock().0 = 9_525;
+        let op_id = make_op_id(2, 1, 73);
+
+        rt.recv_catchup_resp(
+            2,
+            StrictCatchupResp {
+                terminal_states: vec![StrictTerminalState {
+                    coord_node: 2,
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                    ballot: 1,
+                    outcome: Some(StrictTerminalOutcome::Commit(StrictDecisionCommit {
+                        ts_final: 73,
+                        op_msgpack: Bytes::from(rmp_serde::to_vec(&173u64).unwrap()),
+                    })),
+                    resolver_node: 0,
+                    resolver_boot_epoch: 0,
+                    frozen_targets: Vec::new(),
+                }],
+                next_terminal_state_cursor: 1,
+                terminal_decision_generation: 1,
+                history_version: 9_525,
+                history_freshness: 9_525,
+                runtime_started_at: 2,
+                history_node: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(!rt.repository_base_required());
+        assert_eq!(
+            rt.terminal_journal
+                .lock()
+                .await
+                .get(op_id)
+                .and_then(TerminalJournalRecord::required_repository_base_version),
+            None
+        );
     }
 
     #[tokio::test]
@@ -20744,6 +21088,7 @@ mod tests {
                 CancellationToken::new(),
                 Arc::new(cfg.clone()),
             );
+            rt.finish_history_election_for_test();
             {
                 let mut state = rt.state.lock();
                 state.admission_tracking_started = true;

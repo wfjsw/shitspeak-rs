@@ -834,6 +834,7 @@ impl SyncV3State {
         // terminal/history transfer still merges through the one client
         // coordinator below.
         if reason != StrictCatchupReason::HistoryElection as i32
+            && reason != StrictCatchupReason::Admission as i32
             && (self.clients.contains_key(&peer) || self.responders.contains_key(&peer))
         {
             return None;

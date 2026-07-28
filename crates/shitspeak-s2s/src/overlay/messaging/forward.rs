@@ -47,6 +47,8 @@ const CONTROL_LEVEL: ServiceLevel = ServiceLevel::ReliableLowLatency;
 const CONTROL_METRIC: RoutingMetric = RoutingMetric::ReliableLowLatencyCost;
 const VOICE_TRANSPORT_TTL: Duration = Duration::from_millis(750);
 const DISTRIBUTION_PROCESSING_GUARD: Duration = Duration::from_millis(20);
+const MAX_REPAIR_RESPONSE_PACKETS: usize = 8;
+const MAX_REPAIR_RESPONSE_ENCODED_BYTES: usize = 64 * 1024;
 const MAX_ATTACHMENT_BYTES: usize = 256 * 1024;
 const MAX_ATTACHMENT_CHUNKS: usize = 512;
 const MAX_ATTACHMENT_CHUNK_BYTES: usize = 512;
@@ -405,7 +407,12 @@ pub(crate) async fn originate_with_attachments(
             inline_attachments: attachments_to_proto(&attachments),
         };
         ordering
-            .store_pending_with_identity(lane, data.clone(), retained_logical_send)
+            .store_pending_with_identity_and_ttl(
+                lane,
+                data.clone(),
+                retained_logical_send,
+                options.transport_ttl(),
+            )
             .await;
         ordering.cache_ordered_packet(&data).await;
         if let Err(err) = forward_pb_as(
@@ -1142,7 +1149,8 @@ pub(crate) fn spawn_ordered_retransmit_task(
                 _ = shutdown.cancelled() => return,
                 _ = sleep(tick) => {
                     let due = ordering.due_retransmits(Instant::now()).await;
-                    for data in due {
+                    for pending in due {
+                        let (data, transport_ttl) = pending.into_parts();
                         let class = class_from_wire(data.message_class).unwrap_or(MessageClass::Regular);
                         let _ = forward_pb_as(
                             &transport,
@@ -1151,7 +1159,7 @@ pub(crate) fn spawn_ordered_retransmit_task(
                             data,
                             class,
                             false,
-                            None,
+                            transport_ttl,
                             None,
                         )
                         .await;
@@ -1227,7 +1235,121 @@ async fn send_repair_response(
     packets: Vec<pb::OverlayData>,
     not_found: bool,
 ) -> Result<(), OverlayError> {
-    let control = pb::OverlayControl {
+    if packets.is_empty() {
+        return send_control_to(
+            transport,
+            routing,
+            self_id,
+            requester,
+            repair_response_control(
+                self_id,
+                requester,
+                origin,
+                origin_boot_epoch,
+                final_dst,
+                lane,
+                Vec::new(),
+                not_found,
+            ),
+        )
+        .await;
+    }
+
+    let mut batch = Vec::with_capacity(MAX_REPAIR_RESPONSE_PACKETS);
+    for packet in packets {
+        batch.push(packet);
+        let control = repair_response_control(
+            self_id,
+            requester,
+            origin,
+            origin_boot_epoch,
+            final_dst,
+            lane,
+            batch.clone(),
+            not_found,
+        );
+        let oversized = batch.len() > MAX_REPAIR_RESPONSE_PACKETS
+            || wrap(OverlayBody::Control(control)).encoded_len()
+                > MAX_REPAIR_RESPONSE_ENCODED_BYTES;
+        if !oversized {
+            continue;
+        }
+
+        let overflow = batch.pop().expect("the candidate batch is non-empty");
+        if !batch.is_empty() {
+            send_control_to(
+                transport,
+                routing,
+                self_id,
+                requester,
+                repair_response_control(
+                    self_id,
+                    requester,
+                    origin,
+                    origin_boot_epoch,
+                    final_dst,
+                    lane,
+                    std::mem::take(&mut batch),
+                    not_found,
+                ),
+            )
+            .await?;
+        }
+        batch.push(overflow);
+        let single = repair_response_control(
+            self_id,
+            requester,
+            origin,
+            origin_boot_epoch,
+            final_dst,
+            lane,
+            batch.clone(),
+            not_found,
+        );
+        if wrap(OverlayBody::Control(single)).encoded_len() > MAX_REPAIR_RESPONSE_ENCODED_BYTES {
+            warn!(
+                origin,
+                final_dst,
+                lane = lane.get(),
+                "ordered repair packet exceeds the bounded response size; relying on direct retransmission"
+            );
+            batch.clear();
+        }
+    }
+    if batch.is_empty() {
+        return Ok(());
+    }
+    send_control_to(
+        transport,
+        routing,
+        self_id,
+        requester,
+        repair_response_control(
+            self_id,
+            requester,
+            origin,
+            origin_boot_epoch,
+            final_dst,
+            lane,
+            batch,
+            not_found,
+        ),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn repair_response_control(
+    self_id: NodeIdentifier,
+    requester: NodeIdentifier,
+    origin: NodeIdentifier,
+    origin_boot_epoch: u64,
+    final_dst: NodeIdentifier,
+    lane: LaneId,
+    packets: Vec<pb::OverlayData>,
+    not_found: bool,
+) -> pb::OverlayControl {
+    pb::OverlayControl {
         origin: node_to_wire(origin),
         origin_boot_epoch,
         final_dst: node_to_wire(final_dst),
@@ -1237,8 +1359,16 @@ async fn send_repair_response(
         body: Some(OverlayControlBody::RepairResponse(
             pb::OverlayRepairResponse { packets, not_found },
         )),
-    };
-    send_control_to(transport, routing, self_id, requester, control).await
+    }
+}
+
+fn control_message_class(control: &pb::OverlayControl) -> MessageClass {
+    match control.body.as_ref() {
+        Some(OverlayControlBody::RepairResponse(response)) if !response.packets.is_empty() => {
+            MessageClass::Regular
+        }
+        _ => MessageClass::Control,
+    }
 }
 
 async fn send_control_to(
@@ -1262,6 +1392,7 @@ async fn send_control_to(
         return Ok(());
     }
     let tables = routing.load();
+    let message_class = control_message_class(&control);
     let path_trace_set = path_trace_set(&control.path_trace);
     let next_hop = match select_forward_next_hop_for_send(
         &tables,
@@ -1272,7 +1403,7 @@ async fn send_control_to(
         &path_trace_set,
         false,
         Some(transport),
-        MessageClass::Control,
+        message_class,
         TransportSendOptions::default(),
         None,
     )? {
@@ -1341,7 +1472,7 @@ async fn send_control_to(
             next_hop,
             CONTROL_LEVEL,
             Some(CONTROL_METRIC),
-            MessageClass::Control,
+            message_class,
             payload,
         )
         .await;
@@ -3590,6 +3721,111 @@ mod tests {
             path_trace,
             body: Some(OverlayControlBody::Ack(pb::OverlayAck { next_seq: 5 })),
         }
+    }
+
+    const TEST_MAX_REPAIR_RESPONSE_PACKETS: usize = 8;
+    const TEST_MAX_REPAIR_RESPONSE_ENCODED_BYTES: usize = 64 * 1024;
+
+    #[tokio::test]
+    async fn repair_responses_are_chunked_below_control_packet_and_byte_caps() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let mut target_rx = receivers.pop().expect("target receiver");
+        let routing = control_routing_with_route(2, 2);
+        let packets = (0..17)
+            .map(|seq| {
+                let mut packet = test_overlay_data(false);
+                packet.ordering_seq = seq;
+                packet.payload = Bytes::from(vec![u8::try_from(seq).unwrap(); 8 * 1024]);
+                packet
+            })
+            .collect::<Vec<_>>();
+
+        send_repair_response(
+            &transport,
+            &routing,
+            1,
+            2,
+            1,
+            11,
+            2,
+            LaneId::new(NonZeroU32::new(7).unwrap()),
+            packets,
+            false,
+        )
+        .await
+        .expect("bounded repair responses should enqueue");
+
+        let mut response_sizes = Vec::new();
+        let mut received_packets = 0;
+        while received_packets < 17 {
+            let forwarded = timeout(Duration::from_millis(250), target_rx.recv())
+                .await
+                .expect("repair response should be sent promptly")
+                .expect("repair response stream should remain open");
+            let encoded_len = forwarded.payload().len();
+            assert!(
+                encoded_len <= TEST_MAX_REPAIR_RESPONSE_ENCODED_BYTES,
+                "repair response encoded {encoded_len} bytes, exceeding the response cap"
+            );
+            let decoded = decode_message(forwarded.payload()).expect("overlay repair response");
+            let Some(OverlayBody::Control(control)) = decoded.body else {
+                panic!("not overlay control");
+            };
+            let Some(OverlayControlBody::RepairResponse(response)) = control.body else {
+                panic!("not overlay repair response");
+            };
+            assert!(
+                response.packets.len() <= TEST_MAX_REPAIR_RESPONSE_PACKETS,
+                "repair response carried {} packets, exceeding the packet cap",
+                response.packets.len()
+            );
+            received_packets += response.packets.len();
+            response_sizes.push(response.packets.len());
+        }
+        assert_eq!(received_packets, 17);
+        assert!(
+            response_sizes.len() > 1,
+            "an oversized repair set must be split across bounded frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn data_bearing_repair_response_uses_regular_but_not_found_stays_control() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let mut target_rx = receivers.pop().expect("target receiver");
+        let routing = control_routing_with_route(2, 2);
+        let lane = LaneId::new(NonZeroU32::new(7).unwrap());
+
+        send_repair_response(
+            &transport,
+            &routing,
+            1,
+            2,
+            1,
+            11,
+            2,
+            lane,
+            vec![test_overlay_data(false)],
+            false,
+        )
+        .await
+        .expect("data-bearing repair response should enqueue");
+        let data_response = timeout(Duration::from_millis(250), target_rx.recv())
+            .await
+            .expect("data-bearing repair response should be sent promptly")
+            .expect("repair response stream should remain open");
+        assert_eq!(data_response.class(), MessageClass::Regular);
+
+        send_repair_response(&transport, &routing, 1, 2, 1, 11, 2, lane, Vec::new(), true)
+            .await
+            .expect("not-found repair response should enqueue");
+        let not_found = timeout(Duration::from_millis(250), target_rx.recv())
+            .await
+            .expect("not-found repair response should be sent promptly")
+            .expect("repair response stream should remain open");
+        assert_eq!(not_found.class(), MessageClass::Control);
     }
 
     struct CaptureService {

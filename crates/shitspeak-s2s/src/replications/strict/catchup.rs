@@ -30,8 +30,8 @@ use super::super::metrics::{
 use super::super::proto::{
     CatchupOp, StrictBody, StrictCatchupReason, StrictCatchupReq, StrictCatchupResp,
     StrictClockProbeReq, StrictClockProbeResp, StrictHistoryProbeReq, StrictHistoryProbeResp,
-    StrictHistoryTransferResp, StrictTerminalDelta, StrictTerminalPageKind, StrictTerminalSyncAck,
-    StrictTerminalSyncPage, StrictTerminalSyncReq, StrictTerminalSyncStatus,
+    StrictHistoryTransferResp, StrictTerminalDelta, StrictTerminalOutcome, StrictTerminalPageKind,
+    StrictTerminalSyncAck, StrictTerminalSyncPage, StrictTerminalSyncReq, StrictTerminalSyncStatus,
 };
 use super::history_v3::HistoryServerRequest;
 use super::runtime::{
@@ -934,32 +934,41 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         // may not know it was excluded from a frozen configuration, so use a
         // strictly newer authenticated requester cut to trigger normal
         // history election without waiting for steady-state anti-entropy.
-        {
+        let started_history_election = {
             let mut state = rt.state.lock();
             if !state.history_election_blocks_steady_state() {
                 state.request_history_election();
+                true
+            } else {
+                false
             }
-        }
-        rt.wake_clock_tick_loop();
-        let reciprocal = StrictCatchupReq {
-            src_node: rt.self_id as u32,
-            since_version: local_version,
-            chunk_token: local_version,
-            force_snapshot: false,
-            history_probe_only: false,
-            terminal_state_cursor: 0,
-            terminal_decision_generation: 0,
-            snapshot_transfer_id: 0,
-            snapshot_chunk_cursor: 0,
-            history_transfer: None,
         };
-        metrics::record_catchup_request(CatchupMode::Strict);
-        if let Err(error) = rt
-            .net
-            .send_redundant_unicast(from, &rt.topic, StrictBody::CatchupReq(reciprocal))
-            .await
-        {
-            trace!(%error, from, "strict reciprocal admission catchup request failed");
+        if started_history_election {
+            rt.wake_clock_tick_loop();
+        }
+        // V3 fallbacks are independently rate-limited by the admission loop.
+        // Legacy peers still need this reciprocal request immediately.
+        if !rt.v3_repair_supported_by(from) {
+            let reciprocal = StrictCatchupReq {
+                src_node: rt.self_id as u32,
+                since_version: local_version,
+                chunk_token: local_version,
+                force_snapshot: false,
+                history_probe_only: false,
+                terminal_state_cursor: 0,
+                terminal_decision_generation: 0,
+                snapshot_transfer_id: 0,
+                snapshot_chunk_cursor: 0,
+                history_transfer: None,
+            };
+            metrics::record_catchup_request(CatchupMode::Strict);
+            if let Err(error) = rt
+                .net
+                .send_redundant_unicast(from, &rt.topic, StrictBody::CatchupReq(reciprocal))
+                .await
+            {
+                trace!(%error, from, "strict reciprocal admission catchup request failed");
+            }
         }
     }
     // This is a reply path for an authenticated request that has already
@@ -2222,11 +2231,36 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         );
         return None;
     }
+    let inferred_legacy_repository_base = (correlated_v3_history.is_none()
+        && rt.net.peer_strict_replication_protocol_version(from) >= STRICT_PROTOCOL_VERSION_V5
+        && rt.repo.current_version() < resp.history_version
+        && resp.terminal_states.iter().any(|terminal| {
+            matches!(
+                terminal.outcome.as_ref(),
+                Some(StrictTerminalOutcome::Commit(_))
+            )
+        }))
+    .then_some(resp.history_version);
     // Install terminal fences only after authenticating the response origin,
     // but before considering ordinary history. A joining replica must not
     // revive a delayed v1 proposal while replaying validated catchup.
     for terminal in resp.terminal_states.clone() {
-        if !rt.apply_catchup_terminal_state(terminal).await {
+        let terminal_is_commit = matches!(
+            terminal.outcome.as_ref(),
+            Some(StrictTerminalOutcome::Commit(_))
+        );
+        let installed = if let Some(required_version) =
+            inferred_legacy_repository_base.filter(|_| terminal_is_commit)
+        {
+            // Pre-field V5 peers cannot advertise the exact repository base.
+            // Persist the conservative head requirement atomically with the
+            // imported commit before raising the in-memory delivery fence.
+            rt.apply_catchup_terminal_commit_with_repository_base(terminal, required_version)
+                .await
+        } else {
+            rt.apply_catchup_terminal_state(terminal).await
+        };
+        if !installed {
             metrics::record_strict_fence_rejection();
             metrics::record_pipeline_stage(
                 ReplicationPipelineKind::Strict,
@@ -2439,6 +2473,16 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     }
 
     if can_bootstrap && rt.repo.current_version() > 0 {
+        if let Some(peer) = correlated_v3_history {
+            // An incremental admission transfer can race a newly requested
+            // history election. Its payload is intentionally inadmissible on
+            // a nonempty repository, but retaining the client would suppress
+            // all replacement probes until the long session TTL. Cancel it
+            // and let the election select a fenced snapshot immediately.
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Cancelled).await;
+            rt.state.lock().request_history_election();
+            rt.wake_clock_tick_loop();
+        }
         metrics::record_pipeline_stage(
             ReplicationPipelineKind::Strict,
             ReplicationPipelineStage::CatchupApply,
@@ -3140,15 +3184,24 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
     let source_satisfied = terminal_equal || source_already_known || source_cut.generation() == 0;
     let history_needed = rank.version > rt.repo.current_version();
     let terminal_repository_base_version =
-        if rank.terminal_repository_base_version == 0 && rank.version > source_cut.generation() {
-            // Rolling compatibility with pre-field v5 peers. Zero is also the
-            // exact base for a genesis suffix, so conservatively require a
-            // snapshot only when the repository head exceeds the entire
-            // advertised terminal lineage (node 3's 9,522 vs 2,651 shape).
+        if rank.terminal_repository_base_version == 0 && history_needed {
+            // Rolling compatibility with pre-field V5 peers: zero can mean either
+            // an omitted field or an exact genesis base. The wire version cannot
+            // distinguish them, and terminal generation counts aborts rather than
+            // repository mutations, so conservatively require the advertised
+            // repository head whenever history recovery is needed.
             rank.version
         } else {
             rank.terminal_repository_base_version
         };
+    if reason == StrictCatchupReason::HistoryElection
+        && history_needed
+        && rt.repo.current_version() < terminal_repository_base_version
+    {
+        // Latch the prefix requirement before either terminal synchronization
+        // or the already-satisfied fast path can start repository transfer.
+        rt.require_repository_base(terminal_repository_base_version);
+    }
     if source_satisfied {
         rt.v3_sync
             .lock()
@@ -3165,15 +3218,6 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
             rt.state.lock().finish_history_election();
         }
         return;
-    }
-    if reason == StrictCatchupReason::HistoryElection
-        && history_needed
-        && rt.repo.current_version() < terminal_repository_base_version
-    {
-        // Terminal synchronization is a suffix fence, not a replacement for
-        // the repository prefix represented by the elected history rank.
-        // Latch the prefix requirement before importing any terminal record.
-        rt.require_repository_base(terminal_repository_base_version);
     }
     rt.v3_history
         .lock()
@@ -3311,7 +3355,7 @@ async fn start_v3_repository_after_terminal<R: StrictReplicable>(
     } else {
         rt.repo.current_version()
     };
-    let Some(transfer) = rt.v3_history.lock().begin_transfer(
+    let Some(started) = rt.v3_history.lock().begin_transfer(
         peer,
         rank.version,
         cursor,
@@ -3322,6 +3366,16 @@ async fn start_v3_repository_after_terminal<R: StrictReplicable>(
     ) else {
         return false;
     };
+    let (transfer, preempted_metric_reason) = started.into_parts();
+    if let Some(preempted_metric_reason) = preempted_metric_reason {
+        rt.v3_retries.lock().cancel_history_request(peer);
+        let preempted_reason = CatchupReason::from_v3_wire(preempted_metric_reason as i32)
+            .unwrap_or(CatchupReason::RepositoryGap);
+        metrics::record_strict_catchup_session_completion(
+            preempted_reason,
+            StrictCatchupSessionOutcome::Cancelled,
+        );
+    }
     if inherited_metric_reason.is_none() {
         let metric_reason =
             CatchupReason::from_v3_wire(reason as i32).unwrap_or(CatchupReason::RepositoryGap);
@@ -4322,6 +4376,12 @@ pub(super) async fn recv_v3_terminal_sync_req<R: StrictReplicable>(
                 },
             );
         }
+        // Simultaneous arbitration may have yielded our outbound client and
+        // retained it as the reverse obligation. If this responder direction
+        // cannot acquire resources, no final ACK will exist to resume that
+        // client later, so rearm it immediately after expiring the inbound
+        // reducer attempt.
+        resume_deferred_v3_terminal_sync(rt, peer).await;
         return;
     };
     let now = Instant::now();

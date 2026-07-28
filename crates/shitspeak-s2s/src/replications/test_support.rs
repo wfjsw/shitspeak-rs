@@ -1270,6 +1270,7 @@ mod e2e_tests {
                 ReplicationConfig::default().with_delivery_tick_interval(Duration::from_secs(5)),
             ),
         );
+        rt.finish_history_election_for_test();
         // No start(): only the detached ACK effect needs one scheduler turn.
 
         rt.recv_propose_v1(
@@ -1356,6 +1357,7 @@ mod e2e_tests {
                 ReplicationConfig::default().with_delivery_tick_interval(Duration::from_secs(5)),
             ),
         );
+        rt.finish_history_election_for_test();
 
         rt.recv_propose_v1(
             1,
