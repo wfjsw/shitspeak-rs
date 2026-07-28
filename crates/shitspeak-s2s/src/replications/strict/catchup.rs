@@ -3600,6 +3600,58 @@ where
     effects.iter().find_map(predicate)
 }
 
+fn fail_v3_terminal_checkpoint_client<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    peer: PeerIncarnation,
+    epoch: u64,
+    wire: SessionWireIdentity,
+    request_nonce: u64,
+) {
+    let completed = {
+        let mut sync = rt.v3_sync.lock();
+        let effects = sync.transition_session(
+            peer,
+            SessionEvent::ApplyFailed {
+                epoch: SessionPeerEpoch::new(epoch),
+                wire,
+            },
+        );
+        if !effects
+            .iter()
+            .any(|effect| matches!(effect, SessionEffect::CancelRetry { wire: failed } if *failed == wire))
+        {
+            return;
+        }
+        if let Some(dirty_wire) = terminal_start_wire(&effects) {
+            sync.transition_session(
+                peer,
+                SessionEvent::TransferExpired {
+                    epoch: SessionPeerEpoch::new(epoch),
+                    wire: dirty_wire,
+                },
+            );
+        }
+        sync.finish_client(peer)
+    };
+    rt.v3_retries.lock().complete_request(peer, request_nonce);
+    let Some(completed) = completed else {
+        return;
+    };
+    let recovery_reason = StrictCatchupReason::try_from(completed.reason()).ok();
+    let metric_reason = CatchupReason::from_v3_wire(completed.started_reason())
+        .unwrap_or(CatchupReason::TerminalFence);
+    metrics::record_strict_catchup_session_completion(
+        metric_reason,
+        StrictCatchupSessionOutcome::Failed,
+    );
+    if matches!(
+        recovery_reason,
+        Some(StrictCatchupReason::Admission | StrictCatchupReason::RepositoryGap)
+    ) {
+        request_history_election_if_inactive(rt);
+    }
+}
+
 fn record_terminal_send_result<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     peer: PeerIncarnation,
@@ -5100,7 +5152,7 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
                 };
                 let stage_for_newer_repository = elected_newer_source
                     && rt.v3_sync.lock().client(peer).is_some_and(|client| {
-                        StrictCatchupReason::try_from(client.started_reason()).ok()
+                        StrictCatchupReason::try_from(client.reason()).ok()
                             == Some(StrictCatchupReason::HistoryElection)
                     });
                 if stage_for_newer_repository {
@@ -5118,6 +5170,35 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
                         return;
                     }
                 } else {
+                    // A checkpoint page is one source image. Reject it before
+                    // mutating the local journal so a later retired record
+                    // cannot leave an earlier foreign record installed.
+                    let retired_checkpoint_conflict = {
+                        let journal = rt.terminal_journal.lock().await;
+                        validated
+                            .iter()
+                            .any(|state| journal.is_retired((state.op_id_hi, state.op_id_lo)))
+                    };
+                    let unranked_repository_client =
+                        rt.v3_sync.lock().client(peer).is_some_and(|client| {
+                            matches!(
+                                StrictCatchupReason::try_from(client.reason()).ok(),
+                                Some(
+                                    StrictCatchupReason::Admission
+                                        | StrictCatchupReason::RepositoryGap
+                                )
+                            )
+                        });
+                    if retired_checkpoint_conflict && unranked_repository_client {
+                        fail_v3_terminal_checkpoint_client(
+                            rt,
+                            peer,
+                            epoch,
+                            reducer_wire,
+                            page.request_nonce,
+                        );
+                        return;
+                    }
                     for state in validated {
                         if !rt.apply_v3_catchup_terminal_state(peer, state).await {
                             rt.v3_sync.lock().transition_session(

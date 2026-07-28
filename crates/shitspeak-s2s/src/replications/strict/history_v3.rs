@@ -118,6 +118,31 @@ mod tests {
     }
 
     #[test]
+    fn history_election_replaces_pending_admission_intent() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let rank = HistoryRank {
+            version: 100,
+            freshness: 10,
+            runtime_started_at: 20,
+            node_id: 2,
+            terminal_repository_base_version: 90,
+        };
+        let source_cut = TerminalCut::new([1; 16], 2, [2; 32], [3; 32]);
+        state.defer_until_terminal(peer, rank, source_cut, StrictCatchupReason::Admission);
+
+        state.defer_until_terminal(peer, rank, source_cut, StrictCatchupReason::HistoryElection);
+
+        assert_eq!(
+            state
+                .pending_after_terminal(peer)
+                .expect("pending elected intent")
+                .reason(),
+            StrictCatchupReason::HistoryElection
+        );
+    }
+
+    #[test]
     fn response_claim_is_atomic_and_final_page_has_explicit_ack() {
         let peer = PeerIncarnation::new(2, 11);
         let mut state = HistoryV3State::default();
@@ -403,7 +428,7 @@ impl HistoryV3State {
         self.pending
             .entry(peer)
             .and_modify(|current| {
-                let higher_priority = reason_priority(reason) > reason_priority(current.reason);
+                let higher_priority = transfer_preempts(reason, current.reason);
                 let same_intent_advanced = reason == current.reason
                     && (rank.beats(current.rank)
                         || (source_cut.journal_id() == current.source_cut.journal_id()

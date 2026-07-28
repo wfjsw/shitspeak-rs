@@ -21,7 +21,7 @@ use super::{
         send_v3_metadata_control,
     },
     runtime::{
-        STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V3,
+        HistoryRank, STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V3,
         STRICT_V3_CONTROL_MAX_ENCODED_BYTES, StrictRuntime, make_op_id,
     },
     session_reducer::{
@@ -1147,6 +1147,153 @@ async fn checkpoint_completes_when_requester_has_additional_local_fences() {
     );
 }
 
+async fn retired_checkpoint_conflict_requests_history_election(reason: StrictCatchupReason) {
+    let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
+    let (source, source_net) = runtime(1, config.clone());
+    let (sink, sink_net) = runtime(2, config);
+    let safe = make_op_id(1, 11, 1);
+    let conflicting = make_op_id(2, 22, 1);
+    let retired_floor = make_op_id(2, 30, 1);
+
+    assert!(source.apply_catchup_terminal_state(terminal_abort(1)).await);
+    assert!(
+        source
+            .apply_catchup_terminal_state(StrictTerminalState {
+                coord_node: 2,
+                op_id_hi: conflicting.0,
+                op_id_lo: conflicting.1,
+                ballot: 2,
+                outcome: Some(StrictTerminalOutcome::Abort(StrictDecisionAbort {})),
+                resolver_node: 0,
+                resolver_boot_epoch: 0,
+                frozen_targets: Vec::new(),
+            })
+            .await
+    );
+    {
+        let mut journal = sink.terminal_journal.lock().await;
+        journal
+            .upsert_abort_decision(retired_floor, 2)
+            .expect("retirement floor decision");
+        journal.checkpoint(0).expect("retirement checkpoint");
+        assert!(journal.is_retired(conflicting));
+    }
+
+    request_v3_terminal_sync(&sink, 1, reason).await;
+    let request = terminal_request(sink_net.drain_captures().pop().expect("initial request"));
+    recv_v3_terminal_sync_req(&source, 2, 22, request.clone()).await;
+    let page = terminal_page(source_net.drain_captures().pop().expect("checkpoint page"));
+    assert_eq!(
+        StrictTerminalPageKind::try_from(page.kind).ok(),
+        Some(StrictTerminalPageKind::Checkpoint)
+    );
+    assert_eq!(page.checkpoint_states.len(), 2);
+
+    recv_v3_terminal_sync_page(&sink, 1, 11, page).await;
+
+    let peer = PeerIncarnation::new(1, 11);
+    assert!(sink.state.lock().history_election_pending());
+    assert!(sink.v3_sync.lock().client(peer).is_none());
+    assert!(!sink.v3_retries.lock().request_is_current(peer, &request));
+    assert!(sink_net.drain_captures().into_iter().all(|frame| !matches!(
+        frame,
+        CapturedFrame::StrictUnicast {
+            body: StrictBody::TerminalSyncAck(_),
+            ..
+        }
+    )));
+    let journal = sink.terminal_journal.lock().await;
+    assert!(journal.get(safe).is_none());
+    assert!(journal.is_retired(conflicting));
+}
+
+#[tokio::test]
+async fn admission_checkpoint_retired_conflict_requests_history_election() {
+    retired_checkpoint_conflict_requests_history_election(StrictCatchupReason::Admission).await;
+}
+
+#[tokio::test]
+async fn repository_gap_checkpoint_retired_conflict_requests_history_election() {
+    retired_checkpoint_conflict_requests_history_election(StrictCatchupReason::RepositoryGap).await;
+}
+
+#[tokio::test]
+async fn active_history_election_stages_checkpoint_for_admission_started_client() {
+    let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
+    let (source, source_net) = runtime(1, config.clone());
+    let (sink, sink_net) = runtime(2, config);
+    let source_op = make_op_id(1, 11, 1);
+    let conflicting = make_op_id(2, 22, 1);
+    let retired_floor = make_op_id(2, 30, 1);
+    assert!(source.apply_catchup_terminal_state(terminal_abort(1)).await);
+    assert!(
+        source
+            .apply_catchup_terminal_state(StrictTerminalState {
+                coord_node: 2,
+                op_id_hi: conflicting.0,
+                op_id_lo: conflicting.1,
+                ballot: 2,
+                outcome: Some(StrictTerminalOutcome::Abort(StrictDecisionAbort {})),
+                resolver_node: 0,
+                resolver_boot_epoch: 0,
+                frozen_targets: Vec::new(),
+            })
+            .await
+    );
+    let source_cut = source.terminal_journal.lock().await.terminal_cut();
+    {
+        let mut journal = sink.terminal_journal.lock().await;
+        journal
+            .upsert_abort_decision(retired_floor, 2)
+            .expect("retirement floor decision");
+        journal.checkpoint(0).expect("retirement checkpoint");
+        assert!(journal.is_retired(conflicting));
+    }
+
+    request_v3_terminal_sync(&sink, 1, StrictCatchupReason::Admission).await;
+    let request = terminal_request(sink_net.drain_captures().pop().expect("admission request"));
+    let peer = PeerIncarnation::new(1, 11);
+    sink.state.lock().begin_history_election([1]);
+    sink.v3_history.lock().defer_until_terminal(
+        peer,
+        HistoryRank {
+            version: 1,
+            freshness: 1,
+            runtime_started_at: 11,
+            node_id: 1,
+            terminal_repository_base_version: 0,
+        },
+        source_cut,
+        StrictCatchupReason::HistoryElection,
+    );
+    request_v3_terminal_sync(&sink, 1, StrictCatchupReason::HistoryElection).await;
+    assert!(sink_net.drain_captures().is_empty());
+    {
+        let sync = sink.v3_sync.lock();
+        let client = sync.client(peer).expect("coalesced elected client");
+        assert_eq!(
+            client.started_reason(),
+            StrictCatchupReason::Admission as i32
+        );
+        assert_eq!(client.reason(), StrictCatchupReason::HistoryElection as i32);
+    }
+
+    recv_v3_terminal_sync_req(&source, 2, 22, request).await;
+    let page = terminal_page(source_net.drain_captures().pop().expect("checkpoint page"));
+    recv_v3_terminal_sync_page(&sink, 1, 11, page).await;
+
+    assert!(sink_net.drain_captures().into_iter().any(|frame| matches!(
+        frame,
+        CapturedFrame::StrictUnicast {
+            body: StrictBody::TerminalSyncAck(_),
+            ..
+        }
+    )));
+    let journal = sink.terminal_journal.lock().await;
+    assert!(journal.get(source_op).is_none());
+    assert!(journal.is_retired(conflicting));
+}
+
 #[tokio::test]
 async fn terminal_checkpoint_buffers_commit_from_disjoint_frozen_partition() {
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
@@ -1332,6 +1479,29 @@ fn staged_checkpoint_accumulates_pages_until_the_repository_is_bound() {
         .expect("bound staged checkpoint");
     assert_eq!(staged.target_cut(), target);
     assert_eq!(staged.states().len(), 2);
+}
+
+#[test]
+fn history_election_promotes_an_inflight_admission_terminal_client() {
+    let mut state = SyncV3State::default();
+    let peer = PeerIncarnation::new(1, 11);
+    let ttl = Duration::from_secs(30);
+    state
+        .begin_client(peer, StrictCatchupReason::Admission as i32, ttl)
+        .expect("admission terminal client");
+
+    assert!(
+        state
+            .begin_client(peer, StrictCatchupReason::HistoryElection as i32, ttl)
+            .is_none()
+    );
+
+    let client = state.client(peer).expect("promoted terminal client");
+    assert_eq!(
+        client.started_reason(),
+        StrictCatchupReason::Admission as i32
+    );
+    assert_eq!(client.reason(), StrictCatchupReason::HistoryElection as i32);
 }
 
 #[test]

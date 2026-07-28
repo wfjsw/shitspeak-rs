@@ -200,6 +200,13 @@ fn reason_priority(reason: i32) -> u8 {
     }
 }
 
+fn reason_preempts(candidate: i32, current: i32) -> bool {
+    reason_priority(candidate) > reason_priority(current)
+        || (StrictCatchupReason::try_from(candidate).ok()
+            == Some(StrictCatchupReason::HistoryElection)
+            && StrictCatchupReason::try_from(current).ok() == Some(StrictCatchupReason::Admission))
+}
+
 fn cut_advances(candidate: TerminalCut, baseline: TerminalCut) -> bool {
     candidate.journal_id() != baseline.journal_id()
         || candidate.generation() > baseline.generation()
@@ -217,7 +224,7 @@ pub(super) fn source_cut_covers(candidate: TerminalCut, required: TerminalCut) -
 
 impl ClientSession {
     fn merge_intent(&mut self, reason: i32, desired_cut: Option<TerminalCut>) {
-        if reason_priority(reason) > reason_priority(self.reason) {
+        if reason_preempts(reason, self.reason) {
             self.reason = reason;
         }
         // Once a responder has advertised a fixed target, a newly observed
