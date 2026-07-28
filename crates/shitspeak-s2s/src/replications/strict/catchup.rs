@@ -91,7 +91,7 @@ struct S2sRetiredOperation {
     max_counter: u64,
 }
 
-fn encode_s2s_snapshot_envelope<R: StrictReplicable>(
+pub(super) fn encode_s2s_snapshot_envelope<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     snapshot_version: u64,
     repository_snapshot: Bytes,
@@ -1606,7 +1606,7 @@ fn rearm_history_election<R: StrictReplicable>(rt: &StrictRuntime<R>) {
     rt.wake_clock_tick_loop();
 }
 
-async fn install_snapshot_candidate<R: StrictReplicable>(
+pub(super) async fn install_snapshot_candidate<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     from: NodeIdentifier,
     rank: HistoryRank,
@@ -1658,8 +1658,33 @@ async fn install_snapshot_candidate<R: StrictReplicable>(
         return;
     }
     let installed_version = winner.snapshot_version;
+    let peer_protocol_version = rt.net.peer_strict_replication_protocol_version(from);
+    if rt.repository_base_required() && peer_protocol_version < STRICT_PROTOCOL_VERSION_V5 {
+        warn!(
+            from,
+            peer_protocol_version,
+            "strict repository-base recovery requires a v5 snapshot checkpoint"
+        );
+        if let Some(peer) = correlated_peer {
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+        }
+        rearm_history_election(rt);
+        return;
+    }
+    if !rt.repository_snapshot_satisfies_base(installed_version) {
+        warn!(
+            from,
+            snapshot_version = installed_version,
+            "strict snapshot is older than the required terminal-journal repository base"
+        );
+        if let Some(peer) = correlated_peer {
+            finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+        }
+        rearm_history_election(rt);
+        return;
+    }
     let (repository_snapshot, applied_checkpoint) =
-        if rt.net.peer_strict_replication_protocol_version(from) >= STRICT_PROTOCOL_VERSION_V5 {
+        if peer_protocol_version >= STRICT_PROTOCOL_VERSION_V5 {
             match decode_s2s_snapshot_envelope(winner.snapshot_msgpack) {
                 Ok((snapshot, applied, retired)) => (
                     snapshot,
@@ -1706,11 +1731,21 @@ async fn install_snapshot_candidate<R: StrictReplicable>(
                         return;
                     }
                 };
-                let mut state = rt.state.lock();
-                state.applied_operations.clear();
-                state.retired_operations = merged_retired;
+                rt.state
+                    .lock()
+                    .install_repository_checkpoint(merged_retired);
+            }
+            if !rt.finish_repository_base_install(installed_version) {
+                warn!(
+                    from,
+                    snapshot_version = installed_version,
+                    "strict repository-base requirement advanced during snapshot install"
+                );
+                rearm_history_election(rt);
+                return;
             }
             rt.state.lock().finish_history_election();
+            rt.wake_delivery_and_clock_tick();
             request_history_after_snapshot(rt, from, installed_version, correlated_peer).await;
         }
         Err(error) => {

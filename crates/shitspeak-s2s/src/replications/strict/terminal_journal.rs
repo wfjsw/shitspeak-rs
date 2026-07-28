@@ -1137,7 +1137,6 @@ impl TerminalJournal {
         self.checkpoint_epoch
     }
 
-    #[cfg(test)]
     pub(crate) fn checkpoint_repository_version(&self) -> u64 {
         self.checkpoint_repository_version
     }
