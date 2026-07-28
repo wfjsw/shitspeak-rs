@@ -411,6 +411,63 @@ impl SqliteTerminalJournalStore {
             .commit()
             .map_err(|source| sqlite_error(&self.path, source))
     }
+
+    /// Atomically install repository coverage without rotating the active
+    /// terminal set. History recovery synchronizes that set before fetching
+    /// the repository image, so retaining it keeps the receiver's terminal
+    /// digest equal to the elected source after snapshot installation.
+    pub(crate) fn install_repository_base<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = (&'a TerminalJournalOpId, &'a TerminalJournalRecord)>,
+        epoch: u64,
+        repository_version: u64,
+        retired_origins: &BTreeMap<u64, u64>,
+        cut: &TerminalCut,
+    ) -> Result<(), SqliteTerminalJournalError> {
+        let encoded = encode_records(records.into_iter().collect())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        transaction
+            .execute("DELETE FROM journal_records", [])
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        insert_records(&self.path, &transaction, encoded)?;
+        transaction
+            .execute("DELETE FROM retired_origins", [])
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        {
+            let mut statement = transaction
+                .prepare("INSERT INTO retired_origins (op_id_hi, max_counter) VALUES (?1, ?2)")
+                .map_err(|source| sqlite_error(&self.path, source))?;
+            for (origin, counter) in retired_origins {
+                statement
+                    .execute(params![
+                        origin.to_be_bytes().as_slice(),
+                        counter.to_be_bytes().as_slice()
+                    ])
+                    .map_err(|source| sqlite_error(&self.path, source))?;
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO journal_checkpoint (singleton, epoch, repository_version)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(singleton) DO UPDATE SET
+                     epoch = excluded.epoch,
+                     repository_version = excluded.repository_version",
+                params![
+                    epoch.to_be_bytes().as_slice(),
+                    repository_version.to_be_bytes().as_slice()
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        write_metadata(&transaction, &self.topic, cut)
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
 }
 
 fn create_schema_v2(

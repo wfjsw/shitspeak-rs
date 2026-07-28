@@ -225,6 +225,9 @@ message StrictHistoryProbeResp {
   uint32 history_node                   = 7;
   StrictTerminalCut terminal_cut        = 8;
   StrictCatchupReason reason             = 9;
+  // Lowest repository version from which the advertised active terminal set
+  // can be replayed without changing its committed version assignment.
+  uint64 terminal_repository_base_version = 10;
 }
 
 // V3-only correlation for repository suffix/snapshot pagination. These

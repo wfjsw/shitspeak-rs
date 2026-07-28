@@ -343,6 +343,12 @@ pub(crate) struct TerminalJournalRecord {
     terminal_chain_digest: Option<[u8; DIGEST_LEN]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delivery_version: Option<u64>,
+    /// Repository snapshot version that must be installed before this
+    /// catchup-imported commit may enter normal delivery. This is delivery
+    /// metadata rather than terminal-decision identity, so it is deliberately
+    /// excluded from the canonical terminal digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    required_repository_base_version: Option<u64>,
     #[serde(default)]
     delivered: bool,
 }
@@ -386,6 +392,10 @@ impl TerminalJournalRecord {
 
     pub(crate) fn delivery_version(&self) -> Option<u64> {
         self.delivery_version
+    }
+
+    pub(crate) fn required_repository_base_version(&self) -> Option<u64> {
+        self.required_repository_base_version
     }
 
     pub(crate) fn is_delivered(&self) -> bool {
@@ -1141,6 +1151,70 @@ impl TerminalJournal {
         self.checkpoint_repository_version
     }
 
+    /// The oldest repository image that can safely reuse this journal's
+    /// delivery state. A completed delivery requires its exact version, while
+    /// an unfinished intent requires the immediately preceding version. A
+    /// catchup-imported commit can additionally require a repository snapshot
+    /// explicitly, before it has any delivery intent of its own.
+    pub(crate) fn repository_base_required_version(&self) -> u64 {
+        self.records
+            .values()
+            .flat_map(|record| {
+                let delivery_base = record.delivery_version().map(|version| {
+                    if record.is_delivered() {
+                        version
+                    } else {
+                        version.saturating_sub(1)
+                    }
+                });
+                [delivery_base, record.required_repository_base_version()]
+                    .into_iter()
+                    .flatten()
+            })
+            .fold(self.checkpoint_repository_version, u64::max)
+    }
+
+    /// Repository prefix required before this active terminal set can be
+    /// replayed without changing the source's version assignment. A
+    /// contiguous delivered suffix can follow its immediate predecessor;
+    /// gaps or legacy delivery stamps require the complete current image.
+    pub(crate) fn repository_replay_base_version(&self, repository_version: u64) -> u64 {
+        let mut delivered_versions = Vec::new();
+        let mut has_undelivered_commit = false;
+        for record in self.records.values() {
+            if !matches!(
+                record.terminal_decision(),
+                Some(TerminalDecision::Commit { .. })
+            ) {
+                continue;
+            }
+            if record.is_delivered() {
+                let Some(version) = record.delivery_version() else {
+                    return repository_version;
+                };
+                delivered_versions.push(version);
+            } else {
+                has_undelivered_commit = true;
+            }
+        }
+        if delivered_versions.is_empty() {
+            return if has_undelivered_commit {
+                repository_version
+            } else {
+                0
+            };
+        }
+        delivered_versions.sort_unstable();
+        let contiguous = delivered_versions
+            .windows(2)
+            .all(|pair| pair[1] == pair[0].saturating_add(1));
+        if contiguous && delivered_versions.last() == Some(&repository_version) {
+            delivered_versions[0].saturating_sub(1)
+        } else {
+            repository_version
+        }
+    }
+
     pub(crate) fn delivery_version(&self, op_id: TerminalJournalOpId) -> Option<u64> {
         self.records
             .get(&op_id)
@@ -1195,11 +1269,10 @@ impl TerminalJournal {
         Ok(())
     }
 
-    /// Replace the delivery ledger and rotate the terminal journal in the
-    /// same SQLite transaction after a repository snapshot is installed.
-    /// Incoming retirement floors belong to that snapshot; local floors are
-    /// deliberately not unioned because the replacement image may not cover
-    /// their effects.
+    /// Reconcile the delivery ledger with an elected repository image while
+    /// preserving the already-synchronized active terminal set. Delivery
+    /// metadata is outside the canonical terminal digest, so the receiver
+    /// remains equal to the source after installing the repository base.
     pub(crate) fn install_repository_checkpoint(
         &mut self,
         repository_version: u64,
@@ -1217,45 +1290,90 @@ impl TerminalJournal {
             ) {
                 continue;
             }
-            let Some(version) = delivered.get(op_id).copied() else {
-                return Err(TerminalJournalError::CheckpointHasUndeliveredCommits);
-            };
-            if version > repository_version {
-                return Err(TerminalJournalError::ConflictingDeliveryVersion {
-                    op_id_hi: op_id.0,
-                    op_id_lo: op_id.1,
-                });
+            if let Some(version) = delivered.get(op_id).copied() {
+                if version > repository_version {
+                    return Err(TerminalJournalError::ConflictingDeliveryVersion {
+                        op_id_hi: op_id.0,
+                        op_id_lo: op_id.1,
+                    });
+                }
+                record.delivery_version = Some(version);
+                record.delivered = true;
+            } else {
+                if record.is_delivered() {
+                    return Err(TerminalJournalError::CheckpointHasUndeliveredCommits);
+                }
+                // The elected source may have chosen a commit that is not in
+                // its repository image yet. Keep the fence terminal but make
+                // it deliverable only after the snapshot base is installed.
+                record.delivery_version = None;
+                record.delivered = false;
             }
-            record.delivery_version = Some(version);
-            record.delivered = true;
         }
 
         let epoch = self
             .checkpoint_epoch
             .checked_add(1)
             .ok_or(TerminalJournalError::CheckpointEpochExhausted)?;
-        let retired_origins = compact_retired_origins_by_node(retirement_floors_cover_records(
-            incoming_retired,
-            candidate.keys(),
-        )?);
-        let journal_id = generate_journal_id()?;
-        let commitment = TerminalSetCommitment::empty();
-        let retired_set_digest = compute_retired_set_digest(&retired_origins);
-        let digest = combined_terminal_set_digest(retired_set_digest, commitment.digest());
-        let cut = TerminalCut::new(journal_id, 0, EMPTY_CHAIN_DIGEST, digest);
-        if let Some(store) = self.store.as_mut() {
-            store.checkpoint(epoch, repository_version, &retired_origins, &cut)?;
+        let retired_origins = compact_retired_origins_by_node(incoming_retired.clone());
+        if candidate.keys().any(|op_id| {
+            let node = op_id.0 >> 48;
+            let lower = node << 48;
+            let upper = lower | 0x0000_FFFF_FFFF_FFFF;
+            retired_origins
+                .range(lower..=upper)
+                .next_back()
+                .is_some_and(|(origin, counter)| {
+                    op_id.0 < *origin || (op_id.0 == *origin && op_id.1 <= *counter)
+                })
+        }) {
+            return Err(TerminalJournalError::CheckpointHasOperationGaps);
+        }
+        for op_id in delivered.keys() {
+            let represented = candidate.contains_key(op_id) || {
+                let node = op_id.0 >> 48;
+                let lower = node << 48;
+                let upper = lower | 0x0000_FFFF_FFFF_FFFF;
+                retired_origins
+                    .range(lower..=upper)
+                    .next_back()
+                    .is_some_and(|(origin, counter)| {
+                        op_id.0 < *origin || (op_id.0 == *origin && op_id.1 <= *counter)
+                    })
+            };
+            if !represented {
+                return Err(TerminalJournalError::CheckpointHasUndeliveredCommits);
+            }
         }
 
-        self.records.clear();
-        self.journal_id = journal_id;
-        self.terminal_decision_generation = 0;
-        self.terminal_chain_digest = EMPTY_CHAIN_DIGEST;
+        let commitment = TerminalSetCommitment::from_records(&candidate, u64::MAX);
+        let retired_set_digest = compute_retired_set_digest(&retired_origins);
+        let digest = combined_terminal_set_digest(retired_set_digest, commitment.digest());
+        let cut = TerminalCut::new(
+            self.journal_id,
+            self.terminal_decision_generation,
+            self.terminal_chain_digest,
+            digest,
+        );
+        if let Some(store) = self.store.as_mut() {
+            store.install_repository_base(
+                candidate.iter(),
+                epoch,
+                repository_version,
+                &retired_origins,
+                &cut,
+            )?;
+        }
+
+        self.records = candidate;
         self.terminal_set_digest = digest;
         self.terminal_set_commitment = commitment;
         self.retired_set_digest = retired_set_digest;
-        self.generation_index.clear();
-        self.terminal_set_digest_cache = initial_terminal_set_digest_cache(0, digest, digest);
+        self.terminal_set_digest_cache = rebuild_terminal_set_digest_cache(
+            &self.records,
+            &self.generation_index,
+            retired_set_digest,
+        );
         self.checkpoint_epoch = epoch;
         self.checkpoint_repository_version = repository_version;
         self.retired_origins = retired_origins.clone();
@@ -1900,6 +2018,15 @@ impl TerminalJournal {
         op_id: TerminalJournalOpId,
         decision: TerminalDecision,
     ) -> Result<bool, TerminalJournalError> {
+        self.upsert_decision_with_repository_base(op_id, decision, None)
+    }
+
+    fn upsert_decision_with_repository_base(
+        &mut self,
+        op_id: TerminalJournalOpId,
+        decision: TerminalDecision,
+        required_repository_base_version: Option<u64>,
+    ) -> Result<bool, TerminalJournalError> {
         self.mutate(op_id, |record| {
             if record.frozen_targets.is_some() {
                 return Err(TerminalJournalError::MissingV2TerminalIdentity {
@@ -1907,7 +2034,10 @@ impl TerminalJournal {
                     op_id_lo: op_id.1,
                 });
             }
-            upsert_decision_in_record(record, op_id, decision)
+            let decision_changed = upsert_decision_in_record(record, op_id, decision)?;
+            let repository_base_changed = required_repository_base_version
+                .is_some_and(|version| require_repository_base_in_record(record, version));
+            Ok(decision_changed || repository_base_changed)
         })
     }
 
@@ -1929,6 +2059,31 @@ impl TerminalJournal {
             frozen_targets,
             resolver,
             TerminalDecision::commit_bytes(ballot, ts_final, op_msgpack),
+            None,
+        )
+    }
+
+    /// Atomically persist a catchup-imported v2 commit and the repository
+    /// snapshot version required beneath it. Persisting both in one record
+    /// replacement prevents restart from exposing the commit to delivery
+    /// before the missing repository base is installed.
+    pub(crate) fn upsert_v2_commit_decision_with_repository_base_bytes(
+        &mut self,
+        op_id: TerminalJournalOpId,
+        frozen_targets: &[FrozenTarget],
+        resolver: TerminalResolver,
+        ballot: u64,
+        ts_final: u64,
+        op_msgpack: Bytes,
+        required_repository_base_version: u64,
+    ) -> Result<bool, TerminalJournalError> {
+        debug_assert!(required_repository_base_version > 0);
+        self.upsert_v2_decision(
+            op_id,
+            frozen_targets,
+            resolver,
+            TerminalDecision::commit_bytes(ballot, ts_final, op_msgpack),
+            Some(required_repository_base_version),
         )
     }
 
@@ -1945,6 +2100,7 @@ impl TerminalJournal {
             frozen_targets,
             resolver,
             TerminalDecision::abort(ballot),
+            None,
         )
     }
 
@@ -1954,12 +2110,15 @@ impl TerminalJournal {
         frozen_targets: &[FrozenTarget],
         resolver: TerminalResolver,
         decision: TerminalDecision,
+        required_repository_base_version: Option<u64>,
     ) -> Result<bool, TerminalJournalError> {
         self.mutate(op_id, |record| {
             let identity_changed =
                 attach_v2_terminal_identity(record, op_id, frozen_targets, resolver)?;
             let decision_changed = learn_v2_terminal_decision_in_record(record, op_id, decision)?;
-            Ok(identity_changed || decision_changed)
+            let repository_base_changed = required_repository_base_version
+                .is_some_and(|version| require_repository_base_in_record(record, version));
+            Ok(identity_changed || decision_changed || repository_base_changed)
         })
     }
 
@@ -1987,6 +2146,24 @@ impl TerminalJournal {
         self.upsert_decision(
             op_id,
             TerminalDecision::commit_bytes(ballot, ts_final, op_msgpack),
+        )
+    }
+
+    /// Atomically persist a catchup-imported legacy commit and the repository
+    /// snapshot version required beneath it.
+    pub(crate) fn upsert_commit_decision_with_repository_base_bytes(
+        &mut self,
+        op_id: TerminalJournalOpId,
+        ballot: u64,
+        ts_final: u64,
+        op_msgpack: Bytes,
+        required_repository_base_version: u64,
+    ) -> Result<bool, TerminalJournalError> {
+        debug_assert!(required_repository_base_version > 0);
+        self.upsert_decision_with_repository_base(
+            op_id,
+            TerminalDecision::commit_bytes(ballot, ts_final, op_msgpack),
+            Some(required_repository_base_version),
         )
     }
 
@@ -2283,6 +2460,21 @@ fn upsert_accepted_candidate_in_record(
             Ok(true)
         }
     }
+}
+
+fn require_repository_base_in_record(
+    record: &mut TerminalJournalRecord,
+    required_repository_base_version: u64,
+) -> bool {
+    if required_repository_base_version == 0
+        || record
+            .required_repository_base_version
+            .is_some_and(|current| current >= required_repository_base_version)
+    {
+        return false;
+    }
+    record.required_repository_base_version = Some(required_repository_base_version);
+    true
 }
 
 fn upsert_decision_in_record(
@@ -2894,7 +3086,12 @@ fn validate_record(
             "delivered commit is missing its repository version",
         ));
     }
-    if (record.delivery_version.is_some() || record.delivered)
+    if record.required_repository_base_version == Some(0) {
+        return Err(invalid("required repository base version is zero"));
+    }
+    if (record.delivery_version.is_some()
+        || record.required_repository_base_version.is_some()
+        || record.delivered)
         && !matches!(
             record.terminal_decision(),
             Some(TerminalDecision::Commit { .. })
@@ -3010,7 +3207,7 @@ fn sync_parent_directory(_parent: &Path) -> Result<(), TerminalJournalError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, process::Command};
+    use std::{collections::BTreeMap, env, fs, process::Command};
 
     use bytes::Bytes;
     use tempfile::TempDir;
@@ -3050,6 +3247,221 @@ mod tests {
             b"op"
         );
         assert_eq!(journal.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn repository_base_required_version_uses_checkpoint_and_highest_delivered_suffix() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        journal.checkpoint(40).unwrap();
+
+        journal
+            .upsert_commit_decision((1, 1), 1, 1, b"first".to_vec())
+            .unwrap();
+        journal.begin_delivery((1, 1), 12).unwrap();
+        journal.finish_delivery((1, 1), 12).unwrap();
+        assert_eq!(journal.repository_base_required_version(), 40);
+
+        journal
+            .upsert_commit_decision((1, 2), 1, 2, b"second".to_vec())
+            .unwrap();
+        journal.begin_delivery((1, 2), 53).unwrap();
+        journal.finish_delivery((1, 2), 53).unwrap();
+        assert_eq!(journal.repository_base_required_version(), 53);
+    }
+
+    #[test]
+    fn repository_replay_base_distinguishes_contiguous_and_legacy_stamped_suffixes() {
+        let mut contiguous = TerminalJournal::in_memory("channels");
+        for (counter, version) in [(1, 7), (2, 8), (3, 9)] {
+            let op_id = (1, counter);
+            contiguous
+                .upsert_commit_decision(op_id, 1, version, vec![counter as u8])
+                .unwrap();
+            contiguous.begin_delivery(op_id, version).unwrap();
+            contiguous.finish_delivery(op_id, version).unwrap();
+        }
+        assert_eq!(contiguous.repository_replay_base_version(9), 6);
+
+        let mut legacy_stamped = TerminalJournal::in_memory("channels");
+        for counter in 1..=3 {
+            let op_id = (2, counter);
+            legacy_stamped
+                .upsert_commit_decision(op_id, 1, counter, vec![counter as u8])
+                .unwrap();
+            legacy_stamped.begin_delivery(op_id, 9).unwrap();
+            legacy_stamped.finish_delivery(op_id, 9).unwrap();
+        }
+        assert_eq!(legacy_stamped.repository_replay_base_version(9), 9);
+
+        let mut pending = TerminalJournal::in_memory("channels");
+        pending
+            .upsert_commit_decision((3, 1), 1, 10, b"pending".to_vec())
+            .unwrap();
+        assert_eq!(pending.repository_replay_base_version(6), 6);
+
+        let mut abort_only = TerminalJournal::in_memory("channels");
+        abort_only.upsert_abort_decision((4, 1), 1).unwrap();
+        assert_eq!(abort_only.repository_replay_base_version(6), 0);
+    }
+
+    #[test]
+    fn undelivered_intent_requires_the_preceding_repository_version() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        journal
+            .upsert_commit_decision((1, 1), 1, 1, b"pending".to_vec())
+            .unwrap();
+        journal.begin_delivery((1, 1), 99).unwrap();
+
+        assert_eq!(journal.delivery_version((1, 1)), Some(99));
+        assert!(!journal.get((1, 1)).unwrap().is_delivered());
+        assert_eq!(journal.repository_base_required_version(), 98);
+    }
+
+    #[test]
+    fn catchup_repository_base_is_atomic_monotonic_and_survives_reload() {
+        let root = TempDir::new().unwrap();
+        let op_id = (0x0008_0000_0000_0001, 1);
+        {
+            let mut journal =
+                TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+            assert!(
+                journal
+                    .upsert_commit_decision_with_repository_base_bytes(
+                        op_id,
+                        7,
+                        91,
+                        Bytes::from_static(b"caught-up"),
+                        40,
+                    )
+                    .unwrap()
+            );
+            assert_eq!(journal.repository_base_required_version(), 40);
+            assert_eq!(
+                journal
+                    .get(op_id)
+                    .unwrap()
+                    .required_repository_base_version(),
+                Some(40)
+            );
+            let terminal_cut = journal.terminal_cut();
+
+            assert!(
+                journal
+                    .upsert_commit_decision_with_repository_base_bytes(
+                        op_id,
+                        7,
+                        91,
+                        Bytes::from_static(b"caught-up"),
+                        53,
+                    )
+                    .unwrap()
+            );
+            assert_eq!(journal.terminal_cut(), terminal_cut);
+            assert!(
+                !journal
+                    .upsert_commit_decision_with_repository_base_bytes(
+                        op_id,
+                        7,
+                        91,
+                        Bytes::from_static(b"caught-up"),
+                        41,
+                    )
+                    .unwrap()
+            );
+        }
+
+        let reloaded = TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+        assert_eq!(reloaded.repository_base_required_version(), 53);
+        assert_eq!(
+            reloaded
+                .get(op_id)
+                .unwrap()
+                .required_repository_base_version(),
+            Some(53)
+        );
+        assert!(!reloaded.get(op_id).unwrap().is_delivered());
+        assert_eq!(reloaded.delivery_version(op_id), None);
+    }
+
+    #[test]
+    fn v2_catchup_commit_atomically_records_repository_base() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        let op_id = (0x0009_0000_0000_0001, 1);
+        let targets = [FrozenTarget::new(1, 10), FrozenTarget::new(9, 90)];
+        assert!(
+            journal
+                .upsert_v2_commit_decision_with_repository_base_bytes(
+                    op_id,
+                    &targets,
+                    TerminalResolver::new(1, 10),
+                    8,
+                    92,
+                    Bytes::from_static(b"v2-caught-up"),
+                    71,
+                )
+                .unwrap()
+        );
+
+        let record = journal.get(op_id).unwrap();
+        assert_eq!(record.required_repository_base_version(), Some(71));
+        assert_eq!(record.frozen_targets(), Some(targets.as_slice()));
+        assert_eq!(journal.repository_base_required_version(), 71);
+    }
+
+    #[test]
+    fn repository_base_install_preserves_the_synchronized_active_terminal_cut() {
+        let root = TempDir::new().unwrap();
+        let delivered_op = (0x0008_0000_0000_0001, 1);
+        let pending_op = (0x0008_0000_0000_0001, 2);
+        let source_cut;
+        {
+            let mut journal =
+                TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+            journal
+                .upsert_commit_decision_with_repository_base_bytes(
+                    delivered_op,
+                    1,
+                    10,
+                    Bytes::from_static(b"delivered"),
+                    7,
+                )
+                .unwrap();
+            journal
+                .upsert_commit_decision_with_repository_base_bytes(
+                    pending_op,
+                    1,
+                    11,
+                    Bytes::from_static(b"pending"),
+                    7,
+                )
+                .unwrap();
+            source_cut = journal.terminal_cut();
+
+            let retired = journal
+                .install_repository_checkpoint(
+                    7,
+                    &BTreeMap::from([(delivered_op, 7)]),
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+
+            assert!(retired.is_empty());
+            assert_eq!(journal.terminal_cut(), source_cut);
+            assert_eq!(journal.record_count(), 2);
+            assert!(journal.get(delivered_op).unwrap().is_delivered());
+            assert_eq!(journal.delivery_version(delivered_op), Some(7));
+            assert!(!journal.get(pending_op).unwrap().is_delivered());
+            assert_eq!(journal.delivery_version(pending_op), None);
+            assert_eq!(journal.repository_base_required_version(), 7);
+        }
+
+        let reloaded = TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+        assert_eq!(reloaded.terminal_cut(), source_cut);
+        assert_eq!(reloaded.record_count(), 2);
+        assert!(reloaded.get(delivered_op).unwrap().is_delivered());
+        assert!(!reloaded.get(pending_op).unwrap().is_delivered());
+        assert_eq!(reloaded.checkpoint_repository_version(), 7);
+        assert_eq!(reloaded.repository_base_required_version(), 7);
     }
 
     #[test]

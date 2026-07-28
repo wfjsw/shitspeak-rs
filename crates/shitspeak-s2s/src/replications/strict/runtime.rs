@@ -1503,6 +1503,7 @@ pub(crate) struct HistoryRank {
     pub freshness: i64,
     pub runtime_started_at: u64,
     pub node_id: NodeIdentifier,
+    pub terminal_repository_base_version: u64,
 }
 
 fn bootstrap_reachable_peers(net: &dyn StrictNet, self_id: NodeIdentifier) -> Vec<NodeIdentifier> {
@@ -1532,6 +1533,7 @@ impl HistoryRank {
             freshness: metadata.freshness,
             runtime_started_at,
             node_id,
+            terminal_repository_base_version: 0,
         }
     }
 
@@ -2503,6 +2505,10 @@ impl StrictState {
             .max(repository_version);
     }
 
+    fn repository_base_required_version(&self) -> u64 {
+        self.repository_base_required_version
+    }
+
     fn repository_base_missing(&self, repository_version: u64) -> bool {
         repository_version < self.repository_base_required_version
     }
@@ -2519,7 +2525,11 @@ impl StrictState {
         true
     }
 
-    pub(super) fn install_repository_checkpoint(&mut self, retired: BTreeMap<u64, u64>) {
+    pub(super) fn install_repository_checkpoint(
+        &mut self,
+        applied: BTreeMap<OpId, u64>,
+        retired: BTreeMap<u64, u64>,
+    ) {
         let is_retired = |op_id: &OpId| {
             let node = op_id.0 >> 48;
             let lower = node << 48;
@@ -2531,10 +2541,12 @@ impl StrictState {
                     op_id.0 < *origin || (op_id.0 == *origin && op_id.1 <= *counter)
                 })
         };
-        self.commit_buffer
-            .retain(|_, buffered| !is_retired(&buffered.op_id));
-        self.delivering_commits.retain(|op_id| !is_retired(op_id));
-        self.applied_operations.clear();
+        self.commit_buffer.retain(|_, buffered| {
+            !applied.contains_key(&buffered.op_id) && !is_retired(&buffered.op_id)
+        });
+        self.delivering_commits
+            .retain(|op_id| !applied.contains_key(op_id) && !is_retired(op_id));
+        self.applied_operations = applied.into_iter().collect();
         self.terminal_decisions
             .retain(|op_id, _| !is_retired(op_id));
         self.terminal_decision_identities
@@ -3305,6 +3317,17 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.state.lock().repository_base_required()
     }
 
+    pub(super) fn require_repository_base(&self, repository_version: u64) {
+        self.state
+            .lock()
+            .require_repository_base(repository_version);
+    }
+
+    fn repository_base_required_version(&self) -> Option<u64> {
+        let version = self.state.lock().repository_base_required_version();
+        (version > 0).then_some(version)
+    }
+
     pub(super) fn repository_snapshot_satisfies_base(&self, repository_version: u64) -> bool {
         !self
             .state
@@ -3537,14 +3560,14 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
         };
         let durable_repository_version = repo.current_version();
-        let checkpoint_repository_version = journal.checkpoint_repository_version();
-        let repository_base_missing = durable_repository_version < checkpoint_repository_version;
+        let required_repository_version = journal.repository_base_required_version();
+        let repository_base_missing = durable_repository_version < required_repository_version;
         let legacy_delivered = repo
             .legacy_applied_operation_ids()
             .into_iter()
             .map(|op_id| (op_id, durable_repository_version))
             .collect::<BTreeMap<_, _>>();
-        if !legacy_delivered.is_empty() {
+        if !repository_base_missing && !legacy_delivered.is_empty() {
             if let Err(error) = journal
                 .merge_legacy_delivery_checkpoint(durable_repository_version, &legacy_delivered)
             {
@@ -3557,8 +3580,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             warn!(
                 topic = %topic,
                 repository_version = durable_repository_version,
-                required_repository_version = checkpoint_repository_version,
-                "strict repository base is older than its terminal journal checkpoint; preserving delivery markers and requiring a repository snapshot"
+                required_repository_version,
+                "strict repository base is older than its durable delivery history; preserving delivery markers and requiring a repository snapshot"
             );
         } else if let Err(error) = journal.recover_delivery_intents(durable_repository_version) {
             error!(topic = %topic, error = %error, "strict delivery checkpoint recovery failed");
@@ -3604,7 +3627,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         };
         let mut initial_state = StrictState::new();
         if repository_base_missing {
-            initial_state.require_repository_base(checkpoint_repository_version);
+            initial_state.require_repository_base(required_repository_version);
         }
         let arc = Arc::new(Self {
             repo,
@@ -4910,6 +4933,28 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         state_changed
     }
 
+    pub(super) async fn requeue_undelivered_terminal_journal_commits(&self) {
+        let pending = self
+            .terminal_journal
+            .lock()
+            .await
+            .snapshot()
+            .into_iter()
+            .filter_map(|entry| {
+                let (op_id, record) = entry.into_parts();
+                (!record.is_delivered()
+                    && matches!(
+                        record.terminal_decision(),
+                        Some(JournalTerminalDecision::Commit { .. })
+                    ))
+                .then_some(op_id)
+            })
+            .collect::<Vec<_>>();
+        for op_id in pending {
+            self.requeue_terminal_journal_commit(op_id).await;
+        }
+    }
+
     async fn apply_terminal_commit_with_descriptor(
         &self,
         op_id: OpId,
@@ -4917,6 +4962,21 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         ts_final: u64,
         op_msgpack: Bytes,
         identity: Option<&TerminalDecisionIdentity>,
+    ) -> TerminalInstallResult {
+        self.apply_terminal_commit_with_descriptor_and_repository_base(
+            op_id, ballot, ts_final, op_msgpack, identity, None,
+        )
+        .await
+    }
+
+    async fn apply_terminal_commit_with_descriptor_and_repository_base(
+        &self,
+        op_id: OpId,
+        ballot: u64,
+        ts_final: u64,
+        op_msgpack: Bytes,
+        identity: Option<&TerminalDecisionIdentity>,
+        required_repository_base_version: Option<u64>,
     ) -> TerminalInstallResult {
         if let Some(identity) = identity {
             if !self.v2_terminal_commit_fits_catchup_budget(
@@ -4938,8 +4998,18 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let op_msgpack_for_journal = op_msgpack.clone();
         let result = self
             .with_terminal_journal_mutation(move |journal| {
-                let changed = match identity_owned.as_ref() {
-                    Some(identity) => journal.upsert_v2_commit_decision_bytes(
+                let changed = match (identity_owned.as_ref(), required_repository_base_version) {
+                    (Some(identity), Some(required_version)) => journal
+                        .upsert_v2_commit_decision_with_repository_base_bytes(
+                            op_id,
+                            &identity.frozen_targets,
+                            identity.resolver,
+                            ballot,
+                            ts_final,
+                            op_msgpack_for_journal.clone(),
+                            required_version,
+                        ),
+                    (Some(identity), None) => journal.upsert_v2_commit_decision_bytes(
                         op_id,
                         &identity.frozen_targets,
                         identity.resolver,
@@ -4947,7 +5017,15 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                         ts_final,
                         op_msgpack_for_journal.clone(),
                     ),
-                    None => journal.upsert_commit_decision_bytes(
+                    (None, Some(required_version)) => journal
+                        .upsert_commit_decision_with_repository_base_bytes(
+                            op_id,
+                            ballot,
+                            ts_final,
+                            op_msgpack_for_journal,
+                            required_version,
+                        ),
+                    (None, None) => journal.upsert_commit_decision_bytes(
                         op_id,
                         ballot,
                         ts_final,
@@ -4983,7 +5061,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let state_changed = {
                 let mut state = self.state.lock();
                 hydrate_terminal_journal_record(&mut state, op_id, &record, true);
-                enqueue_terminal_commit_for_delivery(&mut state, op_id, &record)
+                !state.repository_base_required()
+                    && enqueue_terminal_commit_for_delivery(&mut state, op_id, &record)
             };
             if state_changed {
                 self.wake_delivery_and_clock_tick();
@@ -5017,13 +5096,15 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let clock = state.clock;
             state.peer_clocks.insert(self.self_id, clock);
             if state.mark_committed(op_id, ts_final) {
-                state.buffer_commit(op_id, ts_final, op_msgpack);
-                if state.history_election_active() {
-                    // A terminal-fenced commit learned during probing must
-                    // drain before a snapshot election can safely continue.
-                    // Return the election to requested/idle; the delivery
-                    // loop explicitly permits that prerequisite drain.
-                    state.request_history_election();
+                if !state.repository_base_required() {
+                    state.buffer_commit(op_id, ts_final, op_msgpack);
+                    if state.history_election_active() {
+                        // A terminal-fenced commit learned during probing must
+                        // drain before a snapshot election can safely continue.
+                        // Return the election to requested/idle; the delivery
+                        // loop explicitly permits that prerequisite drain.
+                        state.request_history_election();
+                    }
                 }
                 state_changed = true;
             }
@@ -5421,7 +5502,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     pub(crate) async fn apply_catchup_terminal_state(&self, terminal: StrictTerminalState) -> bool {
-        self.install_catchup_terminal_state(terminal)
+        self.install_catchup_terminal_state(terminal, self.repository_base_required_version())
             .await
             .is_some()
     }
@@ -5429,6 +5510,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     async fn install_catchup_terminal_state(
         &self,
         terminal: StrictTerminalState,
+        required_repository_base_version: Option<u64>,
     ) -> Option<TerminalTransition> {
         if !self.terminal_storage_ready() {
             metrics::record_strict_fence_rejection();
@@ -5485,12 +5567,13 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let outcome = terminal.outcome;
         let install = match outcome {
             Some(StrictTerminalOutcome::Commit(commit)) => {
-                self.apply_terminal_commit_with_descriptor(
+                self.apply_terminal_commit_with_descriptor_and_repository_base(
                     op_id,
                     terminal.ballot,
                     commit.ts_final,
                     commit.op_msgpack,
                     identity.as_ref(),
+                    required_repository_base_version,
                 )
                 .await
             }
@@ -5550,7 +5633,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         peer: PeerIncarnation,
         terminal: StrictTerminalState,
     ) -> bool {
-        let Some(transition) = self.install_catchup_terminal_state(terminal).await else {
+        let Some(transition) = self
+            .install_catchup_terminal_state(terminal, self.repository_base_required_version())
+            .await
+        else {
             return false;
         };
         let effects =
@@ -12704,6 +12790,88 @@ mod tests {
         }
     }
 
+    struct RetainedLegacyLedgerRepo {
+        inner: Arc<CountingStrictRepo>,
+        retained_op_id: OpId,
+    }
+
+    impl RetainedLegacyLedgerRepo {
+        fn new(retained_op_id: OpId) -> Arc<Self> {
+            Arc::new(Self {
+                inner: CountingStrictRepo::new(),
+                retained_op_id,
+            })
+        }
+
+        fn log(&self) -> Vec<(u64, u64)> {
+            self.inner.log()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StrictReplicable for RetainedLegacyLedgerRepo {
+        type Op = u64;
+
+        fn strict_replication_protocol_version(&self) -> u32 {
+            self.inner.strict_replication_protocol_version()
+        }
+
+        fn legacy_applied_operation_ids(&self) -> Vec<OpId> {
+            vec![self.retained_op_id]
+        }
+
+        fn current_version(&self) -> u64 {
+            self.inner.current_version()
+        }
+
+        fn snapshot(
+            &self,
+        ) -> Result<(u64, Bytes), crate::replications::strict::StrictSnapshotError> {
+            self.inner.snapshot()
+        }
+
+        fn log_since(
+            &self,
+            since: u64,
+        ) -> crate::replications::strict::LogSlice<
+            crate::replications::strict::StrictLogEntry<Self::Op>,
+        > {
+            self.inner.log_since(since)
+        }
+
+        async fn apply_committed(&self, version: u64, op: Self::Op) {
+            self.inner.apply_committed(version, op).await;
+        }
+
+        async fn apply_committed_with_metadata(
+            &self,
+            version: u64,
+            op: Self::Op,
+            metadata: Option<StrictLogMetadata>,
+        ) {
+            self.inner
+                .apply_committed_with_metadata(version, op, metadata)
+                .await;
+        }
+
+        async fn apply_committed_once(
+            &self,
+            version: u64,
+            op: Self::Op,
+            metadata: StrictLogMetadata,
+        ) -> StrictCommitApplyOutcome {
+            self.inner.apply_committed_once(version, op, metadata).await
+        }
+
+        async fn install_snapshot(
+            &self,
+            version: u64,
+            snapshot: Bytes,
+        ) -> Result<(), crate::replications::strict::StrictSnapshotError> {
+            self.inner.install_snapshot(version, snapshot).await
+        }
+    }
+
     fn v2_frozen_targets() -> Vec<FrozenTarget> {
         vec![FrozenTarget::new(1, 1), FrozenTarget::new(2, 1)]
     }
@@ -14285,12 +14453,14 @@ mod tests {
             freshness: 0,
             runtime_started_at: 1,
             node_id: 1,
+            terminal_repository_base_version: 0,
         };
         let remote_rank = HistoryRank {
             version: 1,
             freshness: 1,
             runtime_started_at: 2,
             node_id: 2,
+            terminal_repository_base_version: 0,
         };
         s.history_election_phase = HistoryElectionPhase::FetchingSnapshot {
             peer: 2,
@@ -14715,6 +14885,7 @@ mod tests {
             freshness: 100,
             runtime_started_at: 50,
             node_id: 8,
+            terminal_repository_base_version: 0,
         };
 
         assert!(
@@ -14751,6 +14922,7 @@ mod tests {
             freshness: 0,
             runtime_started_at: 100,
             node_id: 1,
+            terminal_repository_base_version: 0,
         };
 
         let rank_from_3 = HistoryRank {
@@ -14758,18 +14930,21 @@ mod tests {
             freshness: 200,
             runtime_started_at: 50,
             node_id: 3,
+            terminal_repository_base_version: 0,
         };
         let rank_from_4 = HistoryRank {
             version: 10,
             freshness: 200,
             runtime_started_at: 50,
             node_id: 4,
+            terminal_repository_base_version: 0,
         };
         let rank_from_2 = HistoryRank {
             version: 9,
             freshness: 999,
             runtime_started_at: 1,
             node_id: 2,
+            terminal_repository_base_version: 0,
         };
 
         assert_eq!(
@@ -14820,12 +14995,14 @@ mod tests {
             freshness: 0,
             runtime_started_at: 100,
             node_id: 1,
+            terminal_repository_base_version: 0,
         };
         let rank_from_2 = HistoryRank {
             version: 9,
             freshness: 10,
             runtime_started_at: 20,
             node_id: 2,
+            terminal_repository_base_version: 0,
         };
 
         assert_eq!(
@@ -14848,12 +15025,14 @@ mod tests {
             freshness: 0,
             runtime_started_at: 10,
             node_id: 1,
+            terminal_repository_base_version: 0,
         };
         let remote_rank = HistoryRank {
             version: 2,
             freshness: 1,
             runtime_started_at: 9,
             node_id: 2,
+            terminal_repository_base_version: 0,
         };
         assert!(matches!(
             state.record_history_probe_response(2, remote_rank, local_rank),
@@ -14875,18 +15054,21 @@ mod tests {
             freshness: 0,
             runtime_started_at: 100,
             node_id: 1,
+            terminal_repository_base_version: 0,
         };
         let lost_best_rank = HistoryRank {
             version: 10,
             freshness: 10,
             runtime_started_at: 20,
             node_id: 2,
+            terminal_repository_base_version: 0,
         };
         let surviving_rank = HistoryRank {
             version: 7,
             freshness: 100,
             runtime_started_at: 1,
             node_id: 3,
+            terminal_repository_base_version: 0,
         };
         assert_eq!(
             state.record_history_probe_response(2, lost_best_rank, local_rank),
@@ -15027,6 +15209,7 @@ mod tests {
             freshness: 100,
             runtime_started_at: 40,
             node_id: 3,
+            terminal_repository_base_version: 0,
         };
         let snapshot = Bytes::from(rmp_serde::to_vec(&vec![(9u64, 909u64)]).unwrap());
         rt.recv_catchup_resp(3, strict_snapshot_resp(rank_from_3, 9, snapshot))
@@ -15828,6 +16011,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_terminal_suffix_waits_for_its_legacy_repository_base() {
+        let (rt, net, repo) = v1_runtime(ReplicationConfig::default());
+        let peer = PeerIncarnation::new(2, 1);
+        let legacy_repository_prefix = 6;
+        let source_repository_version = legacy_repository_prefix + 1;
+        let op_id = make_op_id(2, 1, 1);
+        let op_msgpack = Bytes::from(rmp_serde::to_vec(&157u64).unwrap());
+        let terminal = StrictTerminalState {
+            coord_node: 2,
+            op_id_hi: op_id.0,
+            op_id_lo: op_id.1,
+            ballot: 1,
+            outcome: Some(StrictTerminalOutcome::Commit(StrictDecisionCommit {
+                ts_final: 10,
+                op_msgpack: op_msgpack.clone(),
+            })),
+            resolver_node: 0,
+            resolver_boot_epoch: 0,
+            frozen_targets: Vec::new(),
+        };
+        let source_cut = {
+            let mut journal = TerminalJournal::in_memory("channels");
+            journal
+                .upsert_commit_decision(op_id, 1, 10, op_msgpack.to_vec())
+                .unwrap();
+            journal.terminal_cut()
+        };
+
+        assert_eq!(repo.current_version(), 0);
+        assert_eq!(rt.terminal_journal.lock().await.record_count(), 0);
+        {
+            let mut state = rt.state.lock();
+            state.request_history_election();
+            state.begin_history_election([2]);
+        }
+        let request_nonce = rt
+            .v3_sync
+            .lock()
+            .record_history_nonce(
+                peer,
+                repl_proto::StrictCatchupReason::HistoryElection as i32,
+                rt.cfg.pending_propose_ttl(),
+            )
+            .unwrap();
+
+        super::super::catchup::recv_v3_history_probe_resp(
+            &rt,
+            2,
+            1,
+            repl_proto::StrictHistoryProbeResp {
+                responder_node: 2,
+                expected_requester_boot_epoch: 1,
+                request_nonce,
+                repository_version: source_repository_version,
+                terminal_repository_base_version: 6,
+                history_freshness: 0,
+                runtime_started_at: 1,
+                history_node: 2,
+                terminal_cut: Some(cut_to_wire(source_cut)),
+                reason: repl_proto::StrictCatchupReason::HistoryElection as i32,
+            },
+        )
+        .await;
+        assert!(net.drain_captures().into_iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::TerminalSyncReq(_),
+                ..
+            }
+        )));
+        assert!(rt.apply_v3_catchup_terminal_state(peer, terminal).await);
+
+        {
+            let mut state = rt.state.lock();
+            // Model a failed snapshot request. The next election is idle, so
+            // an ordinary locally decided commit would be allowed to drain.
+            state.request_history_election();
+            state.clock = 20;
+            state.peer_clocks.insert(1, 20);
+            state.peer_clocks.insert(2, 20);
+        }
+        run_delivery_pass(&rt).await;
+
+        assert_eq!(repo.current_version(), 0);
+        assert!(
+            repo.log().is_empty(),
+            "the active terminal suffix must not be applied on top of an empty repository"
+        );
+        assert!(rt.repository_base_required());
+        let state = rt.state.lock();
+        assert!(state.commit_buffer.is_empty());
+        assert!(
+            state.can_start_history_election(),
+            "the repository-base fence must not deadlock snapshot recovery"
+        );
+    }
+
+    #[tokio::test]
     async fn delivery_in_flight_blocks_bootstrap_until_repository_apply_completes() {
         let net = MockNet::new(1, vec![1, 2]);
         enable_v5_floor_with_v2_endpoints(&net, [2]);
@@ -16173,6 +16455,7 @@ mod tests {
             freshness: 0,
             runtime_started_at: 0,
             node_id: 2,
+            terminal_repository_base_version: 0,
         };
         rt.snapshot_transfers.lock().insert(
             2,
@@ -17671,6 +17954,7 @@ mod tests {
                 expected_requester_boot_epoch: rt.boot_epoch,
                 request_nonce: history_request.request_nonce,
                 repository_version: 3,
+                terminal_repository_base_version: 0,
                 history_freshness: 0,
                 runtime_started_at: 1,
                 history_node: 2,
@@ -20047,6 +20331,7 @@ mod tests {
             freshness: 0,
             runtime_started_at: 1,
             node_id: 2,
+            terminal_repository_base_version: 0,
         };
         {
             let mut state = recovered.state.lock();
@@ -20080,6 +20365,134 @@ mod tests {
         );
         run_delivery_pass(&recovered).await;
         assert_eq!(reset_repo.log(), vec![(1, 101), (2, 202), (3, 303)]);
+    }
+
+    #[tokio::test]
+    async fn delivered_terminal_suffix_without_checkpoint_does_not_replay_without_repository_base()
+    {
+        let temp = tempfile::TempDir::new().unwrap();
+        let net = MockNet::new(1, vec![1]);
+        net.set_epoch(1, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
+        let source_repo = CountingStrictRepo::new();
+        let delivered = [
+            (make_op_id(1, 1, 1), 10, 101u64),
+            (make_op_id(1, 1, 2), 11, 202u64),
+            (make_op_id(1, 1, 3), 12, 303u64),
+        ];
+        assert!(delivered.len() < STRICT_TERMINAL_CHECKPOINT_RECORDS);
+
+        {
+            let source = StrictRuntime::new(
+                source_repo.clone(),
+                1,
+                1,
+                "channels".to_owned(),
+                net.clone(),
+                CancellationToken::new(),
+                Arc::new(ReplicationConfig::default()),
+            );
+            source.finish_history_election_for_test();
+            for (op_id, ts_final, op) in delivered {
+                assert!(
+                    source
+                        .apply_terminal_commit(
+                            op_id,
+                            1,
+                            ts_final,
+                            Bytes::from(rmp_serde::to_vec(&op).unwrap()),
+                        )
+                        .await
+                );
+            }
+            {
+                let mut state = source.state.lock();
+                state.clock = 20;
+                state.peer_clocks.insert(1, 20);
+            }
+            run_delivery_pass(&source).await;
+            assert_eq!(source_repo.log(), vec![(1, 101), (2, 202), (3, 303)]);
+            let journal = source.terminal_journal.lock().await;
+            assert_eq!(journal.checkpoint_repository_version(), 0);
+            assert_eq!(journal.record_count(), delivered.len());
+        }
+
+        net.set_epoch(1, 2);
+        let reset_repo = CountingStrictRepo::new();
+        let recovered = StrictRuntime::new(
+            reset_repo.clone(),
+            1,
+            2,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        recovered.finish_history_election_for_test();
+        {
+            let mut state = recovered.state.lock();
+            state.clock = 20;
+            state.peer_clocks.insert(1, 20);
+        }
+
+        run_delivery_pass(&recovered).await;
+
+        assert_eq!(reset_repo.current_version(), 0);
+        assert!(
+            reset_repo.log().is_empty(),
+            "durably delivered records must wait for repository-base recovery instead of replaying"
+        );
+        assert!(recovered.repository_base_required());
+    }
+
+    #[tokio::test]
+    async fn retained_legacy_applied_id_does_not_downgrade_a_newer_delivery_marker() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let op_id = make_op_id(1, 1, 1);
+        {
+            let mut journal =
+                TerminalJournal::load(Some(temp.path().to_path_buf()), "channels").unwrap();
+            journal
+                .upsert_commit_decision(op_id, 1, 10, rmp_serde::to_vec(&101u64).unwrap())
+                .unwrap();
+            journal.begin_delivery(op_id, 9).unwrap();
+            journal.finish_delivery(op_id, 9).unwrap();
+            assert_eq!(journal.checkpoint_repository_version(), 0);
+        }
+
+        let net = MockNet::new(1, vec![1]);
+        net.set_epoch(1, 2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
+        let reset_repo = RetainedLegacyLedgerRepo::new(op_id);
+        let recovered = StrictRuntime::new(
+            reset_repo.clone(),
+            1,
+            2,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+
+        assert!(recovered.repository_base_required());
+        {
+            let journal = recovered.terminal_journal.lock().await;
+            assert_eq!(journal.delivery_version(op_id), Some(9));
+            assert!(journal.get(op_id).unwrap().is_delivered());
+        }
+
+        recovered.finish_history_election_for_test();
+        {
+            let mut state = recovered.state.lock();
+            state.clock = 20;
+            state.peer_clocks.insert(1, 20);
+        }
+        run_delivery_pass(&recovered).await;
+
+        assert_eq!(reset_repo.current_version(), 0);
+        assert!(reset_repo.log().is_empty());
     }
 
     #[test]

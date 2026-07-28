@@ -192,6 +192,7 @@ mod tests {
             freshness: 4,
             runtime_started_at: 5,
             node_id: 2,
+            terminal_repository_base_version: 0,
         };
         let newer_rank = HistoryRank {
             version: 6,

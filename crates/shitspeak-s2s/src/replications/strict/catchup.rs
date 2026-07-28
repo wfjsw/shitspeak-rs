@@ -1553,6 +1553,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
             freshness: current_rank.freshness,
             runtime_started_at: current_rank.runtime_started_at,
             node_id: current_rank.node_id,
+            terminal_repository_base_version: current_rank.terminal_repository_base_version,
         }
     } else {
         current_rank
@@ -1699,6 +1700,36 @@ pub(super) async fn install_snapshot_candidate<R: StrictReplicable>(
         } else {
             (winner.snapshot_msgpack, None)
         };
+    let prepared_checkpoint =
+        if let Some((applied_checkpoint, retired_checkpoint)) = applied_checkpoint {
+            // Persist the cross-store intent before replacing the repository. If
+            // the process stops between these steps, the retained base marker and
+            // checkpoint version keep delivery fenced on the old repository.
+            rt.require_repository_base(installed_version);
+            let applied_for_journal = applied_checkpoint.clone();
+            let retired_for_journal = retired_checkpoint.clone();
+            let installed_retired = match rt
+                .with_terminal_journal_mutation(move |journal| {
+                    journal.install_repository_checkpoint(
+                        installed_version,
+                        &applied_for_journal,
+                        &retired_for_journal,
+                    )
+                })
+                .await
+            {
+                Ok(retired) => retired,
+                Err(error) => {
+                    rt.record_terminal_journal_failure(&error);
+                    warn!(from, %error, "strict repository-base checkpoint prepare failed");
+                    rearm_history_election(rt);
+                    return;
+                }
+            };
+            Some((applied_checkpoint, installed_retired))
+        } else {
+            None
+        };
     let install_result = rt
         .repo
         .install_snapshot(installed_version, repository_snapshot)
@@ -1710,30 +1741,10 @@ pub(super) async fn install_snapshot_candidate<R: StrictReplicable>(
     );
     match install_result {
         Ok(()) => {
-            if let Some((applied_checkpoint, retired_checkpoint)) = applied_checkpoint {
-                let applied_for_journal = applied_checkpoint.clone();
-                let retired_for_journal = retired_checkpoint.clone();
-                let merged_retired = match rt
-                    .with_terminal_journal_mutation(move |journal| {
-                        journal.install_repository_checkpoint(
-                            installed_version,
-                            &applied_for_journal,
-                            &retired_for_journal,
-                        )
-                    })
-                    .await
-                {
-                    Ok(retired) => retired,
-                    Err(error) => {
-                        rt.record_terminal_journal_failure(&error);
-                        warn!(from, %error, "strict delivery checkpoint install failed");
-                        rearm_history_election(rt);
-                        return;
-                    }
-                };
+            if let Some((applied_checkpoint, installed_retired)) = prepared_checkpoint {
                 rt.state
                     .lock()
-                    .install_repository_checkpoint(merged_retired);
+                    .install_repository_checkpoint(applied_checkpoint, installed_retired);
             }
             if !rt.finish_repository_base_install(installed_version) {
                 warn!(
@@ -1744,6 +1755,7 @@ pub(super) async fn install_snapshot_candidate<R: StrictReplicable>(
                 rearm_history_election(rt);
                 return;
             }
+            rt.requeue_undelivered_terminal_journal_commits().await;
             rt.state.lock().finish_history_election();
             rt.wake_delivery_and_clock_tick();
             request_history_after_snapshot(rt, from, installed_version, correlated_peer).await;
@@ -2280,6 +2292,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         freshness: resp.history_freshness,
         runtime_started_at: resp.runtime_started_at,
         node_id: remote_node,
+        terminal_repository_base_version: 0,
     };
     if resp.snapshot_transfer_rejected || resp.snapshot_transfer_id != 0 {
         apply_snapshot_transfer_response(
@@ -2906,7 +2919,13 @@ pub(super) async fn recv_v3_history_probe_req<R: StrictReplicable>(
         return;
     }
     let rank = rt.v3_history_rank();
-    let cut = cut_to_wire(rt.terminal_journal.lock().await.terminal_cut());
+    let (cut, terminal_repository_base_version) = {
+        let journal = rt.terminal_journal.lock().await;
+        (
+            cut_to_wire(journal.terminal_cut()),
+            journal.repository_replay_base_version(rank.version),
+        )
+    };
     let _ = send_v3_metadata_control(
         rt,
         from,
@@ -2920,6 +2939,7 @@ pub(super) async fn recv_v3_history_probe_req<R: StrictReplicable>(
             history_node: rank.node_id as u32,
             terminal_cut: Some(cut),
             reason: req.reason,
+            terminal_repository_base_version,
         }),
         metric_reason,
         CatchupPhase::Metadata,
@@ -3048,7 +3068,11 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         freshness: resp.history_freshness,
         runtime_started_at: resp.runtime_started_at,
         node_id: from,
+        terminal_repository_base_version: resp.terminal_repository_base_version,
     };
+    if rank.terminal_repository_base_version > rank.version {
+        return;
+    }
     let response_cut = valid_cut.expect("validated terminal cut");
     let repair_reason = accepted_probe
         .repair_reason()
@@ -3115,6 +3139,16 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
     // differ.
     let source_satisfied = terminal_equal || source_already_known || source_cut.generation() == 0;
     let history_needed = rank.version > rt.repo.current_version();
+    let terminal_repository_base_version =
+        if rank.terminal_repository_base_version == 0 && rank.version > source_cut.generation() {
+            // Rolling compatibility with pre-field v5 peers. Zero is also the
+            // exact base for a genesis suffix, so conservatively require a
+            // snapshot only when the repository head exceeds the entire
+            // advertised terminal lineage (node 3's 9,522 vs 2,651 shape).
+            rank.version
+        } else {
+            rank.terminal_repository_base_version
+        };
     if source_satisfied {
         rt.v3_sync
             .lock()
@@ -3131,6 +3165,15 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
             rt.state.lock().finish_history_election();
         }
         return;
+    }
+    if reason == StrictCatchupReason::HistoryElection
+        && history_needed
+        && rt.repo.current_version() < terminal_repository_base_version
+    {
+        // Terminal synchronization is a suffix fence, not a replacement for
+        // the repository prefix represented by the elected history rank.
+        // Latch the prefix requirement before importing any terminal record.
+        rt.require_repository_base(terminal_repository_base_version);
     }
     rt.v3_history
         .lock()
@@ -5363,6 +5406,7 @@ mod tests {
             freshness: 0,
             runtime_started_at: 1,
             node_id: 1,
+            terminal_repository_base_version: 0,
         };
         let local_rank = super::HistoryRank::local(rt);
         let mut state = rt.state.lock();
@@ -6108,6 +6152,7 @@ mod tests {
             freshness: 0,
             runtime_started_at: 1,
             node_id: 2,
+            terminal_repository_base_version: 0,
         };
         let local_rank = super::HistoryRank::local(&rt);
         {

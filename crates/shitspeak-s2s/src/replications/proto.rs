@@ -707,6 +707,7 @@ mod tests {
                 expected_requester_boot_epoch: 18,
                 request_nonce: 102,
                 repository_version: 55,
+                terminal_repository_base_version: 0,
                 history_freshness: 123,
                 runtime_started_at: 24,
                 history_node: 7,
