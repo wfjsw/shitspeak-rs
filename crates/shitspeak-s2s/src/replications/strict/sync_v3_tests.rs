@@ -15,18 +15,23 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     catchup::{
-        recv_v3_clock_probe_resp, recv_v3_history_probe_resp, recv_v3_terminal_sync_page,
-        recv_v3_terminal_sync_req, request_v3_clock_probe, request_v3_history_probe,
-        request_v3_terminal_sync, respond_to_request, resume_deferred_v3_admissions,
+        apply_response, recv_v3_clock_probe_resp, recv_v3_history_probe_resp,
+        recv_v3_terminal_sync_page, recv_v3_terminal_sync_req,
+        register_v3_clock_probe_retry_if_current, register_v3_history_probe_retry_if_current,
+        request_v3_clock_probe, request_v3_history_probe, request_v3_terminal_sync,
+        request_v3_terminal_sync_toward, respond_to_request, resume_deferred_v3_admissions,
         retry_v3_terminal_transmissions, send_v3_metadata_control,
     },
     runtime::{
         HistoryRank, STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V3,
-        STRICT_V3_CONTROL_MAX_ENCODED_BYTES, StrictRuntime, make_op_id,
+        STRICT_PROTOCOL_VERSION_V5, STRICT_V3_CONTROL_MAX_ENCODED_BYTES, StrictRuntime,
+        is_v3_metadata_control, make_op_id,
     },
     session_reducer::{
+        Cursor as SessionCursor, CursorKind as SessionCursorKind, Cut as SessionCut,
         Effect as SessionEffect, Event as SessionEvent, SyncKind as SessionSyncKind,
-        Trigger as SessionTrigger, TriggerOrigin as SessionTriggerOrigin,
+        TransferId as SessionTransferId, Trigger as SessionTrigger,
+        TriggerOrigin as SessionTriggerOrigin, WireIdentity as SessionWireIdentity,
     },
     sync_v3::{
         InboundTerminalSyncDisposition, PeerIncarnation, ResponderSession, SourceTransitionOutcome,
@@ -39,11 +44,12 @@ use crate::replications::{
     config::ReplicationConfig,
     metrics::{CatchupMode, CatchupPhase, CatchupReason},
     proto::{
-        StrictBody, StrictCatchupReason, StrictCatchupReq, StrictClockProbeReq,
+        StrictBody, StrictCatchupReason, StrictCatchupReq, StrictCatchupResp, StrictClockProbeReq,
         StrictClockProbeResp, StrictDecisionAbort, StrictDecisionCommit, StrictFrozenTarget,
         StrictHistoryProbeReq, StrictHistoryProbeResp, StrictHistoryTransferReq,
-        StrictTerminalOutcome, StrictTerminalPageKind, StrictTerminalState, StrictTerminalSyncAck,
-        StrictTerminalSyncPage, StrictTerminalSyncReq, StrictTerminalSyncStatus,
+        StrictHistoryTransferResp, StrictTerminalOutcome, StrictTerminalPageKind,
+        StrictTerminalState, StrictTerminalSyncAck, StrictTerminalSyncPage, StrictTerminalSyncReq,
+        StrictTerminalSyncStatus,
     },
     test_support::{
         CapturedFrame, CountingStrictRepo, MockBulkSendOutcome, MockNet, StrictSendLane,
@@ -77,6 +83,167 @@ fn runtime(
     );
     rt.finish_history_election_for_test();
     (rt, net)
+}
+
+#[test]
+fn only_the_reserved_empty_history_response_shape_is_control_metadata() {
+    let confirmation = crate::replications::proto::StrictCatchupResp {
+        history_transfer: Some(StrictHistoryTransferResp {
+            request_nonce: 7,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(is_v3_metadata_control(&StrictBody::CatchupResp(
+        confirmation.clone()
+    )));
+    assert!(!is_v3_metadata_control(&StrictBody::CatchupResp(
+        crate::replications::proto::StrictCatchupResp {
+            history_node: 2,
+            ..confirmation
+        }
+    )));
+}
+
+#[tokio::test]
+async fn lost_history_final_ack_confirmation_is_replayed_and_stops_retrying() {
+    let retry_delay = Duration::from_millis(20);
+    let config = ReplicationConfig::default()
+        .with_bulk_retry_delay(retry_delay)
+        .with_strict_bulk_retry_max_delay(retry_delay.saturating_mul(2))
+        .with_strict_bulk_retry_jitter_pct(0)
+        .with_pending_propose_ttl(Duration::from_secs(2));
+    let (sink, sink_net) = runtime(1, config.clone());
+    let (source, source_net) = runtime(2, config);
+    let peer = PeerIncarnation::new(2, 22);
+    let transfer = sink
+        .v3_history
+        .lock()
+        .begin_transfer(
+            peer,
+            0,
+            0,
+            StrictCatchupReason::RepositoryGap,
+            sink.cfg.pending_propose_ttl(),
+            false,
+            StrictCatchupReason::RepositoryGap,
+        )
+        .expect("history transfer")
+        .into_parts()
+        .0;
+    let request = StrictCatchupReq {
+        src_node: 1,
+        since_version: 0,
+        chunk_token: 0,
+        force_snapshot: false,
+        history_probe_only: false,
+        terminal_state_cursor: u64::MAX,
+        terminal_decision_generation: 0,
+        snapshot_transfer_id: 0,
+        snapshot_chunk_cursor: 0,
+        history_transfer: Some(transfer),
+    };
+
+    respond_to_request(&source, 1, request).await;
+    let response = source_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::CatchupResp(response),
+                ..
+            } => Some(response),
+            _ => None,
+        })
+        .expect("history response");
+    apply_response(&sink, 2, response).await;
+    let final_ack = sink_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::CatchupReq(request),
+                ..
+            } if request
+                .history_transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.final_ack) =>
+            {
+                Some(request)
+            }
+            _ => None,
+        })
+        .expect("history final ACK");
+
+    respond_to_request(&source, 1, final_ack.clone()).await;
+    let first_confirmation = source_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::CatchupResp(response),
+                ..
+            } => Some(response),
+            _ => None,
+        })
+        .expect("correlated final ACK confirmation");
+    // Drop the first confirmation. The requester must retry the exact final
+    // ACK and the responder must replay the exact confirmation rather than
+    // treating its acknowledged page tombstone as an unrelated duplicate.
+    tokio::time::sleep(retry_delay + Duration::from_millis(10)).await;
+    retry_v3_terminal_transmissions(&sink).await;
+    let retried_final_ack = sink_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::CatchupReq(request),
+                ..
+            } if request
+                .history_transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.final_ack) =>
+            {
+                Some(request)
+            }
+            _ => None,
+        })
+        .expect("history final ACK retry after lost confirmation");
+    assert_eq!(retried_final_ack, final_ack);
+
+    respond_to_request(&source, 1, retried_final_ack).await;
+    let replayed_confirmation = source_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::CatchupResp(response),
+                ..
+            } => Some(response),
+            _ => None,
+        })
+        .expect("replayed correlated final ACK confirmation");
+    assert_eq!(replayed_confirmation, first_confirmation);
+    apply_response(&sink, 2, replayed_confirmation).await;
+
+    tokio::time::sleep(retry_delay.saturating_mul(2) + Duration::from_millis(10)).await;
+    retry_v3_terminal_transmissions(&sink).await;
+    assert!(
+        sink_net.drain_captures().into_iter().all(|frame| !matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::CatchupReq(StrictCatchupReq {
+                    history_transfer: Some(StrictHistoryTransferReq {
+                        final_ack: true,
+                        ..
+                    }),
+                    ..
+                }),
+                ..
+            }
+        )),
+        "a delivered and confirmed history final ACK must not retry"
+    );
 }
 
 #[tokio::test]
@@ -265,6 +432,7 @@ async fn every_operation_free_v3_control_shape_stays_under_the_encoded_limit() {
             expected_responder_boot_epoch: 22,
             request_nonce: 1,
             reason: StrictCatchupReason::DeliveryWatermark as i32,
+            requester_clock: u64::MAX,
         }),
         StrictBody::ClockProbeResp(StrictClockProbeResp {
             responder_node: 1,
@@ -467,6 +635,9 @@ async fn already_known_source_cut_returns_up_to_date_without_allocating_transfer
 #[tokio::test]
 async fn satisfied_terminal_cut_latches_repository_base_before_snapshot_fetch() {
     let (rt, net) = runtime(1, ReplicationConfig::default());
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
+    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V5);
     let peer = PeerIncarnation::new(2, 22);
     let source_cut = rt.terminal_journal.lock().await.terminal_cut();
     {
@@ -861,6 +1032,20 @@ async fn history_election_promotes_an_existing_periodic_probe_without_omitting_i
         vec![3],
         "the existing peer-two nonce keeps its scheduled retry instead of sending an immediate duplicate"
     );
+    retry_v3_terminal_transmissions(&rt).await;
+    let expedited = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("election promotion must pull the retained retry inside the probe watchdog");
+    assert_eq!(expedited.request_nonce, periodic.request_nonce);
     let accepted = rt
         .v3_sync
         .lock()
@@ -878,6 +1063,168 @@ async fn history_election_promotes_an_existing_periodic_probe_without_omitting_i
     assert!(
         accepted.admission_pending(),
         "promoting the nonce must preserve its independent admission intent"
+    );
+}
+
+#[tokio::test]
+async fn history_election_rearms_a_promoted_nonce_missing_its_retry_owner() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+    let peer = PeerIncarnation::new(2, 22);
+    let nonce = rt
+        .v3_sync
+        .lock()
+        .record_history_nonce(
+            peer,
+            StrictCatchupReason::Admission as i32,
+            rt.cfg.pending_propose_ttl(),
+        )
+        .expect("orphaned admission nonce");
+
+    request_v3_history_probe(&rt, 2, StrictCatchupReason::HistoryElection).await;
+
+    let request = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("election must restore transmission ownership for the promoted nonce");
+    assert_eq!(request.request_nonce, nonce);
+    assert_eq!(request.reason, StrictCatchupReason::HistoryElection as i32);
+}
+
+#[tokio::test]
+async fn admission_rearms_a_retained_nonce_missing_its_retry_owner() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+    let peer = PeerIncarnation::new(2, 22);
+    let nonce = rt
+        .v3_sync
+        .lock()
+        .record_history_nonce(
+            peer,
+            StrictCatchupReason::Admission as i32,
+            rt.cfg.pending_propose_ttl(),
+        )
+        .expect("orphaned admission nonce");
+
+    request_v3_history_probe(&rt, 2, StrictCatchupReason::Admission).await;
+
+    let request = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("admission must restore transmission ownership for its retained nonce");
+    assert_eq!(request.request_nonce, nonce);
+    assert_eq!(request.reason, StrictCatchupReason::Admission as i32);
+}
+
+#[tokio::test]
+async fn consumed_history_nonce_cannot_be_resurrected_by_late_retry_registration() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+    let peer = PeerIncarnation::new(2, 22);
+    let nonce = rt
+        .v3_sync
+        .lock()
+        .record_history_nonce(
+            peer,
+            StrictCatchupReason::Admission as i32,
+            rt.cfg.pending_propose_ttl(),
+        )
+        .expect("history nonce");
+    let request = StrictHistoryProbeReq {
+        src_node: 1,
+        expected_responder_boot_epoch: 22,
+        request_nonce: nonce,
+        reason: StrictCatchupReason::Admission as i32,
+    };
+
+    assert!(
+        rt.v3_sync
+            .lock()
+            .accept_history_nonce(peer, nonce)
+            .is_some()
+    );
+    rt.v3_retries.lock().complete_history_probe(peer, nonce);
+    let registered = register_v3_history_probe_retry_if_current(&rt, peer, request.clone());
+    if registered {
+        let _ = send_v3_metadata_control(
+            &rt,
+            2,
+            StrictBody::HistoryProbeReq(request),
+            CatchupReason::Admission,
+            CatchupPhase::Metadata,
+        )
+        .await;
+    }
+    assert!(
+        !registered,
+        "registration after response consumption must reject the stale identity"
+    );
+    assert!(
+        !rt.v3_retries
+            .lock()
+            .history_probe_nonce_is_scheduled(peer, nonce)
+    );
+
+    retry_v3_terminal_transmissions(&rt).await;
+    assert!(
+        net.drain_captures().is_empty(),
+        "a consumed history identity must never retransmit"
+    );
+}
+
+#[tokio::test]
+async fn consumed_clock_nonce_cannot_be_resurrected_by_late_retry_registration() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+    let peer = PeerIncarnation::new(2, 22);
+    let nonce = rt
+        .v3_sync
+        .lock()
+        .record_clock_nonce(peer, rt.cfg.pending_propose_ttl())
+        .expect("clock nonce");
+    let request = StrictClockProbeReq {
+        src_node: 1,
+        expected_responder_boot_epoch: 22,
+        request_nonce: nonce,
+        reason: StrictCatchupReason::Admission as i32,
+        requester_clock: 0,
+    };
+
+    assert!(rt.v3_sync.lock().accept_clock_nonce(peer, nonce));
+    rt.v3_retries.lock().complete_clock_probe(peer, nonce);
+    let registered = register_v3_clock_probe_retry_if_current(&rt, peer, request.clone());
+    if registered {
+        let _ = send_v3_metadata_control(
+            &rt,
+            2,
+            StrictBody::ClockProbeReq(request.clone()),
+            CatchupReason::Admission,
+            CatchupPhase::Metadata,
+        )
+        .await;
+    }
+    assert!(
+        !registered,
+        "registration after response consumption must reject the stale identity"
+    );
+    assert!(!rt.v3_retries.lock().clock_probe_is_current(peer, &request));
+
+    retry_v3_terminal_transmissions(&rt).await;
+    assert!(
+        net.drain_captures().is_empty(),
+        "a consumed clock identity must never retransmit"
     );
 }
 
@@ -1451,6 +1798,425 @@ fn reason_only_session_triggers_coalesce_without_marking_dirty() {
 }
 
 #[test]
+fn failed_client_cleanup_does_not_expire_coalesced_dirty_followup() {
+    let mut state = SyncV3State::default();
+    let peer = PeerIncarnation::new(2, 22);
+    let ttl = Duration::from_secs(30);
+    let trigger = SessionEvent::Trigger(SessionTrigger {
+        kind: SessionSyncKind::Terminal,
+        origin: SessionTriggerOrigin::External,
+        desired_cut: None,
+    });
+    let initial_wire = state
+        .transition_session(peer, trigger)
+        .into_iter()
+        .find_map(|effect| match effect {
+            SessionEffect::StartSession { wire, .. } => Some(wire),
+            _ => None,
+        })
+        .expect("initial terminal wire");
+    state.begin_terminal_client_cache(
+        peer,
+        StrictCatchupReason::TerminalFence as i32,
+        None,
+        initial_wire.nonce().get(),
+        initial_wire.cursor().value(),
+        ttl,
+    );
+
+    let target = TerminalCut::new([1; 16], 1, [2; 32], [3; 32]);
+    let next_cursor = SessionCursor::new(SessionCursorKind::TerminalGeneration, 1);
+    let applied_wire = SessionWireIdentity::new(
+        initial_wire.epoch(),
+        SessionTransferId::new(1),
+        initial_wire.nonce(),
+        initial_wire.cursor(),
+    );
+    let applying = state.transition_session(
+        peer,
+        SessionEvent::PageReceived {
+            kind: SessionSyncKind::Terminal,
+            wire: applied_wire,
+            next_cursor,
+            target_cut: SessionCut::new([1; 16], 1, [2; 32], [3; 32]),
+            has_more: true,
+        },
+    );
+    assert!(applying.iter().any(|effect| matches!(
+        effect,
+        SessionEffect::ValidateAndApply { wire, .. } if *wire == applied_wire
+    )));
+    state
+        .client_mut(peer)
+        .expect("initial client cache")
+        .accept_manifest(1, target, StrictTerminalPageKind::Delta, ttl);
+    assert!(matches!(
+        state.transition_session(peer, trigger).as_slice(),
+        [SessionEffect::Coalesced]
+    ));
+
+    let failed = state.transition_session(
+        peer,
+        SessionEvent::ApplyFailed {
+            epoch: applied_wire.epoch(),
+            wire: applied_wire,
+        },
+    );
+    let replacement_wire = failed
+        .iter()
+        .find_map(|effect| match effect {
+            SessionEffect::StartSession { wire, .. } => Some(*wire),
+            _ => None,
+        })
+        .expect("dirty follow-up wire");
+
+    assert!(state.finish_failed_client(peer).is_some());
+    assert!(state.has_session_work(peer));
+    let replacement_page_wire = SessionWireIdentity::new(
+        replacement_wire.epoch(),
+        SessionTransferId::new(2),
+        replacement_wire.nonce(),
+        replacement_wire.cursor(),
+    );
+    assert!(
+        state
+            .transition_session(
+                peer,
+                SessionEvent::PageReceived {
+                    kind: SessionSyncKind::Terminal,
+                    wire: replacement_page_wire,
+                    next_cursor,
+                    target_cut: SessionCut::new([1; 16], 1, [2; 32], [3; 32]),
+                    has_more: true,
+                },
+            )
+            .iter()
+            .any(|effect| matches!(
+                effect,
+                SessionEffect::ValidateAndApply { wire, .. } if *wire == replacement_page_wire
+            ))
+    );
+}
+
+#[tokio::test]
+async fn invalid_correlated_history_response_cleans_up_and_rearms_election() {
+    let (sink, _net) = runtime(2, ReplicationConfig::default());
+    let peer = PeerIncarnation::new(1, 11);
+    let request = sink
+        .v3_history
+        .lock()
+        .begin_transfer(
+            peer,
+            10,
+            0,
+            StrictCatchupReason::RepositoryGap,
+            Duration::from_secs(30),
+            false,
+            StrictCatchupReason::RepositoryGap,
+        )
+        .expect("history transfer")
+        .into_parts()
+        .0;
+    assert!(!sink.state.lock().history_election_pending());
+
+    apply_response(
+        &sink,
+        1,
+        StrictCatchupResp {
+            // The response is correlated to the authenticated peer and exact
+            // transfer, but its claimed history owner is invalid.
+            history_node: 0,
+            history_transfer: Some(StrictHistoryTransferResp {
+                expected_requester_boot_epoch: 22,
+                transfer_id: request.transfer_id,
+                request_nonce: request.request_nonce,
+                cursor: request.expected_cursor,
+                target_version: request.target_version,
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(
+        !sink.v3_history.lock().has_active_transfer(peer),
+        "a claimed invalid response must not strand its consumed client"
+    );
+    assert!(
+        sink.state.lock().history_election_pending(),
+        "the rejected correlated history response must rearm ranked recovery"
+    );
+}
+
+#[tokio::test]
+async fn correlated_transfer_expiry_rearms_exact_pending_terminal_repair() {
+    let (sink, net) = runtime(2, ReplicationConfig::default());
+    let peer = PeerIncarnation::new(1, 11);
+    let source_cut = TerminalCut::new([7; 16], 9, [8; 32], [9; 32]);
+    sink.v3_history.lock().defer_until_terminal(
+        peer,
+        HistoryRank {
+            version: 10,
+            freshness: 20,
+            runtime_started_at: 30,
+            node_id: 1,
+            terminal_repository_base_version: 10,
+        },
+        source_cut,
+        StrictCatchupReason::RepositoryGap,
+    );
+    request_v3_terminal_sync_toward(
+        &sink,
+        1,
+        StrictCatchupReason::RepositoryGap,
+        Some(source_cut),
+    )
+    .await;
+    let initial = terminal_request(net.drain_captures().pop().expect("initial request"));
+
+    recv_v3_terminal_sync_page(
+        &sink,
+        1,
+        11,
+        StrictTerminalSyncPage {
+            responder_node: 1,
+            expected_requester_boot_epoch: 22,
+            transfer_id: initial.transfer_id,
+            request_nonce: initial.request_nonce,
+            status: StrictTerminalSyncStatus::TransferExpired as i32,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(
+        !sink.v3_retries.lock().request_is_current(peer, &initial),
+        "the expired request retry must be cleared"
+    );
+    assert!(
+        sink.v3_history
+            .lock()
+            .pending_after_terminal(peer)
+            .is_some()
+    );
+    let replacement = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("replacement terminal request");
+    assert_ne!(replacement.request_nonce, initial.request_nonce);
+    let sync = sink.v3_sync.lock();
+    let client = sync.client(peer).expect("replacement client");
+    assert_eq!(client.desired_cut(), Some(source_cut));
+}
+
+#[tokio::test]
+async fn correlated_cursor_mismatch_restarts_exact_terminal_repair_from_zero() {
+    let (sink, net) = runtime(2, ReplicationConfig::default());
+    let peer = PeerIncarnation::new(1, 11);
+    let source_cut = TerminalCut::new([7; 16], 9, [8; 32], [9; 32]);
+    let stale_baseline = TerminalCut::new([7; 16], 4, [4; 32], [5; 32]);
+    sink.v3_sync
+        .lock()
+        .remember_source_cut(peer, stale_baseline);
+    sink.v3_history.lock().defer_until_terminal(
+        peer,
+        HistoryRank {
+            version: 10,
+            freshness: 20,
+            runtime_started_at: 30,
+            node_id: 1,
+            terminal_repository_base_version: 10,
+        },
+        source_cut,
+        StrictCatchupReason::RepositoryGap,
+    );
+    request_v3_terminal_sync_toward(
+        &sink,
+        1,
+        StrictCatchupReason::RepositoryGap,
+        Some(source_cut),
+    )
+    .await;
+    let initial = terminal_request(net.drain_captures().pop().expect("initial request"));
+    assert_eq!(initial.expected_cursor, stale_baseline.generation());
+    // A concurrent trigger may already have promoted dirty reducer work when
+    // the correlated error arrives. The rejected baseline must reset that
+    // inherited wire too, rather than coalescing the repair behind it.
+    request_v3_terminal_sync_toward(
+        &sink,
+        1,
+        StrictCatchupReason::TerminalFence,
+        Some(source_cut),
+    )
+    .await;
+    assert!(net.drain_captures().is_empty());
+
+    recv_v3_terminal_sync_page(
+        &sink,
+        1,
+        11,
+        StrictTerminalSyncPage {
+            responder_node: 1,
+            expected_requester_boot_epoch: 22,
+            transfer_id: initial.transfer_id,
+            request_nonce: initial.request_nonce,
+            status: StrictTerminalSyncStatus::CursorMismatch as i32,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(
+        !sink.v3_retries.lock().request_is_current(peer, &initial),
+        "the mismatched cursor retry must be cleared"
+    );
+    let replacement = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("replacement terminal request");
+    assert_ne!(replacement.request_nonce, initial.request_nonce);
+    assert_eq!(replacement.expected_cursor, 0);
+    let sync = sink.v3_sync.lock();
+    let client = sync.client(peer).expect("replacement client");
+    assert_eq!(client.desired_cut(), Some(source_cut));
+}
+
+#[tokio::test]
+async fn capacity_resource_limit_keeps_bounded_exact_terminal_retry() {
+    let retry_delay = Duration::from_millis(40);
+    let ttl = Duration::from_millis(130);
+    let config = ReplicationConfig::default()
+        .with_bulk_retry_delay(retry_delay)
+        .with_strict_bulk_retry_max_delay(retry_delay.saturating_mul(2))
+        .with_strict_bulk_retry_jitter_pct(0)
+        .with_pending_propose_ttl(ttl);
+    let (sink, net) = runtime(2, config);
+    let peer = PeerIncarnation::new(1, 11);
+    let desired_cut = TerminalCut::new([7; 16], 9, [8; 32], [9; 32]);
+    request_v3_terminal_sync_toward(
+        &sink,
+        1,
+        StrictCatchupReason::RepositoryGap,
+        Some(desired_cut),
+    )
+    .await;
+    let initial = terminal_request(net.drain_captures().pop().expect("initial request"));
+
+    recv_v3_terminal_sync_page(
+        &sink,
+        1,
+        11,
+        StrictTerminalSyncPage {
+            responder_node: 1,
+            expected_requester_boot_epoch: 22,
+            transfer_id: 71,
+            request_nonce: initial.request_nonce,
+            status: StrictTerminalSyncStatus::ResourceLimit as i32,
+            target_cut: Some(cut_to_wire(desired_cut)),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(
+        net.drain_captures().is_empty(),
+        "capacity rejection must not spin"
+    );
+    assert!(sink.v3_retries.lock().request_is_current(peer, &initial));
+    assert_eq!(
+        sink.v3_sync
+            .lock()
+            .client(peer)
+            .and_then(|client| client.desired_cut()),
+        Some(desired_cut)
+    );
+    retry_v3_terminal_transmissions(&sink).await;
+    assert!(
+        net.drain_captures().is_empty(),
+        "the retained request must honor its initial backoff"
+    );
+
+    tokio::time::sleep(ttl + Duration::from_millis(20)).await;
+    retry_v3_terminal_transmissions(&sink).await;
+    assert!(
+        net.drain_captures().is_empty(),
+        "retry must stop at its fixed TTL"
+    );
+    assert!(sink.v3_sync.lock().client(peer).is_none());
+    assert!(!sink.v3_retries.lock().request_is_current(peer, &initial));
+}
+
+#[tokio::test]
+async fn correlated_incarnation_mismatch_rearms_pending_elected_history() {
+    let (sink, net) = runtime(2, ReplicationConfig::default());
+    let peer = PeerIncarnation::new(1, 11);
+    let source_cut = TerminalCut::new([7; 16], 9, [8; 32], [9; 32]);
+    sink.v3_history.lock().defer_until_terminal(
+        peer,
+        HistoryRank {
+            version: 10,
+            freshness: 20,
+            runtime_started_at: 30,
+            node_id: 1,
+            terminal_repository_base_version: 10,
+        },
+        source_cut,
+        StrictCatchupReason::HistoryElection,
+    );
+    request_v3_terminal_sync_toward(
+        &sink,
+        1,
+        StrictCatchupReason::HistoryElection,
+        Some(source_cut),
+    )
+    .await;
+    let initial = terminal_request(net.drain_captures().pop().expect("initial request"));
+    assert!(!sink.state.lock().history_election_pending());
+
+    recv_v3_terminal_sync_page(
+        &sink,
+        1,
+        11,
+        StrictTerminalSyncPage {
+            responder_node: 1,
+            expected_requester_boot_epoch: 22,
+            transfer_id: initial.transfer_id,
+            request_nonce: initial.request_nonce,
+            status: StrictTerminalSyncStatus::IncarnationMismatch as i32,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(sink.v3_sync.lock().client(peer).is_none());
+    assert!(
+        sink.v3_history
+            .lock()
+            .pending_after_terminal(peer)
+            .is_some(),
+        "the exact elected history obligation must survive"
+    );
+    assert!(
+        sink.state.lock().history_election_pending(),
+        "the invalid elected incarnation must rearm source ranking"
+    );
+}
+
+#[test]
 fn staged_checkpoint_accumulates_pages_until_the_repository_is_bound() {
     let mut state = SyncV3State::default();
     let peer = PeerIncarnation::new(1, 11);
@@ -1502,6 +2268,56 @@ fn history_election_promotes_an_inflight_admission_terminal_client() {
         StrictCatchupReason::Admission as i32
     );
     assert_eq!(client.reason(), StrictCatchupReason::HistoryElection as i32);
+}
+
+#[test]
+fn terminal_intent_deferred_behind_reducer_history_preserves_exact_desired_cut() {
+    let mut state = SyncV3State::default();
+    let peer = PeerIncarnation::new(2, 22);
+    let desired_cut = TerminalCut::new([4; 16], 17, [5; 32], [6; 32]);
+
+    assert!(
+        state
+            .transition_session(
+                peer,
+                SessionEvent::Trigger(SessionTrigger {
+                    kind: SessionSyncKind::History,
+                    origin: SessionTriggerOrigin::External,
+                    desired_cut: None,
+                }),
+            )
+            .iter()
+            .any(|effect| matches!(
+                effect,
+                SessionEffect::StartSession {
+                    kind: SessionSyncKind::History,
+                    ..
+                }
+            ))
+    );
+    assert!(matches!(
+        state
+            .transition_session(
+                peer,
+                SessionEvent::Trigger(SessionTrigger {
+                    kind: SessionSyncKind::Terminal,
+                    origin: SessionTriggerOrigin::External,
+                    desired_cut: Some(SessionCut::new([4; 16], 17, [5; 32], [6; 32])),
+                }),
+            )
+            .as_slice(),
+        [SessionEffect::Coalesced]
+    ));
+
+    assert!(state.coalesce_terminal_intent_if_active(
+        peer,
+        StrictCatchupReason::TerminalFence as i32,
+        Some(desired_cut),
+    ));
+    assert_eq!(
+        state.take_deferred_client(peer),
+        Some((StrictCatchupReason::TerminalFence as i32, Some(desired_cut)))
+    );
 }
 
 #[test]
@@ -1739,6 +2555,49 @@ fn payload_cache_expiry_reconciles_reducer_and_stops_periodic_suppression() {
     );
 }
 
+#[test]
+fn terminal_trigger_expires_stale_client_before_reducer_transition() {
+    let mut state = SyncV3State::default();
+    let peer = PeerIncarnation::new(2, 22);
+    let trigger = SessionEvent::Trigger(SessionTrigger {
+        kind: SessionSyncKind::Terminal,
+        origin: SessionTriggerOrigin::External,
+        desired_cut: None,
+    });
+
+    let initial_wire = state
+        .transition_session(peer, trigger)
+        .into_iter()
+        .find_map(|effect| match effect {
+            SessionEffect::StartSession {
+                kind: SessionSyncKind::Terminal,
+                wire,
+            } => Some(wire),
+            _ => None,
+        })
+        .expect("initial terminal wire");
+    state.begin_terminal_client_cache(
+        peer,
+        StrictCatchupReason::TerminalFence as i32,
+        None,
+        initial_wire.nonce().get(),
+        initial_wire.cursor().value(),
+        Duration::ZERO,
+    );
+
+    let effects = state.transition_session(peer, trigger);
+    assert!(effects.iter().any(|effect| {
+        matches!(
+            effect,
+            SessionEffect::StartSession {
+                kind: SessionSyncKind::Terminal,
+                wire,
+            } if *wire != initial_wire
+        )
+    }));
+    assert!(state.client(peer).is_none());
+}
+
 #[tokio::test]
 async fn higher_node_yields_simultaneous_equal_pull_without_reverse_branch() {
     let (rt, net) = runtime(2, ReplicationConfig::default());
@@ -1877,7 +2736,13 @@ async fn collision_resource_limit_keeps_exact_outbound_request_active() {
         },
     )
     .await;
-    assert!(rt.v3_sync.lock().client(peer).is_none());
+    let sync = rt.v3_sync.lock();
+    let client = sync
+        .client(peer)
+        .expect("capacity rejection must retain the bounded client");
+    assert_eq!(client.transfer_id(), 71);
+    assert_eq!(client.pending_nonce(), request.request_nonce);
+    assert!(rt.v3_retries.lock().request_is_current(peer, &request));
 }
 
 #[test]

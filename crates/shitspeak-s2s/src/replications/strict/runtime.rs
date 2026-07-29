@@ -366,9 +366,16 @@ struct TerminalCatchupSnapshot {
 /// A responder-side immutable image for one v2 snapshot transfer. This is
 /// deliberately ephemeral: after a restart the requester detects the missing
 /// transfer and restarts from a fresh, self-consistent image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SnapshotFormat {
+    Repository,
+    S2sEnvelope,
+}
+
 #[derive(Clone)]
 pub(super) struct SnapshotTransfer {
     pub(super) id: u64,
+    pub(super) format: SnapshotFormat,
     pub(super) version: u64,
     pub(super) snapshot_msgpack: Bytes,
     pub(super) snapshot_sha256: Bytes,
@@ -381,6 +388,7 @@ pub(super) struct SnapshotTransfer {
 /// the repository never sees this image until its length and SHA-256 match.
 pub(super) struct SnapshotReceiveTransfer {
     pub(super) id: u64,
+    pub(super) format: SnapshotFormat,
     pub(super) version: u64,
     pub(super) total_bytes: u64,
     pub(super) snapshot_sha256: Bytes,
@@ -1142,6 +1150,17 @@ fn v2_prerequisite_payload_fits(
 /// Whether a v3 frame is bounded control metadata. Terminal pages remain
 /// control only while they contain no decisions; operation-bearing delta and
 /// checkpoint pages must use the bulk lane.
+pub(super) fn is_v3_history_final_ack_confirmation(response: &StrictCatchupResp) -> bool {
+    let Some(correlation) = response.history_transfer.clone() else {
+        return false;
+    };
+    *response
+        == StrictCatchupResp {
+            history_transfer: Some(correlation),
+            ..Default::default()
+        }
+}
+
 pub(super) fn is_v3_metadata_control(body: &StrictBody) -> bool {
     match body {
         StrictBody::ClockProbeReq(_)
@@ -1157,6 +1176,7 @@ pub(super) fn is_v3_metadata_control(body: &StrictBody) -> bool {
             .history_transfer
             .as_ref()
             .is_some_and(|transfer| transfer.final_ack),
+        StrictBody::CatchupResp(response) => is_v3_history_final_ack_confirmation(response),
         _ => false,
     }
 }
@@ -1876,7 +1896,11 @@ pub(crate) struct StrictState {
     /// Lowest repository version covered by the durable terminal-journal
     /// checkpoint. A lower repository is missing the base beneath every
     /// retained terminal suffix and must be replaced before delivery.
-    repository_base_required_version: u64,
+    repository_base_required_version: Option<u64>,
+    /// Exact elected repository identity whose terminal checkpoint is
+    /// durable while the corresponding repository image is not. Unlike a
+    /// plain base-version fence, equal versions are not interchangeable.
+    pending_repository_image_install: Option<HistoryMetadata>,
     pub history_alive_peers: HashSet<NodeIdentifier>,
     /// Highest membership incarnation observed for each node, including a
     /// tombstone after removal. Keeping tombstones prevents reordered events
@@ -1914,6 +1938,13 @@ enum PeerAdmissionPhase {
         clock_ready: bool,
     },
     Admitted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingAdmissionProbe {
+    peer: NodeIdentifier,
+    needs_history: bool,
+    needs_clock: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1960,7 +1991,8 @@ impl StrictState {
             retired_operations: BTreeMap::new(),
             history_election_requested: true,
             history_election_phase: HistoryElectionPhase::Idle,
-            repository_base_required_version: 0,
+            repository_base_required_version: None,
+            pending_repository_image_install: None,
             history_alive_peers: HashSet::new(),
             member_incarnations: HashMap::new(),
             peer_admissions: HashMap::new(),
@@ -2085,7 +2117,7 @@ impl StrictState {
             .iter()
             .filter_map(|op_id| self.committed_ts_final.get(op_id).copied())
             .collect();
-        for admission in self.peer_admissions.values_mut() {
+        for (node, admission) in &mut self.peer_admissions {
             let PeerAdmissionPhase::AwaitingLocalCut { barrier_ts } = admission.phase else {
                 continue;
             };
@@ -2098,19 +2130,26 @@ impl StrictState {
                 .chain(delivering_timestamps.iter())
                 .any(|ts| *ts <= barrier_ts);
             if delivered_high_water >= barrier_ts && !prefix_still_pending {
+                let clock_ready = self
+                    .peer_clocks
+                    .get(node)
+                    .is_some_and(|src_clock| *src_clock > barrier_ts);
                 admission.phase = PeerAdmissionPhase::AwaitingPeer {
                     required_history: metadata,
                     clock_gt: barrier_ts,
                     history_ready: false,
-                    clock_ready: false,
+                    clock_ready,
                 };
             }
         }
     }
 
-    /// Returns true when equal-version freshness disagreement requires a
-    /// history election. Higher remote versions are sufficient evidence that
-    /// the peer is not behind the frozen local cut.
+    /// Returns true when equal-version metadata proves the remote repository
+    /// is fresher and can therefore win a local history election. A lower-
+    /// freshness peer remains excluded until its own reciprocal recovery
+    /// reaches this frozen cut; electing it locally cannot make progress.
+    /// Higher remote versions are sufficient evidence that the peer is not
+    /// behind the frozen local cut.
     fn observe_admission_history(
         &mut self,
         node: NodeIdentifier,
@@ -2135,8 +2174,8 @@ impl StrictState {
         else {
             return false;
         };
-        let freshness_diverged = remote.version == required_history.version
-            && remote.freshness != required_history.freshness;
+        let remote_is_fresher = remote.version == required_history.version
+            && remote.freshness > required_history.freshness;
         let history_ready = remote.version > required_history.version
             || (remote.version == required_history.version
                 && remote.freshness == required_history.freshness);
@@ -2150,17 +2189,26 @@ impl StrictState {
                 clock_ready,
             }
         };
-        freshness_diverged
+        remote_is_fresher
     }
 
     fn observe_admission_clock(&mut self, node: NodeIdentifier, boot_epoch: u64, src_clock: u64) {
-        if self.history_election_blocks_steady_state() {
-            return;
-        }
+        let election_blocks = self.history_election_blocks_steady_state();
         let Some(admission) = self.peer_admissions.get_mut(&node) else {
             return;
         };
         if admission.boot_epoch != boot_epoch {
+            return;
+        }
+        self.peer_clocks
+            .entry(node)
+            .and_modify(|clock| *clock = (*clock).max(src_clock))
+            .or_insert(src_clock);
+        if election_blocks {
+            // The repository cut is not frozen yet, but this authenticated
+            // exact-incarnation clock was observed after election revocation.
+            // Retain it so cut freezing can consume it without another proof
+            // round when it already crosses the eventual barrier.
             return;
         }
         let PeerAdmissionPhase::AwaitingPeer {
@@ -2490,7 +2538,7 @@ impl StrictState {
                 HistoryElectionPhase::Installing
             )
             && self.proposals.is_empty()
-            && (self.repository_base_required_version > 0 || self.commit_buffer.is_empty())
+            && (self.repository_base_required() || self.commit_buffer.is_empty())
             && self.delivering_commits.is_empty()
             && self.pending_proposes.is_empty()
             && self
@@ -2500,28 +2548,72 @@ impl StrictState {
     }
 
     fn require_repository_base(&mut self, repository_version: u64) {
-        self.repository_base_required_version = self
-            .repository_base_required_version
-            .max(repository_version);
+        self.repository_base_required_version = Some(
+            self.repository_base_required_version
+                .map_or(repository_version, |current| {
+                    current.max(repository_version)
+                }),
+        );
     }
 
-    fn repository_base_required_version(&self) -> u64 {
-        self.repository_base_required_version
+    fn repository_base_required_version(&self) -> Option<u64> {
+        self.pending_repository_image_install
+            .map(|pending| pending.version)
+            .into_iter()
+            .chain(self.repository_base_required_version)
+            .max()
     }
 
     fn repository_base_missing(&self, repository_version: u64) -> bool {
-        repository_version < self.repository_base_required_version
+        self.repository_base_required_version
+            .is_some_and(|required| repository_version < required)
     }
 
     pub(super) fn repository_base_required(&self) -> bool {
-        self.repository_base_required_version > 0
+        self.repository_base_required_version.is_some()
+            || self.pending_repository_image_install.is_some()
+    }
+
+    fn require_repository_image_install(&mut self, metadata: HistoryMetadata) {
+        self.require_repository_base(metadata.version);
+        self.pending_repository_image_install = Some(metadata);
+    }
+
+    fn pending_repository_image_install(&self) -> Option<HistoryMetadata> {
+        self.pending_repository_image_install
+    }
+
+    fn repository_candidate_satisfies_requirement(&self, rank: HistoryRank) -> bool {
+        if self
+            .repository_base_required_version
+            .is_some_and(|required| rank.version < required)
+        {
+            return false;
+        }
+        self.pending_repository_image_install.is_none_or(|pending| {
+            (rank.version, rank.freshness) >= (pending.version, pending.freshness)
+        })
     }
 
     fn install_repository_base(&mut self, repository_version: u64) -> bool {
         if self.repository_base_missing(repository_version) {
             return false;
         }
-        self.repository_base_required_version = 0;
+        self.repository_base_required_version = None;
+        true
+    }
+
+    fn finish_repository_image_install(&mut self, metadata: HistoryMetadata) -> bool {
+        if self.pending_repository_image_install != Some(metadata) {
+            return false;
+        }
+        self.pending_repository_image_install = None;
+        if self
+            .repository_base_required_version
+            .is_some_and(|required| metadata.version >= required)
+        {
+            self.repository_base_required_version = None;
+        }
         true
     }
 
@@ -2608,8 +2700,9 @@ impl StrictState {
         )
     }
 
-    #[cfg(test)]
-    pub fn history_election_fetching_snapshot(&self) -> Option<HistoryElectionSnapshotRequest> {
+    pub(super) fn history_election_fetching_snapshot(
+        &self,
+    ) -> Option<HistoryElectionSnapshotRequest> {
         match self.history_election_phase {
             HistoryElectionPhase::FetchingSnapshot {
                 peer,
@@ -2788,6 +2881,24 @@ impl StrictState {
         remote_rank: HistoryRank,
         local_rank: HistoryRank,
     ) -> HistoryProbeResponseOutcome {
+        self.record_history_probe_response_with_source_authorization(
+            peer,
+            remote_rank,
+            local_rank,
+            true,
+        )
+    }
+
+    fn record_history_probe_response_with_source_authorization(
+        &mut self,
+        peer: NodeIdentifier,
+        remote_rank: HistoryRank,
+        local_rank: HistoryRank,
+        pending_source_authorized: bool,
+    ) -> HistoryProbeResponseOutcome {
+        let required_version = self.repository_base_required_version;
+        let pending_install = self.pending_repository_image_install;
+        let repository_base_required = required_version.is_some() || pending_install.is_some();
         match &mut self.history_election_phase {
             HistoryElectionPhase::Probing {
                 pending_peers,
@@ -2798,9 +2909,30 @@ impl StrictState {
                     return HistoryProbeResponseOutcome::Ignored;
                 }
                 *started_at = Instant::now();
-                if remote_rank.beats(local_rank) {
+                let eligible = if repository_base_required {
+                    pending_source_authorized
+                        && required_version.is_none_or(|required| remote_rank.version >= required)
+                        && pending_install.is_none_or(|pending| {
+                            (remote_rank.version, remote_rank.freshness)
+                                >= (pending.version, pending.freshness)
+                        })
+                } else {
+                    remote_rank.beats(local_rank)
+                };
+                if eligible {
                     let replace = match best_remote_rank {
-                        Some(current) => remote_rank.beats(*current),
+                        Some(current) => pending_install.map_or_else(
+                            || remote_rank.beats(*current),
+                            |pending| {
+                                let pending = (pending.version, pending.freshness);
+                                let candidate_exact =
+                                    (remote_rank.version, remote_rank.freshness) == pending;
+                                let current_exact = (current.version, current.freshness) == pending;
+                                (candidate_exact && !current_exact)
+                                    || (candidate_exact == current_exact
+                                        && remote_rank.beats(*current))
+                            },
+                        ),
                         None => true,
                     };
                     if replace {
@@ -2823,6 +2955,11 @@ impl StrictState {
             HistoryElectionPhase::Probing { .. } => return HistoryProbeResponseOutcome::Pending,
             _ => return HistoryProbeResponseOutcome::Ignored,
         }) else {
+            if self.repository_base_required() {
+                self.history_election_phase = HistoryElectionPhase::Idle;
+                self.history_election_requested = true;
+                return HistoryProbeResponseOutcome::Pending;
+            }
             self.finish_history_election();
             return HistoryProbeResponseOutcome::Finished;
         };
@@ -2844,12 +2981,6 @@ impl StrictState {
         snapshot_version: u64,
         snapshot_msgpack: Bytes,
     ) -> HistorySnapshotResponseOutcome {
-        // Catchup responses arrive asynchronously. Recheck the complete
-        // bootstrap predicate while holding the state lock rather than
-        // trusting an earlier caller-side observation.
-        if !self.can_bootstrap_catchup() {
-            return HistorySnapshotResponseOutcome::Ignored;
-        }
         let expected_rank = match self.history_election_phase {
             HistoryElectionPhase::FetchingSnapshot {
                 peer: expected_peer,
@@ -2861,8 +2992,25 @@ impl StrictState {
             }
             _ => return HistorySnapshotResponseOutcome::Ignored,
         };
+        // Catchup responses arrive asynchronously. Recheck the complete
+        // bootstrap predicate while holding the state lock rather than
+        // trusting an earlier caller-side observation. A response for the
+        // current elected fetch owns the only retry path, so a transient
+        // delivery/proposal fence must rearm the election before the caller
+        // releases that client. Late or wrong-peer duplicates above remain
+        // ignored and cannot disturb the current attempt.
+        if !self.can_bootstrap_catchup() {
+            self.request_history_election();
+            return HistorySnapshotResponseOutcome::Retry;
+        }
 
-        if !remote_rank.beats(local_rank) {
+        let forced_repository_candidate = self.repository_base_required()
+            && self.repository_candidate_satisfies_requirement(remote_rank);
+        if self.repository_base_required() && !forced_repository_candidate {
+            self.request_history_election();
+            return HistorySnapshotResponseOutcome::Retry;
+        }
+        if !forced_repository_candidate && !remote_rank.beats(local_rank) {
             self.finish_history_election();
             return HistorySnapshotResponseOutcome::Ignored;
         }
@@ -2871,7 +3019,11 @@ impl StrictState {
         // snapshot is valid when it covers at least the rank that won the
         // election; requiring an exact post-probe rank turns concurrent
         // writes into endless self-rejected retries.
-        if remote_rank.version >= expected_rank.version && !snapshot_msgpack.is_empty() {
+        if (remote_rank.version, remote_rank.freshness)
+            >= (expected_rank.version, expected_rank.freshness)
+            && snapshot_version == remote_rank.version
+            && !snapshot_msgpack.is_empty()
+        {
             self.history_election_phase = HistoryElectionPhase::Installing;
             return HistorySnapshotResponseOutcome::Install(HistoryElectionCandidate {
                 rank: remote_rank,
@@ -2889,11 +3041,13 @@ impl StrictState {
         self.history_election_phase = HistoryElectionPhase::Idle;
         // A completed election may have replaced the repository without a
         // strict commit timestamp. Invalidate prior peer proofs so the next
-        // reconciliation freezes the post-election repository cut.
+        // reconciliation freezes the post-election repository cut. Keep
+        // exact-incarnation clocks observed after request_history_election
+        // revoked the old evidence; freezing rechecks them against the new
+        // barrier before they can satisfy admission.
         let barrier_ts = self.admission_barrier_ts();
         let peers: Vec<_> = self.peer_admissions.keys().copied().collect();
         for node in peers {
-            self.peer_clocks.remove(&node);
             if let Some(admission) = self.peer_admissions.get_mut(&node) {
                 admission.phase = PeerAdmissionPhase::AwaitingLocalCut { barrier_ts };
             }
@@ -3351,9 +3505,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .require_repository_base(repository_version);
     }
 
+    pub(super) fn require_repository_image_install(&self, metadata: HistoryMetadata) {
+        self.state.lock().require_repository_image_install(metadata);
+    }
+
     fn repository_base_required_version(&self) -> Option<u64> {
-        let version = self.state.lock().repository_base_required_version();
-        (version > 0).then_some(version)
+        self.state.lock().repository_base_required_version()
+    }
+
+    pub(super) fn pending_repository_image_install(&self) -> Option<HistoryMetadata> {
+        self.state.lock().pending_repository_image_install()
     }
 
     pub(super) fn repository_snapshot_satisfies_base(&self, repository_version: u64) -> bool {
@@ -3367,6 +3528,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.state
             .lock()
             .install_repository_base(repository_version)
+    }
+
+    pub(super) fn finish_repository_image_install(&self, metadata: HistoryMetadata) -> bool {
+        self.state.lock().finish_repository_image_install(metadata)
     }
 
     pub(super) fn begin_snapshot_capture(&self) -> Option<SnapshotCaptureGuard<'_>> {
@@ -3588,8 +3753,17 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
         };
         let durable_repository_version = repo.current_version();
-        let required_repository_version = journal.repository_base_required_version();
-        let repository_base_missing = durable_repository_version < required_repository_version;
+        let pending_repository_install = journal.pending_repository_image_install();
+        let required_repository_version = pending_repository_install.map_or_else(
+            || journal.repository_base_required_version(),
+            |pending| {
+                journal
+                    .repository_base_required_version()
+                    .max(pending.repository_version())
+            },
+        );
+        let repository_base_missing = pending_repository_install.is_some()
+            || durable_repository_version < required_repository_version;
         let legacy_delivered = repo
             .legacy_applied_operation_ids()
             .into_iter()
@@ -3609,6 +3783,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 topic = %topic,
                 repository_version = durable_repository_version,
                 required_repository_version,
+                repository_image_install_pending = pending_repository_install.is_some(),
                 "strict repository base is older than its durable delivery history; preserving delivery markers and requiring a repository snapshot"
             );
         } else if let Err(error) = journal.recover_delivery_intents(durable_repository_version) {
@@ -3656,6 +3831,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let mut initial_state = StrictState::new();
         if repository_base_missing {
             initial_state.require_repository_base(required_repository_version);
+            if let Some(pending) = pending_repository_install {
+                initial_state.require_repository_image_install(HistoryMetadata {
+                    version: pending.repository_version(),
+                    freshness: pending.history_freshness(),
+                });
+            }
         }
         let arc = Arc::new(Self {
             repo,
@@ -3751,7 +3932,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// Reconcile exact-incarnation route visibility with the private
     /// admission table, freeze any locally applied cuts, and return only
     /// members that are safe to include in a strict delivery watermark.
-    fn reconcile_peer_admissions(&self) -> Vec<NodeIdentifier> {
+    pub(super) fn reconcile_peer_admissions(&self) -> Vec<NodeIdentifier> {
         let routed = delivery_member_incarnations(self.net.as_ref(), self.self_id, self.boot_epoch);
         let mut state = self.state.lock();
         // Read repository metadata while holding the strict-state lock. A
@@ -3806,21 +3987,42 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.state.lock().local_coordination_ready(self.self_id)
     }
 
-    fn pending_admission_probe_peers(&self) -> Vec<NodeIdentifier> {
+    fn pending_admission_probes(&self) -> Vec<PendingAdmissionProbe> {
         let _ = self.reconcile_peer_admissions();
         self.state
             .lock()
             .peer_admissions
             .iter()
             .filter_map(|(node, admission)| {
-                // Retry metadata probes even while the local cut is waiting
-                // for an active history election. Those responses are also
-                // the election's authenticated rank evidence; restricting
-                // retries to AwaitingPeer lets one lost startup response pin
-                // the election until its timeout and leaves no admission
-                // worker available to repair it.
-                (!matches!(admission.phase, PeerAdmissionPhase::Admitted)).then_some(*node)
+                // AwaitingLocalCut is owned by the history election. Its
+                // correlated probes already have transport-level retries,
+                // and admission evidence cannot be consumed before the
+                // post-election repository cut is frozen. Sending a second
+                // proof pair here only multiplies traffic and can promote an
+                // unelected foreign checkpoint into a doomed admission
+                // session.
+                let PeerAdmissionPhase::AwaitingPeer {
+                    history_ready,
+                    clock_ready,
+                    ..
+                } = admission.phase
+                else {
+                    return None;
+                };
+                Some(PendingAdmissionProbe {
+                    peer: *node,
+                    needs_history: !history_ready,
+                    needs_clock: !clock_ready,
+                })
             })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn pending_admission_probe_peers(&self) -> Vec<NodeIdentifier> {
+        self.pending_admission_probes()
+            .into_iter()
+            .map(|probe| probe.peer)
             .collect()
     }
 
@@ -4061,11 +4263,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.state.lock().delivering_commits.len()
     }
 
-    pub(crate) fn v2_terminal_catchup_supported_by(&self, peer: NodeIdentifier) -> bool {
-        self.can_originate_v2()
-            && self.net.peer_strict_replication_protocol_version(peer) >= STRICT_PROTOCOL_VERSION_V2
-    }
-
     /// Pairwise v3 repair is independent of the cluster proposal floor. A v2
     /// relay can forward the opaque authenticated body, while both endpoints
     /// must explicitly advertise and locally retain the v3 journal contract.
@@ -4147,9 +4344,39 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         );
     }
 
-    pub(super) fn advance_v3_clock_probe(&self) -> u64 {
-        let mut state = self.state.lock();
-        advance_clock_for_tick(&mut state, self.self_id)
+    pub(super) fn v3_clock_probe_requester_clock(&self) -> u64 {
+        self.state.lock().clock
+    }
+
+    pub(super) fn advance_v3_clock_probe(
+        &self,
+        from: NodeIdentifier,
+        origin_boot_epoch: u64,
+        requester_clock: u64,
+    ) -> u64 {
+        let _ = self.reconcile_peer_admissions();
+        let (clock, diagnostics) = {
+            let mut state = self.state.lock();
+            state.observe_peer(from, requester_clock);
+            // A probe is an authenticated directed Tempo tick. Raising to
+            // the requester's clock before producing the response prevents a
+            // restarted low-clock peer from taking one retry per historical
+            // timestamp to cross the requester's frozen admission barrier.
+            state.clock = state.clock.max(requester_clock);
+            let clock = state.clock.saturating_add(1);
+            state.clock = clock;
+            state.peer_clocks.insert(self.self_id, clock);
+            state.observe_admission_clock(from, origin_boot_epoch, requester_clock);
+            (clock, state.admission_diagnostics())
+        };
+        self.admission_metrics.update(
+            diagnostics.admitted,
+            diagnostics.awaiting_local_cut,
+            diagnostics.awaiting_peer,
+            diagnostics.highest_barrier,
+        );
+        self.deliver_signal.notify_one();
+        clock
     }
 
     pub(super) fn accept_v3_clock_probe(
@@ -4282,15 +4509,21 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         peer: PeerIncarnation,
         remote_rank: HistoryRank,
         source_cut: TerminalCut,
+        pending_source_authorized: bool,
     ) -> Option<HistoryProbeCandidate> {
         self.v3_history
             .lock()
             .record_probe_candidate(peer, remote_rank, source_cut);
         let local_rank = HistoryRank::local(self);
-        let outcome =
-            self.state
-                .lock()
-                .record_history_probe_response(peer.node(), remote_rank, local_rank);
+        let outcome = self
+            .state
+            .lock()
+            .record_history_probe_response_with_source_authorization(
+                peer.node(),
+                remote_rank,
+                local_rank,
+                pending_source_authorized,
+            );
         match outcome {
             HistoryProbeResponseOutcome::FetchSnapshot(request) => {
                 let selected = self
@@ -4333,9 +4566,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             // retain the inverse obligation to pull its newer repository.
             return;
         }
-        let diagnostics = {
+        let (remote_is_fresher, diagnostics) = {
             let mut state = self.state.lock();
-            let _ = state.observe_admission_history(
+            let remote_is_fresher = state.observe_admission_history(
                 from,
                 origin_boot_epoch,
                 HistoryMetadata {
@@ -4343,7 +4576,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     freshness: remote_rank.freshness,
                 },
             );
-            state.admission_diagnostics()
+            (remote_is_fresher, state.admission_diagnostics())
         };
         self.admission_metrics.update(
             diagnostics.admitted,
@@ -4351,6 +4584,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             diagnostics.awaiting_peer,
             diagnostics.highest_barrier,
         );
+        if remote_is_fresher {
+            self.state.lock().request_history_election();
+            self.wake_clock_tick_loop();
+        }
         self.wake_delivery_and_clock_tick();
     }
 
@@ -9526,11 +9763,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 .await;
             }
             let _ = self.reconcile_peer_admissions();
-            let (freshness_diverged, diagnostics) = {
+            let (remote_is_fresher, diagnostics) = {
                 let mut state = self.state.lock();
-                let freshness_diverged =
+                let remote_is_fresher =
                     state.observe_admission_history(from, origin_boot_epoch, metadata);
-                (freshness_diverged, state.admission_diagnostics())
+                (remote_is_fresher, state.admission_diagnostics())
             };
             self.admission_metrics.update(
                 diagnostics.admitted,
@@ -9538,7 +9775,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 diagnostics.awaiting_peer,
                 diagnostics.highest_barrier,
             );
-            if freshness_diverged {
+            if remote_is_fresher {
                 self.state.lock().request_history_election();
                 self.wake_clock_tick_loop();
             }
@@ -11771,9 +12008,6 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
 /// awaiting admission. This cadence is independent of the coarser ordinary
 /// anti-entropy loop so a healed route cannot pin liveness until 30 seconds.
 async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
-    if !rt.can_originate_v2() {
-        return;
-    }
     // Election completion invalidates prior admission proofs and moves peers
     // back through AwaitingLocalCut. Freeze that new cut before consuming any
     // metadata response retained from a promoted admission probe.
@@ -11783,9 +12017,10 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
     // election has fully stood down, so repository history remains sourced
     // solely from the elected candidate.
     super::catchup::resume_deferred_v3_admissions(rt).await;
-    let peers = rt.pending_admission_probe_peers();
+    let probes = rt.pending_admission_probes();
     let local_version = rt.repo.current_version();
-    for dst in peers {
+    for probe in probes {
+        let dst = probe.peer;
         if rt.net.peer_strict_replication_protocol_version(dst) < STRICT_PROTOCOL_VERSION_V2
             || !rt.net.has_live_route(dst, ServiceLevel::Reliable)
         {
@@ -11795,21 +12030,32 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
             if !rt.admission_probe_due(dst) {
                 continue;
             }
-            // Admission metadata is a bounded, nonce-coalesced proof pair and
-            // may coexist with a terminal responder. Suppressing it behind
-            // responder lifetime leaves the peer proof stuck at clock-only.
-            super::catchup::request_v3_clock_probe(
-                rt,
-                dst,
-                repl_proto::StrictCatchupReason::Admission,
-            )
-            .await;
-            super::catchup::request_v3_history_probe(
-                rt,
-                dst,
-                repl_proto::StrictCatchupReason::Admission,
-            )
-            .await;
+            // Admission metadata is bounded and nonce-coalesced. It may
+            // coexist with a terminal responder; suppressing the missing
+            // proof behind responder lifetime can strand admission.
+            if probe.needs_clock {
+                super::catchup::request_v3_clock_probe(
+                    rt,
+                    dst,
+                    repl_proto::StrictCatchupReason::Admission,
+                )
+                .await;
+            }
+            if probe.needs_history {
+                super::catchup::request_v3_history_probe(
+                    rt,
+                    dst,
+                    repl_proto::StrictCatchupReason::Admission,
+                )
+                .await;
+            }
+            continue;
+        }
+        // The legacy combined probe is a fresh V2 message and remains bound
+        // to the negotiated cluster floor. Pairwise V3 probes above are
+        // endpoint-scoped repair traffic, so a transient unrelated peer
+        // downgrade must not suppress their clock proof and strand admission.
+        if !rt.can_originate_v2() {
             continue;
         }
         if !rt.admission_probe_due(dst) {
@@ -12866,10 +13112,13 @@ mod tests {
             self.version.load(Ordering::Acquire)
         }
 
-        fn snapshot(
+        fn snapshot_with_metadata(
             &self,
-        ) -> Result<(u64, Bytes), crate::replications::strict::StrictSnapshotError> {
-            Ok((self.current_version(), Bytes::new()))
+        ) -> Result<
+            (crate::replications::strict::HistoryMetadata, Bytes),
+            crate::replications::strict::StrictSnapshotError,
+        > {
+            Ok((self.history_metadata(), Bytes::new()))
         }
 
         fn log_since(
@@ -12931,10 +13180,13 @@ mod tests {
             self.inner.current_version()
         }
 
-        fn snapshot(
+        fn snapshot_with_metadata(
             &self,
-        ) -> Result<(u64, Bytes), crate::replications::strict::StrictSnapshotError> {
-            self.inner.snapshot()
+        ) -> Result<
+            (crate::replications::strict::HistoryMetadata, Bytes),
+            crate::replications::strict::StrictSnapshotError,
+        > {
+            self.inner.snapshot_with_metadata()
         }
 
         fn log_since(
@@ -13767,6 +14019,112 @@ mod tests {
     }
 
     #[test]
+    fn admission_probes_wait_until_history_election_freezes_local_cut() {
+        let (rt, _net, _repo) = v1_runtime(ReplicationConfig::default());
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+        assert_eq!(rt.pending_admission_probe_peers(), vec![2]);
+
+        rt.state.lock().request_history_election();
+
+        assert!(rt.pending_admission_probe_peers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admission_polling_requests_only_the_missing_clock_proof() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V1);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+        rt.state
+            .lock()
+            .peer_admissions
+            .get_mut(&2)
+            .expect("peer admission")
+            .phase = PeerAdmissionPhase::AwaitingPeer {
+            required_history: HistoryMetadata {
+                version: 7,
+                freshness: 11,
+            },
+            clock_gt: 53,
+            history_ready: true,
+            clock_ready: false,
+        };
+        net.drain_captures();
+
+        request_admission_probes(&rt).await;
+
+        let captures = net.drain_captures();
+        assert_eq!(
+            captures
+                .iter()
+                .filter(|frame| matches!(
+                    frame,
+                    CapturedFrame::StrictUnicast {
+                        dst: 2,
+                        body: StrictBody::ClockProbeReq(_),
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the missing directed-clock proof must retain retry ownership"
+        );
+        assert!(
+            !captures.iter().any(|frame| matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::HistoryProbeReq(_),
+                    ..
+                }
+            )),
+            "an already-satisfied history proof must not be polled again"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_polling_keeps_legacy_v2_probe_fenced_below_the_cluster_floor() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V1);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V2));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V2);
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+        net.drain_captures();
+
+        request_admission_probes(&rt).await;
+
+        assert!(
+            net.drain_captures().is_empty(),
+            "a fresh legacy V2 request may not bypass the negotiated cluster floor"
+        );
+    }
+
+    #[test]
+    fn clock_proof_observed_during_election_survives_post_election_cut_freeze() {
+        let mut state = StrictState::new();
+        state.admission_tracking_started = true;
+        state.delivered_high_water = 50;
+        state.reconcile_peer_admissions(1, &[(1, 1), (2, 9)]);
+
+        state.observe_admission_clock(2, 9, 51);
+        state.finish_history_election();
+        state.freeze_ready_admission_cuts(HistoryMetadata {
+            version: 8,
+            freshness: 13,
+        });
+
+        assert!(matches!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingPeer {
+                clock_gt: 50,
+                clock_ready: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn admission_cut_waits_for_every_equal_timestamp_delivery() {
         let mut state = StrictState::new();
         state.finish_history_election();
@@ -13849,6 +14207,136 @@ mod tests {
         assert_eq!(
             state.peer_admissions[&2].phase,
             PeerAdmissionPhase::Admitted
+        );
+    }
+
+    #[tokio::test]
+    async fn one_clock_probe_round_trip_crosses_an_asymmetric_admission_barrier() {
+        let requester_net = MockNet::new(1, vec![1, 2]);
+        requester_net.set_epoch(1, 11);
+        requester_net.set_epoch(2, 22);
+        requester_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        requester_net
+            .set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+        requester_net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        let requester = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            11,
+            "channels".to_owned(),
+            requester_net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        requester.finish_history_election_for_test();
+        {
+            let mut state = requester.state.lock();
+            state.clock = 10_000;
+            state.delivered_high_water = 10_000;
+        }
+        requester.seed_membership_snapshot([
+            MemberIncarnation::new(1, 11),
+            MemberIncarnation::new(2, 22),
+        ]);
+        {
+            let mut state = requester.state.lock();
+            state.freeze_ready_admission_cuts(HistoryMetadata {
+                version: 0,
+                freshness: 0,
+            });
+            assert!(!state.observe_admission_history(
+                2,
+                22,
+                HistoryMetadata {
+                    version: 0,
+                    freshness: 0,
+                },
+            ));
+            assert_eq!(
+                state.peer_admissions[&2].phase,
+                PeerAdmissionPhase::AwaitingPeer {
+                    required_history: HistoryMetadata {
+                        version: 0,
+                        freshness: 0,
+                    },
+                    clock_gt: 10_000,
+                    history_ready: true,
+                    clock_ready: false,
+                }
+            );
+        }
+
+        let responder_net = MockNet::new(2, vec![1, 2]);
+        responder_net.set_epoch(1, 11);
+        responder_net.set_epoch(2, 22);
+        responder_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        responder_net
+            .set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+        responder_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V3);
+        let responder = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            2,
+            22,
+            "channels".to_owned(),
+            responder_net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        responder.finish_history_election_for_test();
+        responder.seed_membership_snapshot([
+            MemberIncarnation::new(1, 11),
+            MemberIncarnation::new(2, 22),
+        ]);
+        responder
+            .state
+            .lock()
+            .peer_admissions
+            .get_mut(&1)
+            .unwrap()
+            .phase = PeerAdmissionPhase::Admitted;
+        assert_eq!(responder.state.lock().clock, 0);
+
+        super::super::catchup::request_v3_clock_probe(
+            &requester,
+            2,
+            StrictCatchupReason::Admission,
+        )
+        .await;
+        let request = requester_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::ClockProbeReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("clock probe request");
+        super::super::catchup::recv_v3_clock_probe_req(&responder, 1, 11, request).await;
+        let response = responder_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::ClockProbeResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("clock probe response");
+        super::super::catchup::recv_v3_clock_probe_resp(&requester, 2, 22, response);
+
+        assert!(
+            requester.peer_incarnation_is_admitted(2, 22),
+            "one correlated RTT must raise the restarted responder past the frozen barrier"
+        );
+        request_admission_probes(&requester).await;
+        assert!(
+            requester_net.drain_captures().is_empty(),
+            "an admitted incarnation must not retain periodic admission traffic"
         );
     }
 
@@ -14243,6 +14731,138 @@ mod tests {
         );
     }
 
+    #[test]
+    fn divergent_v3_admission_metadata_rearms_history_election() {
+        use crate::overlay::MemberIncarnation;
+
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        let repo = CountingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo.clone(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+        rt.finish_history_election_for_test();
+        let local = repo.history_metadata();
+        rt.state.lock().peer_admissions.get_mut(&2).unwrap().phase =
+            PeerAdmissionPhase::AwaitingPeer {
+                required_history: local,
+                clock_gt: 0,
+                history_ready: false,
+                clock_ready: true,
+            };
+
+        rt.accept_v3_history_metadata(
+            2,
+            1,
+            HistoryRank {
+                version: local.version,
+                freshness: local.freshness.saturating_add(1),
+                runtime_started_at: 1,
+                node_id: 2,
+                terminal_repository_base_version: 0,
+            },
+        );
+
+        let state = rt.state.lock();
+        assert!(
+            state.history_election_pending(),
+            "equal-version freshness divergence must rearm history election"
+        );
+        assert!(matches!(
+            state.peer_admissions[&2].phase,
+            PeerAdmissionPhase::AwaitingLocalCut { .. }
+        ));
+    }
+
+    #[test]
+    fn lower_freshness_v3_admission_metadata_waits_without_history_election() {
+        use crate::overlay::MemberIncarnation;
+
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        let repo = CountingStrictRepo::new();
+        repo.state.lock().0 = 7;
+        let rt = StrictRuntime::new(
+            repo.clone(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+        rt.finish_history_election_for_test();
+        let required = HistoryMetadata {
+            version: 7,
+            freshness: 40,
+        };
+        rt.state.lock().peer_admissions.get_mut(&2).unwrap().phase =
+            PeerAdmissionPhase::AwaitingPeer {
+                required_history: required,
+                clock_gt: 0,
+                history_ready: false,
+                clock_ready: true,
+            };
+
+        for freshness in [39, 38, 39] {
+            rt.accept_v3_history_metadata(
+                2,
+                1,
+                HistoryRank {
+                    version: required.version,
+                    freshness,
+                    runtime_started_at: 1,
+                    node_id: 2,
+                    terminal_repository_base_version: 0,
+                },
+            );
+        }
+
+        {
+            let state = rt.state.lock();
+            assert!(
+                !state.history_election_pending(),
+                "a provably stale peer cannot win a local pull election"
+            );
+            assert_eq!(
+                state.peer_admissions[&2].phase,
+                PeerAdmissionPhase::AwaitingPeer {
+                    required_history: required,
+                    clock_gt: 0,
+                    history_ready: false,
+                    clock_ready: true,
+                },
+                "the stale peer must remain excluded until it proves the exact frozen history"
+            );
+        }
+
+        rt.accept_v3_history_metadata(
+            2,
+            1,
+            HistoryRank {
+                version: required.version,
+                freshness: required.freshness,
+                runtime_started_at: 1,
+                node_id: 2,
+                terminal_repository_base_version: 0,
+            },
+        );
+        assert!(
+            rt.peer_incarnation_is_admitted(2, 1),
+            "the same peer must be admitted after reciprocal recovery reaches the exact cut"
+        );
+    }
+
     #[tokio::test]
     async fn authenticated_clock_tick_raises_restarted_local_clock_in_one_step() {
         use crate::overlay::MemberIncarnation;
@@ -14632,12 +15252,10 @@ mod tests {
                 1,
                 Bytes::from_static(b"snapshot"),
             ),
-            HistorySnapshotResponseOutcome::Ignored
+            HistorySnapshotResponseOutcome::Retry
         ));
-        assert!(matches!(
-            s.history_election_phase,
-            HistoryElectionPhase::FetchingSnapshot { .. }
-        ));
+        assert!(s.history_election_pending());
+        assert!(!s.history_election_active());
     }
 
     #[test]
@@ -15139,6 +15757,387 @@ mod tests {
         s.finish_history_election();
         assert!(!s.history_election_pending());
         assert!(!s.history_election_installing());
+    }
+
+    #[test]
+    fn elected_snapshot_blocked_by_transient_delivery_rearms_without_orphaning_fetch() {
+        let mut state = StrictState::new();
+        let local_rank = HistoryRank {
+            version: 3,
+            freshness: 30,
+            runtime_started_at: 20,
+            node_id: 3,
+            terminal_repository_base_version: 3,
+        };
+        let remote_rank = HistoryRank {
+            version: 6,
+            freshness: 60,
+            runtime_started_at: 10,
+            node_id: 1,
+            terminal_repository_base_version: 6,
+        };
+
+        state.begin_history_election([1]);
+        let HistoryProbeResponseOutcome::FetchSnapshot(request) =
+            state.record_history_probe_response(1, remote_rank, local_rank)
+        else {
+            panic!("remote rank should win the election");
+        };
+        state.delivering_commits.insert((9, 9));
+
+        assert_eq!(
+            state.record_history_snapshot_response(
+                1,
+                remote_rank,
+                local_rank,
+                remote_rank.version,
+                Bytes::from_static(b"snapshot"),
+            ),
+            HistorySnapshotResponseOutcome::Retry,
+            "a transient install fence must retain retry ownership"
+        );
+        assert!(state.history_election_pending());
+        assert!(!state.history_election_active());
+        assert!(!state.can_start_history_election());
+
+        state.delivering_commits.remove(&(9, 9));
+        assert!(state.can_start_history_election());
+
+        state.begin_history_election([1]);
+        assert!(matches!(
+            state.record_history_probe_response(1, remote_rank, local_rank),
+            HistoryProbeResponseOutcome::FetchSnapshot(_)
+        ));
+        assert_eq!(
+            state.record_history_snapshot_response(
+                2,
+                remote_rank,
+                local_rank,
+                remote_rank.version,
+                Bytes::from_static(b"wrong-peer"),
+            ),
+            HistorySnapshotResponseOutcome::Ignored,
+        );
+        assert_eq!(state.history_election_fetching_snapshot(), Some(request));
+
+        state.finish_history_election();
+        assert_eq!(
+            state.record_history_snapshot_response(
+                1,
+                remote_rank,
+                local_rank,
+                remote_rank.version,
+                Bytes::from_static(b"late-duplicate"),
+            ),
+            HistorySnapshotResponseOutcome::Ignored,
+        );
+    }
+
+    #[tokio::test]
+    async fn same_tuple_pending_repository_install_remains_fenced_after_restart() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V5);
+        net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
+        let repo = CountingStrictRepo::new();
+        *repo.state.lock() = (10, vec![(10, 110, None)]);
+
+        {
+            let runtime = StrictRuntime::new(
+                repo.clone(),
+                1,
+                1,
+                "channels".to_owned(),
+                net.clone(),
+                CancellationToken::new(),
+                Arc::new(ReplicationConfig::default()),
+            );
+            runtime
+                .terminal_journal
+                .lock()
+                .await
+                .install_repository_checkpoint(10, 0, &BTreeMap::new(), &BTreeMap::new())
+                .unwrap();
+            assert!(
+                runtime
+                    .terminal_journal
+                    .lock()
+                    .await
+                    .pending_repository_image_install()
+                    .is_some()
+            );
+        }
+
+        let recovered = StrictRuntime::new(
+            repo,
+            1,
+            2,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        assert!(
+            recovered.repository_base_required(),
+            "metadata equality cannot prove whether an equal-head divergent image installed before the crash"
+        );
+        assert!(
+            recovered
+                .terminal_journal
+                .lock()
+                .await
+                .pending_repository_image_install()
+                .is_some(),
+            "startup must retain the marker until a correlated image install completes durably"
+        );
+    }
+
+    #[test]
+    fn pending_repository_install_elects_exact_identity_over_newer_peer() {
+        let mut state = StrictState::new();
+        let pending = HistoryMetadata {
+            version: 10,
+            freshness: 50,
+        };
+        state.require_repository_image_install(pending);
+        state.begin_history_election([2, 3]);
+
+        let local_rank = HistoryRank {
+            version: 9,
+            freshness: 0,
+            runtime_started_at: 3,
+            node_id: 1,
+            terminal_repository_base_version: 0,
+        };
+        let newer_fallback = HistoryRank {
+            version: 11,
+            freshness: 60,
+            runtime_started_at: 1,
+            node_id: 2,
+            terminal_repository_base_version: 10,
+        };
+        assert_eq!(
+            state.record_history_probe_response(2, newer_fallback, local_rank),
+            HistoryProbeResponseOutcome::Pending,
+            "recovery must wait for an exact pending identity before falling back to newer"
+        );
+
+        let exact = HistoryRank {
+            version: pending.version,
+            freshness: pending.freshness,
+            runtime_started_at: 2,
+            node_id: 3,
+            terminal_repository_base_version: pending.version,
+        };
+        let HistoryProbeResponseOutcome::FetchSnapshot(request) =
+            state.record_history_probe_response(3, exact, local_rank)
+        else {
+            panic!("the exact pending repository identity must win recovery");
+        };
+        assert_eq!(request.peer(), exact.node_id);
+        assert_eq!(request.expected_rank(), exact);
+    }
+
+    #[test]
+    fn pending_repository_install_uses_newer_identity_when_exact_source_is_gone() {
+        let mut state = StrictState::new();
+        let pending = HistoryMetadata {
+            version: 10,
+            freshness: 50,
+        };
+        state.require_repository_image_install(pending);
+        state.begin_history_election([2]);
+
+        let local_rank = HistoryRank {
+            version: 9,
+            freshness: 0,
+            runtime_started_at: 2,
+            node_id: 1,
+            terminal_repository_base_version: 0,
+        };
+        let newer = HistoryRank {
+            version: 11,
+            freshness: 60,
+            runtime_started_at: 1,
+            node_id: 2,
+            terminal_repository_base_version: pending.version,
+        };
+        let HistoryProbeResponseOutcome::FetchSnapshot(request) =
+            state.record_history_probe_response(2, newer, local_rank)
+        else {
+            panic!("an elected newer checkpoint must be able to supersede an orphaned intent");
+        };
+        assert_eq!(request.peer(), newer.node_id);
+        assert_eq!(request.expected_rank(), newer);
+    }
+
+    #[test]
+    fn pending_repository_install_rejects_same_tuple_from_unauthorized_lineage() {
+        let mut state = StrictState::new();
+        let pending = HistoryMetadata {
+            version: 10,
+            freshness: 50,
+        };
+        state.require_repository_image_install(pending);
+        state.begin_history_election([2, 3]);
+
+        let local_rank = HistoryRank {
+            version: 9,
+            freshness: 0,
+            runtime_started_at: 3,
+            node_id: 1,
+            terminal_repository_base_version: 0,
+        };
+        let same_tuple_wrong_lineage = HistoryRank {
+            version: pending.version,
+            freshness: pending.freshness,
+            runtime_started_at: 1,
+            node_id: 2,
+            terminal_repository_base_version: pending.version,
+        };
+        assert_eq!(
+            state.record_history_probe_response_with_source_authorization(
+                2,
+                same_tuple_wrong_lineage,
+                local_rank,
+                false,
+            ),
+            HistoryProbeResponseOutcome::Pending,
+            "repository metadata alone must not authorize a different terminal lineage"
+        );
+
+        let authorized = HistoryRank {
+            runtime_started_at: 2,
+            node_id: 3,
+            ..same_tuple_wrong_lineage
+        };
+        let HistoryProbeResponseOutcome::FetchSnapshot(request) = state
+            .record_history_probe_response_with_source_authorization(
+                3, authorized, local_rank, true,
+            )
+        else {
+            panic!("the exact metadata from the authorized pending lineage must win");
+        };
+        assert_eq!(request.peer(), authorized.node_id);
+        assert_eq!(request.expected_rank(), authorized);
+    }
+
+    #[tokio::test]
+    async fn pending_equal_version_repository_install_requires_matching_freshness_after_restart() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V5);
+        net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
+        let repo = CountingStrictRepo::new();
+        *repo.state.lock() = (10, vec![(10, 110, None)]);
+
+        {
+            let runtime = StrictRuntime::new(
+                repo.clone(),
+                1,
+                1,
+                "channels".to_owned(),
+                net.clone(),
+                CancellationToken::new(),
+                Arc::new(ReplicationConfig::default()),
+            );
+            runtime
+                .terminal_journal
+                .lock()
+                .await
+                .install_repository_checkpoint(10, 50, &BTreeMap::new(), &BTreeMap::new())
+                .unwrap();
+        }
+
+        let recovered = StrictRuntime::new(
+            repo,
+            1,
+            2,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        assert!(
+            recovered.repository_base_required(),
+            "an equal-version repository must stay fenced while its durable image install is pending"
+        );
+
+        let local_rank = HistoryRank {
+            version: 10,
+            freshness: 100,
+            runtime_started_at: 2,
+            node_id: 1,
+            terminal_repository_base_version: 10,
+        };
+        let stale_remote = HistoryRank {
+            version: 10,
+            freshness: 49,
+            runtime_started_at: 1,
+            node_id: 2,
+            terminal_repository_base_version: 10,
+        };
+        {
+            let mut state = recovered.state.lock();
+            state.begin_history_election([2]);
+            assert_eq!(
+                state.record_history_probe_response(2, stale_remote, local_rank),
+                HistoryProbeResponseOutcome::Pending,
+                "a remote below the pending freshness identity must not win"
+            );
+            assert!(state.history_election_pending());
+            assert!(!state.history_election_active());
+        }
+
+        let eligible_remote = HistoryRank {
+            freshness: 50,
+            ..stale_remote
+        };
+        let mut state = recovered.state.lock();
+        state.begin_history_election([2]);
+        assert!(matches!(
+            state.record_history_probe_response(2, eligible_remote, local_rank),
+            HistoryProbeResponseOutcome::FetchSnapshot(_)
+        ));
+        assert!(matches!(
+            state.record_history_snapshot_response(
+                2,
+                eligible_remote,
+                local_rank,
+                10,
+                Bytes::from_static(b"equal-version-image"),
+            ),
+            HistorySnapshotResponseOutcome::Install(_)
+        ));
+    }
+
+    #[test]
+    fn repository_image_fence_only_clears_for_its_exact_metadata() {
+        let mut state = StrictState::new();
+        let intended = HistoryMetadata {
+            version: 10,
+            freshness: 50,
+        };
+        state.require_repository_image_install(intended);
+
+        assert!(!state.finish_repository_image_install(HistoryMetadata {
+            freshness: 49,
+            ..intended
+        }));
+        assert!(state.repository_base_required());
+        assert_eq!(state.pending_repository_image_install(), Some(intended));
+
+        assert!(state.finish_repository_image_install(intended));
+        assert!(!state.repository_base_required());
+        assert_eq!(state.pending_repository_image_install(), None);
     }
 
     #[test]
@@ -16654,6 +17653,7 @@ mod tests {
             2,
             SnapshotTransfer {
                 id: 1,
+                format: SnapshotFormat::Repository,
                 version: 0,
                 snapshot_msgpack: Bytes::new(),
                 snapshot_sha256: Bytes::new(),
@@ -16666,6 +17666,7 @@ mod tests {
             2,
             SnapshotReceiveTransfer {
                 id: 1,
+                format: SnapshotFormat::Repository,
                 version: 0,
                 total_bytes: 0,
                 snapshot_sha256: Bytes::new(),
@@ -18289,12 +19290,36 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn converged_runtime_emits_no_periodic_history_catchup() {
         let interval = Duration::from_millis(100);
-        let (rt, net, _repo) = v1_runtime(
+        let (rt, net, repo) = v1_runtime(
             ReplicationConfig::default().with_strict_steady_state_catchup_interval(interval),
         );
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V5);
+        assert!(
+            rt.can_originate_v2(),
+            "the silence assertion must exercise the current protocol instead of returning early"
+        );
+
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        let metadata = repo.history_metadata();
+        rt.remember_advertised_head(metadata, cut);
+        rt.recv_head_ack(
+            2,
+            1,
+            StrictHeadAck {
+                src_node: 2,
+                src_boot_epoch: 1,
+                expected_target_node: 1,
+                expected_target_boot_epoch: 1,
+                repository_version: metadata.version,
+                terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
+                history_freshness: metadata.freshness,
+            },
+        );
+        assert!(!rt.clock_tick_needed(), "the fixture must be converged");
+
         spawn_steady_state_catchup_loop(rt.clone());
         tokio::task::yield_now().await;
         net.drain_captures();
@@ -20797,11 +21822,14 @@ mod tests {
         assert_eq!(reset_repo.log(), vec![(1, 101), (2, 202), (3, 303)]);
     }
 
-    #[tokio::test]
-    async fn newer_snapshot_replaces_retired_prefix_with_elected_source_terminal_checkpoint() {
+    async fn elected_source_snapshot_replaces_retired_prefix_with_terminal_checkpoint(
+        sink_version: u64,
+        sink_last_operation: u64,
+        exercise_failed_install_retry: bool,
+        restart_after_failed_install: bool,
+    ) {
         const SOURCE_VERSION_BEFORE_SUFFIX: u64 = 9_538;
         const SOURCE_VERSION: u64 = 9_540;
-        const SINK_VERSION: u64 = 9_525;
 
         let source_dir = tempfile::TempDir::new().unwrap();
         let source_net = MockNet::new(1, vec![1, 8]);
@@ -20894,10 +21922,10 @@ mod tests {
                         rmp_serde::to_vec(&counter).unwrap(),
                     )
                     .unwrap();
-                journal.begin_delivery(retired, SINK_VERSION).unwrap();
-                journal.finish_delivery(retired, SINK_VERSION).unwrap();
+                journal.begin_delivery(retired, sink_version).unwrap();
+                journal.finish_delivery(retired, sink_version).unwrap();
             }
-            journal.checkpoint(SINK_VERSION).unwrap();
+            journal.checkpoint(sink_version).unwrap();
             assert_eq!(journal.terminal_cut().generation(), 0);
             assert_eq!(journal.record_count(), 0);
             assert!(journal.is_retired(source_prefix));
@@ -20911,8 +21939,11 @@ mod tests {
         sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V5);
         sink_net.set_strict_protocol_state_dir(Some(sink_dir.path().to_path_buf()));
         let sink_repo = CountingStrictRepo::new();
-        *sink_repo.state.lock() = (SINK_VERSION, vec![(SINK_VERSION, 9_525, None)]);
-        let sink = StrictRuntime::new(
+        *sink_repo.state.lock() = (
+            sink_version,
+            vec![(sink_version, sink_last_operation, None)],
+        );
+        let mut sink = StrictRuntime::new(
             sink_repo.clone(),
             8,
             88,
@@ -20923,7 +21954,7 @@ mod tests {
         );
         {
             let journal = sink.terminal_journal.lock().await;
-            assert_eq!(journal.checkpoint_repository_version(), SINK_VERSION);
+            assert_eq!(journal.checkpoint_repository_version(), sink_version);
             assert_eq!(journal.terminal_cut().generation(), 0);
             assert_eq!(journal.record_count(), 0);
             assert!(journal.is_retired(source_prefix));
@@ -21047,39 +22078,64 @@ mod tests {
                 .is_some()
         );
 
-        sink_repo.fail_snapshot_installs("injected post-journal snapshot failure");
-        super::super::catchup::install_snapshot_candidate(
-            &sink,
-            1,
-            source_rank,
-            snapshot_version,
-            snapshot_envelope.clone(),
-            Instant::now(),
-            Some(PeerIncarnation::new(1, 11)),
-        )
-        .await;
+        if exercise_failed_install_retry {
+            sink_repo.fail_snapshot_installs("injected post-journal snapshot failure");
+            super::super::catchup::install_snapshot_candidate(
+                &sink,
+                1,
+                source_rank,
+                snapshot_version,
+                snapshot_envelope.clone(),
+                Instant::now(),
+                Some(PeerIncarnation::new(1, 11)),
+            )
+            .await;
 
-        assert_eq!(sink_repo.current_version(), SINK_VERSION);
-        assert!(sink.repository_base_required());
-        assert_eq!(
-            sink.terminal_journal.lock().await.terminal_cut(),
-            source_cut
-        );
-        assert!(
-            sink.state
-                .lock()
-                .terminal_decisions
-                .contains_key(&source_prefix)
-        );
+            assert_eq!(sink_repo.current_version(), sink_version);
+            assert!(sink.repository_base_required());
+            assert_eq!(
+                sink.terminal_journal.lock().await.terminal_cut(),
+                source_cut
+            );
+            assert!(
+                sink.state
+                    .lock()
+                    .terminal_decisions
+                    .contains_key(&source_prefix)
+            );
 
-        sink_repo.allow_snapshot_installs();
-        {
-            let mut state = sink.state.lock();
-            state.begin_history_election([1]);
-            assert!(matches!(
-                state.record_history_probe_response(1, source_rank, HistoryRank::local(&sink)),
-                HistoryProbeResponseOutcome::FetchSnapshot(_)
-            ));
+            sink_repo.allow_snapshot_installs();
+            if restart_after_failed_install {
+                drop(sink);
+                sink = StrictRuntime::new(
+                    sink_repo.clone(),
+                    8,
+                    88,
+                    "channels".to_owned(),
+                    sink_net.clone(),
+                    CancellationToken::new(),
+                    Arc::new(ReplicationConfig::default()),
+                );
+                assert!(
+                    sink.repository_base_required(),
+                    "the durable pending image marker must fence an equal-version repository after restart"
+                );
+                assert_eq!(
+                    sink.pending_repository_image_install(),
+                    Some(HistoryMetadata {
+                        version: source_rank.version,
+                        freshness: source_rank.freshness,
+                    })
+                );
+            }
+            {
+                let mut state = sink.state.lock();
+                state.begin_history_election([1]);
+                assert!(matches!(
+                    state.record_history_probe_response(1, source_rank, HistoryRank::local(&sink)),
+                    HistoryProbeResponseOutcome::FetchSnapshot(_)
+                ));
+            }
         }
         super::super::catchup::install_snapshot_candidate(
             &sink,
@@ -21093,6 +22149,15 @@ mod tests {
         .await;
 
         assert_eq!(sink_repo.current_version(), SOURCE_VERSION);
+        assert!(!sink.repository_base_required());
+        assert!(
+            sink.terminal_journal
+                .lock()
+                .await
+                .pending_repository_image_install()
+                .is_none(),
+            "a successful retry must durably clear the repository image marker"
+        );
         let sink_cut = sink.terminal_journal.lock().await.terminal_cut();
         assert_eq!(sink_cut, source_cut);
         assert!(!sink.terminal_journal.lock().await.is_retired(source_prefix));
@@ -21113,6 +22178,10 @@ mod tests {
             MemberIncarnation::new(1, 11),
             MemberIncarnation::new(8, 88),
         ]);
+        // This helper has already completed the elected repository recovery.
+        // Close the synthetic membership-expansion election before exercising
+        // admission: production no longer polls admission in AwaitingLocalCut.
+        sink.finish_history_election_for_test();
         sink.reconcile_peer_admissions();
         {
             let mut state = sink.state.lock();
@@ -21148,6 +22217,22 @@ mod tests {
             .expect("post-recovery admission metadata response");
         super::super::catchup::recv_v3_history_probe_resp(&sink, 1, 11, admission_response).await;
         assert!(sink.peer_incarnation_is_admitted(1, 11));
+    }
+
+    #[tokio::test]
+    async fn newer_snapshot_replaces_retired_prefix_with_elected_source_terminal_checkpoint() {
+        elected_source_snapshot_replaces_retired_prefix_with_terminal_checkpoint(
+            9_525, 9_525, true, false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn equal_head_snapshot_replaces_divergent_compacted_terminal_lineage() {
+        elected_source_snapshot_replaces_retired_prefix_with_terminal_checkpoint(
+            9_540, 9_540, true, true,
+        )
+        .await;
     }
 
     #[tokio::test]

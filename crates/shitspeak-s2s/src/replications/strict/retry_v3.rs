@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::super::proto::{
-    StrictCatchupReq, StrictClockProbeReq, StrictHistoryProbeReq, StrictTerminalSyncAck,
-    StrictTerminalSyncReq,
+    StrictCatchupReq, StrictClockProbeReq, StrictHistoryProbeReq, StrictHistoryTransferResp,
+    StrictTerminalSyncAck, StrictTerminalSyncReq,
 };
 use super::sync_v3::PeerIncarnation;
 use shitspeak_core::NodeIdentifier;
@@ -267,6 +267,31 @@ impl V3RetryState {
         }
     }
 
+    pub(super) fn history_probe_nonce_is_scheduled(
+        &self,
+        peer: PeerIncarnation,
+        nonce: u64,
+    ) -> bool {
+        self.history_probes
+            .get(&peer)
+            .is_some_and(|pending| pending.message.request_nonce == nonce)
+    }
+
+    pub(super) fn expedite_history_probe(
+        &mut self,
+        peer: PeerIncarnation,
+        nonce: u64,
+        now: Instant,
+    ) {
+        if let Some(pending) = self
+            .history_probes
+            .get_mut(&peer)
+            .filter(|pending| pending.message.request_nonce == nonce)
+        {
+            pending.next_at = pending.next_at.min(now);
+        }
+    }
+
     pub(super) fn complete_history_request(&mut self, peer: PeerIncarnation, nonce: u64) {
         if self.history_requests.get(&peer).is_some_and(|pending| {
             pending
@@ -313,6 +338,35 @@ impl V3RetryState {
                 attempt: 0,
             },
         );
+    }
+
+    /// Complete only the final ACK identified by an authenticated peer's
+    /// exact, operation-free confirmation. Ordinary history responses use a
+    /// client request nonce and therefore cannot clear this retry slot.
+    pub(super) fn complete_history_final_ack(
+        &mut self,
+        peer: PeerIncarnation,
+        confirmation: &StrictHistoryTransferResp,
+        local_boot_epoch: u64,
+    ) -> bool {
+        let key = (peer, confirmation.transfer_id);
+        let confirmed = self.history_final_acks.get(&key).is_some_and(|pending| {
+            pending
+                .message
+                .history_transfer
+                .as_ref()
+                .is_some_and(|final_ack| {
+                    final_ack.final_ack
+                        && confirmation.expected_requester_boot_epoch == local_boot_epoch
+                        && confirmation.request_nonce == final_ack.request_nonce
+                        && confirmation.cursor == final_ack.expected_cursor
+                        && confirmation.target_version == final_ack.target_version
+                })
+        });
+        if confirmed {
+            self.history_final_acks.remove(&key);
+        }
+        confirmed
     }
 
     pub(super) fn due(
@@ -613,7 +667,8 @@ fn jittered(delay: Duration, jitter_pct: u32, salt: u64) -> Duration {
 mod tests {
     use super::{PeerIncarnation, V3RetryState, jittered};
     use crate::replications::proto::{
-        StrictClockProbeReq, StrictHistoryProbeReq, StrictTerminalSyncAck, StrictTerminalSyncReq,
+        StrictCatchupReq, StrictClockProbeReq, StrictHistoryProbeReq, StrictHistoryTransferReq,
+        StrictHistoryTransferResp, StrictTerminalSyncAck, StrictTerminalSyncReq,
     };
     use std::time::{Duration, Instant};
 
@@ -714,6 +769,59 @@ mod tests {
         assert!(state.history_probe_is_current(peer, &request));
         state.complete_history_probe(peer, request.request_nonce);
         assert!(!state.history_probe_is_current(peer, &request));
+    }
+
+    #[test]
+    fn history_final_ack_requires_exact_correlated_confirmation() {
+        let peer = PeerIncarnation::new(7, 70);
+        let mut state = V3RetryState::default();
+        let ack = StrictCatchupReq {
+            history_transfer: Some(StrictHistoryTransferReq {
+                transfer_id: 51,
+                request_nonce: 52,
+                expected_cursor: 53,
+                target_version: 54,
+                final_ack: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.register_history_final_ack(
+            peer,
+            ack.clone(),
+            Duration::ZERO,
+            Duration::from_secs(30),
+            0,
+            1,
+        );
+        let confirmation = StrictHistoryTransferResp {
+            expected_requester_boot_epoch: 99,
+            transfer_id: 51,
+            request_nonce: 52,
+            cursor: 53,
+            target_version: 54,
+        };
+
+        for mismatched in [
+            StrictHistoryTransferResp {
+                request_nonce: 55,
+                ..confirmation.clone()
+            },
+            StrictHistoryTransferResp {
+                transfer_id: 56,
+                ..confirmation.clone()
+            },
+            StrictHistoryTransferResp {
+                expected_requester_boot_epoch: 100,
+                ..confirmation.clone()
+            },
+        ] {
+            assert!(!state.complete_history_final_ack(peer, &mismatched, 99));
+            assert!(state.history_final_ack_is_current(peer, &ack));
+        }
+
+        assert!(state.complete_history_final_ack(peer, &confirmation, 99));
+        assert!(!state.history_final_ack_is_current(peer, &ack));
     }
 
     #[test]

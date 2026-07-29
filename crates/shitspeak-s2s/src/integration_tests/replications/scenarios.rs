@@ -78,7 +78,7 @@ impl StrictReplicable for TestChannelReplicationAdapter {
         }
     }
 
-    fn snapshot(&self) -> Result<(u64, Bytes), StrictSnapshotError> {
+    fn snapshot_with_metadata(&self) -> Result<(HistoryMetadata, Bytes), StrictSnapshotError> {
         let repo = self.repo.clone();
         let strict_snapshot = block_in_place_or_current(|handle| {
             handle.block_on(repo.strict_snapshot_in_server(DEFAULT_SERVER_ID))
@@ -94,7 +94,7 @@ impl StrictReplicable for TestChannelReplicationAdapter {
         .map_err(|error| {
             StrictSnapshotError::new(format!("channel test snapshot encode failed: {error}"))
         })?;
-        Ok((version, bytes))
+        Ok((HistoryMetadata { version, freshness }, bytes))
     }
 
     fn log_since(&self, since: u64) -> LogSlice<StrictLogEntry<Self::Op>> {
@@ -336,8 +336,8 @@ impl StrictReplicable for GatedCountingStrictRepo {
         self.inner.history_metadata()
     }
 
-    fn snapshot(&self) -> Result<(u64, Bytes), StrictSnapshotError> {
-        self.inner.snapshot()
+    fn snapshot_with_metadata(&self) -> Result<(HistoryMetadata, Bytes), StrictSnapshotError> {
+        self.inner.snapshot_with_metadata()
     }
 
     fn log_since(&self, since: u64) -> LogSlice<StrictLogEntry<Self::Op>> {

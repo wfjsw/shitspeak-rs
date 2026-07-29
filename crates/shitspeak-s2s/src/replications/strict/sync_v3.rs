@@ -508,6 +508,14 @@ impl SyncV3State {
         peer: PeerIncarnation,
         event: SessionEvent,
     ) -> Vec<SessionEffect> {
+        // A trigger is also the point at which production attempts to open a
+        // replacement wire. Reconcile expired payload leases first so their
+        // reducer lifecycle cannot make the new request look active and
+        // falsely coalesce it. `expire` only feeds non-trigger events back
+        // through this method, so this cannot recurse.
+        if matches!(&event, SessionEvent::Trigger(_)) {
+            self.expire(Instant::now());
+        }
         let newest_epoch = self
             .sessions
             .keys()
@@ -627,6 +635,42 @@ impl SyncV3State {
             .get(&peer)
             .copied()
             .or_else(|| self.durable_source_cuts.get(&peer.node).copied())
+    }
+
+    /// Discard a previously installed delta baseline when an elected source
+    /// must provide a complete foreign checkpoint image. This is only valid
+    /// before starting a new idle client for the same incarnation.
+    pub(super) fn force_checkpoint_from_zero(&mut self, peer: PeerIncarnation) -> bool {
+        if self
+            .sessions
+            .get(&peer)
+            .is_some_and(|session| !session.is_idle())
+        {
+            return false;
+        }
+        self.reset_terminal_baseline(peer);
+        true
+    }
+
+    /// Reset a rejected terminal cursor after the correlated payload client
+    /// has been released. `finish_failed_client` may have promoted coalesced
+    /// dirty work to a new reducer wire, but that wire inherited the rejected
+    /// baseline and must not prevent a fresh cursor-zero replacement.
+    pub(super) fn reset_after_cursor_mismatch(&mut self, peer: PeerIncarnation) {
+        debug_assert!(!self.clients.contains_key(&peer));
+        debug_assert!(!self.finalizing_clients.contains_key(&peer));
+        self.reset_terminal_baseline(peer);
+    }
+
+    fn reset_terminal_baseline(&mut self, peer: PeerIncarnation) {
+        self.sessions
+            .entry(peer)
+            .and_modify(SessionState::reset_terminal_cursor)
+            .or_insert_with(|| SessionState::new(PeerEpoch::new(peer.boot_epoch)));
+        self.known_source_cuts.remove(&peer);
+        self.durable_source_cuts.remove(&peer.node);
+        self.pending_source_transitions.remove(&peer);
+        self.source_transition_history.remove(&peer);
     }
 
     pub(super) fn remember_source_cut(&mut self, peer: PeerIncarnation, cut: TerminalCut) {
@@ -919,6 +963,7 @@ impl SyncV3State {
         true
     }
 
+    #[cfg(test)]
     pub(super) fn cancel_clock_nonce(&mut self, peer: PeerIncarnation, nonce: u64) {
         if self.clock_nonces.get(&peer).map(|pending| pending.value) == Some(nonce) {
             self.clock_nonces.remove(&peer);
@@ -1024,6 +1069,11 @@ impl SyncV3State {
             .is_some_and(|pending| pending.value == nonce)
     }
 
+    pub(super) fn current_history_nonce(&self, peer: PeerIncarnation) -> Option<u64> {
+        self.history_nonces.get(&peer).map(|pending| pending.value)
+    }
+
+    #[cfg(test)]
     pub(super) fn cancel_history_nonce(&mut self, peer: PeerIncarnation, nonce: u64) {
         if self.history_nonces.get(&peer).map(|pending| pending.value) == Some(nonce) {
             self.history_nonces.remove(&peer);
@@ -1057,6 +1107,14 @@ impl SyncV3State {
             return true;
         }
         if self.responders.contains_key(&peer) {
+            self.defer_client(peer, reason, desired_cut);
+            return true;
+        }
+        // The lifecycle reducer may own history work without a terminal
+        // payload cache. A terminal trigger coalesced behind that work still
+        // carries source-specific proof: retain the exact cut until history
+        // releases the peer instead of resuming as an unbounded pull.
+        if self.has_session_work(peer) {
             self.defer_client(peer, reason, desired_cut);
             return true;
         }
@@ -1280,6 +1338,38 @@ impl SyncV3State {
 
     pub(super) fn finish_client(&mut self, peer: PeerIncarnation) -> Option<ClientSession> {
         self.clients.remove(&peer)
+    }
+
+    /// Release a failed payload client and its reducer-owned wire lifecycle.
+    ///
+    /// This is intentionally separate from `finish_client`: callers which
+    /// already transitioned an apply failure may have started a dirty
+    /// follow-up that must remain active.
+    pub(super) fn finish_failed_client(&mut self, peer: PeerIncarnation) -> Option<ClientSession> {
+        let completed = self.clients.remove(&peer)?;
+        let failed_nonce = completed.pending_nonce;
+        let failed_wire = self
+            .sessions
+            .get(&peer)
+            .and_then(SessionState::active_wire)
+            .filter(|wire| wire.nonce().get() == failed_nonce);
+        if let Some(wire) = failed_wire {
+            let _ = self.transition_session(
+                peer,
+                SessionEvent::TransferExpired {
+                    epoch: PeerEpoch::new(peer.boot_epoch()),
+                    wire,
+                },
+            );
+        }
+        debug_assert!(
+            self.sessions
+                .get(&peer)
+                .and_then(SessionState::active_wire)
+                .is_none_or(|wire| wire.nonce().get() != failed_nonce),
+            "failed payload client left its reducer wire active"
+        );
+        Some(completed)
     }
 
     /// Move a completed terminal transfer into its final-ACK handshake.

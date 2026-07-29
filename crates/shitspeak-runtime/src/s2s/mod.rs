@@ -3403,7 +3403,12 @@ impl StrictReplicable for ChannelReplicationAdapter {
             .collect()
     }
 
-    fn snapshot(&self) -> Result<(u64, Bytes), s2s_replications::strict::StrictSnapshotError> {
+    fn snapshot_with_metadata(
+        &self,
+    ) -> Result<
+        (s2s_replications::strict::HistoryMetadata, Bytes),
+        s2s_replications::strict::StrictSnapshotError,
+    > {
         let repo = self.repo.clone();
         let server_id = self.server_id.clone();
         let strict_snapshot = block_in_place_or_current(|handle| {
@@ -3428,7 +3433,10 @@ impl StrictReplicable for ChannelReplicationAdapter {
                 "s2s channel snapshot serialization failed: {error}"
             ))
         })?;
-        Ok((version, bytes))
+        Ok((
+            s2s_replications::strict::HistoryMetadata { version, freshness },
+            bytes,
+        ))
     }
 
     fn log_since(
@@ -3713,7 +3721,12 @@ impl StrictReplicable for BanReplicationAdapter {
             .collect()
     }
 
-    fn snapshot(&self) -> Result<(u64, Bytes), s2s_replications::strict::StrictSnapshotError> {
+    fn snapshot_with_metadata(
+        &self,
+    ) -> Result<
+        (s2s_replications::strict::HistoryMetadata, Bytes),
+        s2s_replications::strict::StrictSnapshotError,
+    > {
         let strict_snapshot = self.repo.strict_snapshot_v5().map_err(|error| {
             let message = format!("s2s ban snapshot capture failed: {error}");
             if self.repo.strict_durability_failure_observed() {
@@ -3735,7 +3748,10 @@ impl StrictReplicable for BanReplicationAdapter {
                 "s2s ban snapshot serialization failed: {error}"
             ))
         })?;
-        Ok((version, bytes))
+        Ok((
+            s2s_replications::strict::HistoryMetadata { version, freshness },
+            bytes,
+        ))
     }
 
     fn log_since(

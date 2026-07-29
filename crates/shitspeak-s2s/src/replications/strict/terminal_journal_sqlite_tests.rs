@@ -1,4 +1,4 @@
-use std::{fs, sync::Arc, thread};
+use std::{collections::BTreeMap, fs, sync::Arc, thread};
 
 use bytes::Bytes;
 use rusqlite::Connection;
@@ -36,13 +36,15 @@ fn schema_v1_migration_preserves_records_and_cut() {
 
     {
         let store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
-        let (records, loaded_cut, epoch, repository_version, retired) =
+        let (records, loaded_cut, epoch, repository_version, retired, pending, freshness) =
             store.load().unwrap().unwrap().into_parts();
         assert_eq!(records.get(&op_id), Some(&record));
         assert_eq!(loaded_cut, cut);
         assert_eq!(epoch, 0);
         assert_eq!(repository_version, 0);
         assert!(retired.is_empty());
+        assert!(!pending);
+        assert_eq!(freshness, 0);
     }
 
     let connection = Connection::open(path).unwrap();
@@ -50,7 +52,7 @@ fn schema_v1_migration_preserves_records_and_cut() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     for table in ["journal_checkpoint", "retired_origins"] {
         assert_eq!(
@@ -63,6 +65,160 @@ fn schema_v1_migration_preserves_records_and_cut() {
                 .unwrap(),
             1
         );
+    }
+    for column in [
+        "repository_image_install_pending",
+        "repository_image_install_freshness",
+    ] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('journal_checkpoint')
+                     WHERE name = ?1",
+                    [column],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn schema_v2_migration_preserves_checkpoint_and_defaults_install_complete() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("journal.sqlite3");
+    let cut = TerminalCut::new([8; 16], 0, [0; 32], [9; 32]);
+    let retired = BTreeMap::from([(17, 23)]);
+    {
+        let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        store.replace_all(std::iter::empty(), &cut).unwrap();
+        store.checkpoint(4, 44, &retired, &cut).unwrap();
+    }
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE journal_checkpoint RENAME TO journal_checkpoint_v3;
+                 CREATE TABLE journal_checkpoint (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     epoch BLOB NOT NULL CHECK (length(epoch) = 8),
+                     repository_version BLOB NOT NULL CHECK (length(repository_version) = 8)
+                 ) STRICT;
+                 INSERT INTO journal_checkpoint (singleton, epoch, repository_version)
+                     SELECT singleton, epoch, repository_version FROM journal_checkpoint_v3;
+                 DROP TABLE journal_checkpoint_v3;
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+    }
+
+    {
+        let store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        let (records, loaded_cut, epoch, repository_version, loaded_retired, pending, freshness) =
+            store.load().unwrap().unwrap().into_parts();
+        assert!(records.is_empty());
+        assert_eq!(loaded_cut, cut);
+        assert_eq!(epoch, 4);
+        assert_eq!(repository_version, 44);
+        assert_eq!(loaded_retired, retired);
+        assert!(!pending);
+        assert_eq!(freshness, 0);
+    }
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    for column in [
+        "repository_image_install_pending",
+        "repository_image_install_freshness",
+    ] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('journal_checkpoint')
+                     WHERE name = ?1",
+                    [column],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn repository_image_install_marker_is_durable_and_coordinate_matched() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("journal.sqlite3");
+    let cut = TerminalCut::new([10; 16], 1, [11; 32], [12; 32]);
+    let op_id = (13, 14);
+    let record = TerminalJournalRecord::default();
+    {
+        let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        store
+            .install_repository_base([(&op_id, &record)], 5, 9_540, -17, &BTreeMap::new(), &cut)
+            .unwrap();
+    }
+
+    {
+        let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        let (_, _, epoch, repository_version, _, pending, freshness) =
+            store.load().unwrap().unwrap().into_parts();
+        assert_eq!(epoch, 5);
+        assert_eq!(repository_version, 9_540);
+        assert!(pending);
+        assert_eq!(freshness, -17);
+
+        assert!(
+            store
+                .complete_repository_image_install(4, 9_540, -17)
+                .is_err()
+        );
+        assert!(
+            store
+                .complete_repository_image_install(5, 9_539, -17)
+                .is_err()
+        );
+        assert!(
+            store
+                .complete_repository_image_install(5, 9_540, -18)
+                .is_err()
+        );
+        let (_, _, _, _, _, pending, freshness) = store.load().unwrap().unwrap().into_parts();
+        assert!(pending);
+        assert_eq!(freshness, -17);
+        store
+            .complete_repository_image_install(5, 9_540, -17)
+            .unwrap();
+    }
+
+    {
+        let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        let (_, _, _, _, _, pending, freshness) = store.load().unwrap().unwrap().into_parts();
+        assert!(!pending);
+        assert_eq!(freshness, 0);
+        store
+            .install_repository_base(
+                [(&op_id, &record)],
+                6,
+                9_541,
+                i64::MAX,
+                &BTreeMap::new(),
+                &cut,
+            )
+            .unwrap();
+        let (_, _, _, _, _, pending, freshness) = store.load().unwrap().unwrap().into_parts();
+        assert!(pending);
+        assert_eq!(freshness, i64::MAX);
+        store.checkpoint(7, 9_541, &BTreeMap::new(), &cut).unwrap();
+        let (_, _, _, _, _, pending, freshness) = store.load().unwrap().unwrap().into_parts();
+        assert!(!pending);
+        assert_eq!(freshness, 0);
     }
 }
 

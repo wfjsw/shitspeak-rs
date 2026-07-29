@@ -196,6 +196,9 @@ message StrictClockProbeReq {
   uint64 expected_responder_boot_epoch = 2;
   uint64 request_nonce                 = 3;
   StrictCatchupReason reason            = 4;
+  // Requester's current Tempo clock. Older senders decode as zero and older
+  // responders ignore this additive field, preserving rolling compatibility.
+  uint64 requester_clock               = 5;
 }
 
 message StrictClockProbeResp {

@@ -25,7 +25,8 @@ use shitspeak_s2s::overlay::{
     ServiceInbound,
 };
 use shitspeak_s2s::replications::strict::{
-    LogSlice, StrictCommitApplyOutcome, StrictLogEntry, StrictLogMetadata, StrictSnapshotError,
+    HistoryMetadata, LogSlice, StrictCommitApplyOutcome, StrictLogEntry, StrictLogMetadata,
+    StrictSnapshotError,
 };
 use shitspeak_s2s::replications::{ReplicationError, ReplicationManager, StrictReplicable};
 use shitspeak_s2s::testing::{FaultSelector, LinkChaos, MessageType};
@@ -853,15 +854,18 @@ impl StrictReplicable for WorkloadRepo {
         self.state.lock().version
     }
 
-    fn snapshot(&self) -> Result<(u64, Bytes), StrictSnapshotError> {
+    fn snapshot_with_metadata(&self) -> Result<(HistoryMetadata, Bytes), StrictSnapshotError> {
         let state = self.state.lock();
-        let version = state.version;
+        let metadata = HistoryMetadata {
+            version: state.version,
+            freshness: 0,
+        };
         let bytes = rmp_serde::to_vec(&state.snapshot())
             .map(Bytes::from)
             .map_err(|error| {
                 StrictSnapshotError::new(format!("workload snapshot encode failed: {error}"))
             })?;
-        Ok((version, bytes))
+        Ok((metadata, bytes))
     }
 
     fn log_since(&self, since: u64) -> LogSlice<StrictLogEntry<Self::Op>> {

@@ -11,3 +11,7 @@ Prefer block scope instead of `drop()`.
 ## Regression handling
 
 When dealing a regression / correctness hole, whether it is a new problem or is found by reviewing the code, especially when it is discovered mid-implementation, first implement a regression test to ensure the issue is real and reproducible. Then, implement a fix and ensure that the regression test passes. This ensures that the issue is properly addressed and prevents future regressions.
+
+## Batch the test
+
+Consider making all changes first and then running the test suite at once, instead of running the test suite after each change. This can save time from repetitive compilation, especially when making multiple changes that are related or dependent on each other. The range/coverage of the test itself however should never be reduced.

@@ -143,6 +143,24 @@ mod tests {
     }
 
     #[test]
+    fn deferred_terminal_sync_preserves_exact_desired_cut() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let desired_cut = TerminalCut::new([4; 16], 17, [5; 32], [6; 32]);
+
+        state.defer_terminal_sync_toward(
+            peer,
+            StrictCatchupReason::RepositoryGap,
+            Some(desired_cut),
+        );
+
+        assert_eq!(
+            state.take_deferred_terminal_intent(peer),
+            Some((StrictCatchupReason::RepositoryGap, Some(desired_cut)))
+        );
+    }
+
+    #[test]
     fn response_claim_is_atomic_and_final_page_has_explicit_ack() {
         let peer = PeerIncarnation::new(2, 11);
         let mut state = HistoryV3State::default();
@@ -174,6 +192,109 @@ mod tests {
         assert!(transfer.final_ack);
         assert_eq!(transfer.transfer_id, request.transfer_id);
         assert_eq!(transfer.acknowledged_request_nonce, request.request_nonce);
+    }
+
+    #[test]
+    fn valid_history_progress_refreshes_client_expiry() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let ttl = Duration::from_secs(1);
+        let first = state
+            .begin_transfer(
+                peer,
+                100,
+                90,
+                StrictCatchupReason::RepositoryGap,
+                ttl,
+                false,
+                StrictCatchupReason::RepositoryGap,
+            )
+            .expect("first request")
+            .into_parts()
+            .0;
+        let original_deadline = Instant::now() + Duration::from_millis(1);
+        state
+            .clients
+            .get_mut(&peer)
+            .expect("active client")
+            .expires_at = original_deadline;
+
+        assert!(state.claim_response(
+            peer,
+            &StrictHistoryTransferResp {
+                expected_requester_boot_epoch: 77,
+                transfer_id: first.transfer_id,
+                request_nonce: first.request_nonce,
+                cursor: first.expected_cursor,
+                target_version: first.target_version,
+            },
+            77,
+        ));
+        let second = state
+            .continue_transfer(peer, 95)
+            .expect("continuation request");
+
+        assert!(
+            state
+                .expire_clients(original_deadline + Duration::from_millis(1))
+                .is_empty()
+        );
+        assert!(state.has_active_transfer(peer));
+        assert!(state.claim_response(
+            peer,
+            &StrictHistoryTransferResp {
+                expected_requester_boot_epoch: 77,
+                transfer_id: second.transfer_id,
+                request_nonce: second.request_nonce,
+                cursor: second.expected_cursor,
+                target_version: second.target_version,
+            },
+            77,
+        ));
+    }
+
+    #[test]
+    fn invalid_history_response_does_not_refresh_client_expiry() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let first = state
+            .begin_transfer(
+                peer,
+                100,
+                90,
+                StrictCatchupReason::RepositoryGap,
+                Duration::from_secs(1),
+                false,
+                StrictCatchupReason::RepositoryGap,
+            )
+            .expect("first request")
+            .into_parts()
+            .0;
+        let original_deadline = Instant::now() + Duration::from_millis(1);
+        state
+            .clients
+            .get_mut(&peer)
+            .expect("active client")
+            .expires_at = original_deadline;
+
+        assert!(!state.claim_response(
+            peer,
+            &StrictHistoryTransferResp {
+                expected_requester_boot_epoch: 77,
+                transfer_id: first.transfer_id,
+                request_nonce: first.request_nonce.wrapping_add(1),
+                cursor: first.expected_cursor,
+                target_version: first.target_version,
+            },
+            77,
+        ));
+        assert_eq!(
+            state
+                .expire_clients(original_deadline + Duration::from_millis(1))
+                .len(),
+            1
+        );
+        assert!(!state.has_active_transfer(peer));
     }
 
     #[test]
@@ -256,7 +377,20 @@ mod tests {
             state.begin_server_request(peer, &request, Duration::from_secs(30)),
             HistoryServerRequest::Build { .. }
         ));
-        assert!(state.cache_server_response(peer, &request, StrictCatchupResp::default()));
+        assert!(state.cache_server_response(
+            peer,
+            &request,
+            StrictCatchupResp {
+                history_transfer: Some(StrictHistoryTransferResp {
+                    transfer_id: request.transfer_id,
+                    request_nonce: request.request_nonce,
+                    cursor: request.expected_cursor,
+                    target_version: request.target_version,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        ));
         assert!(state.has_server_transfer(peer));
         assert!(state.has_checkpoint_blocking_work(Instant::now()));
 
@@ -268,6 +402,17 @@ mod tests {
             ..Default::default()
         };
         assert!(state.acknowledge_server_final(peer, &final_ack));
+        assert!(
+            state.acknowledge_server_final(peer, &final_ack),
+            "an exact retry must receive the confirmation again"
+        );
+        assert!(!state.acknowledge_server_final(
+            peer,
+            &StrictHistoryTransferReq {
+                request_nonce: final_ack.request_nonce.wrapping_add(1),
+                ..final_ack.clone()
+            }
+        ));
         assert!(!state.has_server_transfer(peer));
         assert!(!state.has_any_transfer(peer));
         assert!(!state.has_checkpoint_blocking_work(Instant::now()));
@@ -363,7 +508,14 @@ struct HistoryClient {
     reason: StrictCatchupReason,
     metric_reason: StrictCatchupReason,
     processing_nonce: Option<u64>,
+    ttl: Duration,
     expires_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct DeferredTerminalIntent {
+    reason: StrictCatchupReason,
+    desired_cut: Option<TerminalCut>,
 }
 
 #[derive(Clone)]
@@ -371,6 +523,7 @@ struct HistoryServerPage {
     response: Option<StrictCatchupResp>,
     reason: StrictCatchupReason,
     acknowledged: bool,
+    final_ack_nonce: Option<u64>,
     expires_at: Instant,
 }
 
@@ -418,7 +571,7 @@ pub(super) struct HistoryV3State {
     pending: HashMap<PeerIncarnation, PendingHistoryIntent>,
     clients: HashMap<PeerIncarnation, HistoryClient>,
     server_pages: HashMap<(PeerIncarnation, u64, u64), HistoryServerPage>,
-    deferred_terminal: HashMap<PeerIncarnation, StrictCatchupReason>,
+    deferred_terminal: HashMap<PeerIncarnation, DeferredTerminalIntent>,
     deferred_admissions: HashMap<PeerIncarnation, HistoryProbeCandidate>,
 }
 
@@ -432,6 +585,12 @@ fn reason_priority(reason: StrictCatchupReason) -> u8 {
         | StrictCatchupReason::LegacyV2 => 1,
         StrictCatchupReason::DeliveryWatermark | StrictCatchupReason::Unspecified => 0,
     }
+}
+
+fn desired_cut_replaces(candidate: TerminalCut, current: TerminalCut) -> bool {
+    candidate.journal_id() != current.journal_id()
+        || candidate.generation() > current.generation()
+        || (candidate.generation() == current.generation() && candidate != current)
 }
 
 fn transfer_preempts(candidate: StrictCatchupReason, current: StrictCatchupReason) -> bool {
@@ -591,6 +750,7 @@ impl HistoryV3State {
                 reason,
                 metric_reason,
                 processing_nonce: None,
+                ttl,
                 expires_at: Instant::now() + ttl,
             },
         );
@@ -626,6 +786,7 @@ impl HistoryV3State {
             && response.target_version == client.target_version;
         if accepted {
             client.processing_nonce = Some(response.request_nonce);
+            client.expires_at = Instant::now() + client.ttl;
         }
         accepted
     }
@@ -649,26 +810,39 @@ impl HistoryV3State {
         self.has_active_transfer(peer) || self.has_server_transfer(peer)
     }
 
-    pub(super) fn defer_terminal_sync(
+    pub(super) fn defer_terminal_sync_toward(
         &mut self,
         peer: PeerIncarnation,
         reason: StrictCatchupReason,
+        desired_cut: Option<TerminalCut>,
     ) {
         self.deferred_terminal
             .entry(peer)
             .and_modify(|current| {
-                if reason_priority(reason) > reason_priority(*current) {
-                    *current = reason;
+                if reason_priority(reason) > reason_priority(current.reason) {
+                    current.reason = reason;
+                }
+                if let Some(desired_cut) = desired_cut.filter(|candidate| {
+                    current
+                        .desired_cut
+                        .is_none_or(|cut| desired_cut_replaces(*candidate, cut))
+                }) {
+                    current.desired_cut = Some(desired_cut);
                 }
             })
-            .or_insert(reason);
+            .or_insert(DeferredTerminalIntent {
+                reason,
+                desired_cut,
+            });
     }
 
-    pub(super) fn take_deferred_terminal_sync(
+    pub(super) fn take_deferred_terminal_intent(
         &mut self,
         peer: PeerIncarnation,
-    ) -> Option<StrictCatchupReason> {
-        self.deferred_terminal.remove(&peer)
+    ) -> Option<(StrictCatchupReason, Option<TerminalCut>)> {
+        self.deferred_terminal
+            .remove(&peer)
+            .map(|intent| (intent.reason, intent.desired_cut))
     }
 
     pub(super) fn continue_transfer(
@@ -681,6 +855,7 @@ impl HistoryV3State {
         let acknowledged_request_nonce = client.processing_nonce.take()?;
         client.pending_nonce = nonce;
         client.next_cursor = cursor;
+        client.expires_at = Instant::now() + client.ttl;
         Some(StrictHistoryTransferReq {
             expected_responder_boot_epoch: peer.boot_epoch(),
             transfer_id: client.transfer_id,
@@ -807,6 +982,7 @@ impl HistoryV3State {
                 response: None,
                 reason,
                 acknowledged: false,
+                final_ack_nonce: None,
                 expires_at: now + ttl,
             },
         );
@@ -863,10 +1039,23 @@ impl HistoryV3State {
         let Some(page) = self.server_pages.get_mut(&key) else {
             return false;
         };
-        if page.acknowledged || page.response.is_none() {
+        if page.acknowledged {
+            return page.final_ack_nonce == Some(request.request_nonce);
+        }
+        let Some(response) = page.response.as_ref() else {
+            return false;
+        };
+        let Some(correlation) = response.history_transfer.as_ref() else {
+            return false;
+        };
+        if request.reason != page.reason as i32
+            || request.expected_cursor != correlation.cursor
+            || request.target_version != correlation.target_version
+        {
             return false;
         }
         page.acknowledged = true;
+        page.final_ack_nonce = Some(request.request_nonce);
         true
     }
 

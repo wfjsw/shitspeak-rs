@@ -688,6 +688,7 @@ mod tests {
                 expected_responder_boot_epoch: 24,
                 request_nonce: 101,
                 reason: StrictCatchupReason::DeliveryWatermark as i32,
+                requester_clock: 899,
             }),
             StrictBody::ClockProbeResp(StrictClockProbeResp {
                 responder_node: 7,
@@ -796,6 +797,28 @@ mod tests {
             decision.source_terminal_set_digest,
             target_cut.terminal_set_digest
         );
+    }
+
+    #[test]
+    fn clock_probe_requester_clock_is_additive_and_defaults_for_legacy_wire_data() {
+        // Pre-requester-clock protobuf bytes containing fields 1 through 4.
+        let legacy = [0x08, 0x03, 0x10, 0x18, 0x18, 0x65, 0x20, 0x05];
+        let decoded = StrictClockProbeReq::decode(legacy.as_slice()).unwrap();
+        assert_eq!(decoded.src_node, 3);
+        assert_eq!(decoded.expected_responder_boot_epoch, 24);
+        assert_eq!(decoded.request_nonce, 101);
+        assert_eq!(
+            decoded.reason,
+            StrictCatchupReason::DeliveryWatermark as i32
+        );
+        assert_eq!(decoded.requester_clock, 0);
+
+        let current = StrictClockProbeReq {
+            requester_clock: 10_000,
+            ..decoded
+        };
+        let current = StrictClockProbeReq::decode(current.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(current.requester_clock, 10_000);
     }
 
     #[test]

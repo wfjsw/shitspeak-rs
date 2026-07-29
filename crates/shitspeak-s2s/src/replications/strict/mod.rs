@@ -146,10 +146,10 @@ impl<Op> StrictLogEntry<Op> {
 ///
 /// # Snapshot consistency
 ///
-/// `snapshot` MUST be atomic: the returned `version` MUST equal
-/// `current_version()` at the moment the snapshot bytes were captured.
-/// Implementations are expected to briefly quiesce (e.g. grab their
-/// internal `RwLock`) while reading.
+/// `snapshot_with_metadata` MUST be atomic: the returned metadata MUST
+/// describe the exact repository image represented by the snapshot bytes.
+/// Implementations are expected to briefly quiesce (e.g. grab their internal
+/// `RwLock`) while reading the version, freshness, and repository state.
 #[async_trait]
 pub trait StrictReplicable: Send + Sync + 'static {
     type Op: Serialize + DeserializeOwned + Send + Sync + Clone + 'static;
@@ -183,12 +183,19 @@ pub trait StrictReplicable: Send + Sync + 'static {
         }
     }
 
-    /// Atomically capture a snapshot. The returned `version` matches the
-    /// applied state captured by `msgpack_bytes`.
+    /// Atomically capture a snapshot and the history metadata for that exact
+    /// repository image.
     ///
     /// Capture errors must be reported rather than represented as an empty
     /// snapshot: a responder will fail closed and let the requester retry.
-    fn snapshot(&self) -> Result<(u64, Bytes), StrictSnapshotError>;
+    fn snapshot_with_metadata(&self) -> Result<(HistoryMetadata, Bytes), StrictSnapshotError>;
+
+    /// Atomically capture a snapshot. The returned `version` matches the
+    /// applied state captured by `msgpack_bytes`.
+    fn snapshot(&self) -> Result<(u64, Bytes), StrictSnapshotError> {
+        self.snapshot_with_metadata()
+            .map(|(metadata, bytes)| (metadata.version, bytes))
+    }
 
     /// Ops with version in `(since, current_version]`. Returns
     /// `LogSlice::TooOld` when the structure can no longer satisfy from its

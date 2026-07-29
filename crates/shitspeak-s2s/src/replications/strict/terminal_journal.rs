@@ -681,6 +681,10 @@ pub(crate) enum TerminalJournalError {
     #[error("strict terminal journal cannot checkpoint across an operation-id counter gap")]
     CheckpointHasOperationGaps,
     #[error(
+        "strict terminal journal cannot checkpoint while a repository image install is pending"
+    )]
+    RepositoryImageInstallPending,
+    #[error(
         "strict terminal journal repository checkpoint version {repository_version} regresses below {current_version}"
     )]
     CheckpointVersionRegression {
@@ -691,6 +695,28 @@ pub(crate) enum TerminalJournalError {
     JournalIdGeneration,
     #[error("invalid strict terminal journal metadata at {path:?}: {reason}")]
     InvalidMetadata { path: PathBuf, reason: &'static str },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RepositoryImageInstallIntent {
+    checkpoint_epoch: u64,
+    repository_version: u64,
+    history_freshness: i64,
+}
+
+impl RepositoryImageInstallIntent {
+    #[cfg(test)]
+    pub(crate) fn checkpoint_epoch(self) -> u64 {
+        self.checkpoint_epoch
+    }
+
+    pub(crate) fn repository_version(self) -> u64 {
+        self.repository_version
+    }
+
+    pub(crate) fn history_freshness(self) -> i64 {
+        self.history_freshness
+    }
 }
 
 /// A per-topic terminal-resolution journal.
@@ -717,6 +743,8 @@ pub(crate) struct TerminalJournal {
     terminal_set_digest_cache: RefCell<BTreeMap<u64, [u8; DIGEST_LEN]>>,
     checkpoint_epoch: u64,
     checkpoint_repository_version: u64,
+    repository_image_install_pending: bool,
+    repository_image_install_freshness: i64,
     retired_origins: BTreeMap<u64, u64>,
 }
 
@@ -960,6 +988,8 @@ impl TerminalJournal {
                 ),
                 checkpoint_epoch: 0,
                 checkpoint_repository_version: 0,
+                repository_image_install_pending: false,
+                repository_image_install_freshness: 0,
                 retired_origins: BTreeMap::new(),
             });
         };
@@ -1004,70 +1034,80 @@ impl TerminalJournal {
         }
 
         let mut store = SqliteTerminalJournalStore::open(&path, topic.clone())?;
-        let (loaded, checkpoint_epoch, checkpoint_repository_version, retired_origins) =
-            if let Some(loaded) = store.load()? {
-                let (
-                    mut records,
-                    cut,
-                    checkpoint_epoch,
-                    checkpoint_repository_version,
-                    retired_origins,
-                ) = loaded.into_parts();
-                let active_digest = compute_terminal_set_digest(&records);
-                let retired_digest = compute_retired_set_digest(&retired_origins);
-                let combined_digest = combined_terminal_set_digest(retired_digest, active_digest);
-                let legacy_digest = compute_legacy_terminal_set_digest(&records);
-                let is_pre_checkpoint = checkpoint_epoch == 0
-                    && checkpoint_repository_version == 0
-                    && retired_origins.is_empty();
-                if cut.terminal_set_digest() != &active_digest
-                    && cut.terminal_set_digest() != &combined_digest
-                    && !(is_pre_checkpoint && cut.terminal_set_digest() == &legacy_digest)
-                {
-                    return Err(TerminalJournalError::InvalidMetadata {
-                        path,
-                        reason: "persisted terminal set digest does not match active records and checkpoint floors",
+        let (
+            loaded,
+            checkpoint_epoch,
+            checkpoint_repository_version,
+            retired_origins,
+            repository_image_install_pending,
+            repository_image_install_freshness,
+        ) = if let Some(loaded) = store.load()? {
+            let (
+                mut records,
+                cut,
+                checkpoint_epoch,
+                checkpoint_repository_version,
+                retired_origins,
+                repository_image_install_pending,
+                repository_image_install_freshness,
+            ) = loaded.into_parts();
+            let active_digest = compute_terminal_set_digest(&records);
+            let retired_digest = compute_retired_set_digest(&retired_origins);
+            let combined_digest = combined_terminal_set_digest(retired_digest, active_digest);
+            let legacy_digest = compute_legacy_terminal_set_digest(&records);
+            let is_pre_checkpoint = checkpoint_epoch == 0
+                && checkpoint_repository_version == 0
+                && retired_origins.is_empty();
+            if cut.terminal_set_digest() != &active_digest
+                && cut.terminal_set_digest() != &combined_digest
+                && !(is_pre_checkpoint && cut.terminal_set_digest() == &legacy_digest)
+            {
+                return Err(TerminalJournalError::InvalidMetadata {
+                    path,
+                    reason: "persisted terminal set digest does not match active records and checkpoint floors",
+                });
+            }
+            let validation_cut = TerminalCut::new(
+                *cut.journal_id(),
+                cut.generation(),
+                *cut.chain_digest(),
+                active_digest,
+            );
+            let derived = validate_loaded_sqlite(&path, &mut records, &validation_cut)?;
+            (
+                LoadedTerminalJournal::from_derived(records, *cut.journal_id(), derived),
+                checkpoint_epoch,
+                checkpoint_repository_version,
+                retired_origins,
+                repository_image_install_pending,
+                repository_image_install_freshness,
+            )
+        } else {
+            let legacy_path = legacy_journal_path(&path);
+            let loaded = match fs::read(&legacy_path) {
+                Ok(bytes) => load_records(&legacy_path, &topic, &bytes)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    LoadedTerminalJournal::empty(generate_journal_id()?)
+                }
+                Err(source) => {
+                    return Err(TerminalJournalError::Io {
+                        path: legacy_path,
+                        source,
                     });
                 }
-                let validation_cut = TerminalCut::new(
-                    *cut.journal_id(),
-                    cut.generation(),
-                    *cut.chain_digest(),
-                    active_digest,
-                );
-                let derived = validate_loaded_sqlite(&path, &mut records, &validation_cut)?;
-                (
-                    LoadedTerminalJournal::from_derived(records, *cut.journal_id(), derived),
-                    checkpoint_epoch,
-                    checkpoint_repository_version,
-                    retired_origins,
-                )
-            } else {
-                let legacy_path = legacy_journal_path(&path);
-                let loaded = match fs::read(&legacy_path) {
-                    Ok(bytes) => load_records(&legacy_path, &topic, &bytes)?,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        LoadedTerminalJournal::empty(generate_journal_id()?)
-                    }
-                    Err(source) => {
-                        return Err(TerminalJournalError::Io {
-                            path: legacy_path,
-                            source,
-                        });
-                    }
-                };
-                let cut = TerminalCut::new(
-                    loaded.journal_id,
-                    loaded.terminal_decision_generation,
-                    loaded.terminal_chain_digest,
-                    loaded.terminal_set_digest,
-                );
-                // The legacy JSON remains in place as a rollback artifact. Once
-                // this transaction commits SQLite is the sole authoritative
-                // journal and subsequent startups never consult the JSON file.
-                store.replace_all(loaded.records.iter(), &cut)?;
-                (loaded, 0, 0, BTreeMap::new())
             };
+            let cut = TerminalCut::new(
+                loaded.journal_id,
+                loaded.terminal_decision_generation,
+                loaded.terminal_chain_digest,
+                loaded.terminal_set_digest,
+            );
+            // The legacy JSON remains in place as a rollback artifact. Once
+            // this transaction commits SQLite is the sole authoritative
+            // journal and subsequent startups never consult the JSON file.
+            store.replace_all(loaded.records.iter(), &cut)?;
+            (loaded, 0, 0, BTreeMap::new(), false, 0)
+        };
 
         let mut loaded = loaded;
         let terminal_set_commitment =
@@ -1106,6 +1146,8 @@ impl TerminalJournal {
             terminal_set_digest_cache,
             checkpoint_epoch,
             checkpoint_repository_version,
+            repository_image_install_pending,
+            repository_image_install_freshness,
             retired_origins,
         })
     }
@@ -1136,6 +1178,8 @@ impl TerminalJournal {
             ),
             checkpoint_epoch: 0,
             checkpoint_repository_version: 0,
+            repository_image_install_pending: false,
+            repository_image_install_freshness: 0,
             retired_origins: BTreeMap::new(),
         }
     }
@@ -1174,8 +1218,46 @@ impl TerminalJournal {
         self.checkpoint_epoch
     }
 
+    #[cfg(test)]
     pub(crate) fn checkpoint_repository_version(&self) -> u64 {
         self.checkpoint_repository_version
+    }
+
+    pub(crate) fn pending_repository_image_install(&self) -> Option<RepositoryImageInstallIntent> {
+        self.repository_image_install_pending
+            .then_some(RepositoryImageInstallIntent {
+                checkpoint_epoch: self.checkpoint_epoch,
+                repository_version: self.checkpoint_repository_version,
+                history_freshness: self.repository_image_install_freshness,
+            })
+    }
+
+    pub(crate) fn complete_repository_image_install(
+        &mut self,
+        intent: RepositoryImageInstallIntent,
+    ) -> Result<bool, TerminalJournalError> {
+        if !self.repository_image_install_pending {
+            return Ok(false);
+        }
+        if intent.checkpoint_epoch != self.checkpoint_epoch
+            || intent.repository_version != self.checkpoint_repository_version
+            || intent.history_freshness != self.repository_image_install_freshness
+        {
+            return Err(TerminalJournalError::InvalidMetadata {
+                path: self.path.clone().unwrap_or_default(),
+                reason: "repository image completion does not match the pending checkpoint",
+            });
+        }
+        if let Some(store) = self.store.as_mut() {
+            store.complete_repository_image_install(
+                intent.checkpoint_epoch,
+                intent.repository_version,
+                intent.history_freshness,
+            )?;
+        }
+        self.repository_image_install_pending = false;
+        self.repository_image_install_freshness = 0;
+        Ok(true)
     }
 
     /// The oldest repository image that can safely reuse this journal's
@@ -1303,11 +1385,13 @@ impl TerminalJournal {
     pub(crate) fn install_repository_checkpoint(
         &mut self,
         repository_version: u64,
+        history_freshness: i64,
         delivered: &BTreeMap<TerminalJournalOpId, u64>,
         incoming_retired: &BTreeMap<u64, u64>,
     ) -> Result<BTreeMap<u64, u64>, TerminalJournalError> {
         self.install_repository_checkpoint_records(
             repository_version,
+            history_freshness,
             self.records.clone(),
             self.journal_id,
             self.terminal_decision_generation,
@@ -1324,6 +1408,7 @@ impl TerminalJournal {
     pub(crate) fn install_staged_repository_checkpoint(
         &mut self,
         repository_version: u64,
+        history_freshness: i64,
         source_cut: TerminalCut,
         staged: &[StagedTerminalDecision],
         delivered: &BTreeMap<TerminalJournalOpId, u64>,
@@ -1359,6 +1444,7 @@ impl TerminalJournal {
         }
         self.install_repository_checkpoint_records(
             repository_version,
+            history_freshness,
             source.records,
             *source_cut.journal_id(),
             source_cut.generation(),
@@ -1374,6 +1460,7 @@ impl TerminalJournal {
     fn install_repository_checkpoint_records(
         &mut self,
         repository_version: u64,
+        history_freshness: i64,
         mut candidate: BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
         journal_id: [u8; JOURNAL_ID_LEN],
         generation: u64,
@@ -1464,6 +1551,7 @@ impl TerminalJournal {
                 candidate.iter(),
                 epoch,
                 repository_version,
+                history_freshness,
                 &retired_origins,
                 &cut,
             )?;
@@ -1484,6 +1572,8 @@ impl TerminalJournal {
         );
         self.checkpoint_epoch = epoch;
         self.checkpoint_repository_version = repository_version;
+        self.repository_image_install_pending = true;
+        self.repository_image_install_freshness = history_freshness;
         self.retired_origins = retired_origins.clone();
         Ok(retired_origins)
     }
@@ -1610,6 +1700,9 @@ impl TerminalJournal {
         &mut self,
         repository_version: u64,
     ) -> Result<TerminalCheckpoint, TerminalJournalError> {
+        if self.repository_image_install_pending {
+            return Err(TerminalJournalError::RepositoryImageInstallPending);
+        }
         if repository_version < self.checkpoint_repository_version {
             return Err(TerminalJournalError::CheckpointVersionRegression {
                 repository_version,
@@ -1657,6 +1750,8 @@ impl TerminalJournal {
         self.terminal_set_digest_cache = initial_terminal_set_digest_cache(0, digest, digest);
         self.checkpoint_epoch = epoch;
         self.checkpoint_repository_version = repository_version;
+        self.repository_image_install_pending = false;
+        self.repository_image_install_freshness = 0;
         self.retired_origins = retired_origins;
         Ok(TerminalCheckpoint {
             epoch,
@@ -3321,10 +3416,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        FrozenTarget, StagedTerminalDecision, TerminalDecision, TerminalJournal,
-        TerminalJournalError, TerminalResolver, take_terminal_set_digest_derivations,
-        take_terminal_set_digest_record_visits, take_terminal_set_preview_node_reads,
-        take_terminal_state_derivations,
+        FrozenTarget, RepositoryImageInstallIntent, StagedTerminalDecision, TerminalDecision,
+        TerminalJournal, TerminalJournalError, TerminalResolver,
+        take_terminal_set_digest_derivations, take_terminal_set_digest_record_visits,
+        take_terminal_set_preview_node_reads, take_terminal_state_derivations,
     };
 
     #[test]
@@ -3549,6 +3644,7 @@ mod tests {
             let retired = journal
                 .install_repository_checkpoint(
                     7,
+                    -3,
                     &BTreeMap::from([(delivered_op, 7)]),
                     &BTreeMap::new(),
                 )
@@ -3600,6 +3696,7 @@ mod tests {
             journal
                 .install_staged_repository_checkpoint(
                     9_540,
+                    -17,
                     source_cut,
                     &staged,
                     &BTreeMap::from([(committed, 9_540)]),
@@ -3616,6 +3713,107 @@ mod tests {
         assert_eq!(reloaded.terminal_cut(), source_cut);
         assert_eq!(reloaded.checkpoint_repository_version(), 9_540);
         assert_eq!(reloaded.repository_base_required_version(), 9_540);
+    }
+
+    #[test]
+    fn repository_image_install_intent_requires_exact_coordinates() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        journal
+            .install_repository_checkpoint(9_540, -17, &BTreeMap::new(), &BTreeMap::new())
+            .unwrap();
+        let pending = journal.pending_repository_image_install().unwrap();
+        assert_eq!(pending.checkpoint_epoch(), 1);
+        assert_eq!(pending.repository_version(), 9_540);
+        assert_eq!(pending.history_freshness(), -17);
+
+        for wrong in [
+            RepositoryImageInstallIntent {
+                checkpoint_epoch: 2,
+                ..pending
+            },
+            RepositoryImageInstallIntent {
+                repository_version: 9_539,
+                ..pending
+            },
+            RepositoryImageInstallIntent {
+                history_freshness: -18,
+                ..pending
+            },
+        ] {
+            assert!(matches!(
+                journal.complete_repository_image_install(wrong),
+                Err(TerminalJournalError::InvalidMetadata { .. })
+            ));
+            assert_eq!(journal.pending_repository_image_install(), Some(pending));
+        }
+
+        assert!(journal.complete_repository_image_install(pending).unwrap());
+        assert_eq!(journal.pending_repository_image_install(), None);
+        assert!(!journal.complete_repository_image_install(pending).unwrap());
+    }
+
+    #[test]
+    fn newer_repository_checkpoint_atomically_supersedes_pending_image_intent() {
+        let root = TempDir::new().unwrap();
+        let replacement = {
+            let mut journal =
+                TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+            journal
+                .install_repository_checkpoint(9_540, -17, &BTreeMap::new(), &BTreeMap::new())
+                .unwrap();
+            let original = journal.pending_repository_image_install().unwrap();
+
+            journal
+                .install_repository_checkpoint(9_541, -16, &BTreeMap::new(), &BTreeMap::new())
+                .unwrap();
+
+            let replacement = journal.pending_repository_image_install().unwrap();
+            assert!(replacement.checkpoint_epoch() > original.checkpoint_epoch());
+            assert_eq!(replacement.repository_version(), 9_541);
+            assert_eq!(replacement.history_freshness(), -16);
+            assert!(matches!(
+                journal.complete_repository_image_install(original),
+                Err(TerminalJournalError::InvalidMetadata { .. })
+            ));
+            replacement
+        };
+
+        let journal = TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+        assert_eq!(
+            journal.pending_repository_image_install(),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn repository_image_install_intent_blocks_checkpoint_until_completion() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        journal
+            .install_repository_checkpoint(9_540, -17, &BTreeMap::new(), &BTreeMap::new())
+            .unwrap();
+        let pending = journal.pending_repository_image_install().unwrap();
+
+        assert!(matches!(
+            journal.checkpoint(9_540),
+            Err(TerminalJournalError::RepositoryImageInstallPending)
+        ));
+        assert_eq!(journal.pending_repository_image_install(), Some(pending));
+
+        assert!(journal.complete_repository_image_install(pending).unwrap());
+        assert!(journal.checkpoint(9_540).is_ok());
+    }
+
+    #[test]
+    fn repository_image_install_intent_survives_terminal_journal_updates() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        journal
+            .install_repository_checkpoint(9_540, -17, &BTreeMap::new(), &BTreeMap::new())
+            .unwrap();
+        let pending = journal.pending_repository_image_install().unwrap();
+
+        journal.upsert_abort_decision((1, 1), 1).unwrap();
+
+        assert_eq!(journal.pending_repository_image_install(), Some(pending));
     }
 
     #[test]

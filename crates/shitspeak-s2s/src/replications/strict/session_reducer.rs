@@ -359,6 +359,24 @@ impl SessionState {
         phase_wire(self.phase)
     }
 
+    /// Abandon a terminal client whose source cursor was rejected while
+    /// preserving this incarnation's monotonic nonce/transfer allocators and
+    /// bounded tombstones. Coalesced dirty work may already have opened a
+    /// successor terminal wire; it inherited the same invalid baseline and is
+    /// intentionally superseded by the caller's fresh cursor-zero trigger.
+    pub(super) fn reset_terminal_cursor(&mut self) {
+        debug_assert!(matches!(
+            self.phase,
+            SessionPhase::Idle
+                | SessionPhase::TerminalClient(_)
+                | SessionPhase::TerminalApplying(_)
+        ));
+        self.phase = SessionPhase::Idle;
+        self.dirty = None;
+        self.terminal_acknowledged_cut = None;
+        self.retry_armed = false;
+    }
+
     #[allow(dead_code)]
     pub(super) fn acknowledged_cut(&self) -> Option<Cut> {
         self.terminal_acknowledged_cut

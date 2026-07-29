@@ -603,8 +603,8 @@ use super::owner::{
     LogSlice as OwnerLog, OwnerReplicable, OwnerSnapshotInstallError, OwnerSnapshotInstallOutcome,
 };
 use super::strict::{
-    LogSlice as StrictLog, StrictCommitApplyOutcome, StrictLogEntry, StrictLogMetadata,
-    StrictReplicable, StrictSnapshotError,
+    HistoryMetadata, LogSlice as StrictLog, StrictCommitApplyOutcome, StrictLogEntry,
+    StrictLogMetadata, StrictReplicable, StrictSnapshotError,
 };
 
 /// Mock strict-mode repo: holds a `(version, Vec<(version, op, metadata)>)` log.
@@ -722,7 +722,7 @@ impl StrictReplicable for CountingStrictRepo {
         self.state.lock().0
     }
 
-    fn snapshot(&self) -> Result<(u64, Bytes), StrictSnapshotError> {
+    fn snapshot_with_metadata(&self) -> Result<(HistoryMetadata, Bytes), StrictSnapshotError> {
         let _snapshot_guard = self.snapshot_guard.lock();
         if let Some(message) = self.snapshot_capture_durability_failure.lock().clone() {
             return Err(StrictSnapshotError::durability_failure(message));
@@ -745,7 +745,13 @@ impl StrictReplicable for CountingStrictRepo {
         .map_err(|error| {
             StrictSnapshotError::new(format!("counting snapshot encode failed: {error}"))
         })?;
-        Ok((v, bytes))
+        Ok((
+            HistoryMetadata {
+                version: v,
+                freshness: 0,
+            },
+            bytes,
+        ))
     }
 
     fn log_since(&self, since: u64) -> StrictLog<StrictLogEntry<Self::Op>> {

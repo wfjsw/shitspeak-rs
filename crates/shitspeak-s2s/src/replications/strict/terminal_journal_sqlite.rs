@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use super::terminal_journal::{TerminalCut, TerminalJournalOpId, TerminalJournalRecord};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 #[derive(Debug, Error)]
 pub(crate) enum SqliteTerminalJournalError {
     #[error("strict terminal journal SQLite failed at {path:?}: {source}")]
@@ -51,6 +51,8 @@ pub(crate) struct LoadedSqliteTerminalJournal {
     checkpoint_epoch: u64,
     checkpoint_repository_version: u64,
     retired_origins: BTreeMap<u64, u64>,
+    repository_image_install_pending: bool,
+    repository_image_install_freshness: i64,
 }
 
 impl LoadedSqliteTerminalJournal {
@@ -62,6 +64,8 @@ impl LoadedSqliteTerminalJournal {
         u64,
         u64,
         BTreeMap<u64, u64>,
+        bool,
+        i64,
     ) {
         (
             self.records,
@@ -69,6 +73,8 @@ impl LoadedSqliteTerminalJournal {
             self.checkpoint_epoch,
             self.checkpoint_repository_version,
             self.retired_origins,
+            self.repository_image_install_pending,
+            self.repository_image_install_freshness,
         )
     }
 }
@@ -112,8 +118,12 @@ impl SqliteTerminalJournalStore {
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| sqlite_error(&path, source))?;
         match version {
-            0 => create_schema_v2(&path, &mut connection)?,
-            1 => migrate_schema_v1_to_v2(&path, &mut connection)?,
+            0 => create_schema_v3(&path, &mut connection)?,
+            1 => {
+                migrate_schema_v1_to_v2(&path, &mut connection)?;
+                migrate_schema_v2_to_v3(&path, &mut connection)?;
+            }
+            2 => migrate_schema_v2_to_v3(&path, &mut connection)?,
             SCHEMA_VERSION => {}
             version => {
                 return Err(SqliteTerminalJournalError::UnsupportedSchema { path, version });
@@ -222,23 +232,52 @@ impl SqliteTerminalJournalStore {
         let checkpoint = self
             .connection
             .query_row(
-                "SELECT epoch, repository_version FROM journal_checkpoint WHERE singleton = 1",
+                "SELECT epoch, repository_version, repository_image_install_pending,
+                        repository_image_install_freshness
+                 FROM journal_checkpoint WHERE singleton = 1",
                 [],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|source| sqlite_error(&self.path, source))?;
         let has_checkpoint = checkpoint.is_some();
-        let (checkpoint_epoch, checkpoint_repository_version) = match checkpoint {
-            Some((epoch, version)) => (
+        let (
+            checkpoint_epoch,
+            checkpoint_repository_version,
+            repository_image_install_pending,
+            repository_image_install_freshness,
+        ) = match checkpoint {
+            Some((epoch, version, pending, freshness)) => (
                 decode_u64(&self.path, &epoch, "checkpoint epoch has invalid length")?,
                 decode_u64(
                     &self.path,
                     &version,
                     "checkpoint repository version has invalid length",
                 )?,
+                match pending {
+                    0 => false,
+                    1 => true,
+                    _ => {
+                        return Err(SqliteTerminalJournalError::InvalidData {
+                            path: self.path.clone(),
+                            reason: "repository image install marker is invalid",
+                        });
+                    }
+                },
+                decode_i64(
+                    &self.path,
+                    &freshness,
+                    "repository image install freshness has invalid length",
+                )?,
             ),
-            None => (0, 0),
+            None => (0, 0, false, 0),
         };
         let mut statement = self
             .connection
@@ -285,6 +324,8 @@ impl SqliteTerminalJournalStore {
             checkpoint_epoch,
             checkpoint_repository_version,
             retired_origins,
+            repository_image_install_pending,
+            repository_image_install_freshness,
         }))
     }
 
@@ -394,14 +435,19 @@ impl SqliteTerminalJournalStore {
         }
         transaction
             .execute(
-                "INSERT INTO journal_checkpoint (singleton, epoch, repository_version)
-                 VALUES (1, ?1, ?2)
+                "INSERT INTO journal_checkpoint
+                     (singleton, epoch, repository_version, repository_image_install_pending,
+                      repository_image_install_freshness)
+                 VALUES (1, ?1, ?2, 0, ?3)
                  ON CONFLICT(singleton) DO UPDATE SET
                      epoch = excluded.epoch,
-                     repository_version = excluded.repository_version",
+                     repository_version = excluded.repository_version,
+                     repository_image_install_pending = excluded.repository_image_install_pending,
+                     repository_image_install_freshness = excluded.repository_image_install_freshness",
                 params![
                     epoch.to_be_bytes().as_slice(),
-                    repository_version.to_be_bytes().as_slice()
+                    repository_version.to_be_bytes().as_slice(),
+                    0_i64.to_be_bytes().as_slice()
                 ],
             )
             .map_err(|source| sqlite_error(&self.path, source))?;
@@ -412,15 +458,17 @@ impl SqliteTerminalJournalStore {
             .map_err(|source| sqlite_error(&self.path, source))
     }
 
-    /// Atomically install repository coverage without rotating the active
-    /// terminal set. History recovery synchronizes that set before fetching
-    /// the repository image, so retaining it keeps the receiver's terminal
-    /// digest equal to the elected source after snapshot installation.
+    /// Atomically prepares repository coverage without rotating the active
+    /// terminal set. The pending marker remains durable until the paired
+    /// repository image has been installed and explicitly completed. History
+    /// recovery synchronizes the terminal set before fetching that image, so
+    /// retaining it keeps the receiver equal to the elected source.
     pub(crate) fn install_repository_base<'a>(
         &mut self,
         records: impl IntoIterator<Item = (&'a TerminalJournalOpId, &'a TerminalJournalRecord)>,
         epoch: u64,
         repository_version: u64,
+        repository_freshness: i64,
         retired_origins: &BTreeMap<u64, u64>,
         cut: &TerminalCut,
     ) -> Result<(), SqliteTerminalJournalError> {
@@ -451,14 +499,19 @@ impl SqliteTerminalJournalStore {
         }
         transaction
             .execute(
-                "INSERT INTO journal_checkpoint (singleton, epoch, repository_version)
-                 VALUES (1, ?1, ?2)
+                "INSERT INTO journal_checkpoint
+                     (singleton, epoch, repository_version, repository_image_install_pending,
+                      repository_image_install_freshness)
+                 VALUES (1, ?1, ?2, 1, ?3)
                  ON CONFLICT(singleton) DO UPDATE SET
                      epoch = excluded.epoch,
-                     repository_version = excluded.repository_version",
+                     repository_version = excluded.repository_version,
+                     repository_image_install_pending = excluded.repository_image_install_pending,
+                     repository_image_install_freshness = excluded.repository_image_install_freshness",
                 params![
                     epoch.to_be_bytes().as_slice(),
-                    repository_version.to_be_bytes().as_slice()
+                    repository_version.to_be_bytes().as_slice(),
+                    repository_freshness.to_be_bytes().as_slice()
                 ],
             )
             .map_err(|source| sqlite_error(&self.path, source))?;
@@ -468,9 +521,49 @@ impl SqliteTerminalJournalStore {
             .commit()
             .map_err(|source| sqlite_error(&self.path, source))
     }
+
+    /// Durably completes the cross-store repository image installation that
+    /// was prepared by [`Self::install_repository_base`]. The checkpoint
+    /// epoch and elected repository rank must still identify that exact
+    /// preparation.
+    pub(crate) fn complete_repository_image_install(
+        &mut self,
+        epoch: u64,
+        repository_version: u64,
+        repository_freshness: i64,
+    ) -> Result<(), SqliteTerminalJournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        let changed = transaction
+            .execute(
+                "UPDATE journal_checkpoint
+                 SET repository_image_install_pending = 0,
+                     repository_image_install_freshness = ?4
+                 WHERE singleton = 1 AND epoch = ?1 AND repository_version = ?2
+                     AND repository_image_install_freshness = ?3",
+                params![
+                    epoch.to_be_bytes().as_slice(),
+                    repository_version.to_be_bytes().as_slice(),
+                    repository_freshness.to_be_bytes().as_slice(),
+                    0_i64.to_be_bytes().as_slice()
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, source))?;
+        if changed != 1 {
+            return Err(SqliteTerminalJournalError::InvalidData {
+                path: self.path.clone(),
+                reason: "repository image install completion does not match checkpoint metadata",
+            });
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, source))
+    }
 }
 
-fn create_schema_v2(
+fn create_schema_v3(
     path: &Path,
     connection: &mut Connection,
 ) -> Result<(), SqliteTerminalJournalError> {
@@ -496,13 +589,18 @@ fn create_schema_v2(
              CREATE TABLE journal_checkpoint (
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                  epoch BLOB NOT NULL CHECK (length(epoch) = 8),
-                 repository_version BLOB NOT NULL CHECK (length(repository_version) = 8)
+                 repository_version BLOB NOT NULL CHECK (length(repository_version) = 8),
+                 repository_image_install_pending INTEGER NOT NULL DEFAULT 0
+                     CHECK (repository_image_install_pending IN (0, 1)),
+                 repository_image_install_freshness BLOB NOT NULL
+                     DEFAULT X'0000000000000000'
+                     CHECK (length(repository_image_install_freshness) = 8)
              ) STRICT;
              CREATE TABLE retired_origins (
                  op_id_hi BLOB PRIMARY KEY CHECK (length(op_id_hi) = 8),
                  max_counter BLOB NOT NULL CHECK (length(max_counter) = 8)
              ) WITHOUT ROWID, STRICT;
-             PRAGMA user_version = 2;",
+             PRAGMA user_version = 3;",
         )
         .map_err(|source| sqlite_error(path, source))?;
     transaction
@@ -529,6 +627,30 @@ fn migrate_schema_v1_to_v2(
                  max_counter BLOB NOT NULL CHECK (length(max_counter) = 8)
              ) WITHOUT ROWID, STRICT;
              PRAGMA user_version = 2;",
+        )
+        .map_err(|source| sqlite_error(path, source))?;
+    transaction
+        .commit()
+        .map_err(|source| sqlite_error(path, source))
+}
+
+fn migrate_schema_v2_to_v3(
+    path: &Path,
+    connection: &mut Connection,
+) -> Result<(), SqliteTerminalJournalError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| sqlite_error(path, source))?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE journal_checkpoint ADD COLUMN
+                 repository_image_install_pending INTEGER NOT NULL DEFAULT 0
+                 CHECK (repository_image_install_pending IN (0, 1));
+             ALTER TABLE journal_checkpoint ADD COLUMN
+                 repository_image_install_freshness BLOB NOT NULL
+                 DEFAULT X'0000000000000000'
+                 CHECK (length(repository_image_install_freshness) = 8);
+             PRAGMA user_version = 3;",
         )
         .map_err(|source| sqlite_error(path, source))?;
     transaction
@@ -626,6 +748,14 @@ fn decode_u64(
     Ok(u64::from_be_bytes(decode_array(path, bytes, reason)?))
 }
 
+fn decode_i64(
+    path: &Path,
+    bytes: &[u8],
+    reason: &'static str,
+) -> Result<i64, SqliteTerminalJournalError> {
+    Ok(i64::from_be_bytes(decode_array(path, bytes, reason)?))
+}
+
 fn decode_array<const N: usize>(
     path: &Path,
     bytes: &[u8],
@@ -666,9 +796,12 @@ mod tests {
                 .unwrap();
         }
         let store = SqliteTerminalJournalStore::open(&path, "topic").unwrap();
-        let (records, cut, _, _, _) = store.load().unwrap().unwrap().into_parts();
+        let (records, cut, _, _, _, pending, freshness) =
+            store.load().unwrap().unwrap().into_parts();
         assert_eq!(records.get(&(u64::MAX, 42)), Some(&record));
         assert_eq!(cut, resulting);
+        assert!(!pending);
+        assert_eq!(freshness, 0);
     }
 
     #[test]
@@ -682,8 +815,11 @@ mod tests {
         ]);
         let mut store = SqliteTerminalJournalStore::open(&path, "topic").unwrap();
         store.replace_all(records.iter(), &cut).unwrap();
-        let (loaded, loaded_cut, _, _, _) = store.load().unwrap().unwrap().into_parts();
+        let (loaded, loaded_cut, _, _, _, pending, freshness) =
+            store.load().unwrap().unwrap().into_parts();
         assert_eq!(loaded, records);
         assert_eq!(loaded_cut, cut);
+        assert!(!pending);
+        assert_eq!(freshness, 0);
     }
 }

@@ -391,6 +391,25 @@ fn fast_owner_catchup_s2s_config(
     config
 }
 
+fn fast_quiet_replication_s2s_config(
+    tcp_listen: std::net::SocketAddr,
+    seed_address: std::net::SocketAddr,
+) -> S2sConfig {
+    let mut config = S2sConfig {
+        enabled: true,
+        tcp_listen: vec![tcp_listen],
+        seed_addresses: vec![S2sSeedAddressConfig::new(
+            S2sTransportKindConfig::Tcp,
+            seed_address,
+        )],
+        ..S2sConfig::default()
+    };
+    config.replications.strict_steady_state_catchup_interval_ms = 100;
+    config.replications.owner_catchup_timeout_ms = 250;
+    config.replications.owner_anti_entropy_interval_ms = 100;
+    config
+}
+
 async fn wait_for_s2s_pair(a: &TestServer, b: &TestServer) {
     let ready = wait_until(S2S_DEADLINE, || {
         let a_mgr = a.server.s2s_manager();
@@ -1142,6 +1161,66 @@ fn s2s_prometheus_total(server: &TestServer, metric: &str, labels: &[(&str, &str
         })
         .map(|sample| sample.value())
         .sum()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct S2SCatchupTrafficSnapshot {
+    requests: f64,
+    responses: f64,
+    send_attempts: f64,
+    send_bytes: f64,
+}
+
+impl S2SCatchupTrafficSnapshot {
+    fn capture(server: &TestServer) -> Self {
+        Self {
+            requests: s2s_prometheus_total(
+                server,
+                "shitspeak_s2s_replication_catchup_requests_total",
+                &[],
+            ),
+            responses: s2s_prometheus_total(
+                server,
+                "shitspeak_s2s_replication_catchup_responses_total",
+                &[],
+            ),
+            send_attempts: s2s_prometheus_total(
+                server,
+                "shitspeak_s2s_strict_replication_catchup_send_attempts_total",
+                &[],
+            ),
+            send_bytes: s2s_prometheus_total(
+                server,
+                "shitspeak_s2s_strict_replication_catchup_send_bytes_total",
+                &[],
+            ),
+        }
+    }
+}
+
+async fn wait_for_s2s_catchup_quiescence(
+    server: &TestServer,
+    quiet_period: Duration,
+) -> Option<S2SCatchupTrafficSnapshot> {
+    let deadline = Instant::now() + S2S_DEADLINE;
+    let mut unchanged_since = Instant::now();
+    let mut last = S2SCatchupTrafficSnapshot::capture(server);
+
+    loop {
+        if unchanged_since.elapsed() >= quiet_period {
+            return Some(last);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let current = S2SCatchupTrafficSnapshot::capture(server);
+        if current != last {
+            last = current;
+            unchanged_since = Instant::now();
+        }
+    }
 }
 
 async fn wait_for_s2s_tree_voice_forwarding(source: &TestServer, speaker: &TestClient, slot: u32) {
@@ -3384,6 +3463,173 @@ async fn s2s_channel_replication_propagates() {
     })
     .await;
     assert!(replicated, "Server B should advance its channel log");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_channel_replication_converges_then_catchup_stays_quiet() {
+    let _guard = s2s_network_test_guard().await;
+    let pki = Arc::new(mint_pki(&[1, 2]));
+    let a_s2s_port = pick_free_port().await;
+    let b_s2s_port = pick_free_port().await;
+    let a = spawn_s2s_test_server_with_config(
+        TestServerOpts::default(),
+        Arc::clone(&pki),
+        1,
+        0,
+        fast_quiet_replication_s2s_config(loopback(a_s2s_port), loopback(b_s2s_port)),
+    )
+    .await;
+    // Replication metrics are process-global. Baseline them before node B
+    // starts so activity from earlier serialized scenarios cannot satisfy the
+    // startup-traffic assertions below.
+    let traffic_before_pair = S2SCatchupTrafficSnapshot::capture(&a);
+    let b = spawn_s2s_test_server_with_config(
+        TestServerOpts::default(),
+        pki,
+        2,
+        1,
+        fast_quiet_replication_s2s_config(loopback(b_s2s_port), loopback(a_s2s_port)),
+    )
+    .await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    alice.create_channel(0, "S2S Quiet Lobby", false).await;
+    assert!(
+        bob.recv_until(
+            |message| matches!(
+                message,
+                Message::ChannelState(state)
+                    if state.name.as_deref() == Some("S2S Quiet Lobby")
+            ),
+            S2S_DEADLINE,
+        )
+        .await
+        .is_some(),
+        "the channel must replicate before measuring steady-state traffic"
+    );
+    assert!(
+        wait_until(S2S_DEADLINE, || {
+            b.server.get_channels().current_version() == a.server.get_channels().current_version()
+        })
+        .await,
+        "the channel repositories must converge before measuring steady-state traffic"
+    );
+    let a_snapshot = a
+        .server
+        .get_channels()
+        .s2s_snapshot_in_server(shitspeak_core::DEFAULT_SERVER_ID)
+        .await;
+    let b_snapshot = b
+        .server
+        .get_channels()
+        .s2s_snapshot_in_server(shitspeak_core::DEFAULT_SERVER_ID)
+        .await;
+    assert_eq!(a_snapshot.version(), b_snapshot.version());
+    assert_eq!(a_snapshot.freshness(), b_snapshot.freshness());
+
+    let traffic_after_convergence = S2SCatchupTrafficSnapshot::capture(&a);
+    assert!(
+        traffic_after_convergence.requests > traffic_before_pair.requests,
+        "startup must exercise catchup requests"
+    );
+    assert!(
+        traffic_after_convergence.send_attempts > traffic_before_pair.send_attempts,
+        "startup must exercise physical catchup sends"
+    );
+    assert!(
+        traffic_after_convergence.send_bytes > traffic_before_pair.send_bytes,
+        "startup must account physical catchup bytes"
+    );
+
+    // Observe four configured steady-state intervals without traffic before
+    // taking the baseline. This adapts to slow startup on loaded test hosts.
+    let traffic_before = wait_for_s2s_catchup_quiescence(&a, Duration::from_millis(400))
+        .await
+        .expect("the converged pair must reach catchup quiescence");
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let traffic_after = S2SCatchupTrafficSnapshot::capture(&a);
+    assert_eq!(
+        traffic_after.requests, traffic_before.requests,
+        "a converged pair emitted catchup requests during ten configured intervals"
+    );
+    assert_eq!(
+        traffic_after.responses, traffic_before.responses,
+        "a converged pair emitted catchup responses during ten configured intervals"
+    );
+    assert_eq!(
+        traffic_after.send_attempts, traffic_before.send_attempts,
+        "a converged pair attempted physical catchup sends during ten configured intervals"
+    );
+    assert_eq!(
+        traffic_after.send_bytes, traffic_before.send_bytes,
+        "a converged pair sent physical catchup bytes during ten configured intervals"
+    );
+
+    // Silence must not disable ordinary replication. Prove a subsequent
+    // channel operation still crosses the real overlay, reaches a client, and
+    // is committed to the destination repository.
+    let version_before_post_quiet_operation = a.server.get_channels().current_version();
+    alice.create_channel(0, "S2S After Quiet", false).await;
+    let replicated_message = bob
+        .recv_until(
+            |message| {
+                matches!(
+                    message,
+                    Message::ChannelState(state)
+                        if state.name.as_deref() == Some("S2S After Quiet")
+                )
+            },
+            S2S_DEADLINE,
+        )
+        .await
+        .expect("channel replication must remain live after the quiet interval");
+    let replicated_channel_id = match replicated_message {
+        Message::ChannelState(state) => state
+            .channel_id
+            .expect("the replicated channel state must include its channel id"),
+        other => panic!("expected replicated ChannelState, got {other:?}"),
+    };
+    assert!(
+        wait_until(S2S_DEADLINE, || {
+            let a_version = a.server.get_channels().current_version();
+            let b_version = b.server.get_channels().current_version();
+            a_version > version_before_post_quiet_operation && b_version == a_version
+        })
+        .await,
+        "both channel repositories must commit the post-quiet operation"
+    );
+    let replicated_channel = b
+        .server
+        .get_channels()
+        .get_channel(replicated_channel_id)
+        .await
+        .expect("the destination repository must contain the replicated channel");
+    assert_eq!(replicated_channel.name, "S2S After Quiet");
+    let a_snapshot = a
+        .server
+        .get_channels()
+        .s2s_snapshot_in_server(shitspeak_core::DEFAULT_SERVER_ID)
+        .await;
+    let b_snapshot = b
+        .server
+        .get_channels()
+        .s2s_snapshot_in_server(shitspeak_core::DEFAULT_SERVER_ID)
+        .await;
+    assert_eq!(a_snapshot.version(), b_snapshot.version());
+    assert_eq!(a_snapshot.freshness(), b_snapshot.freshness());
+    assert_eq!(a_snapshot.operation_ids(), b_snapshot.operation_ids());
+
+    drop(alice);
+    drop(bob);
+    join_all([a.shutdown_gracefully(), b.shutdown_gracefully()]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
