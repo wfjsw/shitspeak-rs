@@ -60,6 +60,7 @@ pub(super) struct ClientSession {
     started_reason: i32,
     reason: i32,
     dirty: bool,
+    collision_extension_available: bool,
     staged_checkpoint_states: Option<Vec<StrictTerminalState>>,
     expires_at: Instant,
 }
@@ -294,6 +295,16 @@ impl ClientSession {
         self.dirty
     }
 
+    pub(super) fn can_extend_collision_expiry(&self, nonce: u64) -> bool {
+        self.pending_nonce == nonce && self.collision_extension_available
+    }
+
+    pub(super) fn extend_collision_expiry(&mut self, ttl: Duration) {
+        debug_assert!(self.collision_extension_available);
+        self.collision_extension_available = false;
+        self.expires_at = self.expires_at.checked_add(ttl).unwrap_or(self.expires_at);
+    }
+
     pub(super) fn accept_manifest(
         &mut self,
         transfer_id: u64,
@@ -399,6 +410,10 @@ impl ResponderSession {
             .flatten()
     }
 
+    pub(super) fn matches_initial_nonce(&self, nonce: u64) -> bool {
+        self.initial_nonce == nonce
+    }
+
     pub(super) fn cached_page_nonce(&self) -> Option<u64> {
         self.cached_nonce
     }
@@ -459,6 +474,7 @@ pub(super) struct SyncV3State {
     // the transfer while still preserving a required reverse reconciliation.
     deferred_clients: HashMap<PeerIncarnation, DeferredClientIntent>,
     expired_deferred_clients: HashSet<PeerIncarnation>,
+    pending_collision_resumes: HashSet<PeerIncarnation>,
     completed_responders: HashMap<PeerIncarnation, CompletedResponder>,
     staged_checkpoints: HashMap<PeerIncarnation, StagedTerminalCheckpoint>,
 }
@@ -479,6 +495,7 @@ impl Default for SyncV3State {
             responders: HashMap::new(),
             deferred_clients: HashMap::new(),
             expired_deferred_clients: HashSet::new(),
+            pending_collision_resumes: HashSet::new(),
             completed_responders: HashMap::new(),
             staged_checkpoints: HashMap::new(),
         }
@@ -495,6 +512,7 @@ impl SyncV3State {
             || !self.responders.is_empty()
             || !self.deferred_clients.is_empty()
             || !self.expired_deferred_clients.is_empty()
+            || !self.pending_collision_resumes.is_empty()
     }
 
     /// Commit one pure session transition and return the I/O work it selected.
@@ -1180,6 +1198,7 @@ impl SyncV3State {
                 started_reason: reason,
                 reason,
                 dirty: false,
+                collision_extension_available: false,
                 staged_checkpoint_states: None,
                 expires_at: Instant::now() + ttl,
             },
@@ -1199,6 +1218,7 @@ impl SyncV3State {
         ttl: Duration,
     ) -> Option<TerminalCut> {
         let known_source_cut = self.reusable_source_cut(peer);
+        let collision_extension_available = self.pending_collision_resumes.remove(&peer);
         self.clients.insert(
             peer,
             ClientSession {
@@ -1212,6 +1232,7 @@ impl SyncV3State {
                 started_reason: reason,
                 reason,
                 dirty: false,
+                collision_extension_available,
                 staged_checkpoint_states: None,
                 expires_at: Instant::now() + ttl,
             },
@@ -1259,6 +1280,7 @@ impl SyncV3State {
             .expect("checked terminal client exists");
         let cancelled_nonce = session.pending_nonce;
         self.defer_client(peer, session.reason, session.desired_cut);
+        self.pending_collision_resumes.insert(peer);
         record_ended_client(
             session.started_reason,
             StrictCatchupSessionOutcome::Cancelled,
@@ -1306,6 +1328,10 @@ impl SyncV3State {
         self.deferred_clients
             .remove(&peer)
             .map(|intent| (intent.reason, intent.desired_cut))
+    }
+
+    pub(super) fn clear_pending_collision_resume(&mut self, peer: PeerIncarnation) {
+        self.pending_collision_resumes.remove(&peer);
     }
 
     pub(super) fn take_expired_deferred_clients(
@@ -1563,6 +1589,8 @@ impl SyncV3State {
         self.deferred_clients.retain(|peer, _| peer.node != node);
         self.expired_deferred_clients
             .retain(|peer| peer.node != node);
+        self.pending_collision_resumes
+            .retain(|peer| peer.node != node);
         self.completed_responders
             .retain(|peer, _| peer.node != node);
         self.staged_checkpoints.retain(|peer, _| peer.node != node);
@@ -1583,6 +1611,7 @@ impl SyncV3State {
         }
         self.deferred_clients.clear();
         self.expired_deferred_clients.clear();
+        self.pending_collision_resumes.clear();
         self.staged_checkpoints.clear();
         self.sessions.clear();
     }

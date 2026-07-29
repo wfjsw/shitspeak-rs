@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     catchup::{
         apply_response, recv_v3_clock_probe_resp, recv_v3_history_probe_resp,
-        recv_v3_terminal_sync_page, recv_v3_terminal_sync_req,
+        recv_v3_terminal_sync_ack, recv_v3_terminal_sync_page, recv_v3_terminal_sync_req,
         register_v3_clock_probe_retry_if_current, register_v3_history_probe_retry_if_current,
         request_v3_clock_probe, request_v3_history_probe, request_v3_terminal_sync,
         request_v3_terminal_sync_toward, respond_to_request, resume_deferred_v3_admissions,
@@ -29,7 +29,8 @@ use super::{
     },
     session_reducer::{
         Cursor as SessionCursor, CursorKind as SessionCursorKind, Cut as SessionCut,
-        Effect as SessionEffect, Event as SessionEvent, SyncKind as SessionSyncKind,
+        Effect as SessionEffect, Event as SessionEvent, PeerEpoch as SessionPeerEpoch,
+        ProbeKind as SessionProbeKind, SyncKind as SessionSyncKind,
         TransferId as SessionTransferId, Trigger as SessionTrigger,
         TriggerOrigin as SessionTriggerOrigin, WireIdentity as SessionWireIdentity,
     },
@@ -342,6 +343,270 @@ async fn inbound_history_yields_opposing_terminal_client_then_resumes_it_after_f
         })
         .expect("terminal request must resume after history final ACK");
     assert_ne!(resumed.request_nonce, initial_terminal.request_nonce);
+}
+
+#[tokio::test]
+async fn crossed_terminal_resume_is_backpressured_instead_of_cursor_mismatch_looping() {
+    let retry_delay = Duration::from_millis(20);
+    let ttl = Duration::from_millis(400);
+    let config = ReplicationConfig::default()
+        .with_strict_max_catchup_ops(32)
+        .with_bulk_retry_delay(retry_delay)
+        .with_strict_bulk_retry_max_delay(retry_delay.saturating_mul(2))
+        .with_strict_bulk_retry_jitter_pct(0)
+        .with_pending_propose_ttl(ttl);
+    let (lower, lower_net) = runtime(1, config.clone());
+    let (higher, higher_net) = runtime(2, config);
+    lower
+        .terminal_journal
+        .lock()
+        .await
+        .upsert_abort_decision(make_op_id(1, 11, 1), 1)
+        .expect("lower-node terminal abort");
+
+    // Keep the crossed initial request identities distinct. Production peers
+    // commonly have different reducer nonce histories; a completed reducer
+    // probe advances that nonce without leaving a terminal tombstone.
+    let peer = PeerIncarnation::new(1, 11);
+    let probe_wire = higher
+        .v3_sync
+        .lock()
+        .transition_session(
+            peer,
+            SessionEvent::StartProbe {
+                kind: SessionProbeKind::Clock,
+            },
+        )
+        .into_iter()
+        .find_map(|effect| match effect {
+            SessionEffect::SendRequest { wire, .. } => Some(wire),
+            _ => None,
+        })
+        .expect("higher-node reducer nonce primer");
+    higher.v3_sync.lock().transition_session(
+        peer,
+        SessionEvent::ProbeResponse {
+            epoch: SessionPeerEpoch::new(11),
+            nonce: probe_wire.nonce(),
+        },
+    );
+
+    request_v3_terminal_sync(&lower, 2, StrictCatchupReason::TerminalFence).await;
+    let lower_initial = lower_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("lower-node initial request");
+    request_v3_terminal_sync(&higher, 1, StrictCatchupReason::TerminalFence).await;
+    let higher_initial = higher_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("higher-node crossed initial request");
+
+    recv_v3_terminal_sync_req(&higher, 1, 11, lower_initial).await;
+    let winning_page = higher_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncPage(page),
+                ..
+            } => Some(page),
+            _ => None,
+        })
+        .expect("higher node must serve the winning lower-node direction");
+    recv_v3_terminal_sync_page(&lower, 2, 22, winning_page).await;
+    let winning_ack = lower_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncAck(ack),
+                ..
+            } => Some(ack),
+            _ => None,
+        })
+        .expect("winning terminal ACK");
+    recv_v3_terminal_sync_ack(&higher, 1, 11, winning_ack).await;
+    let mut higher_frames = higher_net.drain_captures();
+    let confirmation = higher_frames
+        .iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncAck(ack),
+                ..
+            } => Some(ack.clone()),
+            _ => None,
+        })
+        .expect("winning terminal ACK confirmation");
+    let resumed = higher_frames
+        .drain(..)
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("higher-node deferred direction must resume");
+    assert_ne!(resumed.request_nonce, higher_initial.request_nonce);
+
+    recv_v3_terminal_sync_ack(&lower, 2, 22, confirmation).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    recv_v3_terminal_sync_req(&lower, 2, 22, higher_initial).await;
+    let cached_page = lower_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncPage(page),
+                ..
+            } => Some(page),
+            _ => None,
+        })
+        .expect("lower node must cache the delayed crossed request");
+    assert_eq!(cached_page.status, StrictTerminalSyncStatus::Ok as i32);
+
+    recv_v3_terminal_sync_req(&lower, 2, 22, resumed.clone()).await;
+    let deflection = lower_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncPage(page),
+                ..
+            } => Some(page),
+            _ => None,
+        })
+        .expect("active responder must deflect the unmatched resumed request");
+    assert_eq!(
+        deflection.status,
+        StrictTerminalSyncStatus::ResourceLimit as i32,
+        "an unmatched initial request must back off without entering the CursorMismatch retry loop"
+    );
+    recv_v3_terminal_sync_page(&higher, 1, 11, deflection).await;
+    let client = higher
+        .v3_sync
+        .lock()
+        .client(PeerIncarnation::new(1, 11))
+        .cloned()
+        .expect("advisory deflection must retain the resumed client");
+    assert_eq!(client.pending_nonce(), resumed.request_nonce);
+
+    // The original resumed-client lease expires before the retained responder.
+    // A correlated collision response must extend that exact client and retry
+    // without resetting its nonce or backoff.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    retry_v3_terminal_transmissions(&higher).await;
+    let retained_retry = higher_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("collision response must keep the exact retry alive");
+    assert_eq!(retained_retry, resumed);
+    recv_v3_terminal_sync_req(&lower, 2, 22, retained_retry).await;
+    let second_deflection = lower_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncPage(page),
+                ..
+            } => Some(page),
+            _ => None,
+        })
+        .expect("retained responder must keep deflecting until expiry");
+    assert_eq!(
+        second_deflection.status,
+        StrictTerminalSyncStatus::ResourceLimit as i32
+    );
+    recv_v3_terminal_sync_page(&higher, 1, 11, second_deflection).await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    retry_v3_terminal_transmissions(&higher).await;
+    let post_expiry_retry = higher_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("exact retry must outlive the stale responder");
+    assert_eq!(post_expiry_retry, resumed);
+    recv_v3_terminal_sync_req(&lower, 2, 22, post_expiry_retry).await;
+    let recovery_page = lower_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncPage(page),
+                ..
+            } => Some(page),
+            _ => None,
+        })
+        .expect("request must proceed after the stale responder expires");
+    assert_eq!(recovery_page.status, StrictTerminalSyncStatus::Ok as i32);
+    recv_v3_terminal_sync_page(&higher, 1, 11, recovery_page).await;
+    let recovery_ack = higher_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncAck(ack),
+                ..
+            } => Some(ack),
+            _ => None,
+        })
+        .expect("recovered terminal transfer ACK");
+    recv_v3_terminal_sync_ack(&lower, 2, 22, recovery_ack).await;
+    let recovery_confirmation = lower_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncAck(ack),
+                ..
+            } => Some(ack),
+            _ => None,
+        })
+        .expect("recovered terminal ACK confirmation");
+    recv_v3_terminal_sync_ack(&higher, 1, 11, recovery_confirmation).await;
+    let higher_cut = higher.terminal_journal.lock().await.terminal_cut();
+    let lower_cut = lower.terminal_journal.lock().await.terminal_cut();
+    assert_eq!(higher_cut.generation(), lower_cut.generation());
+    assert_eq!(
+        higher_cut.terminal_set_digest(),
+        lower_cut.terminal_set_digest()
+    );
+    assert!(
+        higher
+            .v3_sync
+            .lock()
+            .client(PeerIncarnation::new(1, 11))
+            .is_none()
+    );
 }
 
 fn terminal_abort(sequence: u64) -> StrictTerminalState {

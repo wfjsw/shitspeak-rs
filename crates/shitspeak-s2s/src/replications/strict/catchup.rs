@@ -4742,6 +4742,7 @@ async fn complete_deferred_v3_terminal_sync_from_equal_set<R: StrictReplicable>(
     let Some((_reason, desired_cut)) = deferred else {
         return;
     };
+    rt.v3_sync.lock().clear_pending_collision_resume(peer);
     // The authenticated requester advertised the same canonical terminal set
     // as this node. Any cut captured from that requester by the preceding
     // metadata probe is therefore satisfied without opening the reverse
@@ -5280,6 +5281,31 @@ pub(super) async fn recv_v3_terminal_sync_req<R: StrictReplicable>(
         .await;
         return;
     }
+    if req.transfer_id == 0 {
+        let unmatched_active_responder = {
+            let mut sync = rt.v3_sync.lock();
+            sync.expire(Instant::now());
+            sync.responder(peer)
+                .is_some_and(|responder| !responder.matches_initial_nonce(req.request_nonce))
+        };
+        if unmatched_active_responder {
+            // The peer may have yielded this request direction and resumed it
+            // with a fresh initial identity while our original responder is
+            // still waiting for its final ACK. Deflect that identity without
+            // letting the reducer classify it as a cursor error: RESOURCE_LIMIT
+            // retains the exact request and bounded retry schedule until this
+            // responder completes or expires.
+            send_v3_page(
+                rt,
+                from,
+                v3_error_page(rt, epoch, &req, StrictTerminalSyncStatus::ResourceLimit),
+                metric_reason,
+                true,
+            )
+            .await;
+            return;
+        }
+    }
     let mut arbitration = SessionInboundArbitration::KeepCurrent;
     if req.transfer_id == 0 {
         let disposition = rt
@@ -5726,6 +5752,21 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
         // winning request will either make us yield or this request will be
         // retried unchanged after the responder direction disappears.
         if collision_deflection {
+            let ttl = rt.cfg.pending_propose_ttl();
+            // The established joint-lock order is retry then sync. Renew both
+            // leases as one transition so neither owner can expire alone.
+            let mut retries = rt.v3_retries.lock();
+            let mut sync = rt.v3_sync.lock();
+            let can_extend = retries.request_nonce_is_current(peer, page.request_nonce)
+                && sync
+                    .client(peer)
+                    .is_some_and(|client| client.can_extend_collision_expiry(page.request_nonce));
+            if can_extend {
+                retries.extend_current_request_expiry(peer, ttl);
+                sync.client_mut(peer)
+                    .expect("checked collision client exists")
+                    .extend_collision_expiry(ttl);
+            }
             return;
         }
         // A correlated capacity rejection is advisory, not terminal. Keep

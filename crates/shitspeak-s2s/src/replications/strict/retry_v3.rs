@@ -112,6 +112,23 @@ impl V3RetryState {
         }
     }
 
+    pub(super) fn request_nonce_is_current(&self, peer: PeerIncarnation, nonce: u64) -> bool {
+        self.requests
+            .get(&peer)
+            .is_some_and(|pending| pending.message.request_nonce == nonce)
+    }
+
+    pub(super) fn extend_current_request_expiry(&mut self, peer: PeerIncarnation, ttl: Duration) {
+        let pending = self
+            .requests
+            .get_mut(&peer)
+            .expect("checked request exists");
+        pending.expires_at = pending
+            .expires_at
+            .checked_add(ttl)
+            .unwrap_or(pending.expires_at);
+    }
+
     pub(super) fn register_final_ack(
         &mut self,
         peer: PeerIncarnation,
