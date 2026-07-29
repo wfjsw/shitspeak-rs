@@ -566,6 +566,11 @@ country = "US"
 source = "manual"
 ```
 
+Without `[s2s.geo]`, the server probes Cloudflare's check-perf endpoint for
+the egress location. Failed probes retry with exponential backoff from one
+second to a five-minute cap; the first valid result is used for the rest of
+the process lifetime.
+
 Transport and replication tuning examples:
 
 ```toml

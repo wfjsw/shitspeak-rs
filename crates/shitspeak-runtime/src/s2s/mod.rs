@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -45,6 +46,7 @@ use shitspeak_s2s::application::proto::{
     UserRemovePatch, UserStatePatch, UserStatsReply, VoiceFrame, VoiceIntent,
 };
 use shitspeak_s2s::application::voice::{AudioSink, RecipientIndex, RecipientIndexUpdate};
+use shitspeak_s2s::geo::SharedNodeGeo;
 use shitspeak_s2s::overlay as s2s_overlay;
 use shitspeak_s2s::overlay::OverlayNetwork;
 use shitspeak_s2s::replications as s2s_replications;
@@ -84,6 +86,8 @@ const S2S_GATEWAY_CONTROL_MIN_BYTES: usize = 1024 * 1024;
 const S2S_GATEWAY_LANE_MIN_BYTES: usize = 512 * 1024;
 const S2S_VOICE_GATEWAY_MIN_SHARDS: usize = 2;
 const S2S_VOICE_GATEWAY_MAX_SHARDS: usize = 16;
+const OBSERVABILITY_GEO_RETRY_INITIAL_INTERVAL: Duration = Duration::from_secs(1);
+const OBSERVABILITY_GEO_RETRY_CAP: Duration = Duration::from_secs(5 * 60);
 
 fn strict_proposal_gateway_response_timeout(cfg: &s2s_replications::ReplicationConfig) -> Duration {
     let slack = cfg
@@ -118,7 +122,7 @@ pub struct S2SManager {
     overlay_tuning: s2s_overlay::OverlayTuning,
     replication_config: s2s_replications::ReplicationConfig,
     status_http_listen: Option<SocketAddr>,
-    local_geo: Option<NodeGeo>,
+    local_geo: SharedNodeGeo,
     max_users: Arc<AtomicU64>,
     state: RwLock<S2SRuntimeState>,
 }
@@ -127,7 +131,7 @@ pub struct S2SManager {
 struct S2SRuntimeState {
     transport: Option<ConnectionManager>,
     overlay: Option<OverlayNetwork>,
-    local_geo: Option<NodeGeo>,
+    local_geo: Option<SharedNodeGeo>,
     replications: Option<Arc<ReplicationManager>>,
     application: Option<Arc<s2s_application::ApplicationLayer>>,
     recipient_index: Option<Arc<RecipientIndex>>,
@@ -857,7 +861,7 @@ impl S2SManager {
             overlay_tuning: config.s2s.overlay.clone(),
             replication_config: config.s2s.replications.clone().into(),
             status_http_listen: config.s2s.status_http_listen,
-            local_geo: config.s2s.geo.manual_geo(),
+            local_geo: SharedNodeGeo::new(config.s2s.geo.manual_geo()),
             max_users: Arc::new(AtomicU64::new(config.max_users)),
             state: RwLock::new(state),
         }
@@ -905,7 +909,7 @@ impl S2SManager {
             return Some(s2s_status::render_prometheus_metrics(
                 overlay,
                 transport,
-                state.local_geo.clone(),
+                state.local_geo.as_ref().and_then(SharedNodeGeo::get),
             ));
         }
         (state.startup_duplicate_failures > 0).then(|| {
@@ -927,7 +931,7 @@ impl S2SManager {
             return Some(s2s_status::prometheus_samples(
                 overlay,
                 transport,
-                state.local_geo.clone(),
+                state.local_geo.as_ref().and_then(SharedNodeGeo::get),
             ));
         }
         (state.startup_duplicate_failures > 0).then(|| {
@@ -984,7 +988,7 @@ impl S2SManager {
         );
         let mut state = self.state.write();
         state.overlay = Some(overlay);
-        state.local_geo = self.local_geo.clone();
+        state.local_geo = Some(self.local_geo.clone());
         state.replications = Some(repl);
         state.application = Some(app);
     }
@@ -1676,7 +1680,7 @@ impl S2SManager {
             return;
         }
 
-        let local_geo = resolve_observability_geo(self.local_geo.clone()).await;
+        let local_geo = self.local_geo.clone();
 
         let overlay = match OverlayNetwork::start_with_max_users(
             transport.clone(),
@@ -1791,7 +1795,7 @@ impl S2SManager {
             let mut state = self.state.write();
             state.transport = Some(transport.clone());
             state.overlay = Some(overlay.clone());
-            state.local_geo = local_geo.clone();
+            state.local_geo = Some(local_geo.clone());
             state.replications = Some(replications.clone());
             state.application = Some(application.clone());
             state.recipient_index = Some(recipient_index);
@@ -1853,6 +1857,7 @@ impl S2SManager {
             })));
         }
 
+        start_observability_geo_retry(local_geo.clone(), shutdown.clone());
         let status_task = self.status_http_listen.and_then(|listen| {
             match s2s_status::spawn_status_server(
                 listen,
@@ -2105,11 +2110,63 @@ impl S2SManager {
     }
 }
 
-pub async fn resolve_observability_geo(configured_geo: Option<NodeGeo>) -> Option<NodeGeo> {
-    if configured_geo.is_some() {
-        return configured_geo;
+pub fn start_observability_geo_resolution(
+    configured_geo: Option<NodeGeo>,
+    shutdown: watch::Receiver<()>,
+) -> SharedNodeGeo {
+    let local_geo = SharedNodeGeo::new(configured_geo);
+    start_observability_geo_retry(local_geo.clone(), shutdown);
+    local_geo
+}
+
+fn start_observability_geo_retry(local_geo: SharedNodeGeo, shutdown: watch::Receiver<()>) {
+    if local_geo.get().is_some() {
+        return;
     }
-    shitspeak_s2s_transport::discover_public_geo().await
+
+    tokio::spawn(retry_observability_geo_until_resolved(
+        local_geo,
+        shutdown,
+        OBSERVABILITY_GEO_RETRY_INITIAL_INTERVAL,
+        OBSERVABILITY_GEO_RETRY_CAP,
+        || async { shitspeak_s2s_transport::discover_public_geo().await },
+    ));
+}
+
+async fn retry_observability_geo_until_resolved<F, Fut>(
+    local_geo: SharedNodeGeo,
+    mut shutdown: watch::Receiver<()>,
+    retry_initial_interval: Duration,
+    retry_cap: Duration,
+    mut probe: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<NodeGeo>>,
+{
+    if local_geo.get().is_some() {
+        return;
+    }
+
+    let retry_cap = retry_cap.max(retry_initial_interval);
+    let mut retry_delay = retry_initial_interval;
+    loop {
+        let discovered = tokio::select! {
+            _ = shutdown.changed() => return,
+            discovered = probe() => discovered,
+        };
+        if let Some(geo) = discovered {
+            if local_geo.set_if_missing(geo) {
+                info!("public node geolocation resolved");
+            }
+            return;
+        }
+
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            _ = tokio::time::sleep(retry_delay) => {}
+        }
+        retry_delay = retry_delay.saturating_mul(2).min(retry_cap);
+    }
 }
 
 fn spawn_native_client_replication_bridge(
@@ -4271,11 +4328,113 @@ fn block_in_place_or_current<T>(f: impl FnOnce(&tokio::runtime::Handle) -> T) ->
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use super::*;
     use shitspeak_state::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig};
+
+    fn test_node_geo(latitude: f64) -> NodeGeo {
+        NodeGeo::new(latitude, 0.0, None, None, None, "test").expect("valid coordinates")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_geo_retries_with_backoff_until_the_first_success_then_freezes() {
+        let local_geo = SharedNodeGeo::default();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let outcomes = Arc::new(Mutex::new(VecDeque::from([
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(test_node_geo(1.0)),
+            Some(test_node_geo(2.0)),
+        ])));
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let probe_attempts = Arc::clone(&attempts);
+        let probe_outcomes = Arc::clone(&outcomes);
+        let retry_initial = Duration::from_secs(1);
+        let retry_cap = Duration::from_secs(4);
+        let task = tokio::spawn(retry_observability_geo_until_resolved(
+            local_geo.clone(),
+            shutdown_rx,
+            retry_initial,
+            retry_cap,
+            move || {
+                let attempts = Arc::clone(&probe_attempts);
+                let outcomes = Arc::clone(&probe_outcomes);
+                async move {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    outcomes.lock().pop_front().flatten()
+                }
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(local_geo.get().is_none());
+
+        tokio::time::advance(retry_initial).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(local_geo.get().is_none());
+
+        tokio::time::advance(retry_initial.saturating_mul(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert!(local_geo.get().is_none());
+
+        tokio::time::advance(retry_cap).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 4);
+        assert!(local_geo.get().is_none());
+
+        tokio::time::advance(retry_cap).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 5);
+        assert!(local_geo.get().is_none());
+
+        tokio::time::advance(retry_cap).await;
+        task.await.expect("geo retry task completes after success");
+        assert_eq!(attempts.load(Ordering::Relaxed), 6);
+        assert_eq!(local_geo.get().map(|geo| geo.latitude()), Some(1.0));
+        assert_eq!(outcomes.lock().len(), 1, "later results must not be probed");
+
+        tokio::time::advance(retry_cap.saturating_mul(3)).await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 6);
+        assert_eq!(local_geo.get().map(|geo| geo.latitude()), Some(1.0));
+        drop(shutdown_tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_geo_skips_public_geo_probes() {
+        let local_geo = SharedNodeGeo::new(Some(test_node_geo(1.0)));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let probe_attempts = Arc::clone(&attempts);
+        let task = tokio::spawn(retry_observability_geo_until_resolved(
+            local_geo.clone(),
+            shutdown_rx,
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+            move || {
+                let attempts = Arc::clone(&probe_attempts);
+                async move {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    Some(test_node_geo(2.0))
+                }
+            },
+        ));
+
+        task.await.expect("configured geo bypasses retry worker");
+        tokio::time::advance(Duration::from_secs(300)).await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+        assert_eq!(local_geo.get().map(|geo| geo.latitude()), Some(1.0));
+        drop(shutdown_tx);
+    }
 
     #[test]
     fn strict_proposal_gateway_timeout_tracks_replication_ttl() {

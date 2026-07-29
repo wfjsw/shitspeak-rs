@@ -10,6 +10,8 @@ use tokio::task::JoinHandle;
 
 use crate::overlay::{MemberStatus, OverlayNetwork, RoutingMetric};
 use shitspeak_core::NodeGeo;
+
+use crate::geo::SharedNodeGeo;
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{ConnectionManager, MetricsSnapshot, TransportKind};
 use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
@@ -305,7 +307,7 @@ pub fn spawn_status_server(
     listen: SocketAddr,
     overlay: OverlayNetwork,
     transport: ConnectionManager,
-    local_geo: Option<NodeGeo>,
+    local_geo: SharedNodeGeo,
     mut shutdown: watch::Receiver<()>,
 ) -> io::Result<JoinHandle<()>> {
     let listener = std::net::TcpListener::bind(listen)?;
@@ -342,7 +344,7 @@ async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     overlay: OverlayNetwork,
     transport: ConnectionManager,
-    local_geo: Option<NodeGeo>,
+    local_geo: SharedNodeGeo,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
     let mut scratch = [0u8; 1024];
@@ -386,13 +388,13 @@ async fn handle_connection(
             .await
         }
         ("GET", "/topology.json") | ("GET", "/s2s/topology.json") => {
-            let snapshot = build_topology_snapshot(&overlay, &transport, local_geo.clone());
+            let snapshot = build_topology_snapshot(&overlay, &transport, local_geo.get());
             let body = serde_json::to_vec_pretty(&snapshot)
                 .map_err(|error| io::Error::other(error.to_string()))?;
             write_response(&mut stream, "200 OK", "application/json", &body).await
         }
         ("GET", "/metrics") | ("GET", "/s2s/metrics") => {
-            let body = render_prometheus_metrics(&overlay, &transport, local_geo.clone());
+            let body = render_prometheus_metrics(&overlay, &transport, local_geo.get());
             write_response(
                 &mut stream,
                 "200 OK",

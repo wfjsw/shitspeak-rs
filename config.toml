@@ -177,7 +177,9 @@ cache_capacity = 4096
 
 # Optional node geo location for topology dashboards. Manual coordinates take
 # precedence; when omitted, the node probes Cloudflare check-perf endpoints to
-# use the egress IP's observed city/region/country and coordinates.
+# use the egress IP's observed city/region/country and coordinates. Failed
+# probes retry with exponential backoff from one second to five minutes until
+# the first valid result, which remains fixed for the lifetime of the process.
 [s2s.geo]
 # latitude = 32.7767
 # longitude = -96.7970

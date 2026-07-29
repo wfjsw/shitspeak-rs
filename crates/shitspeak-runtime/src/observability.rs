@@ -17,11 +17,11 @@ use tokio::task::JoinHandle;
 
 use crate::client_repository::ClientRepository;
 use crate::constants;
-use crate::geoip::NodeGeo;
 use crate::http_client;
 use crate::s2s::S2SManager;
 use crate::types::DEFAULT_SERVER_ID;
 use shitspeak_runtime_config::{MetricsConfig, RemoteWriteConfig};
+use shitspeak_s2s::geo::SharedNodeGeo;
 use shitspeak_s2s::overlay::OverlayNetwork;
 use shitspeak_s2s::status::{self, PrometheusSample};
 use shitspeak_s2s_transport::ConnectionManager;
@@ -197,14 +197,14 @@ impl S2sMetricsSource for S2SManager {
 pub struct S2sTopologyMetricsSource {
     overlay: OverlayNetwork,
     transport: ConnectionManager,
-    local_geo: Option<NodeGeo>,
+    local_geo: SharedNodeGeo,
 }
 
 impl S2sTopologyMetricsSource {
     pub fn new(
         overlay: OverlayNetwork,
         transport: ConnectionManager,
-        local_geo: Option<NodeGeo>,
+        local_geo: SharedNodeGeo,
     ) -> Self {
         Self {
             overlay,
@@ -225,11 +225,8 @@ impl S2sTopologyMetricsSource {
 #[async_trait]
 impl S2sMetricsSource for S2sTopologyMetricsSource {
     async fn prometheus_metrics_text(&self) -> Option<String> {
-        let mut body = status::render_prometheus_metrics(
-            &self.overlay,
-            &self.transport,
-            self.local_geo.clone(),
-        );
+        let mut body =
+            status::render_prometheus_metrics(&self.overlay, &self.transport, self.local_geo.get());
         append_prometheus_metrics_separator(&mut body);
         render_app_build_info_metrics_into(&mut body, &self.build_info_samples());
         render_process_metrics_into(&mut body, &self.process_samples());
@@ -242,7 +239,7 @@ impl S2sMetricsSource for S2sTopologyMetricsSource {
         external_labels: &HashMap<String, String>,
     ) -> Option<Vec<Vec<u8>>> {
         let mut samples =
-            status::prometheus_samples(&self.overlay, &self.transport, self.local_geo.clone());
+            status::prometheus_samples(&self.overlay, &self.transport, self.local_geo.get());
         samples.extend(self.build_info_samples());
         samples.extend(self.process_samples());
         let timestamp_ms = now_unix_ms();

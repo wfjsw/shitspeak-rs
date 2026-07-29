@@ -9,7 +9,7 @@ use crate::observability::{self, S2sMetricsSource, S2sTopologyMetricsSource};
 use crate::s2s::{
     BanReplicationAdapter, ChannelBlobReplicationAdapter, ChannelReplicationAdapter,
     install_channel_blob_replication_resolver, install_channel_replication_resolver,
-    resolve_observability_geo,
+    start_observability_geo_resolution,
 };
 use crate::types::{DEFAULT_SERVER_ID, NodeIdentifier};
 use serde::Deserialize;
@@ -243,8 +243,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    let local_geo = resolve_observability_geo(config.s2s.geo.manual_geo()).await;
     let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let local_geo =
+        start_observability_geo_resolution(config.s2s.geo.manual_geo(), shutdown_rx.clone());
     let metrics_source: Arc<dyn S2sMetricsSource> = Arc::new(S2sTopologyMetricsSource::new(
         overlay.clone(),
         transport.clone(),
