@@ -2085,18 +2085,34 @@ impl PeerState {
         };
         if let Some(report) = report {
             let status = report.status();
-            tracing::debug!(
-                peer = %self.node_id,
-                ?transport,
-                ?class,
-                queue_capacity = status.capacity(),
-                queue_depth = status.depth(),
-                queue_high_watermark = status.high_depth(),
-                queue_samples = status.samples(),
-                queue_full_samples = status.full_samples(),
-                interval_secs = report.interval().as_secs(),
-                "s2s outbound stream queue watermark"
-            );
+            let utilization = status.high_depth() as f64 / status.capacity().max(1) as f64;
+            macro_rules! log_watermark {
+                ($level:ident) => {
+                    tracing::$level!(
+                        peer = %self.node_id,
+                        ?transport,
+                        ?class,
+                        queue_capacity = status.capacity(),
+                        queue_depth = status.depth(),
+                        queue_high_watermark = status.high_depth(),
+                        queue_samples = status.samples(),
+                        queue_full_samples = status.full_samples(),
+                        interval_secs = report.interval().as_secs(),
+                        "s2s outbound stream queue watermark"
+                    );
+                };
+            }
+            if utilization < 0.5 {
+                log_watermark!(trace);
+            } else if utilization < 0.7 {
+                log_watermark!(debug);
+            } else if utilization < 0.85 {
+                log_watermark!(info);
+            } else if utilization <= 0.95 {
+                log_watermark!(warn);
+            } else {
+                log_watermark!(error);
+            }
         }
     }
 
