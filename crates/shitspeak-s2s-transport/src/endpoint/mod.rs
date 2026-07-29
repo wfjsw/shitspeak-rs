@@ -493,6 +493,9 @@ fn peer_retry_ready(
 ) -> bool {
     let has_live_connection = peer.has_any_live_stream();
     peer.snapshot_addresses().iter().any(|addr| {
+        if !address_dial_allowed(peer, *addr) {
+            return false;
+        }
         if !local_ip_capability.supports_remote(addr.addr().ip()) {
             return false;
         }
@@ -502,6 +505,10 @@ fn peer_retry_ready(
         let retry_policy = address_retry_policy(peer, cfg, *addr, wall_now, has_live_connection);
         peer.address_retry_ready(*addr, now, retry_policy.retry_cap())
     })
+}
+
+fn address_dial_allowed(peer: &PeerState, addr: PeerAddress) -> bool {
+    addr.transport() != TransportKind::Udp || peer.has_live_reliable_stream()
 }
 
 fn compare_dial_candidates(
@@ -737,6 +744,9 @@ async fn try_dial_peer(
     let mut planned_outgoing = 0usize;
     let local_ip_capability = LocalIpCapability::discover();
     for addr in addrs {
+        if !address_dial_allowed(peer, addr) {
+            continue;
+        }
         if !local_ip_capability.supports_remote(addr.addr().ip()) {
             // debug!(
             //     ?addr,
@@ -1212,12 +1222,16 @@ mod tests {
     }
 
     fn install_live_stream(peer: &PeerState) {
+        install_live_stream_for(peer, TransportKind::Tcp);
+    }
+
+    fn install_live_stream_for(peer: &PeerState, transport: TransportKind) {
         let budget = super::super::adaptive_queue::AdaptiveQueueBudget::new(1024 * 1024);
         let (tx, rx) =
             super::super::adaptive_queue::AdaptiveQueueSender::new(budget.split(1024 * 1024));
         std::mem::forget(rx);
         peer.install_stream(ActiveStream::new(
-            TransportKind::Tcp,
+            transport,
             None,
             tx,
             CancellationToken::new(),
@@ -1382,6 +1396,35 @@ mod tests {
             SystemTime::now(),
             LocalIpCapability { has_ipv6: true },
         ));
+    }
+
+    #[test]
+    fn peer_retry_ready_does_not_arm_udp_without_a_live_reliable_transport() {
+        let cfg = TransportConfig::new("ca.pem".into(), "cert.pem".into(), "key.pem".into());
+        let peer = PeerState::new(
+            2,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            MetricsTuning::default(),
+            1024 * 1024,
+        );
+        let udp = PeerAddress::new("127.0.0.1:64742".parse().unwrap(), TransportKind::Udp);
+        peer.add_address(udp);
+
+        assert!(!peer_retry_ready(
+            &peer,
+            &cfg,
+            Instant::now(),
+            SystemTime::now(),
+            LocalIpCapability { has_ipv6: true },
+        ));
+        assert!(!address_dial_allowed(&peer, udp));
+
+        install_live_stream_for(&peer, TransportKind::Udp);
+        assert!(!address_dial_allowed(&peer, udp));
+
+        install_live_stream_for(&peer, TransportKind::Tcp);
+        assert!(address_dial_allowed(&peer, udp));
     }
 
     #[test]

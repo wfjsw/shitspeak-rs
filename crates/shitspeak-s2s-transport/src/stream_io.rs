@@ -1907,11 +1907,10 @@ mod tests {
 
     #[test]
     fn dictionary_capability_requires_compression_enabled() {
-        assert!(dictionary_compression_supported(
-            &CompressionConfig::default()
-        ));
+        let adaptive = CompressionConfig::default().with_adaptive_dictionary_enabled(true);
+        assert!(dictionary_compression_supported(&adaptive));
 
-        let disabled = CompressionConfig::default().with_enabled(false);
+        let disabled = adaptive.with_enabled(false);
         assert!(!dictionary_compression_supported(&disabled));
         assert!(dictionary_compression_hello_payload(&disabled).is_empty());
     }
@@ -1919,6 +1918,7 @@ mod tests {
     #[test]
     fn dictionary_hello_advertises_adaptive_and_configured_support_separately() {
         let cfg = CompressionConfig::default()
+            .with_adaptive_dictionary_enabled(true)
             .with_dictionary_bytes(
                 b"configured s2s transport zstd dictionary bytes for tests".to_vec(),
             )

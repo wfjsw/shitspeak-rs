@@ -2948,6 +2948,14 @@ impl PeerState {
         g.values().any(ActiveStream::is_alive)
     }
 
+    pub(crate) fn has_live_reliable_stream(&self) -> bool {
+        let mut streams = self.streams.lock();
+        prune_dead_streams(&mut streams);
+        streams.values().any(|stream| {
+            stream.is_alive() && stream.transport().is_acceptable_for(ServiceLevel::Reliable)
+        })
+    }
+
     pub fn outgoing_live_count(&self) -> usize {
         let mut g = self.streams.lock();
         prune_dead_streams(&mut g);

@@ -32,16 +32,14 @@ fn config_for(pki: &Pki, node_idx: usize, tcp: SocketAddr) -> TransportConfig {
         .with_bandwidth_probe_size(1024)
 }
 
-fn config_with_udp(pki: &Pki, node_idx: usize, udp: SocketAddr) -> TransportConfig {
-    let (cert, key) = &pki.nodes[node_idx];
-    TransportConfig::new(pki.ca_path.clone(), cert.clone(), key.clone())
+fn config_with_tcp_and_udp(
+    pki: &Pki,
+    node_idx: usize,
+    tcp: SocketAddr,
+    udp: SocketAddr,
+) -> TransportConfig {
+    config_for(pki, node_idx, tcp)
         .with_udp_listen(udp)
-        .with_reconnect_check_interval(Duration::from_millis(50))
-        .with_backoff_initial(Duration::from_millis(20))
-        .with_backoff_cap(Duration::from_millis(500))
-        .with_ping_interval(Duration::from_millis(300))
-        .with_bandwidth_probe_interval(Duration::from_secs(60))
-        .with_bandwidth_probe_size(0)
         .with_udp_mtu(1400)
 }
 
@@ -642,18 +640,30 @@ async fn two_node_udp_packet_encryption_roundtrip() {
     let _guard = s2s_network_test_guard().await;
     install_provider_once();
     let pki = mint_pki(&[111, 222]);
+    let tcp_port_a = pick_free_port().await;
+    let tcp_port_b = pick_free_port().await;
     let port_a = pick_free_udp_port().await;
     let port_b = pick_free_udp_port().await;
-    let cfg_a = config_with_udp(&pki, 0, loopback(port_a));
-    let cfg_b = config_with_udp(&pki, 1, loopback(port_b));
+    let cfg_a = config_with_tcp_and_udp(&pki, 0, loopback(tcp_port_a), loopback(port_a));
+    let cfg_b = config_with_tcp_and_udp(&pki, 1, loopback(tcp_port_b), loopback(port_b));
 
     let (mgr_a, mut inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
     let (mgr_b, mut inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
     assert_eq!(mgr_a.local_node_id(), 111);
     assert_eq!(mgr_b.local_node_id(), 222);
 
+    // UDP key exchange is armed only after a reliable route is live.
+    mgr_a
+        .add_address(
+            222,
+            PeerAddress::new(loopback(tcp_port_b), TransportKind::Tcp),
+        )
+        .await;
+    wait_for_link(&mgr_a, 222, TransportKind::Tcp).await;
+    wait_for_link(&mgr_b, 111, TransportKind::Tcp).await;
+
     // A learns where to send encrypted UDP packets. B installs the reverse
-    // route when it receives a valid encrypted datagram from A.
+    // route when it receives a valid signed key offer from A.
     mgr_a
         .add_address(222, PeerAddress::new(loopback(port_b), TransportKind::Udp))
         .await;
@@ -709,13 +719,24 @@ async fn simultaneous_udp_packet_encryption_dials_converge() {
     let _guard = s2s_network_test_guard().await;
     install_provider_once();
     let pki = mint_pki(&[121, 232]);
+    let tcp_port_a = pick_free_port().await;
+    let tcp_port_b = pick_free_port().await;
     let port_a = pick_free_udp_port().await;
     let port_b = pick_free_udp_port().await;
-    let cfg_a = config_with_udp(&pki, 0, loopback(port_a));
-    let cfg_b = config_with_udp(&pki, 1, loopback(port_b));
+    let cfg_a = config_with_tcp_and_udp(&pki, 0, loopback(tcp_port_a), loopback(port_a));
+    let cfg_b = config_with_tcp_and_udp(&pki, 1, loopback(tcp_port_b), loopback(port_b));
 
     let (mgr_a, mut inbound_a) = ConnectionManager::start(cfg_a).await.unwrap();
     let (mgr_b, mut inbound_b) = ConnectionManager::start(cfg_b).await.unwrap();
+
+    mgr_a
+        .add_address(
+            232,
+            PeerAddress::new(loopback(tcp_port_b), TransportKind::Tcp),
+        )
+        .await;
+    wait_for_link(&mgr_a, 232, TransportKind::Tcp).await;
+    wait_for_link(&mgr_b, 121, TransportKind::Tcp).await;
 
     mgr_a
         .add_address(232, PeerAddress::new(loopback(port_b), TransportKind::Udp))
