@@ -19,13 +19,13 @@ use aws_lc_rs::digest::{SHA256, digest};
 use bytes::Bytes;
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use super::super::error::ReplicationError;
 use super::super::metrics::{
     self, CatchupMode, CatchupPhase, CatchupReason, ReplicationPipelineKind,
-    ReplicationPipelineStage, StrictCatchupDuplicateOutcome, StrictCatchupSessionEvent,
-    StrictCatchupSessionOutcome,
+    ReplicationPipelineStage, StrictAdmissionEvent, StrictCatchupDuplicateOutcome,
+    StrictCatchupSessionEvent, StrictCatchupSessionOutcome, StrictProbeKind, StrictProbeOutcome,
 };
 use super::super::proto::{
     CatchupOp, StrictBody, StrictCatchupReason, StrictCatchupReq, StrictCatchupResp,
@@ -3297,16 +3297,33 @@ pub(super) async fn request_v3_clock_probe<R: StrictReplicable>(
     dst: NodeIdentifier,
     reason: StrictCatchupReason,
 ) -> bool {
+    let metric_reason =
+        CatchupReason::from_v3_wire(reason as i32).unwrap_or(CatchupReason::DeliveryWatermark);
     let Some(epoch) = rt.net.member_boot_epoch(dst) else {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::Clock,
+            metric_reason,
+            StrictProbeOutcome::RejectedPeer,
+        );
         return false;
     };
     if !rt.v3_repair_supported_by(dst) {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::Clock,
+            metric_reason,
+            StrictProbeOutcome::RejectedPeer,
+        );
         return false;
     }
     let Some(nonce) = rt.v3_sync.lock().record_clock_nonce(
         PeerIncarnation::new(dst, epoch),
         rt.cfg.pending_propose_ttl(),
     ) else {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::Clock,
+            metric_reason,
+            StrictProbeOutcome::Coalesced,
+        );
         return false;
     };
     let peer = PeerIncarnation::new(dst, epoch);
@@ -3318,17 +3335,30 @@ pub(super) async fn request_v3_clock_probe<R: StrictReplicable>(
         requester_clock: rt.v3_clock_probe_requester_clock(),
     };
     if !register_v3_clock_probe_retry_if_current(rt, peer, request.clone()) {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::Clock,
+            metric_reason,
+            StrictProbeOutcome::IgnoredNonce,
+        );
         return false;
     }
-    send_v3_metadata_control(
+    let sent = send_v3_metadata_control(
         rt,
         dst,
         StrictBody::ClockProbeReq(request),
-        CatchupReason::from_v3_wire(reason as i32).unwrap_or(CatchupReason::DeliveryWatermark),
+        metric_reason,
         CatchupPhase::Metadata,
     )
     .await
-    .is_ok()
+    .is_ok();
+    if sent {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::Clock,
+            metric_reason,
+            StrictProbeOutcome::Sent,
+        );
+    }
+    sent
 }
 
 pub(super) fn register_v3_clock_probe_retry_if_current<R: StrictReplicable>(
@@ -3393,26 +3423,89 @@ pub(super) fn recv_v3_clock_probe_resp<R: StrictReplicable>(
     epoch: u64,
     resp: StrictClockProbeResp,
 ) {
+    let metric_reason =
+        CatchupReason::from_v3_wire(resp.reason).unwrap_or(CatchupReason::DeliveryWatermark);
     let Some(peer) = v3_peer(rt, from, epoch) else {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::Clock,
+            metric_reason,
+            StrictProbeOutcome::RejectedPeer,
+        );
+        debug!(
+            topic = %rt.topic,
+            peer = from,
+            peer_boot_epoch = epoch,
+            request_nonce = resp.request_nonce,
+            reason = ?StrictCatchupReason::try_from(resp.reason).ok(),
+            rejection = "peer",
+            "strict clock probe response rejected"
+        );
         return;
     };
     if node_from_u32(resp.responder_node) != Some(from)
         || resp.expected_requester_boot_epoch != rt.boot_epoch
         || CatchupReason::from_v3_wire(resp.reason).is_none()
     {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::Clock,
+            metric_reason,
+            StrictProbeOutcome::RejectedEnvelope,
+        );
+        debug!(
+            topic = %rt.topic,
+            peer = from,
+            peer_boot_epoch = epoch,
+            request_nonce = resp.request_nonce,
+            responder_node = resp.responder_node,
+            expected_requester_boot_epoch = resp.expected_requester_boot_epoch,
+            reason = ?StrictCatchupReason::try_from(resp.reason).ok(),
+            rejection = "envelope",
+            "strict clock probe response rejected"
+        );
         return;
     }
-    {
+    let accepted = {
         let mut retries = rt.v3_retries.lock();
-        if !rt
+        let accepted = rt
             .v3_sync
             .lock()
-            .accept_clock_nonce(peer, resp.request_nonce)
-        {
-            return;
+            .accept_clock_nonce(peer, resp.request_nonce);
+        if accepted {
+            retries.complete_clock_probe(peer, resp.request_nonce);
         }
-        retries.complete_clock_probe(peer, resp.request_nonce);
+        accepted
+    };
+    if !accepted {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::Clock,
+            metric_reason,
+            StrictProbeOutcome::IgnoredNonce,
+        );
+        trace!(
+            topic = %rt.topic,
+            peer = from,
+            peer_boot_epoch = epoch,
+            request_nonce = resp.request_nonce,
+            reason = ?StrictCatchupReason::try_from(resp.reason).ok(),
+            rejection = "nonce_not_current",
+            "strict clock probe response ignored"
+        );
+        return;
     }
+    metrics::record_strict_probe_event(
+        StrictProbeKind::Clock,
+        metric_reason,
+        StrictProbeOutcome::Accepted,
+    );
+    trace!(
+        topic = %rt.topic,
+        peer = from,
+        peer_boot_epoch = epoch,
+        request_nonce = resp.request_nonce,
+        reason = ?StrictCatchupReason::try_from(resp.reason).ok(),
+        source_clock = resp.src_clock,
+        "strict clock probe response accepted"
+    );
     rt.accept_v3_clock_probe(from, epoch, resp.src_clock);
 }
 
@@ -3450,10 +3543,22 @@ pub(super) fn prepare_v3_history_probe<R: StrictReplicable>(
     dst: NodeIdentifier,
     reason: StrictCatchupReason,
 ) -> Option<PreparedHistoryProbe> {
+    let metric_reason =
+        CatchupReason::from_v3_wire(reason as i32).unwrap_or(CatchupReason::HistoryElection);
     let Some(epoch) = rt.net.member_boot_epoch(dst) else {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::History,
+            metric_reason,
+            StrictProbeOutcome::RejectedPeer,
+        );
         return None;
     };
     if !rt.v3_repair_supported_by(dst) {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::History,
+            metric_reason,
+            StrictProbeOutcome::RejectedPeer,
+        );
         return None;
     }
     let peer = PeerIncarnation::new(dst, epoch);
@@ -3473,6 +3578,11 @@ pub(super) fn prepare_v3_history_probe<R: StrictReplicable>(
         }
     };
     if promoted_existing {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::History,
+            metric_reason,
+            StrictProbeOutcome::Coalesced,
+        );
         let mut retries = rt.v3_retries.lock();
         if retries.history_probe_nonce_is_scheduled(peer, nonce) {
             if reason == StrictCatchupReason::HistoryElection {
@@ -3482,6 +3592,14 @@ pub(super) fn prepare_v3_history_probe<R: StrictReplicable>(
                 // before the promoted response is retried.
                 retries.expedite_history_probe(peer, nonce, Instant::now());
             }
+            trace!(
+                topic = %rt.topic,
+                peer = dst,
+                peer_boot_epoch = epoch,
+                request_nonce = nonce,
+                reason = ?reason,
+                "strict history probe coalesced with retained retry owner"
+            );
             return None;
         }
     }
@@ -3495,7 +3613,27 @@ pub(super) fn prepare_v3_history_probe<R: StrictReplicable>(
         reason: reason as i32,
     };
     if !register_v3_history_probe_retry_if_current(rt, peer, request.clone()) {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::History,
+            metric_reason,
+            StrictProbeOutcome::IgnoredNonce,
+        );
         return None;
+    }
+    if promoted_existing {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::History,
+            metric_reason,
+            StrictProbeOutcome::RetryRestored,
+        );
+        debug!(
+            topic = %rt.topic,
+            peer = dst,
+            peer_boot_epoch = epoch,
+            request_nonce = nonce,
+            reason = ?reason,
+            "strict history probe restored missing retry owner"
+        );
     }
     Some(PreparedHistoryProbe {
         dst,
@@ -3509,14 +3647,23 @@ pub(super) async fn send_prepared_v3_history_probe<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     prepared: PreparedHistoryProbe,
 ) {
-    let _ = send_v3_metadata_control(
+    let reason = prepared.reason;
+    if send_v3_metadata_control(
         rt,
         prepared.dst,
         prepared.body,
-        prepared.reason,
+        reason,
         CatchupPhase::Metadata,
     )
-    .await;
+    .await
+    .is_ok()
+    {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::History,
+            reason,
+            StrictProbeOutcome::Sent,
+        );
+    }
 }
 
 pub(super) async fn request_v3_history_probe<R: StrictReplicable>(
@@ -3598,6 +3745,20 @@ async fn accept_v3_history_metadata_if_admissible<R: StrictReplicable>(
                 .terminal_cut()
                 .terminal_set_digest()
     {
+        metrics::record_strict_admission_event(StrictAdmissionEvent::HistoryProofTerminalMismatch);
+        let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+        debug!(
+            topic = %rt.topic,
+            peer = peer.node(),
+            peer_boot_epoch = peer.boot_epoch(),
+            remote_repository_version = rank.version,
+            remote_history_freshness = rank.freshness,
+            remote_terminal_set_digest = ?advertised_cut.terminal_set_digest(),
+            local_repository_version = rt.repo.current_version(),
+            local_terminal_set_digest = ?local_cut.terminal_set_digest(),
+            rejection = "terminal_set_digest",
+            "strict admission history proof rejected"
+        );
         return;
     }
     rt.accept_v3_history_metadata(peer.node(), peer.boot_epoch(), rank);
@@ -3640,7 +3801,23 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
     epoch: u64,
     resp: StrictHistoryProbeResp,
 ) {
+    let wire_metric_reason =
+        CatchupReason::from_v3_wire(resp.reason).unwrap_or(CatchupReason::HistoryElection);
     let Some(peer) = v3_peer(rt, from, epoch) else {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::History,
+            wire_metric_reason,
+            StrictProbeOutcome::RejectedPeer,
+        );
+        debug!(
+            topic = %rt.topic,
+            peer = from,
+            peer_boot_epoch = epoch,
+            request_nonce = resp.request_nonce,
+            reason = ?StrictCatchupReason::try_from(resp.reason).ok(),
+            rejection = "peer",
+            "strict history probe response rejected"
+        );
         return;
     };
     let valid_cut = resp.terminal_cut.as_ref().and_then(cut_from_wire);
@@ -3649,21 +3826,56 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         || resp.expected_requester_boot_epoch != rt.boot_epoch
         || valid_cut.is_none()
     {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::History,
+            wire_metric_reason,
+            StrictProbeOutcome::RejectedEnvelope,
+        );
+        debug!(
+            topic = %rt.topic,
+            peer = from,
+            peer_boot_epoch = epoch,
+            request_nonce = resp.request_nonce,
+            responder_node = resp.responder_node,
+            history_node = resp.history_node,
+            expected_requester_boot_epoch = resp.expected_requester_boot_epoch,
+            reason = ?StrictCatchupReason::try_from(resp.reason).ok(),
+            rejection = "envelope",
+            "strict history probe response rejected"
+        );
         return;
     }
     let accepted_probe = {
         let mut retries = rt.v3_retries.lock();
-        let Some(accepted_probe) = rt
+        let accepted_probe = rt
             .v3_sync
             .lock()
-            .accept_history_nonce(peer, resp.request_nonce)
-        else {
-            return;
-        };
-        retries.complete_history_probe(peer, resp.request_nonce);
+            .accept_history_nonce(peer, resp.request_nonce);
+        if accepted_probe.is_some() {
+            retries.complete_history_probe(peer, resp.request_nonce);
+        }
         accepted_probe
     };
+    let Some(accepted_probe) = accepted_probe else {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::History,
+            wire_metric_reason,
+            StrictProbeOutcome::IgnoredNonce,
+        );
+        trace!(
+            topic = %rt.topic,
+            peer = from,
+            peer_boot_epoch = epoch,
+            request_nonce = resp.request_nonce,
+            reason = ?StrictCatchupReason::try_from(resp.reason).ok(),
+            rejection = "nonce_not_current",
+            "strict history probe response ignored"
+        );
+        return;
+    };
     let effective_reason = accepted_probe.reason();
+    let effective_metric_reason =
+        CatchupReason::from_v3_wire(effective_reason).unwrap_or(wire_metric_reason);
     let election_pending = accepted_probe.election_pending();
     let Some(mut reason) = StrictCatchupReason::try_from(effective_reason).ok() else {
         return;
@@ -3696,9 +3908,47 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         terminal_repository_base_version: resp.terminal_repository_base_version,
     };
     if rank.terminal_repository_base_version > rank.version {
+        metrics::record_strict_probe_event(
+            StrictProbeKind::History,
+            effective_metric_reason,
+            StrictProbeOutcome::RejectedPayload,
+        );
+        debug!(
+            topic = %rt.topic,
+            peer = from,
+            peer_boot_epoch = epoch,
+            request_nonce = resp.request_nonce,
+            reason = ?reason,
+            repository_version = rank.version,
+            history_freshness = rank.freshness,
+            terminal_repository_base_version = rank.terminal_repository_base_version,
+            rejection = "terminal_repository_base_above_head",
+            "strict history probe response rejected after nonce acceptance"
+        );
         return;
     }
     let response_cut = valid_cut.expect("validated terminal cut");
+    metrics::record_strict_probe_event(
+        StrictProbeKind::History,
+        effective_metric_reason,
+        StrictProbeOutcome::Accepted,
+    );
+    trace!(
+        topic = %rt.topic,
+        peer = from,
+        peer_boot_epoch = epoch,
+        request_nonce = resp.request_nonce,
+        wire_reason = ?StrictCatchupReason::try_from(resp.reason).ok(),
+        effective_reason = ?reason,
+        repository_version = rank.version,
+        history_freshness = rank.freshness,
+        runtime_started_at = rank.runtime_started_at,
+        terminal_repository_base_version = rank.terminal_repository_base_version,
+        terminal_journal_id = ?response_cut.journal_id(),
+        terminal_generation = response_cut.generation(),
+        terminal_set_digest = ?response_cut.terminal_set_digest(),
+        "strict history probe response accepted"
+    );
     let repair_reason = accepted_probe
         .repair_reason()
         .or_else(|| {
@@ -3780,14 +4030,54 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
     // commitment in the terminal-set digest. Only digest equality or a
     // previously installed source cut can prove this terminal set complete.
     let source_satisfied = terminal_equal || source_already_known;
-    let repository_version = rt.repo.current_version();
+    let local_history = rt.repo.history_metadata();
+    let repository_version = local_history.version;
+    let freshness_replacement_needed = reason == StrictCatchupReason::HistoryElection
+        && rank.version == local_history.version
+        && rank.freshness > local_history.freshness;
     let checkpoint_replacement_needed = reason == StrictCatchupReason::HistoryElection
         && !terminal_equal
         && source_cut.journal_id() != local_cut.journal_id()
         && rank.version >= repository_version;
+    let repository_base_required = rt.repository_base_required();
     let history_needed = rank.version > repository_version
-        || rt.repository_base_required()
+        || freshness_replacement_needed
+        || repository_base_required
         || checkpoint_replacement_needed;
+    let next_action = if !source_satisfied {
+        "terminal_sync"
+    } else if history_needed {
+        "repository_transfer"
+    } else if reason == StrictCatchupReason::HistoryElection {
+        "finish_election"
+    } else {
+        "accept_admission_metadata"
+    };
+    debug!(
+        topic = %rt.topic,
+        peer = source_peer.node(),
+        peer_boot_epoch = source_peer.boot_epoch(),
+        reason = ?reason,
+        local_repository_version = local_history.version,
+        local_history_freshness = local_history.freshness,
+        remote_repository_version = rank.version,
+        remote_history_freshness = rank.freshness,
+        local_terminal_journal_id = ?local_cut.journal_id(),
+        local_terminal_generation = local_cut.generation(),
+        local_terminal_set_digest = ?local_cut.terminal_set_digest(),
+        remote_terminal_journal_id = ?source_cut.journal_id(),
+        remote_terminal_generation = source_cut.generation(),
+        remote_terminal_set_digest = ?source_cut.terminal_set_digest(),
+        terminal_equal,
+        source_already_known,
+        source_satisfied,
+        freshness_replacement_needed,
+        checkpoint_replacement_needed,
+        repository_base_required,
+        history_needed,
+        next_action,
+        "strict history probe convergence decision"
+    );
     if checkpoint_replacement_needed {
         rt.require_repository_base(rank.version);
     }
@@ -3980,11 +4270,19 @@ async fn start_v3_repository_after_terminal<R: StrictReplicable>(
         return false;
     }
     accept_v3_history_metadata_if_admissible(rt, peer, rank, source_cut).await;
+    // Repository application can progress while terminal metadata is checked.
+    // Base transfer decisions must use the current post-await repository cut.
+    let local_history = rt.repo.history_metadata();
     if staged_checkpoint_bound {
         rt.require_repository_base(rank.version);
     }
+    let freshness_replacement_needed = reason == StrictCatchupReason::HistoryElection
+        && rank.version == local_history.version
+        && rank.freshness > local_history.freshness;
     let forced_repository_install = reason == StrictCatchupReason::HistoryElection
-        && (staged_checkpoint_bound || rt.repository_base_required());
+        && (staged_checkpoint_bound
+            || rt.repository_base_required()
+            || freshness_replacement_needed);
     if forced_repository_install
         && rt.net.peer_strict_replication_protocol_version(peer.node()) < STRICT_PROTOCOL_VERSION_V5
     {
@@ -3994,8 +4292,8 @@ async fn start_v3_repository_after_terminal<R: StrictReplicable>(
     if matches!(
         reason,
         StrictCatchupReason::TerminalFence | StrictCatchupReason::DeliveryWatermark
-    ) || rank.version < rt.repo.current_version()
-        || (rank.version == rt.repo.current_version() && !forced_repository_install)
+    ) || rank.version < local_history.version
+        || (rank.version == local_history.version && !forced_repository_install)
     {
         if reason == StrictCatchupReason::HistoryElection {
             rt.state.lock().finish_history_election();
@@ -4006,7 +4304,7 @@ async fn start_v3_repository_after_terminal<R: StrictReplicable>(
     let cursor = if force_snapshot {
         0
     } else {
-        rt.repo.current_version()
+        local_history.version
     };
     let Some(started) = rt.v3_history.lock().begin_transfer(
         peer,
@@ -4036,7 +4334,7 @@ async fn start_v3_repository_after_terminal<R: StrictReplicable>(
     }
     let req = StrictCatchupReq {
         src_node: rt.self_id as u32,
-        since_version: rt.repo.current_version(),
+        since_version: local_history.version,
         chunk_token: if force_snapshot {
             HISTORY_ELECTION_SNAPSHOT_TOKEN
         } else {
@@ -6622,20 +6920,37 @@ mod tests {
 
         fn log_since(
             &self,
-            _since: u64,
+            since: u64,
         ) -> crate::replications::strict::LogSlice<
             crate::replications::strict::StrictLogEntry<Self::Op>,
         > {
-            crate::replications::strict::LogSlice::TooOld
+            if since >= self.version {
+                crate::replications::strict::LogSlice::Available(Vec::new())
+            } else {
+                crate::replications::strict::LogSlice::TooOld
+            }
         }
 
         async fn apply_committed(&self, _version: u64, _op: Self::Op) {}
 
         async fn install_snapshot(
             &self,
-            _version: u64,
-            _snapshot: Bytes,
+            version: u64,
+            snapshot: Bytes,
         ) -> Result<(), crate::replications::strict::StrictSnapshotError> {
+            let (snapshot_version, snapshot_freshness): (u64, i64) =
+                rmp_serde::from_slice(&snapshot).map_err(|error| {
+                    crate::replications::strict::StrictSnapshotError::new(format!(
+                        "test snapshot decode failed: {error}"
+                    ))
+                })?;
+            if snapshot_version != version || snapshot_version != self.version {
+                return Err(crate::replications::strict::StrictSnapshotError::new(
+                    "test snapshot version mismatch",
+                ));
+            }
+            self.advertised_freshness
+                .store(snapshot_freshness, Ordering::Release);
             Ok(())
         }
     }
@@ -7391,16 +7706,118 @@ mod tests {
 
         super::recv_v3_history_probe_resp(&sink, source.self_id, 1, response).await;
 
-        assert!(
-            sink_net.drain_captures().into_iter().any(|frame| matches!(
-                frame,
+        let history_request = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
                 CapturedFrame::StrictUnicast {
                     dst: 1,
-                    body: StrictBody::CatchupReq(ref request),
+                    body: StrictBody::CatchupReq(request),
                     ..
-                } if request.force_snapshot
-            )),
-            "an elected same-version fresher repository must replace the stale local image"
+                } if request.force_snapshot => Some(request),
+                _ => None,
+            })
+            .expect(
+                "an elected same-version fresher repository must replace the stale local image",
+            );
+        assert_eq!(history_request.since_version, sink_metadata.version);
+        assert_eq!(
+            history_request.chunk_token,
+            super::HISTORY_ELECTION_SNAPSHOT_TOKEN
+        );
+
+        respond_to_request(&source, sink.self_id, history_request).await;
+        let history_response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::CatchupResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("forced freshness replacement snapshot");
+        assert!(history_response.too_old_use_snapshot);
+        apply_response(&sink, source.self_id, history_response).await;
+
+        assert_eq!(sink_repo.history_metadata(), source_metadata);
+        assert!(!sink.state.lock().history_election_pending());
+        assert!(!sink.state.lock().history_election_active());
+
+        let post_snapshot = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::CatchupReq(request),
+                    ..
+                } if request
+                    .history_transfer
+                    .as_ref()
+                    .is_some_and(|transfer| !transfer.final_ack) =>
+                {
+                    Some(request)
+                }
+                _ => None,
+            })
+            .expect("post-snapshot freshness confirmation request");
+        respond_to_request(&source, sink.self_id, post_snapshot).await;
+        let post_snapshot_response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::CatchupResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("post-snapshot freshness confirmation response");
+        apply_response(&sink, source.self_id, post_snapshot_response).await;
+
+        let final_ack = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::CatchupReq(request),
+                    ..
+                } if request
+                    .history_transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.final_ack) =>
+                {
+                    Some(request)
+                }
+                _ => None,
+            })
+            .expect("history final ACK");
+        respond_to_request(&source, sink.self_id, final_ack).await;
+        let confirmation = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::CatchupResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("history final ACK confirmation");
+        apply_response(&sink, source.self_id, confirmation).await;
+
+        assert!(sink_net.drain_captures().is_empty());
+        sink.try_bootstrap_catchup().await;
+        super::retry_v3_terminal_transmissions(&sink).await;
+        assert!(
+            sink_net.drain_captures().is_empty(),
+            "a converged freshness replacement must not restart metadata catchup"
         );
     }
 

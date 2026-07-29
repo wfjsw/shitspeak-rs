@@ -323,6 +323,195 @@ pub(crate) enum StrictCatchupThrottleReason {
     Backoff,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictProbeKind {
+    Clock,
+    History,
+}
+
+impl StrictProbeKind {
+    fn index(self) -> usize {
+        match self {
+            Self::Clock => 0,
+            Self::History => 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Clock => "clock",
+            Self::History => "history",
+        }
+    }
+}
+
+/// Bounded lifecycle outcomes for admission and election probes.
+///
+/// Peer, incarnation, nonce, and repository tuples belong in structured logs,
+/// never in this Prometheus dimension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictProbeOutcome {
+    Sent,
+    Coalesced,
+    RetryRestored,
+    Accepted,
+    RejectedPeer,
+    RejectedEnvelope,
+    IgnoredNonce,
+    RejectedPayload,
+}
+
+impl StrictProbeOutcome {
+    fn index(self) -> usize {
+        match self {
+            Self::Sent => 0,
+            Self::Coalesced => 1,
+            Self::RetryRestored => 2,
+            Self::Accepted => 3,
+            Self::RejectedPeer => 4,
+            Self::RejectedEnvelope => 5,
+            Self::IgnoredNonce => 6,
+            Self::RejectedPayload => 7,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Coalesced => "coalesced",
+            Self::RetryRestored => "retry_restored",
+            Self::Accepted => "accepted",
+            Self::RejectedPeer => "rejected_peer",
+            Self::RejectedEnvelope => "rejected_envelope",
+            Self::IgnoredNonce => "ignored_nonce",
+            Self::RejectedPayload => "rejected_payload",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictAdmissionEvent {
+    Started,
+    Revoked,
+    CutFrozen,
+    HistoryProofAccepted,
+    HistoryProofTerminalMismatch,
+    ClockProofAccepted,
+    ClockProofBelowBarrier,
+    Admitted,
+}
+
+impl StrictAdmissionEvent {
+    fn index(self) -> usize {
+        match self {
+            Self::Started => 0,
+            Self::Revoked => 1,
+            Self::CutFrozen => 2,
+            Self::HistoryProofAccepted => 3,
+            Self::HistoryProofTerminalMismatch => 4,
+            Self::ClockProofAccepted => 5,
+            Self::ClockProofBelowBarrier => 6,
+            Self::Admitted => 7,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Revoked => "revoked",
+            Self::CutFrozen => "cut_frozen",
+            Self::HistoryProofAccepted => "history_proof_accepted",
+            Self::HistoryProofTerminalMismatch => "history_proof_terminal_mismatch",
+            Self::ClockProofAccepted => "clock_proof_accepted",
+            Self::ClockProofBelowBarrier => "clock_proof_below_barrier",
+            Self::Admitted => "admitted",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictHistoryElectionEvent {
+    Started,
+    ResponsePending,
+    LocalWon,
+    RemoteWon,
+    SnapshotStarted,
+    Finished,
+    Rearmed,
+    TimedOut,
+}
+
+impl StrictHistoryElectionEvent {
+    fn index(self) -> usize {
+        match self {
+            Self::Started => 0,
+            Self::ResponsePending => 1,
+            Self::LocalWon => 2,
+            Self::RemoteWon => 3,
+            Self::SnapshotStarted => 4,
+            Self::Finished => 5,
+            Self::Rearmed => 6,
+            Self::TimedOut => 7,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::ResponsePending => "response_pending",
+            Self::LocalWon => "local_won",
+            Self::RemoteWon => "remote_won",
+            Self::SnapshotStarted => "snapshot_started",
+            Self::Finished => "finished",
+            Self::Rearmed => "rearmed",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictHeadEvent {
+    EvidenceChanged,
+    EvidenceRepositoryVersionMismatch,
+    EvidenceFreshnessMismatch,
+    EvidenceTerminalDigestMismatch,
+    AckAccepted,
+    AckRejectedEnvelope,
+    AckRejectedDigest,
+    AckRejectedIdentity,
+    TickAttempted,
+}
+
+impl StrictHeadEvent {
+    fn index(self) -> usize {
+        match self {
+            Self::EvidenceChanged => 0,
+            Self::EvidenceRepositoryVersionMismatch => 1,
+            Self::EvidenceFreshnessMismatch => 2,
+            Self::EvidenceTerminalDigestMismatch => 3,
+            Self::AckAccepted => 4,
+            Self::AckRejectedEnvelope => 5,
+            Self::AckRejectedDigest => 6,
+            Self::AckRejectedIdentity => 7,
+            Self::TickAttempted => 8,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::EvidenceChanged => "evidence_changed",
+            Self::EvidenceRepositoryVersionMismatch => "evidence_repository_version_mismatch",
+            Self::EvidenceFreshnessMismatch => "evidence_freshness_mismatch",
+            Self::EvidenceTerminalDigestMismatch => "evidence_terminal_digest_mismatch",
+            Self::AckAccepted => "ack_accepted",
+            Self::AckRejectedEnvelope => "ack_rejected_envelope",
+            Self::AckRejectedDigest => "ack_rejected_digest",
+            Self::AckRejectedIdentity => "ack_rejected_identity",
+            Self::TickAttempted => "tick_attempted",
+        }
+    }
+}
+
 impl StrictCatchupThrottleReason {
     fn index(self) -> usize {
         match self {
@@ -467,6 +656,13 @@ const STRICT_CATCHUP_BACKPRESSURE_METRIC_COUNT: usize =
 // session limiter; publishing either as a zero-valued throttle would imply a
 // control that does not exist.
 const STRICT_CATCHUP_THROTTLE_REASON_COUNT: usize = 2;
+const STRICT_PROBE_KIND_COUNT: usize = 2;
+const STRICT_PROBE_OUTCOME_COUNT: usize = 8;
+const STRICT_PROBE_METRIC_COUNT: usize =
+    STRICT_PROBE_KIND_COUNT * CATCHUP_REASON_COUNT * STRICT_PROBE_OUTCOME_COUNT;
+const STRICT_ADMISSION_EVENT_COUNT: usize = 8;
+const STRICT_HISTORY_ELECTION_EVENT_COUNT: usize = 8;
+const STRICT_HEAD_EVENT_COUNT: usize = 9;
 const CATCHUP_REASONS: [CatchupReason; CATCHUP_REASON_COUNT] = [
     CatchupReason::HistoryElection,
     CatchupReason::Admission,
@@ -526,6 +722,50 @@ const STRICT_CATCHUP_THROTTLE_REASONS: [StrictCatchupThrottleReason;
     STRICT_CATCHUP_THROTTLE_REASON_COUNT] = [
     StrictCatchupThrottleReason::NextHopBytes,
     StrictCatchupThrottleReason::Backoff,
+];
+const STRICT_PROBE_KINDS: [StrictProbeKind; STRICT_PROBE_KIND_COUNT] =
+    [StrictProbeKind::Clock, StrictProbeKind::History];
+const STRICT_PROBE_OUTCOMES: [StrictProbeOutcome; STRICT_PROBE_OUTCOME_COUNT] = [
+    StrictProbeOutcome::Sent,
+    StrictProbeOutcome::Coalesced,
+    StrictProbeOutcome::RetryRestored,
+    StrictProbeOutcome::Accepted,
+    StrictProbeOutcome::RejectedPeer,
+    StrictProbeOutcome::RejectedEnvelope,
+    StrictProbeOutcome::IgnoredNonce,
+    StrictProbeOutcome::RejectedPayload,
+];
+const STRICT_ADMISSION_EVENTS: [StrictAdmissionEvent; STRICT_ADMISSION_EVENT_COUNT] = [
+    StrictAdmissionEvent::Started,
+    StrictAdmissionEvent::Revoked,
+    StrictAdmissionEvent::CutFrozen,
+    StrictAdmissionEvent::HistoryProofAccepted,
+    StrictAdmissionEvent::HistoryProofTerminalMismatch,
+    StrictAdmissionEvent::ClockProofAccepted,
+    StrictAdmissionEvent::ClockProofBelowBarrier,
+    StrictAdmissionEvent::Admitted,
+];
+const STRICT_HISTORY_ELECTION_EVENTS: [StrictHistoryElectionEvent;
+    STRICT_HISTORY_ELECTION_EVENT_COUNT] = [
+    StrictHistoryElectionEvent::Started,
+    StrictHistoryElectionEvent::ResponsePending,
+    StrictHistoryElectionEvent::LocalWon,
+    StrictHistoryElectionEvent::RemoteWon,
+    StrictHistoryElectionEvent::SnapshotStarted,
+    StrictHistoryElectionEvent::Finished,
+    StrictHistoryElectionEvent::Rearmed,
+    StrictHistoryElectionEvent::TimedOut,
+];
+const STRICT_HEAD_EVENTS: [StrictHeadEvent; STRICT_HEAD_EVENT_COUNT] = [
+    StrictHeadEvent::EvidenceChanged,
+    StrictHeadEvent::EvidenceRepositoryVersionMismatch,
+    StrictHeadEvent::EvidenceFreshnessMismatch,
+    StrictHeadEvent::EvidenceTerminalDigestMismatch,
+    StrictHeadEvent::AckAccepted,
+    StrictHeadEvent::AckRejectedEnvelope,
+    StrictHeadEvent::AckRejectedDigest,
+    StrictHeadEvent::AckRejectedIdentity,
+    StrictHeadEvent::TickAttempted,
 ];
 const REPLICATION_PIPELINE_KIND_COUNT: usize = 4;
 const REPLICATION_PIPELINE_STAGE_COUNT: usize = 12;
@@ -595,6 +835,14 @@ static STRICT_CATCHUP_BACKOFF_DELAY_MS: [AtomicU64; CATCHUP_REASON_COUNT * CATCH
 static STRICT_CATCHUP_BULK_IN_FLIGHT_BYTES: AtomicUsize = AtomicUsize::new(0);
 static STRICT_CATCHUP_THROTTLED: [AtomicU64; STRICT_CATCHUP_THROTTLE_REASON_COUNT] =
     [const { AtomicU64::new(0) }; STRICT_CATCHUP_THROTTLE_REASON_COUNT];
+static STRICT_PROBE_EVENTS: [AtomicU64; STRICT_PROBE_METRIC_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_PROBE_METRIC_COUNT];
+static STRICT_ADMISSION_EVENTS_TOTAL: [AtomicU64; STRICT_ADMISSION_EVENT_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_ADMISSION_EVENT_COUNT];
+static STRICT_HISTORY_ELECTION_EVENTS_TOTAL: [AtomicU64; STRICT_HISTORY_ELECTION_EVENT_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_HISTORY_ELECTION_EVENT_COUNT];
+static STRICT_HEAD_EVENTS_TOTAL: [AtomicU64; STRICT_HEAD_EVENT_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_HEAD_EVENT_COUNT];
 
 static REPLICATION_PIPELINE_STAGE_EVENTS: [[AtomicU64; REPLICATION_PIPELINE_STAGE_COUNT];
     REPLICATION_PIPELINE_KIND_COUNT] =
@@ -641,6 +889,13 @@ pub(crate) struct StrictAdmissionMetrics {
     awaiting_local_cut: AtomicUsize,
     awaiting_peer: AtomicUsize,
     highest_barrier: AtomicU64,
+    awaiting_history_only: AtomicUsize,
+    awaiting_clock_only: AtomicUsize,
+    awaiting_both_proofs: AtomicUsize,
+    clock_demand_commit_buffer: AtomicBool,
+    clock_demand_proposal: AtomicBool,
+    clock_demand_missing_peer_clocks: AtomicUsize,
+    unacknowledged_head_peers: AtomicUsize,
 }
 
 impl StrictAdmissionMetrics {
@@ -659,12 +914,53 @@ impl StrictAdmissionMetrics {
             .store(highest_barrier, Ordering::Relaxed);
     }
 
+    pub(crate) fn update_proof_waits(
+        &self,
+        awaiting_history_only: usize,
+        awaiting_clock_only: usize,
+        awaiting_both_proofs: usize,
+    ) {
+        self.awaiting_history_only
+            .store(awaiting_history_only, Ordering::Relaxed);
+        self.awaiting_clock_only
+            .store(awaiting_clock_only, Ordering::Relaxed);
+        self.awaiting_both_proofs
+            .store(awaiting_both_proofs, Ordering::Relaxed);
+    }
+
+    pub(crate) fn update_clock_demand(
+        &self,
+        commit_buffer: bool,
+        proposal: bool,
+        missing_peer_clocks: usize,
+        unacknowledged_head_peers: usize,
+    ) {
+        self.clock_demand_commit_buffer
+            .store(commit_buffer, Ordering::Relaxed);
+        self.clock_demand_proposal
+            .store(proposal, Ordering::Relaxed);
+        self.clock_demand_missing_peer_clocks
+            .store(missing_peer_clocks, Ordering::Relaxed);
+        self.unacknowledged_head_peers
+            .store(unacknowledged_head_peers, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> StrictAdmissionMetricSnapshot {
         StrictAdmissionMetricSnapshot {
             admitted: self.admitted.load(Ordering::Relaxed),
             awaiting_local_cut: self.awaiting_local_cut.load(Ordering::Relaxed),
             awaiting_peer: self.awaiting_peer.load(Ordering::Relaxed),
             highest_barrier: self.highest_barrier.load(Ordering::Relaxed),
+            awaiting_history_only: self.awaiting_history_only.load(Ordering::Relaxed),
+            awaiting_clock_only: self.awaiting_clock_only.load(Ordering::Relaxed),
+            awaiting_both_proofs: self.awaiting_both_proofs.load(Ordering::Relaxed),
+            clock_demand_commit_buffer: self.clock_demand_commit_buffer.load(Ordering::Relaxed)
+                as usize,
+            clock_demand_proposal: self.clock_demand_proposal.load(Ordering::Relaxed) as usize,
+            clock_demand_missing_peer_clocks: self
+                .clock_demand_missing_peer_clocks
+                .load(Ordering::Relaxed),
+            unacknowledged_head_peers: self.unacknowledged_head_peers.load(Ordering::Relaxed),
         }
     }
 }
@@ -675,6 +971,13 @@ struct StrictAdmissionMetricSnapshot {
     awaiting_local_cut: usize,
     awaiting_peer: usize,
     highest_barrier: u64,
+    awaiting_history_only: usize,
+    awaiting_clock_only: usize,
+    awaiting_both_proofs: usize,
+    clock_demand_commit_buffer: usize,
+    clock_demand_proposal: usize,
+    clock_demand_missing_peer_clocks: usize,
+    unacknowledged_head_peers: usize,
 }
 
 pub(crate) fn register_strict_admission_metrics() -> Arc<StrictAdmissionMetrics> {
@@ -683,6 +986,13 @@ pub(crate) fn register_strict_admission_metrics() -> Arc<StrictAdmissionMetrics>
         awaiting_local_cut: AtomicUsize::new(0),
         awaiting_peer: AtomicUsize::new(0),
         highest_barrier: AtomicU64::new(0),
+        awaiting_history_only: AtomicUsize::new(0),
+        awaiting_clock_only: AtomicUsize::new(0),
+        awaiting_both_proofs: AtomicUsize::new(0),
+        clock_demand_commit_buffer: AtomicBool::new(false),
+        clock_demand_proposal: AtomicBool::new(false),
+        clock_demand_missing_peer_clocks: AtomicUsize::new(0),
+        unacknowledged_head_peers: AtomicUsize::new(0),
     });
     STRICT_ADMISSION_METRIC_SOURCES
         .lock()
@@ -743,6 +1053,15 @@ fn strict_backpressure_index(
 
 fn strict_backoff_index(reason: CatchupReason, phase: CatchupPhase) -> usize {
     reason.index() * CATCHUP_PHASE_COUNT + phase.index()
+}
+
+fn strict_probe_index(
+    probe: StrictProbeKind,
+    reason: CatchupReason,
+    outcome: StrictProbeOutcome,
+) -> usize {
+    (probe.index() * CATCHUP_REASON_COUNT + reason.index()) * STRICT_PROBE_OUTCOME_COUNT
+        + outcome.index()
 }
 
 fn legacy_reason(mode: CatchupMode) -> CatchupReason {
@@ -905,6 +1224,29 @@ pub(crate) fn record_strict_catchup_throttled(reason: StrictCatchupThrottleReaso
     increment(&STRICT_CATCHUP_THROTTLED[reason.index()], 1);
 }
 
+pub(crate) fn record_strict_probe_event(
+    probe: StrictProbeKind,
+    reason: CatchupReason,
+    outcome: StrictProbeOutcome,
+) {
+    increment(
+        &STRICT_PROBE_EVENTS[strict_probe_index(probe, reason, outcome)],
+        1,
+    );
+}
+
+pub(crate) fn record_strict_admission_event(event: StrictAdmissionEvent) {
+    increment(&STRICT_ADMISSION_EVENTS_TOTAL[event.index()], 1);
+}
+
+pub(crate) fn record_strict_history_election_event(event: StrictHistoryElectionEvent) {
+    increment(&STRICT_HISTORY_ELECTION_EVENTS_TOTAL[event.index()], 1);
+}
+
+pub(crate) fn record_strict_head_event(event: StrictHeadEvent) {
+    increment(&STRICT_HEAD_EVENTS_TOTAL[event.index()], 1);
+}
+
 pub(crate) fn record_pipeline_stage(
     kind: ReplicationPipelineKind,
     stage: ReplicationPipelineStage,
@@ -990,6 +1332,27 @@ fn aggregate_strict_admission_sources(
             .awaiting_peer
             .saturating_add(snapshot.awaiting_peer);
         aggregate.highest_barrier = aggregate.highest_barrier.max(snapshot.highest_barrier);
+        aggregate.awaiting_history_only = aggregate
+            .awaiting_history_only
+            .saturating_add(snapshot.awaiting_history_only);
+        aggregate.awaiting_clock_only = aggregate
+            .awaiting_clock_only
+            .saturating_add(snapshot.awaiting_clock_only);
+        aggregate.awaiting_both_proofs = aggregate
+            .awaiting_both_proofs
+            .saturating_add(snapshot.awaiting_both_proofs);
+        aggregate.clock_demand_commit_buffer = aggregate
+            .clock_demand_commit_buffer
+            .saturating_add(snapshot.clock_demand_commit_buffer);
+        aggregate.clock_demand_proposal = aggregate
+            .clock_demand_proposal
+            .saturating_add(snapshot.clock_demand_proposal);
+        aggregate.clock_demand_missing_peer_clocks = aggregate
+            .clock_demand_missing_peer_clocks
+            .saturating_add(snapshot.clock_demand_missing_peer_clocks);
+        aggregate.unacknowledged_head_peers = aggregate
+            .unacknowledged_head_peers
+            .saturating_add(snapshot.unacknowledged_head_peers);
         true
     });
     aggregate
@@ -998,7 +1361,7 @@ fn aggregate_strict_admission_sources(
 fn strict_admission_metric_samples(
     snapshot: StrictAdmissionMetricSnapshot,
 ) -> Vec<PrometheusSample> {
-    let mut samples = Vec::with_capacity(4);
+    let mut samples = Vec::with_capacity(12);
     for (state, value) in [
         ("admitted", snapshot.admitted),
         ("awaiting_local_cut", snapshot.awaiting_local_cut),
@@ -1014,6 +1377,37 @@ fn strict_admission_metric_samples(
         "shitspeak_s2s_strict_replication_admission_highest_barrier",
         Vec::new(),
         snapshot.highest_barrier as f64,
+    ));
+    for (proof, value) in [
+        ("history", snapshot.awaiting_history_only),
+        ("clock", snapshot.awaiting_clock_only),
+        ("both", snapshot.awaiting_both_proofs),
+    ] {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_admission_awaiting_proofs",
+            vec![("proof".to_owned(), proof.to_owned())],
+            value as f64,
+        ));
+    }
+    for (reason, value) in [
+        ("commit_buffer", snapshot.clock_demand_commit_buffer),
+        ("proposal", snapshot.clock_demand_proposal),
+        (
+            "missing_peer_clock",
+            snapshot.clock_demand_missing_peer_clocks,
+        ),
+        ("head_ack", snapshot.unacknowledged_head_peers),
+    ] {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_clock_demand",
+            vec![("reason".to_owned(), reason.to_owned())],
+            value as f64,
+        ));
+    }
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_unacknowledged_head_peers",
+        Vec::new(),
+        snapshot.unacknowledged_head_peers as f64,
     ));
     samples
 }
@@ -1147,7 +1541,54 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
     samples.extend(strict_admission_metric_samples(
         aggregate_strict_admission_metrics(),
     ));
+    samples.extend(strict_convergence_event_metric_samples());
 
+    samples
+}
+
+fn strict_convergence_event_metric_samples() -> Vec<PrometheusSample> {
+    let mut samples = Vec::new();
+    for probe in STRICT_PROBE_KINDS {
+        for reason in CATCHUP_REASONS {
+            for outcome in STRICT_PROBE_OUTCOMES {
+                let value = STRICT_PROBE_EVENTS[strict_probe_index(probe, reason, outcome)]
+                    .load(Ordering::Relaxed);
+                if value == 0 {
+                    continue;
+                }
+                samples.push(PrometheusSample::new(
+                    "shitspeak_s2s_strict_replication_probe_events_total",
+                    vec![
+                        ("probe".to_owned(), probe.label().to_owned()),
+                        ("reason".to_owned(), reason.label().to_owned()),
+                        ("outcome".to_owned(), outcome.label().to_owned()),
+                    ],
+                    value as f64,
+                ));
+            }
+        }
+    }
+    for event in STRICT_ADMISSION_EVENTS {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_admission_events_total",
+            vec![("event".to_owned(), event.label().to_owned())],
+            STRICT_ADMISSION_EVENTS_TOTAL[event.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    for event in STRICT_HISTORY_ELECTION_EVENTS {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_history_election_events_total",
+            vec![("event".to_owned(), event.label().to_owned())],
+            STRICT_HISTORY_ELECTION_EVENTS_TOTAL[event.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    for event in STRICT_HEAD_EVENTS {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_head_events_total",
+            vec![("event".to_owned(), event.label().to_owned())],
+            STRICT_HEAD_EVENTS_TOTAL[event.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
     samples
 }
 
@@ -1538,6 +1979,13 @@ mod tests {
             awaiting_local_cut: 2,
             awaiting_peer: 1,
             highest_barrier: 101,
+            awaiting_history_only: 1,
+            awaiting_clock_only: 2,
+            awaiting_both_proofs: 3,
+            clock_demand_commit_buffer: 1,
+            clock_demand_proposal: 0,
+            clock_demand_missing_peer_clocks: 2,
+            unacknowledged_head_peers: 4,
         });
         for (state, value) in [
             ("admitted", 3.0),
@@ -1554,14 +2002,37 @@ mod tests {
             sample.name() == "shitspeak_s2s_strict_replication_admission_highest_barrier"
                 && sample.value() == 101.0
         }));
+        for (proof, value) in [("history", 1.0), ("clock", 2.0), ("both", 3.0)] {
+            assert!(samples.iter().any(|sample| {
+                sample.name() == "shitspeak_s2s_strict_replication_admission_awaiting_proofs"
+                    && sample.labels() == [("proof".to_owned(), proof.to_owned())]
+                    && sample.value() == value
+            }));
+        }
+        for (reason, value) in [
+            ("commit_buffer", 1.0),
+            ("proposal", 0.0),
+            ("missing_peer_clock", 2.0),
+            ("head_ack", 4.0),
+        ] {
+            assert!(samples.iter().any(|sample| {
+                sample.name() == "shitspeak_s2s_strict_replication_clock_demand"
+                    && sample.labels() == [("reason".to_owned(), reason.to_owned())]
+                    && sample.value() == value
+            }));
+        }
     }
 
     #[test]
     fn strict_admission_metrics_aggregate_only_live_runtime_sources() {
         let first = Arc::new(StrictAdmissionMetrics::default());
         first.update(2, 1, 0, 40);
+        first.update_proof_waits(1, 0, 2);
+        first.update_clock_demand(true, false, 1, 2);
         let second = Arc::new(StrictAdmissionMetrics::default());
         second.update(3, 0, 2, 90);
+        second.update_proof_waits(0, 3, 1);
+        second.update_clock_demand(true, true, 2, 1);
         let mut sources = vec![Arc::downgrade(&first), Arc::downgrade(&second)];
 
         assert_eq!(
@@ -1571,6 +2042,13 @@ mod tests {
                 awaiting_local_cut: 1,
                 awaiting_peer: 2,
                 highest_barrier: 90,
+                awaiting_history_only: 1,
+                awaiting_clock_only: 3,
+                awaiting_both_proofs: 3,
+                clock_demand_commit_buffer: 2,
+                clock_demand_proposal: 1,
+                clock_demand_missing_peer_clocks: 3,
+                unacknowledged_head_peers: 3,
             }
         );
 
@@ -1582,8 +2060,63 @@ mod tests {
                 awaiting_local_cut: 1,
                 awaiting_peer: 0,
                 highest_barrier: 40,
+                awaiting_history_only: 1,
+                awaiting_clock_only: 0,
+                awaiting_both_proofs: 2,
+                clock_demand_commit_buffer: 1,
+                clock_demand_proposal: 0,
+                clock_demand_missing_peer_clocks: 1,
+                unacknowledged_head_peers: 2,
             }
         );
         assert_eq!(sources.len(), 1);
+    }
+
+    #[test]
+    fn strict_convergence_metrics_use_only_bounded_dimensions() {
+        record_strict_probe_event(
+            StrictProbeKind::History,
+            CatchupReason::Admission,
+            StrictProbeOutcome::IgnoredNonce,
+        );
+        record_strict_admission_event(StrictAdmissionEvent::HistoryProofTerminalMismatch);
+        record_strict_history_election_event(StrictHistoryElectionEvent::Rearmed);
+        record_strict_head_event(StrictHeadEvent::AckRejectedIdentity);
+
+        let samples = strict_convergence_event_metric_samples();
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_probe_events_total"
+                && sample.labels()
+                    == [
+                        ("probe".to_owned(), "history".to_owned()),
+                        ("reason".to_owned(), "admission".to_owned()),
+                        ("outcome".to_owned(), "ignored_nonce".to_owned()),
+                    ]
+                && sample.value() >= 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_admission_events_total"
+                && sample.labels()
+                    == [(
+                        "event".to_owned(),
+                        "history_proof_terminal_mismatch".to_owned(),
+                    )]
+                && sample.value() >= 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_history_election_events_total"
+                && sample.labels() == [("event".to_owned(), "rearmed".to_owned())]
+                && sample.value() >= 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_head_events_total"
+                && sample.labels() == [("event".to_owned(), "ack_rejected_identity".to_owned())]
+                && sample.value() >= 1.0
+        }));
+        for sample in samples {
+            assert!(sample.labels().iter().all(|(label, _)| {
+                ["probe", "reason", "outcome", "event"].contains(&label.as_str())
+            }));
+        }
     }
 }

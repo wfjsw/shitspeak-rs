@@ -1722,6 +1722,41 @@ impl<'a> PrometheusWriter<'a> {
             "gauge",
         );
         self.header(
+            "shitspeak_s2s_strict_replication_admission_awaiting_proofs",
+            "Strict peer admissions awaiting history, clock, or both reciprocal proofs across active strict topics.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_clock_demand",
+            "Current strict clock-tick demand by bounded cause: active-topic counts for local work and peer counts for missing evidence.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_unacknowledged_head_peers",
+            "Current routed peer incarnations that have not acknowledged local strict head evidence.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_probe_events_total",
+            "Strict clock and history probe lifecycle events by bounded reason and outcome.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_admission_events_total",
+            "Strict peer admission state-machine transitions and proof observations by bounded event.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_history_election_events_total",
+            "Strict history-election state-machine transitions and observations by bounded event.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_head_events_total",
+            "Strict head-evidence observations, acknowledgement outcomes, and clock-tick attempts by bounded event.",
+            "counter",
+        );
+        self.header(
             "shitspeak_s2s_distribution_events_total",
             "Distribution-tree control, forwarding, deadline, and fallback events.",
             "counter",
@@ -3671,6 +3706,33 @@ mod tests {
                 "# TYPE shitspeak_s2s_strict_replication_admission_highest_barrier gauge\n"
             )
         );
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_strict_replication_admission_awaiting_proofs gauge\n"
+            )
+        );
+        assert!(rendered.contains("# TYPE shitspeak_s2s_strict_replication_clock_demand gauge\n"));
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_strict_replication_unacknowledged_head_peers gauge\n"
+            )
+        );
+        assert!(
+            rendered
+                .contains("# TYPE shitspeak_s2s_strict_replication_probe_events_total counter\n")
+        );
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_strict_replication_admission_events_total counter\n"
+            )
+        );
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_history_election_events_total counter\n"
+        ));
+        assert!(
+            rendered
+                .contains("# TYPE shitspeak_s2s_strict_replication_head_events_total counter\n")
+        );
         assert!(rendered.contains(
             "# TYPE shitspeak_s2s_strict_replication_catchup_session_starts_total counter\n"
         ));
@@ -3716,6 +3778,12 @@ mod tests {
         ));
         assert!(rendered.contains(
             "shitspeak_s2s_strict_replication_catchup_duplicate_pages_total{outcome=\"cached_replay\"}"
+        ));
+        assert!(
+            rendered.contains("shitspeak_s2s_strict_replication_clock_demand{reason=\"head_ack\"}")
+        );
+        assert!(rendered.contains(
+            "shitspeak_s2s_strict_replication_head_events_total{event=\"evidence_terminal_digest_mismatch\"}"
         ));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_deadline_wakes_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_proactive_events_total counter\n"));

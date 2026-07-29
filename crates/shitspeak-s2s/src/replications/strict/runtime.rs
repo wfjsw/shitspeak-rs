@@ -28,8 +28,8 @@ use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
 use super::super::metrics::{
     self, CatchupMode, CatchupPhase, CatchupReason, ReplicationPipelineKind,
-    ReplicationPipelineStage, StrictCatchupLane, StrictCatchupSendOutcome,
-    StrictCatchupSessionOutcome,
+    ReplicationPipelineStage, StrictAdmissionEvent, StrictCatchupLane, StrictCatchupSendOutcome,
+    StrictCatchupSessionOutcome, StrictHeadEvent, StrictHistoryElectionEvent,
 };
 use super::super::proto::{
     self as repl_proto, REPLICATION_SERVICE_TAG, StrictAccept, StrictAcceptAck,
@@ -88,6 +88,9 @@ pub(super) const STRICT_PROTOCOL_VERSION_V4: u32 =
     super::super::protocol::STRICT_PROTOCOL_VERSION_V4;
 pub(super) const STRICT_PROTOCOL_VERSION_V5: u32 =
     super::super::protocol::STRICT_PROTOCOL_VERSION_V5;
+#[cfg(test)]
+pub(super) const STRICT_PROTOCOL_VERSION_V6: u32 =
+    super::super::protocol::STRICT_PROTOCOL_VERSION_V6;
 /// Hard ceiling for pairwise-v3 metadata carried on the redundant regular
 /// control path. This bounds the strict envelope and nested protobuf body;
 /// mandatory origin-proof material has separate certificate/signature bounds.
@@ -1943,8 +1946,11 @@ enum PeerAdmissionPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingAdmissionProbe {
     peer: NodeIdentifier,
+    boot_epoch: u64,
     needs_history: bool,
     needs_clock: bool,
+    required_history: HistoryMetadata,
+    clock_gt: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1954,12 +1960,26 @@ struct AdmissionDiagnostics {
     awaiting_local_cut: usize,
     awaiting_peer: usize,
     highest_barrier: u64,
+    awaiting_history_only: usize,
+    awaiting_clock_only: usize,
+    awaiting_both_proofs: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AppliedMemberIncarnation {
     boot_epoch: u64,
     alive: bool,
+    /// Distinguishes an authoritative membership event from the LSDB poll
+    /// that can observe the same epoch first. The later event still owns
+    /// incarnation-scoped cleanup and must not be deduplicated.
+    observation: MemberIncarnationObservation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemberIncarnationObservation {
+    RouteJoin,
+    RouteRestart,
+    MembershipEvent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2028,6 +2048,7 @@ impl StrictState {
                 phase: PeerAdmissionPhase::AwaitingLocalCut { barrier_ts },
             },
         );
+        metrics::record_strict_admission_event(StrictAdmissionEvent::Started);
     }
 
     /// Reconcile the admission table against exact-incarnation, reliably
@@ -2062,6 +2083,7 @@ impl StrictState {
                         AppliedMemberIncarnation {
                             boot_epoch,
                             alive: true,
+                            observation: MemberIncarnationObservation::RouteJoin,
                         },
                     );
                 }
@@ -2071,6 +2093,7 @@ impl StrictState {
                         AppliedMemberIncarnation {
                             boot_epoch,
                             alive: true,
+                            observation: MemberIncarnationObservation::RouteRestart,
                         },
                     );
                 }
@@ -2080,6 +2103,7 @@ impl StrictState {
                         AppliedMemberIncarnation {
                             boot_epoch,
                             alive: true,
+                            observation: MemberIncarnationObservation::RouteJoin,
                         },
                     );
                 }
@@ -2097,6 +2121,7 @@ impl StrictState {
         for node in revoked {
             self.peer_admissions.remove(&node);
             self.peer_clocks.remove(&node);
+            metrics::record_strict_admission_event(StrictAdmissionEvent::Revoked);
         }
         for (node, boot_epoch) in routed_current {
             self.begin_peer_admission(node, boot_epoch);
@@ -2140,6 +2165,7 @@ impl StrictState {
                     history_ready: false,
                     clock_ready,
                 };
+                metrics::record_strict_admission_event(StrictAdmissionEvent::CutFrozen);
             }
         }
     }
@@ -2189,6 +2215,12 @@ impl StrictState {
                 clock_ready,
             }
         };
+        if history_ready {
+            metrics::record_strict_admission_event(StrictAdmissionEvent::HistoryProofAccepted);
+        }
+        if history_ready && clock_ready {
+            metrics::record_strict_admission_event(StrictAdmissionEvent::Admitted);
+        }
         remote_is_fresher
     }
 
@@ -2231,6 +2263,14 @@ impl StrictState {
                 clock_ready,
             }
         };
+        if src_clock > clock_gt {
+            metrics::record_strict_admission_event(StrictAdmissionEvent::ClockProofAccepted);
+        } else {
+            metrics::record_strict_admission_event(StrictAdmissionEvent::ClockProofBelowBarrier);
+        }
+        if history_ready && clock_ready {
+            metrics::record_strict_admission_event(StrictAdmissionEvent::Admitted);
+        }
     }
 
     fn peer_incarnation_is_admitted(
@@ -2302,10 +2342,21 @@ impl StrictState {
                     diagnostics.awaiting_local_cut += 1;
                     diagnostics.highest_barrier = diagnostics.highest_barrier.max(barrier_ts);
                 }
-                PeerAdmissionPhase::AwaitingPeer { clock_gt, .. } => {
+                PeerAdmissionPhase::AwaitingPeer {
+                    clock_gt,
+                    history_ready,
+                    clock_ready,
+                    ..
+                } => {
                     diagnostics.pending += 1;
                     diagnostics.awaiting_peer += 1;
                     diagnostics.highest_barrier = diagnostics.highest_barrier.max(clock_gt);
+                    match (history_ready, clock_ready) {
+                        (false, true) => diagnostics.awaiting_history_only += 1,
+                        (true, false) => diagnostics.awaiting_clock_only += 1,
+                        (false, false) => diagnostics.awaiting_both_proofs += 1,
+                        (true, true) => {}
+                    }
                 }
             }
         }
@@ -2365,15 +2416,31 @@ impl StrictState {
             }
             (MembershipTransition::Removed, _) => MembershipTransition::Removed,
             (MembershipTransition::Restarted, Some(previous))
+                if boot_epoch == previous.boot_epoch
+                    && previous.alive
+                    && previous.observation != MemberIncarnationObservation::MembershipEvent =>
+            {
+                MembershipTransition::Restarted
+            }
+            (MembershipTransition::Restarted, Some(previous))
                 if boot_epoch <= previous.boot_epoch =>
             {
                 MembershipTransition::Ignored
             }
             (MembershipTransition::Restarted, _) => MembershipTransition::Restarted,
             (MembershipTransition::Joined, Some(previous))
-                if boot_epoch == previous.boot_epoch && previous.alive =>
+                if boot_epoch == previous.boot_epoch
+                    && previous.alive
+                    && previous.observation == MemberIncarnationObservation::MembershipEvent =>
             {
                 MembershipTransition::Ignored
+            }
+            (MembershipTransition::Joined, Some(previous))
+                if boot_epoch == previous.boot_epoch
+                    && previous.alive
+                    && previous.observation == MemberIncarnationObservation::RouteRestart =>
+            {
+                MembershipTransition::Restarted
             }
             (MembershipTransition::Joined, Some(previous)) if boot_epoch > previous.boot_epoch => {
                 // A Joined event can be the first observation of a restarted
@@ -2390,6 +2457,7 @@ impl StrictState {
                 AppliedMemberIncarnation {
                     boot_epoch,
                     alive: transition != MembershipTransition::Removed,
+                    observation: MemberIncarnationObservation::MembershipEvent,
                 },
             );
         }
@@ -2720,6 +2788,9 @@ impl StrictState {
         ) {
             return;
         }
+        if self.history_election_blocks_steady_state() {
+            metrics::record_strict_history_election_event(StrictHistoryElectionEvent::Rearmed);
+        }
         self.history_election_requested = true;
         self.history_election_phase = HistoryElectionPhase::Idle;
         // The repository cut is unstable until this election completes.
@@ -2746,6 +2817,7 @@ impl StrictState {
             best_remote_rank: None,
             started_at: Instant::now(),
         };
+        metrics::record_strict_history_election_event(StrictHistoryElectionEvent::Started);
     }
 
     pub fn history_election_timed_out(
@@ -2952,7 +3024,12 @@ impl StrictState {
                 best_remote_rank,
                 ..
             } if pending_peers.is_empty() => *best_remote_rank,
-            HistoryElectionPhase::Probing { .. } => return HistoryProbeResponseOutcome::Pending,
+            HistoryElectionPhase::Probing { .. } => {
+                metrics::record_strict_history_election_event(
+                    StrictHistoryElectionEvent::ResponsePending,
+                );
+                return HistoryProbeResponseOutcome::Pending;
+            }
             _ => return HistoryProbeResponseOutcome::Ignored,
         }) else {
             if self.repository_base_required() {
@@ -2960,6 +3037,7 @@ impl StrictState {
                 self.history_election_requested = true;
                 return HistoryProbeResponseOutcome::Pending;
             }
+            metrics::record_strict_history_election_event(StrictHistoryElectionEvent::LocalWon);
             self.finish_history_election();
             return HistoryProbeResponseOutcome::Finished;
         };
@@ -2970,6 +3048,7 @@ impl StrictState {
             expected_rank: request.expected_rank(),
             started_at: Instant::now(),
         };
+        metrics::record_strict_history_election_event(StrictHistoryElectionEvent::RemoteWon);
         HistoryProbeResponseOutcome::FetchSnapshot(request)
     }
 
@@ -3025,6 +3104,9 @@ impl StrictState {
             && !snapshot_msgpack.is_empty()
         {
             self.history_election_phase = HistoryElectionPhase::Installing;
+            metrics::record_strict_history_election_event(
+                StrictHistoryElectionEvent::SnapshotStarted,
+            );
             return HistorySnapshotResponseOutcome::Install(HistoryElectionCandidate {
                 rank: remote_rank,
                 snapshot_version,
@@ -3037,6 +3119,7 @@ impl StrictState {
     }
 
     pub fn finish_history_election(&mut self) {
+        let was_active = self.history_election_blocks_steady_state();
         self.history_election_requested = false;
         self.history_election_phase = HistoryElectionPhase::Idle;
         // A completed election may have replaced the repository without a
@@ -3051,6 +3134,9 @@ impl StrictState {
             if let Some(admission) = self.peer_admissions.get_mut(&node) {
                 admission.phase = PeerAdmissionPhase::AwaitingLocalCut { barrier_ts };
             }
+        }
+        if was_active {
+            metrics::record_strict_history_election_event(StrictHistoryElectionEvent::Finished);
         }
     }
 
@@ -3451,6 +3537,10 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// advertised the same head. Overlay ACKs are intentionally insufficient:
     /// they precede strict handler delivery and durable repository apply.
     head_evidence: Mutex<Option<LocalHeadEvidence>>,
+    /// Last mismatching remote identity logged for each node. Epoch and
+    /// identity are values rather than map keys so restarts cannot grow this
+    /// diagnostic cache without bound.
+    head_mismatch_observations: Mutex<HashMap<NodeIdentifier, (u64, HeadEvidenceIdentity)>>,
     terminal_catchup_snapshots: Mutex<HashMap<NodeIdentifier, TerminalCatchupSnapshot>>,
     /// Latest complete terminal fence cut learned from each v2 source. A
     /// restart deliberately loses this cache, causing the next catchup to
@@ -3873,6 +3963,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             v3_retries: Mutex::new(V3RetryState::default()),
             v3_history: Mutex::new(HistoryV3State::default()),
             head_evidence: Mutex::new(Some(initial_head_evidence)),
+            head_mismatch_observations: Mutex::new(HashMap::new()),
             terminal_catchup_snapshots: Mutex::new(HashMap::new()),
             terminal_catchup_generations: Mutex::new(HashMap::new()),
             snapshot_transfers: Mutex::new(HashMap::new()),
@@ -3951,6 +4042,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             diagnostics.awaiting_peer,
             diagnostics.highest_barrier,
         );
+        self.admission_metrics.update_proof_waits(
+            diagnostics.awaiting_history_only,
+            diagnostics.awaiting_clock_only,
+            diagnostics.awaiting_both_proofs,
+        );
         admitted
     }
 
@@ -4002,17 +4098,21 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 // unelected foreign checkpoint into a doomed admission
                 // session.
                 let PeerAdmissionPhase::AwaitingPeer {
+                    required_history,
+                    clock_gt,
                     history_ready,
                     clock_ready,
-                    ..
                 } = admission.phase
                 else {
                     return None;
                 };
                 Some(PendingAdmissionProbe {
                     peer: *node,
+                    boot_epoch: admission.boot_epoch,
                     needs_history: !history_ready,
                     needs_clock: !clock_ready,
+                    required_history,
+                    clock_gt,
                 })
             })
             .collect()
@@ -4345,7 +4445,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     pub(super) fn v3_clock_probe_requester_clock(&self) -> u64 {
-        self.state.lock().clock
+        replication_protocol::clock_probe_requester_clock(
+            self.net.strict_replication_protocol_version(),
+            self.net.local_strict_replication_protocol_version(),
+            self.state.lock().clock,
+        )
     }
 
     pub(super) fn advance_v3_clock_probe(
@@ -4355,6 +4459,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         requester_clock: u64,
     ) -> u64 {
         let _ = self.reconcile_peer_admissions();
+        let requester_clock = replication_protocol::clock_probe_requester_clock(
+            self.net.strict_replication_protocol_version(),
+            self.net.peer_strict_replication_protocol_version(from),
+            requester_clock,
+        );
         let (clock, diagnostics) = {
             let mut state = self.state.lock();
             state.observe_peer(from, requester_clock);
@@ -4524,7 +4633,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 local_rank,
                 pending_source_authorized,
             );
-        match outcome {
+        let (selected, outcome_label, selected_peer) = match outcome {
             HistoryProbeResponseOutcome::FetchSnapshot(request) => {
                 let selected = self
                     .net
@@ -4542,14 +4651,43 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     // response that happened to complete the election.
                     self.state.lock().request_history_election();
                 }
-                selected
+                let selected_peer = selected
+                    .as_ref()
+                    .map(|candidate| (candidate.peer().node(), candidate.peer().boot_epoch()));
+                let outcome_label = if selected.is_some() {
+                    "remote_selected"
+                } else {
+                    "selected_missing"
+                };
+                (selected, outcome_label, selected_peer)
             }
             HistoryProbeResponseOutcome::Finished => {
                 self.wake_delivery_and_clock_tick();
-                None
+                (None, "local_finished", None)
             }
-            HistoryProbeResponseOutcome::Ignored | HistoryProbeResponseOutcome::Pending => None,
-        }
+            HistoryProbeResponseOutcome::Ignored => (None, "ignored", None),
+            HistoryProbeResponseOutcome::Pending => (None, "pending", None),
+        };
+        debug!(
+            topic = %self.topic,
+            peer = peer.node(),
+            peer_boot_epoch = peer.boot_epoch(),
+            local_repository_version = local_rank.version,
+            local_history_freshness = local_rank.freshness,
+            local_runtime_started_at = local_rank.runtime_started_at,
+            remote_repository_version = remote_rank.version,
+            remote_history_freshness = remote_rank.freshness,
+            remote_runtime_started_at = remote_rank.runtime_started_at,
+            remote_terminal_repository_base_version = remote_rank.terminal_repository_base_version,
+            remote_terminal_journal_id = ?source_cut.journal_id(),
+            remote_terminal_generation = source_cut.generation(),
+            remote_terminal_set_digest = ?source_cut.terminal_set_digest(),
+            pending_source_authorized,
+            outcome = outcome_label,
+            selected_peer = ?selected_peer,
+            "strict history election rank decision"
+        );
+        selected
     }
 
     /// Admit metadata only after the source's fixed terminal cut has been
@@ -9590,17 +9728,28 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             history_freshness: history_metadata.freshness,
             terminal_set_digest: *terminal_cut.terminal_set_digest(),
         };
-        let mut evidence = self.head_evidence.lock();
-        if evidence
-            .as_ref()
-            .is_some_and(|current| current.identity == identity)
         {
-            return;
+            let mut evidence = self.head_evidence.lock();
+            if evidence
+                .as_ref()
+                .is_some_and(|current| current.identity == identity)
+            {
+                return;
+            }
+            *evidence = Some(LocalHeadEvidence {
+                identity,
+                acknowledged_by: HashSet::new(),
+            });
         }
-        *evidence = Some(LocalHeadEvidence {
-            identity,
-            acknowledged_by: HashSet::new(),
-        });
+        self.head_mismatch_observations.lock().clear();
+        metrics::record_strict_head_event(StrictHeadEvent::EvidenceChanged);
+        debug!(
+            topic = %self.topic,
+            repository_version = identity.repository_version,
+            history_freshness = identity.history_freshness,
+            terminal_set_digest = ?identity.terminal_set_digest,
+            "strict local head evidence changed"
+        );
     }
 
     fn prepare_head_ack(
@@ -9623,14 +9772,51 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             history_freshness: tick.history_freshness,
             terminal_set_digest: *remote_cut.terminal_set_digest(),
         };
-        if !self
+        let local_identity = self
             .head_evidence
             .lock()
             .as_ref()
-            .is_some_and(|current| current.identity == remote_identity)
-        {
+            .map(|current| current.identity);
+        if local_identity != Some(remote_identity) {
+            if local_identity
+                .is_none_or(|local| local.repository_version != remote_identity.repository_version)
+            {
+                metrics::record_strict_head_event(
+                    StrictHeadEvent::EvidenceRepositoryVersionMismatch,
+                );
+            }
+            if local_identity
+                .is_none_or(|local| local.history_freshness != remote_identity.history_freshness)
+            {
+                metrics::record_strict_head_event(StrictHeadEvent::EvidenceFreshnessMismatch);
+            }
+            if local_identity.is_none_or(|local| {
+                local.terminal_set_digest != remote_identity.terminal_set_digest
+            }) {
+                metrics::record_strict_head_event(StrictHeadEvent::EvidenceTerminalDigestMismatch);
+            }
+            let changed = self
+                .head_mismatch_observations
+                .lock()
+                .insert(from, (origin_boot_epoch, remote_identity))
+                != Some((origin_boot_epoch, remote_identity));
+            if changed {
+                debug!(
+                    topic = %self.topic,
+                    peer = from,
+                    peer_boot_epoch = origin_boot_epoch,
+                    local_repository_version = ?local_identity.map(|local| local.repository_version),
+                    local_history_freshness = ?local_identity.map(|local| local.history_freshness),
+                    local_terminal_set_digest = ?local_identity.map(|local| local.terminal_set_digest),
+                    remote_repository_version = remote_identity.repository_version,
+                    remote_history_freshness = remote_identity.history_freshness,
+                    remote_terminal_set_digest = ?remote_identity.terminal_set_digest,
+                    "strict head evidence mismatch"
+                );
+            }
             return None;
         }
+        self.head_mismatch_observations.lock().remove(&from);
         Some(StrictHeadAck {
             src_node: self.self_id as u32,
             src_boot_epoch: self.boot_epoch,
@@ -9651,10 +9837,31 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             || self.net.member_boot_epoch(from) != Some(origin_boot_epoch)
         {
             metrics::record_strict_fence_rejection();
+            metrics::record_strict_head_event(StrictHeadEvent::AckRejectedEnvelope);
+            debug!(
+                topic = %self.topic,
+                peer = from,
+                peer_boot_epoch = origin_boot_epoch,
+                ack_src_node = ack.src_node,
+                ack_src_boot_epoch = ack.src_boot_epoch,
+                ack_target_node = ack.expected_target_node,
+                ack_target_boot_epoch = ack.expected_target_boot_epoch,
+                rejection = "envelope",
+                "strict head acknowledgement rejected"
+            );
             return;
         }
         let Ok(terminal_set_digest) = ack.terminal_set_digest.as_ref().try_into() else {
             metrics::record_strict_fence_rejection();
+            metrics::record_strict_head_event(StrictHeadEvent::AckRejectedDigest);
+            debug!(
+                topic = %self.topic,
+                peer = from,
+                peer_boot_epoch = origin_boot_epoch,
+                digest_bytes = ack.terminal_set_digest.len(),
+                rejection = "digest_length",
+                "strict head acknowledgement rejected"
+            );
             return;
         };
         let identity = HeadEvidenceIdentity {
@@ -9662,15 +9869,36 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             history_freshness: ack.history_freshness,
             terminal_set_digest,
         };
-        let inserted = {
+        let (identity_matches, inserted) = {
             let mut evidence = self.head_evidence.lock();
-            evidence.as_mut().is_some_and(|current| {
-                current.identity == identity
-                    && current
+            let identity_matches = evidence
+                .as_ref()
+                .is_some_and(|current| current.identity == identity);
+            let inserted = identity_matches
+                && evidence.as_mut().is_some_and(|current| {
+                    current
                         .acknowledged_by
                         .insert(PeerIncarnation::new(from, origin_boot_epoch))
-            })
+                });
+            (identity_matches, inserted)
         };
+        if !identity_matches {
+            metrics::record_strict_head_event(StrictHeadEvent::AckRejectedIdentity);
+            debug!(
+                topic = %self.topic,
+                peer = from,
+                peer_boot_epoch = origin_boot_epoch,
+                repository_version = identity.repository_version,
+                history_freshness = identity.history_freshness,
+                terminal_set_digest = ?identity.terminal_set_digest,
+                rejection = "identity",
+                "strict head acknowledgement rejected"
+            );
+            return;
+        }
+        if inserted {
+            metrics::record_strict_head_event(StrictHeadEvent::AckAccepted);
+        }
         if inserted && let Some(runtime) = self.weak_self.lock().as_ref().and_then(Weak::upgrade) {
             tokio::spawn(async move {
                 runtime.maybe_checkpoint_terminal_journal().await;
@@ -11756,10 +11984,26 @@ impl<R: StrictReplicable> StrictRuntime<R> {
 
     fn clock_tick_needed(&self) -> bool {
         let alive = self.reconcile_peer_admissions();
-        if clock_tick_needed_for_state(&self.state.lock(), self.self_id, &alive) {
-            return true;
-        }
-        !self.unacknowledged_head_peers().is_empty()
+        let (commit_buffer, proposal, missing_peer_clocks) = {
+            let state = self.state.lock();
+            (
+                !state.commit_buffer.is_empty(),
+                state.earliest_uncommitted_proposal_ts().is_some(),
+                alive
+                    .iter()
+                    .filter(|node| **node != self.self_id)
+                    .filter(|node| !state.peer_clocks.contains_key(node))
+                    .count(),
+            )
+        };
+        let unacknowledged_head_peers = self.unacknowledged_head_peers().len();
+        self.admission_metrics.update_clock_demand(
+            commit_buffer,
+            proposal,
+            missing_peer_clocks,
+            unacknowledged_head_peers,
+        );
+        commit_buffer || proposal || missing_peer_clocks > 0 || unacknowledged_head_peers > 0
     }
 
     fn unacknowledged_head_peers(&self) -> Vec<NodeIdentifier> {
@@ -11845,6 +12089,7 @@ fn log_accepted_proposal(topic: &str, op_id: OpId, accepted: &AcceptedProposal) 
     }
 }
 
+#[cfg(test)]
 fn clock_tick_needed_for_state(
     state: &StrictState,
     self_id: NodeIdentifier,
@@ -11863,6 +12108,7 @@ async fn emit_clock_tick<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     if !rt.can_originate_v2() {
         return;
     }
+    metrics::record_strict_head_event(StrictHeadEvent::TickAttempted);
     let clock = {
         let mut s = rt.state.lock();
         advance_clock_for_tick(&mut s, rt.self_id)
@@ -11965,6 +12211,13 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
                     interval.saturating_mul(5),
                     rt.cfg.pending_propose_ttl(),
                 ) {
+                    metrics::record_strict_history_election_event(
+                        StrictHistoryElectionEvent::TimedOut,
+                    );
+                    debug!(
+                        topic = %rt.topic,
+                        "strict history election timed out"
+                    );
                     // A probe may be accepted by the transport while its
                     // response is lost on a transient route. Re-arming the
                     // request in the same loop would keep every node in an
@@ -12018,7 +12271,9 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
     // solely from the elected candidate.
     super::catchup::resume_deferred_v3_admissions(rt).await;
     let probes = rt.pending_admission_probes();
-    let local_version = rt.repo.current_version();
+    let local_history = rt.repo.history_metadata();
+    let local_version = local_history.version;
+    let local_clock = rt.state.lock().clock;
     for probe in probes {
         let dst = probe.peer;
         if rt.net.peer_strict_replication_protocol_version(dst) < STRICT_PROTOCOL_VERSION_V2
@@ -12030,6 +12285,21 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
             if !rt.admission_probe_due(dst) {
                 continue;
             }
+            debug!(
+                topic = %rt.topic,
+                peer = dst,
+                peer_boot_epoch = probe.boot_epoch,
+                required_repository_version = probe.required_history.version,
+                required_history_freshness = probe.required_history.freshness,
+                local_repository_version = local_history.version,
+                local_history_freshness = local_history.freshness,
+                local_clock,
+                clock_gt = probe.clock_gt,
+                needs_history = probe.needs_history,
+                needs_clock = probe.needs_clock,
+                protocol = "v3",
+                "strict admission proof retry"
+            );
             // Admission metadata is bounded and nonce-coalesced. It may
             // coexist with a terminal responder; suppressing the missing
             // proof behind responder lifetime can strand admission.
@@ -12061,6 +12331,21 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
         if !rt.admission_probe_due(dst) {
             continue;
         }
+        debug!(
+            topic = %rt.topic,
+            peer = dst,
+            peer_boot_epoch = probe.boot_epoch,
+            required_repository_version = probe.required_history.version,
+            required_history_freshness = probe.required_history.freshness,
+            local_repository_version = local_history.version,
+            local_history_freshness = local_history.freshness,
+            local_clock,
+            clock_gt = probe.clock_gt,
+            needs_history = probe.needs_history,
+            needs_clock = probe.needs_clock,
+            protocol = "v2",
+            "strict admission proof retry"
+        );
         let req = StrictCatchupReq {
             src_node: rt.self_id as u32,
             // Besides asking for the peer's metadata, advertise the local
@@ -14211,14 +14496,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_clock_probe_round_trip_crosses_an_asymmetric_admission_barrier() {
+    async fn one_v6_clock_probe_round_trip_crosses_an_asymmetric_admission_barrier() {
         let requester_net = MockNet::new(1, vec![1, 2]);
         requester_net.set_epoch(1, 11);
         requester_net.set_epoch(2, 22);
-        requester_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        requester_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V6);
         requester_net
-            .set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        requester_net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+            .set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V6));
+        requester_net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V6);
         let requester = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -14269,10 +14554,10 @@ mod tests {
         let responder_net = MockNet::new(2, vec![1, 2]);
         responder_net.set_epoch(1, 11);
         responder_net.set_epoch(2, 22);
-        responder_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        responder_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V6);
         responder_net
-            .set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        responder_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V3);
+            .set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V6));
+        responder_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V6);
         let responder = StrictRuntime::new(
             CountingStrictRepo::new(),
             2,
@@ -14337,6 +14622,45 @@ mod tests {
         assert!(
             requester_net.drain_captures().is_empty(),
             "an admitted incarnation must not retain periodic admission traffic"
+        );
+    }
+
+    #[test]
+    fn clock_probe_requester_clock_waits_for_the_v6_cluster_floor() {
+        const REQUESTER_CLOCK: u64 = 10_000;
+
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 11);
+        net.set_epoch(2, 22);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V6));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V6);
+        let runtime = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            11,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        runtime.state.lock().clock = REQUESTER_CLOCK;
+
+        assert_eq!(runtime.v3_clock_probe_requester_clock(), 0);
+        runtime.state.lock().clock = 0;
+        assert_eq!(
+            runtime.advance_v3_clock_probe(2, 22, REQUESTER_CLOCK),
+            1,
+            "a v5 cluster must ignore an injected requester clock",
+        );
+
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V6);
+        runtime.state.lock().clock = REQUESTER_CLOCK;
+        assert_eq!(runtime.v3_clock_probe_requester_clock(), REQUESTER_CLOCK,);
+        runtime.state.lock().clock = 0;
+        assert_eq!(
+            runtime.advance_v3_clock_probe(2, 22, REQUESTER_CLOCK),
+            REQUESTER_CLOCK + 1,
         );
     }
 
@@ -19220,8 +19544,8 @@ mod tests {
         assert!(!rt.clock_tick_needed());
     }
 
-    #[test]
-    fn route_observed_epoch_before_restart_event_still_clears_old_incarnation_catchup() {
+    #[tokio::test]
+    async fn route_observed_epoch_before_restart_event_still_clears_old_incarnation_catchup() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
         rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
         let old_peer = PeerIncarnation::new(2, 1);

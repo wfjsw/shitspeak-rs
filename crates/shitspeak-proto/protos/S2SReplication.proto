@@ -196,8 +196,9 @@ message StrictClockProbeReq {
   uint64 expected_responder_boot_epoch = 2;
   uint64 request_nonce                 = 3;
   StrictCatchupReason reason            = 4;
-  // Requester's current Tempo clock. Older senders decode as zero and older
-  // responders ignore this additive field, preserving rolling compatibility.
+  // Requester's current Tempo clock. This additive field is encoded only
+  // after the strict participant floor reaches v6; rolling v5/v6 clusters
+  // retain zero-clock probe semantics until the coordinated upgrade finishes.
   uint64 requester_clock               = 5;
 }
 

@@ -23,8 +23,27 @@ pub(crate) const STRICT_PROTOCOL_VERSION_V3: u32 = 3;
 pub(crate) const STRICT_PROTOCOL_VERSION_V4: u32 = 4;
 /// Replication-owned delivery checkpoints and bounded terminal-journal epochs.
 pub(crate) const STRICT_PROTOCOL_VERSION_V5: u32 = 5;
+/// Requester-clock propagation in pairwise clock probes.
+pub(crate) const STRICT_PROTOCOL_VERSION_V6: u32 = 6;
 /// Maximum strict participant capability advertised by this binary.
-pub(crate) const STRICT_PROTOCOL_VERSION_CURRENT: u32 = STRICT_PROTOCOL_VERSION_V5;
+pub(crate) const STRICT_PROTOCOL_VERSION_CURRENT: u32 = STRICT_PROTOCOL_VERSION_V6;
+
+/// Gate requester-clock semantics on the cumulative cluster floor and the
+/// requester's own advertisement. During a rolling v5/v6 upgrade every probe
+/// retains the legacy zero-clock behavior until all participants advertise v6.
+pub(crate) fn clock_probe_requester_clock(
+    negotiated_version: u32,
+    requester_version: u32,
+    requester_clock: u64,
+) -> u64 {
+    if negotiated_version >= STRICT_PROTOCOL_VERSION_V6
+        && requester_version >= STRICT_PROTOCOL_VERSION_V6
+    {
+        requester_clock
+    } else {
+        0
+    }
+}
 
 /// Replication service participation advertised by one upper-layer endpoint.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -336,7 +355,40 @@ mod tests {
         assert_eq!(STRICT_PROTOCOL_VERSION_V3, 3);
         assert_eq!(STRICT_PROTOCOL_VERSION_V4, 4);
         assert_eq!(STRICT_PROTOCOL_VERSION_V5, 5);
-        assert_eq!(STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V5);
+        assert_eq!(STRICT_PROTOCOL_VERSION_V6, 6);
+        assert_eq!(STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V6);
+    }
+
+    #[test]
+    fn requester_clock_semantics_require_a_new_protocol_version() {
+        const CLOCK: u64 = 3_722_765;
+
+        assert_eq!(
+            clock_probe_requester_clock(
+                STRICT_PROTOCOL_VERSION_V5,
+                STRICT_PROTOCOL_VERSION_V6,
+                CLOCK,
+            ),
+            0,
+            "a mixed cluster must retain legacy probe semantics",
+        );
+        assert_eq!(
+            clock_probe_requester_clock(
+                STRICT_PROTOCOL_VERSION_V6,
+                STRICT_PROTOCOL_VERSION_V5,
+                CLOCK,
+            ),
+            0,
+            "an old requester cannot opt into v6 semantics",
+        );
+        assert_eq!(
+            clock_probe_requester_clock(
+                STRICT_PROTOCOL_VERSION_V6,
+                STRICT_PROTOCOL_VERSION_V6,
+                CLOCK,
+            ),
+            CLOCK,
+        );
     }
 
     #[test]
