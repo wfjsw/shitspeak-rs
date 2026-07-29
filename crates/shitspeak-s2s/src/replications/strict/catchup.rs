@@ -7301,6 +7301,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn equal_version_higher_freshness_election_requests_repository_snapshot() {
+        let source_net = MockNet::new(1, vec![1, 2]);
+        let sink_net = MockNet::new(2, vec![1, 2]);
+        configure_v5_peer(&source_net, 1, 2);
+        configure_v5_peer(&sink_net, 2, 1);
+        let source_repo = Arc::new(SnapshotFreshnessRepo {
+            version: 1,
+            captured_freshness: 20,
+            advertised_freshness: AtomicI64::new(20),
+        });
+        let sink_repo = Arc::new(SnapshotFreshnessRepo {
+            version: 1,
+            captured_freshness: 10,
+            advertised_freshness: AtomicI64::new(10),
+        });
+        let source = StrictRuntime::new(
+            source_repo.clone(),
+            1,
+            1,
+            "channels".to_owned(),
+            source_net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let sink = StrictRuntime::new(
+            sink_repo.clone(),
+            2,
+            1,
+            "channels".to_owned(),
+            sink_net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+
+        let source_metadata = source_repo.history_metadata();
+        let sink_metadata = sink_repo.history_metadata();
+        assert_eq!(source_metadata.version, sink_metadata.version);
+        assert!(source_metadata.freshness > sink_metadata.freshness);
+        assert_eq!(
+            source
+                .terminal_journal
+                .lock()
+                .await
+                .terminal_cut()
+                .terminal_set_digest(),
+            sink.terminal_journal
+                .lock()
+                .await
+                .terminal_cut()
+                .terminal_set_digest(),
+            "the repository freshness difference must be the only elected divergence"
+        );
+
+        {
+            let mut state = sink.state.lock();
+            state.request_history_election();
+            state.begin_history_election([source.self_id]);
+        }
+        super::request_v3_history_probe(
+            &sink,
+            source.self_id,
+            super::StrictCatchupReason::HistoryElection,
+        )
+        .await;
+        let request = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::HistoryProbeReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("history election request");
+        super::recv_v3_history_probe_req(&source, sink.self_id, 1, request).await;
+        let response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::HistoryProbeResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("history election response");
+
+        super::recv_v3_history_probe_resp(&sink, source.self_id, 1, response).await;
+
+        assert!(
+            sink_net.drain_captures().into_iter().any(|frame| matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::CatchupReq(ref request),
+                    ..
+                } if request.force_snapshot
+            )),
+            "an elected same-version fresher repository must replace the stale local image"
+        );
+    }
+
+    #[tokio::test]
     async fn equal_head_generation_zero_checkpoint_forces_v5_snapshot_then_stays_quiet() {
         let (source, source_net, source_repo) = test_runtime(1, ReplicationConfig::default());
         let (sink, sink_net, sink_repo) = test_runtime(2, ReplicationConfig::default());

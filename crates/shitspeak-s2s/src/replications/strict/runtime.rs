@@ -19220,6 +19220,31 @@ mod tests {
         assert!(!rt.clock_tick_needed());
     }
 
+    #[test]
+    fn route_observed_epoch_before_restart_event_still_clears_old_incarnation_catchup() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+        let old_peer = PeerIncarnation::new(2, 1);
+        let old_nonce = rt
+            .v3_sync
+            .lock()
+            .record_clock_nonce(old_peer, rt.cfg.pending_propose_ttl())
+            .expect("old incarnation clock probe");
+
+        // Reproduce the ordering seen during a restart: the LSDB route poll
+        // publishes the replacement epoch before the membership event fanout.
+        net.set_epoch(2, 2);
+        let _ = rt.reconcile_peer_admissions();
+        assert_eq!(rt.state.lock().member_incarnations[&2].boot_epoch, 2);
+
+        rt.on_membership_change(&MembershipEvent::Restarted(MemberIncarnation::new(2, 2)));
+
+        assert!(
+            !rt.v3_sync.lock().accept_clock_nonce(old_peer, old_nonce),
+            "the restart event must discard catchup state retained for the replaced incarnation"
+        );
+    }
+
     #[tokio::test]
     async fn joined_peer_wakes_head_evidence_after_poll_observed_expansion_first() {
         use crate::overlay::MemberIncarnation;
