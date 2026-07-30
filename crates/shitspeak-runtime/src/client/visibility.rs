@@ -1219,7 +1219,21 @@ pub async fn visibility_config_reload_messages(
             .copied()
             .collect::<Vec<_>>();
         removed_sessions.sort_by_key(|session| u32::from(*session));
-        messages.extend(removed_sessions.into_iter().map(hidden_user_remove));
+        for session in removed_sessions {
+            if let Some(known) = visibility.get(session)
+                && !known.listener_channels.is_empty()
+            {
+                messages.push(
+                    UserState {
+                        session: Some(session),
+                        listening_channel_remove: sorted_channels(&known.listener_channels),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
+            messages.push(hidden_user_remove(session));
+        }
     }
 
     messages.extend(link_updates_before_removals);
@@ -1334,35 +1348,49 @@ async fn project_message_at_home(
                 .await
             } else {
                 let mut projected = user_state;
-                let target = if viewer.is_superuser()
-                    || session == viewer.get_session_id()
-                    || projected.hash.is_none()
-                {
-                    None
-                } else {
-                    let server_id = viewer.server_id();
-                    server
-                        .get_clients()
-                        .get_client_in_server(&server_id, session)
-                        .await
-                };
+                let server_id = viewer.server_id();
+                let target = server
+                    .get_clients()
+                    .get_client_in_server(&server_id, session)
+                    .await;
+                if let Some(target) = &target {
+                    let old_listeners = visibility
+                        .get(session)
+                        .map(|known| known.listener_channels.clone())
+                        .unwrap_or_default();
+                    let new_listeners = target.get_listening_channel_ids();
+                    visibility.insert(
+                        session,
+                        target.get_current_channel_id(),
+                        new_listeners.clone(),
+                    );
+                    projected.listening_channel_add =
+                        sorted_difference(&new_listeners, &old_listeners);
+                    projected.listening_channel_remove =
+                        sorted_difference(&old_listeners, &new_listeners);
+                }
                 project_user_state_fields_for_viewer(
                     server,
                     viewer,
                     target.as_deref().map(Box::as_ref),
                     &mut projected,
                 );
-                vec![projected.into()]
+                if user_state_delta_empty(&projected) {
+                    Vec::new()
+                } else {
+                    vec![projected.into()]
+                }
             }
         }
         Message::UserRemove(user_remove) => {
-            if !user_filtering_enabled {
-                return vec![message.clone()];
-            }
             let session = ClientSessionIdentifier::from(user_remove.session);
-            if !visibility.remove(session) {
-                return Vec::new();
-            }
+            let Some(listener_channels) = take_known_listener_channels(visibility, session) else {
+                return if user_filtering_enabled {
+                    Vec::new()
+                } else {
+                    vec![message.clone()]
+                };
+            };
             let mut projected = UserRemove::from(user_remove.clone());
             projected.actor = visible_actor_with_home(
                 server,
@@ -1372,7 +1400,19 @@ async fn project_message_at_home(
             )
             .await
             .map(u32::from);
-            vec![projected.into()]
+            let mut messages = Vec::with_capacity(2);
+            if !listener_channels.is_empty() {
+                messages.push(
+                    UserState {
+                        session: Some(session),
+                        listening_channel_remove: sorted_channels(&listener_channels),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
+            messages.push(projected.into());
+            messages
         }
         _ => vec![message.clone()],
     }
@@ -1517,15 +1557,18 @@ async fn visibility_refresh_messages_with_home(
     acl_context: Option<&crate::channel_handler::ClientAclOperationContext>,
     channel_shadow: Option<&SessionChannelShadow>,
 ) -> Vec<Message> {
-    let hide_users_without_traverse = server.get_hide_users_without_traverse();
     let user_filtering_enabled = user_filtering_enabled(server, viewer);
     let was_filtering_users = visibility
         .registered_viewer_id(&viewer.server_id())
         .is_some();
     let transitioning_to_unfiltered = !user_filtering_enabled && was_filtering_users;
     let include_user_state_names = scope.include_user_state_names;
+    let has_listener_channel_removals = !scope.listener_channel_removals.is_empty();
     if scope.is_empty()
-        || (!user_filtering_enabled && !transitioning_to_unfiltered && !include_user_state_names)
+        || (!user_filtering_enabled
+            && !transitioning_to_unfiltered
+            && !include_user_state_names
+            && !has_listener_channel_removals)
     {
         return Vec::new();
     }
@@ -1579,25 +1622,23 @@ async fn visibility_refresh_messages_with_home(
     }
 
     let mut messages = Vec::new();
-    if hide_users_without_traverse {
-        for (session, channel_ids) in scope.listener_channel_removals {
-            if sessions.contains(&session) {
-                continue;
-            }
-            let session = ClientSessionIdentifier::from(session);
-            let removed = visibility.remove_visible_listener_channels(session, &channel_ids);
-            if removed.is_empty() {
-                continue;
-            }
-            messages.push(
-                UserState {
-                    session: Some(session),
-                    listening_channel_remove: removed,
-                    ..Default::default()
-                }
-                .into(),
-            );
+    for (session, channel_ids) in scope.listener_channel_removals {
+        if sessions.contains(&session) {
+            continue;
         }
+        let session = ClientSessionIdentifier::from(session);
+        let removed = visibility.remove_visible_listener_channels(session, &channel_ids);
+        if removed.is_empty() {
+            continue;
+        }
+        messages.push(
+            UserState {
+                session: Some(session),
+                listening_channel_remove: removed,
+                ..Default::default()
+            }
+            .into(),
+        );
     }
 
     let mut sessions = sessions.into_iter().collect::<Vec<_>>();
@@ -1643,8 +1684,8 @@ async fn visibility_refresh_messages_with_home(
                     }
                 }
             }
-            _ if user_filtering_enabled && visibility.remove(session) => {
-                messages.push(hidden_user_remove(session));
+            _ if user_filtering_enabled => {
+                messages.extend(remove_hidden_user(visibility, session));
             }
             _ => {}
         }
@@ -2074,20 +2115,14 @@ async fn project_user_state(
         .get_client_in_server(&server_id, session)
         .await
     else {
-        if visibility.remove(session) {
-            return vec![hidden_user_remove(session)];
-        }
-        return Vec::new();
+        return remove_hidden_user(visibility, session);
     };
 
     let visible =
         can_project_user_with_home(server, viewer, &target, effective_home_channel_id).await;
     let known_before = visibility.get(session).cloned();
     if !visible {
-        if visibility.remove(session) {
-            return vec![hidden_user_remove(session)];
-        }
-        return Vec::new();
+        return remove_hidden_user(visibility, session);
     }
 
     let current_channel = if session == viewer.get_session_id() {
@@ -2157,10 +2192,7 @@ async fn refresh_target_visibility(
     };
 
     if !visible {
-        if visibility.remove(session) {
-            return vec![hidden_user_remove(session)];
-        }
-        return Vec::new();
+        return remove_hidden_user(visibility, session);
     }
 
     let current_channel = if target.get_session_id() == viewer.get_session_id() {
@@ -2336,6 +2368,36 @@ fn hidden_user_remove(session: ClientSessionIdentifier) -> Message {
         ban: Some(false),
     }
     .into()
+}
+
+fn take_known_listener_channels(
+    visibility: &mut UserVisibilityState,
+    session: ClientSessionIdentifier,
+) -> Option<HashSet<u32>> {
+    let listener_channels = visibility.get(session)?.listener_channels.clone();
+    visibility.remove(session).then_some(listener_channels)
+}
+
+fn remove_hidden_user(
+    visibility: &mut UserVisibilityState,
+    session: ClientSessionIdentifier,
+) -> Vec<Message> {
+    let Some(listener_channels) = take_known_listener_channels(visibility, session) else {
+        return Vec::new();
+    };
+    let mut messages = Vec::with_capacity(2);
+    if !listener_channels.is_empty() {
+        messages.push(
+            UserState {
+                session: Some(session),
+                listening_channel_remove: sorted_channels(&listener_channels),
+                ..Default::default()
+            }
+            .into(),
+        );
+    }
+    messages.push(hidden_user_remove(session));
+    messages
 }
 
 fn sorted_channels(channels: &HashSet<u32>) -> Vec<u32> {

@@ -11,7 +11,7 @@ use crate::server::client_projection::ClientProjectionState;
 use crate::server::sharded_subscriber::{LagAction, ShardedSubscriber};
 use crate::types::DEFAULT_SERVER_ID;
 use shitspeak_messages::messages::Message;
-use shitspeak_messages::messages::encoder::{ChannelState, DenyType};
+use shitspeak_messages::messages::encoder::{ChannelState, DenyType, UserState};
 use shitspeak_state::{ACL, ACLPermissions};
 use shitspeak_state::{Channel, ChannelRootConfig};
 
@@ -601,6 +601,232 @@ async fn temp_channel_is_removed_after_last_user_disconnects() {
             .await
             .is_none(),
         "temporary channel should be gone from the repository"
+    );
+}
+
+#[tokio::test]
+async fn disconnect_removes_listeners_before_user() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let channels = server.server.get_channels();
+    channels
+        .create_channel(Channel::new(90, "First listener".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    channels
+        .create_channel(Channel::new(
+            91,
+            "Second listener".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(bob.session_id))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees bob before listener updates");
+    alice.drain_now().await;
+    bob.send(
+        UserState {
+            session: Some(bob.server_session),
+            listening_channel_add: vec![90, 91],
+            ..Default::default()
+        }
+        .into(),
+    )
+    .await;
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(bob.session_id)
+                        && state.listening_channel_add.len() == 2
+                        && state.listening_channel_add.contains(&90)
+                        && state.listening_channel_add.contains(&91))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees both of bob's listeners");
+    alice.drain_now().await;
+
+    let bob_session = bob.session_id;
+    drop(bob);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut listener_removals = Vec::new();
+    let mut sequence = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = alice.recv(remaining).await else {
+            break;
+        };
+        match message {
+            Message::UserState(mut state)
+                if state.session == Some(bob_session)
+                    && !state.listening_channel_remove.is_empty() =>
+            {
+                state.listening_channel_remove.sort_unstable();
+                listener_removals.push(state.listening_channel_remove);
+                sequence.push("listener-remove");
+            }
+            Message::UserRemove(remove) if remove.session == bob_session => {
+                sequence.push("user-remove");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(listener_removals, vec![vec![90, 91]]);
+    assert_eq!(sequence, vec!["listener-remove", "user-remove"]);
+    let duplicate = alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(bob_session)
+                        && (state.listening_channel_remove.contains(&90)
+                            || state.listening_channel_remove.contains(&91)))
+            },
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(duplicate.is_none(), "listener removal must be sent once");
+}
+
+#[tokio::test]
+async fn channel_delete_removes_listener_before_channel_once() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .server
+        .get_channels()
+        .create_channel(Channel::new(
+            92,
+            "Listened channel".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(bob.session_id))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees bob before listener updates");
+    alice.drain_now().await;
+    bob.send(
+        UserState {
+            session: Some(bob.server_session),
+            listening_channel_add: vec![92],
+            ..Default::default()
+        }
+        .into(),
+    )
+    .await;
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(bob.session_id)
+                        && state.listening_channel_add == vec![92])
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees bob's post-auth listener");
+    alice.drain_now().await;
+
+    alice.remove_channel(92).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut listener_removals = Vec::new();
+    let mut sequence = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = alice.recv(remaining).await else {
+            break;
+        };
+        match message {
+            Message::UserState(state)
+                if state.session == Some(bob.session_id)
+                    && !state.listening_channel_remove.is_empty() =>
+            {
+                listener_removals.push(state.listening_channel_remove);
+                sequence.push("listener-remove");
+            }
+            Message::ChannelRemove(remove) if remove.channel_id == 92 => {
+                sequence.push("channel-remove");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(listener_removals, vec![vec![92]]);
+    assert_eq!(sequence, vec!["listener-remove", "channel-remove"]);
+    let duplicate = alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(bob.session_id)
+                        && state.listening_channel_remove.contains(&92))
+            },
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        duplicate.is_none(),
+        "listener removal must not be duplicated"
+    );
+    let bob_state = server
+        .server
+        .get_clients()
+        .get_client_in_server(DEFAULT_SERVER_ID, bob.server_session)
+        .await
+        .expect("bob remains connected");
+    assert!(
+        !bob_state.get_listening_channel_ids().contains(&92),
+        "deleted channels must be removed from canonical listener state"
     );
 }
 

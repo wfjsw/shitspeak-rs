@@ -2721,6 +2721,20 @@ impl ChannelRepository {
             applied_delete.map(|applied_delete| applied_delete.deleted_ids),
         )
         .await?;
+        if deleted {
+            let valid_channel_ids = self
+                .ordered_snapshot_in_server(server_id)
+                .iter()
+                .map(|channel| channel.id)
+                .collect();
+            let channel_version = self.current_version_in_server(server_id);
+            self.move_local_clients_out_of_missing_channels_in_server(
+                server_id,
+                &valid_channel_ids,
+                channel_version,
+            )
+            .await;
+        }
         Ok(deleted)
     }
 
