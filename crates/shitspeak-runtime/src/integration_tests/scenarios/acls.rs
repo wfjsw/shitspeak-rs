@@ -1195,6 +1195,136 @@ async fn traverse_visibility_reconciles_acl_changes() {
 }
 
 #[tokio::test]
+async fn traverse_visibility_reconciles_links_across_visibility_boundary() {
+    const SURVIVING_CHANNEL_ID: u32 = 81;
+    const FLIPPING_CHANNEL_ID: u32 = 82;
+
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_superuser("carol", None, Some(3), vec!["admin".into()]);
+
+    let channels = server.server.get_channels();
+    channels
+        .create_channel(Channel::new(
+            SURVIVING_CHANNEL_ID,
+            "Visible Link Endpoint".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+    channels
+        .create_channel(Channel::new(
+            FLIPPING_CHANNEL_ID,
+            "Visibility Link Target".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+    channels
+        .add_link(SURVIVING_CHANNEL_ID, FLIPPING_CHANNEL_ID)
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+    alice.drain_now().await;
+
+    carol
+        .set_acls(
+            FLIPPING_CHANNEL_ID,
+            vec![ChanAcl {
+                apply_here: true,
+                apply_subs: false,
+                inherited: false,
+                user_id: None,
+                group: Some("all".to_owned()),
+                grant: 0,
+                deny: ACLPermissions::Traverse as u32,
+            }],
+            true,
+        )
+        .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut hide_sequence = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = alice.recv(remaining).await else {
+            break;
+        };
+        match message {
+            Message::ChannelState(state)
+                if state.channel_id == Some(SURVIVING_CHANNEL_ID)
+                    && state.links_remove.contains(&FLIPPING_CHANNEL_ID) =>
+            {
+                hide_sequence.push("links-remove");
+            }
+            Message::ChannelRemove(remove) if remove.channel_id == FLIPPING_CHANNEL_ID => {
+                hide_sequence.push("channel-remove");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        hide_sequence,
+        vec!["links-remove", "channel-remove"],
+        "the surviving endpoint must be unlinked before the hidden channel is removed"
+    );
+
+    alice.drain_now().await;
+    carol.set_acls(FLIPPING_CHANNEL_ID, Vec::new(), true).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut reveal_sequence = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = alice.recv(remaining).await else {
+            break;
+        };
+        match message {
+            Message::ChannelState(state)
+                if state.channel_id == Some(FLIPPING_CHANNEL_ID) && state.name.is_some() =>
+            {
+                reveal_sequence.push("channel-state");
+            }
+            Message::ChannelState(state)
+                if (state.channel_id == Some(SURVIVING_CHANNEL_ID)
+                    && state.links_add.contains(&FLIPPING_CHANNEL_ID))
+                    || (state.channel_id == Some(FLIPPING_CHANNEL_ID)
+                        && state.links_add.contains(&SURVIVING_CHANNEL_ID)) =>
+            {
+                reveal_sequence.push("links-add");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        reveal_sequence,
+        vec!["channel-state", "links-add"],
+        "the restored channel must be known before its link is reintroduced"
+    );
+}
+
+#[tokio::test]
 async fn live_acl_changes_do_not_hide_users_when_visibility_filtering_is_disabled() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

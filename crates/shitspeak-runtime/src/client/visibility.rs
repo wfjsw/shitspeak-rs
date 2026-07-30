@@ -9,7 +9,7 @@ use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, Clie
 use crate::server::Server;
 use parking_lot::RwLock as ParkingRwLock;
 use shitspeak_messages::messages::Message;
-use shitspeak_messages::messages::encoder::{UserRemove, UserState};
+use shitspeak_messages::messages::encoder::{ChannelState, UserRemove, UserState};
 use shitspeak_state::ACLPermissions;
 use shitspeak_state::{ChannelOp, ChannelOperation};
 
@@ -1148,30 +1148,35 @@ pub async fn visibility_config_reload_messages(
             let links_removed = channel
                 .links
                 .iter()
-                .any(|linked_id| removed_channel_id_set.contains(linked_id));
+                .copied()
+                .filter(|linked_id| removed_channel_id_set.contains(linked_id))
+                .collect::<Vec<_>>();
             let links_added = channel
                 .links
                 .iter()
-                .any(|linked_id| added_channel_id_set.contains(linked_id));
+                .copied()
+                .filter(|linked_id| added_channel_id_set.contains(linked_id))
+                .collect::<Vec<_>>();
 
-            if links_removed {
-                let mut state =
-                    crate::channel_handler::build_channel_state_message(server, viewer, channel)
-                        .await;
-                state.links.retain(|linked_id| {
-                    old_channel_ids.contains(linked_id)
-                        && !removed_channel_id_set.contains(linked_id)
-                });
-                link_updates_before_removals.push(state.into());
+            if !links_removed.is_empty() {
+                link_updates_before_removals.push(
+                    ChannelState {
+                        channel_id: Some(channel.id),
+                        links_remove: links_removed,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
             }
-            if links_added {
-                let mut state =
-                    crate::channel_handler::build_channel_state_message(server, viewer, channel)
-                        .await;
-                state
-                    .links
-                    .retain(|linked_id| visible_channel_ids.contains(linked_id));
-                link_updates_after_additions.push(state.into());
+            if !links_added.is_empty() {
+                link_updates_after_additions.push(
+                    ChannelState {
+                        channel_id: Some(channel.id),
+                        links_add: links_added,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
             }
         }
     }
@@ -1262,8 +1267,19 @@ pub async fn visibility_config_reload_messages(
         state
             .links
             .retain(|linked_id| final_visible_channel_ids.contains(linked_id));
+        let deferred_links = std::mem::take(&mut state.links);
         channel_tree_shadow.insert(channel.id);
         messages.push(state.into());
+        if !deferred_links.is_empty() {
+            link_updates_after_additions.push(
+                ChannelState {
+                    channel_id: Some(channel.id),
+                    links: deferred_links,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
     }
 
     messages.extend(link_updates_after_additions);

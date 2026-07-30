@@ -668,6 +668,9 @@ pub async fn build_visible_ordered_channel_snapshot_messages<C: AsRef<Channel>>(
             .as_ref()
             .map_or(snapshot.len(), HashSet::len),
     );
+    // Mumble clients resolve link targets immediately. Introduce the entire
+    // channel map before sending any link-only states.
+    let mut deferred_links = Vec::new();
     for (index, channel) in visible_snapshot_channels(snapshot, visible_channel_ids.as_ref()) {
         if index != 0 && index % 64 == 0 {
             tokio::task::yield_now().await;
@@ -685,9 +688,17 @@ pub async fn build_visible_ordered_channel_snapshot_messages<C: AsRef<Channel>>(
                 .links
                 .retain(|channel_id| visible_channel_ids.contains(channel_id));
         }
+        if !state.links.is_empty() {
+            deferred_links.push(ChannelState {
+                channel_id: state.channel_id,
+                links: std::mem::take(&mut state.links),
+                ..Default::default()
+            });
+        }
         channel_tree_shadow.insert(channel.id);
         messages.push(state.into());
     }
+    messages.extend(deferred_links.into_iter().map(Message::from));
     messages
 }
 
@@ -1328,15 +1339,18 @@ async fn prepare_channel_visibility_refresh_inner(
     final_visible_channel_ids.extend(visible_channel_ids.iter().copied());
 
     let mut additions = Vec::with_capacity(visible_channel_ids.len());
+    // Crossing links are restored only after all structural additions below.
+    let mut link_additions_by_channel: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut addition_ids = Vec::with_capacity(visible_channel_ids.len());
-    for channel in ordered_snapshot_channels(&candidate_channels) {
+    let ordered_candidate_channels = ordered_snapshot_channels(&candidate_channels);
+    for channel in &ordered_candidate_channels {
         if !visible_channel_ids.contains(&channel.id) || channel_tree_shadow.contains(&channel.id) {
             continue;
         }
         let mut state = build_channel_state_message_with_options(
             server,
             client,
-            &channel,
+            channel.as_ref(),
             server.get_send_permission_info() && acl_context.is_none(),
             home_move_impact.map(HomeChannelMoveImpact::new_channel_id),
         )
@@ -1352,6 +1366,19 @@ async fn prepare_channel_visibility_refresh_inner(
         state
             .links
             .retain(|linked_id| final_visible_channel_ids.contains(linked_id));
+        for linked_id in std::mem::take(&mut state.links) {
+            if channel_tree_shadow.contains(&linked_id) {
+                link_additions_by_channel
+                    .entry(linked_id)
+                    .or_default()
+                    .push(channel.id);
+            } else if channel.id < linked_id {
+                link_additions_by_channel
+                    .entry(channel.id)
+                    .or_default()
+                    .push(linked_id);
+            }
+        }
         addition_ids.push(channel.id);
         additions.push(state.into());
         if let Some(context) = acl_context {
@@ -1364,14 +1391,63 @@ async fn prepare_channel_visibility_refresh_inner(
             );
         }
     }
+    let mut link_addition_channels = link_additions_by_channel.into_iter().collect::<Vec<_>>();
+    link_addition_channels.sort_by_key(|(channel_id, _)| *channel_id);
+    additions.extend(
+        link_addition_channels
+            .into_iter()
+            .map(|(channel_id, mut links_add)| {
+                links_add.sort_unstable();
+                links_add.dedup();
+                ChannelState {
+                    channel_id: Some(channel_id),
+                    links_add,
+                    ..Default::default()
+                }
+                .into()
+            }),
+    );
 
-    let removals = removed_channel_ids
-        .iter()
-        .copied()
-        .map(|channel_id| {
-            shitspeak_messages::messages::encoder::ChannelRemove { channel_id }.into()
-        })
-        .collect::<Vec<_>>();
+    let mut removals = Vec::new();
+    // Update surviving endpoints before their linked channels disappear.
+    let mut link_removals_by_channel: HashMap<u32, Vec<u32>> = HashMap::new();
+    if !removed_channel_id_set.is_empty() {
+        for channel in &ordered_candidate_channels {
+            if !removed_channel_id_set.contains(&channel.id) {
+                continue;
+            }
+            for linked_id in channel
+                .links
+                .iter()
+                .copied()
+                .filter(|linked_id| final_visible_channel_ids.contains(linked_id))
+            {
+                link_removals_by_channel
+                    .entry(linked_id)
+                    .or_default()
+                    .push(channel.id);
+            }
+        }
+    }
+    let mut link_removal_channels = link_removals_by_channel.into_iter().collect::<Vec<_>>();
+    link_removal_channels.sort_by_key(|(channel_id, _)| *channel_id);
+    removals.extend(
+        link_removal_channels
+            .into_iter()
+            .map(|(channel_id, mut links_remove)| {
+                links_remove.sort_unstable();
+                links_remove.dedup();
+                ChannelState {
+                    channel_id: Some(channel_id),
+                    links_remove,
+                    ..Default::default()
+                }
+                .into()
+            }),
+    );
+    removals.extend(removed_channel_ids.iter().copied().map(|channel_id| {
+        shitspeak_messages::messages::encoder::ChannelRemove { channel_id }.into()
+    }));
 
     ChannelVisibilityRefresh {
         additions,
@@ -2005,13 +2081,21 @@ pub async fn convert_channel_operation_to_messages_with_acl_context_options(
             }
         }
         ChannelOp::InstallSnapshot { channels, removed } => {
+            // Snapshot installation follows the same map-first ordering as
+            // initial authentication and gap-replay snapshots.
+            let mut deferred_links = Vec::new();
             for channel in ordered_snapshot_channels(channels) {
-                messages.push(
-                    build_channel_state_message(server, client, &channel)
-                        .await
-                        .into(),
-                );
+                let mut state = build_channel_state_message(server, client, &channel).await;
+                if !state.links.is_empty() {
+                    deferred_links.push(ChannelState {
+                        channel_id: state.channel_id,
+                        links: std::mem::take(&mut state.links),
+                        ..Default::default()
+                    });
+                }
+                messages.push(state.into());
             }
+            messages.extend(deferred_links.into_iter().map(Message::from));
             for channel_id in removed {
                 messages.push(
                     shitspeak_messages::messages::encoder::ChannelRemove {

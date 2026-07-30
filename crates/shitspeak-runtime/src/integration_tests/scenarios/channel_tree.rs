@@ -70,6 +70,49 @@ async fn tree_burst_includes_all_channels() {
     }
 }
 
+/// Checks that initial channel links are sent only after every linked channel
+/// has been introduced to the client.
+#[tokio::test]
+async fn tree_burst_defers_links_until_after_channel_map() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+
+    let chans = server.server.get_channels();
+    chans
+        .create_channel(Channel::new(1, "first".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans
+        .create_channel(Channel::new(2, "second".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    chans.add_link(1, 2).await.unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+
+    let last_definition = alice
+        .initial_channel_states
+        .iter()
+        .rposition(|state| state.name.is_some())
+        .expect("channel definitions");
+    assert!(
+        alice.initial_channel_states[..=last_definition]
+            .iter()
+            .all(|state| state.links.is_empty() && state.links_add.is_empty()),
+        "the channel map must not contain links to channels the client may not know yet"
+    );
+    assert!(
+        alice.initial_channel_states[last_definition + 1..]
+            .iter()
+            .any(|state| { state.channel_id == Some(1) && state.links.iter().any(|id| *id == 2) }),
+        "the link should be sent separately after the complete channel map"
+    );
+}
+
 /// Checks that a post-login channel creation reaches already-connected peers.
 /// Expected: Bob receives a `ChannelState` named `lobby`. This follows the
 /// Mumble `ChannelState` create/broadcast behavior in `D:\mumble\src\murmur\Messages.cpp`
