@@ -11858,7 +11858,7 @@ fn log_delivery_applied(
     }
 }
 
-fn run_gc_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
+pub(super) fn run_gc_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     // Repository capability can be lost through a local non-strict write
     // path. Poll it here as well as on protocol ingress so the LSA clamps
     // even while this topic is otherwise idle.
@@ -11913,12 +11913,20 @@ fn run_gc_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     }
     {
         let snapshot_ttl = rt.cfg.pending_propose_ttl();
+        let fetching_snapshot_from = rt
+            .state
+            .lock()
+            .history_election_fetching_snapshot()
+            .map(|request| request.peer());
         // Keep the same source-map-then-receiver-map lock order as snapshot
         // admission. The two maps share one aggregate retained-image cap.
         let mut transfers = rt.snapshot_transfers.lock();
         let mut receivers = rt.snapshot_receivers.lock();
         transfers.retain(|_, transfer| now.duration_since(transfer.last_used_at) < snapshot_ttl);
-        receivers.retain(|_, transfer| now.duration_since(transfer.last_used_at) < snapshot_ttl);
+        receivers.retain(|peer, transfer| {
+            Some(*peer) == fetching_snapshot_from
+                || now.duration_since(transfer.last_used_at) < snapshot_ttl
+        });
     }
     if rt.terminal_resolution_ready() {
         let runtime = rt.clone();

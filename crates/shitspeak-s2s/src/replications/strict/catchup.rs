@@ -26,6 +26,7 @@ use super::super::metrics::{
     self, CatchupMode, CatchupPhase, CatchupReason, ReplicationPipelineKind,
     ReplicationPipelineStage, StrictAdmissionEvent, StrictCatchupDuplicateOutcome,
     StrictCatchupSessionEvent, StrictCatchupSessionOutcome, StrictProbeKind, StrictProbeOutcome,
+    StrictSnapshotReceiveEvent, StrictSnapshotResponderEvent,
 };
 use super::super::proto::{
     CatchupOp, StrictBody, StrictCatchupReason, StrictCatchupReq, StrictCatchupResp,
@@ -75,6 +76,10 @@ const S2S_SNAPSHOT_ENVELOPE_VERSION: u32 = 1;
 const SNAPSHOT_TRANSFER_FORMAT_TAG: u64 = 1 << 63;
 const SNAPSHOT_TRANSFER_ENVELOPE_TAG: u64 = 1 << 62;
 const SNAPSHOT_TRANSFER_COUNTER_MASK: u64 = SNAPSHOT_TRANSFER_ENVELOPE_TAG - 1;
+const SNAPSHOT_TRANSFER_SEQUENCE_BITS: u32 = 24;
+const SNAPSHOT_TRANSFER_SEQUENCE_MASK: u64 = (1 << SNAPSHOT_TRANSFER_SEQUENCE_BITS) - 1;
+const SNAPSHOT_TRANSFER_BOOT_MASK: u64 =
+    SNAPSHOT_TRANSFER_COUNTER_MASK >> SNAPSHOT_TRANSFER_SEQUENCE_BITS;
 
 #[cfg(test)]
 #[path = "catchup_snapshot_tests.rs"]
@@ -202,6 +207,13 @@ fn v3_history_reason(req: &StrictCatchupReq) -> Option<CatchupReason> {
     CatchupReason::from_v3_wire(req.history_transfer.as_ref()?.reason)
 }
 
+fn is_snapshot_completion_request(req: &StrictCatchupReq) -> bool {
+    req.snapshot_transfer_id != 0
+        && req.snapshot_chunk_cursor == 0
+        && !req.force_snapshot
+        && !req.history_probe_only
+}
+
 fn v3_history_request_phase(req: &StrictCatchupReq) -> CatchupPhase {
     if req
         .history_transfer
@@ -209,7 +221,9 @@ fn v3_history_request_phase(req: &StrictCatchupReq) -> CatchupPhase {
         .is_some_and(|transfer| transfer.final_ack)
     {
         CatchupPhase::FinalAck
-    } else if req.force_snapshot || req.snapshot_transfer_id != 0 {
+    } else if req.force_snapshot
+        || (req.snapshot_transfer_id != 0 && !is_snapshot_completion_request(req))
+    {
         CatchupPhase::Snapshot
     } else {
         CatchupPhase::LogDelta
@@ -283,7 +297,7 @@ async fn send_v3_history_response<R: StrictReplicable>(
     dst: NodeIdentifier,
     req: &StrictCatchupReq,
     response: StrictCatchupResp,
-) -> Result<(), ReplicationError> {
+) -> Result<bool, ReplicationError> {
     let reason = v3_history_reason(req).ok_or(ReplicationError::Malformed(
         "v3 history response lacks a bounded reason",
     ))?;
@@ -303,7 +317,7 @@ async fn send_v3_history_response<R: StrictReplicable>(
             transfer,
             response.clone(),
         ) {
-            return Ok(());
+            return Ok(false);
         }
     }
     metrics::record_catchup_response_detail(
@@ -323,6 +337,7 @@ async fn send_v3_history_response<R: StrictReplicable>(
             phase,
         )
         .await
+        .map(|()| true)
 }
 
 fn encoded_response_len<R: StrictReplicable>(
@@ -459,9 +474,9 @@ async fn send_v2_response<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     from: NodeIdentifier,
     response: StrictCatchupResp,
-) {
+) -> SnapshotResponseSendOutcome {
     if !response_fits_budget(rt, from, &response, true) {
-        return;
+        return SnapshotResponseSendOutcome::Suppressed;
     }
     // See send_response: terminal pagination is part of the authenticated
     // admission probe and needs the same redundant delivery semantics as its
@@ -483,6 +498,9 @@ async fn send_v2_response<R: StrictReplicable>(
     };
     if let Err(error) = result {
         warn!(from, error = %error, "strict v2 catchup response send failed");
+        SnapshotResponseSendOutcome::Failed
+    } else {
+        SnapshotResponseSendOutcome::Sent
     }
 }
 
@@ -505,9 +523,12 @@ fn expire_stale_snapshot_images(
     receivers: &mut HashMap<NodeIdentifier, SnapshotReceiveTransfer>,
     now: Instant,
     ttl: Duration,
+    protected_receiver: Option<NodeIdentifier>,
 ) {
     transfers.retain(|_, transfer| now.duration_since(transfer.last_used_at) < ttl);
-    receivers.retain(|_, transfer| now.duration_since(transfer.last_used_at) < ttl);
+    receivers.retain(|peer, transfer| {
+        Some(*peer) == protected_receiver || now.duration_since(transfer.last_used_at) < ttl
+    });
 }
 
 fn retained_snapshot_bytes(
@@ -525,16 +546,45 @@ fn retained_snapshot_bytes(
         .try_fold(0usize, |total, bytes| total.checked_add(bytes))
 }
 
-fn snapshot_transfer_cursor(transfer: &SnapshotTransfer, req: &StrictCatchupReq) -> usize {
-    let requested_cursor = usize::try_from(req.snapshot_chunk_cursor).ok();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotTransferCursor {
+    Initial,
+    Continuation(usize),
+    StaleTransfer,
+    InvalidCursor,
+}
+
+fn snapshot_transfer_cursor(
+    transfer: &SnapshotTransfer,
+    req: &StrictCatchupReq,
+) -> SnapshotTransferCursor {
     if req.snapshot_transfer_id == 0 && req.snapshot_chunk_cursor == 0 {
-        Some(0)
+        SnapshotTransferCursor::Initial
     } else if req.snapshot_transfer_id == transfer.id {
-        requested_cursor.filter(|cursor| *cursor <= transfer.snapshot_msgpack.len())
+        usize::try_from(req.snapshot_chunk_cursor)
+            .ok()
+            .filter(|cursor| *cursor <= transfer.snapshot_msgpack.len())
+            .map(SnapshotTransferCursor::Continuation)
+            .unwrap_or(SnapshotTransferCursor::InvalidCursor)
     } else {
-        None
+        SnapshotTransferCursor::StaleTransfer
     }
-    .unwrap_or(0)
+}
+
+enum PinnedSnapshotTransferOutcome {
+    Serve {
+        transfer: SnapshotTransfer,
+        cursor: usize,
+        event: StrictSnapshotResponderEvent,
+    },
+    Ignore {
+        event: StrictSnapshotResponderEvent,
+        active_transfer_id: u64,
+        active_version: u64,
+        active_total_bytes: usize,
+    },
+    MissingTransfer,
+    Reject,
 }
 
 /// A repository can report that a snapshot failure made durable strict
@@ -590,24 +640,35 @@ fn next_snapshot_transfer_id<R: StrictReplicable>(
     format: SnapshotFormat,
 ) -> u64 {
     loop {
-        let counter = rt.snapshot_transfer_counter.fetch_add(1, Ordering::Relaxed)
-            & SNAPSHOT_TRANSFER_COUNTER_MASK;
-        if counter != 0 {
-            return tagged_snapshot_transfer_id(counter, format);
+        let sequence = rt.snapshot_transfer_counter.fetch_add(1, Ordering::Relaxed)
+            & SNAPSHOT_TRANSFER_SEQUENCE_MASK;
+        if sequence != 0 {
+            // Partition the 62 payload bits so sequential boot epochs have
+            // disjoint transfer spaces. A runtime can originate over sixteen
+            // million snapshot images for one topic before sequence reuse.
+            let boot = rt.boot_epoch & SNAPSHOT_TRANSFER_BOOT_MASK;
+            let identity = (boot << SNAPSHOT_TRANSFER_SEQUENCE_BITS) | sequence;
+            return tagged_snapshot_transfer_id(identity, format);
         }
     }
 }
 
-/// Select the stable responder-side image for this request. A bad cursor or
-/// stale transfer id deliberately restarts from byte zero of the existing
-/// image, while a responder restart/TTL expiry creates a fresh image.
+/// Select the stable responder-side image for this request. An explicit
+/// initial request can replay byte zero, while a matching continuation serves
+/// its requested cursor. Stale ids and invalid cursors must not restart or
+/// refresh a different pinned image.
 fn pinned_snapshot_transfer<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     from: NodeIdentifier,
     req: &StrictCatchupReq,
     terminal_decision_generation: u64,
-) -> Result<(SnapshotTransfer, usize), ()> {
+) -> PinnedSnapshotTransferOutcome {
     let now = Instant::now();
+    let protected_receiver = rt
+        .state
+        .lock()
+        .history_election_fetching_snapshot()
+        .map(|request| request.peer());
     // Keep the transfer lock held through repository capture and envelope
     // construction. Checkpoint rotation uses the same lock as its barrier,
     // preventing a newer retired floor from being paired with older snapshot
@@ -619,10 +680,42 @@ fn pinned_snapshot_transfer<R: StrictReplicable>(
         &mut receivers,
         now,
         rt.cfg.pending_propose_ttl(),
+        protected_receiver,
     );
     if let Some(transfer) = transfers.get_mut(&from) {
-        transfer.last_used_at = now;
-        return Ok((transfer.clone(), snapshot_transfer_cursor(transfer, req)));
+        return match snapshot_transfer_cursor(transfer, req) {
+            SnapshotTransferCursor::Initial => {
+                transfer.last_used_at = now;
+                PinnedSnapshotTransferOutcome::Serve {
+                    transfer: transfer.clone(),
+                    cursor: 0,
+                    event: StrictSnapshotResponderEvent::InitialPagePrepared,
+                }
+            }
+            SnapshotTransferCursor::Continuation(cursor) => {
+                transfer.last_used_at = now;
+                PinnedSnapshotTransferOutcome::Serve {
+                    transfer: transfer.clone(),
+                    cursor,
+                    event: StrictSnapshotResponderEvent::ContinuationPrepared,
+                }
+            }
+            SnapshotTransferCursor::StaleTransfer => PinnedSnapshotTransferOutcome::Ignore {
+                event: StrictSnapshotResponderEvent::StaleTransferIgnored,
+                active_transfer_id: transfer.id,
+                active_version: transfer.version,
+                active_total_bytes: transfer.snapshot_msgpack.len(),
+            },
+            SnapshotTransferCursor::InvalidCursor => PinnedSnapshotTransferOutcome::Ignore {
+                event: StrictSnapshotResponderEvent::InvalidCursorIgnored,
+                active_transfer_id: transfer.id,
+                active_version: transfer.version,
+                active_total_bytes: transfer.snapshot_msgpack.len(),
+            },
+        };
+    }
+    if req.snapshot_transfer_id != 0 || req.snapshot_chunk_cursor != 0 {
+        return PinnedSnapshotTransferOutcome::MissingTransfer;
     }
 
     let Some(_snapshot_capture) = rt.begin_snapshot_capture() else {
@@ -630,7 +723,7 @@ fn pinned_snapshot_transfer<R: StrictReplicable>(
             from,
             "strict snapshot capture deferred by checkpoint barrier"
         );
-        return Err(());
+        return PinnedSnapshotTransferOutcome::Reject;
     };
 
     let (snapshot_metadata, mut snapshot_msgpack) = match rt.repo.snapshot_with_metadata() {
@@ -644,16 +737,19 @@ fn pinned_snapshot_transfer<R: StrictReplicable>(
                 capability_withdrawn,
                 "strict v2 snapshot capture failed; declining transfer"
             );
-            return Err(());
+            return PinnedSnapshotTransferOutcome::Reject;
         }
     };
     let version = snapshot_metadata.version;
     let format = snapshot_format_for_peer(rt, from);
     if format == SnapshotFormat::S2sEnvelope {
-        snapshot_msgpack =
-            encode_s2s_snapshot_envelope(rt, version, snapshot_msgpack).map_err(|error| {
+        snapshot_msgpack = match encode_s2s_snapshot_envelope(rt, version, snapshot_msgpack) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
                 warn!(from, %error, "strict S2S snapshot envelope encoding failed");
-            })?;
+                return PinnedSnapshotTransferOutcome::Reject;
+            }
+        };
     }
     if snapshot_msgpack.len() > rt.cfg.strict_max_snapshot_transfer_bytes() {
         warn!(
@@ -662,7 +758,7 @@ fn pinned_snapshot_transfer<R: StrictReplicable>(
             max_snapshot_bytes = rt.cfg.strict_max_snapshot_transfer_bytes(),
             "strict v2 snapshot exceeds the aggregate retained-image resource limit"
         );
-        return Err(());
+        return PinnedSnapshotTransferOutcome::Reject;
     }
     let mut rank = HistoryRank::local(rt);
     rank.version = version;
@@ -682,14 +778,14 @@ fn pinned_snapshot_transfer<R: StrictReplicable>(
             from,
             "strict v2 snapshot retained-byte accounting overflowed"
         );
-        return Err(());
+        return PinnedSnapshotTransferOutcome::Reject;
     };
     let Some(required_bytes) = retained_bytes.checked_add(transfer.snapshot_msgpack.len()) else {
         warn!(
             from,
             "strict v2 snapshot retained-byte accounting overflowed"
         );
-        return Err(());
+        return PinnedSnapshotTransferOutcome::Reject;
     };
     if required_bytes > rt.cfg.strict_max_snapshot_transfer_bytes() {
         warn!(
@@ -699,10 +795,14 @@ fn pinned_snapshot_transfer<R: StrictReplicable>(
             max_snapshot_bytes = rt.cfg.strict_max_snapshot_transfer_bytes(),
             "strict v2 snapshot would exceed the aggregate retained-image resource limit"
         );
-        return Err(());
+        return PinnedSnapshotTransferOutcome::Reject;
     }
     transfers.insert(from, transfer.clone());
-    Ok((transfer, 0))
+    PinnedSnapshotTransferOutcome::Serve {
+        transfer,
+        cursor: 0,
+        event: StrictSnapshotResponderEvent::ImagePagePrepared,
+    }
 }
 
 fn snapshot_chunk_response<R: StrictReplicable>(
@@ -771,6 +871,22 @@ fn snapshot_chunk_response<R: StrictReplicable>(
     build(cursor + low)
 }
 
+#[derive(Clone, Copy)]
+enum SnapshotResponseSendOutcome {
+    Sent,
+    Suppressed,
+    Failed,
+}
+
+fn record_snapshot_response_send_outcome(outcome: SnapshotResponseSendOutcome) {
+    let event = match outcome {
+        SnapshotResponseSendOutcome::Sent => return,
+        SnapshotResponseSendOutcome::Suppressed => StrictSnapshotResponderEvent::ResponseSuppressed,
+        SnapshotResponseSendOutcome::Failed => StrictSnapshotResponderEvent::ResponseSendFailed,
+    };
+    metrics::record_strict_snapshot_responder_event(event);
+}
+
 async fn send_snapshot_transfer_rejected<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
     from: NodeIdentifier,
@@ -796,8 +912,8 @@ async fn send_snapshot_transfer_rejected<R: StrictReplicable>(
         request_force_snapshot: req.force_snapshot,
         request_history_probe_only: false,
         terminal_decision_generation,
-        snapshot_transfer_id: 0,
-        snapshot_chunk_cursor: 0,
+        snapshot_transfer_id: req.snapshot_transfer_id,
+        snapshot_chunk_cursor: req.snapshot_chunk_cursor,
         snapshot_next_cursor: 0,
         snapshot_total_bytes: 0,
         snapshot_sha256: Bytes::new(),
@@ -805,13 +921,19 @@ async fn send_snapshot_transfer_rejected<R: StrictReplicable>(
         snapshot_transfer_rejected: true,
         history_transfer: history_transfer_response(rt, req),
     };
-    if req.history_transfer.is_some() {
-        if let Err(error) = send_v3_history_response(rt, from, req, response).await {
-            warn!(from, %error, "strict v3 snapshot rejection send failed");
+    let outcome = if req.history_transfer.is_some() {
+        match send_v3_history_response(rt, from, req, response).await {
+            Ok(true) => SnapshotResponseSendOutcome::Sent,
+            Ok(false) => SnapshotResponseSendOutcome::Suppressed,
+            Err(error) => {
+                warn!(from, %error, "strict v3 snapshot rejection send failed");
+                SnapshotResponseSendOutcome::Failed
+            }
         }
     } else {
-        send_v2_response(rt, from, response).await;
-    }
+        send_v2_response(rt, from, response).await
+    };
+    record_snapshot_response_send_outcome(outcome);
 }
 
 async fn respond_with_snapshot_transfer<R: StrictReplicable>(
@@ -821,10 +943,66 @@ async fn respond_with_snapshot_transfer<R: StrictReplicable>(
     terminal_decision_generation: u64,
     build_started_at: Instant,
 ) {
-    let (transfer, cursor) =
+    let (transfer, cursor, responder_event) =
         match pinned_snapshot_transfer(rt, from, req, terminal_decision_generation) {
-            Ok(transfer) => transfer,
-            Err(()) => {
+            PinnedSnapshotTransferOutcome::Serve {
+                transfer,
+                cursor,
+                event,
+            } => (transfer, cursor, event),
+            PinnedSnapshotTransferOutcome::Ignore {
+                mut event,
+                active_transfer_id,
+                active_version,
+                active_total_bytes,
+            } => {
+                if req.history_transfer.is_some() {
+                    event = match event {
+                        StrictSnapshotResponderEvent::StaleTransferIgnored => {
+                            StrictSnapshotResponderEvent::StaleTransferRejected
+                        }
+                        StrictSnapshotResponderEvent::InvalidCursorIgnored => {
+                            StrictSnapshotResponderEvent::InvalidCursorRejected
+                        }
+                        event => event,
+                    };
+                }
+                metrics::record_strict_snapshot_responder_event(event);
+                warn!(
+                        topic = %rt.topic,
+                        from,
+                        reason = ?event,
+                        requested_transfer_id = req.snapshot_transfer_id,
+                        requested_cursor = req.snapshot_chunk_cursor,
+                        active_transfer_id,
+                        active_version,
+                    active_total_bytes,
+                    "ignoring stale strict v2 snapshot continuation"
+                );
+                if req.history_transfer.is_some() {
+                    send_snapshot_transfer_rejected(rt, from, req, terminal_decision_generation)
+                        .await;
+                }
+                return;
+            }
+            PinnedSnapshotTransferOutcome::MissingTransfer => {
+                metrics::record_strict_snapshot_responder_event(
+                    StrictSnapshotResponderEvent::MissingTransferRejected,
+                );
+                warn!(
+                    topic = %rt.topic,
+                    from,
+                    requested_transfer_id = req.snapshot_transfer_id,
+                    requested_cursor = req.snapshot_chunk_cursor,
+                    "rejecting strict v2 snapshot continuation without a pinned image"
+                );
+                send_snapshot_transfer_rejected(rt, from, req, terminal_decision_generation).await;
+                return;
+            }
+            PinnedSnapshotTransferOutcome::Reject => {
+                metrics::record_strict_snapshot_responder_event(
+                    StrictSnapshotResponderEvent::TransferRejected,
+                );
                 send_snapshot_transfer_rejected(rt, from, req, terminal_decision_generation).await;
                 return;
             }
@@ -835,6 +1013,9 @@ async fn respond_with_snapshot_transfer<R: StrictReplicable>(
         .is_some_and(|correlation| correlation.target_version != transfer.version)
     {
         rt.snapshot_transfers.lock().remove(&from);
+        metrics::record_strict_snapshot_responder_event(
+            StrictSnapshotResponderEvent::TransferRejected,
+        );
         send_snapshot_transfer_rejected(rt, from, req, terminal_decision_generation).await;
         return;
     }
@@ -843,6 +1024,9 @@ async fn respond_with_snapshot_transfer<R: StrictReplicable>(
     // include the decision's repository delivery.
     if transfer.terminal_decision_generation != rt.terminal_decision_generation().await {
         rt.snapshot_transfers.lock().remove(&from);
+        metrics::record_strict_snapshot_responder_event(
+            StrictSnapshotResponderEvent::FenceInvalidated,
+        );
         warn!(
             from,
             "strict v2 snapshot transfer invalidated by a newer terminal fence"
@@ -851,6 +1035,9 @@ async fn respond_with_snapshot_transfer<R: StrictReplicable>(
         return;
     }
     let Some(response) = snapshot_chunk_response(rt, &transfer, req, cursor) else {
+        metrics::record_strict_snapshot_responder_event(
+            StrictSnapshotResponderEvent::TransferRejected,
+        );
         warn!(
             from,
             max_bytes = rt.strict_catchup_response_budget(),
@@ -860,19 +1047,26 @@ async fn respond_with_snapshot_transfer<R: StrictReplicable>(
         return;
     };
     let response_bytes = response.snapshot_msgpack.len();
+    metrics::record_strict_snapshot_responder_event(responder_event);
     metrics::record_pipeline_stage(
         ReplicationPipelineKind::Strict,
         ReplicationPipelineStage::CatchupBuild,
         build_started_at.elapsed(),
     );
-    if req.history_transfer.is_some() {
-        if let Err(error) = send_v3_history_response(rt, from, req, response).await {
-            warn!(from, %error, "strict v3 snapshot page send failed");
+    let outcome = if req.history_transfer.is_some() {
+        match send_v3_history_response(rt, from, req, response).await {
+            Ok(true) => SnapshotResponseSendOutcome::Sent,
+            Ok(false) => SnapshotResponseSendOutcome::Suppressed,
+            Err(error) => {
+                warn!(from, %error, "strict v3 snapshot page send failed");
+                SnapshotResponseSendOutcome::Failed
+            }
         }
     } else {
         metrics::record_catchup_response(CatchupMode::Strict, 0, response_bytes);
-        send_v2_response(rt, from, response).await;
-    }
+        send_v2_response(rt, from, response).await
+    };
+    record_snapshot_response_send_outcome(outcome);
 }
 
 /// Build and send a `StrictCatchupResp` answering `req`.
@@ -994,7 +1188,9 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     };
     // V3 history continuations echo the exact response nonce whose physical
     // first-hop reservation is now durable. Legacy v2 can only correlate by
-    // its advancing cursor and therefore retains its single legacy slot.
+    // its advancing log or terminal cursor and therefore retains its single
+    // legacy slot. Snapshot pages are intentionally excluded because the
+    // production bulk pacer does not reserve an uncorrelated Legacy identity.
     if let Some(transfer) = req.history_transfer.as_ref() {
         if transfer.acknowledged_request_nonce != 0 {
             rt.net.acknowledge_bulk_unicast(
@@ -1009,10 +1205,27 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     } else if req.chunk_token > req.since_version
         || (req.terminal_state_cursor != 0
             && req.terminal_state_cursor != TERMINAL_STATE_CURSOR_SKIP)
-        || (req.snapshot_transfer_id != 0 && req.snapshot_chunk_cursor != 0)
     {
         rt.net
             .acknowledge_bulk_unicast(from, &rt.topic, BulkPageIdentity::Legacy);
+    }
+    let snapshot_completion_request = is_snapshot_completion_request(&req);
+    let completed_snapshot_transfer = if snapshot_completion_request {
+        let mut transfers = rt.snapshot_transfers.lock();
+        let completed = transfers.get(&from).is_some_and(|transfer| {
+            transfer.id == req.snapshot_transfer_id && req.since_version >= transfer.version
+        });
+        if completed {
+            transfers.remove(&from);
+        }
+        completed
+    } else {
+        false
+    };
+    if completed_snapshot_transfer {
+        metrics::record_strict_snapshot_responder_event(
+            StrictSnapshotResponderEvent::CompletionAcknowledged,
+        );
     }
     if !rt.terminal_storage_ready() {
         warn!(
@@ -1085,21 +1298,6 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     }
     let build_started_at = std::time::Instant::now();
     let v2_snapshot_transfer = v2_snapshot_transfer_supported(rt, from);
-    // A normal history request after the final image chunk is the receiver's
-    // implicit completion acknowledgement. Retain a completed image until
-    // then (or TTL) so a lost final response can be retried safely.
-    if req.snapshot_transfer_id == 0
-        && !req.force_snapshot
-        && !req.history_probe_only
-        && rt
-            .snapshot_transfers
-            .lock()
-            .get(&from)
-            .is_some_and(|transfer| req.since_version >= transfer.version)
-    {
-        rt.snapshot_transfers.lock().remove(&from);
-    }
-
     // Terminal decisions are durable fences and must reach a joining member
     // before it processes ordinary history. Page them independently from the
     // repository-version cursor so a long-lived journal cannot inflate every
@@ -1248,7 +1446,7 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
         return;
     }
 
-    if req.snapshot_transfer_id != 0 {
+    if req.snapshot_transfer_id != 0 && !snapshot_completion_request {
         if !v2_snapshot_transfer {
             warn!(
                 from,
@@ -1790,6 +1988,7 @@ pub(super) async fn install_snapshot_candidate<R: StrictReplicable>(
         snapshot_msgpack,
         apply_started_at,
         correlated_peer,
+        None,
     )
     .await;
 }
@@ -1803,6 +2002,7 @@ async fn install_snapshot_candidate_with_format<R: StrictReplicable>(
     snapshot_msgpack: Bytes,
     apply_started_at: Instant,
     correlated_peer: Option<PeerIncarnation>,
+    completed_snapshot_transfer_id: Option<u64>,
 ) {
     let local_rank = HistoryRank::local(rt);
     // This state transition rechecks bootstrap and delivery fences while the
@@ -2163,7 +2363,14 @@ async fn install_snapshot_candidate_with_format<R: StrictReplicable>(
             rt.requeue_undelivered_terminal_journal_commits().await;
             rt.state.lock().finish_history_election();
             rt.wake_delivery_and_clock_tick();
-            request_history_after_snapshot(rt, from, installed_version, correlated_peer).await;
+            request_history_after_snapshot(
+                rt,
+                from,
+                installed_version,
+                correlated_peer,
+                completed_snapshot_transfer_id,
+            )
+            .await;
         }
         Err(error) => {
             fail_claimed_v3_history_response(rt, correlated_peer).await;
@@ -2196,6 +2403,7 @@ async fn request_history_after_snapshot<R: StrictReplicable>(
     from: NodeIdentifier,
     snapshot_version: u64,
     correlated_peer: Option<PeerIncarnation>,
+    completed_snapshot_transfer_id: Option<u64>,
 ) {
     if from == rt.self_id
         || !rt.net.has_route(from, ServiceLevel::Reliable)
@@ -2221,7 +2429,7 @@ async fn request_history_after_snapshot<R: StrictReplicable>(
         history_probe_only: false,
         terminal_state_cursor: TERMINAL_STATE_CURSOR_SKIP,
         terminal_decision_generation: rt.remembered_terminal_decision_generation(from),
-        snapshot_transfer_id: 0,
+        snapshot_transfer_id: completed_snapshot_transfer_id.unwrap_or(0),
         snapshot_chunk_cursor: 0,
         history_transfer,
     };
@@ -2256,7 +2464,8 @@ enum SnapshotReceiveOutcome {
         transfer_id: u64,
     },
     Duplicate,
-    Restart,
+    Stale(StrictSnapshotReceiveEvent),
+    Restart(StrictSnapshotReceiveEvent),
 }
 
 fn receive_snapshot_chunk<R: StrictReplicable>(
@@ -2265,6 +2474,48 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
     resp: &StrictCatchupResp,
     remote_rank: HistoryRank,
 ) -> SnapshotReceiveOutcome {
+    let fetching_snapshot_from = rt
+        .state
+        .lock()
+        .history_election_fetching_snapshot()
+        .map(|source| source.peer());
+    let fetching_from_source = fetching_snapshot_from == Some(from);
+    let now = Instant::now();
+    let (active_receiver_id, expired_receiver_id) = {
+        // Expire under the global transfer-before-receiver lock order before
+        // using receiver identity to reject a replacement first page.
+        let mut transfers = rt.snapshot_transfers.lock();
+        let mut receivers = rt.snapshot_receivers.lock();
+        let receiver_id_before_expiry = receivers.get(&from).map(|transfer| transfer.id);
+        expire_stale_snapshot_images(
+            &mut transfers,
+            &mut receivers,
+            now,
+            rt.cfg.pending_propose_ttl(),
+            fetching_snapshot_from.filter(|peer| *peer != from),
+        );
+        let active_receiver_id = receivers.get(&from).map(|transfer| transfer.id);
+        let expired_receiver_id = active_receiver_id
+            .is_none()
+            .then_some(receiver_id_before_expiry)
+            .flatten();
+        (active_receiver_id, expired_receiver_id)
+    };
+    if expired_receiver_id == Some(resp.snapshot_transfer_id) {
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartExpiredReceiver);
+    }
+    if active_receiver_id.is_none()
+        && !fetching_from_source
+        && (resp.request_force_snapshot || rt.repo.current_version() >= resp.snapshot_version)
+    {
+        return SnapshotReceiveOutcome::Stale(StrictSnapshotReceiveEvent::StaleIdle);
+    }
+    if active_receiver_id.is_some_and(|transfer_id| transfer_id != resp.snapshot_transfer_id) {
+        return SnapshotReceiveOutcome::Stale(StrictSnapshotReceiveEvent::StaleForeignTransfer);
+    }
+    if active_receiver_id.is_none() && resp.snapshot_chunk_cursor != 0 {
+        return SnapshotReceiveOutcome::Stale(StrictSnapshotReceiveEvent::StaleMissingReceiver);
+    }
     if !v2_snapshot_transfer_supported(rt, from)
         || !resp.too_old_use_snapshot
         || resp.terminal_sync_only
@@ -2277,10 +2528,10 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
         || resp.snapshot_transfer_id == 0
         || resp.snapshot_sha256.len() != 32
     {
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartInvalidEnvelope);
     }
     let Some(total_bytes) = usize::try_from(resp.snapshot_total_bytes).ok() else {
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartInvalidCursor);
     };
     if total_bytes > rt.cfg.strict_max_snapshot_transfer_bytes() {
         warn!(
@@ -2289,16 +2540,16 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
             max_snapshot_bytes = rt.cfg.strict_max_snapshot_transfer_bytes(),
             "strict v2 snapshot transfer exceeds the local aggregate resource limit"
         );
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartResourceLimit);
     }
     let Some(chunk_cursor) = usize::try_from(resp.snapshot_chunk_cursor).ok() else {
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartInvalidCursor);
     };
     let Some(next_cursor) = usize::try_from(resp.snapshot_next_cursor).ok() else {
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartInvalidCursor);
     };
     let Some(expected_next_cursor) = chunk_cursor.checked_add(resp.snapshot_msgpack.len()) else {
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartInvalidCursor);
     };
     if chunk_cursor > total_bytes
         || next_cursor > total_bytes
@@ -2306,10 +2557,8 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
         || resp.snapshot_has_more != (next_cursor < total_bytes)
         || (chunk_cursor < total_bytes && resp.snapshot_msgpack.is_empty())
     {
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartInvalidCursor);
     }
-
-    let now = Instant::now();
     // Retained snapshot bytes span responder images and receiver assemblies.
     // Keep this source-map-then-receiver-map order in every dual-map path.
     let mut transfers = rt.snapshot_transfers.lock();
@@ -2319,29 +2568,32 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
         &mut receivers,
         now,
         rt.cfg.pending_propose_ttl(),
+        fetching_snapshot_from,
     );
     let replace = match receivers.get(&from) {
         Some(transfer) if transfer.id == resp.snapshot_transfer_id => false,
-        Some(_) => chunk_cursor == 0,
-        None => chunk_cursor == 0,
+        Some(_) => {
+            return SnapshotReceiveOutcome::Stale(StrictSnapshotReceiveEvent::StaleForeignTransfer);
+        }
+        None if chunk_cursor == 0 => true,
+        None => {
+            return SnapshotReceiveOutcome::Stale(StrictSnapshotReceiveEvent::StaleMissingReceiver);
+        }
     };
-    if !replace
-        && receivers
-            .get(&from)
-            .is_none_or(|transfer| transfer.id != resp.snapshot_transfer_id)
-    {
-        return SnapshotReceiveOutcome::Restart;
-    }
     let tagged_format = snapshot_format_from_transfer_id(resp.snapshot_transfer_id);
     let snapshot_format = if replace {
         tagged_format.unwrap_or_else(|| snapshot_format_for_peer(rt, from))
     } else {
         let Some(transfer) = receivers.get(&from) else {
-            return SnapshotReceiveOutcome::Restart;
+            return SnapshotReceiveOutcome::Restart(
+                StrictSnapshotReceiveEvent::RestartMissingState,
+            );
         };
         if tagged_format.is_some_and(|format| format != transfer.format) {
             receivers.remove(&from);
-            return SnapshotReceiveOutcome::Restart;
+            return SnapshotReceiveOutcome::Restart(
+                StrictSnapshotReceiveEvent::RestartFormatMismatch,
+            );
         }
         transfer.format
     };
@@ -2351,7 +2603,9 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
         receivers.remove(&from);
     } else {
         let Some(transfer) = receivers.get(&from) else {
-            return SnapshotReceiveOutcome::Restart;
+            return SnapshotReceiveOutcome::Restart(
+                StrictSnapshotReceiveEvent::RestartMissingState,
+            );
         };
         if transfer.id != resp.snapshot_transfer_id
             || transfer.version != resp.snapshot_version
@@ -2361,7 +2615,9 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
             || transfer.terminal_decision_generation != resp.terminal_decision_generation
         {
             receivers.remove(&from);
-            return SnapshotReceiveOutcome::Restart;
+            return SnapshotReceiveOutcome::Restart(
+                StrictSnapshotReceiveEvent::RestartMetadataMismatch,
+            );
         }
         if transfer.next_cursor != resp.snapshot_chunk_cursor
             || transfer.snapshot_msgpack.len() != chunk_cursor
@@ -2382,7 +2638,7 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
                 };
             }
             receivers.remove(&from);
-            return SnapshotReceiveOutcome::Restart;
+            return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartChunkOrder);
         }
     }
 
@@ -2392,7 +2648,7 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
             "strict v2 snapshot retained-byte accounting overflowed"
         );
         receivers.remove(&from);
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartResourceLimit);
     };
     let Some(required_bytes) = retained_bytes.checked_add(resp.snapshot_msgpack.len()) else {
         warn!(
@@ -2400,7 +2656,7 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
             "strict v2 snapshot retained-byte accounting overflowed"
         );
         receivers.remove(&from);
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartResourceLimit);
     };
     if required_bytes > rt.cfg.strict_max_snapshot_transfer_bytes() {
         warn!(
@@ -2413,7 +2669,7 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
         // Do not leave a stalled partial image holding the cap after rejecting
         // this peer's chunk. The caller re-arms history election.
         receivers.remove(&from);
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartResourceLimit);
     }
     if replace {
         receivers.insert(
@@ -2433,7 +2689,7 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
         );
     }
     let Some(transfer) = receivers.get_mut(&from) else {
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartMissingState);
     };
     transfer.last_used_at = now;
     transfer
@@ -2449,11 +2705,11 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
         };
     }
     let Some(transfer) = receivers.get(&from) else {
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartMissingState);
     };
     if snapshot_sha256(&transfer.snapshot_msgpack) != transfer.snapshot_sha256 {
         receivers.remove(&from);
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartDigestMismatch);
     }
     if snapshot_format_from_transfer_id(transfer.id).is_none()
         && legacy_untagged_snapshot_is_ambiguous(&transfer.snapshot_msgpack)
@@ -2468,7 +2724,7 @@ fn receive_snapshot_chunk<R: StrictReplicable>(
         };
     }
     let Some(transfer) = receivers.remove(&from) else {
-        return SnapshotReceiveOutcome::Restart;
+        return SnapshotReceiveOutcome::Restart(StrictSnapshotReceiveEvent::RestartMissingState);
     };
     SnapshotReceiveOutcome::Complete {
         rank: transfer.rank,
@@ -2548,17 +2804,65 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
     correlated_peer: Option<PeerIncarnation>,
 ) {
     if resp.snapshot_transfer_rejected {
+        metrics::record_strict_snapshot_receive_event(StrictSnapshotReceiveEvent::SourceRejected);
+        let correlated = correlated_peer.is_some();
         if let Some(peer) = correlated_peer {
             finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
         }
-        rt.snapshot_receivers.lock().remove(&from);
+        let (fetching_from_source, election_active) = {
+            let state = rt.state.lock();
+            (
+                state
+                    .history_election_fetching_snapshot()
+                    .is_some_and(|source| source.peer() == from),
+                state.history_election_active(),
+            )
+        };
+        let (active_transfer_id, rejected_active_transfer) = {
+            let mut receivers = rt.snapshot_receivers.lock();
+            let active_transfer_id = receivers.get(&from).map(|receiver| receiver.id);
+            let rejected_active_transfer = resp.snapshot_transfer_id != 0
+                && active_transfer_id == Some(resp.snapshot_transfer_id);
+            if rejected_active_transfer || (correlated && fetching_from_source) {
+                receivers.remove(&from);
+            }
+            (active_transfer_id, rejected_active_transfer)
+        };
         warn!(
+            topic = %rt.topic,
             from,
-            "strict v2 snapshot transfer was rejected by the source; rearming history election"
+            fetching_from_source,
+            correlated_v3_history = correlated,
+            rejected_transfer_id = resp.snapshot_transfer_id,
+            rejected_cursor = resp.snapshot_chunk_cursor,
+            active_transfer_id = ?active_transfer_id,
+            rejected_active_transfer,
+            "strict v2 snapshot transfer was rejected by the source"
         );
-        rearm_history_election(rt);
+        if fetching_from_source
+            && (correlated
+                || rejected_active_transfer
+                || (resp.snapshot_transfer_id == 0 && active_transfer_id.is_none()))
+        {
+            rearm_history_election_if_fetching_from(rt, from);
+        } else if rejected_active_transfer && !election_active {
+            rearm_history_election(rt);
+        }
         return;
     }
+    let receiver_before = {
+        let receivers = rt.snapshot_receivers.lock();
+        receivers.get(&from).map(|receiver| {
+            (
+                receiver.id,
+                receiver.version,
+                receiver.next_cursor,
+                receiver.total_bytes,
+                receiver.terminal_decision_generation,
+                receiver.snapshot_sha256.clone(),
+            )
+        })
+    };
     match receive_snapshot_chunk(rt, from, resp, remote_rank) {
         SnapshotReceiveOutcome::Continue {
             transfer_id,
@@ -2566,6 +2870,7 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
             next_cursor,
             terminal_decision_generation,
         } => {
+            metrics::record_strict_snapshot_receive_event(StrictSnapshotReceiveEvent::Continued);
             request_next_snapshot_chunk(
                 rt,
                 from,
@@ -2584,6 +2889,7 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
             snapshot_msgpack,
             snapshot_sha256: expected_sha256,
         } => {
+            metrics::record_strict_snapshot_receive_event(StrictSnapshotReceiveEvent::Completed);
             if snapshot_sha256(&snapshot_msgpack) != expected_sha256 {
                 if let Some(peer) = correlated_peer {
                     finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
@@ -2604,10 +2910,14 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
                 Bytes::from(snapshot_msgpack),
                 apply_started_at,
                 correlated_peer,
+                Some(resp.snapshot_transfer_id),
             )
             .await;
         }
         SnapshotReceiveOutcome::AmbiguousLegacy { transfer_id } => {
+            metrics::record_strict_snapshot_receive_event(
+                StrictSnapshotReceiveEvent::AmbiguousLegacy,
+            );
             if let Some(peer) = correlated_peer {
                 finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
             }
@@ -2619,23 +2929,130 @@ async fn apply_snapshot_transfer_response<R: StrictReplicable>(
             );
         }
         SnapshotReceiveOutcome::Duplicate => {
+            metrics::record_strict_snapshot_receive_event(
+                StrictSnapshotReceiveEvent::DuplicateActive,
+            );
             trace!(
+                topic = %rt.topic,
                 from,
                 transfer_id = resp.snapshot_transfer_id,
                 chunk_cursor = resp.snapshot_chunk_cursor,
                 "ignoring already-applied strict v2 snapshot chunk"
             );
+            if let Some(peer) = correlated_peer {
+                finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+                let fetching_from_source = rt
+                    .state
+                    .lock()
+                    .history_election_fetching_snapshot()
+                    .is_some_and(|source| source.peer() == from);
+                if fetching_from_source {
+                    rt.snapshot_receivers.lock().remove(&from);
+                    rearm_history_election_if_fetching_from(rt, from);
+                }
+            }
         }
-        SnapshotReceiveOutcome::Restart => {
+        SnapshotReceiveOutcome::Stale(event) => {
+            metrics::record_strict_snapshot_receive_event(event);
+            warn!(
+                topic = %rt.topic,
+                from,
+                reason = ?event,
+                correlated_v3_history = correlated_peer.is_some(),
+                transfer_id = resp.snapshot_transfer_id,
+                chunk_cursor = resp.snapshot_chunk_cursor,
+                next_cursor = resp.snapshot_next_cursor,
+                total_bytes = resp.snapshot_total_bytes,
+                chunk_bytes = resp.snapshot_msgpack.len(),
+                snapshot_version = resp.snapshot_version,
+                remote_repository_version = remote_rank.version,
+                remote_freshness = remote_rank.freshness,
+                terminal_decision_generation = resp.terminal_decision_generation,
+                active_transfer_id = ?receiver_before.as_ref().map(|receiver| receiver.0),
+                active_snapshot_version = ?receiver_before.as_ref().map(|receiver| receiver.1),
+                active_next_cursor = ?receiver_before.as_ref().map(|receiver| receiver.2),
+                active_total_bytes = ?receiver_before.as_ref().map(|receiver| receiver.3),
+                active_terminal_decision_generation = ?receiver_before.as_ref().map(|receiver| receiver.4),
+                active_snapshot_sha256 = ?receiver_before.as_ref().map(|receiver| &receiver.5),
+                incoming_snapshot_sha256 = ?resp.snapshot_sha256,
+                "ignoring stale strict v2 snapshot page"
+            );
+            if let Some(peer) = correlated_peer {
+                finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
+                let fetching_from_source = rt
+                    .state
+                    .lock()
+                    .history_election_fetching_snapshot()
+                    .is_some_and(|source| source.peer() == from);
+                if fetching_from_source {
+                    rt.snapshot_receivers.lock().remove(&from);
+                    rearm_history_election_if_fetching_from(rt, from);
+                }
+            }
+            if event == StrictSnapshotReceiveEvent::StaleIdle
+                && correlated_peer.is_none()
+                && !resp.snapshot_has_more
+                && resp.snapshot_next_cursor == resp.snapshot_total_bytes
+                && rt.repo.current_version() >= resp.snapshot_version
+            {
+                metrics::record_strict_snapshot_receive_event(
+                    StrictSnapshotReceiveEvent::CompletionRetried,
+                );
+                request_history_after_snapshot(
+                    rt,
+                    from,
+                    resp.snapshot_version,
+                    None,
+                    Some(resp.snapshot_transfer_id),
+                )
+                .await;
+            }
+        }
+        SnapshotReceiveOutcome::Restart(event) => {
+            metrics::record_strict_snapshot_receive_event(event);
             if let Some(peer) = correlated_peer {
                 finish_v3_history_transfer(rt, peer, StrictCatchupSessionOutcome::Failed).await;
             }
             rt.snapshot_receivers.lock().remove(&from);
             warn!(
+                topic = %rt.topic,
                 from,
-                "strict v2 snapshot transfer identity or chunk order mismatch"
+                reason = ?event,
+                correlated_v3_history = correlated_peer.is_some(),
+                transfer_id = resp.snapshot_transfer_id,
+                chunk_cursor = resp.snapshot_chunk_cursor,
+                next_cursor = resp.snapshot_next_cursor,
+                total_bytes = resp.snapshot_total_bytes,
+                chunk_bytes = resp.snapshot_msgpack.len(),
+                snapshot_version = resp.snapshot_version,
+                remote_repository_version = remote_rank.version,
+                remote_freshness = remote_rank.freshness,
+                terminal_decision_generation = resp.terminal_decision_generation,
+                active_transfer_id = ?receiver_before.as_ref().map(|receiver| receiver.0),
+                active_snapshot_version = ?receiver_before.as_ref().map(|receiver| receiver.1),
+                active_next_cursor = ?receiver_before.as_ref().map(|receiver| receiver.2),
+                active_total_bytes = ?receiver_before.as_ref().map(|receiver| receiver.3),
+                active_terminal_decision_generation = ?receiver_before.as_ref().map(|receiver| receiver.4),
+                active_snapshot_sha256 = ?receiver_before.as_ref().map(|receiver| &receiver.5),
+                incoming_snapshot_sha256 = ?resp.snapshot_sha256,
+                "strict v2 snapshot page validation failed"
             );
-            rearm_history_election(rt);
+            let (fetching_from_source, election_active) = {
+                let state = rt.state.lock();
+                (
+                    state
+                        .history_election_fetching_snapshot()
+                        .is_some_and(|source| source.peer() == from),
+                    state.history_election_active(),
+                )
+            };
+            if fetching_from_source {
+                rearm_history_election_if_fetching_from(rt, from);
+            } else if !election_active
+                && (receiver_before.is_some() || !resp.request_force_snapshot)
+            {
+                rearm_history_election(rt);
+            }
         }
     }
 }
@@ -6607,7 +7024,7 @@ mod tests {
             Arc,
             atomic::{AtomicI64, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use bytes::Bytes;
@@ -6806,6 +7223,65 @@ mod tests {
 
         assert!(!rt.v3_history.lock().has_active_transfer(peer));
         assert!(rt.state.lock().history_election_pending());
+    }
+
+    #[tokio::test]
+    async fn correlated_stale_snapshot_page_releases_client_and_rearms_current_election() {
+        let (rt, net, _repo) = test_runtime(2, ReplicationConfig::default());
+        begin_snapshot_fetch(&rt, 1);
+        let (peer, transfer) =
+            begin_correlated_history(&rt, &net, 1, 11, 1, StrictCatchupReason::HistoryElection);
+        let chunk = Bytes::from_static(b"x");
+        let mut response = correlated_history_response(1, transfer, 1);
+        response.snapshot_version = 1;
+        response.snapshot_msgpack = chunk;
+        response.too_old_use_snapshot = true;
+        response.request_force_snapshot = true;
+        response.snapshot_transfer_id = 7;
+        response.snapshot_chunk_cursor = 1;
+        response.snapshot_next_cursor = 2;
+        response.snapshot_total_bytes = 2;
+        response.snapshot_sha256 = Bytes::from(vec![0x11; 32]);
+        response.snapshot_has_more = false;
+
+        apply_response(&rt, 1, response).await;
+
+        assert!(!rt.v3_history.lock().has_active_transfer(peer));
+        let state = rt.state.lock();
+        assert!(state.history_election_pending());
+        assert!(state.history_election_fetching_snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn correlated_duplicate_snapshot_page_releases_client_and_rearms_current_election() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
+        let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
+        populate_repo(&source_repo, 96, 4_000);
+        let (sink, sink_net, _sink_repo) = test_runtime(2, cfg);
+        begin_snapshot_fetch(&sink, 96);
+
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first = catchup_response(source_net.drain_captures().pop().unwrap());
+        apply_response(&sink, 1, first.clone()).await;
+        sink_net.drain_captures();
+
+        let (peer, transfer) = begin_correlated_history(
+            &sink,
+            &sink_net,
+            1,
+            11,
+            96,
+            StrictCatchupReason::HistoryElection,
+        );
+        let mut duplicate = first;
+        duplicate.history_transfer = Some(transfer);
+        apply_response(&sink, 1, duplicate).await;
+
+        assert!(!sink.v3_history.lock().has_active_transfer(peer));
+        assert!(!sink.snapshot_receivers.lock().contains_key(&1));
+        let state = sink.state.lock();
+        assert!(state.history_election_pending());
+        assert!(state.history_election_fetching_snapshot().is_none());
     }
 
     #[tokio::test]
@@ -8399,6 +8875,7 @@ mod tests {
             );
             chunk_count += 1;
             let has_more = response.snapshot_has_more;
+            let transfer_id = response.snapshot_transfer_id;
             apply_response(&sink, 1, response).await;
             let captures = sink_net.drain_captures();
             if has_more {
@@ -8413,7 +8890,7 @@ mod tests {
             } else {
                 assert_eq!(captures.len(), 1);
                 let history_request = catchup_request(captures.into_iter().next().unwrap());
-                assert_eq!(history_request.snapshot_transfer_id, 0);
+                assert_eq!(history_request.snapshot_transfer_id, transfer_id);
                 assert!(!history_request.force_snapshot);
                 respond_to_request(&source, 2, history_request).await;
                 assert!(source.snapshot_transfers.lock().is_empty());
@@ -8850,6 +9327,562 @@ mod tests {
         assert_eq!(sink_repo.log(), source_repo.log());
     }
 
+    async fn assert_delayed_final_snapshot_page_retries_completion() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
+        let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
+        populate_repo(&source_repo, 96, 4_000);
+        let (sink, sink_net, sink_repo) = test_runtime(2, cfg);
+        begin_snapshot_fetch(&sink, 96);
+
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_response = catchup_response(source_net.drain_captures().pop().unwrap());
+        let delayed_first = first_response.clone();
+        apply_response(&sink, 1, first_response).await;
+        let mut request = catchup_request(sink_net.drain_captures().pop().unwrap());
+        let delayed_final = loop {
+            respond_to_request(&source, 2, request).await;
+            let response = catchup_response(source_net.drain_captures().pop().unwrap());
+            let has_more = response.snapshot_has_more;
+            if has_more {
+                apply_response(&sink, 1, response).await;
+                request = catchup_request(sink_net.drain_captures().pop().unwrap());
+            } else {
+                assert!(response.snapshot_chunk_cursor > 0);
+                let delayed = response.clone();
+                apply_response(&sink, 1, response).await;
+                break delayed;
+            }
+        };
+
+        sink_net.drain_captures();
+        assert_eq!(sink_repo.current_version(), 96);
+        assert_eq!(sink_repo.log(), source_repo.log());
+        assert!(!sink.state.lock().history_election_pending());
+        assert!(!sink.state.lock().history_election_active());
+
+        apply_response(&sink, 1, delayed_first).await;
+
+        assert!(sink_net.drain_captures().is_empty());
+        assert!(!sink.snapshot_receivers.lock().contains_key(&1));
+        assert!(!sink.state.lock().history_election_pending());
+        assert!(!sink.state.lock().history_election_active());
+
+        let delayed_transfer_id = delayed_final.snapshot_transfer_id;
+        apply_response(&sink, 1, delayed_final).await;
+
+        let captures = sink_net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        let completion_retry = catchup_request(captures.into_iter().next().unwrap());
+        assert_eq!(completion_retry.since_version, 96);
+        assert!(!completion_retry.force_snapshot);
+        assert_eq!(completion_retry.snapshot_transfer_id, delayed_transfer_id);
+        assert_eq!(completion_retry.snapshot_chunk_cursor, 0);
+        respond_to_request(&source, 2, completion_retry).await;
+        source_net.drain_captures();
+        assert!(!source.snapshot_transfers.lock().contains_key(&2));
+        assert_eq!(sink_repo.current_version(), 96);
+        assert_eq!(sink_repo.log(), source_repo.log());
+        assert!(!sink.snapshot_receivers.lock().contains_key(&1));
+        assert!(!sink.state.lock().history_election_pending());
+        assert!(!sink.state.lock().history_election_active());
+    }
+
+    #[tokio::test]
+    async fn delayed_final_forced_snapshot_page_retries_completion_without_rearming() {
+        assert_delayed_final_snapshot_page_retries_completion().await;
+    }
+
+    #[tokio::test]
+    async fn delayed_single_page_fallback_snapshot_is_acknowledged_without_reinstall_or_rearm() {
+        let (source, source_net, source_repo) = test_runtime(1, ReplicationConfig::default());
+        populate_repo(&source_repo, 1, 8);
+        let (sink, sink_net, sink_repo) = test_runtime(2, ReplicationConfig::default());
+        begin_snapshot_fetch(&sink, 1);
+
+        let mut request = force_snapshot_request();
+        request.force_snapshot = false;
+        respond_to_request(&source, 2, request).await;
+        let response = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(!response.request_force_snapshot);
+        assert!(response.too_old_use_snapshot);
+        assert_ne!(response.snapshot_transfer_id, 0);
+        assert!(!response.snapshot_has_more);
+        assert_eq!(response.snapshot_chunk_cursor, 0);
+        let delayed = response.clone();
+
+        apply_response(&sink, 1, response).await;
+        sink_net.drain_captures();
+        assert_eq!(sink_repo.current_version(), 1);
+        assert_eq!(sink_repo.log(), source_repo.log());
+        assert!(!sink.state.lock().history_election_active());
+
+        apply_response(&sink, 1, delayed).await;
+
+        let captures = sink_net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        let completion_retry = catchup_request(captures.into_iter().next().unwrap());
+        assert_eq!(completion_retry.since_version, 1);
+        assert!(!completion_retry.force_snapshot);
+        assert!(!sink.snapshot_receivers.lock().contains_key(&1));
+        assert!(!sink.state.lock().history_election_pending());
+        assert!(!sink.state.lock().history_election_active());
+        assert_eq!(sink_repo.current_version(), 1);
+        assert_eq!(sink_repo.log(), source_repo.log());
+    }
+
+    #[tokio::test]
+    async fn superseded_v2_snapshot_page_does_not_abort_replacement_transfer() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
+        let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
+        populate_repo(&source_repo, 96, 4_000);
+        let (sink, sink_net, sink_repo) = test_runtime(2, cfg);
+        begin_snapshot_fetch(&sink, 96);
+
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_a = catchup_response(source_net.drain_captures().pop().unwrap());
+        let delayed_first_a = first_a.clone();
+        apply_response(&sink, 1, first_a).await;
+        let continuation_a = catchup_request(sink_net.drain_captures().pop().unwrap());
+        respond_to_request(&source, 2, continuation_a).await;
+        let delayed_a = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(delayed_a.snapshot_chunk_cursor > 0);
+
+        source.snapshot_transfers.lock().clear();
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_b = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert_ne!(first_b.snapshot_transfer_id, delayed_a.snapshot_transfer_id);
+        // Model the receiver reset performed when the old transfer is
+        // explicitly rejected or its election watchdog restarts recovery.
+        sink.snapshot_receivers.lock().clear();
+        apply_response(&sink, 1, first_b).await;
+        let mut continuation_b = catchup_request(sink_net.drain_captures().pop().unwrap());
+        let receiver_before_delayed_page = {
+            let receivers = sink.snapshot_receivers.lock();
+            let receiver = receivers.get(&1).unwrap();
+            (
+                receiver.id,
+                receiver.next_cursor,
+                receiver.snapshot_msgpack.clone(),
+            )
+        };
+        let election_pending_before_delayed_page = sink.state.lock().history_election_pending();
+
+        apply_response(&sink, 1, delayed_first_a).await;
+
+        assert!(sink_net.drain_captures().is_empty());
+        let receiver_after_delayed_first_page = {
+            let receivers = sink.snapshot_receivers.lock();
+            let receiver = receivers.get(&1).unwrap();
+            (
+                receiver.id,
+                receiver.next_cursor,
+                receiver.snapshot_msgpack.clone(),
+            )
+        };
+        assert_eq!(
+            receiver_after_delayed_first_page,
+            receiver_before_delayed_page
+        );
+
+        apply_response(&sink, 1, delayed_a).await;
+
+        assert!(sink_net.drain_captures().is_empty());
+        let receiver_after_delayed_page = {
+            let receivers = sink.snapshot_receivers.lock();
+            let receiver = receivers.get(&1).unwrap();
+            (
+                receiver.id,
+                receiver.next_cursor,
+                receiver.snapshot_msgpack.clone(),
+            )
+        };
+        assert_eq!(receiver_after_delayed_page, receiver_before_delayed_page);
+        assert!(
+            sink.state
+                .lock()
+                .history_election_fetching_snapshot()
+                .is_some()
+        );
+        assert_eq!(
+            sink.state.lock().history_election_pending(),
+            election_pending_before_delayed_page
+        );
+        assert_eq!(sink_repo.current_version(), 0);
+
+        loop {
+            respond_to_request(&source, 2, continuation_b).await;
+            let response = catchup_response(source_net.drain_captures().pop().unwrap());
+            let has_more = response.snapshot_has_more;
+            apply_response(&sink, 1, response).await;
+            let captures = sink_net.drain_captures();
+            if has_more {
+                assert_eq!(captures.len(), 1);
+                continuation_b = catchup_request(captures.into_iter().next().unwrap());
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(sink_repo.current_version(), 96);
+        assert_eq!(sink_repo.log(), source_repo.log());
+    }
+
+    #[tokio::test]
+    async fn expired_partial_snapshot_does_not_block_replacement_first_page() {
+        let cfg = ReplicationConfig::default()
+            .with_strict_max_catchup_bytes(256)
+            .with_pending_propose_ttl(Duration::from_secs(60));
+        let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
+        populate_repo(&source_repo, 96, 4_000);
+        let (sink, sink_net, _sink_repo) = test_runtime(2, cfg);
+        begin_snapshot_fetch(&sink, 96);
+
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_a = catchup_response(source_net.drain_captures().pop().unwrap());
+        apply_response(&sink, 1, first_a.clone()).await;
+        sink_net.drain_captures();
+        {
+            let mut receivers = sink.snapshot_receivers.lock();
+            receivers.get_mut(&1).unwrap().last_used_at = Instant::now()
+                .checked_sub(sink.cfg.pending_propose_ttl())
+                .unwrap();
+        }
+
+        source.snapshot_transfers.lock().clear();
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_b = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert_ne!(first_b.snapshot_transfer_id, first_a.snapshot_transfer_id);
+        apply_response(&sink, 1, first_b.clone()).await;
+
+        let receivers = sink.snapshot_receivers.lock();
+        assert_eq!(receivers.get(&1).unwrap().id, first_b.snapshot_transfer_id);
+    }
+
+    #[tokio::test]
+    async fn expired_current_snapshot_continuation_rearms_election() {
+        let cfg = ReplicationConfig::default()
+            .with_strict_max_catchup_bytes(256)
+            .with_pending_propose_ttl(Duration::from_secs(60));
+        let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
+        populate_repo(&source_repo, 96, 4_000);
+        let (sink, sink_net, _sink_repo) = test_runtime(2, cfg);
+        begin_snapshot_fetch(&sink, 96);
+
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first = catchup_response(source_net.drain_captures().pop().unwrap());
+        apply_response(&sink, 1, first).await;
+        let continuation = catchup_request(sink_net.drain_captures().pop().unwrap());
+        respond_to_request(&source, 2, continuation).await;
+        let continuation_response = catchup_response(source_net.drain_captures().pop().unwrap());
+        {
+            let mut receivers = sink.snapshot_receivers.lock();
+            receivers.get_mut(&1).unwrap().last_used_at = Instant::now()
+                .checked_sub(sink.cfg.pending_propose_ttl())
+                .unwrap();
+        }
+        crate::replications::strict::runtime::run_gc_pass(&sink);
+        assert!(sink.snapshot_receivers.lock().contains_key(&1));
+        let mut unrelated_request = force_snapshot_request();
+        unrelated_request.src_node = 3;
+        respond_to_request(&sink, 3, unrelated_request).await;
+        sink_net.drain_captures();
+        assert!(sink.snapshot_receivers.lock().contains_key(&1));
+
+        apply_response(&sink, 1, continuation_response).await;
+
+        assert!(!sink.snapshot_receivers.lock().contains_key(&1));
+        let state = sink.state.lock();
+        assert!(state.history_election_pending());
+        assert!(state.history_election_fetching_snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn delayed_rejection_does_not_abort_replacement_snapshot_receiver() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
+        let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
+        populate_repo(&source_repo, 96, 4_000);
+        let (sink, sink_net, _sink_repo) = test_runtime(2, cfg.clone());
+        begin_snapshot_fetch(&sink, 96);
+
+        let mut warmup_request = force_snapshot_request();
+        warmup_request.src_node = 3;
+        respond_to_request(&source, 3, warmup_request).await;
+        source_net.drain_captures();
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_a = catchup_response(source_net.drain_captures().pop().unwrap());
+        apply_response(&sink, 1, first_a.clone()).await;
+        let continuation_a = catchup_request(sink_net.drain_captures().pop().unwrap());
+
+        let restarted = StrictRuntime::new(
+            source_repo,
+            1,
+            2,
+            "channels".to_owned(),
+            source_net.clone(),
+            CancellationToken::new(),
+            Arc::new(cfg),
+        );
+        respond_to_request(&restarted, 2, force_snapshot_request()).await;
+        let first_b = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert_ne!(first_b.snapshot_transfer_id, first_a.snapshot_transfer_id);
+        sink.snapshot_receivers.lock().clear();
+        apply_response(&sink, 1, first_b.clone()).await;
+        sink_net.drain_captures();
+
+        restarted.snapshot_transfers.lock().clear();
+        respond_to_request(&restarted, 2, continuation_a).await;
+        let delayed_rejection = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(delayed_rejection.snapshot_transfer_rejected);
+        assert_eq!(
+            delayed_rejection.snapshot_transfer_id,
+            first_a.snapshot_transfer_id
+        );
+        apply_response(&sink, 1, delayed_rejection).await;
+
+        let receivers = sink.snapshot_receivers.lock();
+        assert_eq!(receivers.get(&1).unwrap().id, first_b.snapshot_transfer_id);
+        assert!(
+            sink.state
+                .lock()
+                .history_election_fetching_snapshot()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_completion_does_not_retire_newer_pinned_snapshot() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
+        let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
+        populate_repo(&source_repo, 96, 4_000);
+        let (sink, sink_net, _sink_repo) = test_runtime(2, cfg.clone());
+        begin_snapshot_fetch(&sink, 96);
+
+        let mut warmup_request = force_snapshot_request();
+        warmup_request.src_node = 3;
+        respond_to_request(&source, 3, warmup_request).await;
+        source_net.drain_captures();
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_a = catchup_response(source_net.drain_captures().pop().unwrap());
+        apply_response(&sink, 1, first_a).await;
+        let mut request = catchup_request(sink_net.drain_captures().pop().unwrap());
+        let delayed_final_a = loop {
+            respond_to_request(&source, 2, request).await;
+            let response = catchup_response(source_net.drain_captures().pop().unwrap());
+            let has_more = response.snapshot_has_more;
+            let delayed = response.clone();
+            apply_response(&sink, 1, response).await;
+            if has_more {
+                request = catchup_request(sink_net.drain_captures().pop().unwrap());
+            } else {
+                break delayed;
+            }
+        };
+        sink_net.drain_captures();
+
+        let restarted = StrictRuntime::new(
+            source_repo,
+            1,
+            2,
+            "channels".to_owned(),
+            source_net.clone(),
+            CancellationToken::new(),
+            Arc::new(cfg),
+        );
+        respond_to_request(&restarted, 2, force_snapshot_request()).await;
+        let first_b = catchup_response(source_net.drain_captures().pop().unwrap());
+        let transfer_b = first_b.snapshot_transfer_id;
+        assert_ne!(transfer_b, delayed_final_a.snapshot_transfer_id);
+
+        apply_response(&sink, 1, delayed_final_a.clone()).await;
+        let captures = sink_net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        let completion_a = catchup_request(captures.into_iter().next().unwrap());
+        assert_eq!(
+            completion_a.snapshot_transfer_id,
+            delayed_final_a.snapshot_transfer_id
+        );
+        respond_to_request(&restarted, 2, completion_a).await;
+        source_net.drain_captures();
+
+        assert_eq!(
+            restarted.snapshot_transfers.lock().get(&2).unwrap().id,
+            transfer_b
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_v2_snapshot_continuation_does_not_replay_pinned_image() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
+        let (source, source_net, source_repo) = test_runtime(1, cfg);
+        populate_repo(&source_repo, 96, 4_000);
+
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_a = catchup_response(source_net.drain_captures().pop().unwrap());
+        let continuation_a = StrictCatchupReq {
+            src_node: 2,
+            since_version: first_a.snapshot_version,
+            chunk_token: first_a.snapshot_version,
+            force_snapshot: true,
+            history_probe_only: false,
+            terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
+            terminal_decision_generation: first_a.terminal_decision_generation,
+            snapshot_transfer_id: first_a.snapshot_transfer_id,
+            snapshot_chunk_cursor: first_a.snapshot_next_cursor,
+            history_transfer: None,
+        };
+
+        source.snapshot_transfers.lock().clear();
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_b = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert_ne!(first_b.snapshot_transfer_id, first_a.snapshot_transfer_id);
+        let pinned_before_stale_request = {
+            let transfers = source.snapshot_transfers.lock();
+            let transfer = transfers.get(&2).unwrap();
+            (transfer.id, transfer.last_used_at)
+        };
+        respond_to_request(&source, 2, continuation_a).await;
+
+        assert!(source_net.drain_captures().is_empty());
+        let pinned_after_stale_request = {
+            let transfers = source.snapshot_transfers.lock();
+            let transfer = transfers.get(&2).unwrap();
+            (transfer.id, transfer.last_used_at)
+        };
+        assert_eq!(pinned_after_stale_request, pinned_before_stale_request);
+    }
+
+    #[tokio::test]
+    async fn invalid_cursor_does_not_replay_or_refresh_pinned_snapshot() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
+        let (source, source_net, source_repo) = test_runtime(1, cfg);
+        populate_repo(&source_repo, 96, 4_000);
+
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first = catchup_response(source_net.drain_captures().pop().unwrap());
+        let pinned_before = {
+            let transfers = source.snapshot_transfers.lock();
+            let transfer = transfers.get(&2).unwrap();
+            (transfer.id, transfer.last_used_at)
+        };
+        let invalid = StrictCatchupReq {
+            src_node: 2,
+            since_version: first.snapshot_version,
+            chunk_token: first.snapshot_version,
+            force_snapshot: true,
+            history_probe_only: false,
+            terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
+            terminal_decision_generation: first.terminal_decision_generation,
+            snapshot_transfer_id: first.snapshot_transfer_id,
+            snapshot_chunk_cursor: first.snapshot_total_bytes.saturating_add(1),
+            history_transfer: None,
+        };
+
+        respond_to_request(&source, 2, invalid).await;
+
+        assert!(source_net.drain_captures().is_empty());
+        let pinned_after = {
+            let transfers = source.snapshot_transfers.lock();
+            let transfer = transfers.get(&2).unwrap();
+            (transfer.id, transfer.last_used_at)
+        };
+        assert_eq!(pinned_after, pinned_before);
+    }
+
+    #[tokio::test]
+    async fn stale_v2_snapshot_continuation_without_pinned_image_is_rejected() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
+        let (source, source_net, source_repo) = test_runtime(1, cfg);
+        populate_repo(&source_repo, 96, 4_000);
+
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first = catchup_response(source_net.drain_captures().pop().unwrap());
+        let continuation = StrictCatchupReq {
+            src_node: 2,
+            since_version: first.snapshot_version,
+            chunk_token: first.snapshot_version,
+            force_snapshot: true,
+            history_probe_only: false,
+            terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
+            terminal_decision_generation: first.terminal_decision_generation,
+            snapshot_transfer_id: first.snapshot_transfer_id,
+            snapshot_chunk_cursor: first.snapshot_next_cursor,
+            history_transfer: None,
+        };
+        source.snapshot_transfers.lock().clear();
+
+        respond_to_request(&source, 2, continuation).await;
+
+        let rejection = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(rejection.snapshot_transfer_rejected);
+        assert!(!source.snapshot_transfers.lock().contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn stale_v2_snapshot_continuation_without_receiver_preserves_current_election() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
+        let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
+        populate_repo(&source_repo, 96, 4_000);
+        let (sink, sink_net, sink_repo) = test_runtime(2, cfg);
+        begin_snapshot_fetch(&sink, 96);
+
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first = catchup_response(source_net.drain_captures().pop().unwrap());
+        let continuation = StrictCatchupReq {
+            src_node: 2,
+            since_version: first.snapshot_version,
+            chunk_token: first.snapshot_version,
+            force_snapshot: true,
+            history_probe_only: false,
+            terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
+            terminal_decision_generation: first.terminal_decision_generation,
+            snapshot_transfer_id: first.snapshot_transfer_id,
+            snapshot_chunk_cursor: first.snapshot_next_cursor,
+            history_transfer: None,
+        };
+        respond_to_request(&source, 2, continuation).await;
+        let stale_continuation = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(stale_continuation.snapshot_chunk_cursor > 0);
+
+        apply_response(&sink, 1, stale_continuation).await;
+
+        assert!(sink_net.drain_captures().is_empty());
+        assert!(!sink.snapshot_receivers.lock().contains_key(&1));
+        assert_eq!(sink_repo.current_version(), 0);
+        assert!(
+            sink.state
+                .lock()
+                .history_election_fetching_snapshot()
+                .is_some_and(|source| source.peer() == 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_stale_v2_snapshot_page_does_not_rearm_idle_election() {
+        let (sink, sink_net, sink_repo) = test_runtime(2, ReplicationConfig::default());
+
+        apply_response(
+            &sink,
+            1,
+            StrictCatchupResp {
+                snapshot_version: 1,
+                too_old_use_snapshot: true,
+                history_version: 1,
+                history_node: 1,
+                request_force_snapshot: true,
+                next_terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
+                snapshot_transfer_id: 7,
+                snapshot_sha256: Bytes::new(),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(sink_net.drain_captures().is_empty());
+        assert_eq!(sink_repo.current_version(), 0);
+        assert!(!sink.state.lock().history_election_pending());
+        assert!(!sink.state.lock().history_election_active());
+    }
+
     #[tokio::test]
     async fn admission_fallback_snapshot_received_while_idle_rearms_history_election() {
         let (sink, sink_net, sink_repo) = test_runtime(2, ReplicationConfig::default());
@@ -9097,7 +10130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_snapshot_transfer_restarts_from_a_new_source_image_after_loss() {
+    async fn v2_snapshot_transfer_restarts_after_source_image_loss_is_rejected() {
         let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
         let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
         populate_repo(&source_repo, 96, 1_000);
@@ -9109,39 +10142,51 @@ mod tests {
         assert!(first_response.snapshot_has_more);
         let first_id = first_response.snapshot_transfer_id;
         apply_response(&sink, 1, first_response).await;
-        let mut request = catchup_request(sink_net.drain_captures().pop().unwrap());
+        let stale_continuation = catchup_request(sink_net.drain_captures().pop().unwrap());
 
         // Model a source restart after application state changed: its
-        // ephemeral transfer cache is gone, so it must select a new image at
-        // cursor zero rather than splice bytes into the old one.
+        // ephemeral transfer cache is gone. It must reject the uncorrelated
+        // continuation rather than turn it into a new cursor-zero image.
         populate_repo(&source_repo, 97, 20_000);
         source.snapshot_transfers.lock().clear();
-        let mut saw_replacement = false;
+        respond_to_request(&source, 2, stale_continuation).await;
+        let rejection = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(rejection.snapshot_transfer_rejected);
+        apply_response(&sink, 1, rejection).await;
+        assert!(sink.state.lock().history_election_pending());
+
+        begin_snapshot_fetch(&sink, 97);
+        respond_to_request(&source, 2, force_snapshot_request()).await;
+        let first_replacement = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert_ne!(first_replacement.snapshot_transfer_id, first_id);
+        assert_eq!(first_replacement.snapshot_chunk_cursor, 0);
+        let replacement_has_more = first_replacement.snapshot_has_more;
+        apply_response(&sink, 1, first_replacement).await;
+        let captures = sink_net.drain_captures();
+        let mut request = replacement_has_more
+            .then(|| catchup_request(captures.into_iter().next().expect("snapshot continuation")));
         loop {
-            respond_to_request(&source, 2, request).await;
+            let Some(next_request) = request else {
+                break;
+            };
+            respond_to_request(&source, 2, next_request).await;
             let response = catchup_response(source_net.drain_captures().pop().unwrap());
-            if !saw_replacement {
-                assert_ne!(response.snapshot_transfer_id, first_id);
-                assert_eq!(response.snapshot_chunk_cursor, 0);
-                saw_replacement = true;
-            }
             let has_more = response.snapshot_has_more;
             apply_response(&sink, 1, response).await;
             let captures = sink_net.drain_captures();
             if has_more {
-                request = catchup_request(captures.into_iter().next().unwrap());
+                request = Some(catchup_request(captures.into_iter().next().unwrap()));
             } else {
-                break;
+                request = None;
             }
         }
 
-        assert!(saw_replacement);
         assert_eq!(sink_repo.current_version(), 97);
         assert_eq!(sink_repo.log(), source_repo.log());
     }
 
     #[tokio::test]
-    async fn responder_restart_reusing_a_transfer_id_rearms_snapshot_election() {
+    async fn responder_restart_rejects_missing_snapshot_transfer() {
         let cfg = ReplicationConfig::default().with_strict_max_catchup_bytes(256);
         let (source, source_net, source_repo) = test_runtime(1, cfg.clone());
         populate_repo(&source_repo, 96, 500);
@@ -9154,9 +10199,8 @@ mod tests {
         apply_response(&sink, 1, first_response.clone()).await;
         let continuation = catchup_request(sink_net.drain_captures().pop().unwrap());
 
-        // A real runtime restart starts the ephemeral id counter at one
-        // again. Even if that collides with the prior id, the receiver must
-        // refuse to append a changed image at cursor zero.
+        // A real runtime restart loses the ephemeral image. It must reject the
+        // old continuation rather than reuse a transfer id for new bytes.
         populate_repo(&source_repo, 97, 9_000);
         let restarted = StrictRuntime::new(
             source_repo,
@@ -9169,11 +10213,7 @@ mod tests {
         );
         respond_to_request(&restarted, 2, continuation).await;
         let restarted_response = catchup_response(source_net.drain_captures().pop().unwrap());
-        assert_eq!(
-            restarted_response.snapshot_transfer_id,
-            first_response.snapshot_transfer_id
-        );
-        assert_eq!(restarted_response.snapshot_chunk_cursor, 0);
+        assert!(restarted_response.snapshot_transfer_rejected);
         apply_response(&sink, 1, restarted_response).await;
 
         assert_eq!(sink_repo.current_version(), 0);
@@ -9305,7 +10345,7 @@ mod tests {
             next_terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
             terminal_states_has_more: false,
             terminal_sync_only: false,
-            request_force_snapshot: true,
+            request_force_snapshot: false,
             request_history_probe_only: false,
             terminal_decision_generation: 0,
             snapshot_transfer_id: 11,
@@ -9335,7 +10375,7 @@ mod tests {
             next_terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
             terminal_states_has_more: false,
             terminal_sync_only: false,
-            request_force_snapshot: true,
+            request_force_snapshot: false,
             request_history_probe_only: false,
             terminal_decision_generation: 0,
             snapshot_transfer_id: 22,
@@ -9349,14 +10389,15 @@ mod tests {
         };
         apply_response(&sink, 3, second_response).await;
 
-        let receivers = sink.snapshot_receivers.lock();
-        assert_eq!(receivers.len(), 1);
-        assert_eq!(
-            receivers.get(&1).unwrap().snapshot_msgpack.as_slice(),
-            b"abcdef"
-        );
-        assert!(!receivers.contains_key(&3));
-        drop(receivers);
+        {
+            let receivers = sink.snapshot_receivers.lock();
+            assert_eq!(receivers.len(), 1);
+            assert_eq!(
+                receivers.get(&1).unwrap().snapshot_msgpack.as_slice(),
+                b"abcdef"
+            );
+            assert!(!receivers.contains_key(&3));
+        }
         assert!(sink.state.lock().history_election_pending());
     }
 

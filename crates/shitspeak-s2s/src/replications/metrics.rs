@@ -276,6 +276,134 @@ pub(crate) enum StrictCatchupDuplicateOutcome {
     CachedReplay,
 }
 
+/// Bounded receiver-side outcomes for strict repository snapshot pages.
+/// Exact peer, transfer, cursor, version, and digest values belong in logs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictSnapshotReceiveEvent {
+    Continued,
+    Completed,
+    DuplicateActive,
+    StaleIdle,
+    StaleForeignTransfer,
+    StaleMissingReceiver,
+    CompletionRetried,
+    AmbiguousLegacy,
+    SourceRejected,
+    RestartInvalidEnvelope,
+    RestartInvalidCursor,
+    RestartFormatMismatch,
+    RestartMetadataMismatch,
+    RestartChunkOrder,
+    RestartResourceLimit,
+    RestartDigestMismatch,
+    RestartExpiredReceiver,
+    RestartMissingState,
+}
+
+impl StrictSnapshotReceiveEvent {
+    fn index(self) -> usize {
+        match self {
+            Self::Continued => 0,
+            Self::Completed => 1,
+            Self::DuplicateActive => 2,
+            Self::StaleIdle => 3,
+            Self::StaleForeignTransfer => 4,
+            Self::StaleMissingReceiver => 5,
+            Self::CompletionRetried => 6,
+            Self::AmbiguousLegacy => 7,
+            Self::SourceRejected => 8,
+            Self::RestartInvalidEnvelope => 9,
+            Self::RestartInvalidCursor => 10,
+            Self::RestartFormatMismatch => 11,
+            Self::RestartMetadataMismatch => 12,
+            Self::RestartChunkOrder => 13,
+            Self::RestartResourceLimit => 14,
+            Self::RestartDigestMismatch => 15,
+            Self::RestartExpiredReceiver => 16,
+            Self::RestartMissingState => 17,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Continued => "continued",
+            Self::Completed => "completed",
+            Self::DuplicateActive => "duplicate_active",
+            Self::StaleIdle => "stale_idle",
+            Self::StaleForeignTransfer => "stale_foreign_transfer",
+            Self::StaleMissingReceiver => "stale_missing_receiver",
+            Self::CompletionRetried => "completion_retried",
+            Self::AmbiguousLegacy => "ambiguous_legacy",
+            Self::SourceRejected => "source_rejected",
+            Self::RestartInvalidEnvelope => "restart_invalid_envelope",
+            Self::RestartInvalidCursor => "restart_invalid_cursor",
+            Self::RestartFormatMismatch => "restart_format_mismatch",
+            Self::RestartMetadataMismatch => "restart_metadata_mismatch",
+            Self::RestartChunkOrder => "restart_chunk_order",
+            Self::RestartResourceLimit => "restart_resource_limit",
+            Self::RestartDigestMismatch => "restart_digest_mismatch",
+            Self::RestartExpiredReceiver => "restart_expired_receiver",
+            Self::RestartMissingState => "restart_missing_state",
+        }
+    }
+}
+
+/// Bounded responder-side outcomes for strict repository snapshot requests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictSnapshotResponderEvent {
+    ImagePagePrepared,
+    InitialPagePrepared,
+    ContinuationPrepared,
+    CompletionAcknowledged,
+    StaleTransferIgnored,
+    StaleTransferRejected,
+    InvalidCursorIgnored,
+    InvalidCursorRejected,
+    MissingTransferRejected,
+    TransferRejected,
+    FenceInvalidated,
+    ResponseSendFailed,
+    ResponseSuppressed,
+}
+
+impl StrictSnapshotResponderEvent {
+    fn index(self) -> usize {
+        match self {
+            Self::ImagePagePrepared => 0,
+            Self::InitialPagePrepared => 1,
+            Self::ContinuationPrepared => 2,
+            Self::CompletionAcknowledged => 3,
+            Self::StaleTransferIgnored => 4,
+            Self::StaleTransferRejected => 5,
+            Self::InvalidCursorIgnored => 6,
+            Self::InvalidCursorRejected => 7,
+            Self::MissingTransferRejected => 8,
+            Self::TransferRejected => 9,
+            Self::FenceInvalidated => 10,
+            Self::ResponseSendFailed => 11,
+            Self::ResponseSuppressed => 12,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ImagePagePrepared => "image_page_prepared",
+            Self::InitialPagePrepared => "initial_page_prepared",
+            Self::ContinuationPrepared => "continuation_prepared",
+            Self::CompletionAcknowledged => "completion_acknowledged",
+            Self::StaleTransferIgnored => "stale_transfer_ignored",
+            Self::StaleTransferRejected => "stale_transfer_rejected",
+            Self::InvalidCursorIgnored => "invalid_cursor_ignored",
+            Self::InvalidCursorRejected => "invalid_cursor_rejected",
+            Self::MissingTransferRejected => "missing_transfer_rejected",
+            Self::TransferRejected => "transfer_rejected",
+            Self::FenceInvalidated => "fence_invalidated",
+            Self::ResponseSendFailed => "response_send_failed",
+            Self::ResponseSuppressed => "response_suppressed",
+        }
+    }
+}
+
 impl StrictCatchupDuplicateOutcome {
     fn index(self) -> usize {
         match self {
@@ -648,6 +776,8 @@ const STRICT_CATCHUP_SEND_METRIC_COUNT: usize = CATCHUP_REASON_COUNT
     * STRICT_CATCHUP_LANE_COUNT
     * STRICT_CATCHUP_SEND_OUTCOME_COUNT;
 const STRICT_CATCHUP_DUPLICATE_OUTCOME_COUNT: usize = 2;
+const STRICT_SNAPSHOT_RECEIVE_EVENT_COUNT: usize = 18;
+const STRICT_SNAPSHOT_RESPONDER_EVENT_COUNT: usize = 13;
 const STRICT_CATCHUP_BACKPRESSURE_EVENT_COUNT: usize = 3;
 const STRICT_CATCHUP_BACKPRESSURE_METRIC_COUNT: usize =
     CATCHUP_REASON_COUNT * CATCHUP_PHASE_COUNT * STRICT_CATCHUP_BACKPRESSURE_EVENT_COUNT;
@@ -711,6 +841,43 @@ const STRICT_CATCHUP_DUPLICATE_OUTCOMES: [StrictCatchupDuplicateOutcome;
     STRICT_CATCHUP_DUPLICATE_OUTCOME_COUNT] = [
     StrictCatchupDuplicateOutcome::Suppressed,
     StrictCatchupDuplicateOutcome::CachedReplay,
+];
+const STRICT_SNAPSHOT_RECEIVE_EVENTS: [StrictSnapshotReceiveEvent;
+    STRICT_SNAPSHOT_RECEIVE_EVENT_COUNT] = [
+    StrictSnapshotReceiveEvent::Continued,
+    StrictSnapshotReceiveEvent::Completed,
+    StrictSnapshotReceiveEvent::DuplicateActive,
+    StrictSnapshotReceiveEvent::StaleIdle,
+    StrictSnapshotReceiveEvent::StaleForeignTransfer,
+    StrictSnapshotReceiveEvent::StaleMissingReceiver,
+    StrictSnapshotReceiveEvent::CompletionRetried,
+    StrictSnapshotReceiveEvent::AmbiguousLegacy,
+    StrictSnapshotReceiveEvent::SourceRejected,
+    StrictSnapshotReceiveEvent::RestartInvalidEnvelope,
+    StrictSnapshotReceiveEvent::RestartInvalidCursor,
+    StrictSnapshotReceiveEvent::RestartFormatMismatch,
+    StrictSnapshotReceiveEvent::RestartMetadataMismatch,
+    StrictSnapshotReceiveEvent::RestartChunkOrder,
+    StrictSnapshotReceiveEvent::RestartResourceLimit,
+    StrictSnapshotReceiveEvent::RestartDigestMismatch,
+    StrictSnapshotReceiveEvent::RestartExpiredReceiver,
+    StrictSnapshotReceiveEvent::RestartMissingState,
+];
+const STRICT_SNAPSHOT_RESPONDER_EVENTS: [StrictSnapshotResponderEvent;
+    STRICT_SNAPSHOT_RESPONDER_EVENT_COUNT] = [
+    StrictSnapshotResponderEvent::ImagePagePrepared,
+    StrictSnapshotResponderEvent::InitialPagePrepared,
+    StrictSnapshotResponderEvent::ContinuationPrepared,
+    StrictSnapshotResponderEvent::CompletionAcknowledged,
+    StrictSnapshotResponderEvent::StaleTransferIgnored,
+    StrictSnapshotResponderEvent::StaleTransferRejected,
+    StrictSnapshotResponderEvent::InvalidCursorIgnored,
+    StrictSnapshotResponderEvent::InvalidCursorRejected,
+    StrictSnapshotResponderEvent::MissingTransferRejected,
+    StrictSnapshotResponderEvent::TransferRejected,
+    StrictSnapshotResponderEvent::FenceInvalidated,
+    StrictSnapshotResponderEvent::ResponseSendFailed,
+    StrictSnapshotResponderEvent::ResponseSuppressed,
 ];
 const ALL_STRICT_CATCHUP_BACKPRESSURE_EVENTS: [StrictCatchupBackpressureEvent;
     STRICT_CATCHUP_BACKPRESSURE_EVENT_COUNT] = [
@@ -828,6 +995,10 @@ static STRICT_CATCHUP_SEND_BYTES: [AtomicU64; STRICT_CATCHUP_SEND_METRIC_COUNT] 
     [const { AtomicU64::new(0) }; STRICT_CATCHUP_SEND_METRIC_COUNT];
 static STRICT_CATCHUP_DUPLICATES: [AtomicU64; STRICT_CATCHUP_DUPLICATE_OUTCOME_COUNT] =
     [const { AtomicU64::new(0) }; STRICT_CATCHUP_DUPLICATE_OUTCOME_COUNT];
+static STRICT_SNAPSHOT_RECEIVE_EVENTS_TOTAL: [AtomicU64; STRICT_SNAPSHOT_RECEIVE_EVENT_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_SNAPSHOT_RECEIVE_EVENT_COUNT];
+static STRICT_SNAPSHOT_RESPONDER_EVENTS_TOTAL: [AtomicU64; STRICT_SNAPSHOT_RESPONDER_EVENT_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_SNAPSHOT_RESPONDER_EVENT_COUNT];
 static STRICT_CATCHUP_BACKPRESSURE_EVENTS: [AtomicU64; STRICT_CATCHUP_BACKPRESSURE_METRIC_COUNT] =
     [const { AtomicU64::new(0) }; STRICT_CATCHUP_BACKPRESSURE_METRIC_COUNT];
 static STRICT_CATCHUP_BACKOFF_DELAY_MS: [AtomicU64; CATCHUP_REASON_COUNT * CATCHUP_PHASE_COUNT] =
@@ -1183,6 +1354,14 @@ pub(crate) fn record_strict_catchup_send_attempt(
 
 pub(crate) fn record_strict_catchup_duplicate(outcome: StrictCatchupDuplicateOutcome) {
     increment(&STRICT_CATCHUP_DUPLICATES[outcome.index()], 1);
+}
+
+pub(crate) fn record_strict_snapshot_receive_event(event: StrictSnapshotReceiveEvent) {
+    increment(&STRICT_SNAPSHOT_RECEIVE_EVENTS_TOTAL[event.index()], 1);
+}
+
+pub(crate) fn record_strict_snapshot_responder_event(event: StrictSnapshotResponderEvent) {
+    increment(&STRICT_SNAPSHOT_RESPONDER_EVENTS_TOTAL[event.index()], 1);
 }
 
 pub(crate) fn record_strict_catchup_backpressure(
@@ -1707,6 +1886,20 @@ fn strict_catchup_v3_metric_samples() -> Vec<PrometheusSample> {
             STRICT_CATCHUP_DUPLICATES[outcome.index()].load(Ordering::Relaxed) as f64,
         ));
     }
+    for event in STRICT_SNAPSHOT_RECEIVE_EVENTS {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_snapshot_receive_events_total",
+            vec![("event".to_owned(), event.label().to_owned())],
+            STRICT_SNAPSHOT_RECEIVE_EVENTS_TOTAL[event.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    for event in STRICT_SNAPSHOT_RESPONDER_EVENTS {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_snapshot_responder_events_total",
+            vec![("event".to_owned(), event.label().to_owned())],
+            STRICT_SNAPSHOT_RESPONDER_EVENTS_TOTAL[event.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
     samples.push(PrometheusSample::new(
         "shitspeak_s2s_strict_replication_catchup_bulk_in_flight_bytes",
         Vec::new(),
@@ -1882,6 +2075,10 @@ mod tests {
             1_024,
         );
         record_strict_catchup_duplicate(StrictCatchupDuplicateOutcome::CachedReplay);
+        record_strict_snapshot_receive_event(StrictSnapshotReceiveEvent::StaleForeignTransfer);
+        record_strict_snapshot_responder_event(
+            StrictSnapshotResponderEvent::CompletionAcknowledged,
+        );
         record_strict_catchup_backpressure(
             CatchupReason::PeerBehind,
             CatchupPhase::Snapshot,
@@ -1928,6 +2125,16 @@ mod tests {
         assert!(samples.iter().any(|sample| {
             sample.name() == "shitspeak_s2s_strict_replication_catchup_bulk_in_flight_bytes"
                 && sample.value() == 4_096.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_snapshot_receive_events_total"
+                && sample.labels() == [("event".to_owned(), "stale_foreign_transfer".to_owned())]
+                && sample.value() >= 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_snapshot_responder_events_total"
+                && sample.labels() == [("event".to_owned(), "completion_acknowledged".to_owned())]
+                && sample.value() >= 1.0
         }));
 
         let allowed_labels = ["mode", "reason", "phase", "lane", "outcome", "event"];

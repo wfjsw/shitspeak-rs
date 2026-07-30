@@ -1626,6 +1626,16 @@ impl<'a> PrometheusWriter<'a> {
             "counter",
         );
         self.header(
+            "shitspeak_s2s_strict_replication_snapshot_receive_events_total",
+            "Strict replication snapshot receiver progress, stale-page, and bounded restart-reason events.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_snapshot_responder_events_total",
+            "Non-exclusive strict replication snapshot responder decisions, lifecycle transitions, and send anomalies.",
+            "counter",
+        );
+        self.header(
             "shitspeak_s2s_strict_replication_catchup_backpressure_events_total",
             "Strict replication catchup backpressure, retry, and exhausted-retry events by reason and phase.",
             "counter",
@@ -3757,6 +3767,12 @@ mod tests {
             "# TYPE shitspeak_s2s_strict_replication_catchup_duplicate_pages_total counter\n"
         ));
         assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_snapshot_receive_events_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_snapshot_responder_events_total counter\n"
+        ));
+        assert!(rendered.contains(
             "# TYPE shitspeak_s2s_strict_replication_catchup_backpressure_events_total counter\n"
         ));
         assert!(rendered.contains(
@@ -3778,6 +3794,12 @@ mod tests {
         ));
         assert!(rendered.contains(
             "shitspeak_s2s_strict_replication_catchup_duplicate_pages_total{outcome=\"cached_replay\"}"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_strict_replication_snapshot_receive_events_total{event=\"stale_foreign_transfer\"}"
+        ));
+        assert!(rendered.contains(
+            "shitspeak_s2s_strict_replication_snapshot_responder_events_total{event=\"completion_acknowledged\"}"
         ));
         assert!(
             rendered.contains("shitspeak_s2s_strict_replication_clock_demand{reason=\"head_ack\"}")
