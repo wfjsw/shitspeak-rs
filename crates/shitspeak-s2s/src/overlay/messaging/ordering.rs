@@ -390,7 +390,13 @@ impl OverlayOrdering {
             })
     }
 
-    pub(crate) async fn apply_ack(&self, final_dst: NodeIdentifier, lane: LaneId, next_seq: u64) {
+    pub(crate) async fn apply_ack(
+        &self,
+        final_dst: NodeIdentifier,
+        lane: LaneId,
+        origin_boot_epoch: u64,
+        next_seq: u64,
+    ) {
         let mut pending = self.pending.lock().await;
         let key = OutboundKey {
             dst: final_dst,
@@ -398,9 +404,10 @@ impl OverlayOrdering {
         };
         if let Some(packets) = pending.get_mut(&key) {
             let remove: Vec<u64> = packets
-                .keys()
-                .take_while(|seq| **seq < next_seq)
-                .copied()
+                .iter()
+                .take_while(|(seq, _)| **seq < next_seq)
+                .filter(|(_, packet)| packet.data.origin_boot_epoch == origin_boot_epoch)
+                .map(|(seq, _)| *seq)
                 .collect();
             for seq in remove {
                 packets.remove(&seq);
@@ -1108,7 +1115,7 @@ mod tests {
         let ordering = OverlayOrdering::new(&cfg);
         ordering.store_pending(lane(), data(0, b"pending")).await;
 
-        ordering.apply_ack(1, lane(), 1).await;
+        ordering.apply_ack(1, lane(), 99, 1).await;
 
         assert!(
             ordering
@@ -1117,6 +1124,28 @@ mod tests {
                 .is_empty()
         );
         assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_epoch_ack_does_not_remove_current_pending_packet() {
+        let ordering = OverlayOrdering::default();
+        let mut current = data(0, b"current");
+        current.origin_boot_epoch = 100;
+        ordering.store_pending(lane(), current).await;
+
+        ordering.apply_ack(1, lane(), 99, 1).await;
+
+        assert_eq!(
+            ordering.pending_range(1, lane(), 0, 0).await.len(),
+            1,
+            "an ACK from an older origin epoch must not clear current delivery state"
+        );
+
+        ordering.apply_ack(1, lane(), 100, 1).await;
+        assert!(
+            ordering.pending_range(1, lane(), 0, 0).await.is_empty(),
+            "an ACK from the current origin epoch must clear acknowledged delivery state"
+        );
     }
 
     #[tokio::test]
@@ -1132,7 +1161,7 @@ mod tests {
                 .owns_retained_logical_send(1, lane(), identity)
                 .await
         );
-        ordering.apply_ack(1, lane(), 1).await;
+        ordering.apply_ack(1, lane(), 99, 1).await;
         assert!(
             !ordering
                 .owns_retained_logical_send(1, lane(), identity)

@@ -1055,7 +1055,9 @@ pub(crate) async fn handle_control(
     match control.body.clone() {
         Some(OverlayControlBody::Ack(ack)) => {
             if origin == self_id {
-                ordering.apply_ack(final_dst, lane, ack.next_seq).await;
+                ordering
+                    .apply_ack(final_dst, lane, control.origin_boot_epoch, ack.next_seq)
+                    .await;
             } else {
                 let _ = send_control_to(transport, routing, self_id, origin, control).await;
             }

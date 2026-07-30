@@ -11,7 +11,7 @@
 //!   * `ServiceRegistry` dispatches inbound `OverlayData` by tag.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions, TryLockError};
@@ -49,7 +49,6 @@ const HELLO_ACK_METRIC_DEBOUNCE: Duration = Duration::from_millis(500);
 #[derive(Default)]
 struct OrderingPeerEpochs {
     highest: HashMap<NodeIdentifier, u64>,
-    failed: HashSet<NodeIdentifier>,
 }
 
 impl OrderingPeerEpochs {
@@ -132,7 +131,6 @@ async fn apply_ordering_membership_event(
         // retain responsibility for owner-origin shutdown/cleanup.
         super::MembershipEvent::Left(node) => {
             peer_epochs.observe(*node);
-            peer_epochs.failed.remove(&node.node_id());
             ordering.reset_peer(node.node_id()).await;
             Some(node.node_id())
         }
@@ -140,7 +138,6 @@ async fn apply_ordering_membership_event(
         // old epoch ordering state, but do not retire the new peer session.
         super::MembershipEvent::Restarted(node) => {
             let unseen = !peer_epochs.highest.contains_key(&node.node_id());
-            peer_epochs.failed.remove(&node.node_id());
             if unseen || peer_epochs.observe(*node) {
                 ordering.reset_peer(node.node_id()).await;
             }
@@ -148,13 +145,11 @@ async fn apply_ordering_membership_event(
         }
         super::MembershipEvent::Failed(node) => {
             peer_epochs.observe(*node);
-            peer_epochs.failed.insert(node.node_id());
             None
         }
         super::MembershipEvent::Joined(node) => {
-            let healed = peer_epochs.failed.remove(&node.node_id());
             let restarted = peer_epochs.observe(*node);
-            if healed || restarted {
+            if restarted {
                 ordering.reset_peer(node.node_id()).await;
             }
             None
@@ -177,9 +172,8 @@ async fn reconcile_ordering_peer_epoch(
     peer_epochs: &mut OrderingPeerEpochs,
     node: super::MemberIncarnation,
 ) {
-    let healed = peer_epochs.failed.remove(&node.node_id());
     let restarted = peer_epochs.observe(node);
-    if healed || restarted {
+    if restarted {
         ordering.reset_peer(node.node_id()).await;
     }
 }
@@ -1028,7 +1022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_epoch_join_after_failure_resets_ordering() {
+    async fn same_epoch_join_after_failure_preserves_ordering() {
         let ordering = OverlayOrdering::default();
         let mut peer_epochs = OrderingPeerEpochs::default();
         let lane = super::super::LaneId::new(NonZeroU32::new(7).unwrap());
@@ -1056,8 +1050,8 @@ mod tests {
         );
         assert_eq!(
             ordering.next_outbound_seq(peer, lane).await,
-            0,
-            "a healed transport session must not inherit sequence holes from the failed route"
+            1,
+            "a same-epoch heal must preserve ordered sequence continuity"
         );
     }
 
@@ -1119,6 +1113,29 @@ mod tests {
             ordering.next_outbound_seq(peer, lane).await,
             0,
             "snapshot reconciliation must reset state after a lagged restart event"
+        );
+    }
+
+    #[tokio::test]
+    async fn membership_snapshot_preserves_same_epoch_ordering() {
+        let ordering = OverlayOrdering::default();
+        let mut peer_epochs = OrderingPeerEpochs::default();
+        let lane = super::super::LaneId::new(NonZeroU32::new(7).unwrap());
+        let peer = 9;
+        peer_epochs.observe(super::super::MemberIncarnation::new(peer, 7));
+        assert_eq!(ordering.next_outbound_seq(peer, lane).await, 0);
+
+        reconcile_ordering_peer_epoch(
+            &ordering,
+            &mut peer_epochs,
+            super::super::MemberIncarnation::new(peer, 7),
+        )
+        .await;
+
+        assert_eq!(
+            ordering.next_outbound_seq(peer, lane).await,
+            1,
+            "same-epoch snapshot reconciliation must preserve ordered state"
         );
     }
 
