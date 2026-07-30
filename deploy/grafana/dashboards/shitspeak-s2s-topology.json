@@ -1775,7 +1775,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, destination, packet_kind, direction) (shitspeak_s2s_debug_packet_io_bytes_total{job=~\"$job\"})",
+          "expr": "max by (source, destination, packet_kind, direction) (increase(shitspeak_s2s_debug_packet_io_bytes_total{job=~\"$job\"}[$__range]))",
           "format": "table",
           "instant": true,
           "range": false,
@@ -1787,7 +1787,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, destination, packet_kind, direction) (shitspeak_s2s_debug_packet_io_packets_total{job=~\"$job\"})",
+          "expr": "max by (source, destination, packet_kind, direction) (increase(shitspeak_s2s_debug_packet_io_packets_total{job=~\"$job\"}[$__range]))",
           "format": "table",
           "instant": true,
           "range": false,
@@ -1799,7 +1799,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "max by (source, destination, packet_kind, direction) (shitspeak_s2s_debug_packet_io_avg_bps{job=~\"$job\"})",
+          "expr": "max by (source, destination, packet_kind, direction) (rate(shitspeak_s2s_debug_packet_io_bytes_total{job=~\"$job\"}[$__range]))",
           "format": "table",
           "instant": true,
           "range": false,
