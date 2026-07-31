@@ -1303,6 +1303,12 @@ pub(crate) async fn respond_to_request<R: StrictReplicable>(
     // repository-version cursor so a long-lived journal cannot inflate every
     // catchup response beyond the transport frame cap.
     let current_terminal_decision_generation = rt.terminal_decision_generation().await;
+    if !correlated_v3_history
+        && v2_terminal_catchup
+        && req.terminal_state_cursor == TERMINAL_STATE_CURSOR_SKIP
+    {
+        rt.acknowledge_terminal_catchup_snapshot(from, req.terminal_decision_generation);
+    }
     let must_restart_terminal_sync = !correlated_v3_history
         && v2_terminal_catchup
         && req.terminal_state_cursor == TERMINAL_STATE_CURSOR_SKIP
@@ -3131,6 +3137,20 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         fail_claimed_v3_history_response(rt, correlated_v3_history).await;
         return None;
     }
+    let v2_terminal_catchup = rt.can_respond_to_v2_terminal_catchup(from);
+    if resp.terminal_sync_only
+        && v2_terminal_catchup
+        && (resp.next_terminal_state_cursor == 0
+            || resp.next_terminal_state_cursor == TERMINAL_STATE_CURSOR_SKIP)
+    {
+        warn!(
+            from,
+            next_terminal_state_cursor = resp.next_terminal_state_cursor,
+            "strict terminal catchup response has invalid cursor progress"
+        );
+        fail_claimed_v3_history_response(rt, correlated_v3_history).await;
+        return None;
+    }
     let inferred_legacy_repository_base = (correlated_v3_history.is_none()
         && rt.net.peer_strict_replication_protocol_version(from) >= STRICT_PROTOCOL_VERSION_V5
         && rt.repo.current_version() < resp.history_version
@@ -3175,15 +3195,35 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
     // fence cut. Retain it only after every page in that cut has installed;
     // later steady-state catchup echoes it so a source restart or new fence
     // forces terminal pagination instead of trusting a cursor-only skip.
-    let v2_terminal_catchup = rt.can_respond_to_v2_terminal_catchup(from);
-    if v2_terminal_catchup && (!resp.terminal_sync_only || !resp.terminal_states_has_more) {
-        rt.remember_terminal_decision_generation(from, resp.terminal_decision_generation);
-    }
     if resp.terminal_sync_only {
+        let terminal_page_acceptance = if v2_terminal_catchup {
+            rt.accept_terminal_catchup_page(
+                from,
+                resp.terminal_decision_generation,
+                resp.next_terminal_state_cursor,
+                !resp.terminal_states_has_more,
+            )
+        } else {
+            None
+        };
+        if v2_terminal_catchup && terminal_page_acceptance.is_none() {
+            metrics::record_strict_catchup_duplicate(StrictCatchupDuplicateOutcome::Suppressed);
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Strict,
+                ReplicationPipelineStage::CatchupApply,
+                apply_started_at.elapsed(),
+            );
+            fail_claimed_v3_history_response(rt, correlated_v3_history).await;
+            return None;
+        }
+        if v2_terminal_catchup && !resp.terminal_states_has_more {
+            rt.remember_terminal_decision_generation(from, resp.terminal_decision_generation);
+        }
         // A changed terminal-fence cut invalidates every partial image. The
         // next history request will start a new immutable transfer only after
         // all pages of the new cut are installed.
         rt.snapshot_receivers.lock().remove(&from);
+        let mut continuation_sent = false;
         if from != rt.self_id
             && rt.net.has_route(from, ServiceLevel::Reliable)
             && v2_terminal_catchup
@@ -3205,7 +3245,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                 history_transfer: None,
             };
             metrics::record_catchup_request(CatchupMode::Strict);
-            let _ = rt
+            continuation_sent = rt
                 .net
                 // Terminal pagination is a control-plane prerequisite for
                 // both admission metadata and ordinary history. A lost final
@@ -3213,7 +3253,13 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
                 // history evidence permanently absent until another full
                 // generation replay.
                 .send_redundant_unicast(from, &rt.topic, StrictBody::CatchupReq(req))
-                .await;
+                .await
+                .is_ok();
+        }
+        if !continuation_sent {
+            if let Some(acceptance) = terminal_page_acceptance {
+                rt.rollback_terminal_catchup_page(acceptance);
+            }
         }
         metrics::record_pipeline_stage(
             ReplicationPipelineKind::Strict,
@@ -3222,6 +3268,9 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
         );
         fail_claimed_v3_history_response(rt, correlated_v3_history).await;
         return None;
+    }
+    if v2_terminal_catchup {
+        rt.remember_terminal_decision_generation(from, resp.terminal_decision_generation);
     }
     let remote_rank = HistoryRank {
         version: resp.history_version,
@@ -8601,6 +8650,223 @@ mod tests {
         assert_eq!(
             history_response.next_terminal_state_cursor,
             super::TERMINAL_STATE_CURSOR_SKIP
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_terminal_only_page_does_not_fork_continuation() {
+        let (sink, sink_net, _) = test_runtime(2, ReplicationConfig::default());
+        let response = StrictCatchupResp {
+            history_node: 1,
+            terminal_states: vec![terminal_abort(make_op_id(1, 1, 1))],
+            next_terminal_state_cursor: 1,
+            terminal_states_has_more: false,
+            terminal_sync_only: true,
+            terminal_decision_generation: 7,
+            ..Default::default()
+        };
+
+        apply_response(&sink, 1, response.clone()).await;
+        let continuation = catchup_request(
+            sink_net
+                .drain_captures()
+                .pop()
+                .expect("first terminal page continuation"),
+        );
+        assert_eq!(
+            continuation.terminal_state_cursor,
+            super::TERMINAL_STATE_CURSOR_SKIP
+        );
+        assert_eq!(continuation.terminal_decision_generation, 7);
+
+        apply_response(&sink, 1, response).await;
+        assert!(
+            sink_net.drain_captures().is_empty(),
+            "a duplicate terminal page must not fork another continuation chain"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_generation_reset_starts_new_terminal_progress() {
+        let (sink, sink_net, _) = test_runtime(2, ReplicationConfig::default());
+        let response = |generation, counter| StrictCatchupResp {
+            history_node: 1,
+            terminal_states: vec![terminal_abort(make_op_id(1, 1, counter))],
+            next_terminal_state_cursor: 1,
+            terminal_states_has_more: false,
+            terminal_sync_only: true,
+            terminal_decision_generation: generation,
+            ..Default::default()
+        };
+
+        apply_response(&sink, 1, response(7, 1)).await;
+        assert_eq!(sink_net.drain_captures().len(), 1);
+
+        apply_response(&sink, 1, response(0, 2)).await;
+        let captures = sink_net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        let continuation = catchup_request(captures.into_iter().next().unwrap());
+        assert_eq!(
+            continuation.terminal_state_cursor,
+            super::TERMINAL_STATE_CURSOR_SKIP
+        );
+        assert_eq!(continuation.terminal_decision_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_intermediate_terminal_page_emits_one_continuation() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_ops(1);
+        let (source, source_net, _) = test_runtime(1, cfg.clone());
+        source
+            .apply_catchup_terminal_state(terminal_abort(make_op_id(1, 1, 1)))
+            .await;
+        source
+            .apply_catchup_terminal_state(terminal_abort(make_op_id(1, 1, 2)))
+            .await;
+        respond_to_request(
+            &source,
+            2,
+            StrictCatchupReq {
+                src_node: 2,
+                terminal_state_cursor: 0,
+                ..Default::default()
+            },
+        )
+        .await;
+        let page = catchup_response(
+            source_net
+                .drain_captures()
+                .pop()
+                .expect("first terminal page"),
+        );
+        assert!(page.terminal_sync_only);
+        assert!(page.terminal_states_has_more);
+        assert_eq!(page.next_terminal_state_cursor, 1);
+
+        let (sink, sink_net, _) = test_runtime(2, cfg);
+        apply_response(&sink, 1, page.clone()).await;
+        apply_response(&sink, 1, page).await;
+
+        let captures = sink_net.drain_captures();
+        assert_eq!(
+            captures.len(),
+            1,
+            "a duplicate intermediate terminal page must not branch pagination"
+        );
+        let continuation = catchup_request(captures.into_iter().next().unwrap());
+        assert_eq!(continuation.terminal_state_cursor, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_continuation_can_be_retried_by_a_duplicate_page() {
+        let (sink, sink_net, _) = test_runtime(2, ReplicationConfig::default());
+        let response = StrictCatchupResp {
+            history_node: 1,
+            terminal_states: vec![terminal_abort(make_op_id(1, 1, 1))],
+            next_terminal_state_cursor: 1,
+            terminal_states_has_more: true,
+            terminal_sync_only: true,
+            terminal_decision_generation: 7,
+            ..Default::default()
+        };
+
+        sink_net.fail_strict_unicasts_to([1]);
+        apply_response(&sink, 1, response.clone()).await;
+        assert!(sink_net.drain_captures().is_empty());
+
+        sink_net.fail_strict_unicasts_to([]);
+        apply_response(&sink, 1, response).await;
+        let captures = sink_net.drain_captures();
+        assert_eq!(captures.len(), 1);
+        let continuation = catchup_request(captures.into_iter().next().unwrap());
+        assert_eq!(continuation.terminal_state_cursor, 1);
+    }
+
+    #[tokio::test]
+    async fn delayed_intermediate_terminal_page_does_not_regress_completed_generation() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_ops(1);
+        let (source, source_net, _) = test_runtime(1, cfg.clone());
+        source
+            .apply_catchup_terminal_state(terminal_abort(make_op_id(1, 1, 1)))
+            .await;
+        source
+            .apply_catchup_terminal_state(terminal_abort(make_op_id(1, 1, 2)))
+            .await;
+        respond_to_request(
+            &source,
+            2,
+            StrictCatchupReq {
+                src_node: 2,
+                terminal_state_cursor: 0,
+                ..Default::default()
+            },
+        )
+        .await;
+        let first_page = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(first_page.terminal_states_has_more);
+
+        let (sink, sink_net, _) = test_runtime(2, cfg);
+        apply_response(&sink, 1, first_page.clone()).await;
+        let continuation = catchup_request(sink_net.drain_captures().pop().unwrap());
+        respond_to_request(&source, 2, continuation).await;
+        let final_page = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(!final_page.terminal_states_has_more);
+        assert_eq!(
+            first_page.terminal_decision_generation,
+            final_page.terminal_decision_generation
+        );
+
+        apply_response(&sink, 1, final_page).await;
+        let history_request = catchup_request(sink_net.drain_captures().pop().unwrap());
+        assert_eq!(
+            history_request.terminal_state_cursor,
+            super::TERMINAL_STATE_CURSOR_SKIP
+        );
+
+        apply_response(&sink, 1, first_page).await;
+        assert!(
+            sink_net.drain_captures().is_empty(),
+            "a delayed intermediate page from a completed generation must not regress pagination"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_final_terminal_request_replays_the_completed_cut() {
+        let cfg = ReplicationConfig::default().with_strict_max_catchup_ops(1);
+        let (source, source_net, _) = test_runtime(1, cfg);
+        source
+            .apply_catchup_terminal_state(terminal_abort(make_op_id(1, 1, 1)))
+            .await;
+        source
+            .apply_catchup_terminal_state(terminal_abort(make_op_id(1, 1, 2)))
+            .await;
+
+        let first_request = StrictCatchupReq {
+            src_node: 2,
+            terminal_state_cursor: 0,
+            ..Default::default()
+        };
+        respond_to_request(&source, 2, first_request).await;
+        let first_page = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(first_page.terminal_states_has_more);
+        assert_eq!(first_page.next_terminal_state_cursor, 1);
+
+        let final_request = StrictCatchupReq {
+            src_node: 2,
+            terminal_state_cursor: first_page.next_terminal_state_cursor,
+            ..Default::default()
+        };
+        respond_to_request(&source, 2, final_request.clone()).await;
+        let final_page = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(!final_page.terminal_states_has_more);
+        assert_eq!(final_page.next_terminal_state_cursor, 2);
+
+        respond_to_request(&source, 2, final_request).await;
+        let replayed_page = catchup_response(source_net.drain_captures().pop().unwrap());
+        assert!(!replayed_page.terminal_states_has_more);
+        assert_eq!(
+            replayed_page.next_terminal_state_cursor, 2,
+            "a duplicate final request must not restart the immutable cut at cursor zero"
         );
     }
 

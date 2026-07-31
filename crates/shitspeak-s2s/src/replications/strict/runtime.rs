@@ -366,6 +366,20 @@ struct TerminalCatchupSnapshot {
     last_used_at: Instant,
 }
 
+#[derive(Clone)]
+struct TerminalCatchupReceiveProgress {
+    terminal_decision_generation: u64,
+    next_cursor: u64,
+    terminal_complete: bool,
+    last_used_at: Instant,
+}
+
+pub(super) struct TerminalCatchupPageAcceptance {
+    peer: NodeIdentifier,
+    accepted: TerminalCatchupReceiveProgress,
+    previous: Option<TerminalCatchupReceiveProgress>,
+}
+
 /// A responder-side immutable image for one v2 snapshot transfer. This is
 /// deliberately ephemeral: after a restart the requester detects the missing
 /// transfer and restarts from a fresh, self-consistent image.
@@ -3546,6 +3560,11 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// restart deliberately loses this cache, causing the next catchup to
     /// re-page fences instead of trusting a cursor-only skip.
     terminal_catchup_generations: Mutex<HashMap<NodeIdentifier, u64>>,
+    /// Last accepted terminal-only page from each v2 peer. Redundant overlay
+    /// lanes have distinct message identities, so response-level cursor
+    /// progress is what prevents one replayed page from branching catchup.
+    terminal_catchup_receive_progress:
+        Mutex<HashMap<NodeIdentifier, TerminalCatchupReceiveProgress>>,
     /// Per-peer images selected by v2 snapshot catchup. The key is a peer
     /// because a peer has at most one active transfer for this strict topic.
     /// Together with `snapshot_receivers`, retained image bytes are bounded
@@ -3966,6 +3985,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             head_mismatch_observations: Mutex::new(HashMap::new()),
             terminal_catchup_snapshots: Mutex::new(HashMap::new()),
             terminal_catchup_generations: Mutex::new(HashMap::new()),
+            terminal_catchup_receive_progress: Mutex::new(HashMap::new()),
             snapshot_transfers: Mutex::new(HashMap::new()),
             snapshot_receivers: Mutex::new(HashMap::new()),
             snapshot_transfer_counter: AtomicU64::new(1),
@@ -5036,6 +5056,75 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.terminal_catchup_snapshots.lock().remove(&peer);
     }
 
+    pub(super) fn acknowledge_terminal_catchup_snapshot(
+        &self,
+        peer: NodeIdentifier,
+        terminal_decision_generation: u64,
+    ) {
+        let mut snapshots = self.terminal_catchup_snapshots.lock();
+        if snapshots.get(&peer).is_some_and(|snapshot| {
+            snapshot.terminal_decision_generation == terminal_decision_generation
+        }) {
+            snapshots.remove(&peer);
+        }
+    }
+
+    pub(super) fn accept_terminal_catchup_page(
+        &self,
+        peer: NodeIdentifier,
+        terminal_decision_generation: u64,
+        next_cursor: u64,
+        terminal_complete: bool,
+    ) -> Option<TerminalCatchupPageAcceptance> {
+        let now = Instant::now();
+        let mut progress_by_peer = self.terminal_catchup_receive_progress.lock();
+        match progress_by_peer.get(&peer) {
+            Some(progress)
+                if terminal_decision_generation == progress.terminal_decision_generation
+                    && (progress.terminal_complete || next_cursor <= progress.next_cursor) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        // A journal checkpoint rotates its identity and resets generation to
+        // zero, so generation is an opaque cut identity rather than an
+        // ordered counter across the whole peer incarnation.
+        let accepted = TerminalCatchupReceiveProgress {
+            terminal_decision_generation,
+            next_cursor,
+            terminal_complete,
+            last_used_at: now,
+        };
+        let previous = progress_by_peer.insert(peer, accepted.clone());
+        Some(TerminalCatchupPageAcceptance {
+            peer,
+            accepted,
+            previous,
+        })
+    }
+
+    pub(super) fn rollback_terminal_catchup_page(&self, acceptance: TerminalCatchupPageAcceptance) {
+        let mut progress_by_peer = self.terminal_catchup_receive_progress.lock();
+        let still_current = progress_by_peer
+            .get(&acceptance.peer)
+            .is_some_and(|progress| {
+                progress.terminal_decision_generation
+                    == acceptance.accepted.terminal_decision_generation
+                    && progress.next_cursor == acceptance.accepted.next_cursor
+                    && progress.terminal_complete == acceptance.accepted.terminal_complete
+                    && progress.last_used_at == acceptance.accepted.last_used_at
+            });
+        if !still_current {
+            return;
+        }
+        if let Some(previous) = acceptance.previous {
+            progress_by_peer.insert(acceptance.peer, previous);
+        } else {
+            progress_by_peer.remove(&acceptance.peer);
+        }
+    }
+
     async fn v2_resolution_hint_for_op(
         &self,
         op_id: OpId,
@@ -5713,9 +5802,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             max_entries,
             max_bytes,
         );
-        if !page.has_more {
-            self.terminal_catchup_snapshots.lock().remove(&peer);
-        }
         page
     }
 
@@ -10579,6 +10665,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             // fresh authenticated exchange rather than resume its predecessor.
             self.terminal_catchup_snapshots.lock().remove(&node);
             self.terminal_catchup_generations.lock().remove(&node);
+            self.terminal_catchup_receive_progress.lock().remove(&node);
             self.snapshot_transfers.lock().remove(&node);
             self.snapshot_receivers.lock().remove(&node);
             if transition == MembershipTransition::Restarted {
@@ -11910,6 +11997,12 @@ pub(super) fn run_gc_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
         let mut snapshots = rt.terminal_catchup_snapshots.lock();
         let snapshot_ttl = rt.cfg.pending_propose_ttl();
         snapshots.retain(|_, snapshot| now.duration_since(snapshot.last_used_at) < snapshot_ttl);
+    }
+    {
+        let mut progress_by_peer = rt.terminal_catchup_receive_progress.lock();
+        let progress_ttl = rt.cfg.pending_propose_ttl();
+        progress_by_peer
+            .retain(|_, progress| now.duration_since(progress.last_used_at) < progress_ttl);
     }
     {
         let snapshot_ttl = rt.cfg.pending_propose_ttl();
@@ -17974,6 +18067,7 @@ mod tests {
             },
         );
         rt.remember_terminal_decision_generation(2, 7);
+        assert!(rt.accept_terminal_catchup_page(2, 7, 1, false).is_some());
         let rank = HistoryRank {
             version: 0,
             freshness: 0,
@@ -18015,6 +18109,12 @@ mod tests {
 
         assert!(rt.terminal_catchup_snapshots.lock().get(&2).is_none());
         assert_eq!(rt.remembered_terminal_decision_generation(2), 0);
+        assert!(
+            rt.terminal_catchup_receive_progress
+                .lock()
+                .get(&2)
+                .is_none()
+        );
         assert!(rt.snapshot_transfers.lock().get(&2).is_none());
         assert!(rt.snapshot_receivers.lock().get(&2).is_none());
     }
@@ -22854,8 +22954,20 @@ mod tests {
         assert_eq!(second_page.states[0].op_id_lo, 3);
         assert!(!second_page.has_more);
 
+        runtime.acknowledge_terminal_catchup_snapshot(
+            2,
+            second_page.terminal_decision_generation.wrapping_add(1),
+        );
+        let replayed = runtime
+            .terminal_states_for_catchup_page(2, 0, usize::MAX, usize::MAX)
+            .await;
+        let replayed_ids: Vec<_> = replayed.states.iter().map(|state| state.op_id_lo).collect();
+        assert_eq!(replayed_ids, vec![1, 3]);
+
         // A later sync starts a fresh snapshot and picks up the concurrent
-        // terminal fence without relying on the old live index.
+        // terminal fence only after the requester acknowledges the completed
+        // cut. Until then, duplicate final requests must replay that cut.
+        runtime.acknowledge_terminal_catchup_snapshot(2, second_page.terminal_decision_generation);
         let refreshed = runtime
             .terminal_states_for_catchup_page(2, 0, usize::MAX, usize::MAX)
             .await;
