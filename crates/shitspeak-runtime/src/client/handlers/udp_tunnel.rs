@@ -2,7 +2,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::{errors::MessageHandlerError, server::Server};
+use crate::{
+    errors::MessageHandlerError,
+    server::Server,
+    voice::codec::{DecodeError, IncomingUdpPacket},
+};
 
 pub(super) async fn handle_udp_tunnel(
     _server: &Arc<Box<Server>>,
@@ -40,10 +44,23 @@ pub(super) async fn handle_udp_tunnel(
             Ok(())
         }
         Err(e) => {
+            if matches!(&e, DecodeError::NotVoice)
+                && let Ok(IncomingUdpPacket::Ping(ping)) =
+                    IncomingUdpPacket::decode(&data, Some(sender.get_session_id()))
+            {
+                tracing::trace!(
+                    session = u32::from(sender.get_session_id()),
+                    timestamp = ping.timestamp,
+                    format = %ping.format,
+                    "UDPTunnel: ignoring ping"
+                );
+                return Ok(());
+            }
+
             tracing::trace!(session = u32::from(sender.get_session_id()), len = data.len(), error = %e, "UDPTunnel: decode failed");
-            return Err(MessageHandlerError::protocol_violation(format!(
+            Err(MessageHandlerError::protocol_violation(format!(
                 "Failed to decode UDPTunnel audio packet: {e}"
-            )));
+            )))
         }
     }
 }

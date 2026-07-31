@@ -1171,6 +1171,45 @@ async fn voice_tcp_same_channel_routes() {
     assert_eq!(audio.sender_session, Some(alice.server_session));
 }
 
+/// Checks that a legacy audio-channel ping tunneled over TCP is accepted as a
+/// non-audio UDP packet rather than treated as a fatal voice decode failure.
+#[tokio::test]
+async fn voice_tcp_legacy_ping_keeps_connection_alive() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    alice
+        .send(Message::UDPTunnel(Bytes::from_static(&[0x20, 0x01])))
+        .await;
+
+    assert!(
+        !alice.recv_closed(NEGATIVE_WINDOW).await,
+        "legacy ping tunneled over TCP must not disconnect an authenticated client"
+    );
+
+    alice
+        .send_voice_tcp(0, 1, Bytes::from_static(SAMPLE_OPUS))
+        .await;
+    expect_voice_from(
+        &bob,
+        &alice,
+        "voice after a tunneled legacy ping should still route",
+    )
+    .await;
+}
+
 /// Checks that regular voice is not routed to users in unrelated channels.
 /// Expected: after Bob moves to another channel, he receives no TCP-tunneled
 /// voice from Alice. This comes from Mumble's channel-scoped receiver selection
