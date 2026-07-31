@@ -13,6 +13,7 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 shitspeak-auth = { workspace = true }
+shitspeak-proto = { workspace = true }
 shitspeak-runtime = { workspace = true }
 shitspeak-runtime-config = { workspace = true }
 shitspeak-state = { workspace = true }

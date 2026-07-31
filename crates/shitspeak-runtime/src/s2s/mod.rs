@@ -3024,7 +3024,7 @@ async fn apply_user_state_patch(
         || !patch.listening_channel_add.is_empty()
         || !patch.listening_channel_remove.is_empty();
     let channel_cache_key = if should_stage_channel_cache {
-        crate::user_channel_cache::cache_key_for_client(target.as_ref()).await
+        crate::user_channel_cache::cache_key_for_client(server.as_ref(), target.as_ref()).await
     } else {
         None
     };

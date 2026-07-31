@@ -69,6 +69,11 @@ enum UserChannelCacheCommand {
         channel_ids: Vec<u32>,
         response: oneshot::Sender<io::Result<()>>,
     },
+    MigrateKey {
+        from_key: String,
+        to_key: String,
+        response: oneshot::Sender<io::Result<()>>,
+    },
     #[cfg(test)]
     Test {
         operation: Box<dyn FnOnce(&mut UserChannelCacheDb) + Send>,
@@ -188,6 +193,28 @@ impl UserChannelCache {
         receiver.await.map_err(|_| cache_worker_stopped_error())?
     }
 
+    /// Move a legacy cache entry to its stable identity key.
+    ///
+    /// If the stable key is already present, it wins and the legacy entry is
+    /// removed. This prevents a stale numeric user id from overwriting an
+    /// entry that was already stored for the authenticator-provided identity.
+    pub async fn migrate_key(&self, from_key: &str, to_key: &str) -> io::Result<()> {
+        if from_key == to_key {
+            return Ok(());
+        }
+
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(UserChannelCacheCommand::MigrateKey {
+                from_key: from_key.to_owned(),
+                to_key: to_key.to_owned(),
+                response,
+            })
+            .await
+            .map_err(|_| cache_worker_stopped_error())?;
+        receiver.await.map_err(|_| cache_worker_stopped_error())?
+    }
+
     fn start_worker<F>(initialize: F) -> io::Result<Arc<Self>>
     where
         F: FnOnce() -> UserChannelCacheDb + Send + 'static,
@@ -216,6 +243,13 @@ impl UserChannelCache {
                         } => {
                             let _ =
                                 response.send(db.remember_listening_channels(&key, channel_ids));
+                        }
+                        UserChannelCacheCommand::MigrateKey {
+                            from_key,
+                            to_key,
+                            response,
+                        } => {
+                            let _ = response.send(db.migrate_key(&from_key, &to_key));
                         }
                         #[cfg(test)]
                         UserChannelCacheCommand::Test { operation } => operation(&mut db),
@@ -341,6 +375,72 @@ impl UserChannelCacheDb {
             .map_err(|error| sqlite_io_error("commit user channel cache transaction", error))?;
         self.prune_if_due_best_effort(now);
         Ok(())
+    }
+
+    fn migrate_key(&mut self, from_key: &str, to_key: &str) -> io::Result<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|error| sqlite_io_error("begin user channel cache key migration", error))?;
+        let source_exists = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM user_channel_cache WHERE cache_key = ?1)",
+                params![from_key],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| sqlite_io_error("read user channel cache migration source", error))?;
+        if !source_exists {
+            return Ok(());
+        }
+
+        let destination_exists = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM user_channel_cache WHERE cache_key = ?1)",
+                params![to_key],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| {
+                sqlite_io_error("read user channel cache migration destination", error)
+            })?;
+
+        if !destination_exists {
+            tx.execute(
+                "INSERT INTO user_channel_cache (
+                    cache_key,
+                    last_channel_id,
+                    last_channel_expires_at,
+                    listening_channel_expires_at,
+                    updated_at
+                )
+                SELECT ?2,
+                    last_channel_id,
+                    last_channel_expires_at,
+                    listening_channel_expires_at,
+                    updated_at
+                FROM user_channel_cache
+                WHERE cache_key = ?1",
+                params![from_key, to_key],
+            )
+            .map_err(|error| sqlite_io_error("copy user channel cache migration entry", error))?;
+            tx.execute(
+                "INSERT INTO user_channel_listening_channels (cache_key, channel_id)
+                 SELECT ?2, channel_id
+                 FROM user_channel_listening_channels
+                 WHERE cache_key = ?1",
+                params![from_key, to_key],
+            )
+            .map_err(|error| {
+                sqlite_io_error("copy user channel cache migration listeners", error)
+            })?;
+        }
+
+        tx.execute(
+            "DELETE FROM user_channel_cache WHERE cache_key = ?1",
+            params![from_key],
+        )
+        .map_err(|error| sqlite_io_error("remove migrated user channel cache entry", error))?;
+        tx.commit()
+            .map_err(|error| sqlite_io_error("commit user channel cache key migration", error))
     }
 
     fn prune_is_due(&self) -> bool {
@@ -664,21 +764,39 @@ impl UserChannelCacheEntry {
     }
 }
 
-pub fn user_channel_cache_key(user_id: Option<u32>, username: Option<&str>) -> Option<String> {
-    match user_id {
-        Some(user_id) => Some(user_id.to_string()),
-        None => username
-            .filter(|username| !username.is_empty())
-            .map(ToOwned::to_owned),
+pub fn user_channel_cache_key(
+    fqdn: Option<&str>,
+    user_id: Option<u32>,
+    username: Option<&str>,
+) -> Option<String> {
+    match fqdn.filter(|fqdn| !fqdn.is_empty()) {
+        Some(fqdn) => Some(fqdn.to_owned()),
+        None => match user_id {
+            Some(user_id) => Some(user_id.to_string()),
+            None => username
+                .filter(|username| !username.is_empty())
+                .map(ToOwned::to_owned),
+        },
     }
 }
 
-pub async fn cache_key_for_client(client: &Client) -> Option<String> {
-    let user_id = client.get_user_id();
-    if user_id.is_some() {
-        return user_channel_cache_key(user_id, None);
+pub async fn cache_key_for_client(server: &Server, client: &Client) -> Option<String> {
+    let is_remote = client.transport_kind() == ClientTransportKind::Remote;
+    if !records_client_transport(
+        client.transport_kind(),
+        server
+            .read_config()
+            .user_channel_cache_record_remote_sessions,
+    ) {
+        return None;
     }
-    if client.transport_kind() == ClientTransportKind::Remote {
+
+    let fqdn = client.get_fqdn();
+    let user_id = client.get_user_id();
+    if let Some(cache_key) = user_channel_cache_key(fqdn.as_deref(), user_id, None) {
+        return Some(cache_key);
+    }
+    if is_remote {
         return None;
     }
 
@@ -689,7 +807,14 @@ pub async fn cache_key_for_client(client: &Client) -> Option<String> {
             .as_ref()
             .map(|credential| credential.username.clone())
     };
-    user_channel_cache_key(None, username.as_deref())
+    user_channel_cache_key(None, None, username.as_deref())
+}
+
+fn records_client_transport(
+    transport_kind: ClientTransportKind,
+    record_remote_sessions: bool,
+) -> bool {
+    transport_kind != ClientTransportKind::Remote || record_remote_sessions
 }
 
 pub async fn resolve_login_channels(
@@ -793,7 +918,7 @@ pub async fn move_local_clients_out_of_pending_delete(
             continue;
         }
 
-        let channel_cache_key = cache_key_for_client(client.as_ref()).await;
+        let channel_cache_key = cache_key_for_client(server.as_ref(), client.as_ref()).await;
         let target_channel = move_local_client_to_forced_fallback(
             server,
             &client,
@@ -971,16 +1096,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_key_prefers_user_id() {
+    fn cache_key_prefers_fqdn_then_user_id_then_username() {
         assert_eq!(
-            user_channel_cache_key(Some(42), Some("alice")),
+            user_channel_cache_key(Some("alice.example.test"), Some(42), Some("alice")),
+            Some("alice.example.test".to_owned())
+        );
+        assert_eq!(
+            user_channel_cache_key(Some(""), Some(42), Some("alice")),
             Some("42".to_owned())
         );
         assert_eq!(
-            user_channel_cache_key(None, Some("alice")),
+            user_channel_cache_key(None, None, Some("alice")),
             Some("alice".to_owned())
         );
-        assert_eq!(user_channel_cache_key(None, None), None);
+        assert_eq!(user_channel_cache_key(None, None, None), None);
+    }
+
+    #[test]
+    fn remote_client_cache_recording_is_opt_in() {
+        assert!(records_client_transport(
+            ClientTransportKind::NativeMumble,
+            false
+        ));
+        assert!(!records_client_transport(
+            ClientTransportKind::Remote,
+            false
+        ));
+        assert!(records_client_transport(ClientTransportKind::Remote, true));
     }
 
     #[test]
@@ -1015,6 +1157,27 @@ mod tests {
         assert_eq!(cached.last_channel_id, Some(5));
         assert_eq!(cached.listening_channel_ids, vec![5, 9]);
         assert!(dir.path().join(CACHE_DB_FILE_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn cache_migrates_numeric_user_id_key_to_fqdn_key() {
+        let cache = UserChannelCache::new_in_memory();
+        cache.remember_last_channel("42", 5).await.unwrap();
+        cache
+            .remember_listening_channels("42", [7, 9])
+            .await
+            .unwrap();
+
+        cache.migrate_key("42", "alice.example.test").await.unwrap();
+
+        assert!(cache.get("42").await.is_none());
+        assert_eq!(
+            cache.get("alice.example.test").await,
+            Some(CachedUserChannels {
+                last_channel_id: Some(5),
+                listening_channel_ids: vec![7, 9],
+            })
+        );
     }
 
     #[test]

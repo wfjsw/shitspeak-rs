@@ -323,6 +323,7 @@ block other clients assigned to the same projection shard.
 
 ```toml
 blob_storage_dir = "state"
+user_channel_cache_record_remote_sessions = false
 channel_log_max_entries = 10000
 client_log_max_entries = 10000
 channel_snapshot_every_ops = 10
@@ -341,6 +342,12 @@ after every process start.
 `blob_storage_dir` stores channel snapshots, write-ahead logs, channel blobs,
 session blob cache data, user channel cache data, and WASM authenticator
 durable state.
+
+`user_channel_cache_record_remote_sessions` controls whether
+`user_channel_cache.db` also records current/listening channel state for
+sessions hosted on remote S2S nodes. It defaults to `false`, so the database
+only records sessions logged in to this server. Enable it when each node should
+retain remote session channel state as well.
 
 See [Persistence](persistence.md) for backup guidance.
 

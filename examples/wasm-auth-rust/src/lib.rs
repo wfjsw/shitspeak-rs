@@ -275,6 +275,7 @@ struct AuthenticateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     auth_session_id: Option<String>,
     user_id: Option<u32>,
+    fqdn: Option<String>,
     display_name: Option<String>,
     groups: Vec<String>,
     is_superuser: bool,
@@ -301,6 +302,7 @@ impl AuthenticateResponse {
             rejection: None,
             auth_session_id: None,
             user_id,
+            fqdn: None,
             display_name: Some(display_name.to_owned()),
             groups,
             is_superuser,
@@ -324,6 +326,7 @@ impl AuthenticateResponse {
             rejection: Some(rejection.to_owned()),
             auth_session_id: None,
             user_id: None,
+            fqdn: None,
             display_name: None,
             groups: Vec::new(),
             is_superuser: false,

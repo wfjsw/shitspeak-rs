@@ -194,8 +194,12 @@ pub async fn handle_authenticate(
     let authenticated_until = result.authenticated_until;
     let authentication_expiry_action = result.authentication_expiry_action;
     sender.set_language(result.language);
-    let channel_cache_key =
-        crate::user_channel_cache::user_channel_cache_key(result.user_id, Some(username.as_str()));
+    let channel_cache_key = crate::user_channel_cache::user_channel_cache_key(
+        result.fqdn.as_deref(),
+        result.user_id,
+        Some(username.as_str()),
+    );
+    let legacy_channel_cache_key = result.user_id.map(|user_id| user_id.to_string());
 
     if let Some(auth_server_id) = result.virtual_server_id.clone() {
         if auth_server_id != provisional_server_id {
@@ -250,6 +254,7 @@ pub async fn handle_authenticate(
         sender.set_max_bandwidth(result.max_bandwidth);
         let mut gs = sender.write_global_state_direct();
         gs.set_user_id(result.user_id);
+        gs.set_fqdn(result.fqdn);
         gs.set_display_name(result.display_name);
         gs.set_superuser(result.is_superuser);
         gs.set_groups(result.groups.into_iter().collect());
@@ -308,6 +313,23 @@ pub async fn handle_authenticate(
 
     // ── Place user in cached/default channel ─────────────────────────────
     let staged_channel_cache_write = {
+        if let (Some(legacy_key), Some(cache_key)) = (
+            legacy_channel_cache_key.as_deref(),
+            channel_cache_key.as_deref(),
+        ) {
+            if let Err(error) = server
+                .get_user_channel_cache()
+                .migrate_key(legacy_key, cache_key)
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    legacy_key,
+                    cache_key,
+                    "failed to migrate user channel cache identity"
+                );
+            }
+        }
         let restored_channels = crate::user_channel_cache::resolve_login_channels(
             server,
             sender,

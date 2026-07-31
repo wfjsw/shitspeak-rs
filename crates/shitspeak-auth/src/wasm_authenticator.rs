@@ -116,6 +116,7 @@ impl Authenticator for DemoAuthenticator {
         };
         Ok(AuthenticateResult {
             user_id: None,
+            fqdn: None,
             display_name: Some(username.to_owned()),
             groups,
             is_superuser: username == "admin",

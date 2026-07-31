@@ -174,6 +174,8 @@ pub(crate) struct AuthenticatorJsonAuthenticateResponse {
     #[serde(default)]
     user_id: Option<u32>,
     #[serde(default)]
+    fqdn: Option<String>,
+    #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
     groups: Vec<String>,
@@ -212,6 +214,7 @@ impl AuthenticatorJsonAuthenticateResponse {
         }
         Ok(AuthenticateResult {
             user_id: self.user_id,
+            fqdn: self.fqdn,
             display_name: self.display_name,
             groups: self.groups,
             is_superuser: self.is_superuser,
@@ -236,6 +239,7 @@ pub(crate) fn authenticate_result_from_external_claims(
 ) -> AuthenticateResult {
     AuthenticateResult {
         user_id: Some(claims.subject),
+        fqdn: None,
         display_name: claims
             .display_name
             .clone()
@@ -298,6 +302,17 @@ mod tests {
         );
         assert!(result.auth_session_id.is_none());
         assert!(result.authenticated_until.is_none());
+    }
+
+    #[test]
+    fn authenticate_response_maps_fqdn() {
+        let response: AuthenticatorJsonAuthenticateResponse =
+            serde_json::from_str(r#"{"user_id":7,"fqdn":"alice@example.test"}"#).unwrap();
+
+        let result = response.into_authenticate_result().unwrap();
+
+        assert_eq!(result.user_id, Some(7));
+        assert_eq!(result.fqdn.as_deref(), Some("alice@example.test"));
     }
 
     #[test]

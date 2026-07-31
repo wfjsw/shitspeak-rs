@@ -249,6 +249,7 @@ async fn spawn_test_server_with_pki(
         blob_storage_dir: blob_storage_dir
             .as_ref()
             .map(|directory| directory.path().to_path_buf()),
+        user_channel_cache_record_remote_sessions: false,
         channel_log_max_entries: opts.channel_log_max_entries,
         client_log_max_entries: 10_000,
         channel_snapshot_every_ops: 10,

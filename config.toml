@@ -71,6 +71,9 @@ pending_delete_timeout_ms = 5000
 
 # Persistence
 blob_storage_dir = "data"
+# Whether `user_channel_cache.db` also records sessions hosted on remote S2S
+# nodes. Local sessions are always recorded when they have a cache key.
+user_channel_cache_record_remote_sessions = false
 channel_log_max_entries = 300
 client_log_max_entries = 2000
 channel_snapshot_every_ops = 10

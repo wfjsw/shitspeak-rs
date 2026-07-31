@@ -28,6 +28,8 @@ pub enum AuthenticationRejection {
 #[derive(Debug)]
 pub struct AuthenticateResult {
     pub user_id: Option<u32>,
+    /// Authenticator-assigned, globally unique user identifier.
+    pub fqdn: Option<String>,
     pub display_name: Option<String>,
     pub groups: Vec<String>,
     pub is_superuser: bool,
@@ -110,6 +112,7 @@ pub trait Authenticator: Send + Sync + 'static {
         let _ = auxiliary_data;
         Ok(AuthenticateResult {
             user_id: Some(claims.subject),
+            fqdn: None,
             display_name: claims
                 .display_name
                 .clone()

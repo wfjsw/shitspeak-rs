@@ -1200,6 +1200,10 @@ impl Client {
         self.global_state.read().get_user_id()
     }
 
+    pub fn get_fqdn(&self) -> Option<String> {
+        self.global_state.read().get_fqdn().map(ToOwned::to_owned)
+    }
+
     pub fn get_acl_generation(&self) -> u64 {
         self.global_state.read().get_acl_generation()
     }

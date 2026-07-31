@@ -540,7 +540,7 @@ pub async fn handle_user_state(
         || !msg.listening_channel_add.is_empty()
         || !msg.listening_channel_remove.is_empty();
     let channel_cache_key = if should_stage_channel_cache {
-        crate::user_channel_cache::cache_key_for_client(target.as_ref()).await
+        crate::user_channel_cache::cache_key_for_client(server.as_ref(), target.as_ref()).await
     } else {
         None
     };

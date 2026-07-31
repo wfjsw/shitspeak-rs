@@ -33,6 +33,7 @@ pub struct ClientGlobalState {
 
     // ── User identity ─────────────────────────────────────────────────────
     user_id: Option<u32>,
+    fqdn: Option<String>,
     groups: HashSet<String>,
     is_superuser: bool,
     tokens: HashSet<String>,
@@ -75,6 +76,7 @@ impl ClientGlobalState {
             comment_blob_revision: 0,
 
             user_id: None,
+            fqdn: None,
             groups: HashSet::new(),
             is_superuser: false,
             tokens: HashSet::new(),
@@ -394,6 +396,10 @@ impl ClientGlobalState {
         self.user_id
     }
 
+    pub fn get_fqdn(&self) -> Option<&str> {
+        self.fqdn.as_deref()
+    }
+
     pub fn get_acl_generation(&self) -> u64 {
         self.acl_generation
     }
@@ -424,6 +430,16 @@ impl ClientGlobalState {
         self.bump_acl_subject_generation();
         if self.delta_recording {
             self.pending_delta.user_id = Some(user_id);
+        }
+    }
+
+    pub fn set_fqdn(&mut self, fqdn: Option<String>) {
+        if self.fqdn == fqdn {
+            return;
+        }
+        self.fqdn = fqdn;
+        if self.delta_recording {
+            self.pending_delta.fqdn = Some(self.fqdn.clone());
         }
     }
 
@@ -647,5 +663,19 @@ mod tests {
         state.set_superuser(false);
 
         assert!(!state.is_hidden_from_regular_users());
+    }
+
+    #[test]
+    fn fqdn_is_recorded_as_replicated_state() {
+        let mut state = ClientGlobalState::new();
+        state.begin_delta_recording();
+
+        state.set_fqdn(Some("alice@example.test".to_owned()));
+
+        assert_eq!(state.get_fqdn(), Some("alice@example.test"));
+        assert_eq!(
+            state.finish_delta_recording().fqdn,
+            Some(Some("alice@example.test".to_owned()))
+        );
     }
 }

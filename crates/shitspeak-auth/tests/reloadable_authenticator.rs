@@ -135,6 +135,7 @@ fn auxiliary_data() -> AuthenticateAuxiliaryData {
 fn result(label: &str) -> AuthenticateResult {
     AuthenticateResult {
         user_id: None,
+        fqdn: None,
         display_name: Some(label.to_owned()),
         groups: Vec::new(),
         is_superuser: false,

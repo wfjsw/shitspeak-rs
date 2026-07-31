@@ -55,6 +55,7 @@ pub struct ClientGlobalStateDelta {
 
     // Append new replicated fields to preserve positional MessagePack compatibility.
     pub hidden_from_regular_users: Option<bool>,
+    pub fqdn: Option<Option<String>>,
 }
 
 impl ClientGlobalStateDelta {
@@ -84,6 +85,7 @@ impl ClientGlobalStateDelta {
             is_superuser: Some(state.is_superuser()),
             tokens: Some(state.get_tokens().clone()),
             display_name: Some(state.get_display_name_opt().map(ToOwned::to_owned)),
+            fqdn: Some(state.get_fqdn().map(ToOwned::to_owned)),
         }
     }
 
@@ -110,7 +112,8 @@ impl ClientGlobalStateDelta {
             || self.groups.is_some()
             || self.is_superuser.is_some()
             || self.tokens.is_some()
-            || self.display_name.is_some())
+            || self.display_name.is_some()
+            || self.fqdn.is_some())
     }
 
     pub fn affects_acl_generation(&self) -> bool {
@@ -1000,6 +1003,7 @@ mod tests {
                 initial_state: ClientGlobalStateDelta {
                     display_name: Some(Some("alice".into())),
                     user_id: Some(Some(42)),
+                    fqdn: Some(Some("alice.auth.example".into())),
                     current_channel_id: Some(0),
                     ..ClientGlobalStateDelta::default()
                 },
@@ -1044,6 +1048,7 @@ mod tests {
                 assert_eq!(cert_hash, Some(Bytes::from_static(b"hash")));
                 assert_eq!(initial_state.display_name, Some(Some("alice".into())));
                 assert_eq!(initial_state.user_id, Some(Some(42)));
+                assert_eq!(initial_state.fqdn, Some(Some("alice.auth.example".into())));
             }
             other => panic!("expected AddClient, got {other:?}"),
         }

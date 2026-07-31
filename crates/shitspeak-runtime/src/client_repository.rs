@@ -3542,6 +3542,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replicated_delta_applies_and_clears_fqdn() {
+        let mut state = crate::client::client_global_state::ClientGlobalState::new();
+
+        apply_delta_to_global_state(
+            &mut state,
+            &ClientGlobalStateDelta {
+                fqdn: Some(Some("alice.auth.example".to_owned())),
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.get_fqdn(), Some("alice.auth.example"));
+
+        apply_delta_to_global_state(
+            &mut state,
+            &ClientGlobalStateDelta {
+                fqdn: Some(None),
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.get_fqdn(), None);
+    }
+
+    #[test]
     fn projection_broadcast_capacity_tracks_retention_with_a_safe_minimum() {
         assert_eq!(projection_broadcast_capacity(1), 1024);
         assert_eq!(projection_broadcast_capacity(511), 1024);
@@ -5803,6 +5826,9 @@ pub(crate) fn apply_delta_to_global_state(
     }
     if let Some(ref v) = delta.user_id {
         gs.set_user_id(*v);
+    }
+    if let Some(ref v) = delta.fqdn {
+        gs.set_fqdn(v.clone());
     }
     if let Some(ref v) = delta.groups {
         gs.set_groups(v.clone());

@@ -1143,6 +1143,10 @@ pub struct Config {
     /// `None` = in-memory only (no persistence).
     #[serde(default)]
     pub blob_storage_dir: Option<PathBuf>,
+    /// Whether `user_channel_cache.db` records current/listening channel state
+    /// for sessions hosted on remote S2S nodes. Default: `false`.
+    #[serde(default)]
+    pub user_channel_cache_record_remote_sessions: bool,
     /// Max channel log entries kept in memory for replay/S2S.
     #[serde(default = "default_channel_log_max_entries")]
     pub channel_log_max_entries: usize,
@@ -1933,6 +1937,7 @@ mod tests {
             UdpPingUserCountScope::Cluster
         );
         assert_eq!(cfg.blob_storage_dir, Some(PathBuf::from("data")));
+        assert!(!cfg.user_channel_cache_record_remote_sessions);
         assert_eq!(cfg.client_idle_timeout_secs, 30);
         assert_eq!(cfg.authenticate_timeout_ms, 30_000);
         assert_eq!(cfg.pending_delete_timeout_ms, 5_000);
@@ -1986,6 +1991,31 @@ mod tests {
         let disabled_cfg = parse_config(&format!("{base}\nshow_node_id_for_superusers = false\n"))
             .expect("config deserialize");
         assert!(!disabled_cfg.show_node_id_for_superusers);
+    }
+
+    #[test]
+    fn user_channel_cache_remote_sessions_default_off_and_parses_true() {
+        let base = r#"
+            listen = "127.0.0.1:64738"
+            register_name = "test"
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+            send_version = true
+            send_build_info = true
+            send_os_info = true
+            allowed_proxies = []
+            min_client_version = 0
+            max_users = 100
+        "#;
+
+        let default_cfg = parse_config(base).expect("config deserialize");
+        assert!(!default_cfg.user_channel_cache_record_remote_sessions);
+
+        let enabled_cfg = parse_config(&format!(
+            "{base}\nuser_channel_cache_record_remote_sessions = true\n"
+        ))
+        .expect("config deserialize");
+        assert!(enabled_cfg.user_channel_cache_record_remote_sessions);
     }
 
     #[test]

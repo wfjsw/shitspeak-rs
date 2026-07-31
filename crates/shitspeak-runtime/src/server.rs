@@ -1566,6 +1566,7 @@ impl Server {
 
         let AuthenticateResult {
             user_id,
+            fqdn,
             display_name,
             groups,
             is_superuser,
@@ -1625,10 +1626,28 @@ impl Server {
         if !self.client_instance_is_current(&client).await {
             return;
         }
+        if let (Some(user_id), Some(fqdn)) =
+            (user_id, fqdn.as_deref().filter(|fqdn| !fqdn.is_empty()))
+        {
+            let legacy_key = user_id.to_string();
+            if let Err(error) = self
+                .get_user_channel_cache()
+                .migrate_key(&legacy_key, fqdn)
+                .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    legacy_key,
+                    fqdn,
+                    "failed to migrate user channel cache identity during reauthentication"
+                );
+            }
+        }
         let was_superuser = client.is_superuser();
         {
             let mut state = client.write_global_state(&self.clients);
             state.set_user_id(user_id);
+            state.set_fqdn(fqdn);
             state.set_display_name(display_name);
             state.set_groups(groups);
             state.set_superuser(is_superuser);
@@ -1723,6 +1742,7 @@ impl Server {
         .await;
         let mut state = client.write_global_state(&self.clients);
         state.set_user_id(None);
+        state.set_fqdn(None);
         state.set_suppress(!current_permissions.contains(shitspeak_state::ACLPermissions::Speak));
     }
 

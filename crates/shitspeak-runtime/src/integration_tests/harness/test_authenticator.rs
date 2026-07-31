@@ -251,6 +251,7 @@ impl Authenticator for AuthenticatorAdapter {
             authenticated_until: None,
             authentication_expiry_action: Default::default(),
             user_id: entry.user_id,
+            fqdn: None,
             display_name: Some(username.to_owned()),
             groups: entry.groups,
             is_superuser: entry.is_superuser,

@@ -275,9 +275,11 @@ async fn configure_authenticated_client_inner(
         .as_ref()
         .map(|credential| credential.username.clone());
     let channel_cache_key = shitspeak_runtime::user_channel_cache::user_channel_cache_key(
+        result.fqdn.as_deref(),
         result.user_id,
         cache_username.as_deref(),
     );
+    let legacy_channel_cache_key = result.user_id.map(|user_id| user_id.to_string());
     let auth_session_id = result.auth_session_id.clone();
     let authenticated_until = result.authenticated_until;
     let authentication_expiry_action = result.authentication_expiry_action;
@@ -343,6 +345,7 @@ async fn configure_authenticated_client_inner(
     {
         let mut gs = client.write_global_state_direct();
         gs.set_user_id(result.user_id);
+        gs.set_fqdn(result.fqdn);
         gs.set_display_name(result.display_name);
         gs.set_superuser(result.is_superuser);
         gs.set_groups(result.groups.into_iter().collect());
@@ -352,6 +355,24 @@ async fn configure_authenticated_client_inner(
     if let Some(credential) = credential {
         let mut ext = client.user_info_extended().await;
         ext.set_credential(credential);
+    }
+
+    if let (Some(legacy_key), Some(cache_key)) = (
+        legacy_channel_cache_key.as_deref(),
+        channel_cache_key.as_deref(),
+    ) {
+        if let Err(error) = server
+            .get_user_channel_cache()
+            .migrate_key(legacy_key, cache_key)
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                legacy_key,
+                cache_key,
+                "failed to migrate user channel cache identity"
+            );
+        }
     }
 
     let restored_channels = shitspeak_runtime::user_channel_cache::resolve_login_channels(

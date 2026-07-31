@@ -55,6 +55,8 @@ class AuthenticateResponse {
   @omitnull()
   user_id: JSON.Box<i32> | null = null;
   @omitnull()
+  fqdn: string | null = null;
+  @omitnull()
   display_name: string | null = null;
   groups: string[] = [];
   is_superuser: bool = false;

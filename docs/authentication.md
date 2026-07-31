@@ -104,6 +104,7 @@ Successful authentication can provide identity, display name, groups, virtual se
   "accepted": true,
   "auth_session_id": "auth-session-7f3c",
   "user_id": 42,
+  "fqdn": "alice.auth.example",
   "display_name": "Alice",
   "groups": ["admin"],
   "virtual_server_id": null,
@@ -117,6 +118,8 @@ Successful authentication can provide identity, display name, groups, virtual se
 ```
 
 `max_bandwidth`, when present, overrides the configured `max_bandwidth` value advertised to that authenticated client.
+
+`fqdn` is an optional authenticator-assigned, globally unique user identifier. It is replicated between cluster nodes but is not sent in Mumble `UserState` messages.
 
 `auth_session_id` is an optional opaque identifier supplied by the authenticator. The server retains it for the connection and includes it as `auxiliary_data.auth_session_id` in later authentication requests for that connection, including expiry-triggered reauthentication.
 

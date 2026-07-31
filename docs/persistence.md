@@ -16,7 +16,7 @@ The persistence directory stores:
 
 - Channel snapshots and write-ahead logs.
 - Channel blobs and session blob cache data.
-- `user_channel_cache.db` for TTL-bound last/listening channel restoration. Legacy `user_channel_cache.json` data is imported on first startup after upgrade.
+- `user_channel_cache.db` for TTL-bound last/listening channel restoration. Entries use the authenticator-provided `fqdn` when available, otherwise the numeric user id. Legacy `user_channel_cache.json` data is imported on first startup after upgrade. Remote S2S sessions are excluded unless `user_channel_cache_record_remote_sessions = true`.
 - WASM authenticator durable `state_*` data under `wasm_authenticator`.
 - S2S transport adaptive compression dictionary cache and strict-replication terminal journals when `s2s.persistence_dir` points at persistent storage.
 
