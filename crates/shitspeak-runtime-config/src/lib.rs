@@ -1143,6 +1143,12 @@ pub struct Config {
     /// `None` = in-memory only (no persistence).
     #[serde(default)]
     pub blob_storage_dir: Option<PathBuf>,
+    /// Total on-disk budget (bytes) for the session blob cache (user
+    /// textures/comments) before *unreferenced* blobs are evicted
+    /// least-recently-used first. Referenced blobs are never evicted.
+    /// `0` disables eviction. Default: 256 MiB.
+    #[serde(default = "default_session_blob_cache_budget_bytes")]
+    pub session_blob_cache_budget_bytes: u64,
     /// Whether `user_channel_cache.db` records current/listening channel state
     /// for sessions hosted on remote S2S nodes. Default: `false`.
     #[serde(default)]
@@ -1207,6 +1213,25 @@ pub struct Config {
     /// Default: 5000.
     #[serde(default = "default_pending_delete_timeout_ms")]
     pub pending_delete_timeout_ms: u64,
+
+    // ── Authentication abuse protections ──────────────────────────────────
+    /// Leaky-bucket refill rate: authentication attempts allowed per source
+    /// IP per second.  A burst of up to `auth_rate_limit_ip_burst` is allowed
+    /// immediately (e.g. many users behind one NAT joining at once).  Zero
+    /// disables the per-IP limit.  Default: 2.
+    #[serde(default = "default_auth_rate_limit_per_ip_per_second")]
+    pub auth_rate_limit_per_ip_per_second: f64,
+    /// Burst of authentication attempts allowed per source IP.  Default: 10.
+    #[serde(default = "default_auth_rate_limit_ip_burst")]
+    pub auth_rate_limit_ip_burst: f64,
+    /// Leaky-bucket refill rate: authentication attempts allowed per account
+    /// (lowercased username) per second, slowing targeted credential
+    /// stuffing.  Zero disables the per-account limit.  Default: 1.
+    #[serde(default = "default_auth_rate_limit_per_account_per_second")]
+    pub auth_rate_limit_per_account_per_second: f64,
+    /// Burst of authentication attempts allowed per account.  Default: 10.
+    #[serde(default = "default_auth_rate_limit_account_burst")]
+    pub auth_rate_limit_account_burst: f64,
 
     // ── Access control ────────────────────────────────────────────────────
     /// Groups required to connect.  If empty, all authenticated users are
@@ -1575,6 +1600,10 @@ fn default_max_image_message_length() -> u32 {
 fn default_root_channel_name() -> String {
     "Root".to_string()
 }
+
+fn default_session_blob_cache_budget_bytes() -> u64 {
+    256 * 1024 * 1024
+}
 fn default_udp_channel_size() -> usize {
     2048
 }
@@ -1632,6 +1661,22 @@ fn third_power_at_most(base: usize, value: usize) -> bool {
 }
 fn default_pending_delete_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_auth_rate_limit_per_ip_per_second() -> f64 {
+    2.0
+}
+
+fn default_auth_rate_limit_ip_burst() -> f64 {
+    10.0
+}
+
+fn default_auth_rate_limit_per_account_per_second() -> f64 {
+    1.0
+}
+
+fn default_auth_rate_limit_account_burst() -> f64 {
+    10.0
 }
 fn default_channel_log_max_entries() -> usize {
     300

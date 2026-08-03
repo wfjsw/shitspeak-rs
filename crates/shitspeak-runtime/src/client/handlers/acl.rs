@@ -46,8 +46,7 @@ pub async fn handle_acl(
 
     let target_perm =
         crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await;
-    let root_perm = crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
-    if !target_perm.contains(ACLPermissions::Write) && !root_perm.contains(ACLPermissions::Write) {
+    if !target_perm.contains(ACLPermissions::Write) {
         return Err(MessageHandlerError::PermissionDenied(
             shitspeak_messages::messages::encoder::PermissionDenied {
                 r#type: shitspeak_messages::messages::encoder::DenyType::Permission,
@@ -137,7 +136,7 @@ pub async fn handle_acl(
         let mut new_acls = Vec::new();
         for proto_acl in &msg.acls {
             new_acls.push(ACL {
-                user_id: proto_acl.user_id.map(|uid| uid as i32),
+                user_id: proto_acl.user_id,
                 group: proto_acl.group.clone(),
                 apply_here: proto_acl.apply_here,
                 apply_subs: proto_acl.apply_subs,
@@ -202,7 +201,7 @@ pub async fn handle_acl(
                 if !post_write.contains(ACLPermissions::Write) {
                     if let Some(uid) = user_id {
                         new_acls.push(ACL {
-                            user_id: Some(uid as i32),
+                            user_id: Some(uid),
                             group: None,
                             apply_here: true,
                             apply_subs: false,

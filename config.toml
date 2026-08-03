@@ -105,6 +105,14 @@ mode = "startup_calibrated" # startup_calibrated, sequential, fixed
 [authenticator]
 backend = "demo"
 
+# Leaky-bucket abuse protections on authentication (native + web). Zero
+# disables the corresponding limit. Defaults: 2 attempts/sec per source IP
+# with a burst of 10; 1 attempt/sec per account with a burst of 10.
+# auth_rate_limit_per_ip_per_second = 2
+# auth_rate_limit_ip_burst = 10
+# auth_rate_limit_per_account_per_second = 1
+# auth_rate_limit_account_burst = 10
+
 # WASM authenticator configuration used when `backend = "wasm"`.
 # [authenticator.wasm]
 # path = "auth.wasm"

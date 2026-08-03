@@ -1793,6 +1793,8 @@ impl TerminalJournal {
     pub(crate) fn snapshot_with_terminal_decision_generation(
         &self,
     ) -> (u64, Vec<TerminalJournalSnapshotEntry>) {
+        #[cfg(test)]
+        TERMINAL_JOURNAL_SNAPSHOT_COUNT.with(|count| count.set(count.get() + 1));
         (self.terminal_decision_generation, self.snapshot())
     }
 
@@ -2979,6 +2981,7 @@ thread_local! {
     static TERMINAL_SET_DIGEST_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TERMINAL_SET_DIGEST_RECORD_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TERMINAL_SET_PREVIEW_NODE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TERMINAL_JOURNAL_SNAPSHOT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -2999,6 +3002,11 @@ fn take_terminal_set_digest_record_visits() -> usize {
 #[cfg(test)]
 fn take_terminal_set_preview_node_reads() -> usize {
     TERMINAL_SET_PREVIEW_NODE_READS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_terminal_journal_snapshot_count() -> usize {
+    TERMINAL_JOURNAL_SNAPSHOT_COUNT.with(|count| count.replace(0))
 }
 
 fn canonical_terminal_decision_digest(

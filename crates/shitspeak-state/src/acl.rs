@@ -30,7 +30,13 @@ pub(crate) fn effective_acl_compile_count() -> usize {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ACL {
-    pub user_id: Option<i32>,
+    /// The `user_id` was historically stored as `i32` (negative values were
+    /// wrapping casts of large u32 ids, e.g. from OAuth authenticators), so
+    /// persisted snapshots/WALs may contain negative numbers. Deserialization
+    /// reinterprets them via the same wrapping cast so upgrading deployments
+    /// keep their ACLs instead of failing to load.
+    #[serde(default, deserialize_with = "deserialize_user_id")]
+    pub user_id: Option<u32>,
     pub group: Option<String>,
 
     pub apply_here: bool,
@@ -38,6 +44,29 @@ pub struct ACL {
 
     pub allow: BitFlags<ACLPermissions>,
     pub deny: BitFlags<ACLPermissions>,
+}
+
+/// Deserialize `ACL.user_id` leniently: accepts `null` (no user), a plain
+/// `u32`, and legacy negative `i32` values (wrapping back to the original
+/// u32). Out-of-range positive values are rejected loudly instead of being
+/// silently truncated to a different user.
+fn deserialize_user_id<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<i64>::deserialize(deserializer)?;
+    value
+        .map(|v| {
+            if v < 0 {
+                // Legacy wrapping cast of the original u32 (e.g. OAuth ids).
+                Ok(v as u32)
+            } else {
+                u32::try_from(v).map_err(|_| {
+                    serde::de::Error::custom(format!("user_id {v} is out of u32 range"))
+                })
+            }
+        })
+        .transpose()
 }
 
 impl ACL {
@@ -60,7 +89,7 @@ impl ACL {
         self.user_id.is_none()
     }
 
-    pub fn match_user(&self, user_id: i32) -> bool {
+    pub fn match_user(&self, user_id: u32) -> bool {
         match self.user_id {
             Some(id) => id == user_id,
             None => false,
@@ -102,7 +131,7 @@ impl Default for ACL {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AclViewerScope {
     all_viewers: bool,
-    user_ids: BTreeSet<i32>,
+    user_ids: BTreeSet<u32>,
     plain_client_groups: BTreeSet<String>,
 }
 
@@ -111,7 +140,7 @@ impl AclViewerScope {
         self.all_viewers
     }
 
-    pub fn user_ids(&self) -> &BTreeSet<i32> {
+    pub fn user_ids(&self) -> &BTreeSet<u32> {
         &self.user_ids
     }
 
@@ -375,7 +404,7 @@ impl CompiledHierarchy {
 /// principal expression without consulting the channel tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CompiledAclEntry {
-    user_id: Option<i32>,
+    user_id: Option<u32>,
     group: Option<String>,
     allow: BitFlags<ACLPermissions>,
     deny: BitFlags<ACLPermissions>,
@@ -386,7 +415,7 @@ struct CompiledAclEntry {
 impl CompiledAclEntry {
     fn matches(&self, user_id: Option<u32>, client: &ClientMembershipQuery) -> bool {
         if let Some(expected_user_id) = self.user_id {
-            return user_id.is_some_and(|user_id| user_id as i32 == expected_user_id);
+            return user_id.is_some_and(|user_id| user_id == expected_user_id);
         }
 
         self.group.as_deref().is_some_and(|group| {
@@ -813,7 +842,7 @@ fn apply_permission_acl_entries(
         }
 
         let matches = if let Some(uid) = acl.user_id {
-            user_id.is_some_and(|user_id| user_id as i32 == uid)
+            user_id.is_some_and(|user_id| user_id == uid)
         } else {
             acl.match_group(evaluation_channel, Some(acl_channel), &[], client)
         };
@@ -920,7 +949,7 @@ fn apply_path_acl_entries(
             continue;
         }
         let matches = if let Some(uid) = acl.user_id {
-            user_id.is_some_and(|user_id| user_id as i32 == uid)
+            user_id.is_some_and(|user_id| user_id == uid)
         } else {
             acl.match_group(evaluation_channel, Some(acl_channel), &[], client)
         };
@@ -1192,7 +1221,7 @@ mod tests {
     }
 
     fn scoped_acl(
-        user_id: Option<i32>,
+        user_id: Option<u32>,
         group: Option<&str>,
         apply_here: bool,
         apply_subs: bool,
@@ -1207,6 +1236,45 @@ mod tests {
             allow,
             deny,
         }
+    }
+
+    #[test]
+    fn acl_user_id_deserializes_legacy_negative_ids_and_modern_values() {
+        // Legacy persisted ACLs stored user_id as a wrapping-cast i32; large
+        // u32 ids (e.g. from OAuth authenticators) were saved negative.
+        let acl: ACL = serde_json::from_str(
+            r#"{"user_id":-5,"group":null,"apply_here":true,"apply_subs":false,"allow":0,"deny":0}"#,
+        )
+        .expect("legacy negative user_id must deserialize");
+        assert_eq!(acl.user_id, Some((-5i32) as u32));
+
+        // null → no user.
+        let acl: ACL = serde_json::from_str(
+            r#"{"user_id":null,"group":"admin","apply_here":true,"apply_subs":false,"allow":0,"deny":0}"#,
+        )
+        .expect("null user_id must deserialize");
+        assert_eq!(acl.user_id, None);
+
+        // Missing field → no user (serde default).
+        let acl: ACL = serde_json::from_str(
+            r#"{"group":"admin","apply_here":true,"apply_subs":false,"allow":0,"deny":0}"#,
+        )
+        .expect("absent user_id must deserialize");
+        assert_eq!(acl.user_id, None);
+
+        // Modern positive u32 still works.
+        let acl: ACL = serde_json::from_str(
+            r#"{"user_id":7,"group":null,"apply_here":true,"apply_subs":false,"allow":0,"deny":0}"#,
+        )
+        .expect("positive user_id must deserialize");
+        assert_eq!(acl.user_id, Some(7));
+
+        // Out-of-range positive values fail loudly rather than truncating.
+        let error = serde_json::from_str::<ACL>(
+            r#"{"user_id":4294967296,"group":null,"apply_here":true,"apply_subs":false,"allow":0,"deny":0}"#,
+        )
+        .expect_err("out-of-range positive user_id must be rejected");
+        assert!(error.to_string().contains("out of u32 range"));
     }
 
     fn assert_cached_equivalent(

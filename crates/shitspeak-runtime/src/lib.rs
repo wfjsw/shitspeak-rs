@@ -20,6 +20,7 @@ pub mod observability;
 pub mod privacy;
 pub mod protocol_version;
 pub mod proxy_protocol;
+pub mod rate_limits;
 pub mod register;
 pub mod s2s;
 pub mod server;

@@ -167,7 +167,7 @@ impl From<&ExternalAuthClaims> for AuthenticatorJsonExternalAuthClaims {
 
 #[derive(Deserialize)]
 pub(crate) struct AuthenticatorJsonAuthenticateResponse {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     accepted: bool,
     #[serde(default)]
     rejection: Option<String>,
@@ -257,8 +257,8 @@ pub(crate) fn authenticate_result_from_external_claims(
     }
 }
 
-fn default_true() -> bool {
-    true
+fn default_false() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -290,24 +290,29 @@ mod tests {
     }
 
     #[test]
-    fn authenticate_response_defaults_to_accept() {
+    fn authenticate_response_defaults_to_reject() {
+        // Fail closed: a malformed/error-shaped backend response that omits
+        // `accepted` must never be treated as a successful login.
         let response: AuthenticatorJsonAuthenticateResponse =
             serde_json::from_str(r#"{"user_id":7,"display_name":"alice"}"#).unwrap();
-        let result = response.into_authenticate_result().unwrap();
-        assert_eq!(result.user_id, Some(7));
-        assert_eq!(result.display_name.as_deref(), Some("alice"));
-        assert_eq!(
-            result.authentication_expiry_action,
-            AuthenticationExpiryAction::Kick
-        );
-        assert!(result.auth_session_id.is_none());
-        assert!(result.authenticated_until.is_none());
+        assert!(matches!(
+            response.into_authenticate_result(),
+            Err(AuthenticationRejection::RetryLater)
+        ));
+
+        let response: AuthenticatorJsonAuthenticateResponse =
+            serde_json::from_str(r#"{"error":"db down"}"#).unwrap();
+        assert!(matches!(
+            response.into_authenticate_result(),
+            Err(AuthenticationRejection::RetryLater)
+        ));
     }
 
     #[test]
     fn authenticate_response_maps_fqdn() {
         let response: AuthenticatorJsonAuthenticateResponse =
-            serde_json::from_str(r#"{"user_id":7,"fqdn":"alice@example.test"}"#).unwrap();
+            serde_json::from_str(r#"{"accepted":true,"user_id":7,"fqdn":"alice@example.test"}"#)
+                .unwrap();
 
         let result = response.into_authenticate_result().unwrap();
 
@@ -319,6 +324,7 @@ mod tests {
     fn authenticate_response_maps_session_expiry_fields() {
         let response: AuthenticatorJsonAuthenticateResponse = serde_json::from_str(
             r#"{
+                "accepted":true,
                 "auth_session_id":"auth-session-7",
                 "authenticated_until":"2030-01-02T03:04:05Z",
                 "authentication_expiry_action":"reauth"

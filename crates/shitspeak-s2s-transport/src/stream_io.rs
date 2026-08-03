@@ -1484,6 +1484,27 @@ where
                 }
                 Err(_) => MessageClass::Regular,
             };
+            // Validate frame identity on every lane (QUIC v2 and legacy
+            // TCP/KCP/QUIC-v1). Without this, an authenticated but
+            // malicious/misconfigured peer could inject Data frames claiming
+            // any src_node/dst_node, defeating per-node provenance before
+            // overlay routing.
+            if frame.src_node != u32::from(cfg.peer_node) {
+                cfg.mark_protocol_violation();
+                record_quic_protocol_error(QuicProtocolErrorReason::SourceMismatch);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream frame source identity mismatch",
+                ));
+            }
+            if frame.dst_node != u32::from(cfg.local_node) {
+                cfg.mark_protocol_violation();
+                record_quic_protocol_error(QuicProtocolErrorReason::DestinationMismatch);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream frame destination identity mismatch",
+                ));
+            }
             let wire_level = if let Some(expected) = policy.data_class {
                 let wire_level = ServiceLevel::try_from(frame.service_level).map_err(|_| {
                     cfg.mark_protocol_violation();
@@ -1504,22 +1525,6 @@ where
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "best-effort data is not allowed on a QUIC v2 stream",
-                    ));
-                }
-                if frame.src_node != u32::from(cfg.peer_node) {
-                    cfg.mark_protocol_violation();
-                    record_quic_protocol_error(QuicProtocolErrorReason::SourceMismatch);
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "QUIC v2 stream frame source identity mismatch",
-                    ));
-                }
-                if frame.dst_node != u32::from(cfg.local_node) {
-                    cfg.mark_protocol_violation();
-                    record_quic_protocol_error(QuicProtocolErrorReason::DestinationMismatch);
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "QUIC v2 stream frame destination identity mismatch",
                     ));
                 }
                 wire_level

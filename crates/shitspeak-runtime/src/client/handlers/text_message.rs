@@ -67,6 +67,24 @@ pub async fn handle_text_message(
         direct_recipients.push(session_id);
     }
 
+    // ── Enforce the advertised maximum text message length ────────────────
+    // The value is advertised to clients at authenticate time
+    // (max_text_message_length) and enforced for comments; enforce it here
+    // too so an 8 MiB frame cannot be relayed/amplified to every recipient.
+    let max_len = server.get_max_text_message_length() as usize;
+    if max_len > 0 && message.len() > max_len {
+        return Err(MessageHandlerError::PermissionDenied(
+            shitspeak_messages::messages::encoder::PermissionDenied {
+                r#type: shitspeak_messages::messages::encoder::DenyType::TextTooLong,
+                session: sender_session,
+                channel_id: None,
+                reason: None,
+                name: None,
+                permission: None,
+            },
+        ));
+    }
+
     let mut channel_ids = Vec::new();
     for target_channel in channel_id {
         let perms =

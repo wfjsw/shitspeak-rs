@@ -361,7 +361,7 @@ struct TerminalCatchupBudgetViolation {
 }
 
 struct TerminalCatchupSnapshot {
-    records: Vec<TerminalJournalSnapshotEntry>,
+    records: Arc<Vec<TerminalJournalSnapshotEntry>>,
     terminal_decision_generation: u64,
     last_used_at: Instant,
 }
@@ -5743,51 +5743,32 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         max_entries: usize,
         max_bytes: usize,
     ) -> TerminalStatePage {
-        let (fresh_terminal_decision_generation, fresh_records) = self
-            .terminal_journal
-            .lock()
-            .await
-            .snapshot_with_terminal_decision_generation();
         let now = Instant::now();
         let (records, terminal_decision_generation, effective_cursor) = {
+            // Preserve the journal-before-snapshot lock order: a terminal
+            // journal update must not race selection of the peer's stable
+            // transfer cut. Cache hits share the existing image, so they no
+            // longer clone the full journal while holding this guard.
+            let journal = self.terminal_journal.lock().await;
             let mut snapshots = self.terminal_catchup_snapshots.lock();
-            if cursor == 0 {
-                if let Some(snapshot) = snapshots.get_mut(&peer) {
-                    // A retransmitted first page must keep the original
-                    // stable cut. Replacing it would make a concurrent
-                    // cursor-0 request shift every later page index.
-                    snapshot.last_used_at = now;
-                    (
-                        snapshot.records.clone(),
-                        snapshot.terminal_decision_generation,
-                        0,
-                    )
-                } else {
-                    snapshots.insert(
-                        peer,
-                        TerminalCatchupSnapshot {
-                            records: fresh_records.clone(),
-                            terminal_decision_generation: fresh_terminal_decision_generation,
-                            last_used_at: now,
-                        },
-                    );
-                    (fresh_records, fresh_terminal_decision_generation, 0)
-                }
-            } else if let Some(snapshot) = snapshots.get_mut(&peer) {
+            if let Some(snapshot) = snapshots.get_mut(&peer) {
                 snapshot.last_used_at = now;
                 (
-                    snapshot.records.clone(),
+                    Arc::clone(&snapshot.records),
                     snapshot.terminal_decision_generation,
-                    cursor,
+                    (cursor != 0).then_some(cursor).unwrap_or_default(),
                 )
             } else {
+                let (fresh_terminal_decision_generation, fresh_records) =
+                    journal.snapshot_with_terminal_decision_generation();
+                let fresh_records = Arc::new(fresh_records);
                 // A responder restart or session expiry must restart from the
                 // beginning. Duplicate terminal states are idempotent, while
                 // resuming a live BTreeMap index could silently skip a fence.
                 snapshots.insert(
                     peer,
                     TerminalCatchupSnapshot {
-                        records: fresh_records.clone(),
+                        records: Arc::clone(&fresh_records),
                         terminal_decision_generation: fresh_terminal_decision_generation,
                         last_used_at: now,
                     },
@@ -5796,7 +5777,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
         };
         let page = self.terminal_state_page_from_records(
-            &records,
+            records.as_slice(),
             terminal_decision_generation,
             effective_cursor,
             max_entries,
@@ -18061,7 +18042,7 @@ mod tests {
         rt.terminal_catchup_snapshots.lock().insert(
             2,
             TerminalCatchupSnapshot {
-                records: Vec::new(),
+                records: Arc::new(Vec::new()),
                 terminal_decision_generation: 7,
                 last_used_at: Instant::now(),
             },
@@ -22977,6 +22958,53 @@ mod tests {
             .map(|state| state.op_id_lo)
             .collect();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn terminal_catchup_later_pages_reuse_the_peer_snapshot_without_resnapshotting() {
+        let (runtime, _net, _repo) =
+            v1_runtime(ReplicationConfig::default().with_strict_max_catchup_ops(1));
+        let first = make_op_id(1, 1, 1);
+        let second = make_op_id(1, 1, 2);
+        assert!(runtime.apply_terminal_abort(first, 1).await);
+        assert!(runtime.apply_terminal_abort(second, 1).await);
+
+        let first_page = runtime
+            .terminal_states_for_catchup_page(2, 0, 1, usize::MAX)
+            .await;
+        assert_eq!(first_page.states.len(), 1);
+        assert!(first_page.has_more);
+
+        super::super::terminal_journal::take_terminal_journal_snapshot_count();
+        let continuation = {
+            let _journal_guard = runtime.terminal_journal.lock().await;
+            let runtime = Arc::clone(&runtime);
+            let cursor = first_page.next_cursor;
+            let continuation = tokio::spawn(async move {
+                runtime
+                    .terminal_states_for_catchup_page(2, cursor, 1, usize::MAX)
+                    .await
+            });
+            tokio::task::yield_now().await;
+            assert!(
+                !continuation.is_finished(),
+                "cached continuation must stay serialized behind terminal journal updates"
+            );
+            continuation
+        };
+        let second_page = tokio::time::timeout(Duration::from_millis(100), continuation)
+            .await
+            .expect("cached continuation must complete after the journal lock is released")
+            .expect("cached continuation task must not panic");
+        assert_eq!(
+            super::super::terminal_journal::take_terminal_journal_snapshot_count(),
+            0,
+            "cached continuation must not clone the terminal journal"
+        );
+
+        assert_eq!(second_page.states.len(), 1);
+        assert_eq!(second_page.states[0].op_id_lo, 2);
+        assert!(!second_page.has_more);
     }
 
     #[tokio::test]

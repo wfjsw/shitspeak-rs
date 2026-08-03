@@ -328,7 +328,7 @@ pub(crate) fn client_matches_acl_viewer_scope(
     let client_state = client.acl_state_snapshot();
     if client_state
         .user_id()
-        .is_some_and(|user_id| scope.user_ids().contains(&(user_id as i32)))
+        .is_some_and(|user_id| scope.user_ids().contains(&user_id))
     {
         return true;
     }

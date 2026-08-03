@@ -35,6 +35,7 @@ use ping::handle_ping;
 use plugin_data_transmission::handle_plugin_data_transmission;
 use query_users::handle_query_users;
 use request_blob::handle_request_blob;
+pub use request_blob::spawn_request_blob_task;
 use text_message::handle_text_message;
 use udp_tunnel::handle_udp_tunnel;
 use user_list::handle_user_list;

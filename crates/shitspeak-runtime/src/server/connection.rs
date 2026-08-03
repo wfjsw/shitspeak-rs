@@ -59,6 +59,25 @@ fn is_realtime_client_message(message: &Message) -> bool {
     matches!(message, Message::Ping(_) | Message::UDPTunnel(_))
 }
 
+/// Classify a message into an optional rate-limit tier (see
+/// [`crate::rate_limits`] `MESSAGE_TIER_*`). Query messages deliberately
+/// bypass client-message rate limiting; RequestBlob is instead serialized by
+/// its own per-client FIFO queue.
+fn message_rate_tier(message: &Message) -> Option<usize> {
+    match message {
+        Message::PermissionQuery(_)
+        | Message::QueryUsers(_)
+        | Message::ContextAction(_)
+        | Message::VoiceTarget(_)
+        | Message::UserStats(_)
+        | Message::RequestBlob(_) => None,
+        Message::TextMessage(_) => Some(crate::rate_limits::MESSAGE_TIER_TEXT),
+        Message::Ping(_) | Message::UDPTunnel(_) | _ => {
+            Some(crate::rate_limits::MESSAGE_TIER_STATE)
+        }
+    }
+}
+
 fn authenticate_timeout_duration(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms.max(MIN_AUTHENTICATE_TIMEOUT_MS))
 }
@@ -507,6 +526,23 @@ fn spawn_client_message_handler(
     client: &Arc<Box<Client>>,
     message: Message,
 ) {
+    // Per-client, per-type leaky-bucket rate limit: drop messages beyond the
+    // (generous) budget for their tier instead of spawning unbounded handler
+    // tasks. Real clients stay far below the limits; floods get silently
+    // truncated rather than desynchronizing the connection by a forced
+    // disconnect.
+    if let Some(tier) = message_rate_tier(&message) {
+        let session_id = u32::from(client.get_session_id());
+        debug_assert!(tier < crate::rate_limits::MESSAGE_TIER_COUNT);
+        if !server.client_message_rate_limiters()[tier].try_acquire(&session_id) {
+            tracing::debug!(
+                session = session_id,
+                tier,
+                "client message rate limit exceeded, dropping message"
+            );
+            return;
+        }
+    }
     let handler_server = Arc::clone(server);
     let handler_client = Arc::clone(client);
     handler_tasks.spawn(async move {
@@ -837,6 +873,19 @@ impl Server {
             .unwrap_or(remote_addr);
         let real_ip = client_addr.ip();
 
+        // ── Banned IP check ───────────────────────────────────────────────
+        // Reject banned sources before spending resources on a TLS handshake.
+        // (Re-checked after TLS in the Authenticate handler so bans added
+        // while a connection is in flight also take effect.)
+        if self.get_bans().is_banned(real_ip).await {
+            tracing::info!(
+                %remote_addr,
+                %real_ip,
+                "connection from banned IP closed before TLS handshake"
+            );
+            return Ok(());
+        }
+
         let local_addr = tcp_stream.local_addr()?;
         tracing::info!(
             %remote_addr,
@@ -847,7 +896,16 @@ impl Server {
         );
         let tls_ja4 = crate::tls_fingerprint::peek_tls_ja4(&tcp_stream).await?;
         let tls_acceptor = self.tls_acceptor.read().clone();
-        let tls_stream = tls_acceptor.accept(tcp_stream).await?;
+        // A slow/failed TLS handshake must not hold a connection slot (and a
+        // task) indefinitely: cap it with a deadline.
+        let tls_stream = tokio::time::timeout(
+            crate::rate_limits::TLS_HANDSHAKE_TIMEOUT,
+            tls_acceptor.accept(tcp_stream),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out")
+        })??;
         let server_id = self.resolve_tls_server_id(&provisional_server_id, local_addr, &tls_stream);
         tracing::info!(
             %remote_addr,
@@ -1079,6 +1137,10 @@ impl Server {
                     }
 
                     // ── Incoming message from this client ────────────────────
+                    // Reads are never gated here: realtime messages (Ping,
+                    // UDPTunnel voice-over-TCP) must flow even while handler
+                    // tasks are backed up. The in-flight bound lives in the
+                    // non-realtime branch below instead.
                     result = client.read_proto_message() => {
                         match result {
                             Ok(message) => {
@@ -1121,6 +1183,44 @@ impl Server {
                                     )
                                     .await?;
                                 } else {
+                                    // Bound in-flight non-realtime handler
+                                    // tasks without stalling realtime traffic:
+                                    // when the cap is reached, await one
+                                    // completion before spawning the next.
+                                    // (This briefly pauses *non-realtime*
+                                    // processing; Ping/UDPTunnel are handled
+                                    // in the realtime branch above and only
+                                    // wait behind the short completion await.)
+                                    if handler_tasks.len()
+                                        >= crate::rate_limits::MAX_IN_FLIGHT_HANDLERS
+                                    {
+                                        if let Some(result) =
+                                            handler_tasks.join_next().await
+                                        {
+                                            pre_auth_handler_in_flight = false;
+                                            let result = result.map_err(
+                                                HandleIncomingConnectionError::MessageHandlerTaskFailed,
+                                            )?;
+                                            finish_handler_result(
+                                                self,
+                                                &client,
+                                                client.get_session_id(),
+                                                &mut projection_registration,
+                                                result,
+                                            )
+                                            .await?;
+                                            client.touch_activity();
+                                            continue_deferred_client_messages(
+                                                &mut handler_tasks,
+                                                self,
+                                                &client,
+                                                &mut projection_registration,
+                                                &mut deferred_pre_auth_messages,
+                                                &mut pre_auth_handler_in_flight,
+                                            )
+                                            .await?;
+                                        }
+                                    }
                                     let spawned_before_auth = !client.is_authenticated();
                                     spawn_client_message_handler(&mut handler_tasks, self, &client, message);
                                     if spawned_before_auth {
@@ -1298,6 +1398,69 @@ mod client_snapshot_boundary_tests {
                 .await
                 .is_none(),
             "the connection consumer must advance only its vector, not apply the operation"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rate_tier_tests {
+    use super::*;
+    use shitspeak_messages::messages::Message;
+    use shitspeak_proto::mumble_proto::{
+        Authenticate, ContextAction, PermissionQuery, Ping, QueryUsers, RequestBlob, TextMessage,
+        UserState, UserStats, VoiceTarget,
+    };
+
+    #[test]
+    fn message_rate_tier_bypasses_queries_and_request_blobs() {
+        assert_eq!(
+            message_rate_tier(&Message::PermissionQuery(PermissionQuery::default())),
+            None
+        );
+        assert_eq!(
+            message_rate_tier(&Message::QueryUsers(QueryUsers::default())),
+            None
+        );
+        assert_eq!(
+            message_rate_tier(&Message::ContextAction(ContextAction::default())),
+            None
+        );
+        assert_eq!(
+            message_rate_tier(&Message::VoiceTarget(VoiceTarget::default())),
+            None
+        );
+        assert_eq!(
+            message_rate_tier(&Message::UserStats(UserStats::default())),
+            None
+        );
+        assert_eq!(
+            message_rate_tier(&Message::RequestBlob(RequestBlob::default())),
+            None
+        );
+    }
+
+    #[test]
+    fn message_rate_tier_caps_amplification_prone_types() {
+        assert_eq!(
+            message_rate_tier(&Message::TextMessage(TextMessage::default())),
+            Some(crate::rate_limits::MESSAGE_TIER_TEXT)
+        );
+    }
+
+    #[test]
+    fn message_rate_tier_defaults_to_state() {
+        assert_eq!(
+            message_rate_tier(&Message::UserState(UserState::default())),
+            Some(crate::rate_limits::MESSAGE_TIER_STATE)
+        );
+        assert_eq!(
+            message_rate_tier(&Message::Authenticate(Authenticate::default())),
+            Some(crate::rate_limits::MESSAGE_TIER_STATE)
+        );
+        // Realtime messages never reach the limiter but must still classify.
+        assert_eq!(
+            message_rate_tier(&Message::Ping(Ping::default())),
+            Some(crate::rate_limits::MESSAGE_TIER_STATE)
         );
     }
 }

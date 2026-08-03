@@ -82,6 +82,68 @@ pub async fn handle_authenticate(
     let username = msg.username.ok_or(RejectType::InvalidUsername)?;
     let password = msg.password;
 
+    // ── Abuse protections: rate limit + ban check ─────────────────────────
+    // Leaky-bucket rate limits per source IP and per account slow brute
+    // force / credential stuffing. The budgets are generous enough that
+    // legitimate clients (including many behind one NAT) are unaffected.
+    let real_ip = sender.get_real_ip_address();
+    let ip_allowed = server
+        .auth_ip_rate_limiter()
+        .map(|limiter| limiter.try_acquire(&real_ip))
+        .unwrap_or(true);
+    let account_allowed = server
+        .auth_account_rate_limiter()
+        .map(|limiter| limiter.try_acquire(&username.to_ascii_lowercase()))
+        .unwrap_or(true);
+    if !ip_allowed || !account_allowed {
+        tracing::warn!(
+            %real_ip,
+            username = %username,
+            "authentication rate limit exceeded"
+        );
+        return Err(AuthRejection::new_with_language(
+            RejectType::AuthenticatorFail,
+            sender.language(),
+        )
+        .into());
+    }
+
+    // Banned IP (re-checked here: bans may have been added while this
+    // connection was in flight; the TCP path also rejects earlier).
+    if server.get_bans().is_banned(real_ip).await {
+        tracing::info!(
+            %real_ip,
+            session = u32::from(session),
+            "connection from banned IP rejected at authenticate"
+        );
+        return Err(AuthRejection::new_with_language(
+            RejectType::AuthenticatorFail,
+            sender.language(),
+        )
+        .into());
+    }
+    // Banned certificate hash.
+    if let Some(certificate_hash) = sender.get_certificate_hash() {
+        let hash_hex = hex::encode(certificate_hash);
+        let banned_hash = server
+            .get_bans()
+            .get_active_bans()
+            .await
+            .iter()
+            .any(|entry| entry.hash.as_deref() == Some(hash_hex.as_str()));
+        if banned_hash {
+            tracing::info!(
+                session = u32::from(session),
+                "connection from banned certificate rejected at authenticate"
+            );
+            return Err(AuthRejection::new_with_language(
+                RejectType::AuthenticatorFail,
+                sender.language(),
+            )
+            .into());
+        }
+    }
+
     // ── Authentication context ────────────────────────────────────────────
     let certificate_hash = sender.get_certificate_hash().map(Bytes::copy_from_slice);
     let mut session_id = sender.get_session_id();
@@ -605,6 +667,10 @@ pub async fn handle_authenticate(
         "client authenticated"
     );
 
+    // RequestBlob replies can trigger disk or remote fetches. Process them
+    // FIFO with exactly one consumer for this authenticated client.
+    crate::client::handlers::spawn_request_blob_task(Arc::clone(server), Arc::clone(sender)).await;
+
     // ── Spawn per-user voice routing task ─────────────────────────────────
     crate::voice::spawn_voice_routing_task(Arc::clone(server), Arc::clone(sender));
 
@@ -652,8 +718,14 @@ fn spawn_deferred_session_blob_resolution(
         let (user_id, texture_url, comment_url, texture_revision, comment_revision) =
             resolution.into_parts();
         let authenticator = server.authenticator_arc();
-        let texture = resolve_texture(&server, Arc::clone(&authenticator), user_id, texture_url);
-        let comment = resolve_comment(&server, authenticator, user_id, comment_url);
+        let texture = resolve_texture(
+            &server,
+            &client,
+            Arc::clone(&authenticator),
+            user_id,
+            texture_url,
+        );
+        let comment = resolve_comment(&server, &client, authenticator, user_id, comment_url);
         tokio::pin!(texture);
         tokio::pin!(comment);
         let mut texture_done = false;
@@ -677,6 +749,7 @@ fn spawn_deferred_session_blob_resolution(
 
 async fn resolve_texture(
     server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
     authenticator: Arc<dyn Authenticator>,
     user_id: Option<u32>,
     texture_url: Option<String>,
@@ -688,6 +761,11 @@ async fn resolve_texture(
                 .fetch_and_cache(&url)
                 .await
                 .map(|(hash, _)| hash);
+            // Pin immediately after the blob exists so an over-budget
+            // eviction cannot delete it before the deferred apply pins it.
+            if let Some(hash) = &hash {
+                client.pin_texture_blob(server.get_session_blobs(), hash);
+            }
             (Some(url), hash)
         }
         None => {
@@ -710,6 +788,9 @@ async fn resolve_texture(
                 },
                 None => None,
             };
+            if let Some(hash) = &hash {
+                client.pin_texture_blob(server.get_session_blobs(), hash);
+            }
             (None, hash)
         }
     }
@@ -717,6 +798,7 @@ async fn resolve_texture(
 
 async fn resolve_comment(
     server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
     authenticator: Arc<dyn Authenticator>,
     user_id: Option<u32>,
     comment_url: Option<String>,
@@ -728,6 +810,9 @@ async fn resolve_comment(
                 .fetch_and_cache(&url)
                 .await
                 .map(|(hash, _)| hash);
+            if let Some(hash) = &hash {
+                client.pin_comment_blob(server.get_session_blobs(), hash);
+            }
             (Some(url), hash)
         }
         None => {
@@ -750,6 +835,9 @@ async fn resolve_comment(
                 },
                 None => None,
             };
+            if let Some(hash) = &hash {
+                client.pin_comment_blob(server.get_session_blobs(), hash);
+            }
             (None, hash)
         }
     }
@@ -768,7 +856,14 @@ async fn apply_resolved_texture(
         return;
     }
     let mut state = client.write_global_state(server.get_clients());
-    apply_texture_if_revision(&mut state, expected_revision, url, hash);
+    let applied = apply_texture_if_revision(&mut state, expected_revision, url, hash.clone());
+    drop(state);
+    if applied {
+        match hash {
+            Some(hash) => client.pin_texture_blob(server.get_session_blobs(), &hash),
+            None => client.clear_texture_blob_pin(),
+        }
+    }
 }
 
 async fn apply_resolved_comment(
@@ -784,7 +879,14 @@ async fn apply_resolved_comment(
         return;
     }
     let mut state = client.write_global_state(server.get_clients());
-    apply_comment_if_revision(&mut state, expected_revision, url, hash);
+    let applied = apply_comment_if_revision(&mut state, expected_revision, url, hash.clone());
+    drop(state);
+    if applied {
+        match hash {
+            Some(hash) => client.pin_comment_blob(server.get_session_blobs(), &hash),
+            None => client.clear_comment_blob_pin(),
+        }
+    }
 }
 
 fn apply_texture_if_revision(
@@ -792,9 +894,12 @@ fn apply_texture_if_revision(
     expected_revision: u64,
     url: Option<String>,
     hash: Option<String>,
-) {
+) -> bool {
     if state.texture_blob_revision() == expected_revision {
         state.set_texture_blob(url, hash);
+        true
+    } else {
+        false
     }
 }
 
@@ -803,9 +908,12 @@ fn apply_comment_if_revision(
     expected_revision: u64,
     url: Option<String>,
     hash: Option<String>,
-) {
+) -> bool {
     if state.comment_blob_revision() == expected_revision {
         state.set_comment_blob(url, hash);
+        true
+    } else {
+        false
     }
 }
 

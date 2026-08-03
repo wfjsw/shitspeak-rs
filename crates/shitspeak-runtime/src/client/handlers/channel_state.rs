@@ -44,7 +44,25 @@ pub async fn handle_channel_state(
         None => {
             let parent_id = msg.parent.unwrap_or(0);
             let name = match msg.name {
-                Some(n) if !n.is_empty() => n,
+                Some(n) if !n.is_empty() => {
+                    if n.len() > crate::rate_limits::MAX_CHANNEL_NAME_BYTES {
+                        return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                            r#type: DenyType::TextTooLong,
+                            session: u32::from(sender.get_session_id()),
+                            channel_id: None,
+                            reason: Some(
+                                format!(
+                                    "channel name exceeds {} bytes",
+                                    crate::rate_limits::MAX_CHANNEL_NAME_BYTES
+                                )
+                                .into(),
+                            ),
+                            name: None,
+                            permission: None,
+                        }));
+                    }
+                    n
+                }
                 _ => {
                     return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
                         r#type: DenyType::ChannelName,
@@ -78,6 +96,23 @@ pub async fn handle_channel_state(
             } else {
                 ACLPermissions::MakeChannel
             };
+            // Rate-limit temporary channel creation per client: even though a
+            // temp channel only persists while its creator occupies it, an
+            // attacker with TempChannel could still churn unlimited create
+            // operations (each a WAL/S2S op plus optional description blob).
+            if is_temp {
+                let session_id = u32::from(session);
+                if !server.temp_channel_rate_limiter().try_acquire(&session_id) {
+                    return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                        r#type: DenyType::TemporaryChannel,
+                        session: session_id,
+                        channel_id: Some(parent_id),
+                        reason: Some("temporary channel creation rate limit exceeded".into()),
+                        name: None,
+                        permission: None,
+                    }));
+                }
+            }
             let creator_parent_perms =
                 crate::client::acl::compute_permissions_for_client(server, sender, parent_id).await;
             if !creator_parent_perms.contains(required_permission) {
@@ -233,6 +268,24 @@ pub async fn handle_channel_state(
                         name: None,
                         permission: None,
                     }));
+                }
+                if let Some(name) = &msg.name {
+                    if name.len() > crate::rate_limits::MAX_CHANNEL_NAME_BYTES {
+                        return Err(MessageHandlerError::PermissionDenied(PermissionDenied {
+                            r#type: DenyType::TextTooLong,
+                            session: u32::from(session),
+                            channel_id: Some(channel_id),
+                            reason: Some(
+                                format!(
+                                    "channel name exceeds {} bytes",
+                                    crate::rate_limits::MAX_CHANNEL_NAME_BYTES
+                                )
+                                .into(),
+                            ),
+                            name: None,
+                            permission: None,
+                        }));
+                    }
                 }
                 if !has_write {
                     return Err(MessageHandlerError::PermissionDenied(
@@ -540,7 +593,7 @@ async fn add_missing_creator_temp_channel_acls(
     channel: &mut Channel,
 ) {
     let (user_id, group) = match sender.get_user_id() {
-        Some(user_id) => (Some(user_id as i32), None),
+        Some(user_id) => (Some(user_id), None),
         None => match sender.get_certificate_hash() {
             Some(hash) => (None, Some(format!("${}", hex::encode(hash)))),
             None => return,
@@ -626,11 +679,22 @@ async fn description_blob_patch(
 ) -> std::io::Result<Option<Option<String>>> {
     match description {
         Some("") => Ok(Some(None)),
-        Some(description) => server
-            .get_channel_blobs()
-            .put(description.as_bytes())
-            .await
-            .map(|hash| Some(Some(hash))),
+        Some(description) => {
+            if description.len() > crate::rate_limits::MAX_CHANNEL_DESCRIPTION_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "channel description exceeds {} bytes",
+                        crate::rate_limits::MAX_CHANNEL_DESCRIPTION_BYTES
+                    ),
+                ));
+            }
+            server
+                .get_channel_blobs()
+                .put(description.as_bytes())
+                .await
+                .map(|hash| Some(Some(hash)))
+        }
         None => Ok(None),
     }
 }

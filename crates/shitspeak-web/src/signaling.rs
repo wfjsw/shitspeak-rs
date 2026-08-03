@@ -1224,6 +1224,30 @@ async fn handle_signaling_authenticate(
                 return Ok(());
             }
 
+            // Leaky-bucket rate limits per source IP and per account (same
+            // budget as the native path), so the WebSocket password endpoint
+            // cannot be brute-forced or flooded.
+            if let Some(server) = context.server.as_ref() {
+                let ip_allowed = server
+                    .auth_ip_rate_limiter()
+                    .map(|limiter| limiter.try_acquire(&context.real_ip))
+                    .unwrap_or(true);
+                let account_allowed = server
+                    .auth_account_rate_limiter()
+                    .map(|limiter| limiter.try_acquire(&username.to_ascii_lowercase()))
+                    .unwrap_or(true);
+                if !ip_allowed || !account_allowed {
+                    tracing::warn!(
+                        %context.real_ip,
+                        username = %username,
+                        "web authentication rate limit exceeded"
+                    );
+                    send_authentication_rejection(stream, AuthenticationRejection::RetryLater)
+                        .await?;
+                    return Ok(());
+                }
+            }
+
             let preallocated = if let Some(server) = context.server.as_ref() {
                 let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel::<Message>(256);
                 let client = server
@@ -3341,6 +3365,7 @@ mod tests {
             default_channel: 0,
             cert_required: false,
             blob_storage_dir: None,
+            session_blob_cache_budget_bytes: 256 * 1024 * 1024,
             user_channel_cache_record_remote_sessions: false,
             channel_log_max_entries: 10_000,
             client_log_max_entries: 10_000,
@@ -3355,6 +3380,10 @@ mod tests {
             authenticate_timeout_ms: 30_000,
             auth_finalization_concurrency: 4,
             pending_delete_timeout_ms: 5_000,
+            auth_rate_limit_per_ip_per_second: 0.0,
+            auth_rate_limit_ip_burst: 0.0,
+            auth_rate_limit_per_account_per_second: 0.0,
+            auth_rate_limit_account_burst: 0.0,
             required_groups: Default::default(),
             send_permission_info: false,
             hide_users_without_traverse: false,

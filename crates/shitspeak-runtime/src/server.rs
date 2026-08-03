@@ -187,6 +187,16 @@ pub struct Server {
     user_channel_cache: Arc<UserChannelCache>,
     bans: Arc<shitspeak_state::BanRepository>,
 
+    // ── Abuse protections ─────────────────────────────────────────────────
+    auth_ip_rate_limiter: Option<shitspeak_core::rate_limit::KeyedRateLimiter<std::net::IpAddr>>,
+    auth_account_rate_limiter: Option<shitspeak_core::rate_limit::KeyedRateLimiter<String>>,
+    /// Per-client-session message rate limiters, one per message tier
+    /// (see [`crate::rate_limits`] `MESSAGE_TIER_*`).
+    client_message_rate_limiters:
+        [shitspeak_core::rate_limit::KeyedRateLimiter<u32>; crate::rate_limits::MESSAGE_TIER_COUNT],
+    udp_ping_rate_limiter: shitspeak_core::rate_limit::KeyedRateLimiter<std::net::IpAddr>,
+    temp_channel_rate_limiter: shitspeak_core::rate_limit::KeyedRateLimiter<u32>,
+
     codec_info: Mutex<CodecInfo>,
 
     /// Registry of server-defined context menu actions.
@@ -271,6 +281,7 @@ impl Server {
         let node_id = config.local_node_id().map_err(std::io::Error::other)?;
         let client_log_max_entries = config.client_log_max_entries;
         let auth_finalization_concurrency = config.auth_finalization_concurrency;
+        let session_blob_cache_budget_bytes = config.session_blob_cache_budget_bytes;
         let auth_task_executor =
             BackgroundTaskExecutor::new("auth", auth_finalization_concurrency)?;
         let acl_bulk_task_executor = BackgroundTaskExecutor::new("acl-bulk", 1)?;
@@ -284,7 +295,8 @@ impl Server {
                     ChannelRepository::open(node_id, dir, channel_root_config, channel_repo_tuning)
                         .await?;
                 let ch_blobs = Arc::new(ChannelBlobStore::open(dir).await?);
-                let s_blobs = Arc::new(SessionBlobStore::open(dir).await?);
+                let s_blobs =
+                    Arc::new(SessionBlobStore::open(dir, session_blob_cache_budget_bytes).await?);
                 let user_channel_cache = UserChannelCache::open(dir).await?;
                 let ban_repo = shitspeak_state::BanRepository::open(node_id, dir).await?;
                 (ch_repo, ch_blobs, s_blobs, user_channel_cache, ban_repo)
@@ -299,7 +311,8 @@ impl Server {
                     channel_repo_tuning,
                 );
                 let ch_blobs = Arc::new(ChannelBlobStore::open(&tmp).await?);
-                let s_blobs = Arc::new(SessionBlobStore::open(&tmp).await?);
+                let s_blobs =
+                    Arc::new(SessionBlobStore::open(&tmp, session_blob_cache_budget_bytes).await?);
                 let user_channel_cache = UserChannelCache::new_in_memory();
                 let ban_repo = shitspeak_state::BanRepository::new_in_memory(node_id);
                 (ch_repo, ch_blobs, s_blobs, user_channel_cache, ban_repo)
@@ -308,6 +321,12 @@ impl Server {
 
         let s2s_manager = Arc::new(S2SManager::initialize(&config));
         let geoip_config = config.geoip.clone();
+        // Capture abuse-protection tunings before `config` is moved into the
+        // reloadable ArcSwap below.
+        let auth_ip_rate_per_second = config.auth_rate_limit_per_ip_per_second;
+        let auth_ip_burst = config.auth_rate_limit_ip_burst;
+        let auth_account_rate_per_second = config.auth_rate_limit_per_account_per_second;
+        let auth_account_burst = config.auth_rate_limit_account_burst;
         let config = ArcSwap::from_pointee(config);
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(());
         let (visibility_reload_tx, _visibility_reload_rx) = broadcast::channel(64);
@@ -339,6 +358,42 @@ impl Server {
             session_blobs,
             user_channel_cache,
             bans,
+            auth_ip_rate_limiter: (auth_ip_rate_per_second > 0.0).then(|| {
+                shitspeak_core::rate_limit::KeyedRateLimiter::new(
+                    auth_ip_rate_per_second,
+                    auth_ip_burst,
+                    crate::rate_limits::RATE_LIMITER_MAX_ENTRIES,
+                )
+            }),
+            auth_account_rate_limiter: (auth_account_rate_per_second > 0.0).then(|| {
+                shitspeak_core::rate_limit::KeyedRateLimiter::new(
+                    auth_account_rate_per_second,
+                    auth_account_burst,
+                    crate::rate_limits::RATE_LIMITER_MAX_ENTRIES,
+                )
+            }),
+            client_message_rate_limiters: [
+                shitspeak_core::rate_limit::KeyedRateLimiter::new(
+                    crate::rate_limits::MESSAGE_TIER_TEXT_RATE_PER_SECOND,
+                    crate::rate_limits::MESSAGE_TIER_TEXT_BURST,
+                    crate::rate_limits::RATE_LIMITER_MAX_ENTRIES,
+                ),
+                shitspeak_core::rate_limit::KeyedRateLimiter::new(
+                    crate::rate_limits::MESSAGE_TIER_STATE_RATE_PER_SECOND,
+                    crate::rate_limits::MESSAGE_TIER_STATE_BURST,
+                    crate::rate_limits::RATE_LIMITER_MAX_ENTRIES,
+                ),
+            ],
+            udp_ping_rate_limiter: shitspeak_core::rate_limit::KeyedRateLimiter::new(
+                crate::rate_limits::UDP_PING_RATE_PER_SECOND,
+                crate::rate_limits::UDP_PING_BURST,
+                crate::rate_limits::RATE_LIMITER_MAX_ENTRIES,
+            ),
+            temp_channel_rate_limiter: shitspeak_core::rate_limit::KeyedRateLimiter::new(
+                crate::rate_limits::TEMP_CHANNEL_RATE_PER_SECOND,
+                crate::rate_limits::TEMP_CHANNEL_BURST,
+                crate::rate_limits::RATE_LIMITER_MAX_ENTRIES,
+            ),
             codec_info: Mutex::new(CodecInfo::default()),
             config,
             context_actions: Arc::new(
@@ -729,6 +784,16 @@ impl Server {
                         ping.timestamp,
                         ping.format
                     );
+                    // Per-source-IP rate limit on the unauthenticated ping
+                    // reflector so it cannot be used as a spoofable
+                    // amplification/flood target. The budget is generous
+                    // enough for real server-browser traffic, including
+                    // deployments where several Mumble instances share one IP
+                    // (each instance keeps its own limiter).
+                    if !server.udp_ping_rate_limiter().try_acquire(&src_addr.ip()) {
+                        tracing::trace!("UDP ping rate limit exceeded for {}", src_addr);
+                        return;
+                    }
                     let status_server_id =
                         server.udp_ping_status_server_id_for_port(local_addr.port());
                     let reply =
@@ -2134,6 +2199,35 @@ impl Server {
 
     pub fn get_bans(&self) -> &Arc<shitspeak_state::BanRepository> {
         &self.bans
+    }
+
+    pub fn auth_ip_rate_limiter(
+        &self,
+    ) -> Option<&shitspeak_core::rate_limit::KeyedRateLimiter<std::net::IpAddr>> {
+        self.auth_ip_rate_limiter.as_ref()
+    }
+
+    pub fn auth_account_rate_limiter(
+        &self,
+    ) -> Option<&shitspeak_core::rate_limit::KeyedRateLimiter<String>> {
+        self.auth_account_rate_limiter.as_ref()
+    }
+
+    pub fn client_message_rate_limiters(
+        &self,
+    ) -> &[shitspeak_core::rate_limit::KeyedRateLimiter<u32>; crate::rate_limits::MESSAGE_TIER_COUNT]
+    {
+        &self.client_message_rate_limiters
+    }
+
+    pub fn udp_ping_rate_limiter(
+        &self,
+    ) -> &shitspeak_core::rate_limit::KeyedRateLimiter<std::net::IpAddr> {
+        &self.udp_ping_rate_limiter
+    }
+
+    pub fn temp_channel_rate_limiter(&self) -> &shitspeak_core::rate_limit::KeyedRateLimiter<u32> {
+        &self.temp_channel_rate_limiter
     }
 
     pub fn get_clients(&self) -> &Arc<ClientRepository> {

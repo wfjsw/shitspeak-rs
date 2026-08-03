@@ -648,16 +648,31 @@ pub async fn handle_user_state(
         // ── Comment update ────────────────────────────────────────────────────
         if let Some(comment_blob_hash) = comment_blob_hash {
             match comment_blob_hash {
-                Some(hash) => gs.set_comment_blob(None, Some(hash)),
-                None => gs.clear_comment_blob(),
+                Some(hash) => {
+                    // Pin before publishing the reference so eviction cannot
+                    // delete a URL-less blob between the state write and the
+                    // pin.
+                    target.pin_comment_blob(server.get_session_blobs(), &hash);
+                    gs.set_comment_blob(None, Some(hash));
+                }
+                None => {
+                    gs.clear_comment_blob();
+                    target.clear_comment_blob_pin();
+                }
             }
         }
 
         // ── Texture update ────────────────────────────────────────────────────
         if let Some(texture_blob_hash) = texture_blob_hash {
             match texture_blob_hash {
-                Some(hash) => gs.set_texture_blob(None, Some(hash)),
-                None => gs.clear_texture_blob(),
+                Some(hash) => {
+                    target.pin_texture_blob(server.get_session_blobs(), &hash);
+                    gs.set_texture_blob(None, Some(hash));
+                }
+                None => {
+                    gs.clear_texture_blob();
+                    target.clear_texture_blob_pin();
+                }
             }
         }
 

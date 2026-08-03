@@ -5,6 +5,7 @@ pub mod language;
 pub mod linux_net;
 pub mod permissions;
 pub mod protocol_version;
+pub mod rate_limit;
 pub mod session;
 pub mod types;
 

@@ -249,6 +249,7 @@ async fn spawn_test_server_with_pki(
         blob_storage_dir: blob_storage_dir
             .as_ref()
             .map(|directory| directory.path().to_path_buf()),
+        session_blob_cache_budget_bytes: 256 * 1024 * 1024,
         user_channel_cache_record_remote_sessions: false,
         channel_log_max_entries: opts.channel_log_max_entries,
         client_log_max_entries: 10_000,
@@ -263,6 +264,13 @@ async fn spawn_test_server_with_pki(
         client_idle_timeout_secs: opts.client_idle_timeout_secs,
         authenticate_timeout_ms: opts.authenticate_timeout_ms,
         auth_finalization_concurrency: opts.auth_finalization_concurrency,
+        // Integration tests connect hundreds of clients from 127.0.0.1 in a
+        // burst; disable the per-IP/per-account auth rate limits so the
+        // abuse protections never skew test outcomes.
+        auth_rate_limit_per_ip_per_second: 0.0,
+        auth_rate_limit_ip_burst: 0.0,
+        auth_rate_limit_per_account_per_second: 0.0,
+        auth_rate_limit_account_burst: 0.0,
         pending_delete_timeout_ms: 5_000,
         required_groups: Default::default(),
         send_permission_info: opts.send_permission_info,

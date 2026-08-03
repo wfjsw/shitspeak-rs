@@ -62,26 +62,34 @@ pub async fn handle_ban_list(
         sender.write_proto_message(&reply).await?;
     } else {
         // Update mode: replace ban list with provided entries
-        let entries: Vec<BanEntry> = msg
-            .bans
-            .iter()
-            .map(|b| {
-                let addr_str = String::from_utf8_lossy(&b.address);
-                BanEntry {
-                    address: addr_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0])),
-                    mask: b.mask as u8,
-                    name: b.name.clone(),
-                    hash: b.hash.clone(),
-                    reason: b.reason.clone(),
-                    start: b
-                        .start
-                        .as_ref()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(chrono::Utc::now().timestamp()),
-                    duration: b.duration.unwrap_or(0) as u64,
-                }
-            })
-            .collect();
+        let mut entries: Vec<BanEntry> = Vec::with_capacity(msg.bans.len());
+        for b in &msg.bans {
+            let addr_str = String::from_utf8_lossy(&b.address);
+            // Reject unparseable/empty addresses instead of silently turning
+            // them into 0.0.0.0 (which would ban every IPv4 client).
+            let address: IpAddr = addr_str.parse().map_err(|_| {
+                MessageHandlerError::protocol_violation("ban list contains an invalid address")
+            })?;
+            let max_mask: u32 = if address.is_ipv4() { 32 } else { 128 };
+            if b.mask > max_mask {
+                return Err(MessageHandlerError::protocol_violation(
+                    "ban list contains an invalid mask for its address family",
+                ));
+            }
+            entries.push(BanEntry {
+                address,
+                mask: b.mask as u8,
+                name: b.name.clone(),
+                hash: b.hash.clone(),
+                reason: b.reason.clone(),
+                start: b
+                    .start
+                    .as_ref()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(chrono::Utc::now().timestamp()),
+                duration: b.duration.unwrap_or(0) as u64,
+            });
+        }
 
         let op = BanOp::SetBans {
             entries: entries.clone(),

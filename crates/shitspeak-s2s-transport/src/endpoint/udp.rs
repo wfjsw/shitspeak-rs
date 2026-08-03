@@ -28,6 +28,25 @@ use rustls_pki_types::CertificateDer;
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::{Instant as TokioInstant, Interval, interval_at, sleep};
 use tokio_util::sync::CancellationToken;
+
+use shitspeak_core::rate_limit::{KeyedRateLimiter, TokenBucket};
+
+/// Per-source-IP budget for S2S UDP key-exchange packets (offers/readies).
+/// The X.509 chain validation and signature verification that follow are
+/// CPU-expensive, so floods must be throttled. Steady-state traffic never
+/// hits this: key exchanges happen once per establishment and on re-key
+/// only, and the burst covers a hub establishing many sessions at startup.
+const KEY_EXCHANGE_RATE_PER_SECOND: f64 = 10.0;
+const KEY_EXCHANGE_BURST: f64 = 64.0;
+const KEY_EXCHANGE_MAX_SOURCES: usize = 65_536;
+
+/// Global budget for key-exchange verification across *all* sources. The
+/// per-source-IP limiter alone can be bypassed by rotating spoofed source
+/// IPs (each new IP gets a fresh bucket), so a shared bucket bounds the
+/// total X.509/signature verification work regardless of IP rotation. Legit
+/// clusters are unaffected: handshakes are rare (once per link/establishment).
+const KEY_EXCHANGE_GLOBAL_RATE_PER_SECOND: f64 = 100.0;
+const KEY_EXCHANGE_GLOBAL_BURST: f64 = 200.0;
 use tracing::{debug, trace, warn};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
@@ -292,6 +311,16 @@ struct UdpSocketState {
     exchanges: Mutex<HashMap<NodeIdentifier, PeerKeyExchange>>,
     exchange_retransmit: Notify,
     shutdown: CancellationToken,
+    /// Per-source-IP rate limit on the (expensive) key-exchange path: X.509
+    /// chain validation + signature verification only run when the budget
+    /// allows. Steady-state traffic never reaches this — key exchanges are
+    /// rare (once per establishment / re-key), and the burst is large enough
+    /// for a hub establishing many sessions at startup.
+    key_exchange_rate_limiter: KeyedRateLimiter<std::net::IpAddr>,
+    /// Global verification budget shared across all sources (see
+    /// `KEY_EXCHANGE_GLOBAL_RATE_PER_SECOND`), so spoofed-IP rotation cannot
+    /// bypass the per-source limiter.
+    key_exchange_global_budget: std::sync::Mutex<TokenBucket>,
 }
 
 impl UdpSocketState {
@@ -302,6 +331,15 @@ impl UdpSocketState {
             exchanges: Mutex::new(HashMap::new()),
             exchange_retransmit: Notify::new(),
             shutdown: CancellationToken::new(),
+            key_exchange_rate_limiter: KeyedRateLimiter::new(
+                KEY_EXCHANGE_RATE_PER_SECOND,
+                KEY_EXCHANGE_BURST,
+                KEY_EXCHANGE_MAX_SOURCES,
+            ),
+            key_exchange_global_budget: std::sync::Mutex::new(TokenBucket::new(
+                KEY_EXCHANGE_GLOBAL_RATE_PER_SECOND,
+                KEY_EXCHANGE_GLOBAL_BURST,
+            )),
         }
     }
 
@@ -312,6 +350,15 @@ impl UdpSocketState {
             exchanges: Mutex::new(HashMap::new()),
             exchange_retransmit: Notify::new(),
             shutdown: CancellationToken::new(),
+            key_exchange_rate_limiter: KeyedRateLimiter::new(
+                KEY_EXCHANGE_RATE_PER_SECOND,
+                KEY_EXCHANGE_BURST,
+                KEY_EXCHANGE_MAX_SOURCES,
+            ),
+            key_exchange_global_budget: std::sync::Mutex::new(TokenBucket::new(
+                KEY_EXCHANGE_GLOBAL_RATE_PER_SECOND,
+                KEY_EXCHANGE_GLOBAL_BURST,
+            )),
         }
     }
 
@@ -1410,9 +1457,15 @@ async fn handle_udp_datagram(
 
     let (session, plaintext) = match state.session(header.src).await {
         Some(session) => {
-            session.update_addr(peer_addr);
+            // Only a packet that successfully authenticates (AEAD open) may
+            // migrate the session's destination address. Updating it before
+            // decryption let an off-path attacker who knows the peer node id
+            // redirect egress traffic by spoofing a single datagram.
             match session.decrypt_packet(packet, header) {
-                Ok(plaintext) => (session, plaintext),
+                Ok(plaintext) => {
+                    session.update_addr(peer_addr);
+                    (session, plaintext)
+                }
                 Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                     match decrypt_with_candidate_data(state, inner, packet, header, peer_addr)
                         .await?
@@ -1503,8 +1556,33 @@ async fn handle_key_offer(
     peer_addr: SocketAddr,
 ) -> io::Result<()> {
     validate_exchange_header(header, inner.self_id())?;
-    if let Some(existing) = state.session(header.src).await {
-        existing.update_addr(peer_addr);
+    // A session already exists: ignore the offer. The address must not be
+    // migrated from an unauthenticated handshake packet — the Data path
+    // refreshes the peer address only after a successful AEAD open.
+    if state.session(header.src).await.is_some() {
+        return Ok(());
+    }
+    // Throttle the expensive verification (X.509 path build + signature
+    // check) per source IP and across all sources, so spoofed handshake
+    // floods cannot burn CPU (and IP rotation cannot bypass the per-IP
+    // budget). The per-IP check runs first so a single-IP flood (already
+    // rejected there) cannot drain the global budget for other peers.
+    if !state.key_exchange_rate_limiter.try_acquire(&peer_addr.ip()) {
+        tracing::debug!(
+            source = %peer_addr,
+            "S2S UDP key-exchange rate limit exceeded"
+        );
+        return Ok(());
+    }
+    let global_allowed = match state.key_exchange_global_budget.lock() {
+        Ok(mut bucket) => bucket.try_acquire(),
+        Err(poisoned) => poisoned.into_inner().try_acquire(),
+    };
+    if !global_allowed {
+        tracing::debug!(
+            source = %peer_addr,
+            "S2S UDP key-exchange global rate limit exceeded"
+        );
         return Ok(());
     }
     let offer = UdpHandshakeBody::decode(packet)?;
@@ -1548,8 +1626,29 @@ async fn handle_key_ready(
     peer_addr: SocketAddr,
 ) -> io::Result<()> {
     validate_exchange_header(header, inner.self_id())?;
-    if let Some(existing) = state.session(header.src).await {
-        existing.update_addr(peer_addr);
+    // A session already exists: ignore this KeyReady. The address must not be
+    // migrated from an unauthenticated handshake packet.
+    if state.session(header.src).await.is_some() {
+        return Ok(());
+    }
+    // Throttle the expensive verification per source IP first, then against
+    // the global budget (see handle_key_offer).
+    if !state.key_exchange_rate_limiter.try_acquire(&peer_addr.ip()) {
+        tracing::debug!(
+            source = %peer_addr,
+            "S2S UDP key-exchange rate limit exceeded"
+        );
+        return Ok(());
+    }
+    let global_allowed = match state.key_exchange_global_budget.lock() {
+        Ok(mut bucket) => bucket.try_acquire(),
+        Err(poisoned) => poisoned.into_inner().try_acquire(),
+    };
+    if !global_allowed {
+        tracing::debug!(
+            source = %peer_addr,
+            "S2S UDP key-exchange global rate limit exceeded"
+        );
         return Ok(());
     }
     let (packets, promote) = accept_key_ready(
@@ -1839,7 +1938,6 @@ async fn decrypt_with_candidate_data(
         let Some(exchange) = exchanges.get_mut(&header.src) else {
             return Ok(None);
         };
-        exchange.peer_addr = Some(peer_addr);
         let Some(candidate) = exchange.candidate.as_mut() else {
             return Ok(None);
         };
@@ -1847,6 +1945,9 @@ async fn decrypt_with_candidate_data(
             Ok(plaintext) => plaintext,
             Err(_) => return Ok(None),
         };
+        // Only a successfully decrypted packet may pin the exchange's peer
+        // address (retransmit destination).
+        exchange.peer_addr = Some(peer_addr);
         candidate.ready_received = true;
         candidate.peer_addr = peer_addr;
         let packets = exchange_packets_due(exchange, Instant::now(), inner.self_id(), header.src);

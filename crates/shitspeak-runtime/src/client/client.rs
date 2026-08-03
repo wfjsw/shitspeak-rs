@@ -1,8 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     net::{IpAddr, Shutdown, SocketAddr},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -19,7 +22,7 @@ use socket2::Socket;
 use tokio::{
     io::{AsyncWriteExt as _, ReadHalf, WriteHalf},
     net::TcpStream,
-    sync::{Mutex as AsyncMutex, RwLock, RwLockWriteGuard, mpsc, watch},
+    sync::{Mutex as AsyncMutex, Notify, RwLock, RwLockWriteGuard, mpsc, watch},
     time::timeout,
 };
 use tokio_rustls::server::TlsStream;
@@ -353,6 +356,47 @@ pub enum ClientOutboundMessage {
     Batch(Vec<Message>),
 }
 
+/// Per-client RequestBlob work that is deliberately serialized by one
+/// consumer. `VecDeque::new` keeps idle clients allocation-free; once the
+/// consumer catches up, its backing storage is released again.
+struct RequestBlobQueue {
+    pending: VecDeque<msg_encoder::RequestBlob>,
+    limit: usize,
+    changed: Arc<Notify>,
+}
+
+impl RequestBlobQueue {
+    fn new(limit: usize) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            limit,
+            changed: Arc::new(Notify::new()),
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<msg_encoder::RequestBlob> {
+        let request = self.pending.pop_front();
+        let len = self.pending.len();
+        if len == 0 {
+            self.pending.shrink_to(0);
+        } else if self.pending.capacity() > len.saturating_mul(4) {
+            self.pending.shrink_to(len.saturating_mul(2));
+        }
+        request
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.pending.shrink_to(0);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RequestBlobQueueEnqueueError {
+    Full(msg_encoder::RequestBlob),
+    Unavailable,
+}
+
 fn client_tracing_span(
     session_id: ClientSessionIdentifier,
     real_ip_address: IpAddr,
@@ -414,6 +458,12 @@ pub struct Client {
     certificate_chain: Vec<CertificateDer<'static>>,
     user_info_extended: ParkingMutex<Option<UserInfoExtended>>,
 
+    // Pins for session blobs (texture/comment) referenced by this client's
+    // state. Holding a pin prevents the blob from being evicted; the pins
+    // auto-release when this Client is dropped (disconnect/removal).
+    texture_blob_pin: ParkingMutex<Option<crate::blob_store::BlobPin>>,
+    comment_blob_pin: ParkingMutex<Option<crate::blob_store::BlobPin>>,
+
     local_state: ParkingRwLock<Option<ClientLocalState>>,
     global_state: ParkingRwLock<ClientGlobalState>,
     /// Effective permissions owned by this client instance. The map grows to
@@ -430,6 +480,10 @@ pub struct Client {
     /// task; gateway clients use the fallback bridge in `voice::routing`.
     voice_tcp_tx: Option<mpsc::Sender<Bytes>>,
     voice_tcp_rx: ParkingMutex<Option<mpsc::Receiver<Bytes>>>,
+    /// Post-authentication RequestBlob work is serialized by a single
+    /// per-client consumer. The queue is installed once its bound can be
+    /// sized from the authenticated server's user and channel limits.
+    request_blob_queue: ParkingMutex<Option<RequestBlobQueue>>,
     outbound_message_tx: Option<mpsc::Sender<ClientOutboundMessage>>,
     outbound_message_rx: ParkingMutex<Option<mpsc::Receiver<ClientOutboundMessage>>>,
 
@@ -614,6 +668,8 @@ impl Client {
             ),
             certificate_chain,
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
+            texture_blob_pin: ParkingMutex::new(None),
+            comment_blob_pin: ParkingMutex::new(None),
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             acl_permission_cache: scc::HashMap::new(),
@@ -623,6 +679,7 @@ impl Client {
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
             voice_tcp_tx: Some(voice_tcp_tx),
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
+            request_blob_queue: ParkingMutex::new(None),
             outbound_message_tx: Some(outbound_message_tx),
             outbound_message_rx: ParkingMutex::new(Some(outbound_message_rx)),
             published: AtomicBool::new(false),
@@ -784,6 +841,8 @@ impl Client {
             ),
             certificate_chain: Vec::new(),
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
+            texture_blob_pin: ParkingMutex::new(None),
+            comment_blob_pin: ParkingMutex::new(None),
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             acl_permission_cache: scc::HashMap::new(),
@@ -793,6 +852,7 @@ impl Client {
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
             voice_tcp_tx: Some(voice_tcp_tx),
             voice_tcp_rx: ParkingMutex::new(Some(voice_tcp_rx)),
+            request_blob_queue: ParkingMutex::new(None),
             outbound_message_tx: Some(outbound_message_tx),
             outbound_message_rx: ParkingMutex::new(Some(outbound_message_rx)),
             published: AtomicBool::new(false),
@@ -874,6 +934,8 @@ impl Client {
             ),
             certificate_chain: Vec::new(),
             user_info_extended: ParkingMutex::new(Some(UserInfoExtended::default())),
+            texture_blob_pin: ParkingMutex::new(None),
+            comment_blob_pin: ParkingMutex::new(None),
             local_state: ParkingRwLock::new(None),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             acl_permission_cache: scc::HashMap::new(),
@@ -883,6 +945,7 @@ impl Client {
             voice_routing_rx: ParkingMutex::new(None),
             voice_tcp_tx: None,
             voice_tcp_rx: ParkingMutex::new(None),
+            request_blob_queue: ParkingMutex::new(None),
             outbound_message_tx: None,
             outbound_message_rx: ParkingMutex::new(None),
             published: AtomicBool::new(true),
@@ -1916,6 +1979,61 @@ impl Client {
         self.voice_routing_rx.lock().take()
     }
 
+    /// Install the lazy RequestBlob queue after authentication. A second
+    /// installation means the lifecycle attempted to start a duplicate
+    /// consumer.
+    pub(crate) fn install_request_blob_queue(&self, limit: usize) -> bool {
+        let mut queue_slot = self.request_blob_queue.lock();
+        if queue_slot.is_some() {
+            return false;
+        }
+        *queue_slot = Some(RequestBlobQueue::new(limit));
+        true
+    }
+
+    /// Queue a RequestBlob job without waiting. The logical limit bounds
+    /// retained work while the deque itself allocates only when a burst
+    /// arrives.
+    pub(crate) fn enqueue_request_blob(
+        &self,
+        request: msg_encoder::RequestBlob,
+    ) -> Result<(), RequestBlobQueueEnqueueError> {
+        let changed = {
+            let mut queue_slot = self.request_blob_queue.lock();
+            let Some(queue) = queue_slot.as_mut() else {
+                return Err(RequestBlobQueueEnqueueError::Unavailable);
+            };
+            if queue.pending.len() >= queue.limit {
+                return Err(RequestBlobQueueEnqueueError::Full(request));
+            }
+            queue.pending.push_back(request);
+            Arc::clone(&queue.changed)
+        };
+        changed.notify_one();
+        Ok(())
+    }
+
+    /// The worker creates a notification future before inspecting the queue,
+    /// so an enqueue in the check-to-wait gap leaves a stored permit.
+    pub(crate) fn request_blob_queue_notifier(&self) -> Option<Arc<Notify>> {
+        self.request_blob_queue
+            .lock()
+            .as_ref()
+            .map(|queue| Arc::clone(&queue.changed))
+    }
+
+    /// Pop one RequestBlob job. Draining the queue releases any burst-sized
+    /// allocation rather than retaining it for the life of the connection.
+    pub(crate) fn dequeue_request_blob(&self) -> Option<msg_encoder::RequestBlob> {
+        self.request_blob_queue.lock().as_mut()?.pop_front()
+    }
+
+    pub(crate) fn clear_request_blob_queue(&self) {
+        if let Some(queue) = self.request_blob_queue.lock().as_mut() {
+            queue.clear();
+        }
+    }
+
     /// Enqueue an already-encoded `UDPTunnel` payload for transmission to
     /// this client over its TCP voice tunnel.  Non-blocking: returns
     /// immediately, dropping the packet if the queue is full or closed.
@@ -2290,6 +2408,44 @@ impl Client {
         }
         ParkingMutexGuard::map(user_info_extended, |opt| opt.as_mut().unwrap())
     }
+
+    // ── Session blob reference pins ───────────────────────────────────────
+    // A client whose state references a session blob (texture/comment hash)
+    // pins it so eviction never removes content that is still in use. The
+    // pin is replaced when the reference changes and released when this
+    // Client is dropped. Remote clients keep their source URLs, so eviction
+    // of their blobs can refetch; pins still apply to whichever client the
+    // hash was set on.
+
+    /// Pin the session blob `key` as this client's texture reference,
+    /// releasing any previous texture pin.
+    pub fn pin_texture_blob(
+        &self,
+        store: &std::sync::Arc<crate::blob_store::SessionBlobStore>,
+        key: &str,
+    ) {
+        *self.texture_blob_pin.lock() = Some(crate::blob_store::BlobPin::new(store, key));
+    }
+
+    /// Pin the session blob `key` as this client's comment reference,
+    /// releasing any previous comment pin.
+    pub fn pin_comment_blob(
+        &self,
+        store: &std::sync::Arc<crate::blob_store::SessionBlobStore>,
+        key: &str,
+    ) {
+        *self.comment_blob_pin.lock() = Some(crate::blob_store::BlobPin::new(store, key));
+    }
+
+    /// Release this client's texture blob reference (if any).
+    pub fn clear_texture_blob_pin(&self) {
+        self.texture_blob_pin.lock().take();
+    }
+
+    /// Release this client's comment blob reference (if any).
+    pub fn clear_comment_blob_pin(&self) {
+        self.comment_blob_pin.lock().take();
+    }
 }
 
 fn transport_not_readable_error() -> std::io::Error {
@@ -2317,6 +2473,72 @@ fn transport_closed_error() -> std::io::Error {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn request_blob_queue_is_lazy_fifo_bounded_and_releases_after_drain() {
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let client = Client::new_web_gateway(
+            ClientSessionIdentifier::from(0x0002_0001),
+            Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            outbound_tx,
+        );
+        assert!(client.install_request_blob_queue(2));
+        assert!(!client.install_request_blob_queue(2));
+        {
+            let queue = client.request_blob_queue.lock();
+            assert_eq!(queue.as_ref().unwrap().pending.capacity(), 0);
+        }
+        let mut first = msg_encoder::RequestBlob::default();
+        first.session_texture = vec![1];
+        client
+            .enqueue_request_blob(first)
+            .expect("first RequestBlob job should fit");
+        let mut second = msg_encoder::RequestBlob::default();
+        second.session_texture = vec![2];
+        client
+            .enqueue_request_blob(second)
+            .expect("second RequestBlob job should fit");
+        assert!(matches!(
+            client.enqueue_request_blob(msg_encoder::RequestBlob::default()),
+            Err(RequestBlobQueueEnqueueError::Full(_))
+        ));
+
+        assert_eq!(
+            client
+                .dequeue_request_blob()
+                .expect("first queued job")
+                .session_texture,
+            vec![1]
+        );
+        assert_eq!(
+            client
+                .dequeue_request_blob()
+                .expect("second queued job")
+                .session_texture,
+            vec![2]
+        );
+        {
+            let queue = client.request_blob_queue.lock();
+            assert_eq!(queue.as_ref().unwrap().pending.capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn request_blob_queue_releases_excess_partial_burst_storage() {
+        let mut queue = RequestBlobQueue::new(16);
+        for _ in 0..16 {
+            queue.pending.push_back(msg_encoder::RequestBlob::default());
+        }
+        let burst_capacity = queue.pending.capacity();
+        for _ in 0..13 {
+            assert!(queue.pop_front().is_some());
+        }
+        assert_eq!(queue.pending.len(), 3);
+        assert!(queue.pending.capacity() < burst_capacity);
+        assert!(queue.pending.capacity() >= queue.pending.len());
+    }
 
     #[test]
     fn remote_clients_do_not_allocate_local_only_queues() {

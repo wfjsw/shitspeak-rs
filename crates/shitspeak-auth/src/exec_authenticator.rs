@@ -34,6 +34,8 @@ pub enum ExecAuthenticatorError {
     MissingCommand,
     #[error("exec authenticator command `{path}` cannot be empty")]
     EmptyCommand { path: PathBuf },
+    #[error("exec authenticator command `{path}` must be an absolute path")]
+    RelativeCommand { path: PathBuf },
     #[error("exec authenticator setuid/setgid is unsupported on this platform")]
     UnsupportedPermissionDrop,
     #[error("failed to spawn exec authenticator `{path}`: {source}")]
@@ -193,6 +195,12 @@ impl ExecAuthenticatorInner {
             .ok_or(ExecAuthenticatorError::MissingCommand)?;
         if command.as_os_str().is_empty() {
             return Err(ExecAuthenticatorError::EmptyCommand { path: command });
+        }
+        // Resolving the helper through the parent's PATH lets a local
+        // attacker who can influence PATH substitute an arbitrary binary.
+        // Require an absolute path.
+        if !command.is_absolute() {
+            return Err(ExecAuthenticatorError::RelativeCommand { path: command });
         }
         let timeout = match config.timeout_ms() {
             0 => DEFAULT_TIMEOUT,
@@ -520,24 +528,58 @@ impl ExecAuthenticatorInner {
 
     fn spawn_child(&self, _long_running: bool) -> Result<Child, ExecAuthenticatorError> {
         let mut command = Command::new(&self.command);
+        // The helper is operator-supplied and trusted (the operator chooses
+        // which process to run and which environment to configure), so the
+        // parent environment is inherited as-is; `.envs` merges the
+        // explicitly configured variables on top.
         command
             .args(&self.args)
             .envs(&self.environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         if let Some(working_dir) = &self.working_dir {
             command.current_dir(working_dir);
         }
         apply_permission_drop(&mut command, self.uid, self.gid)?;
         apply_background_priority(&mut command);
-        command
+        let mut child = command
             .spawn()
             .map_err(|source| ExecAuthenticatorError::Spawn {
                 path: self.command.clone(),
                 source,
-            })
+            })?;
+        self.spawn_stderr_reader(&mut child);
+        Ok(child)
+    }
+
+    /// Read the helper's stderr in a background task, sanitizing each line
+    /// (control characters stripped, length capped) so a misbehaving helper
+    /// cannot inject ANSI/control sequences into the host logs or flood them.
+    fn spawn_stderr_reader(&self, child: &mut Child) {
+        let Some(stderr) = child.stderr.take() else {
+            return;
+        };
+        let command = self.command.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let sanitized = sanitize_stderr_line(line.trim_end_matches(['\r', '\n']));
+                        tracing::debug!(
+                            command = %command.display(),
+                            stderr = %sanitized,
+                            "exec authenticator stderr"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     fn spawn_long_running_serialized(
@@ -638,6 +680,22 @@ impl ExecAuthenticatorInner {
                 timeout,
             })
     }
+}
+
+/// Sanitize one stderr line for logging: strip control characters (except
+/// tab) and cap the length so a helper cannot inject ANSI/escape sequences
+/// into the host logs or flood them with oversized lines.
+fn sanitize_stderr_line(line: &str) -> String {
+    const MAX_LINE_CHARS: usize = 512;
+    let mut out = String::with_capacity(line.len().min(MAX_LINE_CHARS));
+    for ch in line.chars().take(MAX_LINE_CHARS) {
+        if ch.is_control() && ch != '\t' {
+            out.push('\u{FFFD}');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 #[cfg(windows)]
@@ -926,6 +984,57 @@ mod tests {
     use shitspeak_core::ProtocolVersion;
     use std::net::IpAddr;
 
+    /// Resolve a bare executable name through the test process PATH so tests
+    /// pass absolute command paths (relative commands are rejected).
+    fn resolve_in_path(name: &str) -> PathBuf {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                #[cfg(windows)]
+                {
+                    candidates.push(dir.join(name));
+                    candidates.push(dir.join(format!("{name}.exe")));
+                }
+                #[cfg(not(windows))]
+                candidates.push(dir.join(name));
+            }
+        }
+        candidates
+            .iter()
+            .find(|path| path.is_file())
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} not found in PATH"))
+    }
+
+    #[test]
+    fn relative_command_is_rejected() {
+        let error = match ExecAuthenticator::ephemeral(ExecAuthenticatorConfig::new(
+            "relative-helper.sh",
+        )) {
+            Ok(_) => panic!("relative command must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ExecAuthenticatorError::RelativeCommand { .. }
+        ));
+    }
+
+    #[test]
+    fn sanitize_stderr_line_strips_control_characters_and_caps_length() {
+        // ANSI escape sequences and other control characters are neutralized.
+        assert_eq!(
+            sanitize_stderr_line("hello\x1b[31mworld"),
+            "hello\u{FFFD}[31mworld"
+        );
+        // Tab is preserved; newline (already trimmed by the reader) is not
+        // part of the input here.
+        assert_eq!(sanitize_stderr_line("a\tb"), "a\tb");
+        // Length is capped.
+        let long = "x".repeat(10_000);
+        assert!(sanitize_stderr_line(&long).chars().count() <= 512);
+    }
+
     fn auxiliary_data() -> AuthenticateAuxiliaryData {
         AuthenticateAuxiliaryData {
             certificate_hash: Some(Bytes::from_static(b"cert")),
@@ -1100,7 +1209,7 @@ $null = [Console]::In.ReadLine()
 '{"accepted":true,"display_name":"' + $env:SHITSPEAK_EXEC_AUTH_TEST + '"}'
 "#;
         ExecAuthenticator::ephemeral(
-            ExecAuthenticatorConfig::new("powershell")
+            ExecAuthenticatorConfig::new(resolve_in_path("powershell"))
                 .with_args(["-NoProfile", "-NonInteractive", "-Command", script])
                 .with_environment([("SHITSPEAK_EXEC_AUTH_TEST", "configured-value")])
                 .with_timeout_ms(5_000),
@@ -1115,7 +1224,7 @@ IFS= read -r line
 printf '{"accepted":true,"display_name":"%s"}\n' "$SHITSPEAK_EXEC_AUTH_TEST"
 "#;
         ExecAuthenticator::ephemeral(
-            ExecAuthenticatorConfig::new("sh")
+            ExecAuthenticatorConfig::new(resolve_in_path("sh"))
                 .with_args(["-c", script])
                 .with_environment([("SHITSPEAK_EXEC_AUTH_TEST", "configured-value")])
                 .with_timeout_ms(5_000),
@@ -1144,7 +1253,7 @@ $request = $line | ConvertFrom-Json
 '{"accepted":true,"display_name":"' + $request.username + '","groups":["exec"]}'
 "#
         };
-        let config = ExecAuthenticatorConfig::new("powershell")
+        let config = ExecAuthenticatorConfig::new(resolve_in_path("powershell"))
             .with_args(["-NoProfile", "-NonInteractive", "-Command", script])
             .with_long_running_request_mode(request_mode)
             .with_timeout_ms(5_000);
@@ -1169,7 +1278,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
 }
 "#;
         ExecAuthenticator::long_running(
-            ExecAuthenticatorConfig::new("powershell")
+            ExecAuthenticatorConfig::new(resolve_in_path("powershell"))
                 .with_args(["-NoProfile", "-NonInteractive", "-Command", script])
                 .with_long_running_request_mode(ExecLongRunningRequestMode::Async)
                 .with_timeout_ms(5_000),
@@ -1180,7 +1289,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     #[cfg(windows)]
     fn platform_stalled_async_authenticator() -> ExecAuthenticator {
         ExecAuthenticator::long_running(
-            ExecAuthenticatorConfig::new("powershell")
+            ExecAuthenticatorConfig::new(resolve_in_path("powershell"))
                 .with_args([
                     "-NoProfile",
                     "-NonInteractive",
@@ -1212,7 +1321,7 @@ username=$(printf '%s' "$line" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')
 printf '{"accepted":true,"display_name":"%s","groups":["exec"]}\n' "$username"
 "#
         };
-        let config = ExecAuthenticatorConfig::new("sh")
+        let config = ExecAuthenticatorConfig::new(resolve_in_path("sh"))
             .with_args(["-c", script])
             .with_long_running_request_mode(request_mode)
             .with_timeout_ms(5_000);
@@ -1241,7 +1350,7 @@ while IFS= read -r line; do
 done
 "#;
         ExecAuthenticator::long_running(
-            ExecAuthenticatorConfig::new("sh")
+            ExecAuthenticatorConfig::new(resolve_in_path("sh"))
                 .with_args(["-c", script])
                 .with_long_running_request_mode(ExecLongRunningRequestMode::Async)
                 .with_timeout_ms(5_000),
@@ -1252,7 +1361,7 @@ done
     #[cfg(not(windows))]
     fn platform_stalled_async_authenticator() -> ExecAuthenticator {
         ExecAuthenticator::long_running(
-            ExecAuthenticatorConfig::new("sh")
+            ExecAuthenticatorConfig::new(resolve_in_path("sh"))
                 .with_args(["-c", "exec sleep 30"])
                 .with_long_running_request_mode(ExecLongRunningRequestMode::Async)
                 .with_timeout_ms(100),
@@ -1263,11 +1372,12 @@ done
     #[cfg(not(unix))]
     #[test]
     fn permission_drop_is_rejected_on_non_unix() {
-        let error =
-            match ExecAuthenticator::ephemeral(ExecAuthenticatorConfig::new("cmd").with_uid(1)) {
-                Ok(_) => panic!("non-Unix setuid was accepted"),
-                Err(error) => error,
-            };
+        let error = match ExecAuthenticator::ephemeral(
+            ExecAuthenticatorConfig::new(resolve_in_path("cmd")).with_uid(1),
+        ) {
+            Ok(_) => panic!("non-Unix setuid was accepted"),
+            Err(error) => error,
+        };
         assert!(matches!(
             error,
             ExecAuthenticatorError::UnsupportedPermissionDrop
