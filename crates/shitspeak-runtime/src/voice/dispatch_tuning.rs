@@ -26,12 +26,13 @@ const CONSERVATIVE_RAYON_MIN_LEN: usize = 256;
 const CALIBRATION_KEY: [u8; 16] = [0x42; 16];
 const CALIBRATION_IV_E: [u8; 16] = [0x01; 16];
 const CALIBRATION_IV_D: [u8; 16] = [0x02; 16];
-// Include the small-fan-out crossover region: explicit chunking can use two
-// Rayon workers there without creating one job per recipient.
-const CALIBRATION_FANOUTS: [usize; 11] = [32, 40, 48, 56, 64, 96, 128, 256, 512, 1024, 2048];
-const CALIBRATION_TARGET_CHUNK_LENS: [usize; 6] = [16, 32, 64, 128, 256, 512];
-const CALIBRATION_WARMUPS: usize = 2;
-const CALIBRATION_SAMPLES: usize = 11;
+const CALIBRATION_MAX_FANOUT: usize = 2048;
+const CALIBRATION_TARGET_CHUNK_LENS: [usize; 9] = [8, 16, 24, 32, 48, 64, 128, 256, 512];
+const MODEL_CALIBRATION_WARMUPS: usize = 1;
+const MODEL_CALIBRATION_SAMPLES: usize = 7;
+const CONFIRMATION_WARMUPS: usize = 1;
+const CONFIRMATION_SAMPLES: usize = 7;
+const MODEL_MAX_RELATIVE_ERROR: f64 = 0.25;
 const RAYON_WIN_PERCENT: u128 = 95;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,13 +93,14 @@ impl VoiceDispatchProfile {
         self.rayon_min_len
     }
 
-    pub(crate) fn rayon_chunk_len(self, fanout: usize, rayon_workers: usize) -> usize {
-        RayonChunkPlan::new(fanout, self.rayon_min_len, rayon_workers).chunk_len()
+    pub(crate) fn rayon_chunk_plan(self, fanout: usize, rayon_workers: usize) -> RayonChunkPlan {
+        RayonChunkPlan::new(fanout, self.rayon_min_len, rayon_workers)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RayonChunkPlan {
+pub(crate) struct RayonChunkPlan {
+    fanout: usize,
     chunk_count: usize,
     chunk_len: usize,
 }
@@ -112,19 +114,40 @@ impl RayonChunkPlan {
         );
 
         let requested_chunks = fanout.div_ceil(target_chunk_len);
+        Self::with_chunk_count(fanout, requested_chunks, rayon_workers)
+    }
+
+    fn with_chunk_count(fanout: usize, requested_chunks: usize, rayon_workers: usize) -> Self {
+        assert!(fanout > 0, "Rayon chunking requires at least one recipient");
+        assert!(
+            requested_chunks > 0,
+            "Rayon chunking requires at least one requested chunk"
+        );
+
         let chunk_count = requested_chunks.min(rayon_workers.max(1)).min(fanout);
         Self {
+            fanout,
             chunk_count,
             chunk_len: fanout.div_ceil(chunk_count),
         }
     }
 
-    const fn chunk_count(self) -> usize {
+    pub(crate) const fn chunk_count(self) -> usize {
         self.chunk_count
     }
 
-    const fn chunk_len(self) -> usize {
+    pub(crate) const fn chunk_len(self) -> usize {
         self.chunk_len
+    }
+
+    pub(crate) fn range(self, chunk_index: usize) -> std::ops::Range<usize> {
+        assert!(
+            chunk_index < self.chunk_count,
+            "Rayon chunk index is in range"
+        );
+        let start = chunk_index * self.fanout / self.chunk_count;
+        let end = (chunk_index + 1) * self.fanout / self.chunk_count;
+        start..end
     }
 }
 
@@ -277,11 +300,77 @@ struct CalibrationWorkload {
 }
 
 #[derive(Clone, Copy)]
-struct CalibrationMeasurement {
-    fanout: usize,
-    target_chunk_len: usize,
+struct CalibrationTiming {
     sequential: Duration,
     rayon: Duration,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ModelProbe {
+    fanout: usize,
+    requested_chunks: usize,
+}
+
+impl ModelProbe {
+    fn chunk_plan(self, rayon_workers: usize) -> RayonChunkPlan {
+        RayonChunkPlan::with_chunk_count(self.fanout, self.requested_chunks, rayon_workers)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ModelMeasurement {
+    fanout: usize,
+    chunk_plan: RayonChunkPlan,
+    timing: CalibrationTiming,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LinearCostModel {
+    fixed_ns: f64,
+    per_recipient_ns: f64,
+}
+
+impl LinearCostModel {
+    fn predict(self, fanout: usize) -> f64 {
+        self.fixed_ns + self.per_recipient_ns * fanout as f64
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RayonCostModel {
+    TwoWorkers(LinearCostModel),
+    General {
+        dispatch_ns: f64,
+        per_chunk_ns: f64,
+        per_merged_recipient_ns: f64,
+        critical_chunk_recipient_ns: f64,
+    },
+}
+
+impl RayonCostModel {
+    fn predict(self, chunk_plan: RayonChunkPlan) -> f64 {
+        match self {
+            Self::TwoWorkers(model) => model.predict(chunk_plan.fanout),
+            Self::General {
+                dispatch_ns,
+                per_chunk_ns,
+                per_merged_recipient_ns,
+                critical_chunk_recipient_ns,
+            } => {
+                dispatch_ns
+                    + per_chunk_ns * chunk_plan.chunk_count() as f64
+                    + per_merged_recipient_ns * chunk_plan.fanout as f64
+                    + critical_chunk_recipient_ns * chunk_plan.chunk_len() as f64
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ModeledProfileCandidate {
+    profile: VoiceDispatchProfile,
+    confirmation_fanouts: [usize; 2],
+    score: f64,
 }
 
 async fn calibrate_voice_dispatch_plan(rayon_workers: usize) -> Result<VoiceDispatchPlan, String> {
@@ -298,74 +387,163 @@ async fn calibrate_payload_profile(
     rayon_workers: usize,
 ) -> Result<VoiceDispatchProfile, String> {
     let mut measurements = Vec::new();
-
-    for target_chunk_len in CALIBRATION_TARGET_CHUNK_LENS {
-        for fanout in CALIBRATION_FANOUTS {
-            if target_chunk_len > fanout {
-                continue;
-            }
-            if RayonChunkPlan::new(fanout, target_chunk_len, rayon_workers).chunk_count() < 2 {
-                continue;
-            }
-
-            for warmup in 0..CALIBRATION_WARMUPS {
-                let _ = measure_pair(
-                    encoded,
-                    fanout,
-                    target_chunk_len,
-                    rayon_workers,
-                    warmup % 2 == 0,
-                )
-                .await?;
-            }
-
-            let mut sequential = Vec::with_capacity(CALIBRATION_SAMPLES);
-            let mut rayon = Vec::with_capacity(CALIBRATION_SAMPLES);
-            for sample in 0..CALIBRATION_SAMPLES {
-                let (sequential_sample, rayon_sample) = measure_pair(
-                    encoded,
-                    fanout,
-                    target_chunk_len,
-                    rayon_workers,
-                    sample % 2 == 0,
-                )
-                .await?;
-                sequential.push(sequential_sample);
-                rayon.push(rayon_sample);
-            }
-
-            measurements.push(CalibrationMeasurement {
-                fanout,
-                target_chunk_len,
-                sequential: median_duration(&mut sequential),
-                rayon: median_duration(&mut rayon),
-            });
-        }
+    for probe in model_training_probes(rayon_workers) {
+        let chunk_plan = probe.chunk_plan(rayon_workers);
+        let timing = measure_median_pair(
+            encoded,
+            probe.fanout,
+            chunk_plan,
+            MODEL_CALIBRATION_WARMUPS,
+            MODEL_CALIBRATION_SAMPLES,
+        )
+        .await?;
+        measurements.push(ModelMeasurement {
+            fanout: probe.fanout,
+            chunk_plan,
+            timing,
+        });
     }
 
-    Ok(select_profile(&measurements))
+    let Some(sequential_model) = fit_sequential_model(&measurements) else {
+        tracing::info!("voice dispatch model fit was not usable; selecting sequential dispatch");
+        return Ok(VoiceDispatchProfile::sequential_only());
+    };
+    let Some(rayon_model) = fit_rayon_model(&measurements, rayon_workers) else {
+        tracing::info!("voice dispatch model fit was not usable; selecting sequential dispatch");
+        return Ok(VoiceDispatchProfile::sequential_only());
+    };
+
+    let holdout_probe = model_holdout_probe(rayon_workers);
+    let holdout_plan = holdout_probe.chunk_plan(rayon_workers);
+    let holdout = measure_median_pair(
+        encoded,
+        holdout_probe.fanout,
+        holdout_plan,
+        MODEL_CALIBRATION_WARMUPS,
+        MODEL_CALIBRATION_SAMPLES,
+    )
+    .await?;
+    if !model_matches_holdout(sequential_model, rayon_model, holdout_plan, holdout) {
+        tracing::info!(
+            "voice dispatch model did not match its holdout probe; selecting sequential dispatch"
+        );
+        return Ok(VoiceDispatchProfile::sequential_only());
+    }
+
+    let Some(candidate) = select_modeled_profile(sequential_model, rayon_model, rayon_workers)
+    else {
+        return Ok(VoiceDispatchProfile::sequential_only());
+    };
+
+    if confirm_modeled_profile(encoded, candidate, rayon_workers).await? {
+        Ok(candidate.profile)
+    } else {
+        tracing::info!(
+            "voice dispatch model crossover confirmation failed; selecting sequential dispatch"
+        );
+        Ok(VoiceDispatchProfile::sequential_only())
+    }
+}
+
+fn model_training_probes(rayon_workers: usize) -> Vec<ModelProbe> {
+    if rayon_workers == 2 {
+        return vec![
+            ModelProbe {
+                fanout: 64,
+                requested_chunks: 2,
+            },
+            ModelProbe {
+                fanout: 512,
+                requested_chunks: 2,
+            },
+        ];
+    }
+
+    let coarse_chunks = rayon_workers.min(4);
+    vec![
+        ModelProbe {
+            fanout: 64,
+            requested_chunks: 1,
+        },
+        ModelProbe {
+            fanout: 64,
+            requested_chunks: 2,
+        },
+        ModelProbe {
+            fanout: 512,
+            requested_chunks: 2,
+        },
+        ModelProbe {
+            fanout: 512,
+            requested_chunks: coarse_chunks,
+        },
+        ModelProbe {
+            fanout: CALIBRATION_MAX_FANOUT,
+            requested_chunks: 2,
+        },
+        ModelProbe {
+            fanout: CALIBRATION_MAX_FANOUT,
+            requested_chunks: coarse_chunks,
+        },
+    ]
+}
+
+fn model_holdout_probe(rayon_workers: usize) -> ModelProbe {
+    if rayon_workers == 2 || rayon_workers > 4 {
+        ModelProbe {
+            fanout: CALIBRATION_MAX_FANOUT,
+            requested_chunks: rayon_workers,
+        }
+    } else {
+        ModelProbe {
+            fanout: 1024,
+            requested_chunks: rayon_workers,
+        }
+    }
+}
+
+async fn measure_median_pair(
+    encoded: &CalibrationEncoded,
+    fanout: usize,
+    chunk_plan: RayonChunkPlan,
+    warmups: usize,
+    samples: usize,
+) -> Result<CalibrationTiming, String> {
+    for warmup in 0..warmups {
+        let _ = measure_pair(encoded, fanout, chunk_plan, warmup % 2 == 0).await?;
+    }
+
+    let mut sequential = Vec::with_capacity(samples);
+    let mut rayon = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        let timing = measure_pair(encoded, fanout, chunk_plan, sample % 2 == 0).await?;
+        sequential.push(timing.sequential);
+        rayon.push(timing.rayon);
+    }
+
+    Ok(CalibrationTiming {
+        sequential: median_duration(&mut sequential),
+        rayon: median_duration(&mut rayon),
+    })
 }
 
 async fn measure_pair(
     encoded: &CalibrationEncoded,
     fanout: usize,
-    target_chunk_len: usize,
-    rayon_workers: usize,
+    chunk_plan: RayonChunkPlan,
     rayon_first: bool,
-) -> Result<(Duration, Duration), String> {
+) -> Result<CalibrationTiming, String> {
     let sequential_work = make_workload(fanout)?;
     let rayon_work = make_workload(fanout)?;
 
     if rayon_first {
-        let rayon =
-            time_rayon(rayon_work, encoded.clone(), target_chunk_len, rayon_workers).await?;
+        let rayon = time_rayon(rayon_work, encoded.clone(), chunk_plan).await?;
         let sequential = time_sequential(sequential_work, encoded);
-        Ok((sequential, rayon))
+        Ok(CalibrationTiming { sequential, rayon })
     } else {
         let sequential = time_sequential(sequential_work, encoded);
-        let rayon =
-            time_rayon(rayon_work, encoded.clone(), target_chunk_len, rayon_workers).await?;
-        Ok((sequential, rayon))
+        let rayon = time_rayon(rayon_work, encoded.clone(), chunk_plan).await?;
+        Ok(CalibrationTiming { sequential, rayon })
     }
 }
 
@@ -382,19 +560,16 @@ fn time_sequential(workload: CalibrationWorkload, encoded: &CalibrationEncoded) 
 async fn time_rayon(
     workload: CalibrationWorkload,
     encoded: CalibrationEncoded,
-    target_chunk_len: usize,
-    rayon_workers: usize,
+    chunk_plan: RayonChunkPlan,
 ) -> Result<Duration, String> {
     let started_at = Instant::now();
     tokio::task::spawn_blocking(move || {
-        let chunk_plan =
-            RayonChunkPlan::new(workload.recipients.len(), target_chunk_len, rayon_workers);
-        let batches = workload
-            .recipients
-            .par_chunks(chunk_plan.chunk_len())
-            .map(|recipients| {
+        let recipients = workload.recipients.as_slice();
+        let batches = (0..chunk_plan.chunk_count())
+            .into_par_iter()
+            .map(|chunk_index| {
                 let mut batches = HashMap::<SocketAddr, DatagramBatch>::new();
-                for recipient in recipients {
+                for recipient in &recipients[chunk_plan.range(chunk_index)] {
                     encrypt_recipient(&mut batches, recipient, &encoded);
                 }
                 batches
@@ -495,90 +670,402 @@ fn median_duration(samples: &mut [Duration]) -> Duration {
     samples[samples.len() / 2]
 }
 
-fn select_profile(measurements: &[CalibrationMeasurement]) -> VoiceDispatchProfile {
-    let mut best: Option<(usize, u128, usize, usize)> = None;
+fn fit_sequential_model(measurements: &[ModelMeasurement]) -> Option<LinearCostModel> {
+    let points = measurements
+        .iter()
+        .map(|measurement| {
+            (
+                measurement.fanout as f64,
+                duration_ns(measurement.timing.sequential),
+            )
+        })
+        .collect::<Vec<_>>();
+    let model = fit_linear_model(&points)?;
+    measurements
+        .iter()
+        .all(|measurement| {
+            prediction_matches(
+                model.predict(measurement.fanout),
+                duration_ns(measurement.timing.sequential),
+            )
+        })
+        .then_some(model)
+}
+
+fn fit_rayon_model(
+    measurements: &[ModelMeasurement],
+    rayon_workers: usize,
+) -> Option<RayonCostModel> {
+    if rayon_workers == 2 {
+        let points = measurements
+            .iter()
+            .filter(|measurement| measurement.chunk_plan.chunk_count() == 2)
+            .map(|measurement| {
+                (
+                    measurement.fanout as f64,
+                    duration_ns(measurement.timing.rayon),
+                )
+            })
+            .collect::<Vec<_>>();
+        let model = RayonCostModel::TwoWorkers(fit_linear_model(&points)?);
+        return measurements
+            .iter()
+            .filter(|measurement| measurement.chunk_plan.chunk_count() == 2)
+            .all(|measurement| {
+                prediction_matches(
+                    model.predict(measurement.chunk_plan),
+                    duration_ns(measurement.timing.rayon),
+                )
+            })
+            .then_some(model);
+    }
+
+    let mut system = [[0.0; 5]; 4];
+    for measurement in measurements {
+        let features = [
+            1.0,
+            measurement.chunk_plan.chunk_count() as f64,
+            measurement.fanout as f64,
+            measurement.chunk_plan.chunk_len() as f64,
+        ];
+        let observed = duration_ns(measurement.timing.rayon);
+        for row in 0..4 {
+            for column in 0..4 {
+                system[row][column] += features[row] * features[column];
+            }
+            system[row][4] += features[row] * observed;
+        }
+    }
+    let [
+        dispatch_ns,
+        per_chunk_ns,
+        per_merged_recipient_ns,
+        critical_chunk_recipient_ns,
+    ] = solve_4x4(system)?;
+    let coefficients = [
+        dispatch_ns,
+        per_chunk_ns,
+        per_merged_recipient_ns,
+        critical_chunk_recipient_ns,
+    ];
+    if !coefficients
+        .iter()
+        .all(|coefficient| coefficient.is_finite() && *coefficient >= 0.0)
+        || critical_chunk_recipient_ns == 0.0
+    {
+        return None;
+    }
+
+    let model = RayonCostModel::General {
+        dispatch_ns,
+        per_chunk_ns,
+        per_merged_recipient_ns,
+        critical_chunk_recipient_ns,
+    };
+    measurements
+        .iter()
+        .all(|measurement| {
+            prediction_matches(
+                model.predict(measurement.chunk_plan),
+                duration_ns(measurement.timing.rayon),
+            )
+        })
+        .then_some(model)
+}
+
+fn fit_linear_model(points: &[(f64, f64)]) -> Option<LinearCostModel> {
+    if points.len() < 2 {
+        return None;
+    }
+
+    let count = points.len() as f64;
+    let sum_x = points.iter().map(|(x, _)| x).sum::<f64>();
+    let sum_y = points.iter().map(|(_, y)| y).sum::<f64>();
+    let sum_xx = points.iter().map(|(x, _)| x * x).sum::<f64>();
+    let sum_xy = points.iter().map(|(x, y)| x * y).sum::<f64>();
+    let denominator = count * sum_xx - sum_x * sum_x;
+    if !denominator.is_finite() || denominator <= f64::EPSILON {
+        return None;
+    }
+
+    let per_recipient_ns = (count * sum_xy - sum_x * sum_y) / denominator;
+    let fixed_ns = (sum_y - per_recipient_ns * sum_x) / count;
+    (fixed_ns.is_finite()
+        && fixed_ns >= 0.0
+        && per_recipient_ns.is_finite()
+        && per_recipient_ns > 0.0)
+        .then_some(LinearCostModel {
+            fixed_ns,
+            per_recipient_ns,
+        })
+}
+
+fn solve_4x4(mut system: [[f64; 5]; 4]) -> Option<[f64; 4]> {
+    for column in 0..4 {
+        let pivot = (column..4).max_by(|&left, &right| {
+            system[left][column]
+                .abs()
+                .total_cmp(&system[right][column].abs())
+        })?;
+        if system[pivot][column].abs() <= f64::EPSILON {
+            return None;
+        }
+        system.swap(column, pivot);
+
+        let divisor = system[column][column];
+        for value in &mut system[column][column..] {
+            *value /= divisor;
+        }
+        for row in 0..4 {
+            if row == column {
+                continue;
+            }
+            let factor = system[row][column];
+            for entry in column..5 {
+                system[row][entry] -= factor * system[column][entry];
+            }
+        }
+    }
+
+    let solution = std::array::from_fn(|row| system[row][4]);
+    solution
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(solution)
+}
+
+fn model_matches_holdout(
+    sequential_model: LinearCostModel,
+    rayon_model: RayonCostModel,
+    chunk_plan: RayonChunkPlan,
+    timing: CalibrationTiming,
+) -> bool {
+    prediction_matches(
+        sequential_model.predict(chunk_plan.fanout),
+        duration_ns(timing.sequential),
+    ) && prediction_matches(rayon_model.predict(chunk_plan), duration_ns(timing.rayon))
+}
+
+fn select_modeled_profile(
+    sequential_model: LinearCostModel,
+    rayon_model: RayonCostModel,
+    rayon_workers: usize,
+) -> Option<ModeledProfileCandidate> {
+    let mut best = None;
 
     for target_chunk_len in CALIBRATION_TARGET_CHUNK_LENS {
-        let candidates = measurements
-            .iter()
-            .filter(|measurement| measurement.target_chunk_len == target_chunk_len)
+        let points = (2..=CALIBRATION_MAX_FANOUT)
+            .filter_map(|fanout| {
+                let chunk_plan = RayonChunkPlan::new(fanout, target_chunk_len, rayon_workers);
+                (chunk_plan.chunk_count() >= 2).then(|| {
+                    (
+                        fanout,
+                        sequential_model.predict(fanout),
+                        rayon_model.predict(chunk_plan),
+                    )
+                })
+            })
             .collect::<Vec<_>>();
-        for start in 0..candidates.len() {
-            let suffix = &candidates[start..];
-            if suffix.len() < 2 || !suffix.iter().all(|measurement| rayon_wins(**measurement)) {
+
+        for start in 0..points.len().saturating_sub(1) {
+            let suffix = &points[start..];
+            if !suffix.iter().all(|(_, sequential_ns, rayon_ns)| {
+                model_predicts_rayon_win(*sequential_ns, *rayon_ns)
+            }) {
                 continue;
             }
 
-            let score = suffix
-                .iter()
-                .map(|measurement| measurement.rayon.as_nanos())
-                .sum::<u128>();
-            let candidate = (candidates[start].fanout, score, target_chunk_len, start);
-            if best.is_none_or(|current| candidate < current) {
+            let candidate = ModeledProfileCandidate {
+                profile: VoiceDispatchProfile::new(points[start].0, target_chunk_len),
+                confirmation_fanouts: confirmation_fanouts(
+                    points[start].0,
+                    target_chunk_len,
+                    rayon_workers,
+                ),
+                score: suffix.iter().map(|(_, _, rayon_ns)| rayon_ns).sum(),
+            };
+            if best.is_none_or(|current| modeled_candidate_is_better(candidate, current)) {
                 best = Some(candidate);
             }
         }
     }
 
-    match best {
-        Some((threshold, _, target_chunk_len, _)) => {
-            VoiceDispatchProfile::new(threshold, target_chunk_len)
-        }
-        None => VoiceDispatchProfile::sequential_only(),
-    }
+    best
 }
 
-fn rayon_wins(measurement: CalibrationMeasurement) -> bool {
-    measurement.rayon.as_nanos() * 100 <= measurement.sequential.as_nanos() * RAYON_WIN_PERCENT
+fn confirmation_fanouts(
+    threshold: usize,
+    target_chunk_len: usize,
+    rayon_workers: usize,
+) -> [usize; 2] {
+    let threshold_plan = RayonChunkPlan::new(threshold, target_chunk_len, rayon_workers);
+    let later_fanout = ((threshold + 1)..=CALIBRATION_MAX_FANOUT)
+        .find(|&fanout| {
+            RayonChunkPlan::new(fanout, target_chunk_len, rayon_workers).chunk_count()
+                > threshold_plan.chunk_count()
+        })
+        // Once the plan is capped at the worker count, confirm at the largest
+        // modeled workload so the second probe still exercises a distinctly
+        // larger recipient run.
+        .unwrap_or(CALIBRATION_MAX_FANOUT);
+    [threshold, later_fanout]
+}
+
+fn modeled_candidate_is_better(
+    candidate: ModeledProfileCandidate,
+    current: ModeledProfileCandidate,
+) -> bool {
+    candidate.profile.fanout_threshold() < current.profile.fanout_threshold()
+        || (candidate.profile.fanout_threshold() == current.profile.fanout_threshold()
+            && (candidate.score < current.score
+                || (candidate.score == current.score
+                    && candidate.profile.rayon_min_len() < current.profile.rayon_min_len())))
+}
+
+async fn confirm_modeled_profile(
+    encoded: &CalibrationEncoded,
+    candidate: ModeledProfileCandidate,
+    rayon_workers: usize,
+) -> Result<bool, String> {
+    for fanout in candidate.confirmation_fanouts {
+        let chunk_plan =
+            RayonChunkPlan::new(fanout, candidate.profile.rayon_min_len(), rayon_workers);
+        let timing = measure_median_pair(
+            encoded,
+            fanout,
+            chunk_plan,
+            CONFIRMATION_WARMUPS,
+            CONFIRMATION_SAMPLES,
+        )
+        .await?;
+        if !rayon_wins(timing) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn duration_ns(duration: Duration) -> f64 {
+    duration.as_nanos() as f64
+}
+
+fn prediction_matches(predicted: f64, observed: f64) -> bool {
+    predicted.is_finite()
+        && observed.is_finite()
+        && observed > 0.0
+        && (predicted - observed).abs() / observed <= MODEL_MAX_RELATIVE_ERROR
+}
+
+fn model_predicts_rayon_win(sequential_ns: f64, rayon_ns: f64) -> bool {
+    sequential_ns.is_finite()
+        && rayon_ns.is_finite()
+        && sequential_ns > 0.0
+        && rayon_ns > 0.0
+        && rayon_ns * 100.0 <= sequential_ns * RAYON_WIN_PERCENT as f64
+}
+
+fn rayon_wins(timing: CalibrationTiming) -> bool {
+    timing.rayon.as_nanos() * 100 <= timing.sequential.as_nanos() * RAYON_WIN_PERCENT
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn measurement(
+    fn model_measurement(
         fanout: usize,
-        target_chunk_len: usize,
-        sequential_us: u64,
-        rayon_us: u64,
-    ) -> CalibrationMeasurement {
-        CalibrationMeasurement {
+        requested_chunks: usize,
+        rayon_workers: usize,
+        sequential_ns: u64,
+        rayon_ns: u64,
+    ) -> ModelMeasurement {
+        ModelMeasurement {
             fanout,
-            target_chunk_len,
-            sequential: Duration::from_micros(sequential_us),
-            rayon: Duration::from_micros(rayon_us),
+            chunk_plan: RayonChunkPlan::with_chunk_count(fanout, requested_chunks, rayon_workers),
+            timing: CalibrationTiming {
+                sequential: Duration::from_nanos(sequential_ns),
+                rayon: Duration::from_nanos(rayon_ns),
+            },
         }
     }
 
     #[test]
-    fn selects_lowest_sustained_winning_threshold() {
-        let measurements = vec![
-            measurement(64, 64, 100, 110),
-            measurement(128, 64, 100, 90),
-            measurement(256, 64, 100, 92),
-            measurement(64, 128, 100, 100),
-            measurement(128, 128, 100, 94),
-            measurement(256, 128, 100, 93),
-        ];
+    fn fits_known_cost_models_and_validates_a_holdout() {
+        let sequential = LinearCostModel {
+            fixed_ns: 1_000.0,
+            per_recipient_ns: 100.0,
+        };
+        let rayon = RayonCostModel::General {
+            dispatch_ns: 2_000.0,
+            per_chunk_ns: 300.0,
+            per_merged_recipient_ns: 5.0,
+            critical_chunk_recipient_ns: 60.0,
+        };
+        let measurements = model_training_probes(4)
+            .into_iter()
+            .map(|probe| {
+                let plan = probe.chunk_plan(4);
+                model_measurement(
+                    probe.fanout,
+                    probe.requested_chunks,
+                    4,
+                    sequential.predict(probe.fanout) as u64,
+                    rayon.predict(plan) as u64,
+                )
+            })
+            .collect::<Vec<_>>();
 
-        assert_eq!(
-            select_profile(&measurements),
-            VoiceDispatchProfile::new(128, 64)
-        );
+        let fitted_sequential = fit_sequential_model(&measurements).expect("sequential model fits");
+        let fitted_rayon = fit_rayon_model(&measurements, 4).expect("Rayon model fits");
+        let holdout_probe = model_holdout_probe(4);
+        let holdout_plan = holdout_probe.chunk_plan(4);
+        let holdout = CalibrationTiming {
+            sequential: Duration::from_nanos(sequential.predict(holdout_probe.fanout) as u64),
+            rayon: Duration::from_nanos(rayon.predict(holdout_plan) as u64),
+        };
+
+        assert!(model_matches_holdout(
+            fitted_sequential,
+            fitted_rayon,
+            holdout_plan,
+            holdout
+        ));
     }
 
     #[test]
-    fn rejects_an_isolated_rayon_win() {
-        let measurements = vec![
-            measurement(64, 64, 100, 90),
-            measurement(128, 64, 100, 110),
-            measurement(256, 64, 100, 90),
-        ];
+    fn fits_the_two_worker_model_and_selects_two_way_parallelism() {
+        let sequential = LinearCostModel {
+            fixed_ns: 1_000.0,
+            per_recipient_ns: 100.0,
+        };
+        let rayon = LinearCostModel {
+            fixed_ns: 2_000.0,
+            per_recipient_ns: 30.0,
+        };
+        let measurements = model_training_probes(2)
+            .into_iter()
+            .map(|probe| {
+                model_measurement(
+                    probe.fanout,
+                    probe.requested_chunks,
+                    2,
+                    sequential.predict(probe.fanout) as u64,
+                    rayon.predict(probe.fanout) as u64,
+                )
+            })
+            .collect::<Vec<_>>();
 
-        assert_eq!(
-            select_profile(&measurements),
-            VoiceDispatchProfile::sequential_only()
+        let fitted_sequential = fit_sequential_model(&measurements).expect("sequential model fits");
+        let fitted_rayon = fit_rayon_model(&measurements, 2).expect("Rayon model fits");
+        let candidate = select_modeled_profile(fitted_sequential, fitted_rayon, 2)
+            .expect("model predicts a two-worker crossover");
+        let plan = RayonChunkPlan::new(
+            candidate.profile.fanout_threshold(),
+            candidate.profile.rayon_min_len(),
+            2,
         );
+
+        assert_eq!(plan.chunk_count(), 2);
     }
 
     #[test]
@@ -596,23 +1083,95 @@ mod tests {
             assert_eq!(plan.chunk_count(), expected_chunks);
             assert_eq!(plan.chunk_len(), expected_chunk_len);
             assert!(plan.chunk_count() <= rayon_workers);
-            assert_eq!(fanout.div_ceil(plan.chunk_len()), plan.chunk_count());
+            assert_eq!(
+                (0..plan.chunk_count())
+                    .map(|index| plan.range(index).len())
+                    .sum::<usize>(),
+                fanout
+            );
         }
     }
 
     #[test]
-    fn selects_a_sustained_two_chunk_win_at_low_fanout() {
-        let measurements = vec![
-            measurement(40, 32, 100, 94),
-            measurement(48, 32, 100, 93),
-            measurement(56, 32, 100, 95),
-            measurement(64, 32, 100, 94),
-        ];
-
-        assert_eq!(
-            select_profile(&measurements),
-            VoiceDispatchProfile::new(40, 32)
+    fn supports_exact_balanced_chunks_when_worker_count_is_large() {
+        let plan = RayonChunkPlan::new(2_048, 16, 127);
+        assert_eq!(plan.chunk_count(), 127);
+        assert_eq!(plan.chunk_len(), 17);
+        assert!(
+            (0..plan.chunk_count())
+                .map(|index| plan.range(index).len())
+                .all(|len| len == 16 || len == 17)
         );
+    }
+
+    #[test]
+    fn rejects_singular_and_negative_cost_models() {
+        assert!(fit_linear_model(&[(64.0, 100.0), (64.0, 200.0)]).is_none());
+        assert!(fit_linear_model(&[(64.0, 200.0), (128.0, 100.0)]).is_none());
+    }
+
+    #[test]
+    fn selects_only_sustained_modeled_rayon_wins() {
+        let sequential = LinearCostModel {
+            fixed_ns: 10_000.0,
+            per_recipient_ns: 100.0,
+        };
+        let rayon = RayonCostModel::General {
+            dispatch_ns: 20_000.0,
+            per_chunk_ns: 500.0,
+            per_merged_recipient_ns: 5.0,
+            critical_chunk_recipient_ns: 30.0,
+        };
+        let candidate = select_modeled_profile(sequential, rayon, 8)
+            .expect("model predicts a sustained Rayon crossover");
+        let threshold_plan = RayonChunkPlan::new(
+            candidate.profile.fanout_threshold(),
+            candidate.profile.rayon_min_len(),
+            8,
+        );
+
+        assert!(threshold_plan.chunk_count() >= 2);
+        assert_eq!(
+            candidate.confirmation_fanouts[0],
+            candidate.profile.fanout_threshold()
+        );
+        let confirmation_plan = RayonChunkPlan::new(
+            candidate.confirmation_fanouts[1],
+            candidate.profile.rayon_min_len(),
+            8,
+        );
+        assert!(confirmation_plan.chunk_count() > threshold_plan.chunk_count());
+        assert!(
+            select_modeled_profile(
+                sequential,
+                RayonCostModel::General {
+                    dispatch_ns: 1_000_000_000.0,
+                    per_chunk_ns: 500.0,
+                    per_merged_recipient_ns: 5.0,
+                    critical_chunk_recipient_ns: 30.0,
+                },
+                8,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn confirmation_exercises_the_next_chunk_count_transition() {
+        assert_eq!(confirmation_fanouts(9, 8, 8), [9, 17]);
+        assert_eq!(confirmation_fanouts(9, 8, 2), [9, CALIBRATION_MAX_FANOUT]);
+    }
+
+    #[test]
+    fn requires_a_five_percent_measured_confirmation_win() {
+        assert!(rayon_wins(CalibrationTiming {
+            sequential: Duration::from_micros(100),
+            rayon: Duration::from_micros(95),
+        }));
+        assert!(!rayon_wins(CalibrationTiming {
+            sequential: Duration::from_micros(100),
+            rayon: Duration::from_micros(96),
+        }));
     }
 
     #[test]

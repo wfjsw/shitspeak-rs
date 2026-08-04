@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 use tracing::Instrument;
 
 use super::codec::{self, Audio, PacketFormat};
+use super::dispatch_tuning::{RayonChunkPlan, VoiceDispatchProfile};
 use super::metrics::{
     VoiceAgeStage, VoiceDispatchMode, VoiceEgressResult, VoiceEgressTransport, VoicePipelinePath,
     VoicePipelineStage, VoiceRouteCacheLayer, VoiceRouteKind, VoiceRouteScope, VoiceRouteSource,
@@ -468,6 +469,15 @@ struct Encoded {
     bytes: Bytes,
     checksum: [u8; 16],
 }
+
+type UdpVoiceRecipient = (
+    Arc<Box<Client>>,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    PacketFormat,
+    AudioContext,
+);
+type VoicePlaintext = ((PacketFormat, AudioContext), Encoded);
 
 /// Per-(format, context) plaintext cache. Inlined fixed-size storage covers
 /// every case `route_voice` produces (≤4 unique keys: 2 formats × ≤2 distinct
@@ -2038,6 +2048,62 @@ fn enqueue_voice_tcp_timed(
     record_pipeline_stage(path, VoicePipelineStage::TcpEnqueue, started_at);
 }
 
+fn rayon_chunk_plan_for_udp_recipients(
+    profile: VoiceDispatchProfile,
+    udp_recipient_count: usize,
+    rayon_workers: usize,
+) -> Option<RayonChunkPlan> {
+    if udp_recipient_count == 0 || !profile.uses_rayon(udp_recipient_count) {
+        return None;
+    }
+
+    let chunk_plan = profile.rayon_chunk_plan(udp_recipient_count, rayon_workers);
+    (chunk_plan.chunk_count() >= 2).then_some(chunk_plan)
+}
+
+fn encrypt_udp_recipients(
+    recipients: &[UdpVoiceRecipient],
+    plaintexts: &[VoicePlaintext],
+    path: VoicePipelinePath,
+) -> HashMap<std::net::SocketAddr, DatagramBatch> {
+    let mut batches = HashMap::<std::net::SocketAddr, DatagramBatch>::new();
+    for (client, local_addr, addr, format, context) in recipients {
+        let Some(entry) = plaintexts
+            .iter()
+            .find_map(|(key, entry)| (*key == (*format, *context)).then_some(entry))
+        else {
+            continue;
+        };
+        let Some(mut crypt) = client.try_crypt_state() else {
+            super::metrics::record_crypt_lock_contention_drop(1);
+            super::metrics::record_egress(
+                VoiceEgressTransport::Udp,
+                VoiceEgressResult::Dropped,
+                1,
+                entry.bytes.len(),
+            );
+            continue;
+        };
+        let Some(state) = crypt.as_mut() else {
+            continue;
+        };
+        let encrypted_len = entry.bytes.len() + state.overhead();
+        let batch = batches
+            .entry(*local_addr)
+            .or_insert_with(DatagramBatch::new);
+        let encrypt_started_at = Instant::now();
+        let _ = batch.try_push_zeroed(*addr, encrypted_len, |buf| {
+            state.encrypt_with_precomputed_checksum(buf, &entry.bytes, &entry.checksum)
+        });
+        super::metrics::record_pipeline_stage(
+            path,
+            VoicePipelineStage::UdpEncryptQueue,
+            encrypt_started_at.elapsed(),
+        );
+    }
+    batches
+}
+
 pub(crate) async fn flush_voice_batch(
     server: &Arc<Box<Server>>,
     audio: &Audio,
@@ -2215,19 +2281,12 @@ pub(crate) async fn flush_voice_batch(
         return;
     }
 
-    super::metrics::record_dispatch(VoiceDispatchMode::Rayon);
     let path = VoicePipelinePath::LocalRayon;
 
     // Large-fanout path: bucket recipients while collecting unique
     // (format, context) keys, pre-encode each unique key once, then dispatch
     // the encrypt loop to rayon.
-    let mut udp_items: Vec<(
-        Arc<Box<Client>>,
-        std::net::SocketAddr,
-        std::net::SocketAddr,
-        PacketFormat,
-        AudioContext,
-    )> = Vec::with_capacity(targets.len());
+    let mut udp_items: Vec<UdpVoiceRecipient> = Vec::with_capacity(targets.len());
     let mut tcp_items: Vec<(Arc<Box<Client>>, PacketFormat, AudioContext)> = Vec::new();
     let mut cache = EncodeCache::new();
 
@@ -2280,84 +2339,63 @@ pub(crate) async fn flush_voice_batch(
     tcp_tally.record();
 
     if udp_items.is_empty() {
+        super::metrics::record_dispatch(VoiceDispatchMode::Sequential);
         return;
     }
 
     // Snapshot the cache as a plain Vec for the rayon closure. The Vec is
     // moved into `spawn_blocking`; rayon workers only borrow it during the
     // scoped parallel iteration, so no Arc wrapper is needed here.
-    let plaintexts: Vec<((PacketFormat, AudioContext), Encoded)> = cache
+    let plaintexts: Vec<VoicePlaintext> = cache
         .slots
         .into_iter()
         .flatten()
         .chain(cache.overflow.into_iter())
         .collect();
 
-    let rayon_started_at = Instant::now();
-    let rayon_chunk_len =
-        dispatch_profile.rayon_chunk_len(udp_items.len(), rayon::current_num_threads());
     let batches: HashMap<std::net::SocketAddr, DatagramBatch> =
-        tokio::task::spawn_blocking(move || {
-            use rayon::prelude::*;
-            udp_items
-                .par_chunks(rayon_chunk_len)
-                .map(|recipients| {
-                    let mut batches = HashMap::<std::net::SocketAddr, DatagramBatch>::new();
-                    for (client, local_addr, addr, format, context) in recipients {
-                        let Some(entry) = plaintexts
-                            .iter()
-                            .find_map(|(k, e)| (*k == (*format, *context)).then_some(e))
-                        else {
-                            continue;
-                        };
-                        let Some(mut crypt) = client.try_crypt_state() else {
-                            super::metrics::record_crypt_lock_contention_drop(1);
-                            super::metrics::record_egress(
-                                VoiceEgressTransport::Udp,
-                                VoiceEgressResult::Dropped,
-                                1,
-                                entry.bytes.len(),
-                            );
-                            continue;
-                        };
-                        let Some(state) = crypt.as_mut() else {
-                            continue;
-                        };
-                        let encrypted_len = entry.bytes.len() + state.overhead();
-                        let batch = batches
-                            .entry(*local_addr)
-                            .or_insert_with(DatagramBatch::new);
-                        let encrypt_started_at = Instant::now();
-                        let _ = batch.try_push_zeroed(*addr, encrypted_len, |buf| {
-                            state.encrypt_with_precomputed_checksum(
-                                buf,
-                                &entry.bytes,
-                                &entry.checksum,
+        match rayon_chunk_plan_for_udp_recipients(
+            dispatch_profile,
+            udp_items.len(),
+            rayon::current_num_threads(),
+        ) {
+            Some(rayon_chunk_plan) => {
+                super::metrics::record_dispatch(VoiceDispatchMode::Rayon);
+                let rayon_started_at = Instant::now();
+                let batches = tokio::task::spawn_blocking(move || {
+                    use rayon::prelude::*;
+                    let recipients = udp_items.as_slice();
+                    (0..rayon_chunk_plan.chunk_count())
+                        .into_par_iter()
+                        .map(|chunk_index| {
+                            encrypt_udp_recipients(
+                                &recipients[rayon_chunk_plan.range(chunk_index)],
+                                &plaintexts,
+                                path,
                             )
-                        });
-                        super::metrics::record_pipeline_stage(
-                            path,
-                            VoicePipelineStage::UdpEncryptQueue,
-                            encrypt_started_at.elapsed(),
-                        );
-                    }
-                    batches
+                        })
+                        .reduce(HashMap::new, |mut left, right| {
+                            for (local_addr, batch) in right {
+                                left.entry(local_addr)
+                                    .or_insert_with(DatagramBatch::new)
+                                    .append(batch);
+                            }
+                            left
+                        })
                 })
-                .reduce(HashMap::new, |mut left, right| {
-                    for (local_addr, batch) in right {
-                        left.entry(local_addr)
-                            .or_insert_with(DatagramBatch::new)
-                            .append(batch);
-                    }
-                    left
-                })
-        })
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("voice encrypt task join error: {e}");
-            HashMap::new()
-        });
-    record_pipeline_stage(path, VoicePipelineStage::RayonEncryptJoin, rayon_started_at);
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!("voice encrypt task join error: {error}");
+                    HashMap::new()
+                });
+                record_pipeline_stage(path, VoicePipelineStage::RayonEncryptJoin, rayon_started_at);
+                batches
+            }
+            None => {
+                super::metrics::record_dispatch(VoiceDispatchMode::Sequential);
+                encrypt_udp_recipients(&udp_items, &plaintexts, VoicePipelinePath::LocalSequential)
+            }
+        };
 
     for (local_addr, batch) in batches {
         if batch.is_empty() {
@@ -2617,6 +2655,20 @@ pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rayon_dispatch_requires_enough_udp_recipients() {
+        let profile =
+            super::super::dispatch_tuning::VoiceDispatchPlan::conservative().for_payload_len(170);
+
+        assert!(profile.uses_rayon(512));
+        assert!(rayon_chunk_plan_for_udp_recipients(profile, 1, 8).is_none());
+        assert!(rayon_chunk_plan_for_udp_recipients(profile, 511, 8).is_none());
+
+        let chunk_plan = rayon_chunk_plan_for_udp_recipients(profile, 512, 8)
+            .expect("threshold-sized UDP fan-out uses Rayon");
+        assert_eq!(chunk_plan.chunk_count(), 2);
+    }
 
     #[test]
     fn bounded_local_fanout_queue_evicts_oldest_and_retains_fifo_order() {

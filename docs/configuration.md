@@ -289,10 +289,15 @@ large_payload_rayon_threshold = 512
 large_payload_rayon_min_len = 256
 ```
 
-`startup_calibrated` benchmarks sequential and Rayon encryption at startup and
-selects both profiles. If Rayon has fewer than two workers, the server selects
-sequential dispatch; if calibration fails, it logs a warning and uses a
-conservative fallback.
+`startup_calibrated` takes a small set of production-shaped sequential and
+Rayon probes at startup. It fits separate cost models for both payload classes,
+validates each model against a held-out probe, calculates candidate thresholds,
+then measures the predicted threshold and the next chunk-count transition (or
+the largest modeled fan-out once worker-capped) before accepting it. An invalid
+model, failed validation, or failed confirmation
+selects sequential dispatch. If Rayon has fewer than two workers, the server
+also selects sequential dispatch; an operational calibration failure logs a
+warning and uses a conservative fallback.
 
 `sequential` disables Rayon voice fan-out. `fixed` is an operational override
 for controlled experiments or recovery. In fixed mode, each

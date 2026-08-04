@@ -48,6 +48,16 @@ fn make_crypt() -> CryptState {
     CryptState::from_key("OCB2-AES128", &KEY, &IV_E, &IV_D).expect("crypt state")
 }
 
+fn make_crypt_chunks(fanout: usize, chunk_count: usize) -> Vec<Vec<CryptState>> {
+    (0..chunk_count)
+        .map(|chunk_index| {
+            let start = chunk_index * fanout / chunk_count;
+            let end = (chunk_index + 1) * fanout / chunk_count;
+            (start..end).map(|_| make_crypt()).collect()
+        })
+        .collect()
+}
+
 fn make_audio(opus_len: usize) -> Audio {
     Audio {
         target: AudioTarget::Normal,
@@ -443,23 +453,19 @@ fn bench_fanout_rayon_datagram_batch(c: &mut Criterion) {
     let rayon_workers = rayon::current_num_threads();
 
     for &n in recipient_counts().iter() {
+        let (chunk_count, _) = capped_chunk_plan(n, RAYON_DATAGRAM_BATCH_TARGET_LEN, rayon_workers);
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_with_setup(
-                || (0..n).map(|_| make_crypt()).collect::<Vec<_>>(),
-                |mut states| {
+                || make_crypt_chunks(n, chunk_count),
+                |chunks| {
                     let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
                     let checksum = CryptState::compute_plaintext_checksum(&raw);
-                    let (_, chunk_len) = capped_chunk_plan(
-                        states.len(),
-                        RAYON_DATAGRAM_BATCH_TARGET_LEN,
-                        rayon_workers,
-                    );
-                    let batch = states
-                        .par_chunks_mut(chunk_len)
-                        .map(|chunk| {
+                    let batch = chunks
+                        .into_par_iter()
+                        .map(|mut states| {
                             let mut batch = DatagramBatch::new();
-                            for state in chunk {
+                            for state in &mut states {
                                 let encrypted_len = raw.len() + state.overhead();
                                 batch
                                     .try_push_zeroed(addr, encrypted_len, |buf| {
@@ -546,13 +552,13 @@ fn bench_partitioned_fanout(c: &mut Criterion) {
                     &fanout,
                     |b, &fanout| {
                         b.iter_with_setup(
-                            || (0..fanout).map(|_| make_crypt()).collect::<Vec<_>>(),
-                            |mut states| {
-                                let batch = states
-                                    .par_chunks_mut(chunk_len)
-                                    .map(|chunk| {
+                            || make_crypt_chunks(fanout, chunk_count),
+                            |chunks| {
+                                let batch = chunks
+                                    .into_par_iter()
+                                    .map(|mut states| {
                                         let mut batch = DatagramBatch::new();
-                                        for state in chunk {
+                                        for state in &mut states {
                                             let encrypted_len = raw.len() + state.overhead();
                                             batch
                                                 .try_push_zeroed(addr, encrypted_len, |buf| {

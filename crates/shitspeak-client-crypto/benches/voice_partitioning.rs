@@ -66,6 +66,20 @@ fn make_work(fanout: usize, output_len: usize) -> Vec<RecipientWork> {
         .collect()
 }
 
+fn make_work_chunks(
+    fanout: usize,
+    output_len: usize,
+    chunk_count: usize,
+) -> Vec<Vec<RecipientWork>> {
+    (0..chunk_count)
+        .map(|chunk_index| {
+            let start = chunk_index * fanout / chunk_count;
+            let end = (chunk_index + 1) * fanout / chunk_count;
+            make_work(end - start, output_len)
+        })
+        .collect()
+}
+
 fn encrypt_one(work: &mut RecipientWork, plaintext: &[u8], checksum: &[u8; 16]) {
     work.crypt
         .encrypt_with_precomputed_checksum(&mut work.output, plaintext, checksum)
@@ -119,13 +133,13 @@ fn bench_voice_partitioning(c: &mut Criterion) {
                     &fanout,
                     |b, &n| {
                         b.iter_with_setup(
-                            || make_work(n, output_len),
-                            |mut work| {
-                                let output_prefix = work
-                                    .par_chunks_mut(chunk_len)
-                                    .map(|chunk| {
+                            || make_work_chunks(n, output_len, chunk_count),
+                            |chunks| {
+                                let output_prefix = chunks
+                                    .into_par_iter()
+                                    .map(|mut work| {
                                         let mut prefix = 0u8;
-                                        for recipient in chunk {
+                                        for recipient in &mut work {
                                             encrypt_one(recipient, &plaintext, &checksum);
                                             prefix ^= recipient.output[0];
                                         }
