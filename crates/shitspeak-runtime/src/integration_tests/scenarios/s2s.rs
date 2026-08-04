@@ -2002,6 +2002,61 @@ async fn s2s_cross_node_user_stats_rpc() {
     assert!(msg.is_some(), "Alice should receive Bob's cross-node stats");
 }
 
+/// A comment set by a user on one node must be available to clients on every
+/// other node. The advertised hash alone is insufficient because `RequestBlob`
+/// is handled by the requesting client's local node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_cross_node_user_comment_blob_is_retrievable() {
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    let alice = TestClient::connect_and_authenticate(&a, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+
+    wait_for_server_to_track_client(&b, alice.server_session).await;
+
+    let comment = "Alice's cross-node profile comment";
+    alice.set_comment(comment).await;
+
+    let hash_advertised = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice.session_id)
+                        && us.comment.is_none()
+                        && us.comment_hash.as_ref().is_some_and(|hash| hash.len() == 20))
+            },
+            CLIENT_DEADLINE,
+        )
+        .await;
+    assert!(
+        hash_advertised.is_some(),
+        "Bob should receive Alice's replicated comment hash"
+    );
+
+    bob.request_session_comment(alice.session_id).await;
+    let comment_loaded = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(alice.session_id)
+                        && us.comment.as_deref() == Some(comment))
+            },
+            CLIENT_DEADLINE,
+        )
+        .await;
+    assert!(
+        comment_loaded.is_some(),
+        "Bob should load Alice's comment from the owning node"
+    );
+}
+
 /// A receiver configured to retain remote sessions must update its user
 /// channel cache from the replicated channel-entry event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

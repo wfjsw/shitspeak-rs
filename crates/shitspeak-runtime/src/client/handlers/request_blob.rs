@@ -39,6 +39,20 @@ fn request_is_empty(request: &RequestBlob) -> bool {
         && request.channel_description.is_empty()
 }
 
+async fn get_session_blob(
+    server: &Arc<Box<Server>>,
+    key: &str,
+    source_url: Option<&str>,
+) -> Option<bytes::Bytes> {
+    match source_url {
+        Some(url) => server.get_session_blobs().get(key, url).await,
+        None => match server.get_session_blobs().get_cached(key).await {
+            Some(blob) => Some(blob),
+            None => server.s2s_manager().get_session_blob(key).await,
+        },
+    }
+}
+
 pub async fn spawn_request_blob_task(server: Arc<Box<Server>>, sender: Arc<Box<Client>>) {
     let channel_count = server
         .get_channels()
@@ -205,10 +219,7 @@ async fn handle_request_blob_inner(
         let texture_data = match texture_hash.as_ref() {
             Some(hash) => {
                 let key = hex::encode(hash);
-                match texture_url.as_deref() {
-                    Some(url) => server.get_session_blobs().get(&key, url).await,
-                    None => server.get_session_blobs().get_cached(&key).await,
-                }
+                get_session_blob(server, &key, texture_url.as_deref()).await
             }
             None => None,
         };
@@ -274,10 +285,7 @@ async fn handle_request_blob_inner(
         let comment_data = match comment_hash.as_ref() {
             Some(hash) => {
                 let key = hex::encode(hash);
-                match comment_url.as_deref() {
-                    Some(url) => server.get_session_blobs().get(&key, url).await,
-                    None => server.get_session_blobs().get_cached(&key).await,
-                }
+                get_session_blob(server, &key, comment_url.as_deref()).await
             }
             None => None,
         };

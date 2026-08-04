@@ -15,7 +15,7 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::blob_store::ChannelBlobStore;
+use crate::blob_store::{ChannelBlobStore, SessionBlobStore};
 use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
 use crate::client_repository::{
@@ -71,6 +71,7 @@ const S2S_CLIENT_REPLICATION_WORKER_CAPACITY: usize = 4096;
 const MAX_CLIENT_ORIGIN_SNAPSHOT_ENTRIES: usize = 1_000_000;
 const MAX_CLIENT_ORIGIN_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
 const S2S_GATEWAY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const S2S_SESSION_BLOB_TOPIC: &str = "session_blobs";
 const STRICT_PROPOSAL_GATEWAY_SLACK_TICKS: u32 = 4;
 const VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const S2S_CHANNEL_REPLICATION_SLOW_STAGE: Duration = Duration::from_secs(1);
@@ -142,6 +143,7 @@ struct S2SRuntimeState {
     client_replication: Option<s2s_replications::OwnerHandle<ClientReplicationAdapter>>,
     channel_blob_replications:
         HashMap<String, s2s_replications::BlobHandle<ChannelBlobReplicationAdapter>>,
+    session_blob_replication: Option<s2s_replications::BlobHandle<SessionBlobReplicationAdapter>>,
     bridge_tasks: Vec<JoinHandle<()>>,
     gateway_tx: Option<S2SGatewayTx>,
     startup_duplicate_failures: u64,
@@ -1475,6 +1477,12 @@ impl S2SManager {
         handle.get(key).await
     }
 
+    /// Retrieve a URL-less session blob from the local cache or an S2S peer.
+    pub(crate) async fn get_session_blob(&self, key: &str) -> Option<Bytes> {
+        let handle = self.state.read().session_blob_replication.clone()?;
+        handle.get(key).await
+    }
+
     fn channel_replication_handle(
         &self,
         server_id: &str,
@@ -1747,6 +1755,7 @@ impl S2SManager {
             ban_replication,
             client_replication,
             channel_blob_replications,
+            session_blob_replication,
             bridge_tasks,
         ) = match server_handle.as_ref() {
             Some(server) => {
@@ -1765,7 +1774,7 @@ impl S2SManager {
             }
             None => {
                 warn!("s2s repository replication skipped: server handle dropped");
-                (HashMap::new(), None, None, HashMap::new(), Vec::new())
+                (HashMap::new(), None, None, HashMap::new(), None, Vec::new())
             }
         };
 
@@ -1804,6 +1813,7 @@ impl S2SManager {
             state.ban_replication = ban_replication;
             state.client_replication = client_replication;
             state.channel_blob_replications = channel_blob_replications;
+            state.session_blob_replication = session_blob_replication;
             state.bridge_tasks = bridge_tasks;
             #[cfg(feature = "pre-release-workload")]
             if let Some(workload) = started_pre_release_workload {
@@ -1885,6 +1895,7 @@ impl S2SManager {
             state.ban_replication = None;
             state.client_replication = None;
             state.channel_blob_replications.clear();
+            state.session_blob_replication = None;
             state.server = None;
             state.recipient_index = None;
             state.application = None;
@@ -1928,6 +1939,7 @@ impl S2SManager {
         Option<s2s_replications::StrictHandle<BanReplicationAdapter>>,
         Option<s2s_replications::OwnerHandle<ClientReplicationAdapter>>,
         HashMap<String, s2s_replications::BlobHandle<ChannelBlobReplicationAdapter>>,
+        Option<s2s_replications::BlobHandle<SessionBlobReplicationAdapter>>,
         Vec<JoinHandle<()>>,
     ) {
         let bans = Arc::new(BanReplicationAdapter::new(server.get_bans().clone()));
@@ -1955,6 +1967,14 @@ impl S2SManager {
         ) {
             warn!(error = %e, "failed to register s2s channel blob replication");
         }
+        let session_blob_handle = match self.register_session_blob_replication(replications, server)
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                warn!(error = %e, "failed to register s2s session blob replication");
+                None
+            }
+        };
         let ban_handle = match replications.register_strict("bans", bans) {
             Ok(handle) => Some(handle),
             Err(e) => {
@@ -2012,6 +2032,7 @@ impl S2SManager {
             ban_handle,
             client_handle,
             channel_blob_handles,
+            session_blob_handle,
             bridge_tasks,
         )
     }
@@ -2107,6 +2128,26 @@ impl S2SManager {
                 Ok(handle)
             }
         }
+    }
+
+    fn register_session_blob_replication(
+        &self,
+        replications: &Arc<ReplicationManager>,
+        server: &Arc<Box<Server>>,
+    ) -> Result<
+        s2s_replications::BlobHandle<SessionBlobReplicationAdapter>,
+        s2s_replications::ReplicationError,
+    > {
+        let topic = S2S_SESSION_BLOB_TOPIC.to_owned();
+        let repo = Arc::new(SessionBlobReplicationAdapter::new(
+            server.get_session_blobs().clone(),
+        ));
+        let runtime = replications
+            .blob_topic_parts()
+            .build_runtime(topic.clone(), repo);
+        runtime.start();
+        replications.install_blob_runtime(topic, runtime.clone())?;
+        Ok(s2s_replications::BlobHandle::with_runtime(runtime))
     }
 }
 
@@ -3725,6 +3766,55 @@ impl BlobReplicable for ChannelBlobReplicationAdapter {
             .filter_map(|channel| channel.description_hash.clone())
             .filter(|key| key.len() == 40)
             .collect()
+    }
+}
+
+/// Replicates URL-less user session blobs on demand. Cache eviction remains
+/// owned by `SessionBlobStore`, so the generic blob runtime must not decay it.
+#[derive(Clone)]
+struct SessionBlobReplicationAdapter {
+    blobs: Arc<SessionBlobStore>,
+}
+
+impl SessionBlobReplicationAdapter {
+    fn new(blobs: Arc<SessionBlobStore>) -> Self {
+        Self { blobs }
+    }
+}
+
+#[async_trait]
+impl BlobReplicable for SessionBlobReplicationAdapter {
+    async fn get_blob(&self, key: &str) -> Option<Bytes> {
+        self.blobs.get_cached(key).await
+    }
+
+    async fn put_blob(
+        &self,
+        key: &str,
+        data: Bytes,
+    ) -> Result<(), s2s_replications::ReplicationError> {
+        let written = self.blobs.put(key, &data).await.map_err(|_| {
+            s2s_replications::ReplicationError::Malformed("session blob store write failed")
+        })?;
+        if written == key {
+            Ok(())
+        } else {
+            Err(s2s_replications::ReplicationError::Malformed(
+                "session blob key does not match content",
+            ))
+        }
+    }
+
+    async fn delete_blob(&self, _key: &str) -> Result<(), s2s_replications::ReplicationError> {
+        Ok(())
+    }
+
+    async fn stored_keys(&self) -> HashSet<String> {
+        HashSet::new()
+    }
+
+    async fn referenced_keys(&self) -> HashSet<String> {
+        HashSet::new()
     }
 }
 

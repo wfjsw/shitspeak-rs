@@ -169,9 +169,9 @@ impl ChannelBlobStore {
 /// eviction). Eviction batches down to 75% of the budget to avoid churn at
 /// the boundary. Reference checks are O(1) hash-map lookups.
 ///
-/// During S2S, both the blob hash and the source URL are propagated to peer
-/// nodes.  A peer that lacks the blob fetches it directly from the same URL;
-/// nodes never pull blobs from each other.
+/// During S2S, URL-backed blobs are fetched directly from their source URL.
+/// URL-less blobs created by a connected user are fetched from a peer through
+/// the S2S blob replication topic.
 ///
 pub struct SessionBlobStore {
     root: PathBuf,
