@@ -297,10 +297,12 @@ conservative fallback.
 `sequential` disables Rayon voice fan-out. `fixed` is an operational override
 for controlled experiments or recovery. In fixed mode, each
 `*_rayon_threshold` is the recipient count at which Rayon dispatch begins, and
-each `*_rayon_min_len` is the minimum recipient run assigned as parallel work,
-not a per-packet task. All four values must be at least `1`, and a minimum run
-length cannot exceed its corresponding threshold. The four numeric settings
-are ignored outside fixed mode.
+each `*_rayon_min_len` is the target recipient-run size for parallel work, not
+a per-packet task. Runs are balanced, so their actual size can be smaller than
+the target when that permits useful parallelism. Dispatch creates no more runs
+than there are Rayon workers. All four values must be at least `1`, and a
+target run length cannot exceed its corresponding threshold. The four numeric
+settings are ignored outside fixed mode.
 
 ## Timeouts
 

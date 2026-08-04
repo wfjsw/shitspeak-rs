@@ -28,9 +28,21 @@ use shitspeak_rs::voice::udp_batch::DatagramBatch;
 const KEY: [u8; 16] = [0x42; 16];
 const IV_E: [u8; 16] = [0x01; 16];
 const IV_D: [u8; 16] = [0x02; 16];
-const RAYON_DATAGRAM_BATCH_MIN_LEN: usize = 256;
-const PARTITIONED_FANOUT_SIZES: [usize; 3] = [512, 1024, 2048];
-const PARTITION_MIN_LENS: [usize; 4] = [64, 128, 256, 512];
+const RAYON_DATAGRAM_BATCH_TARGET_LEN: usize = 256;
+const PARTITIONED_FANOUT_SIZES: [usize; 8] = [40, 48, 56, 64, 96, 128, 512, 2048];
+const PARTITION_TARGET_CHUNK_LENS: [usize; 6] = [16, 32, 64, 128, 256, 512];
+
+fn capped_chunk_plan(
+    fanout: usize,
+    target_chunk_len: usize,
+    rayon_workers: usize,
+) -> (usize, usize) {
+    let chunk_count = fanout
+        .div_ceil(target_chunk_len)
+        .min(rayon_workers.max(1))
+        .min(fanout);
+    (chunk_count, fanout.div_ceil(chunk_count))
+}
 
 fn make_crypt() -> CryptState {
     CryptState::from_key("OCB2-AES128", &KEY, &IV_E, &IV_D).expect("crypt state")
@@ -424,29 +436,38 @@ fn bench_fanout_seq_datagram_batch(c: &mut Criterion) {
 // Same production-shaped buffer path as above, but using the large-fanout
 // Rayon fold/reduce layout from flush_voice_batch.
 fn bench_fanout_rayon_datagram_batch(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fanout/rayon_datagram_batch_encode_encrypt");
+    let mut group = c.benchmark_group("fanout/rayon_capped_datagram_batch_encode_encrypt");
     let opus_len = 170;
     let audio = make_audio(opus_len);
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 64738));
+    let rayon_workers = rayon::current_num_threads();
 
     for &n in recipient_counts().iter() {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_with_setup(
                 || (0..n).map(|_| make_crypt()).collect::<Vec<_>>(),
-                |states| {
+                |mut states| {
                     let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
                     let checksum = CryptState::compute_plaintext_checksum(&raw);
+                    let (_, chunk_len) = capped_chunk_plan(
+                        states.len(),
+                        RAYON_DATAGRAM_BATCH_TARGET_LEN,
+                        rayon_workers,
+                    );
                     let batch = states
-                        .into_par_iter()
-                        .with_min_len(RAYON_DATAGRAM_BATCH_MIN_LEN)
-                        .fold(DatagramBatch::new, |mut batch, mut state| {
-                            let encrypted_len = raw.len() + state.overhead();
-                            batch
-                                .try_push_zeroed(addr, encrypted_len, |buf| {
-                                    state.encrypt_with_precomputed_checksum(buf, &raw, &checksum)
-                                })
-                                .unwrap();
+                        .par_chunks_mut(chunk_len)
+                        .map(|chunk| {
+                            let mut batch = DatagramBatch::new();
+                            for state in chunk {
+                                let encrypted_len = raw.len() + state.overhead();
+                                batch
+                                    .try_push_zeroed(addr, encrypted_len, |buf| {
+                                        state
+                                            .encrypt_with_precomputed_checksum(buf, &raw, &checksum)
+                                    })
+                                    .unwrap();
+                            }
                             batch
                         })
                         .reduce(DatagramBatch::new, |mut left, right| {
@@ -465,15 +486,15 @@ fn bench_fanout_rayon_datagram_batch(c: &mut Criterion) {
 // ── 7. Large fan-out partition size ─────────────────────────────────────────
 //
 // The production large-fanout path runs one `spawn_blocking` operation and
-// lets Rayon split its recipient collection. The minimum partition length is
-// deliberately varied here: each Rayon work item encrypts a run of recipients,
-// never a single UDP packet. This measures whether a lower floor gives enough
-// work to more cores without scheduling packets independently.
+// creates explicitly balanced recipient runs. The number of runs is capped at
+// the Rayon worker count, so every partial DatagramBatch represents useful
+// coarse work rather than an independently scheduled packet.
 fn bench_partitioned_fanout(c: &mut Criterion) {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 64738));
     let mut group = c.benchmark_group("fanout/partitioned_datagram_batch_encrypt");
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(2));
+    let rayon_workers = rayon::current_num_threads();
 
     for opus_len in [170, 768] {
         let raw = Audio::encode(
@@ -509,29 +530,38 @@ fn bench_partitioned_fanout(c: &mut Criterion) {
                 },
             );
 
-            for min_len in PARTITION_MIN_LENS {
+            for target_chunk_len in PARTITION_TARGET_CHUNK_LENS {
+                let (chunk_count, chunk_len) =
+                    capped_chunk_plan(fanout, target_chunk_len, rayon_workers);
+                if chunk_count < 2 {
+                    continue;
+                }
                 group.bench_with_input(
                     BenchmarkId::new(
-                        format!("rayon_min_len={min_len}"),
-                        format!("opus={opus_len}/fanout={fanout}"),
+                        format!(
+                            "rayon_target={target_chunk_len}/chunks={chunk_count}/workers={rayon_workers}"
+                        ),
+                        format!("opus={opus_len}/fanout={fanout}/chunk_len={chunk_len}"),
                     ),
                     &fanout,
                     |b, &fanout| {
                         b.iter_with_setup(
                             || (0..fanout).map(|_| make_crypt()).collect::<Vec<_>>(),
-                            |states| {
+                            |mut states| {
                                 let batch = states
-                                    .into_par_iter()
-                                    .with_min_len(min_len)
-                                    .fold(DatagramBatch::new, |mut batch, mut state| {
-                                        let encrypted_len = raw.len() + state.overhead();
-                                        batch
-                                            .try_push_zeroed(addr, encrypted_len, |buf| {
-                                                state.encrypt_with_precomputed_checksum(
-                                                    buf, &raw, &checksum,
-                                                )
-                                            })
-                                            .unwrap();
+                                    .par_chunks_mut(chunk_len)
+                                    .map(|chunk| {
+                                        let mut batch = DatagramBatch::new();
+                                        for state in chunk {
+                                            let encrypted_len = raw.len() + state.overhead();
+                                            batch
+                                                .try_push_zeroed(addr, encrypted_len, |buf| {
+                                                    state.encrypt_with_precomputed_checksum(
+                                                        buf, &raw, &checksum,
+                                                    )
+                                                })
+                                                .unwrap();
+                                        }
                                         batch
                                     })
                                     .reduce(DatagramBatch::new, |mut left, right| {

@@ -26,8 +26,10 @@ const CONSERVATIVE_RAYON_MIN_LEN: usize = 256;
 const CALIBRATION_KEY: [u8; 16] = [0x42; 16];
 const CALIBRATION_IV_E: [u8; 16] = [0x01; 16];
 const CALIBRATION_IV_D: [u8; 16] = [0x02; 16];
-const CALIBRATION_FANOUTS: [usize; 6] = [64, 128, 256, 512, 1024, 2048];
-const CALIBRATION_MIN_LENS: [usize; 4] = [64, 128, 256, 512];
+// Include the small-fan-out crossover region: explicit chunking can use two
+// Rayon workers there without creating one job per recipient.
+const CALIBRATION_FANOUTS: [usize; 11] = [32, 40, 48, 56, 64, 96, 128, 256, 512, 1024, 2048];
+const CALIBRATION_TARGET_CHUNK_LENS: [usize; 6] = [16, 32, 64, 128, 256, 512];
 const CALIBRATION_WARMUPS: usize = 2;
 const CALIBRATION_SAMPLES: usize = 11;
 const RAYON_WIN_PERCENT: u128 = 95;
@@ -88,6 +90,41 @@ impl VoiceDispatchProfile {
 
     pub(crate) fn rayon_min_len(self) -> usize {
         self.rayon_min_len
+    }
+
+    pub(crate) fn rayon_chunk_len(self, fanout: usize, rayon_workers: usize) -> usize {
+        RayonChunkPlan::new(fanout, self.rayon_min_len, rayon_workers).chunk_len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RayonChunkPlan {
+    chunk_count: usize,
+    chunk_len: usize,
+}
+
+impl RayonChunkPlan {
+    fn new(fanout: usize, target_chunk_len: usize, rayon_workers: usize) -> Self {
+        assert!(fanout > 0, "Rayon chunking requires at least one recipient");
+        assert!(
+            target_chunk_len > 0,
+            "Rayon chunking requires a nonzero target chunk length"
+        );
+
+        let requested_chunks = fanout.div_ceil(target_chunk_len);
+        let chunk_count = requested_chunks.min(rayon_workers.max(1)).min(fanout);
+        Self {
+            chunk_count,
+            chunk_len: fanout.div_ceil(chunk_count),
+        }
+    }
+
+    const fn chunk_count(self) -> usize {
+        self.chunk_count
+    }
+
+    const fn chunk_len(self) -> usize {
+        self.chunk_len
     }
 }
 
@@ -202,16 +239,18 @@ pub(crate) async fn resolve_voice_dispatch_plan(
             );
             VoiceDispatchPlan::sequential()
         }
-        VoiceDispatchMode::StartupCalibrated => match calibrate_voice_dispatch_plan().await {
-            Ok(plan) => plan,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "voice dispatch calibration failed; using conservative fallback"
-                );
-                VoiceDispatchPlan::conservative()
+        VoiceDispatchMode::StartupCalibrated => {
+            match calibrate_voice_dispatch_plan(rayon_workers).await {
+                Ok(plan) => plan,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "voice dispatch calibration failed; using conservative fallback"
+                    );
+                    VoiceDispatchPlan::conservative()
+                }
             }
-        },
+        }
     };
 
     Ok(ResolvedVoiceDispatchPlan {
@@ -240,47 +279,64 @@ struct CalibrationWorkload {
 #[derive(Clone, Copy)]
 struct CalibrationMeasurement {
     fanout: usize,
-    min_len: usize,
+    target_chunk_len: usize,
     sequential: Duration,
     rayon: Duration,
 }
 
-async fn calibrate_voice_dispatch_plan() -> Result<VoiceDispatchPlan, String> {
+async fn calibrate_voice_dispatch_plan(rayon_workers: usize) -> Result<VoiceDispatchPlan, String> {
     let small_payload = make_calibration_encoded(170)?;
     let large_payload = make_calibration_encoded(768)?;
-    let small_profile = calibrate_payload_profile(&small_payload).await?;
-    let large_profile = calibrate_payload_profile(&large_payload).await?;
+    let small_profile = calibrate_payload_profile(&small_payload, rayon_workers).await?;
+    let large_profile = calibrate_payload_profile(&large_payload, rayon_workers).await?;
 
     Ok(VoiceDispatchPlan::calibrated(small_profile, large_profile))
 }
 
 async fn calibrate_payload_profile(
     encoded: &CalibrationEncoded,
+    rayon_workers: usize,
 ) -> Result<VoiceDispatchProfile, String> {
     let mut measurements = Vec::new();
 
-    for min_len in CALIBRATION_MIN_LENS {
+    for target_chunk_len in CALIBRATION_TARGET_CHUNK_LENS {
         for fanout in CALIBRATION_FANOUTS {
-            if min_len > fanout {
+            if target_chunk_len > fanout {
+                continue;
+            }
+            if RayonChunkPlan::new(fanout, target_chunk_len, rayon_workers).chunk_count() < 2 {
                 continue;
             }
 
             for warmup in 0..CALIBRATION_WARMUPS {
-                let _ = measure_pair(encoded, fanout, min_len, warmup % 2 == 0).await?;
+                let _ = measure_pair(
+                    encoded,
+                    fanout,
+                    target_chunk_len,
+                    rayon_workers,
+                    warmup % 2 == 0,
+                )
+                .await?;
             }
 
             let mut sequential = Vec::with_capacity(CALIBRATION_SAMPLES);
             let mut rayon = Vec::with_capacity(CALIBRATION_SAMPLES);
             for sample in 0..CALIBRATION_SAMPLES {
-                let (sequential_sample, rayon_sample) =
-                    measure_pair(encoded, fanout, min_len, sample % 2 == 0).await?;
+                let (sequential_sample, rayon_sample) = measure_pair(
+                    encoded,
+                    fanout,
+                    target_chunk_len,
+                    rayon_workers,
+                    sample % 2 == 0,
+                )
+                .await?;
                 sequential.push(sequential_sample);
                 rayon.push(rayon_sample);
             }
 
             measurements.push(CalibrationMeasurement {
                 fanout,
-                min_len,
+                target_chunk_len,
                 sequential: median_duration(&mut sequential),
                 rayon: median_duration(&mut rayon),
             });
@@ -293,19 +349,22 @@ async fn calibrate_payload_profile(
 async fn measure_pair(
     encoded: &CalibrationEncoded,
     fanout: usize,
-    min_len: usize,
+    target_chunk_len: usize,
+    rayon_workers: usize,
     rayon_first: bool,
 ) -> Result<(Duration, Duration), String> {
     let sequential_work = make_workload(fanout)?;
     let rayon_work = make_workload(fanout)?;
 
     if rayon_first {
-        let rayon = time_rayon(rayon_work, encoded.clone(), min_len).await?;
+        let rayon =
+            time_rayon(rayon_work, encoded.clone(), target_chunk_len, rayon_workers).await?;
         let sequential = time_sequential(sequential_work, encoded);
         Ok((sequential, rayon))
     } else {
         let sequential = time_sequential(sequential_work, encoded);
-        let rayon = time_rayon(rayon_work, encoded.clone(), min_len).await?;
+        let rayon =
+            time_rayon(rayon_work, encoded.clone(), target_chunk_len, rayon_workers).await?;
         Ok((sequential, rayon))
     }
 }
@@ -313,7 +372,7 @@ async fn measure_pair(
 fn time_sequential(workload: CalibrationWorkload, encoded: &CalibrationEncoded) -> Duration {
     let started_at = Instant::now();
     let mut batches = HashMap::<SocketAddr, DatagramBatch>::new();
-    for recipient in workload.recipients {
+    for recipient in &workload.recipients {
         encrypt_recipient(&mut batches, recipient, encoded);
     }
     black_box(batches);
@@ -323,21 +382,23 @@ fn time_sequential(workload: CalibrationWorkload, encoded: &CalibrationEncoded) 
 async fn time_rayon(
     workload: CalibrationWorkload,
     encoded: CalibrationEncoded,
-    min_len: usize,
+    target_chunk_len: usize,
+    rayon_workers: usize,
 ) -> Result<Duration, String> {
     let started_at = Instant::now();
     tokio::task::spawn_blocking(move || {
+        let chunk_plan =
+            RayonChunkPlan::new(workload.recipients.len(), target_chunk_len, rayon_workers);
         let batches = workload
             .recipients
-            .into_par_iter()
-            .with_min_len(min_len)
-            .fold(
-                HashMap::<SocketAddr, DatagramBatch>::new,
-                |mut batches, recipient| {
+            .par_chunks(chunk_plan.chunk_len())
+            .map(|recipients| {
+                let mut batches = HashMap::<SocketAddr, DatagramBatch>::new();
+                for recipient in recipients {
                     encrypt_recipient(&mut batches, recipient, &encoded);
-                    batches
-                },
-            )
+                }
+                batches
+            })
             .reduce(HashMap::new, |mut left, right| {
                 for (local_addr, batch) in right {
                     left.entry(local_addr)
@@ -355,7 +416,7 @@ async fn time_rayon(
 
 fn encrypt_recipient(
     batches: &mut HashMap<SocketAddr, DatagramBatch>,
-    recipient: CalibrationRecipient,
+    recipient: &CalibrationRecipient,
     encoded: &CalibrationEncoded,
 ) {
     let Some(mut crypt) = recipient
@@ -437,10 +498,10 @@ fn median_duration(samples: &mut [Duration]) -> Duration {
 fn select_profile(measurements: &[CalibrationMeasurement]) -> VoiceDispatchProfile {
     let mut best: Option<(usize, u128, usize, usize)> = None;
 
-    for min_len in CALIBRATION_MIN_LENS {
+    for target_chunk_len in CALIBRATION_TARGET_CHUNK_LENS {
         let candidates = measurements
             .iter()
-            .filter(|measurement| measurement.min_len == min_len)
+            .filter(|measurement| measurement.target_chunk_len == target_chunk_len)
             .collect::<Vec<_>>();
         for start in 0..candidates.len() {
             let suffix = &candidates[start..];
@@ -452,7 +513,7 @@ fn select_profile(measurements: &[CalibrationMeasurement]) -> VoiceDispatchProfi
                 .iter()
                 .map(|measurement| measurement.rayon.as_nanos())
                 .sum::<u128>();
-            let candidate = (candidates[start].fanout, score, min_len, start);
+            let candidate = (candidates[start].fanout, score, target_chunk_len, start);
             if best.is_none_or(|current| candidate < current) {
                 best = Some(candidate);
             }
@@ -460,7 +521,9 @@ fn select_profile(measurements: &[CalibrationMeasurement]) -> VoiceDispatchProfi
     }
 
     match best {
-        Some((threshold, _, min_len, _)) => VoiceDispatchProfile::new(threshold, min_len),
+        Some((threshold, _, target_chunk_len, _)) => {
+            VoiceDispatchProfile::new(threshold, target_chunk_len)
+        }
         None => VoiceDispatchProfile::sequential_only(),
     }
 }
@@ -475,13 +538,13 @@ mod tests {
 
     fn measurement(
         fanout: usize,
-        min_len: usize,
+        target_chunk_len: usize,
         sequential_us: u64,
         rayon_us: u64,
     ) -> CalibrationMeasurement {
         CalibrationMeasurement {
             fanout,
-            min_len,
+            target_chunk_len,
             sequential: Duration::from_micros(sequential_us),
             rayon: Duration::from_micros(rayon_us),
         }
@@ -515,6 +578,40 @@ mod tests {
         assert_eq!(
             select_profile(&measurements),
             VoiceDispatchProfile::sequential_only()
+        );
+    }
+
+    #[test]
+    fn caps_explicit_chunks_at_the_rayon_worker_count() {
+        let cases = [
+            (40, 32, 8, 2, 20),
+            (60, 32, 8, 2, 30),
+            (2_048, 32, 8, 8, 256),
+            (5, 1, 8, 5, 1),
+        ];
+
+        for (fanout, target_chunk_len, rayon_workers, expected_chunks, expected_chunk_len) in cases
+        {
+            let plan = RayonChunkPlan::new(fanout, target_chunk_len, rayon_workers);
+            assert_eq!(plan.chunk_count(), expected_chunks);
+            assert_eq!(plan.chunk_len(), expected_chunk_len);
+            assert!(plan.chunk_count() <= rayon_workers);
+            assert_eq!(fanout.div_ceil(plan.chunk_len()), plan.chunk_count());
+        }
+    }
+
+    #[test]
+    fn selects_a_sustained_two_chunk_win_at_low_fanout() {
+        let measurements = vec![
+            measurement(40, 32, 100, 94),
+            measurement(48, 32, 100, 93),
+            measurement(56, 32, 100, 95),
+            measurement(64, 32, 100, 94),
+        ];
+
+        assert_eq!(
+            select_profile(&measurements),
+            VoiceDispatchProfile::new(40, 32)
         );
     }
 

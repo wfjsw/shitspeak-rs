@@ -2294,20 +2294,21 @@ pub(crate) async fn flush_voice_batch(
         .collect();
 
     let rayon_started_at = Instant::now();
+    let rayon_chunk_len =
+        dispatch_profile.rayon_chunk_len(udp_items.len(), rayon::current_num_threads());
     let batches: HashMap<std::net::SocketAddr, DatagramBatch> =
         tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             udp_items
-                .into_par_iter()
-                .with_min_len(dispatch_profile.rayon_min_len())
-                .fold(
-                    HashMap::<std::net::SocketAddr, DatagramBatch>::new,
-                    |mut batches, (client, local_addr, addr, format, context)| {
+                .par_chunks(rayon_chunk_len)
+                .map(|recipients| {
+                    let mut batches = HashMap::<std::net::SocketAddr, DatagramBatch>::new();
+                    for (client, local_addr, addr, format, context) in recipients {
                         let Some(entry) = plaintexts
                             .iter()
-                            .find_map(|(k, e)| (*k == (format, context)).then_some(e))
+                            .find_map(|(k, e)| (*k == (*format, *context)).then_some(e))
                         else {
-                            return batches;
+                            continue;
                         };
                         let Some(mut crypt) = client.try_crypt_state() else {
                             super::metrics::record_crypt_lock_contention_drop(1);
@@ -2317,15 +2318,17 @@ pub(crate) async fn flush_voice_batch(
                                 1,
                                 entry.bytes.len(),
                             );
-                            return batches;
+                            continue;
                         };
                         let Some(state) = crypt.as_mut() else {
-                            return batches;
+                            continue;
                         };
                         let encrypted_len = entry.bytes.len() + state.overhead();
-                        let batch = batches.entry(local_addr).or_insert_with(DatagramBatch::new);
+                        let batch = batches
+                            .entry(*local_addr)
+                            .or_insert_with(DatagramBatch::new);
                         let encrypt_started_at = Instant::now();
-                        let _ = batch.try_push_zeroed(addr, encrypted_len, |buf| {
+                        let _ = batch.try_push_zeroed(*addr, encrypted_len, |buf| {
                             state.encrypt_with_precomputed_checksum(
                                 buf,
                                 &entry.bytes,
@@ -2337,9 +2340,9 @@ pub(crate) async fn flush_voice_batch(
                             VoicePipelineStage::UdpEncryptQueue,
                             encrypt_started_at.elapsed(),
                         );
-                        batches
-                    },
-                )
+                    }
+                    batches
+                })
                 .reduce(HashMap::new, |mut left, right| {
                     for (local_addr, batch) in right {
                         left.entry(local_addr)

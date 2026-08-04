@@ -12,8 +12,20 @@ use shitspeak_client_crypto::CryptState;
 const KEY: [u8; 16] = [0x42; 16];
 const IV_E: [u8; 16] = [0x01; 16];
 const IV_D: [u8; 16] = [0x02; 16];
-const FANOUT_SIZES: [usize; 3] = [512, 1024, 2048];
-const PARTITION_MIN_LENS: [usize; 4] = [64, 128, 256, 512];
+const FANOUT_SIZES: [usize; 9] = [40, 48, 56, 64, 96, 128, 512, 1024, 2048];
+const PARTITION_TARGET_CHUNK_LENS: [usize; 6] = [16, 32, 64, 128, 256, 512];
+
+fn capped_chunk_plan(
+    fanout: usize,
+    target_chunk_len: usize,
+    rayon_workers: usize,
+) -> (usize, usize) {
+    let chunk_count = fanout
+        .div_ceil(target_chunk_len)
+        .min(rayon_workers.max(1))
+        .min(fanout);
+    (chunk_count, fanout.div_ceil(chunk_count))
+}
 
 struct RecipientWork {
     crypt: CryptState,
@@ -64,6 +76,7 @@ fn bench_voice_partitioning(c: &mut Criterion) {
     let mut group = c.benchmark_group("voice_encrypt/recipient_partitioning");
     group.sample_size(20);
     group.measurement_time(std::time::Duration::from_secs(2));
+    let rayon_workers = rayon::current_num_threads();
 
     for opus_len in [170, 768] {
         let plaintext = make_voice_plaintext(opus_len);
@@ -90,24 +103,34 @@ fn bench_voice_partitioning(c: &mut Criterion) {
                 },
             );
 
-            for min_len in PARTITION_MIN_LENS {
+            for target_chunk_len in PARTITION_TARGET_CHUNK_LENS {
+                let (chunk_count, chunk_len) =
+                    capped_chunk_plan(fanout, target_chunk_len, rayon_workers);
+                if chunk_count < 2 {
+                    continue;
+                }
                 group.bench_with_input(
-                    BenchmarkId::new(format!("rayon_min_len={min_len}"), &parameter),
+                    BenchmarkId::new(
+                        format!(
+                            "rayon_target={target_chunk_len}/chunks={chunk_count}/workers={rayon_workers}"
+                        ),
+                        format!("{parameter}/chunk_len={chunk_len}"),
+                    ),
                     &fanout,
                     |b, &n| {
                         b.iter_with_setup(
                             || make_work(n, output_len),
-                            |work| {
+                            |mut work| {
                                 let output_prefix = work
-                                    .into_par_iter()
-                                    .with_min_len(min_len)
-                                    .fold(
-                                        || 0u8,
-                                        |prefix, mut recipient| {
-                                            encrypt_one(&mut recipient, &plaintext, &checksum);
-                                            prefix ^ recipient.output[0]
-                                        },
-                                    )
+                                    .par_chunks_mut(chunk_len)
+                                    .map(|chunk| {
+                                        let mut prefix = 0u8;
+                                        for recipient in chunk {
+                                            encrypt_one(recipient, &plaintext, &checksum);
+                                            prefix ^= recipient.output[0];
+                                        }
+                                        prefix
+                                    })
                                     .reduce(|| 0u8, |left, right| left ^ right);
                                 black_box(output_prefix);
                             },

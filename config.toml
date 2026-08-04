@@ -94,7 +94,8 @@ udp_send_retry_budget_ms = 2
 # starts listening. Dispatch changes require a restart.
 [voice.dispatch]
 mode = "startup_calibrated" # startup_calibrated, sequential, fixed
-# Fixed mode uses these values instead of benchmarking at startup.
+# Fixed mode uses these values instead of benchmarking at startup. The value
+# targets the recipient-run size; Rayon never receives more runs than workers.
 # small_payload_rayon_threshold = 512
 # small_payload_rayon_min_len = 256
 # large_payload_rayon_threshold = 512
