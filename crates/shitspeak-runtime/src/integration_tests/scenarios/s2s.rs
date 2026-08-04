@@ -2002,6 +2002,67 @@ async fn s2s_cross_node_user_stats_rpc() {
     assert!(msg.is_some(), "Alice should receive Bob's cross-node stats");
 }
 
+/// A receiver configured to retain remote sessions must update its user
+/// channel cache from the replicated channel-entry event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_remote_channel_entry_updates_receiver_user_channel_cache() {
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair_with_opts(
+        TestServerOpts {
+            user_channel_cache_record_remote_sessions: true,
+            ..TestServerOpts::default()
+        },
+        TestServerOpts::default(),
+    )
+    .await;
+    wait_for_s2s_pair(&a, &b).await;
+    register_pair_users(&a, &b);
+
+    a.server
+        .get_channels()
+        .create_channel(Channel::new(
+            42,
+            "Remote cached channel".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("create channel on node A");
+    let channel_replicated = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(b.server.get_channels().get_channel(42))
+                .is_some()
+        })
+    })
+    .await;
+    assert!(
+        channel_replicated,
+        "node B should learn the channel before Bob enters it"
+    );
+
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+    wait_for_server_to_track_client(&a, bob.server_session).await;
+
+    bob.move_to_channel(42).await;
+
+    let cached = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(a.server.get_user_channel_cache().get("2"))
+                .is_some_and(|channels| channels.last_channel_id == Some(42))
+        })
+    })
+    .await;
+    assert!(
+        cached,
+        "node A should cache Bob's channel after receiving node B's replicated entry"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s2s_cross_node_user_stats_omits_sensitive_fields_for_non_superuser() {
     let _guard = s2s_network_test_guard().await;

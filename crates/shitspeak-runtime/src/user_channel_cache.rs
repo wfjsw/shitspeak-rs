@@ -9,6 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::client::state_log::{ClientStateBroadcastPayload, ClientStateOperation};
 use crate::client::{Client, ClientTransportKind};
 use crate::server::Server;
 use shitspeak_state::ACLPermissions;
@@ -808,6 +809,109 @@ pub async fn cache_key_for_client(server: &Server, client: &Client) -> Option<St
             .map(|credential| credential.username.clone())
     };
     user_channel_cache_key(None, None, username.as_deref())
+}
+
+/// Listen to replicated client state after it has been materialized locally
+/// and retain remote channel entries when configured to do so.
+///
+/// The client-state broadcast is the single passive stream shared by client
+/// projections and S2S. It includes both normal remote operations and remote
+/// snapshots, so observing it avoids coupling the cache to replication's
+/// apply path.
+pub(crate) fn spawn_remote_session_cache_observer(
+    server: &Arc<Box<Server>>,
+    mut shutdown: tokio::sync::watch::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    let mut events = server.get_clients().subscribe();
+    let server = Arc::downgrade(server);
+    tokio::spawn(async move {
+        loop {
+            let event = tokio::select! {
+                _ = shutdown.changed() => return,
+                event = events.recv() => event,
+            };
+            match event {
+                Ok(event) => {
+                    let Some(server) = server.upgrade() else {
+                        return;
+                    };
+                    record_remote_channel_entry(&server, &event).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        skipped,
+                        "remote user channel cache observer lagged; skipped remote channel entries"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
+}
+
+async fn record_remote_channel_entry(
+    server: &Arc<Box<Server>>,
+    event: &ClientStateBroadcastPayload,
+) {
+    if event.entry.node_id == server.get_clients().local_node_id() {
+        return;
+    }
+
+    let (server_id, session_id, client_instance_id, channel_id) = match &event.entry.op {
+        ClientStateOperation::AddClient {
+            server_id,
+            session_id,
+            client_instance_id,
+            initial_state,
+            ..
+        } => match initial_state.current_channel_id {
+            Some(channel_id) => (server_id, *session_id, *client_instance_id, channel_id),
+            None => return,
+        },
+        ClientStateOperation::UpdateGlobalState {
+            server_id,
+            session_id,
+            client_instance_id,
+            delta,
+            ..
+        } => match delta.current_channel_id {
+            Some(channel_id) => (server_id, *session_id, *client_instance_id, channel_id),
+            None => return,
+        },
+        ClientStateOperation::RemoveClient { .. } | ClientStateOperation::ResetNode { .. } => {
+            return;
+        }
+    };
+
+    let Some(client) = server
+        .get_clients()
+        .get_client_in_server(server_id, session_id)
+        .await
+    else {
+        return;
+    };
+    if client.transport_kind() != ClientTransportKind::Remote
+        || client.client_instance_id() != client_instance_id
+    {
+        return;
+    }
+
+    let Some(cache_key) = cache_key_for_client(server.as_ref(), client.as_ref()).await else {
+        return;
+    };
+    if let Err(error) = server
+        .get_user_channel_cache()
+        .remember_last_channel(&cache_key, channel_id)
+        .await
+    {
+        tracing::warn!(
+            error = %error,
+            cache_key,
+            session = u32::from(session_id),
+            channel_id,
+            "failed to record remote user channel cache entry"
+        );
+    }
 }
 
 fn records_client_transport(

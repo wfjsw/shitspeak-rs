@@ -621,6 +621,11 @@ impl Server {
         let mut extension_tasks = JoinSet::<()>::new();
         self.extensions
             .spawn_tasks(Arc::clone(self), internal_rx.clone(), &mut extension_tasks)?;
+        let remote_channel_cache_observer =
+            crate::user_channel_cache::spawn_remote_session_cache_observer(
+                self,
+                internal_rx.clone(),
+            );
         let s2s_task = Arc::clone(&self.s2s_manager)
             .spawn_runtime_task(Arc::downgrade(self), internal_rx.clone());
         let metrics_source: Arc<dyn crate::observability::S2sMetricsSource> =
@@ -689,6 +694,7 @@ impl Server {
         let _ = idle_reaper.await;
         let _ = pending_delete_watchdog.await;
         while extension_tasks.join_next().await.is_some() {}
+        let _ = remote_channel_cache_observer.await;
         s2s_task.join().await;
         if let Some(task) = observability_metrics_task {
             let _ = task.await;
