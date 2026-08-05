@@ -930,6 +930,11 @@ impl<'a> PrometheusWriter<'a> {
     fn render(&mut self, snapshot: &TopologySnapshot) {
         self.header("shitspeak_s2s_node_info", "S2S node metadata.", "gauge");
         self.header(
+            "shitspeak_s2s_node_strict_replication_protocol_version",
+            "S2S node advertised strict replication protocol version.",
+            "gauge",
+        );
+        self.header(
             "shitspeak_s2s_node_status",
             "S2S node status by state.",
             "gauge",
@@ -1887,6 +1892,11 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
                 ),
             ],
             1.0,
+        ));
+        out.push(sample(
+            "shitspeak_s2s_node_strict_replication_protocol_version",
+            vec![("node", node_id.as_str())],
+            node.strict_replication_protocol_version.unwrap_or(0) as f64,
         ));
         for state in ["alive", "failed", "left"] {
             out.push(sample(
@@ -3527,6 +3537,18 @@ mod tests {
         );
 
         assert!(rendered.contains("# TYPE shitspeak_s2s_node_info gauge\n"));
+        assert!(
+            rendered
+                .contains("# TYPE shitspeak_s2s_node_strict_replication_protocol_version gauge\n")
+        );
+        assert!(
+            rendered
+                .contains("shitspeak_s2s_node_strict_replication_protocol_version{node=\"1\"} 2")
+        );
+        assert!(
+            !rendered
+                .contains("shitspeak_s2s_node_strict_replication_protocol_version{node=\"2\"}")
+        );
         assert!(rendered.contains(
             "shitspeak_s2s_node_geo_latitude{node=\"1\",city=\"Dallas \\\"North\\\"\\nWest\\\\\",region=\"TX\",country=\"US\",source=\"manual\"} 32.7767"
         ));
