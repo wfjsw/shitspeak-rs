@@ -28,8 +28,9 @@ use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
 use super::super::metrics::{
     self, CatchupMode, CatchupPhase, CatchupReason, ReplicationPipelineKind,
-    ReplicationPipelineStage, StrictAdmissionEvent, StrictCatchupLane, StrictCatchupSendOutcome,
-    StrictCatchupSessionOutcome, StrictHeadEvent, StrictHistoryElectionEvent,
+    ReplicationPipelineStage, StrictAdmissionEvent, StrictCatchupBackpressureEvent,
+    StrictCatchupLane, StrictCatchupSendOutcome, StrictCatchupSessionOutcome, StrictHeadEvent,
+    StrictHistoryElectionEvent,
 };
 use super::super::proto::{
     self as repl_proto, REPLICATION_SERVICE_TAG, StrictAccept, StrictAcceptAck,
@@ -42,7 +43,11 @@ use super::super::proto::{
 };
 use super::super::protocol::{
     self as replication_protocol, ProtocolMember, ReplicationProtocolCapabilities,
+    STRICT_PROTOCOL_VERSION_V1, STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V4,
+    STRICT_PROTOCOL_VERSION_V5,
 };
+#[cfg(test)]
+use super::super::protocol::{STRICT_PROTOCOL_VERSION_V3, STRICT_PROTOCOL_VERSION_V6};
 use super::super::topic::ErasedStrictRuntime;
 pub(crate) use super::bulk_pacing::BulkPageIdentity;
 use super::bulk_pacing::{BulkAdmissionError, BulkPacer};
@@ -80,18 +85,6 @@ const HEAD_EVIDENCE_RETRY_MAX_MULTIPLIER: u32 = 64;
 pub(super) const STRICT_REPLICATION_SLOW_STAGE: Duration = Duration::from_secs(1);
 const STRICT_DELIVERY_BLOCKED_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STRICT_TERMINAL_CHECKPOINT_RECORDS: usize = 4096;
-const STRICT_PROTOCOL_VERSION_V1: u32 = 1;
-pub(super) const STRICT_PROTOCOL_VERSION_V2: u32 =
-    super::super::protocol::STRICT_PROTOCOL_VERSION_V2;
-pub(super) const STRICT_PROTOCOL_VERSION_V3: u32 =
-    super::super::protocol::STRICT_PROTOCOL_VERSION_V3;
-pub(super) const STRICT_PROTOCOL_VERSION_V4: u32 =
-    super::super::protocol::STRICT_PROTOCOL_VERSION_V4;
-pub(super) const STRICT_PROTOCOL_VERSION_V5: u32 =
-    super::super::protocol::STRICT_PROTOCOL_VERSION_V5;
-#[cfg(test)]
-pub(super) const STRICT_PROTOCOL_VERSION_V6: u32 =
-    super::super::protocol::STRICT_PROTOCOL_VERSION_V6;
 /// Hard ceiling for pairwise-v3 metadata carried on the redundant regular
 /// control path. This bounds the strict envelope and nested protobuf body;
 /// mandatory origin-proof material has separate certificate/signature bounds.
@@ -1000,22 +993,34 @@ impl OverlayStrictNet {
         let reservation = if page_identity != BulkPageIdentity::Legacy
             && let Some(next_hop) = next_hop
         {
-            Some(
-                self.bulk_pacer
-                    .try_reserve(dst, topic, page_identity, next_hop, encoded_len)
-                    .map_err(|error| match error {
-                        BulkAdmissionError::Busy { retry_after } => {
-                            ReplicationError::StrictBulkAdmissionBusy { retry_after }
-                        }
-                        BulkAdmissionError::FrameTooLarge {
-                            encoded_bytes,
-                            max_bytes,
-                        } => ReplicationError::StrictBulkFrameTooLarge {
-                            encoded_bytes,
-                            max_bytes,
-                        },
-                    })?,
-            )
+            match self
+                .bulk_pacer
+                .try_reserve(dst, topic, page_identity, next_hop, encoded_len)
+            {
+                Ok(reservation) => Some(reservation),
+                Err(BulkAdmissionError::Busy { retry_after }) => {
+                    record_bulk_catchup_backpressure(catchup_metric, retry_after);
+                    if let Some((reason, phase)) = catchup_metric {
+                        metrics::record_strict_catchup_send_attempt(
+                            reason,
+                            phase,
+                            StrictCatchupLane::Bulk,
+                            StrictCatchupSendOutcome::Backpressured,
+                            encoded_len,
+                        );
+                    }
+                    return Err(ReplicationError::StrictBulkAdmissionBusy { retry_after });
+                }
+                Err(BulkAdmissionError::FrameTooLarge {
+                    encoded_bytes,
+                    max_bytes,
+                }) => {
+                    return Err(ReplicationError::StrictBulkFrameTooLarge {
+                        encoded_bytes,
+                        max_bytes,
+                    });
+                }
+            }
         } else {
             None
         };
@@ -1034,6 +1039,9 @@ impl OverlayStrictNet {
             )
             .await;
 
+        if result.as_ref().is_err_and(replication_bulk_backpressure) {
+            record_bulk_catchup_backpressure(catchup_metric, Duration::ZERO);
+        }
         if let Some((reason, phase)) = catchup_metric {
             let outcome = if result.is_ok() {
                 StrictCatchupSendOutcome::Enqueued
@@ -1059,6 +1067,20 @@ impl OverlayStrictNet {
             }
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+fn record_bulk_catchup_backpressure(
+    catchup_metric: Option<(CatchupReason, CatchupPhase)>,
+    backoff: Duration,
+) {
+    if let Some((reason, phase)) = catchup_metric {
+        metrics::record_strict_catchup_backpressure(
+            reason,
+            phase,
+            StrictCatchupBackpressureEvent::Backpressured,
+            backoff,
+        );
     }
 }
 
@@ -13404,6 +13426,25 @@ mod tests {
         for peer in peers {
             net.set_peer_strict_replication_protocol_version(peer, STRICT_PROTOCOL_VERSION_V4);
         }
+    }
+
+    #[test]
+    fn bulk_catchup_backpressure_emits_reasoned_metric() {
+        record_bulk_catchup_backpressure(
+            Some((CatchupReason::OwnerAntiEntropy, CatchupPhase::FinalAck)),
+            Duration::from_millis(25),
+        );
+
+        assert!(metrics::prometheus_samples().iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_catchup_backpressure_events_total"
+                && sample.labels()
+                    == [
+                        ("reason".to_owned(), "owner_anti_entropy".to_owned()),
+                        ("phase".to_owned(), "final_ack".to_owned()),
+                        ("event".to_owned(), "backpressured".to_owned()),
+                    ]
+                && sample.value() >= 1.0
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

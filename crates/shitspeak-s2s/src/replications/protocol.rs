@@ -15,9 +15,12 @@ use super::proto::REPLICATION_SERVICE_TAG;
 use crate::upper_layer_capabilities::{CapabilityEnvelopeError, UpperLayerCapabilityEnvelope};
 
 const REPLICATION_CAPABILITIES_FORMAT_VERSION: u32 = 1;
+/// Original strict proposal frame format.
+pub(crate) const STRICT_PROTOCOL_VERSION_V1: u32 = 1;
 /// Frozen-target proposals and durable terminal decisions.
 pub(crate) const STRICT_PROTOCOL_VERSION_V2: u32 = 2;
 /// Pairwise correlated probes and terminal delta synchronization.
+#[cfg(test)]
 pub(crate) const STRICT_PROTOCOL_VERSION_V3: u32 = 3;
 /// Explicit incarnation-bound durable repository-head acknowledgement.
 pub(crate) const STRICT_PROTOCOL_VERSION_V4: u32 = 4;

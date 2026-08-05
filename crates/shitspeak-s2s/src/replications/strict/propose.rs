@@ -18,10 +18,11 @@ use tracing::trace;
 use super::super::error::ReplicationError;
 use super::super::metrics::{self, ReplicationPipelineKind, ReplicationPipelineStage};
 use super::super::proto::{StrictBody, StrictProposeAck, StrictProposeV1};
+use super::super::protocol::STRICT_PROTOCOL_VERSION_V2;
 use super::StrictReplicable;
 use super::runtime::{
-    Proposal, STRICT_PROTOCOL_VERSION_V2, STRICT_REPLICATION_SLOW_STAGE, StrictProtocolSnapshot,
-    StrictRuntime, frozen_targets_from_epochs,
+    Proposal, STRICT_REPLICATION_SLOW_STAGE, StrictProtocolSnapshot, StrictRuntime,
+    frozen_targets_from_epochs,
 };
 
 impl<R: StrictReplicable> StrictRuntime<R> {

@@ -1535,6 +1535,23 @@ async fn traverse_visibility_reconciles_online_group_changes() {
     );
     alice.drain_now().await;
 
+    // Authentication sends ServerSync before the connection's visibility
+    // baseline is installed in its projection shard. Wait for one projected
+    // self update so the following group mutation is observed by a ready
+    // projection rather than racing registration under suite load.
+    alice.set_self_mute(true).await;
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(alice.session_id) && state.self_mute == Some(true))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("Alice's projection is ready");
+    alice.drain_now().await;
+
     let live_alice = connected_client(&server, &alice).await;
     {
         let mut state = live_alice.write_global_state(server.server.get_clients());

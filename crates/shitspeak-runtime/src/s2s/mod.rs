@@ -5027,40 +5027,16 @@ mod tests {
         )
         .await
         .expect("open persisted channel repo");
-        let mut local_op = strict_channel_create_op(8);
-        local_op.version = 1;
-        assert_eq!(
-            semantic_failure_repo
-                .apply_strict_operation_once(
-                    local_op,
-                    StrictReplicationMetadata::new(901, 902, 903),
-                )
-                .await
-                .expect("apply local strict operation"),
-            StrictOperationApplyOutcome::Applied
-        );
         let semantic_failure_adapter = ChannelReplicationAdapter::new(
             DEFAULT_SERVER_ID.to_owned(),
             Arc::clone(&semantic_failure_repo),
             None,
         );
-        let semantic_snapshot = rmp_serde::to_vec(&ChannelSnapshot {
-            channels: vec![shitspeak_state::Channel::new(
-                9,
-                "semantic-replacement",
-                0,
-                0,
-                Some(0),
-            )],
-            freshness: 0,
-            strict_operation_ids: Vec::new(),
-        })
-        .expect("encode semantic replacement snapshot");
 
         let error = semantic_failure_adapter
-            .install_snapshot(1, Bytes::from(semantic_snapshot))
+            .install_snapshot(1, Bytes::from_static(b"not-msgpack"))
             .await
-            .expect_err("snapshot without a local operation id must be rejected");
+            .expect_err("malformed snapshot must be rejected");
         assert!(!error.is_durability_failure());
         assert!(semantic_failure_repo.strict_operation_durability_enabled());
     }

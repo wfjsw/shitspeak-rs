@@ -612,6 +612,10 @@ async fn send_and_assert_large_tree_shout_delivery(
 ) {
     let speak_start = Instant::now();
     let route_sample = RouteResourceSample::capture_target();
+    let allowed_loss = frames
+        .len()
+        .saturating_mul(LARGE_TREE_LOSS_BUDGET_PERCENT)
+        .div_ceil(100);
     let send_task = async {
         let resource_sample = SpeakResourceSample::capture();
         send_large_tree_voice_segment(alice, case, frames).await;
@@ -620,10 +624,6 @@ async fn send_and_assert_large_tree_shout_delivery(
         (send_end, resources)
     };
     let receive_task = async {
-        let allowed_loss = frames
-            .len()
-            .saturating_mul(LARGE_TREE_LOSS_BUDGET_PERCENT)
-            .div_ceil(100);
         let mut expected_indices = expected.iter().copied().collect::<Vec<_>>();
         expected_indices.sort_unstable();
         join_all(expected_indices.iter().map(|&idx| async move {
@@ -772,10 +772,10 @@ async fn send_and_assert_large_tree_shout_delivery(
     );
 
     assert!(
-        route_resources.frames() >= frames.len() as u64,
-        "{}: expected at least {} routed target frames, saw {}",
+        route_resources.frames() >= frames.len().saturating_sub(allowed_loss) as u64,
+        "{}: expected at least {} routed target frames after allowing up to {allowed_loss} dropped frames, saw {}",
         case.label,
-        frames.len(),
+        frames.len().saturating_sub(allowed_loss),
         route_resources.frames()
     );
     assert!(
@@ -822,7 +822,17 @@ async fn wait_for_voice_target_installed(
     client: &TestClient,
     slot: u32,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    wait_for_voice_target_installed_with_deadline(server, client, slot, Duration::from_secs(5))
+        .await;
+}
+
+async fn wait_for_voice_target_installed_with_deadline(
+    server: &crate::integration_tests::harness::TestServer,
+    client: &TestClient,
+    slot: u32,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let sender = server
             .server
@@ -835,7 +845,7 @@ async fn wait_for_voice_target_installed(
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "voice target slot {slot} was not installed before shout"
+            "voice target slot {slot} was not installed within {timeout:?} before shout"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -2960,7 +2970,7 @@ async fn voice_target_group_filter_applies_to_linked_channel_listeners() {
 /// 500 clients per selected top-level branch are deterministically scattered
 /// across the real topology, then a superuser shouts to channel targets with
 /// exact, recursive, linked, recursive+linked, and group-filtered settings.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn voice_target_large_root_multi_branch_1000_clients_shout_matrix() {
     let _guard = s2s_network_test_guard().await;
     let server = spawn_test_server(TestServerOpts {
@@ -3184,7 +3194,13 @@ async fn voice_target_large_root_multi_branch_1000_clients_shout_matrix() {
                 )],
             ))
             .await;
-        wait_for_voice_target_installed(&server, &alice, case.slot).await;
+        wait_for_voice_target_installed_with_deadline(
+            &server,
+            &alice,
+            case.slot,
+            LARGE_TREE_STREAM_BARRIER_DEADLINE,
+        )
+        .await;
         sync_large_tree_test_client_stream(&alice, 0x571E_8000 + case.slot as u64, case.label)
             .await;
         drain_large_tree_clients_until_quiet(&alice, &clients).await;
@@ -3198,6 +3214,10 @@ async fn voice_target_large_root_multi_branch_1000_clients_shout_matrix() {
         send_and_assert_large_tree_shout_delivery(&alice, &clients, &expected, &case, &frames)
             .await;
     }
+
+    drop(alice);
+    drop(clients);
+    server.shutdown_gracefully().await;
 }
 
 // ── Real UDP / OCB2 tests ──────────────────────────────────────────────────

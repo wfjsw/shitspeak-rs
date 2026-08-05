@@ -896,7 +896,13 @@ pub(crate) fn record_udp_drain_drop(reason: UdpDrainDropReason) {
 }
 
 pub(crate) fn record_queue_drop(reason: VoiceQueueDropReason) {
-    increment(&QUEUE_DROPS[queue_drop_index(reason)], 1);
+    record_queue_drop_count(reason, 1);
+}
+
+pub(crate) fn record_queue_drop_count(reason: VoiceQueueDropReason, count: usize) {
+    if count > 0 {
+        increment(&QUEUE_DROPS[queue_drop_index(reason)], count as u64);
+    }
 }
 
 pub(crate) fn record_packet_age(stage: VoiceAgeStage, age: Duration) {
@@ -1206,10 +1212,20 @@ pub(crate) fn record_queue_instance_closed(
 }
 
 pub(crate) fn record_queue_enqueue(kind: VoiceQueueKind, result: VoiceQueueEnqueueResult) {
-    increment(
-        &QUEUE_ENQUEUES[queue_kind_index(kind)][queue_enqueue_result_index(result)],
-        1,
-    );
+    record_queue_enqueue_count(kind, result, 1);
+}
+
+pub(crate) fn record_queue_enqueue_count(
+    kind: VoiceQueueKind,
+    result: VoiceQueueEnqueueResult,
+    count: usize,
+) {
+    if count > 0 {
+        increment(
+            &QUEUE_ENQUEUES[queue_kind_index(kind)][queue_enqueue_result_index(result)],
+            count as u64,
+        );
+    }
 }
 
 pub(crate) fn record_native_ingress_event(transport: VoiceIngressTransport, is_terminator: bool) {

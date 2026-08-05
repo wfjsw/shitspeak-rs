@@ -18,6 +18,7 @@ pub use client::{Client, ClientInstanceId, ClientTransportKind};
 pub use client::{ClientOutboundMessage, ClientStateSubscription, OwnedMessageBatch};
 pub(crate) use client::{
     DeferredSessionBlobResolution, PostAuthBaseline, RequestBlobQueueEnqueueError,
+    VoiceTcpEnqueueResult,
 };
 pub(crate) use client_instance_id::next_client_instance_id;
 pub use handlers::AsyncMessageHandlerExt;

@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 use std::sync::{
-    Arc,
+    Arc, Weak,
     atomic::{AtomicU64, Ordering},
 };
 
 use parking_lot::RwLock;
 
-use super::{ClientInstanceId, client_session_identifier::ClientSessionIdentifier};
+use super::{Client, ClientInstanceId, client_session_identifier::ClientSessionIdentifier};
 use shitspeak_messages::messages::encoder::AudioContext;
 
 static NEXT_VOICE_TARGET_DEFINITION_ID: AtomicU64 = AtomicU64::new(1);
@@ -30,7 +30,7 @@ pub struct VoiceTarget {
         RwLock<
             Option<(
                 ResolvedVoiceTargetRecipientsCacheKey,
-                Arc<[ResolvedVoiceTargetRecipient]>,
+                Arc<[CachedVoiceTargetRecipient]>,
             )>,
         >,
     >,
@@ -231,6 +231,45 @@ pub struct ResolvedVoiceTargetRecipient {
     context: AudioContext,
 }
 
+/// A locally resolved recipient retained without extending the client's
+/// lifetime. The cached entry is valid only while the surrounding
+/// `VoiceTarget` cache key remains current; callers must still validate the
+/// upgraded client before delivery.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedVoiceTargetRecipient {
+    client: Weak<Box<Client>>,
+    session_id: ClientSessionIdentifier,
+    client_instance_id: ClientInstanceId,
+    context: AudioContext,
+}
+
+impl CachedVoiceTargetRecipient {
+    pub(crate) fn new(client: &Arc<Box<Client>>, context: AudioContext) -> Self {
+        Self {
+            client: Arc::downgrade(client),
+            session_id: client.get_session_id(),
+            client_instance_id: client.client_instance_id(),
+            context,
+        }
+    }
+
+    pub(crate) fn upgrade(&self) -> Option<Arc<Box<Client>>> {
+        self.client.upgrade()
+    }
+
+    pub(crate) fn session_id(&self) -> ClientSessionIdentifier {
+        self.session_id
+    }
+
+    pub(crate) fn client_instance_id(&self) -> ClientInstanceId {
+        self.client_instance_id
+    }
+
+    pub(crate) fn context(&self) -> AudioContext {
+        self.context
+    }
+}
+
 impl ResolvedVoiceTargetRecipient {
     pub fn new(
         session_id: ClientSessionIdentifier,
@@ -372,7 +411,7 @@ impl VoiceTarget {
         ));
     }
 
-    pub fn cached_resolved_recipients(
+    pub(crate) fn cached_resolved_recipients(
         &self,
         server_id: &str,
         channel_version: u64,
@@ -381,7 +420,7 @@ impl VoiceTarget {
         sender_acl_generation: u64,
         hide_users_without_traverse: bool,
         source_channel: u32,
-    ) -> Option<Arc<[ResolvedVoiceTargetRecipient]>> {
+    ) -> Option<Arc<[CachedVoiceTargetRecipient]>> {
         let lookup = ResolvedVoiceTargetRecipientsCacheLookupKey {
             server_id,
             channel_version,
@@ -398,7 +437,7 @@ impl VoiceTarget {
             .map(|(_, recipients)| recipients.clone())
     }
 
-    pub fn store_resolved_recipients(
+    pub(crate) fn store_resolved_recipients(
         &self,
         server_id: &str,
         channel_version: u64,
@@ -407,7 +446,7 @@ impl VoiceTarget {
         sender_acl_generation: u64,
         hide_users_without_traverse: bool,
         source_channel: u32,
-        recipients: Arc<[ResolvedVoiceTargetRecipient]>,
+        recipients: Arc<[CachedVoiceTargetRecipient]>,
     ) {
         *self.resolved_recipients.write() = Some((
             ResolvedVoiceTargetRecipientsCacheKey::new(
@@ -527,12 +566,7 @@ mod tests {
     #[test]
     fn voice_target_recipient_cache_is_scoped_by_versions() {
         let target = VoiceTarget::new();
-        let recipients: Arc<[ResolvedVoiceTargetRecipient]> =
-            Arc::from([ResolvedVoiceTargetRecipient::new(
-                ClientSessionIdentifier::from(5),
-                99,
-                AudioContext::Shout,
-            )]);
+        let recipients: Arc<[CachedVoiceTargetRecipient]> = Arc::from([]);
 
         target.store_resolved_recipients("default", 1, 2, 3, 4, false, 10, recipients.clone());
 
@@ -569,14 +603,33 @@ mod tests {
     }
 
     #[test]
+    fn cached_voice_target_recipient_does_not_keep_client_alive() {
+        let client = Arc::new(Client::new_remote_in_server(
+            crate::types::DEFAULT_SERVER_ID.to_owned(),
+            ClientSessionIdentifier::from(0x0002_0001),
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 64738)),
+            None,
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 64738)),
+            None,
+            chrono::Utc::now(),
+            99,
+        ));
+        let recipient = CachedVoiceTargetRecipient::new(&client, AudioContext::Shout);
+
+        assert_eq!(recipient.session_id(), client.get_session_id());
+        assert_eq!(recipient.client_instance_id(), 99);
+        assert_eq!(recipient.context(), AudioContext::Shout);
+        assert!(recipient.upgrade().is_some());
+
+        drop(client);
+        assert!(recipient.upgrade().is_none());
+    }
+
+    #[test]
     fn voice_target_cache_clear_removes_cached_recipients() {
         let mut target = VoiceTarget::new();
-        let recipients: Arc<[ResolvedVoiceTargetRecipient]> =
-            Arc::from([ResolvedVoiceTargetRecipient::new(
-                ClientSessionIdentifier::from(5),
-                99,
-                AudioContext::Whisper,
-            )]);
+        let recipients: Arc<[CachedVoiceTargetRecipient]> = Arc::from([]);
 
         target.store_resolved_recipients("default", 1, 2, 3, 4, false, 10, recipients);
 

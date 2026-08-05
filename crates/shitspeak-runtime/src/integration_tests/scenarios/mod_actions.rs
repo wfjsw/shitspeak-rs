@@ -2,7 +2,10 @@
 //! reconnect attempt). Kick and ban are guarded by root-channel ACL permissions,
 //! while mute/deaf moderation is guarded by MuteDeafen.
 
-use std::time::Duration;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
 use shitspeak_messages::messages::Message;
@@ -288,6 +291,72 @@ async fn mod_kicks_other() {
     assert!(
         alice_observed.is_some(),
         "Alice should have received UserRemove for Bob"
+    );
+}
+
+/// An authenticated client can have received ServerSync while its connection
+/// task has not yet published AddClient. Kicking it in that window must still
+/// produce a UserRemove for existing peers.
+#[tokio::test]
+async fn mod_kick_publishes_authenticated_target_before_removal() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+
+    let (target_tx, mut target_rx) = tokio::sync::mpsc::channel(1);
+    let target = server
+        .server
+        .get_clients()
+        .allocate_web_client(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 30_101)),
+            server.addr,
+            target_tx,
+        )
+        .await;
+    {
+        let mut state = target.write_global_state_direct();
+        state.set_display_name(Some("pending".to_owned()));
+    }
+    target.set_authenticated(true);
+    target.set_published(false);
+    let target_session = u32::from(target.get_session_id());
+
+    alice.kick(target_session, "publish before remove").await;
+
+    let target_notice = tokio::time::timeout(Duration::from_secs(2), target_rx.recv())
+        .await
+        .expect("target receives its kick notice")
+        .expect("target kick notice is sent");
+    assert!(matches!(
+        target_notice,
+        Message::UserRemove(remove)
+            if remove.session == target_session
+                && remove.actor == Some(alice.session_id)
+                && remove.reason.as_deref() == Some("publish before remove")
+                && remove.ban == Some(false)
+    ));
+
+    let peer_notice = alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserRemove(remove)
+                    if remove.session == target_session
+                        && remove.actor == Some(alice.session_id)
+                        && remove.reason.as_deref() == Some("publish before remove")
+                        && remove.ban == Some(false))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        peer_notice.is_some(),
+        "peers must receive UserRemove when a pre-publish client is kicked"
     );
 }
 

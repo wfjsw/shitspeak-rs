@@ -174,6 +174,14 @@ fn udp_tunnel_write_chunk_end(frames: &[Bytes], start: usize) -> usize {
 }
 
 pub type ClientInstanceId = u64;
+
+#[derive(Clone, Copy)]
+pub(crate) enum VoiceTcpEnqueueResult {
+    Accepted,
+    Full,
+    Closed,
+}
+
 pub type ClientStateSubscription = tokio::sync::broadcast::Receiver<
     std::sync::Arc<crate::client::state_log::ClientStateBroadcastPayload>,
 >;
@@ -2043,55 +2051,26 @@ impl Client {
     /// builds the packet is silently dropped (voice is realtime, backlog is
     /// worse than loss).
     pub fn try_enqueue_voice_tcp(&self, raw: Bytes) -> bool {
+        matches!(
+            self.try_enqueue_voice_tcp_inner(raw, true),
+            VoiceTcpEnqueueResult::Accepted
+        )
+    }
+
+    /// Variant for a large, already-batched voice fanout. It avoids a
+    /// contended global queue-depth metrics mutex once per recipient; the
+    /// batch still records its enqueue and egress outcomes.
+    pub(crate) fn try_enqueue_voice_tcp_batched(&self, raw: Bytes) -> VoiceTcpEnqueueResult {
+        self.try_enqueue_voice_tcp_inner(raw, false)
+    }
+
+    fn try_enqueue_voice_tcp_inner(
+        &self,
+        raw: Bytes,
+        record_metrics: bool,
+    ) -> VoiceTcpEnqueueResult {
         let Some(voice_tcp_tx) = self.voice_tcp_tx.as_ref() else {
-            crate::voice::metrics::record_queue_enqueue(
-                crate::voice::metrics::VoiceQueueKind::TcpFallback,
-                crate::voice::metrics::VoiceQueueEnqueueResult::Closed,
-            );
-            crate::voice::metrics::record_queue_drop(
-                crate::voice::metrics::VoiceQueueDropReason::TcpQueueClosed,
-            );
-            tracing::trace!(
-                session = u32::from(self.get_session_id()),
-                "voice TCP queue unavailable, dropping packet"
-            );
-            return false;
-        };
-        let capacity = voice_tcp_tx.max_capacity();
-        let depth = capacity.saturating_sub(voice_tcp_tx.capacity());
-        crate::voice::metrics::record_queue_status(
-            crate::voice::metrics::VoiceQueueKind::TcpFallback,
-            depth,
-            capacity,
-        );
-        match voice_tcp_tx.try_send(raw) {
-            Ok(()) => {
-                crate::voice::metrics::record_queue_enqueue(
-                    crate::voice::metrics::VoiceQueueKind::TcpFallback,
-                    crate::voice::metrics::VoiceQueueEnqueueResult::Accepted,
-                );
-                true
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                crate::voice::metrics::record_queue_enqueue(
-                    crate::voice::metrics::VoiceQueueKind::TcpFallback,
-                    crate::voice::metrics::VoiceQueueEnqueueResult::Full,
-                );
-                crate::voice::metrics::record_queue_drop(
-                    crate::voice::metrics::VoiceQueueDropReason::TcpQueueFull,
-                );
-                debug_assert!(
-                    false,
-                    "voice TCP queue full for session {}",
-                    u32::from(self.get_session_id())
-                );
-                tracing::trace!(
-                    session = u32::from(self.get_session_id()),
-                    "voice TCP queue full, dropping packet"
-                );
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            if record_metrics {
                 crate::voice::metrics::record_queue_enqueue(
                     crate::voice::metrics::VoiceQueueKind::TcpFallback,
                     crate::voice::metrics::VoiceQueueEnqueueResult::Closed,
@@ -2101,9 +2080,68 @@ impl Client {
                 );
                 tracing::trace!(
                     session = u32::from(self.get_session_id()),
-                    "voice TCP queue closed, dropping packet"
+                    "voice TCP queue unavailable, dropping packet"
                 );
-                false
+            }
+            return VoiceTcpEnqueueResult::Closed;
+        };
+        let capacity = voice_tcp_tx.max_capacity();
+        let depth = capacity.saturating_sub(voice_tcp_tx.capacity());
+        if record_metrics {
+            crate::voice::metrics::record_queue_status(
+                crate::voice::metrics::VoiceQueueKind::TcpFallback,
+                depth,
+                capacity,
+            );
+        }
+        match voice_tcp_tx.try_send(raw) {
+            Ok(()) => {
+                if record_metrics {
+                    crate::voice::metrics::record_queue_enqueue(
+                        crate::voice::metrics::VoiceQueueKind::TcpFallback,
+                        crate::voice::metrics::VoiceQueueEnqueueResult::Accepted,
+                    );
+                }
+                VoiceTcpEnqueueResult::Accepted
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if record_metrics {
+                    crate::voice::metrics::record_queue_enqueue(
+                        crate::voice::metrics::VoiceQueueKind::TcpFallback,
+                        crate::voice::metrics::VoiceQueueEnqueueResult::Full,
+                    );
+                    crate::voice::metrics::record_queue_drop(
+                        crate::voice::metrics::VoiceQueueDropReason::TcpQueueFull,
+                    );
+                }
+                debug_assert!(
+                    false,
+                    "voice TCP queue full for session {}",
+                    u32::from(self.get_session_id())
+                );
+                if record_metrics {
+                    tracing::trace!(
+                        session = u32::from(self.get_session_id()),
+                        "voice TCP queue full, dropping packet"
+                    );
+                }
+                VoiceTcpEnqueueResult::Full
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                if record_metrics {
+                    crate::voice::metrics::record_queue_enqueue(
+                        crate::voice::metrics::VoiceQueueKind::TcpFallback,
+                        crate::voice::metrics::VoiceQueueEnqueueResult::Closed,
+                    );
+                    crate::voice::metrics::record_queue_drop(
+                        crate::voice::metrics::VoiceQueueDropReason::TcpQueueClosed,
+                    );
+                    tracing::trace!(
+                        session = u32::from(self.get_session_id()),
+                        "voice TCP queue closed, dropping packet"
+                    );
+                }
+                VoiceTcpEnqueueResult::Closed
             }
         }
     }

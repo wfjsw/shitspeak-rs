@@ -47,6 +47,7 @@ const S2S_SHOUT_MIN_SPEAK_SPAN: Duration = Duration::from_secs(10);
 const S2S_SHOUT_CONNECT_DEADLINE: Duration = Duration::from_secs(600);
 const S2S_SHOUT_CONNECT_ATTEMPT_DEADLINE: Duration = Duration::from_secs(60);
 const S2S_SHOUT_CONNECT_ATTEMPTS: usize = 3;
+const S2S_SHOUT_UDP_BIND_DEADLINE: Duration = Duration::from_secs(60);
 const S2S_SHOUT_AUTHENTICATE_TIMEOUT_MS: u64 = 600_000;
 const S2S_SHOUT_AUTH_FINALIZATION_CONCURRENCY: usize = 64;
 // A 500-recipient fanout is intentionally a throughput stress test. Preserve
@@ -421,8 +422,14 @@ async fn wait_for_s2s_pair(a: &TestServer, b: &TestServer) {
 
         a_mgr.application().is_some()
             && b_mgr.application().is_some()
-            && a_mgr.replications().is_some()
-            && b_mgr.replications().is_some()
+            && a_mgr.replications().as_ref().is_some_and(|replications| {
+                replications.strict_capability_activation_ready()
+                    && replications.strict_protocol_version() > 0
+            })
+            && b_mgr.replications().as_ref().is_some_and(|replications| {
+                replications.strict_capability_activation_ready()
+                    && replications.strict_protocol_version() > 0
+            })
             && a_transport
                 .as_ref()
                 .is_some_and(|transport| !transport.live_transport_kinds(2).is_empty())
@@ -1915,7 +1922,8 @@ async fn connect_s2s_shout_listeners(server: &TestServer, count: usize) -> Vec<T
 }
 
 async fn prepare_s2s_shout_udp_listeners(server: &TestServer, listeners: &mut [TestClient]) {
-    for listener in &mut *listeners {
+    let deadline = tokio::time::Instant::now() + S2S_SHOUT_UDP_BIND_DEADLINE;
+    for (index, listener) in listeners.iter_mut().enumerate() {
         listener
             .open_udp()
             .await
@@ -1924,34 +1932,34 @@ async fn prepare_s2s_shout_udp_listeners(server: &TestServer, listeners: &mut [T
             .udp_handshake()
             .await
             .expect("cross-node shout UDP listener handshake");
-    }
-    // The handshake is an encrypted ping consumed by the server's UDP
-    // ingress. Allow the address bindings to become visible before routing the
-    // measured talkspurt; otherwise the first frame can legitimately choose
-    // the TCP fallback while the server is still learning each endpoint.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let mut ready = true;
-        for listener in listeners.iter() {
+
+        // The test clients all use 127.0.0.1, so an unbound packet has to be
+        // matched by decrypting against same-IP clients. Waiting here keeps
+        // the ingress queue from accumulating 500 expensive first-packet
+        // lookups before any address is cached. A UDP datagram can also be
+        // lost while the server is busy, so retry this one listener until its
+        // endpoint is confirmed instead of leaving it permanently on TCP.
+        loop {
             let client = server
                 .server
                 .get_clients()
                 .get_client(listener.server_session)
                 .await
                 .expect("UDP shout listener should remain connected");
-            if client.get_udp_address().is_none() || client.prefers_tcp_tunnel() {
-                ready = false;
+            if client.get_udp_address().is_some() && !client.prefers_tcp_tunnel() {
                 break;
             }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cross-node shout UDP listener {index} did not bind within {:?}",
+                S2S_SHOUT_UDP_BIND_DEADLINE
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            listener
+                .udp_handshake()
+                .await
+                .expect("cross-node shout UDP listener handshake");
         }
-        if ready {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "cross-node shout UDP listener handshakes did not bind every endpoint"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -2945,6 +2953,10 @@ async fn s2s_cross_node_voice_target_shout_stream_is_contiguous_under_load() {
         wall,
         S2S_SHOUT_ROUTE_CPU_BUDGET
     );
+
+    drop(alice);
+    drop(listeners);
+    join_all([a.shutdown_gracefully(), b.shutdown_gracefully()]).await;
 }
 
 /// Verifies the deployed long-haul path from node 8 to node 1. The path has
@@ -3260,6 +3272,15 @@ async fn s2s_broadcast_shout_to_all_clients_survives_bad_node() {
         wall,
         S2S_SHOUT_ROUTE_CPU_BUDGET
     );
+
+    drop(alice);
+    drop(listeners);
+    join_all([
+        a.shutdown_gracefully(),
+        b.shutdown_gracefully(),
+        _c.shutdown_gracefully(),
+    ])
+    .await;
 }
 
 /// Measures cross-node traffic amplification for a root shout that includes

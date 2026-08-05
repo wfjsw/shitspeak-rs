@@ -98,6 +98,19 @@ pub async fn handle_user_remove(
         return Ok(());
     }
 
+    // `ServerSync` reaches native clients through the writer queue before
+    // their connection task transfers projection ownership and publishes the
+    // AddClient entry. A moderator can therefore act on an authenticated,
+    // still-unpublished local client. Publish it before removing it so the
+    // corresponding RemoveClient entry is emitted and peers observe the
+    // ordered join/leave lifecycle.
+    if target.is_authenticated() && !target.is_published() {
+        server
+            .get_clients()
+            .publish_client_in_server(&server_id, target_session)
+            .await;
+    }
+
     let reason = msg.reason.clone().unwrap_or_default();
 
     if is_ban {

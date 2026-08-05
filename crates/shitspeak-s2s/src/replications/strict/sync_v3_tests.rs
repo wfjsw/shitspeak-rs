@@ -24,9 +24,8 @@ use super::{
         send_v3_metadata_control,
     },
     runtime::{
-        HistoryRank, STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V4,
-        STRICT_PROTOCOL_VERSION_V5, STRICT_V3_CONTROL_MAX_ENCODED_BYTES, StrictRuntime,
-        is_v3_metadata_control, make_op_id,
+        HistoryRank, STRICT_V3_CONTROL_MAX_ENCODED_BYTES, StrictRuntime, is_v3_metadata_control,
+        make_op_id,
     },
     session_reducer::{
         Cursor as SessionCursor, CursorKind as SessionCursorKind, Cut as SessionCut,
@@ -52,6 +51,9 @@ use crate::replications::{
         StrictHistoryTransferResp, StrictTerminalOutcome, StrictTerminalPageKind,
         StrictTerminalState, StrictTerminalSyncAck, StrictTerminalSyncPage, StrictTerminalSyncReq,
         StrictTerminalSyncStatus,
+    },
+    protocol::{
+        STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V4, STRICT_PROTOCOL_VERSION_V5,
     },
     test_support::{
         CapturedFrame, CountingStrictRepo, MockBulkSendOutcome, MockNet, StrictSendLane,

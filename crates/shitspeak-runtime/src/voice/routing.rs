@@ -22,10 +22,10 @@ use super::metrics::{
 use super::udp_batch::{self, DatagramBatch};
 use crate::{
     client::{
-        Client, ClientInstanceId,
+        Client, ClientInstanceId, VoiceTcpEnqueueResult,
         client_session_identifier::ClientSessionIdentifier,
         voice_target::{
-            AuthorizedVoiceTarget, ResolvedVoiceTargetChannel, ResolvedVoiceTargetRecipient,
+            AuthorizedVoiceTarget, CachedVoiceTargetRecipient, ResolvedVoiceTargetChannel,
             VoiceTarget,
         },
     },
@@ -42,7 +42,7 @@ const S2S_RECIPIENT_CACHE_INITIAL_CAPACITY: usize = 256;
 const S2S_RECIPIENT_CACHE_MAX_CAPACITY: usize = 65536;
 
 static S2S_TARGET_RECIPIENT_CACHE: LazyLock<
-    AdaptiveHashCache<S2SVoiceTargetResolutionCacheKey, Arc<[ResolvedVoiceTargetRecipient]>>,
+    AdaptiveHashCache<S2SVoiceTargetResolutionCacheKey, Arc<[CachedVoiceTargetRecipient]>>,
 > = LazyLock::new(|| {
     AdaptiveHashCache::new(
         S2S_RECIPIENT_CACHE_INITIAL_CAPACITY,
@@ -51,7 +51,7 @@ static S2S_TARGET_RECIPIENT_CACHE: LazyLock<
 });
 
 static S2S_NORMAL_RECIPIENT_CACHE: LazyLock<
-    AdaptiveHashCache<S2SVoiceNormalResolutionCacheKey, Arc<[ResolvedVoiceTargetRecipient]>>,
+    AdaptiveHashCache<S2SVoiceNormalResolutionCacheKey, Arc<[CachedVoiceTargetRecipient]>>,
 > = LazyLock::new(|| {
     AdaptiveHashCache::new(
         S2S_RECIPIENT_CACHE_INITIAL_CAPACITY,
@@ -59,8 +59,10 @@ static S2S_NORMAL_RECIPIENT_CACHE: LazyLock<
     )
 });
 
-const LOCAL_FANOUT_QUEUE_CAPACITY: usize = 8;
-
+// The routing-age policy remains the realtime bound. Sixteen entries let a
+// 20 ms talkspurt absorb a scheduler stall up to that policy limit instead of
+// evicting frames after only 160 ms.
+const LOCAL_FANOUT_QUEUE_CAPACITY: usize = 16;
 enum BoundedPushResult<T> {
     Accepted,
     EvictedNonTerminator,
@@ -95,7 +97,7 @@ fn audio_is_terminator(audio: &Audio) -> bool {
 
 struct LocalFanoutWork {
     audio: Audio,
-    recipients: Arc<[ResolvedVoiceTargetRecipient]>,
+    targets: Arc<[(Arc<Box<Client>>, AudioContext)]>,
     server_id: String,
     sender_id: ClientSessionIdentifier,
     sender_instance_id: ClientInstanceId,
@@ -713,60 +715,51 @@ fn push_unique_target(
     }
 }
 
-async fn live_targets_from_cached_recipients(
-    server: &Arc<Box<Server>>,
-    server_id: &str,
-    recipients: &[ResolvedVoiceTargetRecipient],
+fn live_targets_from_local_fanout_snapshot(
+    targets: &[(Arc<Box<Client>>, AudioContext)],
+) -> Vec<(Arc<Box<Client>>, AudioContext)> {
+    targets
+        .iter()
+        .filter(|(client, _)| {
+            !client.is_removed()
+                && client.is_authenticated()
+                && client.is_published()
+                && client.read_local_state().is_some()
+                && client.can_receive_voice()
+        })
+        .cloned()
+        .collect()
+}
+
+fn live_targets_from_cached_local_recipients(
+    recipients: &[CachedVoiceTargetRecipient],
 ) -> Vec<(Arc<Box<Client>>, AudioContext)> {
     let mut targets = Vec::with_capacity(recipients.len());
-    let local_node_id = server.get_clients().local_node_id();
-    let session_ids = recipients
-        .iter()
-        .map(ResolvedVoiceTargetRecipient::session_id)
-        .collect::<Vec<_>>();
-    let clients = server
-        .get_clients()
-        .get_local_clients_by_ids_in_server(server_id, &session_ids)
-        .await;
-
-    for (recipient, client) in recipients.iter().zip(clients) {
-        let session_id = recipient.session_id();
-        if session_id.get_node_id() != local_node_id {
-            continue;
-        }
-        let Some(client) = client else {
+    for recipient in recipients {
+        let Some(client) = recipient.upgrade() else {
             continue;
         };
-        if client.client_instance_id() != recipient.client_instance_id() {
-            continue;
-        }
-        if !client.is_authenticated() || !client.is_published() {
-            continue;
-        }
-        if !client.read_local_state().is_some() {
-            continue;
-        }
-        if !client.can_receive_voice() {
+        if client.get_session_id() != recipient.session_id()
+            || client.client_instance_id() != recipient.client_instance_id()
+            || client.is_removed()
+            || !client.is_authenticated()
+            || !client.is_published()
+            || !client.read_local_state().is_some()
+            || !client.can_receive_voice()
+        {
             continue;
         }
         targets.push((client, recipient.context()));
     }
-
     targets
 }
 
-fn cacheable_recipients_from_targets(
+fn cacheable_local_recipients_from_targets(
     targets: &[(Arc<Box<Client>>, AudioContext)],
-) -> Arc<[ResolvedVoiceTargetRecipient]> {
+) -> Arc<[CachedVoiceTargetRecipient]> {
     targets
         .iter()
-        .map(|(client, context)| {
-            ResolvedVoiceTargetRecipient::new(
-                client.get_session_id(),
-                client.client_instance_id(),
-                *context,
-            )
-        })
+        .map(|(client, context)| CachedVoiceTargetRecipient::new(client, *context))
         .collect::<Vec<_>>()
         .into()
 }
@@ -883,7 +876,7 @@ async fn resolve_s2s_voice_intent(
                 VoiceRouteCacheLayer::Recipients,
                 true,
             );
-            return live_targets_from_cached_recipients(server, server_id, &recipients).await;
+            return live_targets_from_cached_local_recipients(&recipients);
         }
         super::metrics::record_route_cache(
             VoiceRouteSource::S2s,
@@ -900,7 +893,8 @@ async fn resolve_s2s_voice_intent(
             default_context,
         )
         .await;
-        S2S_TARGET_RECIPIENT_CACHE.put(cache_key, cacheable_recipients_from_targets(&targets));
+        S2S_TARGET_RECIPIENT_CACHE
+            .put(cache_key, cacheable_local_recipients_from_targets(&targets));
         return targets;
     }
 
@@ -915,7 +909,7 @@ async fn resolve_s2s_voice_intent(
                 VoiceRouteCacheLayer::Recipients,
                 true,
             );
-            return live_targets_from_cached_recipients(server, server_id, &recipients).await;
+            return live_targets_from_cached_local_recipients(&recipients);
         }
         super::metrics::record_route_cache(
             VoiceRouteSource::S2s,
@@ -932,7 +926,8 @@ async fn resolve_s2s_voice_intent(
             default_context,
         )
         .await;
-        S2S_NORMAL_RECIPIENT_CACHE.put(cache_key, cacheable_recipients_from_targets(&targets));
+        S2S_NORMAL_RECIPIENT_CACHE
+            .put(cache_key, cacheable_local_recipients_from_targets(&targets));
         return targets;
     }
 
@@ -1565,7 +1560,7 @@ async fn resolved_voice_target_recipients(
             VoiceRouteCacheLayer::Recipients,
             true,
         );
-        return live_targets_from_cached_recipients(server, server_id, &recipients).await;
+        return live_targets_from_cached_local_recipients(&recipients);
     }
     super::metrics::record_route_cache(
         VoiceRouteSource::Local,
@@ -1594,7 +1589,7 @@ async fn resolved_voice_target_recipients(
         sender_acl_generation,
         hide_users_without_traverse,
         source_channel,
-        cacheable_recipients_from_targets(&targets),
+        cacheable_local_recipients_from_targets(&targets),
     );
     targets
 }
@@ -1854,11 +1849,11 @@ async fn route_voice_inner(
     }
 
     if let Some(queue) = local_fanout_queue {
-        let recipients = cacheable_recipients_from_targets(&targets);
+        let targets = Arc::from(targets);
         queue
             .push(LocalFanoutWork {
                 audio: audio.clone(),
-                recipients,
+                targets,
                 server_id: server_id.clone(),
                 sender_id,
                 sender_instance_id: sender.client_instance_id(),
@@ -1986,26 +1981,86 @@ async fn route_decoded_s2s_voice_frame(
     super::metrics::record_route_scope(VoiceRouteSource::S2s, voice_intent_scope(&intent));
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct VoiceTcpEgressTally {
     queued_packets: usize,
     queued_bytes: usize,
     dropped_packets: usize,
     dropped_bytes: usize,
+    full_packets: usize,
+    closed_packets: usize,
 }
 
 impl VoiceTcpEgressTally {
-    fn enqueue(&mut self, client: &Client, bytes: &Bytes) {
-        if client.try_enqueue_voice_tcp(bytes.clone()) {
-            self.queued_packets += 1;
-            self.queued_bytes += bytes.len();
-        } else {
-            self.dropped_packets += 1;
-            self.dropped_bytes += bytes.len();
+    fn from_enqueue_result(result: VoiceTcpEnqueueResult, bytes: usize) -> Self {
+        let mut tally = Self::default();
+        tally.record_enqueue_result(result, bytes);
+        tally
+    }
+
+    fn record_enqueue_result(&mut self, result: VoiceTcpEnqueueResult, bytes: usize) {
+        match result {
+            VoiceTcpEnqueueResult::Accepted => {
+                self.queued_packets += 1;
+                self.queued_bytes += bytes;
+            }
+            VoiceTcpEnqueueResult::Full => {
+                self.dropped_packets += 1;
+                self.dropped_bytes += bytes;
+                self.full_packets += 1;
+            }
+            VoiceTcpEnqueueResult::Closed => {
+                self.dropped_packets += 1;
+                self.dropped_bytes += bytes;
+                self.closed_packets += 1;
+            }
         }
     }
 
-    fn record(self) {
+    fn merge(&mut self, other: Self) {
+        self.queued_packets += other.queued_packets;
+        self.queued_bytes += other.queued_bytes;
+        self.dropped_packets += other.dropped_packets;
+        self.dropped_bytes += other.dropped_bytes;
+        self.full_packets += other.full_packets;
+        self.closed_packets += other.closed_packets;
+    }
+
+    fn enqueue(&mut self, client: &Client, bytes: &Bytes) {
+        if client.try_enqueue_voice_tcp(bytes.clone()) {
+            self.record_enqueue_result(VoiceTcpEnqueueResult::Accepted, bytes.len());
+        } else {
+            self.record_enqueue_result(VoiceTcpEnqueueResult::Full, bytes.len());
+        }
+    }
+
+    fn record_queue_outcomes(&self) {
+        super::metrics::record_queue_enqueue_count(
+            super::metrics::VoiceQueueKind::TcpFallback,
+            super::metrics::VoiceQueueEnqueueResult::Accepted,
+            self.queued_packets,
+        );
+        super::metrics::record_queue_enqueue_count(
+            super::metrics::VoiceQueueKind::TcpFallback,
+            super::metrics::VoiceQueueEnqueueResult::Full,
+            self.full_packets,
+        );
+        super::metrics::record_queue_enqueue_count(
+            super::metrics::VoiceQueueKind::TcpFallback,
+            super::metrics::VoiceQueueEnqueueResult::Closed,
+            self.closed_packets,
+        );
+        super::metrics::record_queue_drop_count(
+            super::metrics::VoiceQueueDropReason::TcpQueueFull,
+            self.full_packets,
+        );
+        super::metrics::record_queue_drop_count(
+            super::metrics::VoiceQueueDropReason::TcpQueueClosed,
+            self.closed_packets,
+        );
+    }
+
+    fn record(&self) {
         if self.queued_packets > 0 {
             super::metrics::record_egress(
                 VoiceEgressTransport::TcpTunnel,
@@ -2059,6 +2114,87 @@ fn rayon_chunk_plan_for_udp_recipients(
 
     let chunk_plan = profile.rayon_chunk_plan(udp_recipient_count, rayon_workers);
     (chunk_plan.chunk_count() >= 2).then_some(chunk_plan)
+}
+
+fn rayon_chunk_plan_for_tcp_recipients(
+    profile: VoiceDispatchProfile,
+    tcp_recipient_count: usize,
+    rayon_workers: usize,
+) -> Option<RayonChunkPlan> {
+    if tcp_recipient_count == 0 || !profile.uses_rayon(tcp_recipient_count) {
+        return None;
+    }
+
+    let chunk_plan = profile.rayon_chunk_plan(tcp_recipient_count, rayon_workers);
+    (chunk_plan.chunk_count() >= 2).then_some(chunk_plan)
+}
+
+/// Applies a recipient partition and aggregates its TCP enqueue outcomes.
+/// Callers finish the entire partition before dispatching the next source
+/// frame, which keeps every individual recipient's TCP queue FIFO.
+fn tally_tcp_recipient_enqueues_sequential<T>(
+    recipients: &[T],
+    enqueue: &impl Fn(&T) -> VoiceTcpEgressTally,
+) -> VoiceTcpEgressTally
+where
+    T: Sized,
+{
+    recipients
+        .iter()
+        .fold(VoiceTcpEgressTally::default(), |mut tally, recipient| {
+            tally.merge(enqueue(recipient));
+            tally
+        })
+}
+
+fn tally_tcp_recipient_enqueues<T>(
+    recipients: &[T],
+    rayon_chunk_plan: Option<RayonChunkPlan>,
+    enqueue: &(impl Fn(&T) -> VoiceTcpEgressTally + Sync),
+) -> VoiceTcpEgressTally
+where
+    T: Sync,
+{
+    let Some(rayon_chunk_plan) = rayon_chunk_plan else {
+        return tally_tcp_recipient_enqueues_sequential(recipients, enqueue);
+    };
+
+    use rayon::prelude::*;
+    (0..rayon_chunk_plan.chunk_count())
+        .into_par_iter()
+        .map(|chunk_index| {
+            tally_tcp_recipient_enqueues_sequential(
+                &recipients[rayon_chunk_plan.range(chunk_index)],
+                enqueue,
+            )
+        })
+        .reduce(VoiceTcpEgressTally::default, |mut left, right| {
+            left.merge(right);
+            left
+        })
+}
+
+type TcpVoiceRecipient = (Arc<Box<Client>>, Bytes);
+
+fn enqueue_tcp_recipients(
+    profile: VoiceDispatchProfile,
+    recipients: Vec<TcpVoiceRecipient>,
+) -> (VoiceTcpEgressTally, bool) {
+    let rayon_chunk_plan = rayon_chunk_plan_for_tcp_recipients(
+        profile,
+        recipients.len(),
+        rayon::current_num_threads(),
+    );
+    let enqueue = |(client, bytes): &TcpVoiceRecipient| {
+        VoiceTcpEgressTally::from_enqueue_result(
+            client.try_enqueue_voice_tcp_batched(bytes.clone()),
+            bytes.len(),
+        )
+    };
+    (
+        tally_tcp_recipient_enqueues(&recipients, rayon_chunk_plan, &enqueue),
+        rayon_chunk_plan.is_some(),
+    )
 }
 
 fn encrypt_udp_recipients(
@@ -2285,22 +2421,20 @@ pub(crate) async fn flush_voice_batch(
 
     // Large-fanout path: bucket recipients while collecting unique
     // (format, context) keys, pre-encode each unique key once, then dispatch
-    // the encrypt loop to rayon.
+    // the CPU-bound encryption and TCP queueing loops to rayon.
     let mut udp_items: Vec<UdpVoiceRecipient> = Vec::with_capacity(targets.len());
-    let mut tcp_items: Vec<(Arc<Box<Client>>, PacketFormat, AudioContext)> = Vec::new();
+    let mut tcp_items: Vec<TcpVoiceRecipient> = Vec::with_capacity(targets.len());
     let mut cache = EncodeCache::new();
 
     for (client, context) in targets {
         let format = client_packet_format(client, server_protocol_version);
-        // Touch the cache so every (format, context) seen is pre-encoded.
-        let encode_started_at = Instant::now();
-        let _ = cache.get_or_encode(audio, *context, format);
-        record_pipeline_stage(path, VoicePipelineStage::Encode, encode_started_at);
-
         let lookup_started_at = Instant::now();
         if client.prefers_tcp_tunnel() {
             record_pipeline_stage(path, VoicePipelineStage::RecipientLookup, lookup_started_at);
-            tcp_items.push((client.clone(), format, *context));
+            let encode_started_at = Instant::now();
+            let entry = cache.get_or_encode(audio, *context, format);
+            record_pipeline_stage(path, VoicePipelineStage::Encode, encode_started_at);
+            tcp_items.push((client.clone(), entry.bytes));
             continue;
         }
         match client.get_udp_address() {
@@ -2311,6 +2445,9 @@ pub(crate) async fn flush_voice_batch(
                         VoicePipelineStage::RecipientLookup,
                         lookup_started_at,
                     );
+                    let encode_started_at = Instant::now();
+                    let _ = cache.get_or_encode(audio, *context, format);
+                    record_pipeline_stage(path, VoicePipelineStage::Encode, encode_started_at);
                     udp_items.push((client.clone(), local_addr, addr, format, *context));
                 } else {
                     record_pipeline_stage(
@@ -2318,28 +2455,35 @@ pub(crate) async fn flush_voice_batch(
                         VoicePipelineStage::RecipientLookup,
                         lookup_started_at,
                     );
-                    tcp_items.push((client.clone(), format, *context));
+                    let encode_started_at = Instant::now();
+                    let entry = cache.get_or_encode(audio, *context, format);
+                    record_pipeline_stage(path, VoicePipelineStage::Encode, encode_started_at);
+                    tcp_items.push((client.clone(), entry.bytes));
                 }
             }
             None => {
                 record_pipeline_stage(path, VoicePipelineStage::RecipientLookup, lookup_started_at);
-                tcp_items.push((client.clone(), format, *context));
+                let encode_started_at = Instant::now();
+                let entry = cache.get_or_encode(audio, *context, format);
+                record_pipeline_stage(path, VoicePipelineStage::Encode, encode_started_at);
+                tcp_items.push((client.clone(), entry.bytes));
             }
         }
     }
-
-    // TCP fallback recipients — enqueue using the cached plaintext, do not await.
-    let mut tcp_tally = VoiceTcpEgressTally::default();
-    for (client, format, context) in &tcp_items {
-        let encode_started_at = Instant::now();
-        let entry = cache.get_or_encode(audio, *context, *format);
-        record_pipeline_stage(path, VoicePipelineStage::Encode, encode_started_at);
-        enqueue_voice_tcp_timed(path, &mut tcp_tally, client, &entry.bytes);
+    let tcp_enqueue_started_at = Instant::now();
+    let (tcp_tally, tcp_used_rayon) = enqueue_tcp_recipients(dispatch_profile, tcp_items);
+    if tcp_tally.queued_packets + tcp_tally.dropped_packets > 0 {
+        record_pipeline_stage(path, VoicePipelineStage::TcpEnqueue, tcp_enqueue_started_at);
     }
+    tcp_tally.record_queue_outcomes();
     tcp_tally.record();
 
     if udp_items.is_empty() {
-        super::metrics::record_dispatch(VoiceDispatchMode::Sequential);
+        super::metrics::record_dispatch(if tcp_used_rayon {
+            VoiceDispatchMode::Rayon
+        } else {
+            VoiceDispatchMode::Sequential
+        });
         return;
     }
 
@@ -2353,14 +2497,13 @@ pub(crate) async fn flush_voice_batch(
         .chain(cache.overflow.into_iter())
         .collect();
 
-    let batches: HashMap<std::net::SocketAddr, DatagramBatch> =
+    let (batches, udp_used_rayon): (HashMap<std::net::SocketAddr, DatagramBatch>, bool) =
         match rayon_chunk_plan_for_udp_recipients(
             dispatch_profile,
             udp_items.len(),
             rayon::current_num_threads(),
         ) {
             Some(rayon_chunk_plan) => {
-                super::metrics::record_dispatch(VoiceDispatchMode::Rayon);
                 let rayon_started_at = Instant::now();
                 let batches = tokio::task::spawn_blocking(move || {
                     use rayon::prelude::*;
@@ -2389,13 +2532,18 @@ pub(crate) async fn flush_voice_batch(
                     HashMap::new()
                 });
                 record_pipeline_stage(path, VoicePipelineStage::RayonEncryptJoin, rayon_started_at);
-                batches
+                (batches, true)
             }
-            None => {
-                super::metrics::record_dispatch(VoiceDispatchMode::Sequential);
-                encrypt_udp_recipients(&udp_items, &plaintexts, VoicePipelinePath::LocalSequential)
-            }
+            None => (
+                encrypt_udp_recipients(&udp_items, &plaintexts, VoicePipelinePath::LocalSequential),
+                false,
+            ),
         };
+    super::metrics::record_dispatch(if tcp_used_rayon || udp_used_rayon {
+        VoiceDispatchMode::Rayon
+    } else {
+        VoiceDispatchMode::Sequential
+    });
 
     for (local_addr, batch) in batches {
         if batch.is_empty() {
@@ -2534,12 +2682,7 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
                 ) {
                     continue;
                 }
-                let targets = live_targets_from_cached_recipients(
-                    &fanout_server,
-                    &work.server_id,
-                    &work.recipients,
-                )
-                .await;
+                let targets = live_targets_from_local_fanout_snapshot(&work.targets);
                 let Some(latest_sender) = fanout_server
                     .get_clients()
                     .get_client_in_server(&work.server_id, work.sender_id)
@@ -2688,6 +2831,57 @@ mod tests {
         let high = rayon_chunk_plan_for_udp_recipients(profile, 2_048, 8)
             .expect("later breakpoint uses Rayon");
         assert_eq!((high.chunk_count(), high.chunk_len()), (4, 512));
+    }
+
+    #[test]
+    fn parallel_tcp_enqueue_keeps_each_recipient_fifo_and_aggregates_outcomes() {
+        const RECIPIENTS: usize = 512;
+        const FRAMES: usize = 8;
+
+        let profile =
+            super::super::dispatch_tuning::VoiceDispatchPlan::conservative().for_payload_len(170);
+        let chunk_plan = rayon_chunk_plan_for_tcp_recipients(profile, RECIPIENTS, 2)
+            .expect("large TCP fan-out should use multiple chunks");
+        assert_eq!(chunk_plan.chunk_count(), 2);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("test Rayon pool");
+        let mut senders = Vec::with_capacity(RECIPIENTS);
+        let mut receivers = Vec::with_capacity(RECIPIENTS);
+        for _ in 0..RECIPIENTS {
+            let (sender, receiver) = tokio::sync::mpsc::channel(FRAMES);
+            senders.push(sender);
+            receivers.push(receiver);
+        }
+
+        for frame in 0..FRAMES {
+            let tally = pool.install(|| {
+                let enqueue = |sender: &tokio::sync::mpsc::Sender<usize>| {
+                    let result = match sender.try_send(frame) {
+                        Ok(()) => VoiceTcpEnqueueResult::Accepted,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            VoiceTcpEnqueueResult::Full
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            VoiceTcpEnqueueResult::Closed
+                        }
+                    };
+                    VoiceTcpEgressTally::from_enqueue_result(result, 1)
+                };
+                tally_tcp_recipient_enqueues(&senders, Some(chunk_plan), &enqueue)
+            });
+            assert_eq!(tally.queued_packets, RECIPIENTS);
+            assert_eq!(tally.queued_bytes, RECIPIENTS);
+            assert_eq!(tally.dropped_packets, 0);
+        }
+
+        for receiver in &mut receivers {
+            let delivered = (0..FRAMES)
+                .map(|_| receiver.try_recv().expect("queued TCP frame"))
+                .collect::<Vec<_>>();
+            assert_eq!(delivered, (0..FRAMES).collect::<Vec<_>>());
+        }
     }
 
     #[test]

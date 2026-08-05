@@ -1144,6 +1144,7 @@ fn replication_error_kind(error: &ReplicationError) -> &'static str {
         ReplicationError::NotOwner { .. } => "not_owner",
         ReplicationError::Malformed(_) => "malformed",
         ReplicationError::StrictBulkFrameTooLarge { .. } => "strict_bulk_frame_too_large",
+        ReplicationError::StrictBulkAdmissionBusy { .. } => "strict_bulk_admission_busy",
     }
 }
 
@@ -1177,6 +1178,16 @@ mod tests {
         assert_eq!(restored.expected_delivery_ids, ["tree-1"]);
         assert_eq!(restored.deliveries, ["tree-1"]);
         assert_eq!(restored.strict_propose_timeouts, 2);
+    }
+
+    #[test]
+    fn replication_error_kind_distinguishes_strict_bulk_admission_busy() {
+        assert_eq!(
+            replication_error_kind(&ReplicationError::StrictBulkAdmissionBusy {
+                retry_after: Duration::from_millis(25),
+            }),
+            "strict_bulk_admission_busy"
+        );
     }
 
     #[tokio::test]

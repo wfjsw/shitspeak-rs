@@ -207,6 +207,27 @@ async fn connect_hidden_move_clients(
     );
     alice.drain_now().await;
     bob.drain_now().await;
+
+    // `ServerSync` reaches the socket before the connection task transfers its
+    // visibility baseline to a projection shard.  A projected self update is
+    // the readiness barrier: once it arrives, subsequent visibility changes
+    // are rendered by the same shard rather than racing its registration.
+    bob.set_self_mute(true).await;
+    let projection_ready = bob
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(bob.session_id) && state.self_mute == Some(true))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        projection_ready.is_some(),
+        "Bob's projection must be ready before exercising hidden-channel visibility"
+    );
+    alice.drain_now().await;
+    bob.drain_now().await;
     (alice, bob)
 }
 
@@ -328,7 +349,11 @@ async fn allowed_hidden_move_reveals_hierarchy_before_move_and_revokes_after_lea
         Message::ChannelState(state) if state.channel_id == Some(HIDDEN_CHILD) => Some(state),
         _ => None,
     });
-    assert_eq!(parent_state.and_then(|state| state.parent), Some(0));
+    assert_eq!(
+        parent_state.and_then(|state| state.parent),
+        Some(0),
+        "unexpected temporary channel-state sequence: {relevant:?}"
+    );
     assert_eq!(
         child_state.and_then(|state| state.parent),
         Some(HIDDEN_PARENT)

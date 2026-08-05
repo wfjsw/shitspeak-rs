@@ -1935,13 +1935,30 @@ async fn sharded_visibility_reload_is_ordered_and_does_not_wait_for_full_writer(
         .iter()
         .map(|channel| channel.id)
         .collect::<ChannelTreeShadow>();
+    let mut user_visibility = UserVisibilityState::default();
+    for client in &published {
+        user_visibility.remember_projected_user(
+            client.get_session_id(),
+            client.get_current_channel_id(),
+            client.get_listening_channel_ids(),
+        );
+    }
     let make_state = |client: &Arc<Box<Client>>| {
-        ClientProjectionState::new(
+        let mut client_visibility = user_visibility.clone();
+        client_visibility.remember_projected_user(
+            client.get_session_id(),
+            client.get_current_channel_id(),
+            client.get_listening_channel_ids(),
+        );
+        ClientProjectionState::from_post_auth_baseline(
             Arc::downgrade(&server),
             Arc::clone(client),
-            channel_shadow.clone(),
-            session_shadow.clone(),
-            UserVisibilityState::default(),
+            crate::client::PostAuthBaseline::with_user_visibility(
+                session_shadow.clone(),
+                channel_shadow.clone(),
+                client_visibility,
+                server.visibility_generation(),
+            ),
             client_versions.clone(),
             client_epochs.clone(),
             channel_version,

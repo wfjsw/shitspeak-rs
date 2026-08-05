@@ -34,15 +34,16 @@ use super::super::proto::{
     StrictHistoryTransferResp, StrictTerminalDelta, StrictTerminalOutcome, StrictTerminalPageKind,
     StrictTerminalSyncAck, StrictTerminalSyncPage, StrictTerminalSyncReq, StrictTerminalSyncStatus,
 };
-use super::history_v3::HistoryServerRequest;
 #[cfg(test)]
-use super::runtime::STRICT_PROTOCOL_VERSION_V2;
+use super::super::protocol::STRICT_PROTOCOL_VERSION_V2;
+use super::super::protocol::STRICT_PROTOCOL_VERSION_V5;
+use super::history_v3::HistoryServerRequest;
 use super::runtime::{
     BulkPageIdentity, HISTORY_ELECTION_SNAPSHOT_TOKEN, HistoryProbeResponseOutcome, HistoryRank,
-    HistorySnapshotResponseOutcome, STRICT_PROTOCOL_VERSION_V5, SnapshotFormat,
-    SnapshotReceiveTransfer, SnapshotTransfer, StrictRuntime, TerminalCommitProof,
-    TerminalDecisionIdentity, is_v3_history_final_ack_confirmation, node_from_u32,
-    replication_bulk_backpressure, terminal_identity_from_wire, validate_v3_metadata_control,
+    HistorySnapshotResponseOutcome, SnapshotFormat, SnapshotReceiveTransfer, SnapshotTransfer,
+    StrictRuntime, TerminalCommitProof, TerminalDecisionIdentity,
+    is_v3_history_final_ack_confirmation, node_from_u32, replication_bulk_backpressure,
+    terminal_identity_from_wire, validate_v3_metadata_control,
 };
 use super::session_reducer::{
     Cursor as SessionCursor, CursorKind as SessionCursorKind, Effect as SessionEffect,
@@ -7117,11 +7118,9 @@ mod tests {
             StrictResolutionPrepare, StrictTerminalOutcome, StrictTerminalState,
             StrictTerminalSyncPage, StrictTerminalSyncStatus,
         },
+        protocol::{STRICT_PROTOCOL_VERSION_V4, STRICT_PROTOCOL_VERSION_V5},
         strict::{
-            runtime::{
-                HistoryRank, STRICT_PROTOCOL_VERSION_V4, STRICT_PROTOCOL_VERSION_V5, StrictRuntime,
-                make_op_id,
-            },
+            runtime::{HistoryRank, StrictRuntime, make_op_id},
             sync_v3::PeerIncarnation,
             terminal_journal::{FrozenTarget, TerminalJournal, TerminalResolver},
         },

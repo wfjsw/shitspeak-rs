@@ -16,7 +16,7 @@ use crate::session::{
     initial_server_events_with_channel_snapshot, server_event_from_message,
 };
 use crate::voice::{InboundVoiceMetadata, SsrcAllocator, VoiceTargetKind};
-use shitspeak_runtime::api::Authenticator;
+use shitspeak_auth::{AuthenticationRejection, Authenticator};
 use shitspeak_runtime::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
 use shitspeak_runtime::client::state_log::{ClientStateLogEntry, ClientStateOperation};
 use shitspeak_runtime::client::visibility::UserVisibilityState;
@@ -1842,15 +1842,11 @@ struct MoqActiveSpeaker {
     channel_id: u32,
 }
 
-fn authentication_rejection_reason(
-    rejection: shitspeak_runtime::api::AuthenticationRejection,
-) -> String {
+fn authentication_rejection_reason(rejection: AuthenticationRejection) -> String {
     match rejection {
-        shitspeak_runtime::api::AuthenticationRejection::WrongPassword => "wrong password",
-        shitspeak_runtime::api::AuthenticationRejection::NoSuchUser => "no such user",
-        shitspeak_runtime::api::AuthenticationRejection::RetryLater => {
-            "authenticator temporarily unavailable"
-        }
+        AuthenticationRejection::WrongPassword => "wrong password",
+        AuthenticationRejection::NoSuchUser => "no such user",
+        AuthenticationRejection::RetryLater => "authenticator temporarily unavailable",
     }
     .to_string()
 }
@@ -1910,9 +1906,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::OnceLock;
+    use std::time::Duration;
 
     use crate::protocol::AuthRequest;
-    use shitspeak_runtime::api::{
+    use shitspeak_auth::{
         AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationExpiryAction,
         AuthenticationRejection,
     };
@@ -2164,8 +2161,19 @@ mod tests {
     #[tokio::test]
     async fn inbound_audio_waits_for_acknowledged_voice_epoch() {
         let server = test_server(TestAuthenticator).await;
-        let context = test_session_context(Arc::clone(&server));
-        let mut runtime = MoqSessionRuntime::new(context);
+        let mut recipient = MoqSessionRuntime::new(test_session_context(Arc::clone(&server)));
+        recipient
+            .handle_control_command(ClientCommand::Authenticate {
+                auth: AuthRequest::Password {
+                    username: "alice".to_string(),
+                    password: "secret".to_string(),
+                },
+            })
+            .await
+            .expect("authenticate recipient");
+        let mut voice_rx = recipient.voice_rx.take().expect("recipient voice rx");
+
+        let mut runtime = MoqSessionRuntime::new(test_session_context(Arc::clone(&server)));
         runtime
             .handle_control_command(ClientCommand::Authenticate {
                 auth: AuthRequest::Password {
@@ -2180,13 +2188,17 @@ mod tests {
             .as_ref()
             .cloned()
             .expect("authenticated client");
-        let mut voice_rx = client.take_voice_routing_rx().expect("voice rx");
 
         runtime
             .handle_inbound_audio_frame(MoqAudioFrame::new(100, Bytes::from_static(b"ignored")))
             .await
             .expect("audio before ptt");
-        assert!(voice_rx.try_recv().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), voice_rx.recv())
+                .await
+                .is_err(),
+            "audio before a voice-control acknowledgement must not route"
+        );
 
         let ack = runtime
             .handle_control_command(ClientCommand::VoiceControl {
@@ -2202,11 +2214,14 @@ mod tests {
             .handle_inbound_audio_frame(MoqAudioFrame::new(101, Bytes::from_static(b"opus")))
             .await
             .expect("audio after ptt");
-        let routed = voice_rx
-            .try_recv()
-            .expect("routed voice")
-            .decoded_audio()
-            .clone();
+        let routed = Audio::decode(
+            &tokio::time::timeout(Duration::from_secs(1), voice_rx.recv())
+                .await
+                .expect("routed voice before timeout")
+                .expect("routed voice"),
+            None,
+        )
+        .expect("decode routed voice");
         assert_eq!(routed.sender_session, Some(client.get_session_id()));
         let AudioPayload::Opus(opus) = routed.audio_payload else {
             panic!("expected opus payload");
@@ -2217,8 +2232,19 @@ mod tests {
     #[tokio::test]
     async fn inbound_audio_accepts_terminator_after_ptt_off_ack() {
         let server = test_server(TestAuthenticator).await;
-        let context = test_session_context(Arc::clone(&server));
-        let mut runtime = MoqSessionRuntime::new(context);
+        let mut recipient = MoqSessionRuntime::new(test_session_context(Arc::clone(&server)));
+        recipient
+            .handle_control_command(ClientCommand::Authenticate {
+                auth: AuthRequest::Password {
+                    username: "alice".to_string(),
+                    password: "secret".to_string(),
+                },
+            })
+            .await
+            .expect("authenticate recipient");
+        let mut voice_rx = recipient.voice_rx.take().expect("recipient voice rx");
+
+        let mut runtime = MoqSessionRuntime::new(test_session_context(Arc::clone(&server)));
         runtime
             .handle_control_command(ClientCommand::Authenticate {
                 auth: AuthRequest::Password {
@@ -2228,13 +2254,6 @@ mod tests {
             })
             .await
             .expect("authenticate");
-        let client = runtime
-            .client
-            .as_ref()
-            .cloned()
-            .expect("authenticated client");
-        let mut voice_rx = client.take_voice_routing_rx().expect("voice rx");
-
         runtime
             .handle_control_command(ClientCommand::VoiceControl {
                 ptt: true,
@@ -2247,7 +2266,10 @@ mod tests {
             .handle_inbound_audio_frame(MoqAudioFrame::new(10, Bytes::from_static(b"opus")))
             .await
             .expect("audio");
-        let _ = voice_rx.try_recv().expect("routed voice");
+        tokio::time::timeout(Duration::from_secs(1), voice_rx.recv())
+            .await
+            .expect("routed voice before timeout")
+            .expect("routed voice");
 
         runtime
             .handle_control_command(ClientCommand::VoiceControl {
@@ -2262,11 +2284,14 @@ mod tests {
             .await
             .expect("terminator after ptt off");
 
-        let routed = voice_rx
-            .try_recv()
-            .expect("routed terminator")
-            .decoded_audio()
-            .clone();
+        let routed = Audio::decode(
+            &tokio::time::timeout(Duration::from_secs(1), voice_rx.recv())
+                .await
+                .expect("routed terminator before timeout")
+                .expect("routed terminator"),
+            None,
+        )
+        .expect("decode routed terminator");
         let AudioPayload::Opus(opus) = routed.audio_payload else {
             panic!("expected opus payload");
         };
