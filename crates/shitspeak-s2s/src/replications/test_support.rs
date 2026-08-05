@@ -633,6 +633,15 @@ impl CountingStrictRepo {
         Self::with_strict_protocol_version(crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION)
     }
 
+    /// A repository fixture advertising the currently supported strict
+    /// participant protocol. Integration scenarios that exercise admitted
+    /// peers should use this instead of the legacy LSA compatibility value.
+    pub fn new_current() -> Arc<Self> {
+        Self::with_strict_protocol_version(
+            crate::replications::protocol::STRICT_PROTOCOL_VERSION_CURRENT,
+        )
+    }
+
     pub fn new_v1() -> Arc<Self> {
         Self::with_strict_protocol_version(1)
     }

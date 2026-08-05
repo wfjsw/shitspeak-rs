@@ -834,7 +834,8 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
         .with_propose_ttl(Duration::from_secs(20))
         .with_pending_propose_ttl(Duration::from_secs(30));
     let mut cluster = ReplCluster::build_full_mesh_with_config(&[1, 2, 3], cfg.clone()).await;
-    let repos: Vec<Arc<CountingStrictRepo>> = (0..3).map(|_| CountingStrictRepo::new()).collect();
+    let repos: Vec<Arc<CountingStrictRepo>> =
+        (0..3).map(|_| CountingStrictRepo::new_current()).collect();
     let mut handles = Vec::new();
     for (idx, repo) in repos.iter().enumerate() {
         handles.push(
@@ -909,6 +910,15 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
         new_overlay.local_boot_epoch() > old_epoch,
         "same-ID restart did not advance the incarnation"
     );
+    // A restarted process registers replication before routing converges. If
+    // we wait for routes first, incumbents observe the new incarnation while
+    // it still advertises no strict capability and never receive a later
+    // membership event when the topic becomes capable.
+    let new_manager = ReplicationManager::with_config(new_overlay.clone(), cfg);
+    let new_repo = CountingStrictRepo::new_current();
+    let new_handle = new_manager
+        .register_strict("channels-restart", new_repo.clone())
+        .unwrap();
     assert!(
         wait_until(Duration::from_secs(8), || {
             new_overlay.route_to(2, ServiceLevel::Reliable).is_some()
@@ -917,11 +927,6 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
         .await,
         "restarted coordinator did not rejoin routing"
     );
-    let new_manager = ReplicationManager::with_config(new_overlay.clone(), cfg);
-    let new_repo = CountingStrictRepo::new();
-    let new_handle = new_manager
-        .register_strict("channels-restart", new_repo.clone())
-        .unwrap();
     assert!(
         wait_until(Duration::from_secs(8), || {
             new_manager.strict_protocol_version() >= STRICT_PROTOCOL_VERSION_CURRENT
@@ -935,7 +940,30 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
         cluster.manager(0).strict_protocol_version(),
         cluster.manager(1).strict_protocol_version()
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            let peers_ready = handles.iter().all(|handle| {
+                let state = handle.debug_state();
+                !state.election_pending()
+                    && !state.election_active()
+                    && state.admitted_peers() == 2
+                    && state.awaiting_local_cut_peers() == 0
+                    && state.awaiting_peer_proof_peers() == 0
+            });
+            let restarted = new_handle.debug_state();
+            peers_ready
+                && !restarted.election_pending()
+                && !restarted.election_active()
+                && restarted.admitted_peers() == 2
+                && restarted.awaiting_local_cut_peers() == 0
+                && restarted.awaiting_peer_proof_peers() == 0
+        })
+        .await,
+        "restarted strict admission did not converge: node2={:?}, node3={:?}, restarted={:?}",
+        handles[0].debug_state(),
+        handles[1].debug_state(),
+        new_handle.debug_state(),
+    );
 
     let version = match timeout(Duration::from_secs(20), handles[0].propose(2222)).await {
         Ok(Ok(version)) => version,
@@ -1003,8 +1031,8 @@ async fn strict_late_join_catches_up_via_log() {
     .await;
     assert!(ok, "A and B must drop C from alive after partition");
 
-    let repo_a = CountingStrictRepo::new();
-    let repo_b = CountingStrictRepo::new();
+    let repo_a = CountingStrictRepo::new_current();
+    let repo_b = CountingStrictRepo::new_current();
     let h_a = cluster
         .register_strict(0, "channels", repo_a.clone())
         .unwrap();
@@ -1038,7 +1066,7 @@ async fn strict_late_join_catches_up_via_log() {
     assert!(ok, "C must see A and B as alive after heal");
 
     // Now register on C — catchup_bootstrap fires with current_version=0.
-    let repo_c = CountingStrictRepo::new();
+    let repo_c = CountingStrictRepo::new_current();
     let _h_c = cluster
         .register_strict(2, "channels", repo_c.clone())
         .unwrap();

@@ -19,7 +19,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use prost::Message as _;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
-use tokio::time::sleep;
+use tokio::time::{Instant as TokioInstant, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
 
@@ -76,6 +76,7 @@ use shitspeak_s2s_transport::{MessageClass, OriginSignature, RoutingMetric, Serv
 /// always-on heartbeat behavior.
 const CLOCK_TICK_ACTIVE_BURST_TICKS: usize = 3;
 const CLOCK_TICK_BURST_COOLDOWN_MULTIPLIER: u32 = 4;
+const HEAD_EVIDENCE_RETRY_MAX_MULTIPLIER: u32 = 64;
 pub(super) const STRICT_REPLICATION_SLOW_STAGE: Duration = Duration::from_secs(1);
 const STRICT_DELIVERY_BLOCKED_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STRICT_TERMINAL_CHECKPOINT_RECORDS: usize = 4096;
@@ -137,13 +138,13 @@ fn strict_retained_logical_send(topic: &str, body: &StrictBody) -> [u8; 32] {
     identity
 }
 
-/// Independent salts keep the periodic strict-repair lanes from lining up
+/// Independent salts keep strict timer lanes from lining up
 /// even when a node has only one topic.
 #[derive(Clone, Copy)]
 enum StrictTimerLane {
     Admission = 0x41,
+    HeadEvidence = 0x48,
     TerminalRepair = 0x54,
-    SteadyState = 0x53,
 }
 
 /// Return a stable initial offset in `[0, interval)` for one node/topic timer.
@@ -1550,7 +1551,13 @@ fn bootstrap_reachable_peers(net: &dyn StrictNet, self_id: NodeIdentifier) -> Ve
         // link-state view converges. Bootstrap must not wait for a probe sent
         // through such a route: it would pin the election until its coarse
         // timeout even though the remaining live peers have already replied.
-        .filter(|node| *node != self_id && net.has_live_route(*node, ServiceLevel::Reliable))
+        .filter(|node| {
+            *node != self_id
+                && replication_protocol::strict_participant_version_supported(
+                    net.peer_strict_replication_protocol_version(*node),
+                )
+                && net.has_live_route(*node, ServiceLevel::Reliable)
+        })
         .collect()
 }
 
@@ -3478,6 +3485,13 @@ struct HeadEvidenceIdentity {
 struct LocalHeadEvidence {
     identity: HeadEvidenceIdentity,
     acknowledged_by: HashSet<PeerIncarnation>,
+    retries: HashMap<PeerIncarnation, HeadEvidenceRetry>,
+}
+
+#[derive(Debug)]
+struct HeadEvidenceRetry {
+    attempts: u8,
+    next_retry_at: TokioInstant,
 }
 
 pub struct StrictRuntime<R: StrictReplicable> {
@@ -3492,7 +3506,6 @@ pub struct StrictRuntime<R: StrictReplicable> {
     pub(super) clock_tick_signal: Notify,
     pub(super) propose_semaphore: Arc<Semaphore>,
     pub(super) next_op_counter: AtomicU64,
-    pub(super) steady_catchup_cursor: AtomicU64,
     /// Cursor used only by terminal-fence repair probes. Keeping it separate
     /// from ordinary anti-entropy lets each newly observed stale fence query
     /// its coordinator first, then rotate across the remaining frozen peers.
@@ -3936,6 +3949,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 terminal_set_digest: *journal.terminal_cut().terminal_set_digest(),
             },
             acknowledged_by: HashSet::new(),
+            retries: HashMap::new(),
         };
         let mut initial_state = StrictState::new();
         if repository_base_missing {
@@ -3959,7 +3973,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             clock_tick_signal: Notify::new(),
             propose_semaphore,
             next_op_counter: AtomicU64::new(1),
-            steady_catchup_cursor: AtomicU64::new(0),
             terminal_repair_cursor: AtomicU64::new(0),
             recovery_attempt_counter: AtomicU64::new(1),
             recoveries: Mutex::new(HashMap::new()),
@@ -4023,7 +4036,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         spawn_delivery_loop(self.clone());
         spawn_clock_tick_loop(self.clone());
         spawn_bootstrap_retry_loop(self.clone());
-        spawn_steady_state_catchup_loop(self.clone());
+        spawn_repair_loops(self.clone());
         spawn_v3_terminal_retry_loop(self.clone());
     }
 
@@ -4110,6 +4123,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .peer_admissions
             .iter()
             .filter_map(|(node, admission)| {
+                if !replication_protocol::strict_participant_version_supported(
+                    self.net.peer_strict_replication_protocol_version(*node),
+                ) {
+                    return None;
+                }
                 // AwaitingLocalCut is owned by the history election. Its
                 // correlated probes already have transport-level retries,
                 // and admission evidence cannot be consumed before the
@@ -4160,20 +4178,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         true
     }
 
-    /// Periodic admission/repair/anti-entropy triggers share the peer's v3
-    /// coordinator. They must not open another branch while a correlated
-    /// probe or terminal/history transfer for the same incarnation exists.
-    fn v3_periodic_work_active(&self, node: NodeIdentifier) -> bool {
-        let Some(boot_epoch) = self.net.member_boot_epoch(node) else {
-            return false;
-        };
-        let peer = PeerIncarnation::new(node, boot_epoch);
-        if self.v3_sync.lock().has_periodic_work(peer) {
-            return true;
-        }
-        self.v3_history.lock().has_any_transfer(peer)
-    }
-
     pub(crate) fn wake_clock_tick_loop(&self) {
         self.clock_tick_signal.notify_one();
     }
@@ -4187,7 +4191,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         &self,
         request: HistoryElectionSnapshotRequest,
     ) -> Result<(), ReplicationError> {
-        if !self.can_originate_v2() {
+        if !self.can_originate_v2()
+            || !replication_protocol::strict_participant_version_supported(
+                self.net
+                    .peer_strict_replication_protocol_version(request.peer()),
+            )
+        {
             return Ok(());
         }
         let body = StrictBody::CatchupReq(StrictCatchupReq {
@@ -4221,6 +4230,21 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 return;
             }
         }
+        // Deprecated participant capabilities are intentionally absent from
+        // bootstrap. Do this before claiming a retry slot so an old
+        // advertisement cannot create bootstrap bookkeeping or defer a
+        // later supported peer's election.
+        let peers = bootstrap_reachable_peers(self.net.as_ref(), self.self_id);
+        if peers.is_empty() {
+            // Once deprecated participants have been excluded, an otherwise
+            // singleton strict cluster has no remote history to elect. Close
+            // the startup fence so its local V4+ participant can propose.
+            // This intentionally creates no retry bookkeeping for the
+            // excluded advertisements.
+            self.state.lock().finish_history_election();
+            self.wake_delivery_and_clock_tick();
+            return;
+        }
         {
             let mut last = self.last_bootstrap_attempt.lock();
             let now = Instant::now();
@@ -4238,7 +4262,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // coalesce independently.  Filtering here could let a lower-ranked
         // subset win merely because the true winner already had periodic
         // repair in flight.
-        let peers = bootstrap_reachable_peers(self.net.as_ref(), self.self_id);
         let (history_membership_expanded, can_start) = {
             let mut state = self.state.lock();
             let expanded = state.observe_history_alive_peers(peers.iter().copied());
@@ -4248,11 +4271,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             self.wake_clock_tick_loop();
         }
         if !can_start {
-            return;
-        }
-        if peers.is_empty() {
-            self.state.lock().finish_history_election();
-            self.wake_delivery_and_clock_tick();
             return;
         }
         self.state
@@ -4383,14 +4401,19 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.state.lock().delivering_commits.len()
     }
 
-    /// Pairwise v3 repair is independent of the cluster proposal floor. A v2
-    /// relay can forward the opaque authenticated body, while both endpoints
-    /// must explicitly advertise and locally retain the v3 journal contract.
+    /// Pairwise V3 repair bodies are cumulative machinery used by V4+ strict
+    /// participants. A relay can forward the opaque authenticated body, while
+    /// both endpoints must advertise a supported durable-head capability and
+    /// locally retain the repair-journal contract.
     pub(super) fn v3_repair_supported_by(&self, peer: NodeIdentifier) -> bool {
         self.terminal_storage_ready()
             && self.repo.strict_replication_protocol_version() >= STRICT_PROTOCOL_VERSION_V2
-            && self.net.local_strict_replication_protocol_version() >= STRICT_PROTOCOL_VERSION_V3
-            && self.net.peer_strict_replication_protocol_version(peer) >= STRICT_PROTOCOL_VERSION_V3
+            && replication_protocol::strict_participant_version_supported(
+                self.net.local_strict_replication_protocol_version(),
+            )
+            && replication_protocol::strict_participant_version_supported(
+                self.net.peer_strict_replication_protocol_version(peer),
+            )
             && self.net.member_boot_epoch(peer).is_some()
     }
 
@@ -4419,7 +4442,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if Self::v3_source_transition_from_decision(decision).is_none()
             || !self.terminal_storage_ready()
             || self.repo.strict_replication_protocol_version() < STRICT_PROTOCOL_VERSION_V2
-            || self.net.local_strict_replication_protocol_version() < STRICT_PROTOCOL_VERSION_V3
+            || !replication_protocol::strict_participant_version_supported(
+                self.net.local_strict_replication_protocol_version(),
+            )
         {
             return false;
         }
@@ -4436,11 +4461,30 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         })
     }
 
+    /// A frozen descriptor can outlive a capability advertisement. Do not
+    /// fan a terminal decision out to a peer that has since deprecated itself
+    /// as a strict participant; direct ingress rejects it for the same
+    /// reason. The returned destinations are also the only retry candidates.
+    fn supported_terminal_fanout_destinations(
+        &self,
+        dsts: impl IntoIterator<Item = NodeIdentifier>,
+    ) -> Vec<NodeIdentifier> {
+        dsts.into_iter()
+            .filter(|peer| {
+                *peer != self.self_id
+                    && replication_protocol::strict_participant_version_supported(
+                        self.net.peer_strict_replication_protocol_version(*peer),
+                    )
+            })
+            .collect()
+    }
+
     fn spawn_terminal_fanout_retries(&self, dsts: Vec<NodeIdentifier>, body: StrictBody) {
         // Pairwise capability is enough for v3 repair. In a mixed cluster,
         // retain the legacy replay tail only for peers that cannot repair
         // this exact source transition through terminal deltas.
-        let legacy_dsts: Vec<_> = dsts
+        let legacy_dsts: Vec<_> = self
+            .supported_terminal_fanout_destinations(dsts)
             .into_iter()
             .filter(|peer| !self.decision_has_complete_v3_repair_coverage(&[*peer], &body))
             .collect();
@@ -7481,9 +7525,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     let _ = w.send(());
                 }
                 self.wake_delivery_and_clock_tick();
-                if let Err(e) = send_terminal_fanout_with_broadcast(
+                let dsts = self.supported_terminal_fanout_destinations(accepted.dsts);
+                if let Err(e) = send_terminal_fanout_targeted(
                     self.net.as_ref(),
-                    &accepted.dsts,
+                    &dsts,
                     &self.topic,
                     accepted.body.clone(),
                 )
@@ -7491,7 +7536,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 {
                     trace!(error=%e, "send commit multicast failed");
                 }
-                self.spawn_terminal_fanout_retries(accepted.dsts, accepted.body);
+                self.spawn_terminal_fanout_retries(dsts, accepted.body);
             }
             ProposeQuorumOutcome::V1(accept) => {
                 self.send_normal_accept_phase(op_id, accept).await;
@@ -8262,13 +8307,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             source_chain_digest,
             source_terminal_set_digest,
         });
-        if let Err(error) = send_terminal_fanout_with_broadcast(
-            self.net.as_ref(),
-            &dsts,
-            &self.topic,
-            decision.clone(),
-        )
-        .await
+        let dsts = self.supported_terminal_fanout_destinations(dsts);
+        if let Err(error) =
+            send_terminal_fanout_targeted(self.net.as_ref(), &dsts, &self.topic, decision.clone())
+                .await
         {
             trace!(%error, "send strict terminal commit decision failed");
         }
@@ -9049,9 +9091,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .into_iter()
             .filter(|node| *node != self.self_id && !invalid_targets.contains(node))
             .collect();
+        let dsts = self.supported_terminal_fanout_destinations(dsts);
         if let Err(error) =
-            send_terminal_fanout_with_broadcast(self.net.as_ref(), &dsts, &self.topic, body.clone())
-                .await
+            send_terminal_fanout_targeted(self.net.as_ref(), &dsts, &self.topic, body.clone()).await
         {
             trace!(%error, "send strict terminal resolution decision failed");
         }
@@ -9655,13 +9697,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 .into_iter()
                 .filter(|node| *node != self.self_id)
                 .collect();
-            if let Err(e) = send_terminal_fanout_with_broadcast(
-                self.net.as_ref(),
-                &dsts,
-                &self.topic,
-                body.clone(),
-            )
-            .await
+            let dsts = self.supported_terminal_fanout_destinations(dsts);
+            if let Err(e) =
+                send_terminal_fanout_targeted(self.net.as_ref(), &dsts, &self.topic, body.clone())
+                    .await
             {
                 trace!(error=%e, "send commit gossip multicast failed");
             }
@@ -9806,6 +9845,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             *evidence = Some(LocalHeadEvidence {
                 identity,
                 acknowledged_by: HashSet::new(),
+                retries: HashMap::new(),
             });
         }
         self.head_mismatch_observations.lock().clear();
@@ -9936,18 +9976,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             history_freshness: ack.history_freshness,
             terminal_set_digest,
         };
+        let peer = PeerIncarnation::new(from, origin_boot_epoch);
         let (identity_matches, inserted) = {
             let mut evidence = self.head_evidence.lock();
-            let identity_matches = evidence
-                .as_ref()
-                .is_some_and(|current| current.identity == identity);
-            let inserted = identity_matches
-                && evidence.as_mut().is_some_and(|current| {
-                    current
-                        .acknowledged_by
-                        .insert(PeerIncarnation::new(from, origin_boot_epoch))
-                });
-            (identity_matches, inserted)
+            match evidence.as_mut() {
+                Some(current) if current.identity == identity => {
+                    current.retries.remove(&peer);
+                    (true, current.acknowledged_by.insert(peer))
+                }
+                _ => (false, false),
+            }
         };
         if !identity_matches {
             metrics::record_strict_head_event(StrictHeadEvent::AckRejectedIdentity);
@@ -10611,6 +10649,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 evidence
                     .acknowledged_by
                     .retain(|peer| peer.node() != member.node_id());
+                evidence
+                    .retries
+                    .retain(|peer, _| peer.node() != member.node_id());
             }
         }
         {
@@ -10623,6 +10664,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 transition,
                 MembershipTransition::Joined | MembershipTransition::Restarted
             ) && member.node_id() != self.self_id
+                && replication_protocol::strict_participant_version_supported(
+                    self.net
+                        .peer_strict_replication_protocol_version(member.node_id()),
+                )
             {
                 state.begin_peer_admission(member.node_id(), member.incarnation());
             }
@@ -10759,7 +10804,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let peer_added = matches!(
             transition,
             MembershipTransition::Joined | MembershipTransition::Restarted
-        );
+        ) && member.node_id() != self.self_id
+            && replication_protocol::strict_participant_version_supported(
+                self.net
+                    .peer_strict_replication_protocol_version(member.node_id()),
+            );
         if peer_added {
             // Evidence acknowledgement is exact-incarnation scoped and must
             // be re-driven on every membership expansion, even if the idle
@@ -10904,6 +10953,16 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
         // not advance clocks, install history/terminal state, or cause an
         // acknowledgement, recovery, gossip, or follow-up catchup request.
         if !origin_authenticated {
+            metrics::record_strict_fence_rejection();
+            return;
+        }
+        // Participant capabilities before V4 lack durable-head
+        // acknowledgement and are deprecated. Reject their direct frames as
+        // well as excluding them from normal target selection, so an old
+        // endpoint cannot mutate state or provoke repair traffic.
+        if !replication_protocol::strict_participant_version_supported(
+            self.net.peer_strict_replication_protocol_version(from),
+        ) {
             metrics::record_strict_fence_rejection();
             return;
         }
@@ -11189,17 +11248,18 @@ async fn send_terminal_fanout(
     net.send_multicast(dsts, topic, body).await
 }
 
-async fn send_terminal_fanout_with_broadcast(
+/// Send a terminal decision only to its explicit destination set. An overlay
+/// broadcast cannot preserve the V4 participant-capability gate, so failed
+/// single-destination sends wait for the bounded directed repair path.
+async fn send_terminal_fanout_targeted(
     net: &dyn StrictNet,
     dsts: &[NodeIdentifier],
     topic: &str,
     body: StrictBody,
 ) -> Result<(), ReplicationError> {
     if let [dst] = dsts {
-        return send_retry_unicast_with_broadcast(net, *dst, topic, body).await;
+        return net.send_unicast(*dst, topic, body).await;
     }
-    // A multi-destination multicast can partially enqueue before reporting
-    // an error. Broadcasting here would duplicate every successful bucket.
     send_terminal_fanout(net, dsts, topic, body).await
 }
 
@@ -11317,7 +11377,24 @@ fn spawn_commit_fanout_retries(
             if started_at.elapsed() >= retry_ttl {
                 return;
             }
-            if let Err(e) = net.send_multicast(&dsts, &topic, body.clone()).await {
+            let current_dsts: Vec<_> = dsts
+                .iter()
+                .copied()
+                .filter(|peer| {
+                    replication_protocol::strict_participant_version_supported(
+                        net.peer_strict_replication_protocol_version(*peer),
+                    )
+                })
+                .collect();
+            if current_dsts.is_empty() {
+                retry_attempt = retry_attempt.saturating_add(1);
+                retry_interval = retry_interval.saturating_mul(2).min(retry_ttl);
+                continue;
+            }
+            if let Err(e) = net
+                .send_multicast(&current_dsts, &topic, body.clone())
+                .await
+            {
                 trace!(error=%e, "commit fanout retry failed");
             }
             retry_attempt = retry_attempt.saturating_add(1);
@@ -11336,6 +11413,11 @@ fn recovery_commit_repair_dsts(
         .copied()
         .chain(net.alive_members())
         .filter(|node| *node != self_id)
+        .filter(|node| {
+            replication_protocol::strict_participant_version_supported(
+                net.peer_strict_replication_protocol_version(*node),
+            )
+        })
         .collect();
     dsts.sort_unstable();
     dsts.dedup();
@@ -11388,7 +11470,7 @@ fn spawn_recovery_commit_repair_retries(
                 continue;
             }
             if let Err(e) =
-                send_retry_multicast_with_broadcast(net.as_ref(), &dsts, &topic, body.clone()).await
+                send_terminal_fanout_targeted(net.as_ref(), &dsts, &topic, body.clone()).await
             {
                 trace!(error=%e, "recovery commit repair retry failed");
             }
@@ -11741,7 +11823,9 @@ fn delivery_member_incarnations(
         }
         if node == self_id {
             members.push((node, self_boot_epoch));
-        } else if net.has_live_route(node, ServiceLevel::Reliable)
+        } else if replication_protocol::strict_participant_version_supported(
+            net.peer_strict_replication_protocol_version(node),
+        ) && net.has_live_route(node, ServiceLevel::Reliable)
             && let Some(boot_epoch) = net.member_boot_epoch(node)
         {
             members.push((node, boot_epoch));
@@ -12085,12 +12169,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             missing_peer_clocks,
             unacknowledged_head_peers,
         );
-        commit_buffer || proposal || missing_peer_clocks > 0 || unacknowledged_head_peers > 0
+        commit_buffer || proposal || missing_peer_clocks > 0
     }
 
-    fn unacknowledged_head_peers(&self) -> Vec<NodeIdentifier> {
-        let live_v4_peers: Vec<_> = self
-            .net
+    fn live_head_evidence_peers(&self) -> Vec<PeerIncarnation> {
+        self.net
             .alive_members()
             .into_iter()
             .filter(|node| {
@@ -12103,7 +12186,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     .member_boot_epoch(node)
                     .map(|epoch| PeerIncarnation::new(node, epoch))
             })
-            .collect();
+            .collect()
+    }
+
+    fn unacknowledged_head_peer_incarnations(&self) -> Vec<PeerIncarnation> {
+        let live_v4_peers = self.live_head_evidence_peers();
         let evidence = self.head_evidence.lock();
         let Some(current) = evidence.as_ref() else {
             return Vec::new();
@@ -12111,7 +12198,53 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         live_v4_peers
             .into_iter()
             .filter(|peer| !current.acknowledged_by.contains(peer))
+            .collect()
+    }
+
+    fn unacknowledged_head_peers(&self) -> Vec<NodeIdentifier> {
+        self.unacknowledged_head_peer_incarnations()
+            .into_iter()
             .map(PeerIncarnation::node)
+            .collect()
+    }
+
+    fn take_due_unacknowledged_head_peers(&self, interval: Duration) -> Vec<NodeIdentifier> {
+        let live_peers = self.live_head_evidence_peers();
+        let live_peer_set: HashSet<_> = live_peers.iter().copied().collect();
+        let now = TokioInstant::now();
+        let retry_jitter = strict_timer_start_jitter(
+            self.self_id,
+            &self.topic,
+            StrictTimerLane::HeadEvidence,
+            interval,
+        );
+        let mut evidence = self.head_evidence.lock();
+        let Some(current) = evidence.as_mut() else {
+            return Vec::new();
+        };
+        let acknowledged_by = &current.acknowledged_by;
+        current
+            .retries
+            .retain(|peer, _| live_peer_set.contains(peer) && !acknowledged_by.contains(peer));
+        live_peers
+            .into_iter()
+            .filter(|peer| !current.acknowledged_by.contains(peer))
+            .filter_map(|peer| {
+                let retry = current.retries.entry(peer).or_insert(HeadEvidenceRetry {
+                    attempts: 0,
+                    next_retry_at: now,
+                });
+                if retry.next_retry_at > now {
+                    return None;
+                }
+                let multiplier = 1_u32
+                    .checked_shl(u32::from(retry.attempts))
+                    .unwrap_or(HEAD_EVIDENCE_RETRY_MAX_MULTIPLIER)
+                    .min(HEAD_EVIDENCE_RETRY_MAX_MULTIPLIER);
+                retry.attempts = retry.attempts.saturating_add(1);
+                retry.next_retry_at = now + interval.saturating_mul(multiplier) + retry_jitter;
+                Some(peer.node())
+            })
             .collect()
     }
 }
@@ -12222,6 +12355,30 @@ async fn emit_clock_tick<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     let Some(terminal_cut) = terminal_cut else {
         return;
     };
+    send_due_head_evidence(rt, history_metadata, terminal_cut, clock).await;
+}
+
+/// Send only the due durable-head advertisements.  The normal clock ticker
+/// calls this once when it has advanced for another reason, so a newly
+/// observed peer receives evidence immediately without making every later
+/// tempo tick repeat the unacknowledged-head fanout.
+async fn send_due_head_evidence<R: StrictReplicable>(
+    rt: &Arc<StrictRuntime<R>>,
+    history_metadata: HistoryMetadata,
+    terminal_cut: TerminalCut,
+    clock: u64,
+) {
+    if !rt.can_originate_v2()
+        || rt.net.local_strict_replication_protocol_version() < STRICT_PROTOCOL_VERSION_V4
+    {
+        return;
+    }
+    rt.remember_advertised_head(history_metadata, terminal_cut);
+    let peers =
+        rt.take_due_unacknowledged_head_peers(rt.cfg.strict_steady_state_catchup_interval());
+    if peers.is_empty() {
+        return;
+    }
     let evidence_body = StrictBody::ClockTick(StrictClockTick {
         src_node: rt.self_id as u32,
         src_clock: clock,
@@ -12229,7 +12386,7 @@ async fn emit_clock_tick<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
         terminal_cut: Some(cut_to_wire(terminal_cut)),
         history_freshness: history_metadata.freshness,
     });
-    for dst in rt.unacknowledged_head_peers() {
+    for dst in peers {
         if let Err(error) = rt
             .net
             .send_redundant_unicast(dst, &rt.topic, evidence_body.clone())
@@ -12238,6 +12395,20 @@ async fn emit_clock_tick<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
             trace!(%error, dst, "strict head evidence send failed");
         }
     }
+}
+
+/// Re-advertise durable V4 head evidence without creating tempo work.  Unlike
+/// `emit_clock_tick`, this preserves the local clock and never multicasts.
+async fn retry_unacknowledged_head_evidence<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
+    if !rt.can_originate_v2()
+        || rt.net.local_strict_replication_protocol_version() < STRICT_PROTOCOL_VERSION_V4
+    {
+        return;
+    }
+    let terminal_cut = rt.terminal_journal.lock().await.terminal_cut();
+    let history_metadata = rt.repo.history_metadata();
+    let clock = rt.state.lock().clock;
+    send_due_head_evidence(rt, history_metadata, terminal_cut, clock).await;
 }
 
 async fn sleep_or_shutdown<R: StrictReplicable>(
@@ -12457,7 +12628,7 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
     }
 }
 
-fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
+fn spawn_repair_loops<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
     let weak = Arc::downgrade(&rt);
     drop(rt);
     tokio::spawn(async move {
@@ -12475,16 +12646,22 @@ fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>
         let mut terminal_repair_ticker =
             tokio::time::interval_at(terminal_repair_start, terminal_repair_interval);
         terminal_repair_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let steady_interval = rt.cfg.strict_steady_state_catchup_interval();
-        let steady_start = tokio::time::Instant::now()
+        // A normal head change or membership wake sends its first directed
+        // advertisement immediately.  Start background retries only after a
+        // full retry interval, with a separate deterministic offset, so a
+        // missing ACK cannot line up with or extend the active clock burst.
+        let head_evidence_interval = rt.cfg.strict_steady_state_catchup_interval();
+        let head_evidence_start = tokio::time::Instant::now()
+            + head_evidence_interval
             + strict_timer_start_jitter(
                 rt.self_id,
                 &rt.topic,
-                StrictTimerLane::SteadyState,
-                steady_interval,
+                StrictTimerLane::HeadEvidence,
+                head_evidence_interval,
             );
-        let mut steady_ticker = tokio::time::interval_at(steady_start, steady_interval);
-        steady_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut head_evidence_ticker =
+            tokio::time::interval_at(head_evidence_start, head_evidence_interval);
+        head_evidence_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = rt.shutdown.cancelled() => return,
@@ -12496,8 +12673,8 @@ fn spawn_steady_state_catchup_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>
                     // independently of history catch-up.
                     let _ = request_terminal_repair_probe(&rt).await;
                 }
-                _ = steady_ticker.tick() => {
-                    request_steady_state_catchup(&rt).await;
+                _ = head_evidence_ticker.tick() => {
+                    retry_unacknowledged_head_evidence(&rt).await;
                 }
             }
         }
@@ -12690,6 +12867,9 @@ async fn request_terminal_repair_probe<R: StrictReplicable>(rt: &Arc<StrictRunti
             // repair does, so it never queries a replacement incarnation.
             *node != rt.self_id
                 && frozen_epoch.is_none_or(|epoch| rt.net.member_boot_epoch(*node) == Some(epoch))
+                && replication_protocol::strict_participant_version_supported(
+                    rt.net.peer_strict_replication_protocol_version(*node),
+                )
                 && rt.net.has_route(*node, ServiceLevel::Reliable)
         })
         .map(|(node, _)| node)
@@ -12745,57 +12925,6 @@ async fn request_terminal_repair_probe<R: StrictReplicable>(rt: &Arc<StrictRunti
             false
         }
     }
-}
-
-async fn request_steady_state_catchup<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
-    if !rt.can_originate_v2() {
-        return;
-    }
-    if rt.state.lock().history_election_blocks_steady_state() {
-        return;
-    }
-    let alive = rt.net.alive_members();
-    let mut peers: Vec<NodeIdentifier> = alive
-        .into_iter()
-        .filter(|node| {
-            *node != rt.self_id
-                && rt.net.has_route(*node, ServiceLevel::Reliable)
-                && !rt.head_evidence_supported_by(*node)
-                && (!rt.v3_repair_supported_by(*node) || !rt.v3_periodic_work_active(*node))
-        })
-        .collect();
-    if peers.is_empty() {
-        return;
-    }
-    peers.sort_unstable();
-    let cursor = rt.steady_catchup_cursor.fetch_add(1, Ordering::Relaxed) as usize;
-    let dst = peers[cursor % peers.len()];
-    if rt.v3_repair_supported_by(dst) {
-        super::catchup::request_v3_history_probe(
-            rt,
-            dst,
-            repl_proto::StrictCatchupReason::SteadyState,
-        )
-        .await;
-        return;
-    }
-    let req = StrictCatchupReq {
-        src_node: rt.self_id as u32,
-        since_version: rt.repo.current_version(),
-        chunk_token: 0,
-        force_snapshot: false,
-        history_probe_only: false,
-        terminal_state_cursor: super::catchup::TERMINAL_STATE_CURSOR_SKIP,
-        terminal_decision_generation: rt.remembered_terminal_decision_generation(dst),
-        snapshot_transfer_id: 0,
-        snapshot_chunk_cursor: 0,
-        history_transfer: None,
-    };
-    metrics::record_catchup_request(CatchupMode::Strict);
-    let _ = rt
-        .net
-        .send_unicast(dst, &rt.topic, StrictBody::CatchupReq(req))
-        .await;
 }
 
 // ---------- Helpers ----------
@@ -13263,17 +13392,17 @@ mod tests {
         (rt, net, repo)
     }
 
-    fn enable_v5_floor_with_v2_endpoints(
+    fn enable_v5_floor_with_v4_participants(
         net: &MockNet,
         peers: impl IntoIterator<Item = NodeIdentifier>,
     ) {
         // Fresh strict origination requires the cumulative V5 cluster floor,
-        // while these compatibility fixtures intentionally exercise V2
-        // endpoint behavior and wire records.
+        // while these fixtures intentionally exercise the retained V2 wire
+        // records between supported V4+ participants.
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V2));
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
         for peer in peers {
-            net.set_peer_strict_replication_protocol_version(peer, STRICT_PROTOCOL_VERSION_V2);
+            net.set_peer_strict_replication_protocol_version(peer, STRICT_PROTOCOL_VERSION_V4);
         }
     }
 
@@ -13775,7 +13904,7 @@ mod tests {
             strict_timer_start_jitter(
                 7,
                 "strict/channel/example",
-                StrictTimerLane::SteadyState,
+                StrictTimerLane::HeadEvidence,
                 interval,
             )
         );
@@ -14400,8 +14529,8 @@ mod tests {
     async fn admission_polling_requests_only_the_missing_clock_proof() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V1);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
         rt.state
             .lock()
@@ -14959,7 +15088,7 @@ mod tests {
         for node in [1, 2, 3] {
             net.set_epoch(node, 1);
         }
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -15016,7 +15145,7 @@ mod tests {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -15072,6 +15201,7 @@ mod tests {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -15096,6 +15226,7 @@ mod tests {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo.clone(),
@@ -15144,6 +15275,7 @@ mod tests {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo.clone(),
@@ -15195,6 +15327,7 @@ mod tests {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         let repo = CountingStrictRepo::new();
         repo.state.lock().0 = 7;
         let rt = StrictRuntime::new(
@@ -15276,7 +15409,7 @@ mod tests {
         let net = MockNet::new(1, vec![1, 2]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -15491,6 +15624,7 @@ mod tests {
     #[test]
     fn recovery_commit_repair_includes_live_replacement_members() {
         let net = MockNet::new(2, vec![1, 2, 3]);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         let frozen_targets = HashSet::from([2, 3]);
 
         assert_eq!(
@@ -15499,9 +15633,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_commit_repair_excludes_deprecated_participants() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V4);
+
+        assert_eq!(
+            recovery_commit_repair_dsts(net.as_ref(), 1, &HashSet::from([2])),
+            vec![3],
+            "a stale frozen descriptor must not reintroduce a deprecated peer to terminal repair"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn recovery_commit_retry_waits_for_route_rtt_rto() {
         let net = MockNet::new(1, vec![1, 2]);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         net.set_route_rtt(2, Duration::from_millis(400));
         let cfg = Arc::new(
             ReplicationConfig::default()
@@ -15544,6 +15693,56 @@ mod tests {
         assert_eq!(sends[0].lane, StrictSendLane::Ordinary);
         assert_eq!(sends[0].target, StrictSendTarget::Unicast(2));
         assert_eq!(sends[0].outcome, StrictSendOutcome::Sent);
+        shutdown.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_commit_retry_never_broadcasts_to_escape_a_failed_target() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V3);
+        net.fail_strict_unicasts_to([2]);
+        let cfg = Arc::new(
+            ReplicationConfig::default()
+                .with_strict_consensus_retry_min(Duration::from_millis(50))
+                .with_strict_consensus_retry_max(Duration::from_millis(50))
+                .with_strict_consensus_rtt_margin(Duration::ZERO)
+                .with_strict_consensus_retry_jitter_pct(0),
+        );
+        let shutdown = CancellationToken::new();
+        let op_id = make_op_id(1, 1, 78);
+        let body = StrictBody::RecoveryCommit(StrictRecoveryCommit {
+            takeover_node: 1,
+            coord_node: 1,
+            op_id_hi: op_id.0,
+            op_id_lo: op_id.1,
+            ..Default::default()
+        });
+
+        spawn_recovery_commit_repair_retries(
+            net.clone(),
+            shutdown.clone(),
+            "channels".to_owned(),
+            1,
+            op_id,
+            HashSet::from([1, 2]),
+            body,
+            cfg,
+            Duration::from_millis(200),
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            net.drain_captures().is_empty(),
+            "a failed targeted recovery retry must not broadcast to deprecated participants"
+        );
+        let sends = net.drain_strict_send_observations();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].target, StrictSendTarget::Unicast(2));
+        assert_eq!(sends[0].outcome, StrictSendOutcome::InjectedFailure);
         shutdown.cancel();
     }
 
@@ -15746,7 +15945,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_catchup_only_targets_reliably_routable_peers() {
         let net = MockNet::new(1, vec![1, 2, 3]);
-        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
+        enable_v5_floor_with_v4_participants(&net, [2, 3]);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
         // Node 2 remains in the logical routing table, but its first-hop
@@ -15773,12 +15972,13 @@ mod tests {
                 dst, body, ..
             } => {
                 assert_eq!(*dst, 3);
-                let StrictBody::CatchupReq(req) = body else {
-                    panic!("expected catchup request, got {body:?}");
+                let StrictBody::HistoryProbeReq(req) = body else {
+                    panic!("expected V4 history probe, got {body:?}");
                 };
-                assert!(req.history_probe_only);
-                assert!(!req.force_snapshot);
-                assert_eq!(req.chunk_token, 0);
+                assert_eq!(req.src_node, 1);
+                assert_eq!(req.expected_responder_boot_epoch, 1);
+                assert_ne!(req.request_nonce, 0);
+                assert_eq!(req.reason, StrictCatchupReason::HistoryElection as i32);
             }
             other => panic!("unexpected capture: {other:?}"),
         }
@@ -15913,7 +16113,7 @@ mod tests {
     #[tokio::test]
     async fn strict_catchup_followup_uses_response_token_when_repo_version_lags() {
         let net = MockNet::new(1, vec![1, 2]);
-        enable_v5_floor_with_v2_endpoints(&net, [2]);
+        enable_v5_floor_with_v4_participants(&net, [2]);
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
             repo.clone(),
@@ -16684,7 +16884,7 @@ mod tests {
     #[tokio::test]
     async fn strict_history_election_fetches_only_best_snapshot() {
         let net = MockNet::new(1, vec![1, 2, 3]);
-        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
+        enable_v5_floor_with_v4_participants(&net, [2, 3]);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
         let repo = CountingStrictRepo::new();
@@ -16711,12 +16911,13 @@ mod tests {
                 panic!("unexpected capture: {capture:?}");
             };
             probe_dsts.push(*dst);
-            let StrictBody::CatchupReq(req) = body else {
-                panic!("expected catchup request, got {body:?}");
+            let StrictBody::HistoryProbeReq(req) = body else {
+                panic!("expected V4 history probe, got {body:?}");
             };
-            assert!(req.history_probe_only);
-            assert!(!req.force_snapshot);
-            assert_eq!(req.chunk_token, 0);
+            assert_eq!(req.src_node, 1);
+            assert_eq!(req.expected_responder_boot_epoch, 1);
+            assert_ne!(req.request_nonce, 0);
+            assert_eq!(req.reason, StrictCatchupReason::HistoryElection as i32);
         }
         probe_dsts.sort_unstable();
         assert_eq!(probe_dsts, vec![2, 3]);
@@ -16749,7 +16950,7 @@ mod tests {
     #[tokio::test]
     async fn strict_history_election_local_best_requests_no_snapshot() {
         let net = MockNet::new(1, vec![1, 2, 3]);
-        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
+        enable_v5_floor_with_v4_participants(&net, [2, 3]);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
         let repo = CountingStrictRepo::new();
@@ -16779,7 +16980,7 @@ mod tests {
     #[tokio::test]
     async fn strict_history_election_ignores_non_winning_snapshot_response() {
         let net = MockNet::new(1, vec![1, 2, 3]);
-        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
+        enable_v5_floor_with_v4_participants(&net, [2, 3]);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
         let repo = CountingStrictRepo::new();
@@ -16827,7 +17028,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_send_failures_keep_retry_throttle() {
         let net = MockNet::new(1, vec![1, 2, 3]);
-        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
+        enable_v5_floor_with_v4_participants(&net, [2, 3]);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
         net.fail_strict_unicasts_to([2, 3]);
@@ -16845,30 +17046,8 @@ mod tests {
 
         assert!(rt.last_bootstrap_attempt.lock().is_some());
         assert!(rt.state.lock().history_election_pending());
-        assert!(!rt.state.lock().history_election_active());
+        assert!(rt.state.lock().history_election_active());
         assert!(net.drain_captures().is_empty());
-    }
-
-    #[tokio::test]
-    async fn steady_state_catchup_stands_down_while_history_election_is_pending() {
-        let net = MockNet::new(1, vec![1, 2]);
-        let repo = CountingStrictRepo::new();
-        let rt = StrictRuntime::new(
-            repo,
-            1,
-            0,
-            "channels".to_owned(),
-            net.clone(),
-            CancellationToken::new(),
-            Arc::new(ReplicationConfig::default()),
-        );
-
-        request_steady_state_catchup(&rt).await;
-
-        assert!(
-            net.drain_captures().is_empty(),
-            "ordinary catchup must not race a pending history election"
-        );
     }
 
     #[tokio::test]
@@ -17710,7 +17889,7 @@ mod tests {
     #[tokio::test]
     async fn delivery_in_flight_blocks_bootstrap_until_repository_apply_completes() {
         let net = MockNet::new(1, vec![1, 2]);
-        enable_v5_floor_with_v2_endpoints(&net, [2]);
+        enable_v5_floor_with_v4_participants(&net, [2]);
         net.set_epoch(2, 1);
         let repo = BlockingStrictRepo::new();
         let rt = StrictRuntime::new(
@@ -17759,7 +17938,7 @@ mod tests {
             frame,
             CapturedFrame::StrictUnicast {
                 dst: 2,
-                body: StrictBody::CatchupReq(_),
+                body: StrictBody::HistoryProbeReq(_),
                 ..
             }
         )));
@@ -18843,7 +19022,7 @@ mod tests {
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
-        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
+        enable_v5_floor_with_v4_participants(&net, [2, 3]);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -18990,7 +19169,8 @@ mod tests {
     #[tokio::test]
     async fn durable_v2_pending_fence_uses_terminal_only_repair_while_election_is_idle() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V2);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         let op_id = make_op_id(2, 1, 138);
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&138u64).unwrap());
         {
@@ -19013,34 +19193,27 @@ mod tests {
         net.drain_captures();
 
         assert!(request_terminal_repair_probe(&rt).await);
-        assert!(net.drain_captures().iter().any(|frame| {
-            matches!(
-                frame,
-                CapturedFrame::StrictUnicast {
-                    dst: 2,
-                    body: StrictBody::CatchupReq(StrictCatchupReq {
-                        since_version: 0,
-                        chunk_token: 0,
-                        force_snapshot: false,
-                        history_probe_only: true,
-                        terminal_state_cursor: 0,
-                        terminal_decision_generation: 0,
-                        snapshot_transfer_id: 0,
-                        snapshot_chunk_cursor: 0,
+        assert!(
+            net.drain_captures().iter().any(|frame| {
+                matches!(
+                    frame,
+                    CapturedFrame::StrictUnicast {
+                        dst: 2,
+                        body: StrictBody::TerminalSyncReq(_),
                         ..
-                    }),
-                    ..
-                }
-            )
-        }));
+                    }
+                )
+            }),
+            "a supported participant must repair the durable V2 fence through V3 terminal sync"
+        );
     }
 
     #[tokio::test]
     async fn v3_watermark_clock_probe_is_bounded_during_active_terminal_transfer() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         let peer = PeerIncarnation::new(2, 1);
         assert!(
             rt.v3_sync
@@ -19052,7 +19225,6 @@ mod tests {
                 )
                 .is_some()
         );
-        assert!(rt.v3_periodic_work_active(2));
         {
             let mut state = rt.state.lock();
             state.clock = 20;
@@ -19154,7 +19326,11 @@ mod tests {
         let repository_version = rt.repo.current_version();
         rt.remember_advertised_head(rt.repo.history_metadata(), cut);
 
-        assert!(rt.clock_tick_needed());
+        assert_eq!(rt.unacknowledged_head_peers(), vec![2]);
+        assert!(
+            !rt.clock_tick_needed(),
+            "a missing durable-head acknowledgement must not create clock demand"
+        );
         rt.recv_head_ack(
             2,
             1,
@@ -19168,7 +19344,190 @@ mod tests {
                 history_freshness: 0,
             },
         );
+        assert!(rt.unacknowledged_head_peers().is_empty());
         assert!(!rt.clock_tick_needed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unacknowledged_head_retries_are_directed_backed_off_and_stop_at_ack() {
+        let interval = Duration::from_millis(100);
+        let (rt, net, _repo) = v1_runtime(
+            ReplicationConfig::default().with_strict_steady_state_catchup_interval(interval),
+        );
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        let metadata = rt.repo.history_metadata();
+        rt.remember_advertised_head(metadata, cut);
+        assert!(
+            !rt.clock_tick_needed(),
+            "head evidence must not keep the normal clock-tick burst active"
+        );
+
+        // Production starts repair timers before a membership/head wake, so
+        // make the initial direct advertisement and its retry ticker share
+        // the same paused-time origin.
+        spawn_repair_loops(rt.clone());
+        spawn_clock_tick_loop(rt.clone());
+        rt.wake_clock_tick_loop();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+
+        let initial = net.drain_captures();
+        let initial_multicasts = initial
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    frame,
+                    CapturedFrame::StrictMulticast {
+                        body: StrictBody::ClockTick(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            initial_multicasts, 1,
+            "the explicit wake emits one normal tick"
+        );
+        let initial_clock = initial
+            .iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::ClockTick(tick),
+                    ..
+                } if tick.terminal_cut.is_some() => Some(tick.src_clock),
+                _ => None,
+            })
+            .expect("the normal tick advertises the unacknowledged head directly");
+        assert_eq!(rt.state.lock().clock, initial_clock);
+        let first_retry_delay = interval
+            + strict_timer_start_jitter(
+                rt.self_id,
+                &rt.topic,
+                StrictTimerLane::HeadEvidence,
+                interval,
+            );
+        let first_retry_at = rt
+            .head_evidence
+            .lock()
+            .as_ref()
+            .and_then(|evidence| {
+                evidence
+                    .retries
+                    .get(&PeerIncarnation::new(2, 1))
+                    .map(|retry| retry.next_retry_at)
+            })
+            .expect("initial directed evidence must retain retry state");
+        assert_eq!(
+            first_retry_at.duration_since(TokioInstant::now()),
+            first_retry_delay,
+            "the immediate advertisement must schedule its first backoff window"
+        );
+
+        let retry_wait = first_retry_at.duration_since(TokioInstant::now());
+        tokio::time::advance(retry_wait.saturating_sub(Duration::from_millis(1))).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            net.drain_captures().is_empty(),
+            "head evidence retry must wait through its delayed first firing"
+        );
+
+        // The repair ticker has a fixed phase. It can poll just before the
+        // peer-specific deadline, so cross one full steady interval after
+        // that deadline rather than assuming their phases are identical.
+        tokio::time::advance(Duration::from_millis(1) + interval).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        let retry = net.drain_captures();
+        assert_eq!(
+            retry.len(),
+            1,
+            "one due head retry must not be accompanied by unrelated strict work"
+        );
+        assert!(
+            !retry.iter().any(|frame| matches!(
+                frame,
+                CapturedFrame::StrictMulticast {
+                    body: StrictBody::ClockTick(_),
+                    ..
+                }
+            )),
+            "head evidence retry must never multicast"
+        );
+        let retry_ticks: Vec<_> = retry
+            .iter()
+            .filter_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::ClockTick(tick),
+                    ..
+                } if tick.terminal_cut.is_some() => Some(tick),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retry_ticks.len(), 1, "one peer receives one directed retry");
+        assert_eq!(retry_ticks[0].src_clock, initial_clock);
+        assert_eq!(
+            rt.state.lock().clock,
+            initial_clock,
+            "head evidence retry must not advance the local clock"
+        );
+        let second_retry_at = rt
+            .head_evidence
+            .lock()
+            .as_ref()
+            .and_then(|evidence| {
+                evidence
+                    .retries
+                    .get(&PeerIncarnation::new(2, 1))
+                    .map(|retry| retry.next_retry_at)
+            })
+            .expect("first retry must retain its exponential follow-up deadline");
+        assert_eq!(
+            second_retry_at.duration_since(TokioInstant::now()),
+            interval.saturating_mul(2)
+                + strict_timer_start_jitter(
+                    rt.self_id,
+                    &rt.topic,
+                    StrictTimerLane::HeadEvidence,
+                    interval,
+                ),
+            "the second unacknowledged head retry must use double the base backoff"
+        );
+
+        rt.recv_head_ack(
+            2,
+            1,
+            StrictHeadAck {
+                src_node: 2,
+                src_boot_epoch: 1,
+                expected_target_node: 1,
+                expected_target_boot_epoch: 1,
+                repository_version: metadata.version,
+                terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
+                history_freshness: metadata.freshness,
+            },
+        );
+        assert!(rt.unacknowledged_head_peers().is_empty());
+        net.drain_captures();
+
+        tokio::time::advance(interval.saturating_mul(16)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            net.drain_captures().is_empty(),
+            "an exact head acknowledgement must leave the quiet runtime with no background strict work"
+        );
+        rt.shutdown.cancel();
     }
 
     #[tokio::test]
@@ -19213,9 +19572,10 @@ mod tests {
             .expect("every repeated head advertisement needs an application-level ack");
         }
         assert!(
-            rt.clock_tick_needed(),
+            !rt.unacknowledged_head_peers().is_empty(),
             "peer evidence is not an acknowledgement of our advertisement"
         );
+        assert!(!rt.clock_tick_needed());
     }
 
     #[tokio::test]
@@ -19268,8 +19628,12 @@ mod tests {
         );
         net.set_live_reliable_routes([1, 2]);
         assert!(
-            rt.clock_tick_needed(),
-            "route appearance must expose the unacknowledged peer"
+            !rt.unacknowledged_head_peers().is_empty(),
+            "route appearance must expose the unacknowledged peer to directed repair"
+        );
+        assert!(
+            !rt.clock_tick_needed(),
+            "route appearance must not restart the active clock-tick burst"
         );
     }
 
@@ -19327,7 +19691,8 @@ mod tests {
                 history_freshness: 0,
             },
         );
-        assert!(rt.clock_tick_needed());
+        assert!(!rt.unacknowledged_head_peers().is_empty());
+        assert!(!rt.clock_tick_needed());
     }
 
     #[tokio::test]
@@ -19396,7 +19761,8 @@ mod tests {
             },
         );
 
-        assert!(rt.clock_tick_needed());
+        assert!(!rt.unacknowledged_head_peers().is_empty());
+        assert!(!rt.clock_tick_needed());
     }
 
     #[test]
@@ -19484,7 +19850,8 @@ mod tests {
         )
         .await;
 
-        assert!(rt.clock_tick_needed());
+        assert!(!rt.unacknowledged_head_peers().is_empty());
+        assert!(!rt.clock_tick_needed());
         tokio::task::yield_now().await;
         assert!(
             !net.drain_captures().iter().any(|frame| matches!(
@@ -19495,6 +19862,77 @@ mod tests {
                 }
             )),
             "a rejected clock source must not start evidence repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_v4_participant_cannot_mutate_strict_runtime_or_trigger_replies() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V6));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        let initial_clock = rt.state.lock().clock;
+
+        rt.dispatch(
+            2,
+            1,
+            true,
+            StrictBody::ClockTick(StrictClockTick {
+                src_node: 2,
+                src_clock: initial_clock.saturating_add(10),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            rt.state.lock().clock,
+            initial_clock,
+            "a deprecated participant must not advance strict state"
+        );
+        assert!(
+            net.drain_captures().is_empty(),
+            "a deprecated participant must not receive strict repair replies"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_v4_member_does_not_create_admission_or_bootstrap_work() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V6));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        net.drain_captures();
+
+        rt.on_membership_change(&MembershipEvent::Joined(MemberIncarnation::new(2, 1)));
+        rt.try_bootstrap_catchup().await;
+        request_admission_probes(&rt).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+
+        {
+            let state = rt.state.lock();
+            assert!(
+                !state.peer_admissions.contains_key(&2),
+                "a pre-V4 member must not enter the admission table"
+            );
+            assert!(
+                !state.history_election_pending(),
+                "a pre-V4 member must not schedule bootstrap election work"
+            );
+        }
+        assert!(
+            rt.last_bootstrap_attempt.lock().is_none(),
+            "a pre-V4 member must not claim a bootstrap retry slot"
+        );
+        assert!(
+            rt.pending_admission_probe_peers().is_empty(),
+            "a pre-V4 member must not retain admission probes"
+        );
+        assert!(
+            net.drain_captures().is_empty(),
+            "a pre-V4 member must not receive bootstrap or admission frames"
         );
     }
 
@@ -19626,9 +20064,11 @@ mod tests {
         assert!(!rt.clock_tick_needed());
 
         net.set_epoch(2, 2);
-        assert!(rt.clock_tick_needed());
+        assert!(!rt.unacknowledged_head_peers().is_empty());
+        assert!(!rt.clock_tick_needed());
         rt.recv_head_ack(2, 1, ack(1));
-        assert!(rt.clock_tick_needed());
+        assert!(!rt.unacknowledged_head_peers().is_empty());
+        assert!(!rt.clock_tick_needed());
         rt.recv_head_ack(2, 2, ack(2));
         assert!(!rt.clock_tick_needed());
     }
@@ -19699,49 +20139,19 @@ mod tests {
         rt.shutdown.cancel();
     }
 
-    #[tokio::test]
-    async fn v3_peer_uses_steady_fallback_without_becoming_pending_head_evidence() {
-        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
-        rt.state.lock().peer_clocks.insert(2, 1);
-        let cut = rt.terminal_journal.lock().await.terminal_cut();
-        rt.remember_advertised_head(rt.repo.history_metadata(), cut);
-
-        assert!(
-            !rt.clock_tick_needed(),
-            "a d578-era v3 peer cannot supply v4 head acknowledgement"
-        );
-        request_steady_state_catchup(&rt).await;
-
-        assert!(net.drain_captures().into_iter().any(|frame| matches!(
-            frame,
-            CapturedFrame::StrictUnicast {
-                dst: 2,
-                body: StrictBody::HistoryProbeReq(request),
-                ..
-            } if request.reason == repl_proto::StrictCatchupReason::SteadyState as i32
-        )));
-    }
-
     #[tokio::test(start_paused = true)]
-    async fn converged_runtime_emits_no_periodic_history_catchup() {
+    async fn acknowledged_v4_head_is_quiet_without_repository_mutations() {
         let interval = Duration::from_millis(100);
-        let (rt, net, repo) = v1_runtime(
+        let (rt, net, _repo) = v1_runtime(
             ReplicationConfig::default().with_strict_steady_state_catchup_interval(interval),
         );
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V5);
-        assert!(
-            rt.can_originate_v2(),
-            "the silence assertion must exercise the current protocol instead of returning early"
-        );
-
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         rt.state.lock().peer_clocks.insert(2, 1);
+
         let cut = rt.terminal_journal.lock().await.terminal_cut();
-        let metadata = repo.history_metadata();
+        let metadata = rt.repo.history_metadata();
         rt.remember_advertised_head(metadata, cut);
         rt.recv_head_ack(
             2,
@@ -19756,16 +20166,28 @@ mod tests {
                 history_freshness: metadata.freshness,
             },
         );
-        assert!(!rt.clock_tick_needed(), "the fixture must be converged");
+        assert!(
+            !rt.clock_tick_needed(),
+            "an acknowledged head and unchanged repository must create no clock demand"
+        );
+        assert!(rt.unacknowledged_head_peers().is_empty());
 
-        spawn_steady_state_catchup_loop(rt.clone());
-        tokio::task::yield_now().await;
+        spawn_repair_loops(rt.clone());
+        spawn_clock_tick_loop(rt.clone());
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
         net.drain_captures();
 
-        tokio::time::advance(interval.saturating_mul(10)).await;
-        tokio::task::yield_now().await;
+        tokio::time::advance(interval.saturating_mul(20)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
 
-        assert!(net.drain_captures().is_empty());
+        assert!(
+            net.drain_captures().is_empty(),
+            "an acknowledged V4 head must not schedule catchup, ticks, or evidence retries while the repository stays quiet"
+        );
         rt.shutdown.cancel();
     }
 
@@ -19773,7 +20195,7 @@ mod tests {
     async fn live_v2_pending_fence_starts_resolution_after_phase_two_grace() {
         let cfg = ReplicationConfig::default();
         let (rt, net, _repo) = v1_runtime(cfg.clone());
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V2);
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         net.set_live_reliable_routes([1]);
         let op_id = make_op_id(2, 1, 140);
         let op_msgpack = Bytes::from(rmp_serde::to_vec(&140u64).unwrap());
@@ -19818,13 +20240,19 @@ mod tests {
                 frame,
                 CapturedFrame::StrictUnicast {
                     dst: 2,
-                    body: StrictBody::CatchupReq(StrictCatchupReq {
-                        history_probe_only: true,
-                        terminal_state_cursor: 0,
-                        ..
-                    }),
+                    body: StrictBody::ClockProbeReq(probe),
                     ..
-                }
+                } if probe.reason == StrictCatchupReason::TerminalFence as i32
+            )
+        }));
+        assert!(captures.iter().any(|frame| {
+            matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::TerminalSyncReq(request),
+                    ..
+                } if request.reason == StrictCatchupReason::TerminalFence as i32
             )
         }));
         rt.shutdown.cancel();
@@ -19869,7 +20297,9 @@ mod tests {
         let source_net = MockNet::new(1, vec![1, 2]);
         source_net.set_epoch(1, 1);
         source_net.set_epoch(2, 1);
-        enable_v5_floor_with_v2_endpoints(&source_net, [2]);
+        source_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        source_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        source_net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         let source = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,
@@ -19884,7 +20314,9 @@ mod tests {
         let sink_net = MockNet::new(2, vec![1, 2]);
         sink_net.set_epoch(1, 1);
         sink_net.set_epoch(2, 1);
-        enable_v5_floor_with_v2_endpoints(&sink_net, [1]);
+        sink_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        sink_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V4);
         let sink_repo = CountingStrictRepo::new();
         let sink = StrictRuntime::new(
             sink_repo.clone(),
@@ -19939,27 +20371,27 @@ mod tests {
             .find_map(|frame| match frame {
                 CapturedFrame::StrictUnicast {
                     dst: 1,
-                    body: StrictBody::CatchupReq(request),
+                    body: StrictBody::TerminalSyncReq(request),
                     ..
                 } => Some(request),
                 _ => None,
             })
             .expect("sink must request the missing terminal decision from its frozen peer");
-        source.recv_catchup_req(2, request).await;
-        let response = source_net
+        super::super::catchup::recv_v3_terminal_sync_req(&source, 2, 1, request).await;
+        let page = source_net
             .drain_captures()
             .into_iter()
             .find_map(|frame| match frame {
                 CapturedFrame::StrictUnicast {
                     dst: 2,
-                    body: StrictBody::CatchupResp(response),
+                    body: StrictBody::TerminalSyncPage(page),
                     ..
-                } => Some(response),
+                } => Some(page),
                 _ => None,
             })
             .expect("source must return the durable terminal decision");
 
-        sink.recv_catchup_resp(1, response).await;
+        super::super::catchup::recv_v3_terminal_sync_page(&sink, 1, 1, page).await;
         assert!(!sink.state.lock().pending_proposes.contains_key(&op_id));
         assert!(matches!(
             sink.state.lock().terminal_decisions.get(&op_id),
@@ -20161,7 +20593,7 @@ mod tests {
             ..Default::default()
         });
 
-        send_terminal_fanout_with_broadcast(net.as_ref(), &[2, 3], "channels", body.clone())
+        send_terminal_fanout_targeted(net.as_ref(), &[2, 3], "channels", body.clone())
             .await
             .unwrap();
 
@@ -20198,7 +20630,7 @@ mod tests {
         });
 
         assert!(
-            send_terminal_fanout_with_broadcast(net.as_ref(), &[2, 3], "channels", body.clone(),)
+            send_terminal_fanout_targeted(net.as_ref(), &[2, 3], "channels", body.clone(),)
                 .await
                 .is_err()
         );
@@ -20209,6 +20641,42 @@ mod tests {
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].lane, StrictSendLane::Ordinary);
         assert_eq!(sends[0].target, StrictSendTarget::Multicast(vec![2, 3]));
+        assert_eq!(sends[0].outcome, StrictSendOutcome::InjectedFailure);
+    }
+
+    #[tokio::test]
+    async fn terminal_fanout_single_destination_never_broadcasts() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.fail_strict_unicasts_to([2]);
+        let body = StrictBody::Decision(StrictDecision {
+            resolver_node: 1,
+            ballot: NORMAL_ACCEPT_BALLOT,
+            coord_node: 1,
+            op_id_hi: make_op_id(1, 1, 136).0,
+            op_id_lo: make_op_id(1, 1, 136).1,
+            outcome: Some(StrictDecisionOutcome::Abort(StrictDecisionAbort {})),
+            src_clock: 1,
+            resolver_boot_epoch: 1,
+            frozen_targets: vec![StrictFrozenTarget {
+                node: 1,
+                boot_epoch: 1,
+            }],
+            ..Default::default()
+        });
+
+        assert!(
+            send_terminal_fanout_targeted(net.as_ref(), &[2], "channels", body)
+                .await
+                .is_err()
+        );
+
+        assert!(
+            net.drain_captures().is_empty(),
+            "a terminal decision must not escape its supported destination set through broadcast fallback"
+        );
+        let sends = net.drain_strict_send_observations();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].target, StrictSendTarget::Unicast(2));
         assert_eq!(sends[0].outcome, StrictSendOutcome::InjectedFailure);
     }
 
@@ -20267,11 +20735,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn all_v3_exact_incarnation_decision_has_no_terminal_replay_tail() {
+    async fn all_v4_exact_incarnation_decision_has_no_terminal_replay_tail() {
         let (rt, net, _repo) = v1_runtime(terminal_replay_test_config());
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         let decision = valid_v3_terminal_replay_decision();
 
         assert!(rt.decision_has_complete_v3_repair_coverage(&[2], &decision));
@@ -20283,14 +20751,68 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn mixed_v2_v3_target_retains_terminal_replay_tail() {
+    async fn pre_v4_participant_receives_no_terminal_decision_replay_tail() {
+        let (rt, net, _repo) = v1_runtime(terminal_replay_test_config());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        let decision = valid_v3_terminal_replay_decision();
+
+        rt.spawn_terminal_fanout_retries(vec![2], decision);
+        advance_past_first_terminal_replay().await;
+
+        assert!(
+            net.drain_captures().is_empty(),
+            "a deprecated pre-V4 participant must receive no terminal-decision retry fanout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_retry_rechecks_participant_capability_before_send() {
+        let (rt, net, _repo) = v1_runtime(terminal_replay_test_config());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        let mut decision = valid_v3_terminal_replay_decision();
+        let StrictBody::Decision(candidate) = &mut decision else {
+            unreachable!();
+        };
+        candidate.source_terminal_generation = 0;
+
+        rt.spawn_terminal_fanout_retries(vec![2], decision);
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        advance_past_first_terminal_replay().await;
+
+        assert!(
+            net.drain_captures().is_empty(),
+            "a terminal retry worker must stop targeting a peer that downgrades below V4"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_incarnation_retains_terminal_replay_tail() {
+        let (rt, net, _repo) = v1_runtime(terminal_replay_test_config());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        net.set_epoch(2, 2);
+        let decision = valid_v3_terminal_replay_decision();
+
+        rt.spawn_terminal_fanout_retries(vec![2], decision.clone());
+        advance_past_first_terminal_replay().await;
+
+        assert!(captured_terminal_replay(&net.drain_captures(), &decision));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mixed_v4_exact_and_replaced_targets_replay_only_to_the_replacement() {
         let (rt, net, _repo) = v1_runtime(terminal_replay_test_config());
         net.set_alive(vec![1, 2, 3]);
-        net.set_epoch(3, 1);
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V2);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V2);
-        net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V3);
+        net.set_epoch(3, 2);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V4);
         let mut decision = valid_v3_terminal_replay_decision();
         let StrictBody::Decision(candidate) = &mut decision else {
             unreachable!();
@@ -20315,30 +20837,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(retries, vec![vec![2]]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn replacement_incarnation_retains_terminal_replay_tail() {
-        let (rt, net, _repo) = v1_runtime(terminal_replay_test_config());
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
-        net.set_epoch(2, 2);
-        let decision = valid_v3_terminal_replay_decision();
-
-        rt.spawn_terminal_fanout_retries(vec![2], decision.clone());
-        advance_past_first_terminal_replay().await;
-
-        assert!(captured_terminal_replay(&net.drain_captures(), &decision));
+        assert_eq!(retries, vec![vec![3]]);
     }
 
     #[tokio::test(start_paused = true)]
     async fn malformed_v3_transition_retains_terminal_replay_tail() {
         let (rt, net, _repo) = v1_runtime(terminal_replay_test_config());
-        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         let mut decision = valid_v3_terminal_replay_decision();
         let StrictBody::Decision(candidate) = &mut decision else {
             unreachable!();
@@ -20354,6 +20861,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_fanout_retries_after_the_former_fixed_window() {
         let net = MockNet::new(1, vec![1, 2]);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         let shutdown = CancellationToken::new();
         let body = StrictBody::Decision(StrictDecision {
             resolver_node: 1,
@@ -20420,6 +20928,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn terminal_fanout_retry_uses_route_rtt_and_exponential_backoff() {
         let net = MockNet::new(1, vec![1, 2]);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         net.set_route_rtt(2, Duration::from_millis(100));
         let shutdown = CancellationToken::new();
         let op_id = make_op_id(1, 1, 136);
@@ -20782,7 +21291,7 @@ mod tests {
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
         net.set_epoch(3, 1);
-        enable_v5_floor_with_v2_endpoints(&net, [2, 3]);
+        enable_v5_floor_with_v4_participants(&net, [2, 3]);
         let rt = StrictRuntime::new(
             CountingStrictRepo::new(),
             1,

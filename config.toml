@@ -215,7 +215,8 @@ ping_interval_secs = 2
 idle_ping_interval_secs = 10
 # How often stream transports sample native loss counters; zero disables it.
 native_stats_interval_secs = 10
-# Per-frame timeout for writes to reliable stream transports.
+# Maximum write deadline for TCP/QUIC streams. KCP uses its native
+# no-progress watchdog unless `no_progress_close_ms` is zero.
 stream_write_timeout_ms = 1000
 # Maximum time to establish and acknowledge all required QUIC v2 class lanes.
 quic_session_setup_timeout_ms = 10000
@@ -445,8 +446,8 @@ strict_max_catchup_bytes = 524288
 strict_max_snapshot_transfer_bytes = 67108864
 # Minimum spacing between strict startup/heal history-election attempts.
 strict_bootstrap_retry_interval_ms = 500
-# Compatibility setting retained for older configurations. Steady-state strict
-# repair is now evidence-driven; there is no periodic history-catchup poll.
+# Base cadence for directed, evidence-driven V4 durable-head retries. They
+# continue while the strict repository log is quiet until exact acknowledgement.
 strict_steady_state_catchup_interval_ms = 5000
 # Per-next-hop strict bulk pacing. Byte budgets are shared by all topics and
 # logical destinations whose current route uses the same first hop.

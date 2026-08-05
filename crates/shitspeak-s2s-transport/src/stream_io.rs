@@ -130,6 +130,10 @@ pub(crate) struct StreamPumpConfig {
     idle_ping_interval: Duration,
     native_stats_interval: Duration,
     stream_write_timeout: Duration,
+    /// KCP closes stalled writes through its own no-progress watchdog. `None`
+    /// means this is not a KCP stream; `Some(Duration::ZERO)` deliberately
+    /// disables that watchdog and retains the generic stream deadline.
+    kcp_no_progress_timeout: Option<Duration>,
     compression: CompressionConfig,
     /// Cap on how many in-flight pings we remember. Older entries are
     /// dropped when the buffer fills, preventing unbounded memory if pongs
@@ -151,6 +155,7 @@ impl StreamPumpConfig {
         idle_ping_interval: Duration,
         native_stats_interval: Duration,
         stream_write_timeout: Duration,
+        kcp_no_progress_timeout: Option<Duration>,
         compression: CompressionConfig,
         max_pending_pings: usize,
     ) -> Self {
@@ -163,6 +168,7 @@ impl StreamPumpConfig {
             idle_ping_interval,
             native_stats_interval,
             stream_write_timeout,
+            kcp_no_progress_timeout,
             compression,
             max_pending_pings,
             quic_v2_lane: None,
@@ -1355,7 +1361,11 @@ fn quic_delivery_lane(class: MessageClass) -> QuicDeliveryLane {
 }
 
 fn stream_write_deadline(cfg: &StreamPumpConfig, expires_at: Option<Instant>) -> Option<Duration> {
-    let mut deadline = (!cfg.stream_write_timeout.is_zero()).then_some(cfg.stream_write_timeout);
+    let kcp_no_progress_timeout_enabled = cfg
+        .kcp_no_progress_timeout
+        .is_some_and(|timeout| !timeout.is_zero());
+    let mut deadline = (!kcp_no_progress_timeout_enabled && !cfg.stream_write_timeout.is_zero())
+        .then_some(cfg.stream_write_timeout);
     if let Some(expires_at) = expires_at {
         let remaining = expires_at.saturating_duration_since(Instant::now());
         deadline = Some(deadline.map_or(remaining, |deadline| deadline.min(remaining)));
@@ -1830,9 +1840,44 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(30),
             Duration::from_secs(1),
+            None,
             CompressionConfig::default(),
             4,
         )
+    }
+
+    #[test]
+    fn kcp_stream_write_uses_native_no_progress_timeout() {
+        let mut cfg = test_stream_cfg();
+        cfg.transport = TransportKind::Kcp;
+        cfg.stream_write_timeout = Duration::from_millis(1);
+        cfg.kcp_no_progress_timeout = Some(Duration::from_millis(1_500));
+
+        assert_eq!(
+            stream_write_deadline(&cfg, None),
+            None,
+            "the generic stream deadline must not cancel KCP before its native no-progress watchdog"
+        );
+
+        let expires_at = Instant::now() + Duration::from_secs(1);
+        assert!(
+            stream_write_deadline(&cfg, Some(expires_at)).is_some(),
+            "an explicit message expiry remains an intentional application deadline"
+        );
+    }
+
+    #[test]
+    fn kcp_stream_write_falls_back_to_generic_timeout_when_native_watchdog_is_disabled() {
+        let mut cfg = test_stream_cfg();
+        cfg.transport = TransportKind::Kcp;
+        cfg.stream_write_timeout = Duration::from_millis(1);
+        cfg.kcp_no_progress_timeout = Some(Duration::ZERO);
+
+        assert_eq!(
+            stream_write_deadline(&cfg, None),
+            Some(Duration::from_millis(1)),
+            "disabling KCP's native watchdog must not disable every stalled-write escape hatch"
+        );
     }
 
     #[tokio::test]

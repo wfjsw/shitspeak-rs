@@ -817,6 +817,7 @@ async fn install_quic_v2_session(
         inner.cfg().idle_ping_interval(),
         inner.cfg().native_stats_interval(),
         inner.cfg().stream_write_timeout(),
+        None,
         inner.cfg().compression_config().clone(),
         inner.cfg().max_pending_pings(),
     )

@@ -1,4 +1,4 @@
-//! Focused protocol-v3 repair tests.
+//! Focused cumulative-repair tests for supported strict participants.
 //!
 //! These tests deliberately exercise the pairwise repair seam without
 //! starting the background strict runtime. That keeps timer traffic out of
@@ -15,15 +15,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     catchup::{
-        apply_response, recv_v3_clock_probe_resp, recv_v3_history_probe_resp,
-        recv_v3_terminal_sync_ack, recv_v3_terminal_sync_page, recv_v3_terminal_sync_req,
-        register_v3_clock_probe_retry_if_current, register_v3_history_probe_retry_if_current,
-        request_v3_clock_probe, request_v3_history_probe, request_v3_terminal_sync,
-        request_v3_terminal_sync_toward, respond_to_request, resume_deferred_v3_admissions,
-        retry_v3_terminal_transmissions, send_v3_metadata_control,
+        apply_response, recv_v3_clock_probe_req, recv_v3_clock_probe_resp,
+        recv_v3_history_probe_resp, recv_v3_terminal_sync_ack, recv_v3_terminal_sync_page,
+        recv_v3_terminal_sync_req, register_v3_clock_probe_retry_if_current,
+        register_v3_history_probe_retry_if_current, request_v3_clock_probe,
+        request_v3_history_probe, request_v3_terminal_sync, request_v3_terminal_sync_toward,
+        respond_to_request, resume_deferred_v3_admissions, retry_v3_terminal_transmissions,
+        send_v3_metadata_control,
     },
     runtime::{
-        HistoryRank, STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V3,
+        HistoryRank, STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V4,
         STRICT_PROTOCOL_VERSION_V5, STRICT_V3_CONTROL_MAX_ENCODED_BYTES, StrictRuntime,
         is_v3_metadata_control, make_op_id,
     },
@@ -66,11 +67,11 @@ fn runtime(
     let net = MockNet::new(self_id, vec![1, 2]);
     net.set_epoch(1, 11);
     net.set_epoch(2, 22);
-    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
-    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
     net.set_peer_strict_replication_protocol_version(
         if self_id == 1 { 2 } else { 1 },
-        STRICT_PROTOCOL_VERSION_V3,
+        STRICT_PROTOCOL_VERSION_V4,
     );
     let repo = CountingStrictRepo::new();
     let rt = StrictRuntime::new(
@@ -1104,10 +1105,10 @@ async fn history_election_syncs_from_the_winner_not_the_last_responder() {
     net.set_epoch(1, 11);
     net.set_epoch(2, 22);
     net.set_epoch(3, 33);
-    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
-    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
-    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V3);
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V4);
     let rt = StrictRuntime::new(
         CountingStrictRepo::new(),
         1,
@@ -1229,14 +1230,15 @@ async fn history_election_promotes_an_existing_periodic_probe_without_omitting_i
     net.set_epoch(2, 22);
     net.set_epoch(3, 33);
     // New rounds require the cumulative V5 cluster floor. Keep the endpoint
-    // advertisements at V3 so this remains a focused V3 repair-coordinator
-    // test rather than accidentally disabling bootstrap origination.
+    // advertisements at the V4 support floor so this remains a focused
+    // cumulative-repair coordinator test rather than accidentally disabling
+    // bootstrap origination.
     net.set_strict_replication_protocol_version(
         crate::replications::protocol::STRICT_PROTOCOL_VERSION_CURRENT,
     );
-    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
-    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V3);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V4);
     let rt = StrictRuntime::new(
         CountingStrictRepo::new(),
         1,
@@ -3438,6 +3440,60 @@ async fn lost_clock_probe_retries_one_nonce_while_terminal_transfer_remains_acti
 }
 
 #[tokio::test]
+async fn duplicate_v4_pairwise_clock_probe_request_replays_one_clock_response() {
+    let (rt, net) = runtime(2, ReplicationConfig::default());
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+    net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V4);
+    let request = StrictClockProbeReq {
+        src_node: 1,
+        expected_responder_boot_epoch: 22,
+        request_nonce: 7,
+        requester_clock: 100,
+        reason: StrictCatchupReason::Admission as i32,
+    };
+
+    recv_v3_clock_probe_req(&rt, 1, 11, request.clone()).await;
+    let first = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 1,
+                body: StrictBody::ClockProbeResp(response),
+                ..
+            } => Some(response),
+            _ => None,
+        })
+        .expect("first clock probe response");
+    let clock_after_first = rt.state.lock().clock;
+
+    recv_v3_clock_probe_req(&rt, 1, 11, request).await;
+    let second = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 1,
+                body: StrictBody::ClockProbeResp(response),
+                ..
+            } => Some(response),
+            _ => None,
+        })
+        .expect("duplicate clock probe response");
+
+    assert_eq!(
+        second, first,
+        "duplicate retries must replay the same proof"
+    );
+    assert_eq!(
+        rt.state.lock().clock,
+        clock_after_first,
+        "a duplicate probe must not ratchet the responder clock"
+    );
+}
+
+#[tokio::test]
 async fn equal_cut_history_election_response_also_satisfies_admission_history() {
     let (rt, net) = runtime(1, ReplicationConfig::default());
     rt.seed_membership_snapshot([MemberIncarnation::new(1, 11), MemberIncarnation::new(2, 22)]);
@@ -3578,10 +3634,10 @@ async fn newer_promoted_admission_metadata_resumes_after_election_closes() {
     net.set_epoch(1, 11);
     net.set_epoch(2, 22);
     net.set_epoch(3, 33);
-    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V3);
-    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
-    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V3);
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V4);
     let rt = StrictRuntime::new(
         CountingStrictRepo::new(),
         1,

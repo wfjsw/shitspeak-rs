@@ -52,14 +52,15 @@ S2S state has its own root:
 persistence_dir = "state/s2s"
 ```
 
-Strict replication uses one cumulative capability version, currently `2`.
-The local LSA starts at version `0`; it promotes automatically only after all
-of these conditions hold:
+Strict replication accepts cumulative participant capabilities `4` or newer;
+this binary advertises `6`. The local LSA starts at participant version `0` and
+promotes automatically only after all of these conditions hold:
 
 - `s2s.persistence_dir` passes the durable-state probe and boot-epoch check.
 - The production S2S manager has declared and successfully registered its
   complete expected strict-topic set (Channel and Ban, plus the pre-release
-  workload when enabled), and every runtime reports support for version `2`.
+  workload when enabled), and every runtime reports support for the durable
+  proposal/snapshot contract.
   Valid lazy channel scopes are probed when they register as well.
 - The local S2S identity can construct a bounded, authenticated v2
   origin-proof envelope.
@@ -68,8 +69,11 @@ of these conditions hold:
   fits `strict_max_catchup_bytes`, the transport payload budget, and that
   48 KiB protocol ceiling.
 
-Therefore a writable `s2s.persistence_dir` by itself does not enable strict
-v2 when server repositories are in memory (`blob_storage_dir` is omitted).
+The durable proposal/snapshot contract is still labeled `v2` in its internal
+wire messages; it is cumulative protocol machinery used by V4+ participants,
+not an accepted participant capability. Therefore a writable
+`s2s.persistence_dir` by itself does not enable strict replication when server
+repositories are in memory (`blob_storage_dir` is omitted).
 There is no capability setting to flip manually. Normal shared-S2S storage
 probe recovery re-promotes an already registered node automatically when no
 repository capability loss is latched. A terminal-journal failure is

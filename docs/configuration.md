@@ -595,6 +595,8 @@ packet_loss_ewma_alpha = 0.02
 ping_interval_secs = 2
 idle_ping_interval_secs = 10
 native_stats_interval_secs = 10
+# Maximum write deadline for TCP/QUIC streams. KCP uses its native
+# no-progress watchdog unless `no_progress_close_ms` is zero.
 stream_write_timeout_ms = 1000
 # Deadline for establishing and acknowledging all required QUIC v2 lanes.
 quic_session_setup_timeout_ms = 10000
@@ -762,8 +764,8 @@ strict_max_catchup_bytes = 524288
 # Channel/Ban state, not just one snapshot.
 strict_max_snapshot_transfer_bytes = 67108864
 strict_bootstrap_retry_interval_ms = 500
-# Retained for configuration compatibility; periodic steady-state polling is
-# disabled in favor of evidence-driven repair.
+# Base cadence for directed, evidence-driven V4 durable-head retries. They
+# continue while the strict repository log is quiet until exact acknowledgement.
 strict_steady_state_catchup_interval_ms = 5000
 pending_propose_ttl_ms = 20000
 recovery_ttl_ms = 10000
@@ -939,11 +941,16 @@ and neither may exceed 100. Configure `repair_max_extra_copies_per_frame` only
 in the supported `0..2` range.
 
 `strict_bootstrap_retry_interval_ms` gates strict startup and partition-heal
-history-election retries. `strict_steady_state_catchup_interval_ms` and
-`owner_anti_entropy_interval_ms` remain accepted for configuration
-compatibility, but no longer schedule background catchup. Steady-state repair
-is driven by observed gaps or stalls. Owner replication frames are retained on
-an end-to-end acknowledged overlay lane between those repair events.
+history-election retries. `strict_steady_state_catchup_interval_ms` is the
+base cadence for directed, evidence-driven V4 durable-head retries. It is not
+a periodic history-catchup poll: a retry is scheduled only for a live peer
+incarnation that has not acknowledged the exact current repository and
+terminal head. Those retries continue even when the strict repository log has
+no mutations, and stop after the exact acknowledgement or route/incarnation
+loss. Observed gaps and stalls are additional repair signals.
+`owner_anti_entropy_interval_ms` remains accepted for configuration
+compatibility; owner replication frames are retained on an end-to-end
+acknowledged overlay lane between repair events.
 
 `transport_ttl_ms`, `repair_transport_ttl_ms`, and `repair_request_ttl_ms` are
 the remote S2S voice delivery budget. They are not a local listener playout

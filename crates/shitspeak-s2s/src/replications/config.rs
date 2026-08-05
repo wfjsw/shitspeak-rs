@@ -64,7 +64,10 @@ pub struct ReplicationConfig {
     /// this throttle dedupes burst events so we don't fan out duplicate
     /// requests when several peers join in quick succession after a heal.
     strict_bootstrap_retry_interval: Duration,
-    /// Minimum interval between steady-state catchup probes after bootstrap.
+    /// Base cadence for evidence-driven V4 durable-head retries. A directed
+    /// retry exists only while a live peer incarnation lacks acknowledgement
+    /// of the exact current head, and remains active while the repository log
+    /// is quiet.
     strict_steady_state_catchup_interval: Duration,
     /// Maximum encoded bulk bytes awaiting acknowledgement through one
     /// transport next hop across all strict topics and logical destinations.
@@ -556,6 +559,10 @@ pub struct ReplicationTuning {
     pub strict_max_snapshot_transfer_bytes: usize,
     #[serde(default = "default_strict_bootstrap_retry_interval_ms")]
     pub strict_bootstrap_retry_interval_ms: u64,
+    /// Base cadence for evidence-driven V4 durable-head retries. A directed
+    /// retry exists only while a live peer incarnation lacks acknowledgement
+    /// of the exact current head, and remains active while the repository log
+    /// is quiet.
     #[serde(default = "default_strict_steady_state_catchup_interval_ms")]
     pub strict_steady_state_catchup_interval_ms: u64,
     #[serde(default = "default_strict_bulk_max_in_flight_bytes_per_next_hop")]
@@ -672,6 +679,10 @@ impl ReplicationTuning {
             (
                 "strict_transport_ttl_max_ms",
                 self.strict_transport_ttl_max_ms,
+            ),
+            (
+                "strict_steady_state_catchup_interval_ms",
+                self.strict_steady_state_catchup_interval_ms,
             ),
         ] {
             if value == 0 {
@@ -1056,6 +1067,19 @@ mod tests {
             ..ReplicationTuning::default()
         };
         assert!(overflow_safe.validate().is_err());
+    }
+
+    #[test]
+    fn strict_steady_state_catchup_interval_rejects_zero() {
+        let tuning = ReplicationTuning {
+            strict_steady_state_catchup_interval_ms: 0,
+            ..ReplicationTuning::default()
+        };
+
+        assert_eq!(
+            tuning.validate().unwrap_err(),
+            "s2s.replications.strict_steady_state_catchup_interval_ms must be greater than zero"
+        );
     }
 
     #[test]

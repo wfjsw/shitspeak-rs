@@ -13,8 +13,8 @@ use super::super::metrics::{
     self, CatchupReason, StrictCatchupSessionEvent, StrictCatchupSessionOutcome,
 };
 use super::super::proto::{
-    StrictCatchupReason, StrictTerminalCut, StrictTerminalPageKind, StrictTerminalState,
-    StrictTerminalSyncPage,
+    StrictCatchupReason, StrictClockProbeResp, StrictTerminalCut, StrictTerminalPageKind,
+    StrictTerminalState, StrictTerminalSyncPage,
 };
 use super::session_reducer::{
     self, Cut as ReducerCut, Effect as SessionEffect, Event as SessionEvent, PeerEpoch,
@@ -107,6 +107,14 @@ struct ProbeNonce {
     repair_reason: Option<i32>,
     expires_at: Instant,
 }
+
+#[derive(Clone, Debug)]
+struct CachedClockProbeResponse {
+    response: StrictClockProbeResp,
+    expires_at: Instant,
+}
+
+const CLOCK_PROBE_RESPONSE_CACHE_PER_PEER: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct AcceptedHistoryProbe {
@@ -460,6 +468,11 @@ pub(super) struct SyncV3State {
     // chain position merely because its journal lineage matches.
     source_transition_history: HashMap<PeerIncarnation, BTreeMap<u64, PendingSourceTransition>>,
     clock_nonces: HashMap<PeerIncarnation, ProbeNonce>,
+    // A requester retries one clock-probe nonce until it either receives the
+    // response or expires its local obligation. Replaying the first response
+    // prevents route-diverse copies from advancing the responder clock and
+    // allocating a distinct retained transport identity on every retry.
+    clock_probe_responses: HashMap<PeerIncarnation, Vec<CachedClockProbeResponse>>,
     history_nonces: HashMap<PeerIncarnation, ProbeNonce>,
     clients: HashMap<PeerIncarnation, ClientSession>,
     // A client remains lifecycle-active while its final ACK is in flight.
@@ -489,6 +502,7 @@ impl Default for SyncV3State {
             pending_source_transitions: HashMap::new(),
             source_transition_history: HashMap::new(),
             clock_nonces: HashMap::new(),
+            clock_probe_responses: HashMap::new(),
             history_nonces: HashMap::new(),
             clients: HashMap::new(),
             finalizing_clients: HashMap::new(),
@@ -637,6 +651,10 @@ impl SyncV3State {
         self.completed_responders
             .retain(|_, completed| completed.expires_at > now);
         self.clock_nonces.retain(|_, nonce| nonce.expires_at > now);
+        self.clock_probe_responses.retain(|_, responses| {
+            responses.retain(|response| response.expires_at > now);
+            !responses.is_empty()
+        });
         self.history_nonces
             .retain(|_, nonce| nonce.expires_at > now);
     }
@@ -979,6 +997,42 @@ impl SyncV3State {
         }
         self.clock_nonces.remove(&peer);
         true
+    }
+
+    pub(super) fn cached_clock_probe_response(
+        &mut self,
+        peer: PeerIncarnation,
+        nonce: u64,
+        ttl: Duration,
+    ) -> Option<StrictClockProbeResp> {
+        let now = Instant::now();
+        self.expire(now);
+        let response = self
+            .clock_probe_responses
+            .get_mut(&peer)?
+            .iter_mut()
+            .find(|response| response.response.request_nonce == nonce)?;
+        response.expires_at = now + ttl;
+        Some(response.response.clone())
+    }
+
+    pub(super) fn remember_clock_probe_response(
+        &mut self,
+        peer: PeerIncarnation,
+        response: StrictClockProbeResp,
+        ttl: Duration,
+    ) {
+        let now = Instant::now();
+        self.expire(now);
+        let responses = self.clock_probe_responses.entry(peer).or_default();
+        responses.retain(|cached| cached.response.request_nonce != response.request_nonce);
+        if responses.len() == CLOCK_PROBE_RESPONSE_CACHE_PER_PEER {
+            responses.remove(0);
+        }
+        responses.push(CachedClockProbeResponse {
+            response,
+            expires_at: now + ttl,
+        });
     }
 
     #[cfg(test)]
@@ -1548,6 +1602,8 @@ impl SyncV3State {
         self.source_transition_history
             .retain(|peer, _| peer.node != node);
         self.clock_nonces.retain(|peer, _| peer.node != node);
+        self.clock_probe_responses
+            .retain(|peer, _| peer.node != node);
         self.history_nonces.retain(|peer, _| peer.node != node);
         self.clients.retain(|peer, session| {
             let retain = peer.node != node;

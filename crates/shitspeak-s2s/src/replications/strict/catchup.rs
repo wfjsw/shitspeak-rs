@@ -3860,23 +3860,49 @@ pub(super) async fn recv_v3_clock_probe_req<R: StrictReplicable>(
     let Some(reason) = CatchupReason::from_v3_wire(req.reason) else {
         return;
     };
-    if v3_peer(rt, from, epoch).is_none()
-        || node_from_u32(req.src_node) != Some(from)
+    let Some(peer) = v3_peer(rt, from, epoch) else {
+        return;
+    };
+    if node_from_u32(req.src_node) != Some(from)
         || req.expected_responder_boot_epoch != rt.boot_epoch
         || req.request_nonce == 0
     {
         return;
     }
+    let cached_response = {
+        rt.v3_sync.lock().cached_clock_probe_response(
+            peer,
+            req.request_nonce,
+            rt.cfg.pending_propose_ttl(),
+        )
+    };
+    if let Some(response) = cached_response {
+        let _ = send_v3_metadata_control(
+            rt,
+            from,
+            StrictBody::ClockProbeResp(response),
+            reason,
+            CatchupPhase::Metadata,
+        )
+        .await;
+        return;
+    }
+    let response = StrictClockProbeResp {
+        responder_node: rt.self_id as u32,
+        expected_requester_boot_epoch: epoch,
+        request_nonce: req.request_nonce,
+        src_clock: rt.advance_v3_clock_probe(from, epoch, req.requester_clock),
+        reason: req.reason,
+    };
+    rt.v3_sync.lock().remember_clock_probe_response(
+        peer,
+        response.clone(),
+        rt.cfg.pending_propose_ttl(),
+    );
     let _ = send_v3_metadata_control(
         rt,
         from,
-        StrictBody::ClockProbeResp(StrictClockProbeResp {
-            responder_node: rt.self_id as u32,
-            expected_requester_boot_epoch: epoch,
-            request_nonce: req.request_nonce,
-            src_clock: rt.advance_v3_clock_probe(from, epoch, req.requester_clock),
-            reason: req.reason,
-        }),
+        StrictBody::ClockProbeResp(response),
         reason,
         CatchupPhase::Metadata,
     )
@@ -7093,8 +7119,8 @@ mod tests {
         },
         strict::{
             runtime::{
-                HistoryRank, STRICT_PROTOCOL_VERSION_V3, STRICT_PROTOCOL_VERSION_V4,
-                STRICT_PROTOCOL_VERSION_V5, StrictRuntime, make_op_id,
+                HistoryRank, STRICT_PROTOCOL_VERSION_V4, STRICT_PROTOCOL_VERSION_V5, StrictRuntime,
+                make_op_id,
             },
             sync_v3::PeerIncarnation,
             terminal_journal::{FrozenTarget, TerminalJournal, TerminalResolver},
@@ -7112,17 +7138,13 @@ mod tests {
         Arc<CountingStrictRepo>,
     ) {
         let net = MockNet::new(self_id, vec![1, 2]);
-        // New rounds require a v5 cluster floor even when the repository
-        // exercises the v2 terminal/snapshot contract. Keep this shared
-        // fixture modern-capable; individual legacy tests explicitly lower
-        // the relevant peer advertisement below.
+        // V4 participants retain the internal V2 terminal/snapshot contract.
+        // Keep the shared fixture participant-supported; individual legacy
+        // rejection tests explicitly lower the relevant peer advertisement.
         net.set_strict_replication_protocol_version(super::STRICT_PROTOCOL_VERSION_V5);
-        net.set_local_strict_replication_protocol_version(Some(super::STRICT_PROTOCOL_VERSION_V2));
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
         for peer in [1, 2, 3] {
-            net.set_peer_strict_replication_protocol_version(
-                peer,
-                super::STRICT_PROTOCOL_VERSION_V2,
-            );
+            net.set_peer_strict_replication_protocol_version(peer, STRICT_PROTOCOL_VERSION_V4);
         }
         let repo = CountingStrictRepo::new();
         let rt = StrictRuntime::new(
@@ -7726,8 +7748,8 @@ mod tests {
         *repo.state.lock() = (1, vec![(1, 1, None)]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
         assert!(!rt.peer_incarnation_is_admitted(2, 1));
 
@@ -7800,8 +7822,8 @@ mod tests {
         *repo.state.lock() = (1, vec![(1, 1, None)]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
 
         let mut checkpointed = TerminalJournal::in_memory("channels");
@@ -7862,8 +7884,8 @@ mod tests {
         let (rt, net, _repo) = test_runtime(1, ReplicationConfig::default());
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
-        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
 
         super::request_v3_terminal_sync(&rt, 2, super::StrictCatchupReason::TerminalFence).await;
@@ -8572,8 +8594,8 @@ mod tests {
     async fn terminal_only_pages_continue_across_global_floor_downgrade() {
         let cfg = ReplicationConfig::default().with_strict_max_catchup_ops(1);
         let (source, source_net, _) = test_runtime(1, cfg);
-        source_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        source_net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
+        source_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        source_net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
         let first_id = make_op_id(1, 1, 1);
         let second_id = make_op_id(1, 1, 2);
         source
@@ -8611,8 +8633,8 @@ mod tests {
         assert_eq!(first_page.next_chunk_token, 17);
 
         let (sink, sink_net, _) = test_runtime(2, ReplicationConfig::default());
-        sink_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V3);
+        sink_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V4);
         source_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         sink_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
         apply_response(&sink, 1, first_page).await;
@@ -8878,10 +8900,10 @@ mod tests {
         for net in [&source_net, &sink_net] {
             net.set_epoch(1, 1);
             net.set_epoch(2, 1);
-            net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+            net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
         }
-        source_net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
-        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V3);
+        source_net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V4);
 
         let frozen_targets = vec![FrozenTarget::new(1, 1), FrozenTarget::new(2, 1)];
         let resolver = TerminalResolver::new(1, 1);
@@ -9509,10 +9531,10 @@ mod tests {
         let expected_log = source_repo.log();
         let (sink, sink_net, sink_repo) = test_runtime(2, cfg);
         for net in [&source_net, &sink_net] {
-            net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
+            net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
         }
-        source_net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V3);
-        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V3);
+        source_net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V4);
         begin_snapshot_fetch(&sink, 96);
 
         respond_to_request(&source, 2, force_snapshot_request()).await;
@@ -10153,8 +10175,8 @@ mod tests {
     async fn admission_fallback_snapshot_received_while_idle_rearms_history_election() {
         let (sink, sink_net, sink_repo) = test_runtime(2, ReplicationConfig::default());
         sink_net.set_epoch(1, 11);
-        sink_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V3);
+        sink_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V4);
         let peer = PeerIncarnation::new(1, 11);
         let request = sink
             .v3_history
@@ -10252,8 +10274,8 @@ mod tests {
             let (sink, sink_net, sink_repo) = test_runtime(2, ReplicationConfig::default());
             sink_net.set_epoch(1, 11);
             sink_net
-                .set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V3));
-            sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V3);
+                .set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+            sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V4);
             let stale_peer = PeerIncarnation::new(1, 11);
             let request = sink
                 .v3_history
