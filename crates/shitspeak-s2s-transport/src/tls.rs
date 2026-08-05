@@ -19,6 +19,10 @@ use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use super::error::ConfigError;
 use super::identity::NodeIdentity;
 
+fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
 /// Build the mTLS pair (server, client) used by all stream transports.
 pub fn build_tls_configs(
     identity: &NodeIdentity,
@@ -51,14 +55,16 @@ pub(crate) fn verify_peer_cert_chain(
 }
 
 fn build_server(identity: &NodeIdentity) -> Result<ServerConfig, ConfigError> {
-    let verifier = WebPkiClientVerifier::builder(identity.roots().clone())
-        .build()
-        .map_err(|e| ConfigError::X509(format!("client verifier: {e}")))?;
+    let verifier =
+        WebPkiClientVerifier::builder_with_provider(identity.roots().clone(), crypto_provider())
+            .build()
+            .map_err(|e| ConfigError::X509(format!("client verifier: {e}")))?;
 
     let key = clone_key(identity.key());
     let chain = identity.chain().to_vec();
 
-    let cfg = ServerConfig::builder()
+    let cfg = ServerConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()?
         .with_client_cert_verifier(verifier)
         .with_single_cert(chain, key)?;
     Ok(cfg)
@@ -69,7 +75,8 @@ fn build_client(identity: &NodeIdentity) -> Result<ClientConfig, ConfigError> {
     let key = clone_key(identity.key());
     let chain = identity.chain().to_vec();
 
-    let cfg = ClientConfig::builder()
+    let cfg = ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(chain, key)?;
@@ -101,9 +108,10 @@ struct CaPinnedVerifier {
 
 impl CaPinnedVerifier {
     fn new(roots: Arc<RootCertStore>) -> Self {
-        let inner = rustls::client::WebPkiServerVerifier::builder(roots)
-            .build()
-            .expect("server verifier builder");
+        let inner =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(roots, crypto_provider())
+                .build()
+                .expect("server verifier builder");
         Self { inner }
     }
 }
@@ -237,17 +245,8 @@ mod tests {
         NodeIdentity::load(&ca_path, &cert_path, &key_path).unwrap()
     }
 
-    fn install_default_provider() {
-        use std::sync::Once;
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        });
-    }
-
     #[test]
-    fn build_configs_succeeds() {
-        install_default_provider();
+    fn build_configs_succeeds_without_process_default_crypto_provider() {
         let dir = TempDir::new().unwrap();
         let id = mint(&dir, "10");
         let (_server, _client) = build_tls_configs(&id).unwrap();
@@ -255,7 +254,6 @@ mod tests {
 
     #[test]
     fn peer_chain_must_be_signed_by_configured_s2s_ca() {
-        install_default_provider();
         let trusted_dir = TempDir::new().unwrap();
         let untrusted_dir = TempDir::new().unwrap();
         let trusted = mint(&trusted_dir, "10");
