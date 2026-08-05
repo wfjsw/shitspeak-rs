@@ -619,6 +619,18 @@
           "instant": true,
           "range": false,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max by (node) (shitspeak_s2s_node_strict_replication_protocol_version{job=~\"$job\"})",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "C"
         }
       ],
       "title": "Nodes",
@@ -638,7 +650,8 @@
             },
             "renameByName": {
               "Value #A": "info",
-              "Value #B": "alive"
+              "Value #B": "alive",
+              "Value #C": "strict replication protocol version"
             }
           }
         }
