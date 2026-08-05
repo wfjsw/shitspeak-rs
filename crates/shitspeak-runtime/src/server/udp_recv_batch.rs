@@ -53,6 +53,7 @@ impl VoiceUdpRecvBatch {
         })
     }
 
+    #[allow(dead_code)]
     fn first_buffer_mut(&mut self) -> &mut [u8] {
         self.buffers[0].as_mut_slice()
     }
