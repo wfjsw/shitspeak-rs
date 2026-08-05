@@ -4799,6 +4799,18 @@ async fn start_v3_repository_after_terminal<R: StrictReplicable>(
     } else {
         local_history.version
     };
+    if reason == StrictCatchupReason::HistoryElection
+        && !rt
+            .state
+            .lock()
+            .begin_history_election_snapshot_transfer(peer.node())
+    {
+        // The watchdog released this election while terminal synchronization
+        // was awaiting its final transition. Do not start an unowned history
+        // transfer; select a fresh donor instead.
+        rearm_history_election(rt);
+        return false;
+    }
     let Some(started) = rt.v3_history.lock().begin_transfer(
         peer,
         rank.version,
@@ -5115,6 +5127,13 @@ pub(super) async fn request_v3_terminal_sync_toward<R: StrictReplicable>(
     let wire = {
         let mut sync = rt.v3_sync.lock();
         if force_elected_checkpoint && !sync.force_checkpoint_from_zero(peer) {
+            if sync.coalesce_terminal_intent_if_active(peer, reason as i32, desired_cut) {
+                metrics::record_strict_catchup_session_event(
+                    metric_reason,
+                    StrictCatchupSessionEvent::Coalesced,
+                );
+                return;
+            }
             rearm_history_election(rt);
             return;
         }

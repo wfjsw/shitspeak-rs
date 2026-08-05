@@ -2824,6 +2824,25 @@ impl StrictState {
         }
     }
 
+    /// Give the repository transfer its own timeout after the elected source
+    /// has completed the prerequisite terminal synchronization.
+    pub(super) fn begin_history_election_snapshot_transfer(
+        &mut self,
+        peer: NodeIdentifier,
+    ) -> bool {
+        match &mut self.history_election_phase {
+            HistoryElectionPhase::FetchingSnapshot {
+                peer: expected_peer,
+                started_at,
+                ..
+            } if *expected_peer == peer => {
+                *started_at = Instant::now();
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn request_history_election(&mut self) {
         if matches!(
             self.history_election_phase,
@@ -16822,6 +16841,56 @@ mod tests {
                 Duration::from_secs(20),
             ),
             "terminal synchronization and snapshot transfer need a longer timeout than probing"
+        );
+    }
+
+    #[test]
+    fn history_election_restarts_snapshot_timeout_after_terminal_sync() {
+        let mut state = StrictState::new();
+        state.begin_history_election([2]);
+        let local_rank = HistoryRank {
+            version: 8,
+            freshness: 0,
+            runtime_started_at: 100,
+            node_id: 1,
+            terminal_repository_base_version: 0,
+        };
+        let remote_rank = HistoryRank {
+            version: 9,
+            freshness: 1,
+            runtime_started_at: 200,
+            node_id: 2,
+            terminal_repository_base_version: 0,
+        };
+        assert!(matches!(
+            state.record_history_probe_response(2, remote_rank, local_rank),
+            HistoryProbeResponseOutcome::FetchSnapshot(_)
+        ));
+
+        let snapshot_timeout = Duration::from_secs(20);
+        let now = Instant::now();
+        match &mut state.history_election_phase {
+            HistoryElectionPhase::FetchingSnapshot { started_at, .. } => {
+                // The elected source spent the initial transfer lease
+                // synchronizing its terminal checkpoint before repository
+                // transfer could begin.
+                *started_at = now - snapshot_timeout;
+            }
+            phase => panic!("expected elected snapshot fetch, got {phase:?}"),
+        }
+        assert!(state.history_election_timed_out(
+            now,
+            Duration::from_millis(500),
+            snapshot_timeout,
+        ));
+
+        // Beginning the repository transfer must receive its own full lease;
+        // otherwise terminal synchronization consumes the snapshot deadline.
+        assert!(state.begin_history_election_snapshot_transfer(2));
+
+        assert!(
+            !state.history_election_timed_out(now, Duration::from_millis(500), snapshot_timeout,),
+            "the repository transfer must not inherit the terminal-sync timeout"
         );
     }
 
