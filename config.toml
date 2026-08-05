@@ -89,9 +89,11 @@ max_routing_queue_age_ms = 250
 # Linux sendmmsg WouldBlock retry budget; 0 fails fast. Ignored on non-Linux.
 udp_send_retry_budget_ms = 2
 
-# Voice fan-out dispatch policy. The default calibrates separate profiles for
-# payloads up to and including 512 bytes and above 512 bytes before the server
-# starts listening. Dispatch changes require a restart.
+# Voice fan-out dispatch policy. The default calibrates separate, piecewise
+# profiles for payloads up to and including 512 bytes and above 512 bytes
+# before the server starts listening. Each calibrated breakpoint jointly sets
+# a Rayon worker cap and minimum recipient-run size. Dispatch changes require
+# a restart.
 [voice.dispatch]
 mode = "startup_calibrated" # startup_calibrated, sequential, fixed
 # Fixed mode uses these values instead of benchmarking at startup. The value

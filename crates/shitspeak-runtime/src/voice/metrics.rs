@@ -566,6 +566,16 @@ static DISPATCH_TUNING_SMALL_THRESHOLD: AtomicU64 = AtomicU64::new(512);
 static DISPATCH_TUNING_SMALL_MIN_LEN: AtomicU64 = AtomicU64::new(256);
 static DISPATCH_TUNING_LARGE_THRESHOLD: AtomicU64 = AtomicU64::new(512);
 static DISPATCH_TUNING_LARGE_MIN_LEN: AtomicU64 = AtomicU64::new(256);
+const DISPATCH_TUNING_PAYLOAD_CLASS_COUNT: usize = 2;
+const DISPATCH_TUNING_BREAKPOINT_SETTING_COUNT: usize = 3;
+static DISPATCH_TUNING_BREAKPOINT_COUNTS: [AtomicU64; DISPATCH_TUNING_PAYLOAD_CLASS_COUNT] =
+    [const { AtomicU64::new(0) }; DISPATCH_TUNING_PAYLOAD_CLASS_COUNT];
+static DISPATCH_TUNING_BREAKPOINTS: [[[AtomicU64; DISPATCH_TUNING_BREAKPOINT_SETTING_COUNT];
+    super::dispatch_tuning::MAX_RAYON_DISPATCH_BREAKPOINTS];
+    DISPATCH_TUNING_PAYLOAD_CLASS_COUNT] = [const {
+    [const { [const { AtomicU64::new(0) }; DISPATCH_TUNING_BREAKPOINT_SETTING_COUNT] };
+        super::dispatch_tuning::MAX_RAYON_DISPATCH_BREAKPOINTS]
+}; DISPATCH_TUNING_PAYLOAD_CLASS_COUNT];
 static DISPATCH_TUNING_SOURCE: AtomicU64 = AtomicU64::new(3);
 static DISPATCH_TUNING_CALIBRATION_DURATION_US: AtomicU64 = AtomicU64::new(0);
 static PIPELINE_STAGE_EVENTS: [[AtomicU64; VOICE_PIPELINE_STAGE_COUNT]; VOICE_PIPELINE_PATH_COUNT] =
@@ -1027,6 +1037,30 @@ pub(crate) fn record_dispatch_tuning(plan: VoiceDispatchPlan, calibration_durati
         plan.large_payload().rayon_min_len() as u64,
         Ordering::Relaxed,
     );
+    for (payload_class, profile) in [plan.small_payload(), plan.large_payload()]
+        .into_iter()
+        .enumerate()
+    {
+        let breakpoints = profile.breakpoints();
+        DISPATCH_TUNING_BREAKPOINT_COUNTS[payload_class]
+            .store(breakpoints.len() as u64, Ordering::Relaxed);
+        for breakpoint_index in 0..super::dispatch_tuning::MAX_RAYON_DISPATCH_BREAKPOINTS {
+            let values = breakpoints
+                .get(breakpoint_index)
+                .map(|breakpoint| {
+                    [
+                        breakpoint.fanout_threshold() as u64,
+                        breakpoint.rayon_max_workers() as u64,
+                        breakpoint.rayon_min_len() as u64,
+                    ]
+                })
+                .unwrap_or([0; DISPATCH_TUNING_BREAKPOINT_SETTING_COUNT]);
+            for (setting_index, value) in values.into_iter().enumerate() {
+                DISPATCH_TUNING_BREAKPOINTS[payload_class][breakpoint_index][setting_index]
+                    .store(value, Ordering::Relaxed);
+            }
+        }
+    }
     DISPATCH_TUNING_SOURCE.store(plan.source().metric_value(), Ordering::Relaxed);
     DISPATCH_TUNING_CALIBRATION_DURATION_US.store(
         calibration_duration.as_micros().min(u64::MAX as u128) as u64,
@@ -1449,6 +1483,30 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             ));
         }
     }
+    for (payload_class_index, payload_class) in ["le_512", "gt_512"].into_iter().enumerate() {
+        let breakpoint_count =
+            DISPATCH_TUNING_BREAKPOINT_COUNTS[payload_class_index].load(Ordering::Relaxed) as usize;
+        for breakpoint_index in 0..breakpoint_count {
+            for (setting_index, setting) in
+                ["fanout_threshold", "rayon_max_workers", "rayon_min_len"]
+                    .into_iter()
+                    .enumerate()
+            {
+                samples.push(PrometheusSample::new(
+                    "shitspeak_voice_dispatch_breakpoint",
+                    vec![
+                        ("payload_class".to_owned(), payload_class.to_owned()),
+                        ("breakpoint".to_owned(), breakpoint_index.to_string()),
+                        ("setting".to_owned(), setting.to_owned()),
+                        ("source".to_owned(), dispatch_tuning_source.to_owned()),
+                    ],
+                    DISPATCH_TUNING_BREAKPOINTS[payload_class_index][breakpoint_index]
+                        [setting_index]
+                        .load(Ordering::Relaxed) as f64,
+                ));
+            }
+        }
+    }
     samples.push(PrometheusSample::new(
         "shitspeak_voice_dispatch_calibration_duration_seconds",
         vec![("source".to_owned(), dispatch_tuning_source.to_owned())],
@@ -1715,6 +1773,33 @@ mod tests {
                 ],
             ),
             256.0
+        );
+        assert_eq!(
+            sample_value(
+                &samples,
+                "shitspeak_voice_dispatch_breakpoint",
+                &[
+                    ("payload_class", "le_512"),
+                    ("breakpoint", "0"),
+                    ("setting", "rayon_min_len"),
+                    ("source", "fallback"),
+                ],
+            ),
+            256.0
+        );
+        assert_eq!(
+            sample_value(
+                &samples,
+                "shitspeak_voice_dispatch_breakpoint",
+                &[
+                    ("payload_class", "le_512"),
+                    ("breakpoint", "0"),
+                    ("setting", "rayon_max_workers"),
+                    ("source", "fallback"),
+                ],
+            ),
+            0.0,
+            "zero denotes the legacy unlimited worker cap"
         );
         assert_eq!(
             sample_value(

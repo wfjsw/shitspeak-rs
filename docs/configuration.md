@@ -291,13 +291,15 @@ large_payload_rayon_min_len = 256
 
 `startup_calibrated` takes a small set of production-shaped sequential and
 Rayon probes at startup. It fits separate cost models for both payload classes,
-validates each model against a held-out probe, calculates candidate thresholds,
-then measures the predicted threshold and the next chunk-count transition (or
-the largest modeled fan-out once worker-capped) before accepting it. An invalid
-model, failed validation, or failed confirmation
-selects sequential dispatch. If Rayon has fewer than two workers, the server
-also selects sequential dispatch; an operational calibration failure logs a
-warning and uses a conservative fallback.
+validates each model against a held-out probe, then derives a bounded ordered
+schedule of fan-out breakpoints. Each breakpoint jointly caps the number of
+Rayon chunks and sets a minimum recipient-run size, allowing larger fan-outs to
+use fewer workers with larger, balanced batches when that reduces dispatch and
+merge overhead. Every selected breakpoint is measured before the schedule is
+accepted. An invalid model, failed validation, or failed confirmation selects
+sequential dispatch. If Rayon has fewer than two workers, the server also
+selects sequential dispatch; an operational calibration failure logs a warning
+and uses a conservative fallback.
 
 `sequential` disables Rayon voice fan-out. `fixed` is an operational override
 for controlled experiments or recovery. In fixed mode, each

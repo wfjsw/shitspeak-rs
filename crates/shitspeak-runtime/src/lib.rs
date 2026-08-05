@@ -60,8 +60,10 @@ pub async fn run_server_with_extensions(
         rayon_workers = dispatch_tuning.rayon_workers(),
         small_payload_threshold = dispatch_plan.small_payload().fanout_threshold(),
         small_payload_min_len = dispatch_plan.small_payload().rayon_min_len(),
+        small_payload_breakpoints = ?dispatch_plan.small_payload().breakpoints(),
         large_payload_threshold = dispatch_plan.large_payload().fanout_threshold(),
         large_payload_min_len = dispatch_plan.large_payload().rayon_min_len(),
+        large_payload_breakpoints = ?dispatch_plan.large_payload().breakpoints(),
         "voice dispatch tuning resolved"
     );
     voice::metrics::record_dispatch_tuning(dispatch_plan, dispatch_tuning.elapsed());

@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt,
     hint::black_box,
     net::SocketAddr,
     time::{Duration, Instant},
@@ -28,6 +29,7 @@ const CALIBRATION_IV_E: [u8; 16] = [0x01; 16];
 const CALIBRATION_IV_D: [u8; 16] = [0x02; 16];
 const CALIBRATION_MAX_FANOUT: usize = 2048;
 const CALIBRATION_TARGET_CHUNK_LENS: [usize; 9] = [8, 16, 24, 32, 48, 64, 128, 256, 512];
+pub(crate) const MAX_RAYON_DISPATCH_BREAKPOINTS: usize = 8;
 const MODEL_CALIBRATION_WARMUPS: usize = 1;
 const MODEL_CALIBRATION_SAMPLES: usize = 7;
 const CONFIRMATION_WARMUPS: usize = 1;
@@ -63,38 +65,151 @@ impl VoiceDispatchPlanSource {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RayonDispatchBreakpoint {
+    fanout_threshold: usize,
+    rayon_max_workers: usize,
+    rayon_min_len: usize,
+}
+
+impl RayonDispatchBreakpoint {
+    pub(crate) const fn new(
+        fanout_threshold: usize,
+        rayon_max_workers: usize,
+        rayon_min_len: usize,
+    ) -> Self {
+        Self {
+            fanout_threshold,
+            rayon_max_workers,
+            rayon_min_len,
+        }
+    }
+
+    const fn disabled() -> Self {
+        Self::new(usize::MAX, 1, 1)
+    }
+
+    pub(crate) const fn fanout_threshold(self) -> usize {
+        self.fanout_threshold
+    }
+
+    pub(crate) const fn rayon_max_workers(self) -> usize {
+        // Expose the unbounded legacy profile as zero to telemetry rather than
+        // publishing `usize::MAX` as an implausible worker count.
+        if self.rayon_max_workers == usize::MAX {
+            0
+        } else {
+            self.rayon_max_workers
+        }
+    }
+
+    pub(crate) const fn rayon_min_len(self) -> usize {
+        self.rayon_min_len
+    }
+}
+
+impl fmt::Debug for RayonDispatchBreakpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rayon_max_workers =
+            (self.rayon_max_workers != usize::MAX).then_some(self.rayon_max_workers);
+        formatter
+            .debug_struct("RayonDispatchBreakpoint")
+            .field("fanout_threshold", &self.fanout_threshold)
+            .field("rayon_max_workers", &rayon_max_workers)
+            .field("rayon_min_len", &self.rayon_min_len)
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VoiceDispatchProfile {
-    fanout_threshold: usize,
-    rayon_min_len: usize,
+    breakpoints: [RayonDispatchBreakpoint; MAX_RAYON_DISPATCH_BREAKPOINTS],
+    breakpoint_count: usize,
 }
 
 impl VoiceDispatchProfile {
     const fn new(fanout_threshold: usize, rayon_min_len: usize) -> Self {
         Self {
-            fanout_threshold,
-            rayon_min_len,
+            // The legacy fixed configuration has no worker cap. Its one tier
+            // therefore preserves the old target-run-size behavior exactly.
+            breakpoints: [RayonDispatchBreakpoint::new(fanout_threshold, usize::MAX, rayon_min_len);
+                MAX_RAYON_DISPATCH_BREAKPOINTS],
+            breakpoint_count: 1,
         }
     }
 
     const fn sequential_only() -> Self {
-        Self::new(usize::MAX, CONSERVATIVE_RAYON_MIN_LEN)
+        Self {
+            breakpoints: [RayonDispatchBreakpoint::disabled(); MAX_RAYON_DISPATCH_BREAKPOINTS],
+            breakpoint_count: 0,
+        }
+    }
+
+    pub(crate) fn from_breakpoints(breakpoints: &[RayonDispatchBreakpoint]) -> Option<Self> {
+        if breakpoints.is_empty() || breakpoints.len() > MAX_RAYON_DISPATCH_BREAKPOINTS {
+            return None;
+        }
+        if breakpoints.iter().any(|breakpoint| {
+            breakpoint.fanout_threshold == 0
+                || breakpoint.rayon_max_workers < 2
+                || breakpoint.rayon_min_len == 0
+        }) || breakpoints
+            .windows(2)
+            .any(|pair| pair[0].fanout_threshold >= pair[1].fanout_threshold)
+        {
+            return None;
+        }
+
+        let mut profile = Self::sequential_only();
+        profile.breakpoints[..breakpoints.len()].copy_from_slice(breakpoints);
+        profile.breakpoint_count = breakpoints.len();
+        Some(profile)
     }
 
     pub(crate) fn uses_rayon(self, fanout: usize) -> bool {
-        fanout >= self.fanout_threshold
+        self.breakpoint_for_fanout(fanout).is_some()
     }
 
     pub(crate) fn fanout_threshold(self) -> usize {
-        self.fanout_threshold
+        self.breakpoints
+            .first()
+            .copied()
+            .filter(|_| self.breakpoint_count > 0)
+            .map_or(usize::MAX, RayonDispatchBreakpoint::fanout_threshold)
     }
 
     pub(crate) fn rayon_min_len(self) -> usize {
-        self.rayon_min_len
+        self.breakpoints
+            .first()
+            .copied()
+            .filter(|_| self.breakpoint_count > 0)
+            .map_or(
+                CONSERVATIVE_RAYON_MIN_LEN,
+                RayonDispatchBreakpoint::rayon_min_len,
+            )
+    }
+
+    pub(crate) fn breakpoints(&self) -> &[RayonDispatchBreakpoint] {
+        &self.breakpoints[..self.breakpoint_count]
     }
 
     pub(crate) fn rayon_chunk_plan(self, fanout: usize, rayon_workers: usize) -> RayonChunkPlan {
-        RayonChunkPlan::new(fanout, self.rayon_min_len, rayon_workers)
+        let breakpoint = self
+            .breakpoint_for_fanout(fanout)
+            .expect("Rayon dispatch requires a matching breakpoint");
+        RayonChunkPlan::new(
+            fanout,
+            breakpoint.rayon_min_len,
+            rayon_workers.min(breakpoint.rayon_max_workers),
+        )
+    }
+
+    fn breakpoint_for_fanout(self, fanout: usize) -> Option<RayonDispatchBreakpoint> {
+        self.breakpoints[..self.breakpoint_count]
+            .iter()
+            .rev()
+            .find(|breakpoint| breakpoint.fanout_threshold <= fanout)
+            .copied()
     }
 }
 
@@ -305,7 +420,7 @@ struct CalibrationTiming {
     rayon: Duration,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ModelProbe {
     fanout: usize,
     requested_chunks: usize,
@@ -366,10 +481,32 @@ impl RayonCostModel {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ModeledDispatchTier {
+    rayon_max_workers: usize,
+    rayon_min_len: usize,
+}
+
+impl ModeledDispatchTier {
+    fn chunk_plan(self, fanout: usize, rayon_workers: usize) -> RayonChunkPlan {
+        RayonChunkPlan::new(
+            fanout,
+            self.rayon_min_len,
+            rayon_workers.min(self.rayon_max_workers),
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ModeledProfileCandidate {
     profile: VoiceDispatchProfile,
-    confirmation_fanouts: [usize; 2],
+}
+
+#[derive(Clone, Copy)]
+struct ModeledScheduleSegment {
+    start_fanout: usize,
+    end_fanout: usize,
+    tier: ModeledDispatchTier,
     score: f64,
 }
 
@@ -456,49 +593,46 @@ fn model_training_probes(rayon_workers: usize) -> Vec<ModelProbe> {
                 fanout: 512,
                 requested_chunks: 2,
             },
+            ModelProbe {
+                fanout: CALIBRATION_MAX_FANOUT,
+                requested_chunks: 2,
+            },
         ];
     }
 
     let coarse_chunks = rayon_workers.min(4);
-    vec![
-        ModelProbe {
-            fanout: 64,
-            requested_chunks: 1,
-        },
-        ModelProbe {
-            fanout: 64,
-            requested_chunks: 2,
-        },
-        ModelProbe {
-            fanout: 512,
-            requested_chunks: 2,
-        },
-        ModelProbe {
-            fanout: 512,
-            requested_chunks: coarse_chunks,
-        },
-        ModelProbe {
-            fanout: CALIBRATION_MAX_FANOUT,
-            requested_chunks: 2,
-        },
-        ModelProbe {
-            fanout: CALIBRATION_MAX_FANOUT,
-            requested_chunks: coarse_chunks,
-        },
-    ]
+    let mut probes = Vec::new();
+    for (fanout, requested_chunks) in [
+        (64, 1),
+        (64, 2),
+        (512, 2),
+        (512, coarse_chunks),
+        (CALIBRATION_MAX_FANOUT, 2),
+        (CALIBRATION_MAX_FANOUT, coarse_chunks),
+        // The wide-pool shape must be part of the training set. Previously a
+        // pool with more than four workers was asked to predict this unseen
+        // shape only in the holdout, which made the model extrapolate exactly
+        // where dispatch overhead is most sensitive.
+        (512, rayon_workers),
+        (CALIBRATION_MAX_FANOUT, rayon_workers),
+    ] {
+        let probe = ModelProbe {
+            fanout,
+            requested_chunks,
+        };
+        if !probes.contains(&probe) {
+            probes.push(probe);
+        }
+    }
+    probes
 }
 
 fn model_holdout_probe(rayon_workers: usize) -> ModelProbe {
-    if rayon_workers == 2 || rayon_workers > 4 {
-        ModelProbe {
-            fanout: CALIBRATION_MAX_FANOUT,
-            requested_chunks: rayon_workers,
-        }
-    } else {
-        ModelProbe {
-            fanout: 1024,
-            requested_chunks: rayon_workers,
-        }
+    // Keep the full-pool shape independent of training while retaining a
+    // fanout between the two full-pool training probes.
+    ModelProbe {
+        fanout: 1024,
+        requested_chunks: rayon_workers,
     }
 }
 
@@ -851,75 +985,176 @@ fn select_modeled_profile(
     rayon_model: RayonCostModel,
     rayon_workers: usize,
 ) -> Option<ModeledProfileCandidate> {
-    let mut best = None;
+    let tiers = modeled_dispatch_tiers(rayon_workers);
+    let choices = (2..=CALIBRATION_MAX_FANOUT)
+        .map(|fanout| {
+            modeled_tier_for_range(
+                &tiers,
+                fanout,
+                fanout,
+                sequential_model,
+                rayon_model,
+                rayon_workers,
+            )
+        })
+        .collect::<Vec<_>>();
+    let start_index = choices
+        .iter()
+        .rposition(Option::is_none)
+        .map_or(0, |index| index + 1);
+    // Require at least two fanouts in the accepted suffix. A solitary maximum
+    // fanout point cannot establish a sustained crossover.
+    if choices.len().saturating_sub(start_index) < 2 {
+        return None;
+    }
 
-    for target_chunk_len in CALIBRATION_TARGET_CHUNK_LENS {
-        let points = (2..=CALIBRATION_MAX_FANOUT)
-            .filter_map(|fanout| {
-                let chunk_plan = RayonChunkPlan::new(fanout, target_chunk_len, rayon_workers);
-                (chunk_plan.chunk_count() >= 2).then(|| {
-                    (
-                        fanout,
-                        sequential_model.predict(fanout),
-                        rayon_model.predict(chunk_plan),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-
-        for start in 0..points.len().saturating_sub(1) {
-            let suffix = &points[start..];
-            if !suffix.iter().all(|(_, sequential_ns, rayon_ns)| {
-                model_predicts_rayon_win(*sequential_ns, *rayon_ns)
-            }) {
-                continue;
-            }
-
-            let candidate = ModeledProfileCandidate {
-                profile: VoiceDispatchProfile::new(points[start].0, target_chunk_len),
-                confirmation_fanouts: confirmation_fanouts(
-                    points[start].0,
-                    target_chunk_len,
-                    rayon_workers,
-                ),
-                score: suffix.iter().map(|(_, _, rayon_ns)| rayon_ns).sum(),
-            };
-            if best.is_none_or(|current| modeled_candidate_is_better(candidate, current)) {
-                best = Some(candidate);
-            }
+    let mut segments: Vec<ModeledScheduleSegment> = Vec::new();
+    for (index, choice) in choices.iter().enumerate().skip(start_index) {
+        let fanout = index + 2;
+        let (tier, score) = choice.expect("the sustained suffix has a modeled Rayon winner");
+        if segments.last().is_some_and(|segment| segment.tier == tier) {
+            let segment = segments
+                .last_mut()
+                .expect("the nonempty segment list retains its last entry");
+            segment.end_fanout = fanout;
+            segment.score += score;
+        } else {
+            segments.push(ModeledScheduleSegment {
+                start_fanout: fanout,
+                end_fanout: fanout,
+                tier,
+                score,
+            });
         }
     }
 
-    best
-}
-
-fn confirmation_fanouts(
-    threshold: usize,
-    target_chunk_len: usize,
-    rayon_workers: usize,
-) -> [usize; 2] {
-    let threshold_plan = RayonChunkPlan::new(threshold, target_chunk_len, rayon_workers);
-    let later_fanout = ((threshold + 1)..=CALIBRATION_MAX_FANOUT)
-        .find(|&fanout| {
-            RayonChunkPlan::new(fanout, target_chunk_len, rayon_workers).chunk_count()
-                > threshold_plan.chunk_count()
+    coalesce_modeled_segments(
+        &mut segments,
+        &tiers,
+        sequential_model,
+        rayon_model,
+        rayon_workers,
+    )?;
+    let breakpoints = segments
+        .into_iter()
+        .map(|segment| {
+            RayonDispatchBreakpoint::new(
+                segment.start_fanout,
+                segment.tier.rayon_max_workers,
+                segment.tier.rayon_min_len,
+            )
         })
-        // Once the plan is capped at the worker count, confirm at the largest
-        // modeled workload so the second probe still exercises a distinctly
-        // larger recipient run.
-        .unwrap_or(CALIBRATION_MAX_FANOUT);
-    [threshold, later_fanout]
+        .collect::<Vec<_>>();
+    VoiceDispatchProfile::from_breakpoints(&breakpoints)
+        .map(|profile| ModeledProfileCandidate { profile })
 }
 
-fn modeled_candidate_is_better(
-    candidate: ModeledProfileCandidate,
-    current: ModeledProfileCandidate,
-) -> bool {
-    candidate.profile.fanout_threshold() < current.profile.fanout_threshold()
-        || (candidate.profile.fanout_threshold() == current.profile.fanout_threshold()
-            && (candidate.score < current.score
-                || (candidate.score == current.score
-                    && candidate.profile.rayon_min_len() < current.profile.rayon_min_len())))
+fn modeled_tier_for_range(
+    tiers: &[ModeledDispatchTier],
+    start_fanout: usize,
+    end_fanout: usize,
+    sequential_model: LinearCostModel,
+    rayon_model: RayonCostModel,
+    rayon_workers: usize,
+) -> Option<(ModeledDispatchTier, f64)> {
+    tiers
+        .iter()
+        .copied()
+        .filter_map(|tier| {
+            let mut score = 0.0;
+            for fanout in start_fanout..=end_fanout {
+                let chunk_plan = tier.chunk_plan(fanout, rayon_workers);
+                if chunk_plan.chunk_count() < 2
+                    || !model_predicts_rayon_win(
+                        sequential_model.predict(fanout),
+                        rayon_model.predict(chunk_plan),
+                    )
+                {
+                    return None;
+                }
+                score += rayon_model.predict(chunk_plan);
+            }
+            Some((tier, score))
+        })
+        .min_by(|(left_tier, left_score), (right_tier, right_score)| {
+            left_score
+                .total_cmp(right_score)
+                // When the predicted timing is tied, fewer workers are
+                // preferable because they avoid needless task and merge
+                // overhead.
+                .then_with(|| {
+                    left_tier
+                        .rayon_max_workers
+                        .cmp(&right_tier.rayon_max_workers)
+                })
+                .then_with(|| left_tier.rayon_min_len.cmp(&right_tier.rayon_min_len))
+        })
+}
+
+fn coalesce_modeled_segments(
+    segments: &mut Vec<ModeledScheduleSegment>,
+    tiers: &[ModeledDispatchTier],
+    sequential_model: LinearCostModel,
+    rayon_model: RayonCostModel,
+    rayon_workers: usize,
+) -> Option<()> {
+    while segments.len() > MAX_RAYON_DISPATCH_BREAKPOINTS {
+        let (merge_index, merged) = (0..segments.len() - 1)
+            .filter_map(|index| {
+                let left = segments[index];
+                let right = segments[index + 1];
+                let (tier, score) = modeled_tier_for_range(
+                    tiers,
+                    left.start_fanout,
+                    right.end_fanout,
+                    sequential_model,
+                    rayon_model,
+                    rayon_workers,
+                )?;
+                Some((
+                    index,
+                    ModeledScheduleSegment {
+                        start_fanout: left.start_fanout,
+                        end_fanout: right.end_fanout,
+                        tier,
+                        score,
+                    },
+                    score - left.score - right.score,
+                ))
+            })
+            .min_by(
+                |(left_index, _, left_penalty), (right_index, _, right_penalty)| {
+                    left_penalty
+                        .total_cmp(right_penalty)
+                        .then_with(|| left_index.cmp(right_index))
+                },
+            )
+            .map(|(index, segment, _)| (index, segment))?;
+        segments[merge_index] = merged;
+        segments.remove(merge_index + 1);
+    }
+    Some(())
+}
+
+fn modeled_dispatch_tiers(rayon_workers: usize) -> Vec<ModeledDispatchTier> {
+    let mut worker_caps = Vec::new();
+    for worker_cap in [2, 3, 4, 6, 8, 12, 16, 24, 32, rayon_workers] {
+        if worker_cap <= rayon_workers && !worker_caps.contains(&worker_cap) {
+            worker_caps.push(worker_cap);
+        }
+    }
+
+    worker_caps
+        .into_iter()
+        .flat_map(|rayon_max_workers| {
+            CALIBRATION_TARGET_CHUNK_LENS
+                .into_iter()
+                .map(move |rayon_min_len| ModeledDispatchTier {
+                    rayon_max_workers,
+                    rayon_min_len,
+                })
+        })
+        .collect()
 }
 
 async fn confirm_modeled_profile(
@@ -927,9 +1162,8 @@ async fn confirm_modeled_profile(
     candidate: ModeledProfileCandidate,
     rayon_workers: usize,
 ) -> Result<bool, String> {
-    for fanout in candidate.confirmation_fanouts {
-        let chunk_plan =
-            RayonChunkPlan::new(fanout, candidate.profile.rayon_min_len(), rayon_workers);
+    for fanout in confirmation_fanouts(candidate.profile) {
+        let chunk_plan = candidate.profile.rayon_chunk_plan(fanout, rayon_workers);
         let timing = measure_median_pair(
             encoded,
             fanout,
@@ -943,6 +1177,24 @@ async fn confirm_modeled_profile(
         }
     }
     Ok(true)
+}
+
+fn confirmation_fanouts(profile: VoiceDispatchProfile) -> Vec<usize> {
+    let breakpoints = profile.breakpoints();
+    let mut fanouts = Vec::with_capacity(breakpoints.len() * 2);
+    for (index, breakpoint) in breakpoints.iter().enumerate() {
+        let start_fanout = breakpoint.fanout_threshold();
+        let end_fanout = breakpoints
+            .get(index + 1)
+            .map_or(CALIBRATION_MAX_FANOUT, |next| next.fanout_threshold() - 1);
+        fanouts.push(start_fanout);
+        if end_fanout != start_fanout {
+            // The endpoint also exercises any chunk-count transitions caused
+            // by the tier's target batch size before the next tier begins.
+            fanouts.push(end_fanout);
+        }
+    }
+    fanouts
 }
 
 fn duration_ns(duration: Duration) -> f64 {
@@ -1059,11 +1311,9 @@ mod tests {
         let fitted_rayon = fit_rayon_model(&measurements, 2).expect("Rayon model fits");
         let candidate = select_modeled_profile(fitted_sequential, fitted_rayon, 2)
             .expect("model predicts a two-worker crossover");
-        let plan = RayonChunkPlan::new(
-            candidate.profile.fanout_threshold(),
-            candidate.profile.rayon_min_len(),
-            2,
-        );
+        let plan = candidate
+            .profile
+            .rayon_chunk_plan(candidate.profile.fanout_threshold(), 2);
 
         assert_eq!(plan.chunk_count(), 2);
     }
@@ -1124,23 +1374,25 @@ mod tests {
         };
         let candidate = select_modeled_profile(sequential, rayon, 8)
             .expect("model predicts a sustained Rayon crossover");
-        let threshold_plan = RayonChunkPlan::new(
-            candidate.profile.fanout_threshold(),
-            candidate.profile.rayon_min_len(),
-            8,
-        );
+        let threshold_plan = candidate
+            .profile
+            .rayon_chunk_plan(candidate.profile.fanout_threshold(), 8);
 
         assert!(threshold_plan.chunk_count() >= 2);
-        assert_eq!(
-            candidate.confirmation_fanouts[0],
-            candidate.profile.fanout_threshold()
+        assert!(candidate.profile.breakpoints().len() > 1);
+        assert!(
+            candidate
+                .profile
+                .breakpoints()
+                .windows(2)
+                .all(|pair| pair[0].fanout_threshold() < pair[1].fanout_threshold())
         );
-        let confirmation_plan = RayonChunkPlan::new(
-            candidate.confirmation_fanouts[1],
-            candidate.profile.rayon_min_len(),
-            8,
-        );
-        assert!(confirmation_plan.chunk_count() > threshold_plan.chunk_count());
+        for breakpoint in candidate.profile.breakpoints() {
+            let plan = candidate
+                .profile
+                .rayon_chunk_plan(breakpoint.fanout_threshold(), 8);
+            assert!(plan.chunk_count() >= 2);
+        }
         assert!(
             select_modeled_profile(
                 sequential,
@@ -1157,9 +1409,107 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_exercises_the_next_chunk_count_transition() {
-        assert_eq!(confirmation_fanouts(9, 8, 8), [9, 17]);
-        assert_eq!(confirmation_fanouts(9, 8, 2), [9, CALIBRATION_MAX_FANOUT]);
+    fn coalesces_rounding_oscillations_without_delaying_the_crossover() {
+        let sequential = LinearCostModel {
+            fixed_ns: 10_000.0,
+            per_recipient_ns: 100.0,
+        };
+        let rayon = RayonCostModel::General {
+            dispatch_ns: 20_000.0,
+            per_chunk_ns: 500.0,
+            per_merged_recipient_ns: 5.0,
+            critical_chunk_recipient_ns: 30.0,
+        };
+        let candidate = select_modeled_profile(sequential, rayon, 32)
+            .expect("the modeled crossover is sustained");
+
+        assert_eq!(candidate.profile.fanout_threshold(), 150);
+        assert!(
+            candidate.profile.breakpoints().len() <= MAX_RAYON_DISPATCH_BREAKPOINTS,
+            "the bounded schedule coalesces ceiling-division oscillations"
+        );
+        for fanout in candidate.profile.fanout_threshold()..=CALIBRATION_MAX_FANOUT {
+            let chunk_plan = candidate.profile.rayon_chunk_plan(fanout, 32);
+            assert!(model_predicts_rayon_win(
+                sequential.predict(fanout),
+                rayon.predict(chunk_plan),
+            ));
+        }
+    }
+
+    #[test]
+    fn calibrated_breakpoints_scale_worker_count_and_batch_size_together() {
+        let profile = VoiceDispatchProfile::from_breakpoints(&[
+            RayonDispatchBreakpoint::new(512, 2, 256),
+            RayonDispatchBreakpoint::new(1_024, 2, 512),
+            RayonDispatchBreakpoint::new(1_536, 3, 512),
+            RayonDispatchBreakpoint::new(2_048, 4, 512),
+        ])
+        .expect("valid calibrated breakpoint schedule");
+
+        assert!(!profile.uses_rayon(511));
+        assert_eq!(profile.rayon_chunk_plan(512, 8).chunk_count(), 2);
+        assert_eq!(profile.rayon_chunk_plan(512, 8).chunk_len(), 256);
+        assert_eq!(profile.rayon_chunk_plan(1_024, 8).chunk_count(), 2);
+        assert_eq!(profile.rayon_chunk_plan(1_024, 8).chunk_len(), 512);
+        assert_eq!(profile.rayon_chunk_plan(1_536, 8).chunk_count(), 3);
+        assert_eq!(profile.rayon_chunk_plan(1_536, 8).chunk_len(), 512);
+        assert_eq!(profile.rayon_chunk_plan(2_048, 8).chunk_count(), 4);
+        assert_eq!(profile.rayon_chunk_plan(2_048, 8).chunk_len(), 512);
+    }
+
+    #[test]
+    fn calibrated_breakpoints_cap_requested_workers_to_the_runtime_pool() {
+        let profile =
+            VoiceDispatchProfile::from_breakpoints(&[RayonDispatchBreakpoint::new(512, 8, 256)])
+                .expect("valid calibrated breakpoint schedule");
+
+        let plan = profile.rayon_chunk_plan(2_048, 4);
+        assert_eq!(plan.chunk_count(), 4);
+        assert_eq!(plan.chunk_len(), 512);
+    }
+
+    #[test]
+    fn confirmation_covers_each_breakpoint_and_its_tier_endpoint() {
+        let profile = VoiceDispatchProfile::from_breakpoints(&[
+            RayonDispatchBreakpoint::new(512, 2, 256),
+            RayonDispatchBreakpoint::new(1_024, 4, 512),
+            RayonDispatchBreakpoint::new(1_536, 4, 512),
+        ])
+        .expect("valid calibrated breakpoint schedule");
+
+        assert_eq!(
+            confirmation_fanouts(profile),
+            vec![512, 1_023, 1_024, 1_535, 1_536, CALIBRATION_MAX_FANOUT]
+        );
+    }
+
+    #[test]
+    fn wide_pool_training_includes_the_full_worker_shape_before_holdout() {
+        let training = model_training_probes(8);
+        assert!(training.contains(&ModelProbe {
+            fanout: 512,
+            requested_chunks: 8,
+        }));
+        assert!(training.contains(&ModelProbe {
+            fanout: CALIBRATION_MAX_FANOUT,
+            requested_chunks: 8,
+        }));
+        assert_eq!(
+            model_holdout_probe(8),
+            ModelProbe {
+                fanout: 1_024,
+                requested_chunks: 8,
+            }
+        );
+        assert!(!training.contains(&model_holdout_probe(8)));
+
+        let two_worker_training = model_training_probes(2);
+        assert!(two_worker_training.contains(&ModelProbe {
+            fanout: CALIBRATION_MAX_FANOUT,
+            requested_chunks: 2,
+        }));
+        assert!(!two_worker_training.contains(&model_holdout_probe(2)));
     }
 
     #[test]

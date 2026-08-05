@@ -2671,6 +2671,26 @@ mod tests {
     }
 
     #[test]
+    fn rayon_dispatch_uses_the_active_calibrated_breakpoint() {
+        use super::super::dispatch_tuning::{RayonDispatchBreakpoint, VoiceDispatchProfile};
+
+        let profile = VoiceDispatchProfile::from_breakpoints(&[
+            RayonDispatchBreakpoint::new(512, 2, 256),
+            RayonDispatchBreakpoint::new(1_024, 4, 512),
+        ])
+        .expect("valid dispatch schedule");
+
+        assert!(rayon_chunk_plan_for_udp_recipients(profile, 511, 8).is_none());
+        let low = rayon_chunk_plan_for_udp_recipients(profile, 512, 8)
+            .expect("first breakpoint uses Rayon");
+        assert_eq!((low.chunk_count(), low.chunk_len()), (2, 256));
+
+        let high = rayon_chunk_plan_for_udp_recipients(profile, 2_048, 8)
+            .expect("later breakpoint uses Rayon");
+        assert_eq!((high.chunk_count(), high.chunk_len()), (4, 512));
+    }
+
+    #[test]
     fn bounded_local_fanout_queue_evicts_oldest_and_retains_fifo_order() {
         let mut queue = VecDeque::new();
         for frame in 0..LOCAL_FANOUT_QUEUE_CAPACITY {
