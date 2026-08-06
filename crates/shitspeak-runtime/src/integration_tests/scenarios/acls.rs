@@ -2798,6 +2798,64 @@ async fn cached_login_into_in_group_speak_channel_starts_unsuppressed() {
 }
 
 #[tokio::test]
+async fn cached_login_without_traverse_falls_back_to_default_channel() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let channels = server.server.get_channels();
+    channels
+        .create_channel(Channel::new(78, "Cached hidden".to_owned(), 0, 0, Some(0)))
+        .await
+        .unwrap();
+    channels
+        .set_acls(
+            78,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Traverse.into(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+    server
+        .server
+        .get_user_channel_cache()
+        .remember_last_channel("2", 78)
+        .await
+        .unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let self_state = bob
+        .initial_user_states
+        .iter()
+        .find(|state| state.session == Some(bob.session_id))
+        .expect("Bob self state");
+
+    assert_eq!(
+        self_state.channel_id,
+        Some(0),
+        "a cached channel without Traverse must not be restored"
+    );
+    assert_eq!(
+        server
+            .server
+            .get_user_channel_cache()
+            .get("2")
+            .await
+            .and_then(|channels| channels.last_channel_id),
+        Some(0),
+        "the fallback channel should replace the unusable cache entry"
+    );
+}
+
+#[tokio::test]
 async fn acl_cache_does_not_cross_reused_local_session_ids() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

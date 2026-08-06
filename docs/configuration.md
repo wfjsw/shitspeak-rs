@@ -130,6 +130,7 @@ preserve_write_acl_on_edit = false
 grant_temp_channel_creator_acl = true
 reevaluate_speak_on_acl_change = true
 allow_move_without_traverse = false
+reveal_users_in_current_and_linked_channels_without_traverse = false
 ```
 
 ## Top-Level Server Settings
@@ -452,6 +453,7 @@ allow_move_without_traverse = false
 - `grant_temp_channel_creator_acl`: when true, temporary channel creators receive local ACL grants for missing Write, Enter, and Speak permissions.
 - `reevaluate_speak_on_acl_change`: when true, ACL edits reevaluate Speak for clients currently in the changed channel subtree and update their `UserState.suppress` state.
 - `allow_move_without_traverse`: when true, a moderator with the required Move permissions may move another user into a channel the target cannot traverse. It does not change self-move authorization. Hidden destination ancestors are revealed to the moved client only while needed and revoked after departure. The default is false.
+- `reveal_users_in_current_and_linked_channels_without_traverse`: when true, a user temporarily retained in a channel they cannot traverse also sees the users in that channel, its directly linked channels, and users in those linked channels. It also reveals otherwise inaccessible directly linked channels and their users when the user can traverse their current channel. The temporary channel trace remains limited to those channels and their ancestors. The default is false.
 
 The checked-in development config sets stricter values than the code defaults for some ACL toggles.
 

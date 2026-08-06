@@ -41,6 +41,7 @@ pub struct TestServerOpts {
     pub grant_temp_channel_creator_acl: bool,
     pub reevaluate_speak_on_acl_change: bool,
     pub allow_move_without_traverse: bool,
+    pub reveal_users_in_current_and_linked_channels_without_traverse: bool,
     pub privacy: PrivacyConfig,
     pub server_protocol_version: ProtocolVersion,
     pub user_channel_cache_record_remote_sessions: bool,
@@ -70,6 +71,7 @@ impl Default for TestServerOpts {
             grant_temp_channel_creator_acl: true,
             reevaluate_speak_on_acl_change: false,
             allow_move_without_traverse: false,
+            reveal_users_in_current_and_linked_channels_without_traverse: false,
             privacy: PrivacyConfig::default(),
             server_protocol_version: APP_PROTO_VER,
             user_channel_cache_record_remote_sessions: false,
@@ -286,7 +288,10 @@ async fn spawn_test_server_with_pki(
             opts.grant_temp_channel_creator_acl,
             opts.reevaluate_speak_on_acl_change,
         )
-        .with_allow_move_without_traverse(opts.allow_move_without_traverse),
+        .with_allow_move_without_traverse(opts.allow_move_without_traverse)
+        .with_reveal_users_in_current_and_linked_channels_without_traverse(
+            opts.reveal_users_in_current_and_linked_channels_without_traverse,
+        ),
         privacy: opts.privacy,
         s2s,
         web: WebConfig::default(),

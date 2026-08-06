@@ -433,6 +433,25 @@ pub(crate) async fn compute_permissions_for_client_with_identity(
     .await
 }
 
+pub(crate) async fn compute_permissions_for_client_with_identity_and_home_channel(
+    server: &Arc<Box<Server>>,
+    client: &Arc<Box<Client>>,
+    channel_id: u32,
+    home_channel_id: u32,
+    user_id: Option<u32>,
+    groups: HashSet<String>,
+    is_superuser: bool,
+) -> enumflags2::BitFlags<ACLPermissions> {
+    compute_permissions_for_client_inner(
+        server,
+        client,
+        channel_id,
+        Some(home_channel_id),
+        Some((user_id, groups, is_superuser)),
+    )
+    .await
+}
+
 async fn compute_permissions_for_client_inner(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,

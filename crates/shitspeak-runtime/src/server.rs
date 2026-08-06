@@ -1685,15 +1685,36 @@ impl Server {
                 .await;
             return;
         }
+        let current_channel_id = client.get_current_channel_id();
         let current_permissions = crate::client::acl::compute_permissions_for_client_with_identity(
             self,
             &client,
-            client.get_current_channel_id(),
+            current_channel_id,
             user_id,
             groups.clone(),
             is_superuser,
         )
         .await;
+        let target_channel_id =
+            if current_permissions.contains(shitspeak_state::ACLPermissions::Traverse) {
+                current_channel_id
+            } else {
+                crate::user_channel_cache::existing_default_channel(self, &client.server_id()).await
+            };
+        let target_permissions = if target_channel_id == current_channel_id {
+            current_permissions
+        } else {
+            crate::client::acl::compute_permissions_for_client_with_identity_and_home_channel(
+                self,
+                &client,
+                target_channel_id,
+                target_channel_id,
+                user_id,
+                groups.clone(),
+                is_superuser,
+            )
+            .await
+        };
         if !self.client_instance_is_current(&client).await {
             return;
         }
@@ -1722,9 +1743,9 @@ impl Server {
             state.set_display_name(display_name);
             state.set_groups(groups);
             state.set_superuser(is_superuser);
-            state.set_suppress(
-                !current_permissions.contains(shitspeak_state::ACLPermissions::Speak),
-            );
+            state.set_current_channel_id(target_channel_id);
+            state
+                .set_suppress(!target_permissions.contains(shitspeak_state::ACLPermissions::Speak));
         }
         if was_superuser != client.is_superuser() {
             crate::toggle_superuser_visibility::refresh_context_menu(self, &client).await;
@@ -2140,6 +2161,24 @@ impl Server {
                             new_config.acl.allow_move_without_traverse()
                         );
                     }
+                    if current
+                        .acl
+                        .reveal_users_in_current_and_linked_channels_without_traverse()
+                        != new_config
+                            .acl
+                            .reveal_users_in_current_and_linked_channels_without_traverse()
+                    {
+                        visibility_reload = true;
+                        tracing::info!(
+                            "config reload: acl.reveal_users_in_current_and_linked_channels_without_traverse {} -> {}",
+                            current
+                                .acl
+                                .reveal_users_in_current_and_linked_channels_without_traverse(),
+                            new_config
+                                .acl
+                                .reveal_users_in_current_and_linked_channels_without_traverse()
+                        );
+                    }
                     if current.privacy.certificate_hash_protection()
                         != new_config.privacy.certificate_hash_protection()
                     {
@@ -2360,6 +2399,12 @@ impl Server {
 
     pub fn get_allow_move_without_traverse(&self) -> bool {
         self.read_config().acl.allow_move_without_traverse()
+    }
+
+    pub fn get_reveal_users_in_current_and_linked_channels_without_traverse(&self) -> bool {
+        self.read_config()
+            .acl
+            .reveal_users_in_current_and_linked_channels_without_traverse()
     }
 
     pub(crate) async fn reevaluate_speak_after_acl_change(

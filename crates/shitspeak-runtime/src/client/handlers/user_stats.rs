@@ -45,6 +45,7 @@ pub async fn handle_user_stats(
     let mut effective_stats_only = stats_only;
     let mut details = target_session == sender_id;
     let mut local = target_session == sender_id;
+    let mut expose_certificate_identity = target_session == sender_id;
     if target_session != sender_id {
         if let Some(target_state) = server
             .get_clients()
@@ -60,6 +61,8 @@ pub async fn handle_user_stats(
             let has_root_ban = root_perms.contains(shitspeak_state::ACLPermissions::Ban);
             details = has_root_ban;
             local = has_root_ban || target_channel == sender.get_current_channel_id();
+            expose_certificate_identity =
+                has_root_ban && server.get_certificate_hash_privacy().is_none();
             if !has_root_ban {
                 let target_channel_perms = crate::client::acl::compute_permissions_for_client(
                     server,
@@ -135,7 +138,14 @@ pub async fn handle_user_stats(
         sender.clone()
     };
 
-    let user_stats = build_user_stats_payload(&target, effective_stats_only, details, local).await;
+    let user_stats = build_user_stats_payload(
+        &target,
+        effective_stats_only,
+        details,
+        local,
+        expose_certificate_identity,
+    )
+    .await;
     let reply: Message = user_stats.into();
     sender.write_proto_message(&reply).await?;
     Ok(())
@@ -151,6 +161,7 @@ async fn build_user_stats_payload(
     stats_only: bool,
     details: bool,
     local: bool,
+    expose_certificate_identity: bool,
 ) -> UserStats {
     let stats = *target.write_stats().await;
     let local_state = target.read_local_state();
@@ -192,7 +203,7 @@ async fn build_user_stats_payload(
     UserStats {
         session: Some(u32::from(target.get_session_id())),
         stats_only: Some(stats_only),
-        certificates: if stats_only || !details {
+        certificates: if stats_only || !expose_certificate_identity {
             Vec::new()
         } else {
             target.get_certificate_chain().to_vec()
@@ -207,7 +218,7 @@ async fn build_user_stats_payload(
         tcp_ping_var: Some(stats.tcp_ping_var()),
         version,
         celt_versions: Vec::new(),
-        address: details.then(|| target.get_real_ip_address()),
+        address: expose_certificate_identity.then(|| target.get_real_ip_address()),
         bandwidth: local.then_some(bandwidth),
         onlinesecs: Some(onlinesecs),
         idlesecs: local.then_some(idlesecs),
@@ -314,6 +325,7 @@ impl UserStatsResponder for ServerUserStatsResponder {
         );
         let mut details = actor_id == target_id;
         let mut local = actor_id == target_id;
+        let mut expose_certificate_identity = actor_id == target_id;
         if actor_id != target_id {
             let Some(actor) = server
                 .get_clients()
@@ -337,6 +349,8 @@ impl UserStatsResponder for ServerUserStatsResponder {
             let has_root_ban = root_perms.contains(shitspeak_state::ACLPermissions::Ban);
             details = has_root_ban;
             local = has_root_ban || target_channel == actor.get_current_channel_id();
+            expose_certificate_identity =
+                has_root_ban && server.get_certificate_hash_privacy().is_none();
             if !has_root_ban {
                 let target_channel_perms = crate::client::acl::compute_permissions_for_client(
                     &server,
@@ -353,7 +367,14 @@ impl UserStatsResponder for ServerUserStatsResponder {
                 stats_only = true;
             }
         }
-        let user_stats = build_user_stats_payload(&target, stats_only, details, local).await;
+        let user_stats = build_user_stats_payload(
+            &target,
+            stats_only,
+            details,
+            local,
+            expose_certificate_identity,
+        )
+        .await;
         let proto: shitspeak_proto::mumble_proto::UserStats = user_stats.into();
         let mut buf = BytesMut::with_capacity(proto.encoded_len());
         if let Err(e) = proto.encode(&mut buf) {

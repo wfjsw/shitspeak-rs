@@ -210,6 +210,23 @@ async fn allow_move_without_traverse_reads_live_acl_config() {
     assert!(!server.get_allow_move_without_traverse());
 }
 
+#[tokio::test]
+async fn reveal_users_in_current_and_linked_channels_without_traverse_reads_live_acl_config() {
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("test server");
+    assert!(!server.get_reveal_users_in_current_and_linked_channels_without_traverse());
+
+    let mut config = (*server.config.load_full()).clone();
+    config.acl = config
+        .acl
+        .clone()
+        .with_reveal_users_in_current_and_linked_channels_without_traverse(true);
+    server.config.store(Arc::new(config));
+
+    assert!(server.get_reveal_users_in_current_and_linked_channels_without_traverse());
+}
+
 struct TestIdentityFixture {
     _dir: tempfile::TempDir,
     cert_path: String,
@@ -1044,6 +1061,105 @@ async fn authentication_expiry_reauth_preserves_state_while_pending_and_applies_
         local.authentication_expiry_action(),
         AuthenticationExpiryAction::Kick
     );
+}
+
+#[tokio::test]
+async fn authentication_expiry_reauth_moves_user_to_default_after_losing_traverse() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let mut config = test_config(Vec::new());
+    config.default_channel = 1;
+    let server = Server::new(config, authenticator).await.expect("server");
+    server
+        .channels
+        .create_channel(shitspeak_state::Channel::new(
+            1,
+            "Default".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("default channel");
+    server
+        .channels
+        .create_channel(shitspeak_state::Channel::new(
+            2,
+            "Restricted".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .expect("restricted channel");
+    server
+        .channels
+        .set_acls(
+            2,
+            true,
+            vec![shitspeak_state::ACL {
+                user_id: None,
+                group: Some("!original-group".to_owned()),
+                apply_here: true,
+                apply_subs: false,
+                allow: enumflags2::BitFlags::empty(),
+                deny: shitspeak_state::ACLPermissions::Traverse.into(),
+            }],
+        )
+        .await
+        .expect("restricted channel ACL");
+
+    let client = authentication_expiry_test_client(&server).await;
+    {
+        let mut state = client.write_global_state(&server.clients);
+        state.set_current_channel_id(2);
+    }
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication started")
+        .expect("reauthentication call");
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("next-auth-session".to_owned()),
+            authenticated_until: Some(deadline + chrono::Duration::hours(1)),
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
+            user_id: Some(42),
+            fqdn: None,
+            display_name: Some("Updated Name".to_owned()),
+            groups: vec!["updated-group".to_owned()],
+            is_superuser: false,
+            virtual_server_id: None,
+            language: Language::default(),
+            max_bandwidth: None,
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send successful reauthentication");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !client.is_reauthentication_in_progress() && client.get_current_channel_id() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reauthentication moved the user to the default channel");
+
+    assert!(client.is_authenticated());
+    assert!(
+        server
+            .clients
+            .get_client_in_server(DEFAULT_SERVER_ID, client.get_session_id())
+            .await
+            .is_some(),
+        "losing non-root Traverse during reauthentication must not disconnect the user"
+    );
+    assert_eq!(client.get_current_channel_id(), 1);
 }
 
 #[tokio::test]

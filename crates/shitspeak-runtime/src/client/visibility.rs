@@ -870,6 +870,36 @@ async fn can_view_user_with_home(
         }
     };
     perms.contains(ACLPermissions::Traverse)
+        || viewer_can_temporarily_view_current_or_linked_channel(
+            server,
+            viewer,
+            target.get_current_channel_id(),
+            effective_home_channel_id,
+        )
+        .await
+}
+
+async fn viewer_can_temporarily_view_current_or_linked_channel(
+    server: &Arc<Box<Server>>,
+    viewer: &Arc<Box<Client>>,
+    target_channel_id: u32,
+    effective_home_channel_id: Option<u32>,
+) -> bool {
+    if !server.get_reveal_users_in_current_and_linked_channels_without_traverse() {
+        return false;
+    }
+
+    let home_channel_id =
+        effective_home_channel_id.unwrap_or_else(|| viewer.get_current_channel_id());
+    if target_channel_id == home_channel_id {
+        return true;
+    }
+
+    server
+        .get_channels()
+        .get_channel_in_server(&viewer.server_id(), home_channel_id)
+        .await
+        .is_some_and(|channel| channel.links.contains(&target_channel_id))
 }
 
 fn superuser_hidden_from_viewer(viewer: &Arc<Box<Client>>, target: &Arc<Box<Client>>) -> bool {
@@ -905,7 +935,7 @@ async fn can_project_user_with_home(
     if !server.get_hide_channels_without_traverse() {
         return true;
     }
-    match effective_home_channel_id {
+    let channel_is_visible = match effective_home_channel_id {
         Some(home_channel_id) => {
             crate::channel_handler::can_view_channel_with_ancestors_at_home(
                 server,
@@ -923,7 +953,15 @@ async fn can_project_user_with_home(
             )
             .await
         }
-    }
+    };
+    channel_is_visible
+        || viewer_can_temporarily_view_current_or_linked_channel(
+            server,
+            viewer,
+            target.get_current_channel_id(),
+            effective_home_channel_id,
+        )
+        .await
 }
 
 pub async fn get_visible_client_in_server(
@@ -1100,10 +1138,15 @@ pub async fn visibility_config_reload_messages(
             visible_channel_ids.insert(channel.id);
         }
     }
-    visible_channel_ids.extend(crate::channel_handler::channel_and_ancestor_ids(
-        &channels,
-        viewer.get_current_channel_id(),
-    ));
+    visible_channel_ids.extend(
+        crate::channel_handler::retained_viewer_channel_ids(
+            server,
+            viewer,
+            &channels,
+            viewer.get_current_channel_id(),
+        )
+        .await,
+    );
     crate::channel_handler::close_visible_channel_ancestors(&channels, &mut visible_channel_ids);
 
     let mut visible_targets = Vec::new();
@@ -1900,6 +1943,8 @@ async fn visibility_refresh_scope_for_channel_operation_inner(
     let mut scope = VisibilityRefreshScope::new();
     let channels = server.get_channels();
     let mut visibility = visibility;
+    let current_and_linked_visibility_enabled = client.is_some()
+        && server.get_reveal_users_in_current_and_linked_channels_without_traverse();
     match &op.op {
         ChannelOp::CreateChannel { channel } => {
             scope.include_channel(channel.id);
@@ -2023,10 +2068,37 @@ async fn visibility_refresh_scope_for_channel_operation_inner(
             scope.include_all_channels();
             scope.include_known_users();
         }
-        ChannelOp::MarkPendingDelete { .. }
-        | ChannelOp::CancelPendingDelete { .. }
-        | ChannelOp::AddLink { .. }
-        | ChannelOp::RemoveLink { .. } => {}
+        ChannelOp::AddLink { a, b } | ChannelOp::RemoveLink { a, b } => {
+            if current_and_linked_visibility_enabled {
+                scope.include_channels([*a, *b]);
+            }
+        }
+        ChannelOp::MarkPendingDelete { .. } | ChannelOp::CancelPendingDelete { .. } => {}
+    }
+    if current_and_linked_visibility_enabled {
+        if let ChannelOp::EditChannel {
+            id,
+            links_add,
+            links_remove,
+            ..
+        } = &op.op
+            && (!links_add.is_empty() || !links_remove.is_empty())
+        {
+            scope.include_channel(*id);
+            scope.include_channels(links_add.iter().chain(links_remove).copied());
+        }
+    }
+    if let Some(client) = client
+        && current_and_linked_visibility_enabled
+    {
+        let current_channel_id = client.get_current_channel_id();
+        scope.include_channel(current_channel_id);
+        if let Some(channel) = channels
+            .get_channel_in_server(&client.server_id(), current_channel_id)
+            .await
+        {
+            scope.include_channels(channel.links.iter().copied());
+        }
     }
     scope
 }
@@ -2094,6 +2166,32 @@ async fn visibility_refresh_scope_for_viewer_delta(
         scope.include_channel(new_channel_id);
         if let Some(old_channel_id) = old_viewer_channel_id {
             scope.include_channel(old_channel_id);
+        }
+        if server.get_reveal_users_in_current_and_linked_channels_without_traverse() {
+            let channels = server
+                .get_channels()
+                .get_all_in_server(&viewer.server_id())
+                .await;
+            scope.include_channels(
+                crate::channel_handler::retained_viewer_channel_ids(
+                    server,
+                    viewer,
+                    &channels,
+                    new_channel_id,
+                )
+                .await,
+            );
+            if let Some(old_channel_id) = old_viewer_channel_id {
+                scope.include_channels(
+                    crate::channel_handler::retained_viewer_channel_ids(
+                        server,
+                        viewer,
+                        &channels,
+                        old_channel_id,
+                    )
+                    .await,
+                );
+            }
         }
         let impact = match home_move_impact {
             Some(impact) => impact,
@@ -2190,6 +2288,10 @@ async fn refresh_target_visibility(
     acl_context: Option<&crate::channel_handler::ClientAclOperationContext>,
     projected_target_channel_id: Option<u32>,
 ) -> Vec<Message> {
+    // An ACL context is only authoritative when this viewer was evaluated for
+    // the ACL operation. Unmatched ACL edits keep the context for operation
+    // bookkeeping but have no permission results, so use the live projection.
+    let acl_context = acl_context.filter(|context| context.has_evaluation());
     let session = target.get_session_id();
     let known_before = visibility.get(session).cloned();
     let target_channel_id = projected_target_channel_id
@@ -2203,6 +2305,13 @@ async fn refresh_target_visibility(
         (!server.get_hide_users_without_traverse() || context.can_view_channel(target_channel_id))
             && (!server.get_hide_channels_without_traverse()
                 || context.can_view_channel_with_ancestors(target_channel_id))
+            || viewer_can_temporarily_view_current_or_linked_channel(
+                server,
+                viewer,
+                target_channel_id,
+                effective_home_channel_id,
+            )
+            .await
     } else {
         can_project_user_with_home(server, viewer, target, effective_home_channel_id).await
     };

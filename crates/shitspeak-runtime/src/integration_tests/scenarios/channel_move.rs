@@ -4,7 +4,10 @@
 use std::time::Duration;
 
 use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
-use shitspeak_messages::messages::Message;
+use shitspeak_messages::messages::{
+    Message,
+    encoder::{ChannelState, UserState},
+};
 use shitspeak_state::{ACL, ACLPermissions, Channel};
 
 /// Checks that a user's own channel move is broadcast to other clients.
@@ -96,9 +99,322 @@ async fn moderator_move_other() {
     );
 }
 
+#[tokio::test]
+async fn unrelated_acl_update_preserves_temporary_visible_users_and_links() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        allow_move_without_traverse: true,
+        reveal_users_in_current_and_linked_channels_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let channels = server.server.get_channels();
+    for (channel_id, name) in [
+        (330, "Visible source"),
+        (331, "Visible linked"),
+        (332, "Unrelated ACL target"),
+    ] {
+        channels
+            .create_channel(Channel::new(channel_id, name.to_owned(), 0, 0, Some(0)))
+            .await
+            .unwrap();
+    }
+    channels.add_link(330, 331).await.unwrap();
+    for channel_id in [330, 331] {
+        channels
+            .set_acls(
+                channel_id,
+                true,
+                vec![group_acl(
+                    "!mover",
+                    enumflags2::BitFlags::empty(),
+                    ACLPermissions::Traverse.into(),
+                    false,
+                )],
+            )
+            .await
+            .unwrap();
+    }
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+
+    alice.move_other(carol.session_id, 330).await;
+    carol
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(carol.session_id) && state.channel_id == Some(330))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("Carol enters the hidden source channel");
+    carol
+        .send(
+            UserState {
+                session: Some(carol.server_session),
+                listening_channel_add: vec![0],
+                ..Default::default()
+            }
+            .into(),
+        )
+        .await;
+    carol
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(carol.session_id)
+                        && state.listening_channel_add == vec![0])
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("Carol starts listening to the visible root channel");
+    bob.drain_now().await;
+
+    alice.move_other(bob.session_id, 330).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_self = false;
+    let mut saw_linked_channel = false;
+    let mut saw_carol_listener = false;
+    while tokio::time::Instant::now() < deadline
+        && !(saw_self && saw_linked_channel && saw_carol_listener)
+    {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = bob.recv(remaining).await else {
+            break;
+        };
+        saw_self |= matches!(&message, Message::UserState(state)
+            if state.session == Some(bob.session_id) && state.channel_id == Some(330));
+        saw_linked_channel |= matches!(&message, Message::ChannelState(state)
+            if state.channel_id == Some(331));
+        saw_carol_listener |= matches!(&message, Message::UserState(state)
+            if state.session == Some(carol.session_id)
+                && state.listening_channel_add.contains(&0));
+    }
+    assert!(saw_self, "Bob enters the hidden source channel");
+    assert!(
+        saw_linked_channel,
+        "Bob should receive the temporarily visible linked channel"
+    );
+    assert!(
+        saw_carol_listener,
+        "Bob should receive Carol's visible listener"
+    );
+    bob.drain_now().await;
+
+    alice
+        .set_acls(
+            332,
+            vec![shitspeak_messages::messages::encoder::ChanAcl {
+                apply_here: true,
+                apply_subs: false,
+                inherited: false,
+                user_id: None,
+                group: Some("other".to_owned()),
+                grant: 0,
+                deny: ACLPermissions::Traverse as u32,
+            }],
+            true,
+        )
+        .await;
+    alice.query_acls(332).await;
+    alice
+        .recv_until(
+            |message| matches!(message, Message::ACL(acl) if acl.channel_id == 332),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("unrelated ACL update commits");
+
+    assert!(
+        bob.recv_until(
+        |message| {
+            matches!(message, Message::ChannelRemove(remove) if remove.channel_id == 331)
+                || matches!(message, Message::UserRemove(remove) if remove.session == carol.session_id)
+                || matches!(message, Message::UserState(state)
+                    if state.session == Some(carol.session_id)
+                        && state.listening_channel_remove.contains(&0))
+            },
+            Duration::from_millis(300),
+        )
+        .await
+        .is_none(),
+        "an unrelated ACL update must not retract temporary channels, users, or listeners"
+    );
+}
+
+#[tokio::test]
+async fn linked_channel_without_traverse_is_visible_from_traversable_current_channel() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        allow_move_without_traverse: true,
+        reveal_users_in_current_and_linked_channels_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let channels = server.server.get_channels();
+    for (channel_id, name) in [(333, "Traversable current"), (334, "Hidden linked")] {
+        channels
+            .create_channel(Channel::new(channel_id, name.to_owned(), 0, 0, Some(0)))
+            .await
+            .unwrap();
+    }
+    channels
+        .set_acls(
+            334,
+            true,
+            vec![group_acl(
+                "!mover",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Traverse.into(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+    assert!(
+        !bob.initial_channel_states
+            .iter()
+            .any(|state| state.channel_id == Some(334)),
+        "Bob cannot Traverse the unlinked hidden channel"
+    );
+
+    alice.move_other(carol.session_id, 334).await;
+    carol
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(carol.session_id) && state.channel_id == Some(334))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("Carol enters the hidden channel");
+    bob.move_to_channel(333).await;
+    bob.recv_until(
+        |message| {
+            matches!(message, Message::UserState(state)
+                if state.session == Some(bob.session_id) && state.channel_id == Some(333))
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("Bob enters the traversable current channel");
+    bob.drain_now().await;
+
+    alice
+        .send(
+            ChannelState {
+                channel_id: Some(333),
+                links_add: vec![334],
+                ..Default::default()
+            }
+            .into(),
+        )
+        .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_hidden_channel = false;
+    let mut saw_carol = false;
+    while tokio::time::Instant::now() < deadline && !(saw_hidden_channel && saw_carol) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = bob.recv(remaining).await else {
+            break;
+        };
+        saw_hidden_channel |= matches!(&message, Message::ChannelState(state)
+            if state.channel_id == Some(334));
+        saw_carol |= matches!(&message, Message::UserState(state)
+            if state.session == Some(carol.session_id) && state.channel_id == Some(334));
+    }
+    assert!(
+        saw_hidden_channel,
+        "the linked channel should be visible from Bob's traversable current channel"
+    );
+    assert!(
+        saw_carol,
+        "users in the non-traversable linked channel should be visible"
+    );
+    bob.drain_now().await;
+
+    alice
+        .send(
+            ChannelState {
+                channel_id: Some(333),
+                links_remove: vec![334],
+                ..Default::default()
+            }
+            .into(),
+        )
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_carol_remove = false;
+    let mut saw_hidden_channel_remove = false;
+    while tokio::time::Instant::now() < deadline && !(saw_carol_remove && saw_hidden_channel_remove)
+    {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = bob.recv(remaining).await else {
+            break;
+        };
+        saw_carol_remove |= matches!(&message, Message::UserRemove(remove)
+            if remove.session == carol.session_id);
+        saw_hidden_channel_remove |= matches!(&message, Message::ChannelRemove(remove)
+            if remove.channel_id == 334);
+    }
+    assert!(
+        saw_carol_remove,
+        "unlinking should remove users from the no-longer-visible linked channel"
+    );
+    assert!(
+        saw_hidden_channel_remove,
+        "unlinking should remove the no-longer-visible linked channel"
+    );
+}
+
 const HIDDEN_PARENT: u32 = 320;
 const HIDDEN_CHILD: u32 = 321;
 const HIDDEN_SIBLING: u32 = 322;
+const HIDDEN_LINKED: u32 = 323;
 
 fn group_acl(
     group: &str,
@@ -151,6 +467,16 @@ async fn configure_hidden_move_channels(
         ))
         .await
         .unwrap();
+    channels
+        .create_channel(Channel::new(
+            HIDDEN_LINKED,
+            "Hidden linked".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
 
     channels
         .set_acls(
@@ -161,6 +487,19 @@ async fn configure_hidden_move_channels(
                 ACLPermissions::Move.into(),
                 enumflags2::BitFlags::empty(),
                 destination_move,
+            )],
+        )
+        .await
+        .unwrap();
+    channels
+        .set_acls(
+            HIDDEN_LINKED,
+            true,
+            vec![group_acl(
+                "!mover",
+                enumflags2::BitFlags::empty(),
+                (ACLPermissions::Traverse | ACLPermissions::Enter).into(),
+                true,
             )],
         )
         .await
@@ -197,7 +536,7 @@ async fn connect_hidden_move_clients(
         .await
         .expect("bob");
     assert!(
-        [HIDDEN_PARENT, HIDDEN_CHILD, HIDDEN_SIBLING]
+        [HIDDEN_PARENT, HIDDEN_CHILD, HIDDEN_SIBLING, HIDDEN_LINKED]
             .into_iter()
             .all(|channel_id| !bob
                 .initial_channel_states
@@ -425,6 +764,213 @@ async fn allowed_hidden_move_reveals_hierarchy_before_move_and_revokes_after_lea
         leave_sequence,
         vec!["self-move", "child-remove", "parent-remove"],
         "departure must be delivered before descendant-first visibility revocation"
+    );
+}
+
+#[tokio::test]
+async fn allowed_hidden_move_keeps_users_and_links_hidden_without_opt_in() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        allow_move_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    configure_hidden_move_channels(&server, true).await;
+    server
+        .server
+        .get_channels()
+        .add_link(HIDDEN_CHILD, HIDDEN_LINKED)
+        .await
+        .expect("link hidden channels");
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+    server
+        .authenticator
+        .register_user("dave", None, Some(4), vec![]);
+
+    let (alice, bob) = connect_hidden_move_clients(&server).await;
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+    let dave = TestClient::connect_and_authenticate(&server, "dave", None)
+        .await
+        .expect("dave");
+    alice.move_other(carol.session_id, HIDDEN_CHILD).await;
+    carol
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(carol.session_id)
+                        && state.channel_id == Some(HIDDEN_CHILD))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("Carol enters the hidden current channel");
+    alice.move_other(dave.session_id, HIDDEN_LINKED).await;
+    dave.recv_until(
+        |message| {
+            matches!(message, Message::UserState(state)
+                    if state.session == Some(dave.session_id)
+                        && state.channel_id == Some(HIDDEN_LINKED))
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("Dave enters the hidden linked channel");
+    bob.drain_now().await;
+
+    alice.move_other(bob.session_id, HIDDEN_CHILD).await;
+    bob.recv_until(
+        |message| {
+            matches!(message, Message::UserState(state)
+                    if state.session == Some(bob.session_id)
+                        && state.channel_id == Some(HIDDEN_CHILD))
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("Bob enters the hidden current channel");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = bob.recv(remaining).await else {
+            break;
+        };
+        assert!(
+            !matches!(&message, Message::ChannelState(state)
+                if state.channel_id == Some(HIDDEN_LINKED))
+                && !matches!(&message, Message::UserState(state)
+                    if matches!(state.session, Some(session)
+                        if session == carol.session_id || session == dave.session_id)),
+            "the default policy must not reveal hidden linked channels or their users"
+        );
+    }
+}
+
+#[tokio::test]
+async fn allowed_hidden_move_reveals_current_and_linked_channel_users_when_configured() {
+    let server = spawn_test_server(TestServerOpts {
+        hide_users_without_traverse: true,
+        hide_channels_without_traverse: true,
+        allow_move_without_traverse: true,
+        reveal_users_in_current_and_linked_channels_without_traverse: true,
+        ..TestServerOpts::default()
+    })
+    .await;
+    configure_hidden_move_channels(&server, true).await;
+    server
+        .server
+        .get_channels()
+        .add_link(HIDDEN_CHILD, HIDDEN_LINKED)
+        .await
+        .expect("link hidden channels");
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+    server
+        .authenticator
+        .register_user("dave", None, Some(4), vec![]);
+
+    let (alice, bob) = connect_hidden_move_clients(&server).await;
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+    let dave = TestClient::connect_and_authenticate(&server, "dave", None)
+        .await
+        .expect("dave");
+
+    alice.move_other(carol.session_id, HIDDEN_CHILD).await;
+    carol
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(carol.session_id)
+                        && state.channel_id == Some(HIDDEN_CHILD))
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("Carol enters the hidden current channel");
+    alice.move_other(dave.session_id, HIDDEN_LINKED).await;
+    dave.recv_until(
+        |message| {
+            matches!(message, Message::UserState(state)
+                    if state.session == Some(dave.session_id)
+                        && state.channel_id == Some(HIDDEN_LINKED))
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("Dave enters the hidden linked channel");
+    bob.drain_now().await;
+
+    alice.move_other(bob.session_id, HIDDEN_CHILD).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut relevant = Vec::new();
+    let mut saw_child = false;
+    let mut saw_linked = false;
+    let mut saw_carol = false;
+    let mut saw_dave = false;
+    while tokio::time::Instant::now() < deadline
+        && !(saw_child && saw_linked && saw_carol && saw_dave)
+    {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(message) = bob.recv(remaining).await else {
+            break;
+        };
+        saw_child |= matches!(&message, Message::ChannelState(state)
+            if state.channel_id == Some(HIDDEN_CHILD));
+        saw_linked |= matches!(&message, Message::ChannelState(state)
+            if state.channel_id == Some(HIDDEN_LINKED));
+        saw_carol |= matches!(&message, Message::UserState(state)
+            if state.session == Some(carol.session_id) && state.channel_id == Some(HIDDEN_CHILD));
+        saw_dave |= matches!(&message, Message::UserState(state)
+            if state.session == Some(dave.session_id) && state.channel_id == Some(HIDDEN_LINKED));
+        if matches!(&message, Message::ChannelState(state)
+            if state.channel_id == Some(HIDDEN_SIBLING))
+        {
+            panic!("temporary visibility must not disclose a hidden sibling");
+        }
+        relevant.push(message);
+    }
+
+    assert!(saw_child, "Bob should receive his hidden current channel");
+    assert!(
+        saw_linked,
+        "Bob should receive the directly linked hidden channel"
+    );
+    assert!(
+        saw_carol,
+        "Bob should see users in his hidden current channel"
+    );
+    assert!(
+        saw_dave,
+        "Bob should see users in the directly linked hidden channel"
+    );
+
+    let last_channel_index = relevant
+        .iter()
+        .rposition(|message| {
+            matches!(message, Message::ChannelState(state)
+                if matches!(state.channel_id, Some(HIDDEN_CHILD | HIDDEN_LINKED)))
+        })
+        .expect("relevant channel states");
+    let first_peer_index = relevant
+        .iter()
+        .position(|message| {
+            matches!(message, Message::UserState(state)
+                if matches!(state.session, Some(session)
+                    if session == carol.session_id || session == dave.session_id))
+        })
+        .expect("relevant peer state");
+    assert!(
+        last_channel_index < first_peer_index,
+        "temporary channels must be introduced before their users: {relevant:?}"
     );
 }
 

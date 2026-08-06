@@ -1121,7 +1121,7 @@ async fn forced_move_candidates(
     candidates
 }
 
-async fn existing_default_channel(server: &Arc<Box<Server>>, server_id: &str) -> u32 {
+pub(crate) async fn existing_default_channel(server: &Arc<Box<Server>>, server_id: &str) -> u32 {
     let default_channel = server.get_default_channel();
     let target_channel = if server
         .get_channels()

@@ -349,6 +349,31 @@ pub(crate) fn channel_and_ancestor_ids<C: AsRef<shitspeak_state::Channel>>(
     result
 }
 
+/// Returns the channels retained around a viewer's current placement. The
+/// current-channel trace is always kept; the optional ACL policy also retains
+/// directly linked channels and their structural ancestors.
+pub(crate) async fn retained_viewer_channel_ids<C: AsRef<Channel>>(
+    server: &Arc<Box<Server>>,
+    _client: &Arc<Box<Client>>,
+    channels: &[C],
+    home_channel_id: u32,
+) -> HashSet<u32> {
+    let mut retained = channel_and_ancestor_ids(channels, home_channel_id);
+    if !server.get_reveal_users_in_current_and_linked_channels_without_traverse() {
+        return retained;
+    }
+
+    let linked_channel_ids = channels
+        .iter()
+        .find(|channel| channel.as_ref().id == home_channel_id)
+        .map(|channel| channel.as_ref().links.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for linked_channel_id in linked_channel_ids {
+        retained.extend(channel_and_ancestor_ids(channels, linked_channel_id));
+    }
+    retained
+}
+
 /// Extends `channel_ids` with every descendant of an already-affected
 /// channel. Building the parent-to-children index once keeps reparent and
 /// home-channel refreshes linear in the channel tree rather than repeatedly
@@ -456,22 +481,8 @@ async fn viewer_current_channel_and_ancestor_ids(
     client: &Arc<Box<Client>>,
 ) -> HashSet<u32> {
     let server_id = client.server_id();
-    let channels = server.get_channels();
-    let mut result = HashSet::new();
-    let mut current_id = client.get_current_channel_id();
-    loop {
-        if !result.insert(current_id) {
-            break;
-        }
-        let Some(channel) = channels.get_channel_in_server(&server_id, current_id).await else {
-            break;
-        };
-        let Some(parent_id) = channel.parent_id else {
-            break;
-        };
-        current_id = parent_id;
-    }
-    result
+    let channels = server.get_channels().get_all_in_server(&server_id).await;
+    retained_viewer_channel_ids(server, client, &channels, client.get_current_channel_id()).await
 }
 
 pub async fn can_view_channel(
@@ -585,9 +596,9 @@ async fn channel_is_visible_in_shadow(
                         .expect("retained viewer channel IDs were just set")
                 }
             };
-            // Only updates to the viewer's own current channel or an
-            // ancestor of it may bypass Traverse. A sibling must still be
-            // rejected when one of its ancestors is hidden.
+            // Only the viewer's retained current-channel trace, and the
+            // opt-in directly linked channels, may bypass Traverse. A sibling
+            // must still be rejected when one of its ancestors is hidden.
             if !retained.contains(&channel_id) {
                 return false;
             }
@@ -653,10 +664,10 @@ pub async fn build_visible_ordered_channel_snapshot_messages<C: AsRef<Channel>>(
                 visible_channel_ids.insert(channel.id);
             }
         }
-        visible_channel_ids.extend(channel_and_ancestor_ids(
-            snapshot,
-            client.get_current_channel_id(),
-        ));
+        visible_channel_ids.extend(
+            retained_viewer_channel_ids(server, client, snapshot, client.get_current_channel_id())
+                .await,
+        );
         close_visible_channel_ancestors(snapshot, &mut visible_channel_ids);
         Some(visible_channel_ids)
     } else {
@@ -1081,6 +1092,10 @@ impl ClientAclOperationContext {
             .contains(shitspeak_state::ACLPermissions::Traverse)
     }
 
+    pub(crate) fn has_evaluation(&self) -> bool {
+        self.evaluation.is_some()
+    }
+
     pub(crate) fn can_view_channel_with_ancestors(&self, channel_id: u32) -> bool {
         if !self.can_view_channel(channel_id) {
             return false;
@@ -1314,10 +1329,15 @@ async fn prepare_channel_visibility_refresh_inner(
     let effective_home_channel_id = home_move_impact
         .map(HomeChannelMoveImpact::new_channel_id)
         .unwrap_or_else(|| client.get_current_channel_id());
-    visible_channel_ids.extend(channel_and_ancestor_ids(
-        &candidate_channels,
-        effective_home_channel_id,
-    ));
+    visible_channel_ids.extend(
+        retained_viewer_channel_ids(
+            server,
+            client,
+            &candidate_channels,
+            effective_home_channel_id,
+        )
+        .await,
+    );
     close_visible_channel_ancestors(&candidate_channels, &mut visible_channel_ids);
 
     let removed_channel_ids = channel_tree_shadow

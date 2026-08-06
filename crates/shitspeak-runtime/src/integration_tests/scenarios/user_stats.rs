@@ -76,6 +76,74 @@ async fn user_stats_cross_channel_omits_extended_fields_for_non_superuser() {
 }
 
 #[tokio::test]
+async fn user_stats_privacy_hides_identity_from_root_ban_user() {
+    let privacy = shitspeak_runtime_config::PrivacyConfig::new(
+        true,
+        Some("test-certificate-hash-secret".to_owned()),
+    );
+    let server = spawn_test_server(TestServerOpts {
+        privacy,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .server
+        .get_channels()
+        .set_acls(
+            0,
+            true,
+            vec![ACL {
+                user_id: Some(1),
+                group: None,
+                apply_here: true,
+                apply_subs: true,
+                allow: ACLPermissions::Ban.into(),
+                deny: enumflags2::BitFlags::empty(),
+            }],
+        )
+        .await
+        .expect("grant root Ban");
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    alice
+        .send(
+            UserStats {
+                session: Some(bob.session_id),
+                stats_only: Some(false),
+                ..UserStats::default()
+            }
+            .into(),
+        )
+        .await;
+
+    let msg = alice
+        .recv_until(
+            |m| matches!(m, Message::UserStats(us) if us.session == Some(bob.session_id)),
+            Duration::from_secs(2),
+        )
+        .await;
+    let Some(Message::UserStats(stats)) = msg else {
+        panic!("Alice should receive Bob's UserStats response");
+    };
+
+    assert!(stats.certificates.is_empty());
+    assert_eq!(stats.address, None);
+    assert!(stats.version.is_some());
+}
+
+#[tokio::test]
 async fn user_stats_includes_sensitive_fields_for_superuser() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

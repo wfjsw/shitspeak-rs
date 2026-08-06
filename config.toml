@@ -155,6 +155,11 @@ reevaluate_speak_on_acl_change = true
 # When true, a moderator with the required Move permissions may move another
 # user into a channel that user cannot Traverse. The default is false.
 allow_move_without_traverse = false
+# When true, a user temporarily retained in a channel they cannot Traverse
+# also sees users in that channel and its directly linked channels. It also
+# reveals inaccessible directly linked channels and their users when the user
+# can Traverse their current channel.
+reveal_users_in_current_and_linked_channels_without_traverse = false
 
 # Privacy behavior toggles
 [privacy]
