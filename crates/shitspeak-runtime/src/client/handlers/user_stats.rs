@@ -33,7 +33,6 @@ pub async fn handle_user_stats(
     );
 
     let sender_id = sender.get_session_id();
-    let sender_is_superuser = sender.is_superuser();
     let server_id = sender.server_id();
     let local_node_id = server.get_clients().local_node_id();
     let stats_only = msg.stats_only.unwrap_or(false);
@@ -44,6 +43,8 @@ pub async fn handle_user_stats(
         crate::client::client_session_identifier::ClientSessionIdentifier::from(target_session_raw);
 
     let mut effective_stats_only = stats_only;
+    let mut details = target_session == sender_id;
+    let mut local = target_session == sender_id;
     if target_session != sender_id {
         if let Some(target_state) = server
             .get_clients()
@@ -56,7 +57,10 @@ pub async fn handle_user_stats(
             let target_channel = target_state.get_current_channel_id();
             let root_perms =
                 crate::client::acl::compute_permissions_for_client(server, sender, 0).await;
-            if !root_perms.contains(shitspeak_state::ACLPermissions::Ban) {
+            let has_root_ban = root_perms.contains(shitspeak_state::ACLPermissions::Ban);
+            details = has_root_ban;
+            local = has_root_ban || target_channel == sender.get_current_channel_id();
+            if !has_root_ban {
                 let target_channel_perms = crate::client::acl::compute_permissions_for_client(
                     server,
                     sender,
@@ -102,8 +106,7 @@ pub async fn handle_user_stats(
                             return Ok(());
                         }
                     };
-                let mut user_stats: UserStats = proto.into();
-                apply_user_stats_privacy(&mut user_stats, sender_is_superuser);
+                let user_stats: UserStats = proto.into();
                 let outbound: Message = user_stats.into();
                 sender.write_proto_message(&outbound).await?;
             }
@@ -132,8 +135,7 @@ pub async fn handle_user_stats(
         sender.clone()
     };
 
-    let user_stats =
-        build_user_stats_payload(&target, effective_stats_only, sender_is_superuser).await;
+    let user_stats = build_user_stats_payload(&target, effective_stats_only, details, local).await;
     let reply: Message = user_stats.into();
     sender.write_proto_message(&reply).await?;
     Ok(())
@@ -147,11 +149,12 @@ pub async fn handle_user_stats(
 async fn build_user_stats_payload(
     target: &Arc<Box<Client>>,
     stats_only: bool,
-    include_sensitive_fields: bool,
+    details: bool,
+    local: bool,
 ) -> UserStats {
     let stats = *target.write_stats().await;
     let local_state = target.read_local_state();
-    let local = local_state.as_ref();
+    let local_state_ref = local_state.as_ref();
 
     let now = chrono::Utc::now();
     let login_time = target.get_login_time();
@@ -160,32 +163,42 @@ async fn build_user_stats_payload(
     let bandwidth = average_bandwidth_bits_per_second(stats.total_volume(), onlinesecs);
     let (from_client, from_server) = udp_network_stats(target);
 
-    let version = target.protocol_version().map(|v| {
-        shitspeak_messages::messages::encoder::Version {
-            version: Some(v),
-            release: include_sensitive_fields
-                .then(|| local.and_then(|l| l.get_release().map(|s| s.to_owned())))
-                .flatten(),
-            os: include_sensitive_fields
-                .then(|| local.and_then(|l| l.get_os_name().map(|s| s.to_owned())))
-                .flatten(),
-            os_version: include_sensitive_fields
-                .then(|| local.and_then(|l| l.get_os_version().map(|s| s.to_owned())))
-                .flatten(),
-        }
-        .into()
-    });
+    let version = details
+        .then(|| {
+            target.protocol_version().map(|v| {
+                shitspeak_messages::messages::encoder::Version {
+                    version: Some(v),
+                    release: details
+                        .then(|| {
+                            local_state_ref.and_then(|l| l.get_release().map(|s| s.to_owned()))
+                        })
+                        .flatten(),
+                    os: details
+                        .then(|| {
+                            local_state_ref.and_then(|l| l.get_os_name().map(|s| s.to_owned()))
+                        })
+                        .flatten(),
+                    os_version: details
+                        .then(|| {
+                            local_state_ref.and_then(|l| l.get_os_version().map(|s| s.to_owned()))
+                        })
+                        .flatten(),
+                }
+                .into()
+            })
+        })
+        .flatten();
 
     UserStats {
         session: Some(u32::from(target.get_session_id())),
         stats_only: Some(stats_only),
-        certificates: if stats_only || !include_sensitive_fields {
+        certificates: if stats_only || !details {
             Vec::new()
         } else {
             target.get_certificate_chain().to_vec()
         },
-        from_client,
-        from_server,
+        from_client: local.then_some(from_client).flatten(),
+        from_server: local.then_some(from_server).flatten(),
         udp_packets: Some(stats.udp_packets()),
         tcp_packets: Some(stats.tcp_packets()),
         udp_ping_avg: Some(stats.udp_ping_avg()),
@@ -194,12 +207,12 @@ async fn build_user_stats_payload(
         tcp_ping_var: Some(stats.tcp_ping_var()),
         version,
         celt_versions: Vec::new(),
-        address: include_sensitive_fields.then(|| target.get_real_ip_address()),
-        bandwidth: Some(bandwidth),
+        address: details.then(|| target.get_real_ip_address()),
+        bandwidth: local.then_some(bandwidth),
         onlinesecs: Some(onlinesecs),
-        idlesecs: Some(idlesecs),
-        strong_certificate: Some(target.is_verified()),
-        opus: Some(true),
+        idlesecs: local.then_some(idlesecs),
+        strong_certificate: details.then(|| target.is_verified()),
+        opus: details.then_some(true),
     }
 }
 
@@ -229,19 +242,6 @@ fn packet_stats_to_proto(
         late: Some(late),
         lost: Some(lost),
         resync: Some(resync),
-    }
-}
-
-fn apply_user_stats_privacy(stats: &mut UserStats, include_sensitive_fields: bool) {
-    if include_sensitive_fields {
-        return;
-    }
-    stats.certificates.clear();
-    stats.address = None;
-    if let Some(version) = stats.version.as_mut() {
-        version.release = None;
-        version.os = None;
-        version.os_version = None;
     }
 }
 
@@ -312,7 +312,8 @@ impl UserStatsResponder for ServerUserStatsResponder {
         let actor_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
             request.actor_session,
         );
-        let mut actor_is_superuser = target.is_superuser();
+        let mut details = actor_id == target_id;
+        let mut local = actor_id == target_id;
         if actor_id != target_id {
             let Some(actor) = server
                 .get_clients()
@@ -324,7 +325,6 @@ impl UserStatsResponder for ServerUserStatsResponder {
                     payload: Bytes::new(),
                 };
             };
-            actor_is_superuser = actor.is_superuser();
             if !crate::client::visibility::can_view_user(&server, &actor, &target).await {
                 return UserStatsApplyOutcome {
                     found: false,
@@ -334,7 +334,10 @@ impl UserStatsResponder for ServerUserStatsResponder {
             let target_channel = target.get_current_channel_id();
             let root_perms =
                 crate::client::acl::compute_permissions_for_client(&server, &actor, 0).await;
-            if !root_perms.contains(shitspeak_state::ACLPermissions::Ban) {
+            let has_root_ban = root_perms.contains(shitspeak_state::ACLPermissions::Ban);
+            details = has_root_ban;
+            local = has_root_ban || target_channel == actor.get_current_channel_id();
+            if !has_root_ban {
                 let target_channel_perms = crate::client::acl::compute_permissions_for_client(
                     &server,
                     &actor,
@@ -350,7 +353,7 @@ impl UserStatsResponder for ServerUserStatsResponder {
                 stats_only = true;
             }
         }
-        let user_stats = build_user_stats_payload(&target, stats_only, actor_is_superuser).await;
+        let user_stats = build_user_stats_payload(&target, stats_only, details, local).await;
         let proto: shitspeak_proto::mumble_proto::UserStats = user_stats.into();
         let mut buf = BytesMut::with_capacity(proto.encoded_len());
         if let Err(e) = proto.encode(&mut buf) {

@@ -7,20 +7,35 @@ use shitspeak_state::Channel;
 use shitspeak_state::{ACL, ACLPermissions};
 
 #[tokio::test]
-async fn user_stats_omits_sensitive_fields_for_non_superuser() {
+async fn user_stats_cross_channel_omits_extended_fields_for_non_superuser() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
         .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    server
+        .server
+        .get_channels()
+        .create_channel(Channel::new(80, "Other".to_owned(), 0, 0, Some(0)))
+        .await
+        .expect("create target channel");
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
         .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    bob.move_to_channel(80).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     alice
         .send(
             UserStats {
-                session: Some(alice.session_id),
+                session: Some(bob.session_id),
                 stats_only: Some(false),
                 ..UserStats::default()
             }
@@ -30,23 +45,34 @@ async fn user_stats_omits_sensitive_fields_for_non_superuser() {
 
     let msg = alice
         .recv_until(
-            |m| matches!(m, Message::UserStats(us) if us.session == Some(alice.session_id)),
+            |m| matches!(m, Message::UserStats(us) if us.session == Some(bob.session_id)),
             Duration::from_secs(2),
         )
         .await;
 
     let Some(Message::UserStats(stats)) = msg else {
-        panic!("Alice should receive her UserStats response");
+        panic!("Alice should receive Bob's UserStats response");
     };
 
+    // Murmur's cross-channel, non-root-Ban response contains only the
+    // packet/ping counters and online time. Extended details are local-only.
     assert!(stats.certificates.is_empty());
     assert_eq!(stats.address, None);
-    let version = stats.version.as_ref().expect("version should be present");
-    assert!(version.version_v1.is_some() || version.version_v2.is_some());
-    assert_eq!(version.release, None);
-    assert_eq!(version.os, None);
-    assert_eq!(version.os_version, None);
-    assert_eq!(stats.strong_certificate, Some(true));
+    assert_eq!(stats.from_client, None);
+    assert_eq!(stats.from_server, None);
+    assert_eq!(stats.version, None);
+    assert!(stats.celt_versions.is_empty());
+    assert_eq!(stats.bandwidth, None);
+    assert_eq!(stats.idlesecs, None);
+    assert_eq!(stats.strong_certificate, None);
+    assert_eq!(stats.opus, None);
+    assert!(stats.udp_packets.is_some());
+    assert!(stats.tcp_packets.is_some());
+    assert!(stats.udp_ping_avg.is_some());
+    assert!(stats.udp_ping_var.is_some());
+    assert!(stats.tcp_ping_avg.is_some());
+    assert!(stats.tcp_ping_var.is_some());
+    assert!(stats.onlinesecs.is_some());
 }
 
 #[tokio::test]

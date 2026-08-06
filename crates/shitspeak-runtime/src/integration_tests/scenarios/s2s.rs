@@ -2168,12 +2168,9 @@ async fn s2s_cross_node_user_stats_omits_sensitive_fields_for_non_superuser() {
     };
     assert!(stats.certificates.is_empty());
     assert_eq!(stats.address, None);
-    let version = stats.version.as_ref().expect("version should be present");
-    assert!(version.version_v1.is_some() || version.version_v2.is_some());
-    assert_eq!(version.release, None);
-    assert_eq!(version.os, None);
-    assert_eq!(version.os_version, None);
-    assert_eq!(stats.strong_certificate, Some(true));
+    assert_eq!(stats.version, None);
+    assert_eq!(stats.strong_certificate, None);
+    assert_eq!(stats.opus, None);
 }
 
 /// Checks cross-node plugin data routing to explicitly targeted receiver sessions.
