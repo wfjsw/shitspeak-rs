@@ -982,6 +982,13 @@ impl ConnectionManager {
         addrs
     }
 
+    /// Failures encountered while resolving implicit advertise candidates.
+    /// They are reported only after all local and public-address discovery
+    /// sources have been considered.
+    pub fn implicit_advertise_failures(&self) -> &[String] {
+        self.inner.cfg().implicit_advertise_failures()
+    }
+
     pub async fn listen_addresses_with_public_ip_probe(&self) -> Vec<PeerAddress> {
         let mut addrs = self.listen_addresses();
         let local_ips =

@@ -115,6 +115,11 @@ pub struct TransportConfig {
     /// Local interface names whose addresses should be published when listen
     /// addresses need automatic advertise expansion.
     local_advertise_interfaces: Vec<String>,
+
+    /// Failures while resolving implicit advertise candidates. They are
+    /// retained until all address-discovery sources have been considered so
+    /// startup can decide whether S2S has any usable advertised address.
+    implicit_advertise_failures: Vec<String>,
 }
 
 impl TransportConfig {
@@ -179,6 +184,7 @@ impl TransportConfig {
             max_users: 100,
             advertise_private_ips: true,
             local_advertise_interfaces: Vec::new(),
+            implicit_advertise_failures: Vec::new(),
         }
     }
 
@@ -473,6 +479,10 @@ impl TransportConfig {
 
     pub fn local_advertise_interfaces(&self) -> &[String] {
         &self.local_advertise_interfaces
+    }
+
+    pub fn implicit_advertise_failures(&self) -> &[String] {
+        &self.implicit_advertise_failures
     }
 
     // --- Chainable setters ---
@@ -845,6 +855,13 @@ impl TransportConfig {
             {
                 self.local_advertise_interfaces.push(interface.to_string());
             }
+        }
+        self
+    }
+
+    pub fn with_implicit_advertise_failure(mut self, failure: String) -> Self {
+        if !self.implicit_advertise_failures.contains(&failure) {
+            self.implicit_advertise_failures.push(failure);
         }
         self
     }

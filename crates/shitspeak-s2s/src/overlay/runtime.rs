@@ -941,6 +941,24 @@ pub(crate) async fn start_inner(
     upper_layer_capabilities: Option<Vec<u8>>,
 ) -> Result<Arc<OverlayInner>, OverlayError> {
     let self_addresses = transport.listen_addresses_with_public_ip_probe().await;
+    let implicit_advertise_failures = transport.implicit_advertise_failures();
+    if !implicit_advertise_failures.is_empty() {
+        if let Err(error) =
+            validate_implicit_advertise_failures(implicit_advertise_failures, self_addresses.len())
+        {
+            warn!(
+                implicit_advertise_failures = ?implicit_advertise_failures,
+                self_address_count = self_addresses.len(),
+                "s2s startup found no routable advertise address after implicit resolution, interface discovery, and public-IP discovery"
+            );
+            return Err(error);
+        }
+        warn!(
+            implicit_advertise_failures = ?implicit_advertise_failures,
+            self_address_count = self_addresses.len(),
+            "ignoring unusable implicit S2S advertise addresses after interface and public-IP discovery found routable addresses"
+        );
+    }
     let inner = Arc::new(OverlayInner::new(
         transport,
         cfg,
@@ -958,11 +976,48 @@ pub(crate) async fn start_inner(
     Ok(inner)
 }
 
+fn validate_implicit_advertise_failures(
+    implicit_advertise_failures: &[String],
+    self_address_count: usize,
+) -> Result<(), OverlayError> {
+    if implicit_advertise_failures.is_empty() || self_address_count > 0 {
+        return Ok(());
+    }
+    Err(OverlayError::Config(format!(
+        "implicit S2S advertise resolution failed and no routable advertise address was found: {}",
+        implicit_advertise_failures.join("; ")
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::num::NonZeroU32;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn implicit_advertise_failure_allows_a_discovered_address() {
+        assert!(validate_implicit_advertise_failures(
+            &["s2s.tcp_advertise \"localhost:64739\" did not resolve to any routable advertise addresses".to_owned()],
+            1,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn implicit_advertise_failure_rejects_an_empty_final_address_list() {
+        let error = validate_implicit_advertise_failures(
+            &["s2s.tcp_advertise \"localhost:64739\" did not resolve to any routable advertise addresses".to_owned()],
+            0,
+        )
+        .expect_err("implicit advertise failure without a discovered address must stop startup");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no routable advertise address was found")
+        );
+    }
 
     #[tokio::test]
     async fn terminal_left_event_purges_only_the_affected_peer() {

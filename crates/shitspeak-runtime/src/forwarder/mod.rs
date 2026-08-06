@@ -548,7 +548,6 @@ fn default_channel_wal_compaction_expire_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
 
     fn parse_forwarder_config(raw: &str) -> ForwarderConfig {
         config::Config::builder()
@@ -581,10 +580,10 @@ mod tests {
     }
 
     #[test]
-    fn register_hostname_still_auto_advertises_when_set() {
+    fn register_hostname_uses_soft_implicit_s2s_advertise() {
         let config = parse_forwarder_config(
             r#"
-            register_hostname = "127.0.0.1"
+            register_hostname = "localhost"
 
             [s2s]
             enabled = true
@@ -597,12 +596,10 @@ mod tests {
 
         let transport = config
             .transport_config()
-            .expect("register_hostname can be used for auto advertise")
+            .expect("unroutable register_hostname is ignored")
             .expect("s2s enabled");
-        assert_eq!(
-            transport.tcp_advertise(),
-            &["127.0.0.1:64739".parse::<SocketAddr>().unwrap()]
-        );
+        assert!(transport.tcp_advertise().is_empty());
+        assert_eq!(transport.implicit_advertise_failures().len(), 1);
     }
 
     #[test]

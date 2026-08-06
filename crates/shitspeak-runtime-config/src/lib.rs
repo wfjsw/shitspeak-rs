@@ -208,12 +208,20 @@ impl S2sConfig {
             auto_advertise_host,
             &self.tcp_listen,
         )?;
-        for addr in tcp_advertise.addrs {
-            cfg = if tcp_advertise.is_override {
+        let ResolvedAdvertiseAddrs {
+            addrs,
+            is_override,
+            implicit_failures,
+        } = tcp_advertise;
+        for addr in addrs {
+            cfg = if is_override {
                 cfg.with_tcp_advertise_override(addr)
             } else {
                 cfg.with_tcp_advertise(addr)
             };
+        }
+        for failure in implicit_failures {
+            cfg = cfg.with_implicit_advertise_failure(failure);
         }
         let kcp_advertise = resolve_s2s_advertise_overrides(
             "s2s.kcp_advertise",
@@ -221,12 +229,20 @@ impl S2sConfig {
             auto_advertise_host,
             &self.kcp_listen,
         )?;
-        for addr in kcp_advertise.addrs {
-            cfg = if kcp_advertise.is_override {
+        let ResolvedAdvertiseAddrs {
+            addrs,
+            is_override,
+            implicit_failures,
+        } = kcp_advertise;
+        for addr in addrs {
+            cfg = if is_override {
                 cfg.with_kcp_advertise_override(addr)
             } else {
                 cfg.with_kcp_advertise(addr)
             };
+        }
+        for failure in implicit_failures {
+            cfg = cfg.with_implicit_advertise_failure(failure);
         }
         let quic_advertise = resolve_s2s_advertise_overrides(
             "s2s.quic_advertise",
@@ -234,12 +250,20 @@ impl S2sConfig {
             auto_advertise_host,
             &self.quic_listen,
         )?;
-        for addr in quic_advertise.addrs {
-            cfg = if quic_advertise.is_override {
+        let ResolvedAdvertiseAddrs {
+            addrs,
+            is_override,
+            implicit_failures,
+        } = quic_advertise;
+        for addr in addrs {
+            cfg = if is_override {
                 cfg.with_quic_advertise_override(addr)
             } else {
                 cfg.with_quic_advertise(addr)
             };
+        }
+        for failure in implicit_failures {
+            cfg = cfg.with_implicit_advertise_failure(failure);
         }
         let udp_advertise = resolve_s2s_advertise_overrides(
             "s2s.udp_advertise",
@@ -247,12 +271,20 @@ impl S2sConfig {
             auto_advertise_host,
             &self.udp_listen,
         )?;
-        for addr in udp_advertise.addrs {
-            cfg = if udp_advertise.is_override {
+        let ResolvedAdvertiseAddrs {
+            addrs,
+            is_override,
+            implicit_failures,
+        } = udp_advertise;
+        for addr in addrs {
+            cfg = if is_override {
                 cfg.with_udp_advertise_override(addr)
             } else {
                 cfg.with_udp_advertise(addr)
             };
+        }
+        for failure in implicit_failures {
+            cfg = cfg.with_implicit_advertise_failure(failure);
         }
 
         cfg = cfg.with_seed_targets(
@@ -376,6 +408,7 @@ enum ListenAddrs {
 struct ResolvedAdvertiseAddrs {
     addrs: Vec<SocketAddr>,
     is_override: bool,
+    implicit_failures: Vec<String>,
 }
 
 fn deserialize_listen_addrs<'de, D>(deserializer: D) -> Result<Vec<SocketAddr>, D::Error>
@@ -434,6 +467,7 @@ fn resolve_s2s_advertise_overrides(
         return Ok(ResolvedAdvertiseAddrs {
             addrs: resolved,
             is_override: true,
+            implicit_failures: Vec::new(),
         });
     }
 
@@ -444,29 +478,55 @@ fn resolve_s2s_advertise_overrides(
         return Ok(ResolvedAdvertiseAddrs {
             addrs: Vec::new(),
             is_override: false,
+            implicit_failures: Vec::new(),
         });
     };
     if listen.is_empty() {
         return Ok(ResolvedAdvertiseAddrs {
             addrs: Vec::new(),
             is_override: false,
+            implicit_failures: Vec::new(),
         });
     };
+    let mut implicit_failures = Vec::new();
     for listen_addr in listen {
         let value = format_host_port(host, listen_addr.port());
-        let addrs = resolve_s2s_advertise_addrs(label, &value)?;
-        let addrs = filter_advertise_addrs_for_listen(
-            label,
-            &value,
-            addrs,
-            std::slice::from_ref(listen_addr),
-        )?;
-        push_unique_socket_addrs(&mut resolved, addrs);
+        match resolve_s2s_advertise_addrs(label, &value).and_then(|addrs| {
+            filter_implicit_advertise_addrs(label, &value, addrs).and_then(|addrs| {
+                filter_advertise_addrs_for_listen(
+                    label,
+                    &value,
+                    addrs,
+                    std::slice::from_ref(listen_addr),
+                )
+            })
+        }) {
+            Ok(addrs) => push_unique_socket_addrs(&mut resolved, addrs),
+            Err(failure) => implicit_failures.push(failure),
+        }
     }
     Ok(ResolvedAdvertiseAddrs {
         addrs: resolved,
         is_override: false,
+        implicit_failures,
     })
+}
+
+fn filter_implicit_advertise_addrs(
+    label: &str,
+    value: &str,
+    addrs: Vec<SocketAddr>,
+) -> Result<Vec<SocketAddr>, String> {
+    let addrs = addrs
+        .into_iter()
+        .filter(|addr| is_routable_advertise_ip(addr.ip()))
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(format!(
+            "{label} {value:?} did not resolve to any routable advertise addresses"
+        ));
+    }
+    Ok(addrs)
 }
 
 fn filter_advertise_addrs_for_listen(
@@ -3391,13 +3451,58 @@ mod tests {
         "#;
         let cfg = parse_s2s(raw).expect("s2s config parses");
         let transport = cfg
-            .transport_config_with_auto_advertise_host(Some("127.0.0.1"))
+            .transport_config_with_auto_advertise_host(Some("8.8.8.8"))
             .expect("auto advertise host resolves")
             .expect("s2s enabled");
         assert_eq!(
             transport.tcp_advertise(),
-            &["127.0.0.1:64739".parse::<SocketAddr>().unwrap()]
+            &["8.8.8.8:64739".parse::<SocketAddr>().unwrap()]
         );
+        assert!(!transport.tcp_advertise_override());
+    }
+
+    #[test]
+    fn s2s_auto_advertise_host_ignores_unroutable_hostname() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "0.0.0.0:64739"
+        "#;
+        let cfg = parse_s2s(raw).expect("s2s config parses");
+        let transport = cfg
+            .transport_config_with_auto_advertise_host(Some("localhost"))
+            .expect("unroutable implicit advertise hostname is ignored")
+            .expect("s2s enabled");
+
+        assert!(transport.tcp_advertise().is_empty());
+        assert!(!transport.tcp_advertise_override());
+        assert_eq!(transport.implicit_advertise_failures().len(), 1);
+        assert!(
+            transport.implicit_advertise_failures()[0]
+                .contains("did not resolve to any routable advertise addresses")
+        );
+    }
+
+    #[test]
+    fn s2s_auto_advertise_host_ignores_literal_loopback() {
+        let raw = r#"
+            enabled = true
+            ca_path = "s2s-ca.pem"
+            cert_path = "s2s-node.pem"
+            key_path = "s2s-node.key"
+            tcp_listen = "0.0.0.0:64739"
+        "#;
+        let cfg = parse_s2s(raw).expect("s2s config parses");
+        let transport = cfg
+            .transport_config_with_auto_advertise_host(Some("127.0.0.1"))
+            .expect("literal loopback implicit advertise host is ignored")
+            .expect("s2s enabled");
+
+        assert!(transport.tcp_advertise().is_empty());
+        assert!(!transport.tcp_advertise_override());
+        assert_eq!(transport.implicit_advertise_failures().len(), 1);
     }
 
     #[test]
