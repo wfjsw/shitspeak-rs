@@ -66,7 +66,10 @@ use super::terminal_journal::{
     TerminalJournal, TerminalJournalError, TerminalJournalRecord, TerminalJournalSnapshotEntry,
     TerminalResolver, TerminalTransition,
 };
-use super::{HistoryMetadata, StrictCommitApplyOutcome, StrictLogMetadata, StrictReplicable};
+use super::{
+    HistoryMetadata, StrictCommitApplyOutcome, StrictLogMetadata, StrictReplicable,
+    StrictSnapshotError,
+};
 use crate::overlay::{LaneId, MembershipEvent, OverlayNetwork, OverlaySendOptions};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{MessageClass, OriginSignature, RoutingMetric, ServiceLevel};
@@ -3535,6 +3538,15 @@ struct HeadEvidenceRetry {
     next_retry_at: TokioInstant,
 }
 
+/// The only published pairing of the replicated repository head and durable
+/// terminal cut. Strict runtime mutations refresh this under one mutex, so
+/// advertisements never need to retry a racy pair of independent reads.
+#[derive(Clone, Copy)]
+struct RepositoryTerminalHead {
+    history_metadata: HistoryMetadata,
+    terminal_cut: TerminalCut,
+}
+
 pub struct StrictRuntime<R: StrictReplicable> {
     pub(super) repo: Arc<R>,
     pub(super) self_id: NodeIdentifier,
@@ -3635,8 +3647,9 @@ pub struct StrictRuntime<R: StrictReplicable> {
     checkpoint_in_progress: AtomicBool,
     terminal_protocol_storage_healthy: AtomicBool,
     terminal_checkpoint_requires_v5: AtomicBool,
+    repository_terminal_head: AsyncMutex<RepositoryTerminalHead>,
     #[cfg(test)]
-    head_snapshot_after_terminal_cut_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    head_snapshot_after_boundary_acquired_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 pub(super) struct SnapshotCaptureGuard<'a> {
@@ -3723,9 +3736,14 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         T: Send + 'static,
         F: FnOnce(&mut TerminalJournal) -> T + Send + 'static,
     {
+        let mut head = self.repository_terminal_head.lock().await;
         if !self.terminal_journal_durable {
             let mut journal = self.terminal_journal.lock().await;
             let result = operation(&mut journal);
+            *head = RepositoryTerminalHead {
+                history_metadata: self.repo.history_metadata(),
+                terminal_cut: journal.terminal_cut(),
+            };
             if journal.checkpoint_epoch() > 0 {
                 self.terminal_checkpoint_requires_v5
                     .store(true, Ordering::Release);
@@ -3733,17 +3751,67 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             return result;
         }
         let journal = Arc::clone(&self.terminal_journal);
-        let (result, checkpointed) = tokio::task::spawn_blocking(move || {
+        let (result, checkpointed, terminal_cut) = tokio::task::spawn_blocking(move || {
             let mut journal = journal.blocking_lock();
             let result = operation(&mut journal);
-            (result, journal.checkpoint_epoch() > 0)
+            (
+                result,
+                journal.checkpoint_epoch() > 0,
+                journal.terminal_cut(),
+            )
         })
         .await
         .expect("strict terminal journal blocking task panicked");
+        *head = RepositoryTerminalHead {
+            history_metadata: self.repo.history_metadata(),
+            terminal_cut,
+        };
         if checkpointed {
             self.terminal_checkpoint_requires_v5
                 .store(true, Ordering::Release);
         }
+        result
+    }
+
+    async fn refresh_repository_terminal_head_after_repository_mutation(
+        &self,
+        head: &mut RepositoryTerminalHead,
+    ) {
+        *head = RepositoryTerminalHead {
+            history_metadata: self.repo.history_metadata(),
+            terminal_cut: self.terminal_journal.lock().await.terminal_cut(),
+        };
+    }
+
+    pub(super) async fn apply_repository_commit_once(
+        &self,
+        version: u64,
+        op: R::Op,
+        metadata: StrictLogMetadata,
+    ) -> StrictCommitApplyOutcome {
+        let mut head = self.repository_terminal_head.lock().await;
+        let outcome = self.repo.apply_committed_once(version, op, metadata).await;
+        self.refresh_repository_terminal_head_after_repository_mutation(&mut head)
+            .await;
+        outcome
+    }
+
+    pub(super) async fn apply_repository_commit(&self, version: u64, op: R::Op) {
+        let mut head = self.repository_terminal_head.lock().await;
+        self.repo.apply_committed(version, op).await;
+        self.refresh_repository_terminal_head_after_repository_mutation(&mut head)
+            .await;
+    }
+
+    pub(super) async fn install_repository_snapshot(
+        &self,
+        version: u64,
+        snapshot: Bytes,
+    ) -> Result<(), StrictSnapshotError> {
+        let mut head = self.repository_terminal_head.lock().await;
+        let result = self.repo.install_snapshot(version, snapshot).await;
+        self.refresh_repository_terminal_head_after_repository_mutation(&mut head)
+            .await;
         result
     }
 
@@ -3818,8 +3886,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         }) {
             return;
         }
-        let metadata = self.repo.history_metadata();
-        let current_cut = self.terminal_journal.lock().await.terminal_cut();
+        let head = self.repository_terminal_head.lock().await;
+        let metadata = head.history_metadata;
+        let current_cut = head.terminal_cut;
+        drop(head);
         let identity = HeadEvidenceIdentity {
             repository_version: metadata.version,
             history_freshness: metadata.freshness,
@@ -3840,9 +3910,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             Ok(checkpoint) => {
                 self.terminal_checkpoint_requires_v5
                     .store(true, Ordering::Release);
-                let (cut, retired) = {
-                    let journal = self.terminal_journal.lock().await;
-                    (journal.terminal_cut(), journal.retired_origins())
+                let (metadata, cut, retired) = {
+                    let head = self.repository_terminal_head.lock().await;
+                    let metadata = head.history_metadata;
+                    let cut = head.terminal_cut;
+                    let retired = self.terminal_journal.lock().await.retired_origins();
+                    (metadata, cut, retired)
                 };
                 {
                     let mut state = self.state.lock();
@@ -3985,11 +4058,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             net.report_strict_replication_repository_capability_loss();
         }
         let initial_history_metadata = repo.history_metadata();
+        let initial_terminal_cut = journal.terminal_cut();
         let initial_head_evidence = LocalHeadEvidence {
             identity: HeadEvidenceIdentity {
                 repository_version: initial_history_metadata.version,
                 history_freshness: initial_history_metadata.freshness,
-                terminal_set_digest: *journal.terminal_cut().terminal_set_digest(),
+                terminal_set_digest: *initial_terminal_cut.terminal_set_digest(),
             },
             acknowledged_by: HashSet::new(),
             retries: HashMap::new(),
@@ -4049,8 +4123,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             checkpoint_in_progress: AtomicBool::new(false),
             terminal_protocol_storage_healthy: AtomicBool::new(terminal_protocol_storage_healthy),
             terminal_checkpoint_requires_v5: AtomicBool::new(terminal_checkpoint_requires_v5),
+            repository_terminal_head: AsyncMutex::new(RepositoryTerminalHead {
+                history_metadata: initial_history_metadata,
+                terminal_cut: initial_terminal_cut,
+            }),
             #[cfg(test)]
-            head_snapshot_after_terminal_cut_hook: Mutex::new(None),
+            head_snapshot_after_boundary_acquired_hook: Mutex::new(None),
         });
         if let Some(violation) = arc.first_terminal_record_exceeding_catchup_budget() {
             // The journal remains authoritative for local delivery, but a
@@ -11705,17 +11783,16 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
         let apply_outcome = match disposition {
             DeliveryDisposition::AlreadyApplied => StrictCommitApplyOutcome::AlreadyApplied,
             DeliveryDisposition::Apply => {
-                rt.repo
-                    .apply_committed_once(
-                        version,
-                        op,
-                        StrictLogMetadata {
-                            op_id_hi: buf.op_id.0,
-                            op_id_lo: buf.op_id.1,
-                            ts_final: buf.ts_final,
-                        },
-                    )
-                    .await
+                rt.apply_repository_commit_once(
+                    version,
+                    op,
+                    StrictLogMetadata {
+                        op_id_hi: buf.op_id.0,
+                        op_id_lo: buf.op_id.1,
+                        ts_final: buf.ts_final,
+                    },
+                )
+                .await
             }
         };
         let apply_elapsed = apply_started.elapsed();
@@ -12480,24 +12557,16 @@ async fn retry_unacknowledged_head_evidence<R: StrictReplicable>(rt: &Arc<Strict
     send_due_head_evidence(rt, history_metadata, terminal_cut, clock).await;
 }
 
-/// Capture a durable terminal cut that was observed while the repository head
-/// stayed unchanged. A terminal decision is committed before repository
-/// delivery, so reading the cut and repository metadata independently can
-/// otherwise advertise a head that never existed locally.
+/// Capture the atomically published durable terminal cut and repository head.
 async fn coherent_advertised_head<R: StrictReplicable>(
     rt: &Arc<StrictRuntime<R>>,
 ) -> (HistoryMetadata, TerminalCut) {
-    loop {
-        let history_metadata = rt.repo.history_metadata();
-        let terminal_cut = rt.terminal_journal.lock().await.terminal_cut();
-        #[cfg(test)]
-        if let Some(hook) = rt.head_snapshot_after_terminal_cut_hook.lock().take() {
-            hook();
-        }
-        if rt.repo.history_metadata() == history_metadata {
-            return (history_metadata, terminal_cut);
-        }
+    let head = rt.repository_terminal_head.lock().await;
+    #[cfg(test)]
+    if let Some(hook) = rt.head_snapshot_after_boundary_acquired_hook.lock().take() {
+        hook();
     }
+    (head.history_metadata, head.terminal_cut)
 }
 
 async fn sleep_or_shutdown<R: StrictReplicable>(
@@ -19541,81 +19610,77 @@ mod tests {
         assert!(rt.prepare_clock_tick_evidence(2, 1, &tick).is_none());
     }
 
-    #[tokio::test]
-    async fn clock_head_retries_after_terminal_read_to_avoid_a_hybrid_identity() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coherent_head_snapshot_serializes_repository_delivery() {
         let (rt, net, repo) = v1_runtime(ReplicationConfig::default());
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
         net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
-        rt.state.lock().peer_clocks.insert(2, 1);
 
         let initial_cut = rt.terminal_journal.lock().await.terminal_cut();
-        let journal = Arc::clone(&rt.terminal_journal);
-        *rt.head_snapshot_after_terminal_cut_hook.lock() = Some(Box::new(move || {
-            journal
-                .try_lock()
-                .expect("terminal cut read must release the journal lock")
-                .upsert_abort_decision(make_op_id(1, 1, 1), 1)
-                .expect("test terminal decision");
-            repo.state.lock().0 = 1;
+        let (snapshot_started_tx, snapshot_started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *rt.head_snapshot_after_boundary_acquired_hook.lock() = Some(Box::new(move || {
+            snapshot_started_tx
+                .send(())
+                .expect("test snapshot observer");
+            release_rx.recv().expect("test snapshot release");
         }));
 
-        emit_clock_tick(&rt).await;
+        let snapshot = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { coherent_advertised_head(&rt).await }
+        });
+        snapshot_started_rx.await.expect("snapshot started");
 
-        let tick = net
-            .drain_captures()
-            .into_iter()
-            .find_map(|frame| match frame {
-                CapturedFrame::StrictMulticast {
-                    body: StrictBody::ClockTick(tick),
-                    ..
-                } => Some(tick),
-                _ => None,
-            })
-            .expect("clock tick");
-        let current_cut = rt.terminal_journal.lock().await.terminal_cut();
-        assert_ne!(current_cut, initial_cut);
-        assert_eq!(tick.repository_version, 1);
-        assert_eq!(tick.history_freshness, 0);
+        let writer = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move {
+                rt.apply_repository_commit_once(
+                    1,
+                    1,
+                    StrictLogMetadata {
+                        op_id_hi: 1,
+                        op_id_lo: 1,
+                        ts_final: 1,
+                    },
+                )
+                .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !writer.is_finished(),
+            "repository delivery must wait for an in-flight head snapshot"
+        );
+
+        release_tx.send(()).expect("release snapshot");
+        let (metadata, cut) = snapshot.await.expect("head snapshot task");
         assert_eq!(
-            tick.terminal_cut.as_ref().and_then(cut_from_wire),
-            Some(current_cut),
-            "the advertised cut must be from the same post-delivery head"
+            metadata,
+            HistoryMetadata {
+                version: 0,
+                freshness: 0,
+            }
         );
+        assert_eq!(
+            cut, initial_cut,
+            "the cut and repository head must come from one stable boundary"
+        );
+        assert_eq!(
+            writer.await.expect("repository delivery task"),
+            StrictCommitApplyOutcome::Applied
+        );
+        assert_eq!(repo.history_metadata().version, 1);
 
-        let matching_remote_tick = StrictClockTick {
-            src_node: 2,
-            src_clock: tick.src_clock,
-            repository_version: tick.repository_version,
-            terminal_cut: tick.terminal_cut.clone(),
-            history_freshness: tick.history_freshness,
-        };
-        assert!(
-            rt.prepare_clock_tick_evidence(2, 1, &matching_remote_tick)
-                .is_none(),
-            "a coherent advertised head must not start TerminalFence repair"
-        );
-        assert!(
-            rt.prepare_head_ack(2, 1, &matching_remote_tick).is_some(),
-            "a coherent advertised head must be exactly acknowledged"
-        );
-        rt.recv_head_ack(
-            2,
-            1,
-            StrictHeadAck {
-                src_node: 2,
-                src_boot_epoch: 1,
-                expected_target_node: 1,
-                expected_target_boot_epoch: 1,
-                repository_version: tick.repository_version,
-                terminal_set_digest: Bytes::copy_from_slice(current_cut.terminal_set_digest()),
-                history_freshness: tick.history_freshness,
-            },
-        );
-        assert!(
-            rt.unacknowledged_head_peers().is_empty(),
-            "the matching final acknowledgement must settle the advertised head"
-        );
+        let (post_delivery_metadata, post_delivery_cut) = coherent_advertised_head(&rt).await;
+        assert_eq!(post_delivery_metadata.version, 1);
+        assert_eq!(post_delivery_cut, initial_cut);
+
+        assert!(rt.apply_terminal_abort(make_op_id(1, 1, 2), 1).await);
+        let (post_terminal_metadata, post_terminal_cut) = coherent_advertised_head(&rt).await;
+        assert_eq!(post_terminal_metadata, post_delivery_metadata);
+        assert_ne!(post_terminal_cut, initial_cut);
     }
 
     #[tokio::test]

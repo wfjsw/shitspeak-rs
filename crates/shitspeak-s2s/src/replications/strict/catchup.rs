@@ -2245,8 +2245,7 @@ async fn install_snapshot_candidate_with_format<R: StrictReplicable>(
         None
     };
     let install_result = rt
-        .repo
-        .install_snapshot(installed_version, repository_snapshot)
+        .install_repository_snapshot(installed_version, repository_snapshot)
         .await;
     metrics::record_pipeline_stage(
         ReplicationPipelineKind::Strict,
@@ -3611,7 +3610,7 @@ pub(crate) async fn apply_response<R: StrictReplicable>(
             rt.wake_delivery_and_clock_tick();
         } else if can_bootstrap {
             let repo_apply_started_at = std::time::Instant::now();
-            rt.repo.apply_committed(cop.version, op).await;
+            rt.apply_repository_commit(cop.version, op).await;
             metrics::record_pipeline_stage(
                 ReplicationPipelineKind::Strict,
                 ReplicationPipelineStage::RepoApply,
