@@ -8,9 +8,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _};
 use tracing::{info, warn};
 
-use crate::http_client;
 use crate::server::Server;
 use crate::types::DEFAULT_SERVER_ID;
 use shitspeak_runtime_config::Config;
@@ -25,17 +26,25 @@ const INITIAL_DELAY_MAX_SECS: u64 = 120;
 /// Re-registration interval: ~1 hour with ±5 minutes jitter.
 const REGISTER_INTERVAL_SECS: u64 = 3600;
 const REGISTER_JITTER_SECS: u64 = 300;
+const REGISTRATION_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct RegistrationCredentials {
+    digest: String,
+    certificate_chain: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
+}
 
 /// Build the XML registration payload.
-async fn build_register_xml(server: &Arc<Box<Server>>, config: &Config) -> String {
+async fn build_register_xml(server: &Arc<Box<Server>>, config: &Config, digest: &str) -> String {
     let user_count = server.get_clients().len_in_server(DEFAULT_SERVER_ID).await;
     let channel_count = server.get_channels().len_in_server(DEFAULT_SERVER_ID).await;
 
-    build_register_xml_with_counts(config, user_count, channel_count)
+    build_register_xml_with_counts(config, digest, user_count, channel_count)
 }
 
 fn build_register_xml_with_counts(
     config: &Config,
+    digest: &str,
     user_count: usize,
     channel_count: usize,
 ) -> String {
@@ -86,6 +95,13 @@ fn build_register_xml_with_counts(
     xml.push_str(&escape_xml(advertised_url));
     xml.push_str("</url>\n");
 
+    // SHA-1 of the DER-encoded leaf TLS certificate. The public registry uses
+    // this to verify that the registration request represents the server it
+    // subsequently probes.
+    xml.push_str("  <digest>");
+    xml.push_str(digest);
+    xml.push_str("</digest>\n");
+
     // User count
     xml.push_str("  <users>");
     xml.push_str(&user_count.to_string());
@@ -118,6 +134,56 @@ fn build_register_xml_with_counts(
 
     xml.push_str("</server>\n");
     xml
+}
+
+async fn load_registration_credentials(config: &Config) -> Result<RegistrationCredentials, String> {
+    let certificate_pem = tokio::fs::read(&config.cert_path)
+        .await
+        .map_err(|error| format!("read TLS certificate {:?}: {error}", config.cert_path))?;
+    let private_key_pem = tokio::fs::read(&config.key_path)
+        .await
+        .map_err(|error| format!("read TLS private key {:?}: {error}", config.key_path))?;
+
+    registration_credentials_from_pem(&certificate_pem, &private_key_pem)
+}
+
+fn registration_credentials_from_pem(
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+) -> Result<RegistrationCredentials, String> {
+    let certificate_chain = CertificateDer::pem_slice_iter(certificate_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("parse TLS certificate: {error}"))?;
+    let leaf_certificate = certificate_chain
+        .first()
+        .ok_or_else(|| "TLS certificate PEM contains no certificates".to_owned())?;
+    let private_key = PrivateKeyDer::from_pem_slice(private_key_pem)
+        .map_err(|error| format!("parse TLS private key: {error}"))?;
+
+    Ok(RegistrationCredentials {
+        digest: hex::encode(digest(&SHA1_FOR_LEGACY_USE_ONLY, leaf_certificate.as_ref()).as_ref()),
+        certificate_chain,
+        private_key,
+    })
+}
+
+fn build_registration_client(
+    credentials: RegistrationCredentials,
+) -> Result<reqwest::Client, String> {
+    let root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(credentials.certificate_chain, credentials.private_key)
+        .map_err(|error| format!("configure registration client certificate: {error}"))?;
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    reqwest::Client::builder()
+        .timeout(REGISTRATION_HTTP_TIMEOUT)
+        .tls_backend_preconfigured(tls_config)
+        .build()
+        .map_err(|error| format!("build registration HTTP client: {error}"))
 }
 
 /// Escape special XML characters in a string.
@@ -188,17 +254,6 @@ pub fn spawn_register_task(
             }
         }
 
-        let client = match http_client::build_with_webpki_fallback(
-            Duration::from_secs(30),
-            "public server registration",
-        ) {
-            Ok(client) => client,
-            Err(e) => {
-                warn!("Registration task disabled: failed to build HTTP client: {e}");
-                return;
-            }
-        };
-
         loop {
             // Re-read config in case it was hot-reloaded
             let config = server.read_config().clone();
@@ -208,33 +263,51 @@ pub fn spawn_register_task(
                 return;
             }
 
-            let xml = build_register_xml(&server, &config).await;
+            match load_registration_credentials(&config).await {
+                Ok(credentials) => {
+                    let xml = build_register_xml(&server, &config, &credentials.digest).await;
 
-            info!("Registering server with public list at {}", REGISTRY_URL);
+                    match build_registration_client(credentials) {
+                        Ok(client) => {
+                            info!("Registering server with public list at {}", REGISTRY_URL);
 
-            match client
-                .post(REGISTRY_URL)
-                .header("Content-Type", "text/xml")
-                .body(xml.clone())
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    if resp.status().is_success() {
-                        match resp.text().await {
-                            Ok(body) => info!("Registration successful: {}", body.trim()),
-                            Err(e) => warn!("Registration response read failed: {}", e),
+                            match client
+                                .post(REGISTRY_URL)
+                                .header("Content-Type", "text/xml")
+                                .body(xml)
+                                .send()
+                                .await
+                            {
+                                Ok(resp) => {
+                                    if resp.status().is_success() {
+                                        match resp.text().await {
+                                            Ok(body) => {
+                                                info!("Registration successful: {}", body.trim())
+                                            }
+                                            Err(e) => {
+                                                warn!("Registration response read failed: {}", e)
+                                            }
+                                        }
+                                    } else {
+                                        warn!(
+                                            "Registration failed with status {}: {:?}",
+                                            resp.status(),
+                                            resp.text().await.unwrap_or_default()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Registration request failed: {}", e);
+                                }
+                            }
                         }
-                    } else {
-                        warn!(
-                            "Registration failed with status {}: {:?}",
-                            resp.status(),
-                            resp.text().await.unwrap_or_default()
-                        );
+                        Err(error) => {
+                            warn!(%error, "Registration skipped: failed to build mTLS client");
+                        }
                     }
                 }
-                Err(e) => {
-                    warn!("Registration request failed: {}", e);
+                Err(error) => {
+                    warn!(%error, "Registration skipped: failed to load TLS identity");
                 }
             }
 
@@ -291,13 +364,38 @@ mod tests {
             "#,
         );
 
-        let xml = build_register_xml_with_counts(&config, 12, 3);
+        let digest = "0123456789abcdef0123456789abcdef01234567";
+        let xml = build_register_xml_with_counts(&config, digest, 12, 3);
 
         assert!(xml.contains(
             "<url>mumble://voice.example.test:64738/?title=ShitSpeak&amp;region=us</url>"
         ));
+        assert!(xml.contains(&format!("<digest>{digest}</digest>")));
         assert!(xml.contains("<users>12</users>"));
         assert!(xml.contains("<channels>3</channels>"));
+    }
+
+    #[test]
+    fn registration_credentials_digest_the_leaf_certificate() {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate certificate");
+        let certificate_pem = certificate.cert.pem();
+        let private_key_pem = certificate.key_pair.serialize_pem();
+        let leaf_certificate = CertificateDer::pem_slice_iter(certificate_pem.as_bytes())
+            .next()
+            .expect("certificate PEM contains a leaf certificate")
+            .expect("parse leaf certificate");
+
+        let credentials = registration_credentials_from_pem(
+            certificate_pem.as_bytes(),
+            private_key_pem.as_bytes(),
+        )
+        .expect("load registration credentials");
+        let expected_digest =
+            hex::encode(digest(&SHA1_FOR_LEGACY_USE_ONLY, leaf_certificate.as_ref()).as_ref());
+
+        assert_eq!(credentials.digest, expected_digest);
+        build_registration_client(credentials).expect("build mTLS registration client");
     }
 
     #[test]
