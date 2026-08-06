@@ -3635,6 +3635,8 @@ pub struct StrictRuntime<R: StrictReplicable> {
     checkpoint_in_progress: AtomicBool,
     terminal_protocol_storage_healthy: AtomicBool,
     terminal_checkpoint_requires_v5: AtomicBool,
+    #[cfg(test)]
+    head_snapshot_after_terminal_cut_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 pub(super) struct SnapshotCaptureGuard<'a> {
@@ -4047,6 +4049,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             checkpoint_in_progress: AtomicBool::new(false),
             terminal_protocol_storage_healthy: AtomicBool::new(terminal_protocol_storage_healthy),
             terminal_checkpoint_requires_v5: AtomicBool::new(terminal_checkpoint_requires_v5),
+            #[cfg(test)]
+            head_snapshot_after_terminal_cut_hook: Mutex::new(None),
         });
         if let Some(violation) = arc.first_terminal_record_exceeding_catchup_budget() {
             // The journal remains authoritative for local delivery, but a
@@ -12381,13 +12385,13 @@ async fn emit_clock_tick<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
         let mut s = rt.state.lock();
         advance_clock_for_tick(&mut s, rt.self_id)
     };
-    let terminal_cut =
+    let (history_metadata, terminal_cut) =
         if rt.net.local_strict_replication_protocol_version() >= STRICT_PROTOCOL_VERSION_V4 {
-            Some(rt.terminal_journal.lock().await.terminal_cut())
+            let (history_metadata, terminal_cut) = coherent_advertised_head(rt).await;
+            (history_metadata, Some(terminal_cut))
         } else {
-            None
+            (rt.repo.history_metadata(), None)
         };
-    let history_metadata = rt.repo.history_metadata();
     if let Some(cut) = terminal_cut {
         rt.remember_advertised_head(history_metadata, cut);
     }
@@ -12471,10 +12475,29 @@ async fn retry_unacknowledged_head_evidence<R: StrictReplicable>(rt: &Arc<Strict
     {
         return;
     }
-    let terminal_cut = rt.terminal_journal.lock().await.terminal_cut();
-    let history_metadata = rt.repo.history_metadata();
+    let (history_metadata, terminal_cut) = coherent_advertised_head(rt).await;
     let clock = rt.state.lock().clock;
     send_due_head_evidence(rt, history_metadata, terminal_cut, clock).await;
+}
+
+/// Capture a durable terminal cut that was observed while the repository head
+/// stayed unchanged. A terminal decision is committed before repository
+/// delivery, so reading the cut and repository metadata independently can
+/// otherwise advertise a head that never existed locally.
+async fn coherent_advertised_head<R: StrictReplicable>(
+    rt: &Arc<StrictRuntime<R>>,
+) -> (HistoryMetadata, TerminalCut) {
+    loop {
+        let history_metadata = rt.repo.history_metadata();
+        let terminal_cut = rt.terminal_journal.lock().await.terminal_cut();
+        #[cfg(test)]
+        if let Some(hook) = rt.head_snapshot_after_terminal_cut_hook.lock().take() {
+            hook();
+        }
+        if rt.repo.history_metadata() == history_metadata {
+            return (history_metadata, terminal_cut);
+        }
+    }
 }
 
 async fn sleep_or_shutdown<R: StrictReplicable>(
@@ -19516,6 +19539,83 @@ mod tests {
         };
 
         assert!(rt.prepare_clock_tick_evidence(2, 1, &tick).is_none());
+    }
+
+    #[tokio::test]
+    async fn clock_head_retries_after_terminal_read_to_avoid_a_hybrid_identity() {
+        let (rt, net, repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        rt.state.lock().peer_clocks.insert(2, 1);
+
+        let initial_cut = rt.terminal_journal.lock().await.terminal_cut();
+        let journal = Arc::clone(&rt.terminal_journal);
+        *rt.head_snapshot_after_terminal_cut_hook.lock() = Some(Box::new(move || {
+            journal
+                .try_lock()
+                .expect("terminal cut read must release the journal lock")
+                .upsert_abort_decision(make_op_id(1, 1, 1), 1)
+                .expect("test terminal decision");
+            repo.state.lock().0 = 1;
+        }));
+
+        emit_clock_tick(&rt).await;
+
+        let tick = net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictMulticast {
+                    body: StrictBody::ClockTick(tick),
+                    ..
+                } => Some(tick),
+                _ => None,
+            })
+            .expect("clock tick");
+        let current_cut = rt.terminal_journal.lock().await.terminal_cut();
+        assert_ne!(current_cut, initial_cut);
+        assert_eq!(tick.repository_version, 1);
+        assert_eq!(tick.history_freshness, 0);
+        assert_eq!(
+            tick.terminal_cut.as_ref().and_then(cut_from_wire),
+            Some(current_cut),
+            "the advertised cut must be from the same post-delivery head"
+        );
+
+        let matching_remote_tick = StrictClockTick {
+            src_node: 2,
+            src_clock: tick.src_clock,
+            repository_version: tick.repository_version,
+            terminal_cut: tick.terminal_cut.clone(),
+            history_freshness: tick.history_freshness,
+        };
+        assert!(
+            rt.prepare_clock_tick_evidence(2, 1, &matching_remote_tick)
+                .is_none(),
+            "a coherent advertised head must not start TerminalFence repair"
+        );
+        assert!(
+            rt.prepare_head_ack(2, 1, &matching_remote_tick).is_some(),
+            "a coherent advertised head must be exactly acknowledged"
+        );
+        rt.recv_head_ack(
+            2,
+            1,
+            StrictHeadAck {
+                src_node: 2,
+                src_boot_epoch: 1,
+                expected_target_node: 1,
+                expected_target_boot_epoch: 1,
+                repository_version: tick.repository_version,
+                terminal_set_digest: Bytes::copy_from_slice(current_cut.terminal_set_digest()),
+                history_freshness: tick.history_freshness,
+            },
+        );
+        assert!(
+            rt.unacknowledged_head_peers().is_empty(),
+            "the matching final acknowledgement must settle the advertised head"
+        );
     }
 
     #[tokio::test]
