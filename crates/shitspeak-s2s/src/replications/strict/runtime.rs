@@ -9822,11 +9822,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         };
         let peer = PeerIncarnation::new(from, origin_boot_epoch);
         let repository_ahead = tick.repository_version > self.repo.current_version();
-        let terminal_ahead = !self
-            .v3_sync
-            .lock()
-            .known_source_cut(peer)
-            .is_some_and(|known| source_cut_covers(known, remote_cut));
+        let terminal_known_locally = self
+            .terminal_journal
+            .try_lock()
+            .is_ok_and(|journal| journal.recognizes_terminal_cut(&remote_cut));
+        let terminal_ahead = !terminal_known_locally
+            && !self
+                .v3_sync
+                .lock()
+                .known_source_cut(peer)
+                .is_some_and(|known| source_cut_covers(known, remote_cut));
         if !repository_ahead && !terminal_ahead {
             return None;
         }
@@ -11053,9 +11058,6 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
             }
             StrictBody::Commit(c) => self.recv_commit(from, c).await,
             StrictBody::ClockTick(t) => {
-                if !self.recv_clock_tick_with_origin_epoch(from, origin_boot_epoch, t.clone()) {
-                    return;
-                }
                 let head_ack = self.prepare_head_ack(from, origin_boot_epoch, &t);
                 let history_probe = self.prepare_clock_tick_evidence(from, origin_boot_epoch, &t);
                 let history_election = self.request_history_election_for_clock_rank_divergence(
@@ -11063,6 +11065,12 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                     origin_boot_epoch,
                     &t,
                 );
+                // A clock tick is a delivery watermark only after its
+                // advertised terminal cut has been synchronized. Otherwise a
+                // reordered tick could release a later buffered commit before
+                // the earlier terminal decision arrives.
+                let delivery_fenced =
+                    history_probe.is_some() && t.repository_version > self.repo.current_version();
                 if (head_ack.is_some() || history_probe.is_some() || history_election)
                     && let Some(weak) = self.weak_self.lock().clone()
                 {
@@ -11093,6 +11101,10 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                         }
                     });
                 }
+                if delivery_fenced {
+                    return;
+                }
+                let _ = self.recv_clock_tick_with_origin_epoch(from, origin_boot_epoch, t);
             }
             StrictBody::HeadAck(ack) => {
                 self.recv_head_ack(from, origin_boot_epoch, ack);
@@ -12379,10 +12391,23 @@ async fn emit_clock_tick<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
     if let Some(cut) = terminal_cut {
         rt.remember_advertised_head(history_metadata, cut);
     }
-    let base_body = StrictBody::ClockTick(StrictClockTick {
-        src_node: rt.self_id as u32,
-        src_clock: clock,
-        ..Default::default()
+    // A delivery watermark is only safe when its clock evidence is ordered
+    // after every terminal decision known to the peer. The terminal cut
+    // makes that dependency explicit: a receiver that has not synchronized
+    // this cut must not let this tick advance the peer watermark.
+    let base_body = StrictBody::ClockTick(match terminal_cut {
+        Some(cut) => StrictClockTick {
+            src_node: rt.self_id as u32,
+            src_clock: clock,
+            repository_version: history_metadata.version,
+            terminal_cut: Some(cut_to_wire(cut)),
+            history_freshness: history_metadata.freshness,
+        },
+        None => StrictClockTick {
+            src_node: rt.self_id as u32,
+            src_clock: clock,
+            ..Default::default()
+        },
     });
     let dsts: Vec<_> = rt
         .net
@@ -15497,6 +15522,74 @@ mod tests {
         let state = rt.state.lock();
         assert_eq!(state.clock, 80_000);
         assert_eq!(state.peer_clocks.get(&1), Some(&80_000));
+    }
+
+    #[tokio::test]
+    async fn clock_tick_waits_for_advertised_terminal_cut_before_releasing_delivery() {
+        let (rt, net, repo) = v1_runtime(ReplicationConfig::default());
+        enable_v5_floor_with_v4_participants(&net, [2]);
+        net.set_live_reliable_routes([2]);
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+
+        let earlier_op = (1, 1);
+        let earlier_bytes = Bytes::from(rmp_serde::to_vec(&101u64).unwrap());
+        let source_cut = {
+            let mut journal = TerminalJournal::in_memory("channels");
+            journal
+                .upsert_commit_decision(earlier_op, 2, 10, earlier_bytes.to_vec())
+                .unwrap();
+            journal.terminal_cut()
+        };
+        {
+            let mut state = rt.state.lock();
+            state.clock = 11;
+            state.peer_clocks.insert(1, 11);
+            state.peer_clocks.insert(2, 0);
+            state.peer_admissions.insert(
+                2,
+                PeerAdmission {
+                    boot_epoch: 1,
+                    phase: PeerAdmissionPhase::Admitted,
+                },
+            );
+            state.buffer_commit((2, 1), 10, Bytes::from(rmp_serde::to_vec(&202u64).unwrap()));
+        }
+
+        rt.dispatch(
+            2,
+            1,
+            true,
+            StrictBody::ClockTick(StrictClockTick {
+                src_node: 2,
+                src_clock: 11,
+                repository_version: 1,
+                terminal_cut: Some(cut_to_wire(source_cut)),
+                history_freshness: 0,
+            }),
+        )
+        .await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            rt.state.lock().peer_clocks.get(&2),
+            Some(&0),
+            "a tick must not advance delivery until its terminal cut is known"
+        );
+        assert!(net.drain_captures().into_iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(_),
+                ..
+            }
+        )));
+
+        run_delivery_pass(&rt).await;
+        assert!(
+            repo.log().is_empty(),
+            "the later commit must remain buffered"
+        );
+        assert_eq!(rt.state.lock().commit_buffer.len(), 1);
     }
 
     #[test]

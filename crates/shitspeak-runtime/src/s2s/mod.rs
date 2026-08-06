@@ -652,7 +652,7 @@ fn parse_cgroup_memory_available() -> Option<u64> {
 #[must_use]
 pub enum ChannelOpProposeResult {
     Proposed,
-    Unavailable,
+    Standalone,
     Failed(String),
 }
 
@@ -666,13 +666,13 @@ impl ChannelOpProposeResult {
     }
 
     pub fn should_apply_locally(&self) -> bool {
-        matches!(self, Self::Unavailable)
+        matches!(self, Self::Standalone)
     }
 
     pub fn failure_reason(&self) -> Option<&str> {
         match self {
             Self::Failed(reason) => Some(reason),
-            Self::Proposed | Self::Unavailable => None,
+            Self::Proposed | Self::Standalone => None,
         }
     }
 }
@@ -769,25 +769,27 @@ pub enum ChannelOpCompletion {
 #[must_use]
 pub enum ChannelOpProposalStart {
     Started(ChannelOpProposal),
-    Unavailable,
+    Standalone,
+    Failed(String),
 }
 
 impl ChannelOpProposalStart {
     pub async fn completed(self) -> ChannelOpProposeResult {
         match self {
             Self::Started(proposal) => proposal.completed().await,
-            Self::Unavailable => ChannelOpProposeResult::Unavailable,
+            Self::Standalone => ChannelOpProposeResult::Standalone,
+            Self::Failed(reason) => ChannelOpProposeResult::Failed(reason),
         }
     }
 
     pub fn should_apply_locally(&self) -> bool {
-        matches!(self, Self::Unavailable)
+        matches!(self, Self::Standalone)
     }
 
     pub fn into_started(self) -> Option<ChannelOpProposal> {
         match self {
             Self::Started(proposal) => Some(proposal),
-            Self::Unavailable => None,
+            Self::Standalone | Self::Failed(_) => None,
         }
     }
 }
@@ -1079,9 +1081,14 @@ impl S2SManager {
         server_id: Option<&str>,
         op: ChannelOp,
     ) -> ChannelOpProposalStart {
+        if !self.enabled {
+            return ChannelOpProposalStart::Standalone;
+        }
         let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID).to_owned();
         let Some(tx) = self.state.read().gateway_tx.clone() else {
-            return ChannelOpProposalStart::Unavailable;
+            return ChannelOpProposalStart::Failed(
+                "s2s channel proposal gateway unavailable".to_owned(),
+            );
         };
         let (accepted_tx, accepted_rx) = oneshot::channel();
         let (respond, rx) = oneshot::channel();
@@ -1094,7 +1101,9 @@ impl S2SManager {
             })
             .await
         {
-            return ChannelOpProposalStart::Unavailable;
+            return ChannelOpProposalStart::Failed(
+                "s2s channel proposal gateway unavailable".to_owned(),
+            );
         }
         ChannelOpProposalStart::Started(ChannelOpProposal {
             accepted: Some(accepted_rx),
@@ -4534,6 +4543,18 @@ mod tests {
 
         assert!(timeout > s2s_replications::ReplicationConfig::default().propose_ttl());
         assert_eq!(timeout, Duration::from_millis(10_200));
+    }
+
+    #[test]
+    fn only_explicit_standalone_mode_allows_local_channel_mutation() {
+        let standalone = ChannelOpProposalStart::Standalone;
+        assert!(standalone.should_apply_locally());
+        assert!(ChannelOpProposeResult::Standalone.should_apply_locally());
+
+        let unavailable =
+            ChannelOpProposalStart::Failed("s2s channel proposal gateway unavailable".to_owned());
+        assert!(!unavailable.should_apply_locally());
+        assert!(!ChannelOpProposeResult::failed("gateway unavailable").should_apply_locally());
     }
 
     #[test]
