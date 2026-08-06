@@ -233,6 +233,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
             Some(initial_replication_capabilities),
         )
         .await?;
+    let channel_repository = repositories
+        .as_ref()
+        .map(|repositories| Arc::clone(&repositories.channels));
     let replication_manager = match repositories {
         Some(repositories) => Some(start_forwarder_replications(
             overlay.clone(),
@@ -246,11 +249,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let local_geo =
         start_observability_geo_resolution(config.s2s.geo.manual_geo(), shutdown_rx.clone());
-    let metrics_source: Arc<dyn S2sMetricsSource> = Arc::new(S2sTopologyMetricsSource::new(
-        overlay.clone(),
-        transport.clone(),
-        local_geo.clone(),
-    ));
+    let mut metrics_source =
+        S2sTopologyMetricsSource::new(overlay.clone(), transport.clone(), local_geo.clone());
+    if let Some(channels) = channel_repository {
+        metrics_source = metrics_source.with_channel_repository(channels);
+    }
+    let metrics_source: Arc<dyn S2sMetricsSource> = Arc::new(metrics_source);
     let status_task = config.s2s.status_http_listen.and_then(|listen| {
         match status::spawn_status_server(
             listen,

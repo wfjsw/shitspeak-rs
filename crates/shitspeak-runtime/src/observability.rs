@@ -198,6 +198,7 @@ pub struct S2sTopologyMetricsSource {
     overlay: OverlayNetwork,
     transport: ConnectionManager,
     local_geo: SharedNodeGeo,
+    channels: Option<Arc<ChannelRepository>>,
 }
 
 impl S2sTopologyMetricsSource {
@@ -210,7 +211,15 @@ impl S2sTopologyMetricsSource {
             overlay,
             transport,
             local_geo,
+            channels: None,
         }
+    }
+
+    /// Add channel repository metrics when this topology source belongs to a
+    /// replication-capable S2S forwarder.
+    pub fn with_channel_repository(mut self, channels: Arc<ChannelRepository>) -> Self {
+        self.channels = Some(channels);
+        self
     }
 
     fn build_info_samples(&self) -> Vec<PrometheusSample> {
@@ -219,6 +228,14 @@ impl S2sTopologyMetricsSource {
 
     fn process_samples(&self) -> Vec<PrometheusSample> {
         process_samples(self.transport.local_node_id())
+    }
+
+    async fn channel_consensus_samples(&self) -> Vec<PrometheusSample> {
+        let Some(channels) = &self.channels else {
+            return Vec::new();
+        };
+        let snapshot = ChannelConsensusMetricsSnapshot::from_repository(channels).await;
+        channel_consensus_samples_from_snapshot(&snapshot)
     }
 }
 
@@ -230,6 +247,10 @@ impl S2sMetricsSource for S2sTopologyMetricsSource {
         append_prometheus_metrics_separator(&mut body);
         render_app_build_info_metrics_into(&mut body, &self.build_info_samples());
         render_process_metrics_into(&mut body, &self.process_samples());
+        let channel_samples = self.channel_consensus_samples().await;
+        if !channel_samples.is_empty() {
+            render_channel_consensus_metrics_into(&mut body, &channel_samples);
+        }
         Some(body)
     }
 
@@ -242,6 +263,7 @@ impl S2sMetricsSource for S2sTopologyMetricsSource {
             status::prometheus_samples(&self.overlay, &self.transport, self.local_geo.get());
         samples.extend(self.build_info_samples());
         samples.extend(self.process_samples());
+        samples.extend(self.channel_consensus_samples().await);
         let timestamp_ms = now_unix_ms();
         Some(remote_write_bodies(
             &samples,
@@ -398,26 +420,14 @@ fn current_process_resident_memory_bytes() -> Option<u64> {
     None
 }
 
-struct ConsensusMetricsSnapshot {
+struct ChannelConsensusMetricsSnapshot {
     channel_versions: Vec<(String, u64)>,
-    client_versions: Vec<(u16, u64)>,
-    client_version_vector: String,
-    total_clients: usize,
     total_channels: usize,
     channels_by_server: Vec<(String, usize)>,
 }
 
-impl ConsensusMetricsSnapshot {
-    async fn from_repositories(clients: &ClientRepository, channels: &ChannelRepository) -> Self {
-        let (client_snapshot, client_versions) = clients.snapshot_with_versions().await;
-        let total_clients = client_snapshot.len();
-        drop(client_snapshot);
-        let mut client_versions = client_versions.into_iter().collect::<Vec<_>>();
-        let local_node_id = clients.local_node_id();
-        client_versions.retain(|(node_id, _)| *node_id != local_node_id);
-        client_versions.push((local_node_id, clients.current_version()));
-        client_versions.sort_by_key(|(node_id, _)| *node_id);
-
+impl ChannelConsensusMetricsSnapshot {
+    async fn from_repository(channels: &ChannelRepository) -> Self {
         let mut server_ids = channels.known_server_ids();
         if server_ids.is_empty() {
             server_ids.push(DEFAULT_SERVER_ID.to_owned());
@@ -438,15 +448,49 @@ impl ConsensusMetricsSnapshot {
             channels_by_server.push((server_id, channel_count));
         }
 
-        let client_version_vector = serialize_client_version_vector(&client_versions);
         Self {
             channel_versions,
-            client_versions,
-            client_version_vector,
-            total_clients,
             total_channels,
             channels_by_server,
         }
+    }
+}
+
+struct ConsensusMetricsSnapshot {
+    channel_metrics: ChannelConsensusMetricsSnapshot,
+    client_versions: Vec<(u16, u64)>,
+    client_version_vector: String,
+    total_clients: usize,
+}
+
+impl ConsensusMetricsSnapshot {
+    async fn from_repositories(clients: &ClientRepository, channels: &ChannelRepository) -> Self {
+        let channel_metrics = ChannelConsensusMetricsSnapshot::from_repository(channels).await;
+        let (client_snapshot, client_versions) = clients.snapshot_with_versions().await;
+        let total_clients = client_snapshot.len();
+        drop(client_snapshot);
+        let mut client_versions = client_versions.into_iter().collect::<Vec<_>>();
+        let local_node_id = clients.local_node_id();
+        client_versions.retain(|(node_id, _)| *node_id != local_node_id);
+        client_versions.push((local_node_id, clients.current_version()));
+        client_versions.sort_by_key(|(node_id, _)| *node_id);
+
+        let client_version_vector = serialize_client_version_vector(&client_versions);
+        Self {
+            channel_metrics,
+            client_versions,
+            client_version_vector,
+            total_clients,
+        }
+    }
+}
+
+fn render_channel_consensus_metrics_into(out: &mut String, samples: &[PrometheusSample]) {
+    for (name, help) in CHANNEL_CONSENSUS_METRIC_HEADERS {
+        render_prometheus_header(out, name, help, "gauge");
+    }
+    for sample in samples {
+        render_prometheus_sample(out, sample);
     }
 }
 
@@ -473,6 +517,21 @@ fn consensus_samples_from_snapshot(snapshot: &ConsensusMetricsSnapshot) -> Vec<P
             *version as f64,
         ));
     }
+    samples.extend(channel_consensus_samples_from_snapshot(
+        &snapshot.channel_metrics,
+    ));
+    samples.push(PrometheusSample::new(
+        "shitspeak_consensus_clients_total",
+        Vec::new(),
+        snapshot.total_clients as f64,
+    ));
+    samples
+}
+
+fn channel_consensus_samples_from_snapshot(
+    snapshot: &ChannelConsensusMetricsSnapshot,
+) -> Vec<PrometheusSample> {
+    let mut samples = Vec::with_capacity(snapshot.channel_versions.len() * 2 + 1);
     for (server_id, version) in &snapshot.channel_versions {
         samples.push(PrometheusSample::new(
             "shitspeak_consensus_channel_repository_version",
@@ -480,11 +539,6 @@ fn consensus_samples_from_snapshot(snapshot: &ConsensusMetricsSnapshot) -> Vec<P
             *version as f64,
         ));
     }
-    samples.push(PrometheusSample::new(
-        "shitspeak_consensus_clients_total",
-        Vec::new(),
-        snapshot.total_clients as f64,
-    ));
     samples.push(PrometheusSample::new(
         "shitspeak_consensus_channels_total",
         Vec::new(),
@@ -527,6 +581,21 @@ fn serialize_client_version_vector(versions: &[(u16, u64)]) -> String {
         .collect::<Vec<_>>()
         .join(",")
 }
+
+const CHANNEL_CONSENSUS_METRIC_HEADERS: &[(&str, &str)] = &[
+    (
+        "shitspeak_consensus_channel_repository_version",
+        "Current channel repository version by server scope.",
+    ),
+    (
+        "shitspeak_consensus_channels_total",
+        "Total materialized channels in the channel repository.",
+    ),
+    (
+        "shitspeak_consensus_channels_by_server",
+        "Materialized channels in the channel repository by server scope.",
+    ),
+];
 
 const CONSENSUS_METRIC_HEADERS: &[(&str, &str)] = &[
     (
@@ -1561,12 +1630,14 @@ mod tests {
     #[test]
     fn consensus_metrics_render_counts_versions_and_vector() {
         let snapshot = ConsensusMetricsSnapshot {
-            channel_versions: vec![("alpha".to_owned(), 12), ("default".to_owned(), 7)],
+            channel_metrics: ChannelConsensusMetricsSnapshot {
+                channel_versions: vec![("alpha".to_owned(), 12), ("default".to_owned(), 7)],
+                total_channels: 9,
+                channels_by_server: vec![("alpha".to_owned(), 2), ("default".to_owned(), 7)],
+            },
             client_versions: vec![(1, 3), (2, 5)],
             client_version_vector: "1:3,2:5".to_owned(),
             total_clients: 4,
-            total_channels: 9,
-            channels_by_server: vec![("alpha".to_owned(), 2), ("default".to_owned(), 7)],
         };
         let samples = consensus_samples_from_snapshot(&snapshot);
         let mut rendered = String::new();
@@ -1588,6 +1659,29 @@ mod tests {
         assert!(
             rendered.contains("shitspeak_consensus_channels_by_server{server_id=\"default\"} 7")
         );
+    }
+
+    #[test]
+    fn channel_consensus_metrics_render_the_ordinary_node_series() {
+        let snapshot = ChannelConsensusMetricsSnapshot {
+            channel_versions: vec![("alpha".to_owned(), 12), ("default".to_owned(), 7)],
+            total_channels: 9,
+            channels_by_server: vec![("alpha".to_owned(), 2), ("default".to_owned(), 7)],
+        };
+        let samples = channel_consensus_samples_from_snapshot(&snapshot);
+        let mut rendered = String::new();
+        render_channel_consensus_metrics_into(&mut rendered, &samples);
+
+        assert!(rendered.contains("# TYPE shitspeak_consensus_channel_repository_version gauge\n"));
+        assert!(
+            rendered
+                .contains("shitspeak_consensus_channel_repository_version{server_id=\"alpha\"} 12")
+        );
+        assert!(rendered.contains("shitspeak_consensus_channels_total 9"));
+        assert!(
+            rendered.contains("shitspeak_consensus_channels_by_server{server_id=\"default\"} 7")
+        );
+        assert!(!rendered.contains("shitspeak_consensus_clients_total"));
     }
 
     #[test]
