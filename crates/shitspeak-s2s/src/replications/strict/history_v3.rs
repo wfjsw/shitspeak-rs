@@ -335,7 +335,7 @@ mod tests {
             state.begin_server_request(peer, &admission, Duration::from_secs(30)),
             HistoryServerRequest::Build { .. }
         ));
-        assert!(state.cache_server_response(peer, &admission, StrictCatchupResp::default()));
+        assert!(state.cache_server_response(peer, &admission, StrictCatchupResp::default(), None,));
 
         let election = StrictHistoryTransferReq {
             transfer_id: 11,
@@ -357,7 +357,7 @@ mod tests {
             history_version: 7,
             ..Default::default()
         };
-        assert!(state.cache_server_response(peer, &election, election_response));
+        assert!(state.cache_server_response(peer, &election, election_response, None));
         assert!(matches!(
             state.begin_server_request(peer, &election, Duration::from_secs(30)),
             HistoryServerRequest::Replay(response) if response.history_version == 7
@@ -389,7 +389,8 @@ mod tests {
                     ..Default::default()
                 }),
                 ..Default::default()
-            }
+            },
+            None,
         ));
         assert!(state.has_server_transfer(peer));
         assert!(state.has_checkpoint_blocking_work(Instant::now()));
@@ -401,9 +402,9 @@ mod tests {
             final_ack: true,
             ..Default::default()
         };
-        assert!(state.acknowledge_server_final(peer, &final_ack));
+        assert!(state.acknowledge_server_final(peer, &final_ack, None));
         assert!(
-            state.acknowledge_server_final(peer, &final_ack),
+            state.acknowledge_server_final(peer, &final_ack, None),
             "an exact retry must receive the confirmation again"
         );
         assert!(!state.acknowledge_server_final(
@@ -411,7 +412,8 @@ mod tests {
             &StrictHistoryTransferReq {
                 request_nonce: final_ack.request_nonce.wrapping_add(1),
                 ..final_ack.clone()
-            }
+            },
+            None,
         ));
         assert!(!state.has_server_transfer(peer));
         assert!(!state.has_any_transfer(peer));
@@ -524,7 +526,15 @@ struct HistoryServerPage {
     reason: StrictCatchupReason,
     acknowledged: bool,
     final_ack_nonce: Option<u64>,
+    bound_snapshot_completion: Option<BoundSnapshotCompletion>,
+    bound_snapshot_final_ack: Option<StrictCatchupReq>,
     expires_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct BoundSnapshotCompletion {
+    transfer_id: u64,
+    version: u64,
 }
 
 #[derive(Clone)]
@@ -799,6 +809,16 @@ impl HistoryV3State {
         self.clients.contains_key(&peer)
     }
 
+    /// The immutable history target for a response currently being applied.
+    /// A V7 snapshot can cover that target even when its repository version
+    /// advanced after the source metadata probe.
+    pub(super) fn processing_target_version(&self, peer: PeerIncarnation) -> Option<u64> {
+        self.clients
+            .get(&peer)
+            .filter(|client| client.processing_nonce.is_some())
+            .map(|client| client.target_version)
+    }
+
     pub(super) fn has_server_transfer(&self, peer: PeerIncarnation) -> bool {
         let now = Instant::now();
         self.server_pages.iter().any(|((known_peer, _, _), page)| {
@@ -983,6 +1003,8 @@ impl HistoryV3State {
                 reason,
                 acknowledged: false,
                 final_ack_nonce: None,
+                bound_snapshot_completion: None,
+                bound_snapshot_final_ack: None,
                 expires_at: now + ttl,
             },
         );
@@ -994,6 +1016,7 @@ impl HistoryV3State {
         peer: PeerIncarnation,
         request: &StrictHistoryTransferReq,
         response: StrictCatchupResp,
+        bound_snapshot_completion: Option<(u64, u64)>,
     ) -> bool {
         self.server_pages
             .get_mut(&(peer, request.transfer_id, request.request_nonce))
@@ -1003,6 +1026,13 @@ impl HistoryV3State {
                 }
                 if page.response.is_none() {
                     page.response = Some(response);
+                    page.bound_snapshot_completion =
+                        bound_snapshot_completion.map(|(transfer_id, version)| {
+                            BoundSnapshotCompletion {
+                                transfer_id,
+                                version,
+                            }
+                        });
                 }
                 true
             })
@@ -1027,6 +1057,7 @@ impl HistoryV3State {
         &mut self,
         peer: PeerIncarnation,
         request: &StrictHistoryTransferReq,
+        bound_snapshot_final_ack: Option<&StrictCatchupReq>,
     ) -> bool {
         if !request.final_ack || request.acknowledged_request_nonce == 0 {
             return false;
@@ -1040,7 +1071,10 @@ impl HistoryV3State {
             return false;
         };
         if page.acknowledged {
-            return page.final_ack_nonce == Some(request.request_nonce);
+            return page.final_ack_nonce == Some(request.request_nonce)
+                && bound_snapshot_final_ack.is_none_or(|final_ack| {
+                    page.bound_snapshot_final_ack.as_ref() == Some(final_ack)
+                });
         }
         let Some(response) = page.response.as_ref() else {
             return false;
@@ -1056,7 +1090,39 @@ impl HistoryV3State {
         }
         page.acknowledged = true;
         page.final_ack_nonce = Some(request.request_nonce);
+        page.bound_snapshot_final_ack = bound_snapshot_final_ack.cloned();
         true
+    }
+
+    /// Return whether this is the exact V7 final ACK retained after the
+    /// responder released its bound snapshot image. The server-page TTL and
+    /// peer-incarnation key bound this authorization to the existing replay
+    /// lifetime.
+    pub(super) fn has_bound_snapshot_final_ack(
+        &self,
+        peer: PeerIncarnation,
+        request: &StrictCatchupReq,
+    ) -> bool {
+        let Some(transfer) = request.history_transfer.as_ref() else {
+            return false;
+        };
+        if !transfer.final_ack || transfer.acknowledged_request_nonce == 0 {
+            return false;
+        }
+        let key = (
+            peer,
+            transfer.transfer_id,
+            transfer.acknowledged_request_nonce,
+        );
+        let Some(page) = self.server_pages.get(&key) else {
+            return false;
+        };
+        page.expires_at > Instant::now()
+            && page.bound_snapshot_completion.is_some_and(|completion| {
+                completion.transfer_id == request.snapshot_transfer_id
+                    && completion.version == request.since_version
+            })
+            && page.bound_snapshot_final_ack.as_ref() == Some(request)
     }
 
     pub(super) fn discard_peer(&mut self, node: NodeIdentifier) -> Vec<FinishedHistoryClient> {

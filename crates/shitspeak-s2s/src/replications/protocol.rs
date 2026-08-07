@@ -31,8 +31,11 @@ pub(crate) const STRICT_PROTOCOL_VERSION_MINIMUM_SUPPORTED: u32 = STRICT_PROTOCO
 pub(crate) const STRICT_PROTOCOL_VERSION_V5: u32 = 5;
 /// Requester-clock propagation in pairwise clock probes.
 pub(crate) const STRICT_PROTOCOL_VERSION_V6: u32 = 6;
+/// A repository snapshot envelope bound to the exact terminal cut elected for
+/// a foreign checkpoint replacement.
+pub(crate) const STRICT_PROTOCOL_VERSION_V7: u32 = 7;
 /// Maximum strict participant capability advertised by this binary.
-pub(crate) const STRICT_PROTOCOL_VERSION_CURRENT: u32 = STRICT_PROTOCOL_VERSION_V6;
+pub(crate) const STRICT_PROTOCOL_VERSION_CURRENT: u32 = STRICT_PROTOCOL_VERSION_V7;
 
 pub(crate) fn strict_participant_version_supported(version: u32) -> bool {
     version >= STRICT_PROTOCOL_VERSION_MINIMUM_SUPPORTED
@@ -376,7 +379,8 @@ mod tests {
         assert_eq!(STRICT_PROTOCOL_VERSION_V4, 4);
         assert_eq!(STRICT_PROTOCOL_VERSION_V5, 5);
         assert_eq!(STRICT_PROTOCOL_VERSION_V6, 6);
-        assert_eq!(STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V6);
+        assert_eq!(STRICT_PROTOCOL_VERSION_V7, 7);
+        assert_eq!(STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V7);
     }
 
     #[test]

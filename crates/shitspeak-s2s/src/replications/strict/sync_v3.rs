@@ -793,6 +793,26 @@ impl SyncV3State {
             .cloned()
     }
 
+    /// Return an elected checkpoint whose repository boundary is covered by
+    /// a later V7 repository image. The caller must first verify that the
+    /// image's bound terminal cut equals the returned checkpoint's target.
+    /// Older envelopes cannot make that association and must use the exact
+    /// repository-version lookup above.
+    pub(super) fn staged_checkpoint_for_bound_snapshot(
+        &self,
+        peer: PeerIncarnation,
+        repository_version: u64,
+    ) -> Option<StagedTerminalCheckpoint> {
+        self.staged_checkpoints
+            .get(&peer)
+            .filter(|checkpoint| {
+                checkpoint
+                    .repository_version
+                    .is_some_and(|bound| bound <= repository_version)
+            })
+            .cloned()
+    }
+
     pub(super) fn remove_staged_checkpoint(
         &mut self,
         peer: PeerIncarnation,

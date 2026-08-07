@@ -47,7 +47,9 @@ use super::super::protocol::{
     STRICT_PROTOCOL_VERSION_V5,
 };
 #[cfg(test)]
-use super::super::protocol::{STRICT_PROTOCOL_VERSION_V3, STRICT_PROTOCOL_VERSION_V6};
+use super::super::protocol::{
+    STRICT_PROTOCOL_VERSION_V3, STRICT_PROTOCOL_VERSION_V6, STRICT_PROTOCOL_VERSION_V7,
+};
 use super::super::topic::ErasedStrictRuntime;
 pub(crate) use super::bulk_pacing::BulkPageIdentity;
 use super::bulk_pacing::{BulkAdmissionError, BulkPacer};
@@ -395,6 +397,8 @@ pub(super) struct SnapshotTransfer {
     pub(super) snapshot_sha256: Bytes,
     pub(super) rank: HistoryRank,
     pub(super) terminal_decision_generation: u64,
+    /// Present only for a V7 bound snapshot envelope.
+    pub(super) terminal_cut: Option<TerminalCut>,
     pub(super) last_used_at: Instant,
 }
 
@@ -3547,6 +3551,17 @@ struct RepositoryTerminalHead {
     terminal_cut: TerminalCut,
 }
 
+/// A V7 repository image and the terminal ledger that proves it. Capturing
+/// these through the published-head boundary prevents an elected checkpoint
+/// from being paired with a later terminal lineage.
+pub(super) struct SnapshotTerminalBoundary {
+    pub(super) history_metadata: HistoryMetadata,
+    pub(super) repository_snapshot: Bytes,
+    pub(super) terminal_cut: TerminalCut,
+    pub(super) applied_operations: BTreeMap<OpId, u64>,
+    pub(super) retired_operations: BTreeMap<u64, u64>,
+}
+
 pub struct StrictRuntime<R: StrictReplicable> {
     pub(super) repo: Arc<R>,
     pub(super) self_id: NodeIdentifier,
@@ -3643,13 +3658,24 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// independent per-peer allowance.
     pub(super) snapshot_receivers: Mutex<HashMap<NodeIdentifier, SnapshotReceiveTransfer>>,
     pub(super) snapshot_transfer_counter: AtomicU64,
+    /// Serializes initial image construction while its map locks are released
+    /// for an async V7 boundary capture.
+    snapshot_image_build_gate: AsyncMutex<()>,
     snapshot_captures_in_progress: AtomicU64,
     checkpoint_in_progress: AtomicBool,
     terminal_protocol_storage_healthy: AtomicBool,
     terminal_checkpoint_requires_v5: AtomicBool,
+    /// Serializes a V7 image capture with the portion of delivery that joins
+    /// repository bytes, the durable terminal record, and the runtime ledger.
+    /// The published head alone cannot cover the interval between repository
+    /// apply and ledger finalization.
+    snapshot_terminal_boundary: AsyncMutex<()>,
     repository_terminal_head: AsyncMutex<RepositoryTerminalHead>,
     #[cfg(test)]
     head_snapshot_after_boundary_acquired_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    delivery_after_repository_apply_hook:
+        Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 pub(super) struct SnapshotCaptureGuard<'a> {
@@ -3781,6 +3807,100 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             history_metadata: self.repo.history_metadata(),
             terminal_cut: self.terminal_journal.lock().await.terminal_cut(),
         };
+    }
+
+    pub(super) async fn snapshot_terminal_boundary(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.snapshot_terminal_boundary.lock().await
+    }
+
+    pub(super) async fn snapshot_image_build_gate(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.snapshot_image_build_gate.lock().await
+    }
+
+    #[cfg(test)]
+    async fn pause_delivery_after_repository_apply(&self) {
+        let hook = self.delivery_after_repository_apply_hook.lock().take();
+        if let Some((reached, resume)) = hook {
+            let _ = reached.send(());
+            let _ = resume.await;
+        }
+    }
+
+    /// Capture a repository image and its terminal ledger at one durable
+    /// boundary. A source that cannot prove this relation must not donate an
+    /// elected checkpoint image: the receiver would otherwise have to guess
+    /// which terminal lineage authorizes the repository contents.
+    pub(super) async fn capture_snapshot_terminal_boundary(
+        &self,
+    ) -> Result<SnapshotTerminalBoundary, StrictSnapshotError> {
+        let _boundary = self.snapshot_terminal_boundary().await;
+        let head = self.repository_terminal_head.lock().await;
+        let (history_metadata, repository_snapshot) = self.repo.snapshot_with_metadata()?;
+        if history_metadata != head.history_metadata {
+            return Err(StrictSnapshotError::new(
+                "repository snapshot changed outside the published terminal-head boundary",
+            ));
+        }
+        let journal = self.terminal_journal.lock().await;
+        let terminal_cut = journal.terminal_cut();
+        if terminal_cut != head.terminal_cut {
+            return Err(StrictSnapshotError::new(
+                "terminal journal changed outside the published repository-head boundary",
+            ));
+        }
+        let retired_operations = journal.retired_origins();
+        let state = self.state.lock();
+        let applied_operations = state
+            .applied_operations
+            .iter()
+            .filter_map(|(op_id, version)| {
+                (*version <= history_metadata.version).then_some((*op_id, *version))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (op_id, version) in &applied_operations {
+            if journal.is_retired(*op_id) {
+                continue;
+            }
+            let represented = journal.get(*op_id).is_some_and(|record| {
+                matches!(
+                    record.terminal_decision(),
+                    Some(JournalTerminalDecision::Commit { .. })
+                ) && record.is_delivered()
+                    && record.delivery_version() == Some(*version)
+            });
+            if !represented {
+                return Err(StrictSnapshotError::new(format!(
+                    "snapshot operation ({}, {}) at version {} is absent from its terminal cut",
+                    op_id.0, op_id.1, version
+                )));
+            }
+        }
+        for entry in journal.snapshot() {
+            let (op_id, record) = entry.into_parts();
+            let Some(version) = record.delivery_version() else {
+                continue;
+            };
+            if version <= history_metadata.version
+                && record.is_delivered()
+                && matches!(
+                    record.terminal_decision(),
+                    Some(JournalTerminalDecision::Commit { .. })
+                )
+                && applied_operations.get(&op_id) != Some(&version)
+            {
+                return Err(StrictSnapshotError::new(format!(
+                    "terminal commit ({}, {}) at version {} is absent from its repository ledger",
+                    op_id.0, op_id.1, version
+                )));
+            }
+        }
+        Ok(SnapshotTerminalBoundary {
+            history_metadata,
+            repository_snapshot,
+            terminal_cut,
+            applied_operations,
+            retired_operations,
+        })
     }
 
     pub(super) async fn apply_repository_commit_once(
@@ -4119,16 +4239,20 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             snapshot_transfers: Mutex::new(HashMap::new()),
             snapshot_receivers: Mutex::new(HashMap::new()),
             snapshot_transfer_counter: AtomicU64::new(1),
+            snapshot_image_build_gate: AsyncMutex::new(()),
             snapshot_captures_in_progress: AtomicU64::new(0),
             checkpoint_in_progress: AtomicBool::new(false),
             terminal_protocol_storage_healthy: AtomicBool::new(terminal_protocol_storage_healthy),
             terminal_checkpoint_requires_v5: AtomicBool::new(terminal_checkpoint_requires_v5),
+            snapshot_terminal_boundary: AsyncMutex::new(()),
             repository_terminal_head: AsyncMutex::new(RepositoryTerminalHead {
                 history_metadata: initial_history_metadata,
                 terminal_cut: initial_terminal_cut,
             }),
             #[cfg(test)]
             head_snapshot_after_boundary_acquired_hook: Mutex::new(None),
+            #[cfg(test)]
+            delivery_after_repository_apply_hook: Mutex::new(None),
         });
         if let Some(violation) = arc.first_terminal_record_exceeding_catchup_budget() {
             // The journal remains authoritative for local delivery, but a
@@ -4305,6 +4429,15 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.clock_tick_signal.notify_one();
     }
 
+    /// History election changes control-plane ownership, not the Tempo work
+    /// that a clock tick advances. Avoid turning recovery retries into an
+    /// unconditional multicast burst when there is no delivery demand.
+    pub(crate) fn wake_clock_tick_if_needed(&self) {
+        if self.clock_tick_needed() {
+            self.wake_clock_tick_loop();
+        }
+    }
+
     /// Start a cluster-wide election as soon as an admission response reveals
     /// a terminal lineage that admission is not allowed to install.
     pub(super) fn request_global_history_election(&self) -> bool {
@@ -4323,7 +4456,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // This is a verified foreign lineage, not a membership flap. Bypass
         // the bootstrap retry throttle so admission cannot leave recovery idle.
         *self.last_bootstrap_attempt.lock() = None;
-        self.wake_clock_tick_loop();
         let weak = self.weak_self.lock().clone();
         if let Some(weak) = weak {
             tokio::spawn(async move {
@@ -4429,7 +4561,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.state
             .lock()
             .begin_history_election(peers.iter().copied());
-        self.wake_clock_tick_loop();
+        self.wake_clock_tick_if_needed();
         for dst in peers {
             if self.v3_repair_supported_by(dst) {
                 super::catchup::request_v3_history_probe(
@@ -11809,78 +11941,97 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
             op_bytes = buf.op_msgpack.len(),
             "strict delivery applying committed op"
         );
-        let apply_started = Instant::now();
-        let apply_outcome = match disposition {
-            DeliveryDisposition::AlreadyApplied => StrictCommitApplyOutcome::AlreadyApplied,
-            DeliveryDisposition::Apply => {
-                rt.apply_repository_commit_once(
-                    version,
-                    op,
-                    StrictLogMetadata {
-                        op_id_hi: buf.op_id.0,
-                        op_id_lo: buf.op_id.1,
-                        ts_final: buf.ts_final,
-                    },
-                )
-                .await
-            }
-        };
-        let apply_elapsed = apply_started.elapsed();
-        metrics::record_pipeline_stage(
-            ReplicationPipelineKind::Strict,
-            ReplicationPipelineStage::RepoApply,
-            apply_elapsed,
-        );
-        if apply_outcome == StrictCommitApplyOutcome::Failed {
-            rt.net
-                .report_strict_replication_repository_capability_loss();
-            warn!(
-                topic = %rt.topic,
-                op_id_hi = buf.op_id.0,
-                op_id_lo = buf.op_id.1,
-                ts_final = buf.ts_final,
-                "strict delivery repository application failed; rearming history election before retry"
+        let (apply_outcome, apply_elapsed, waker, local_proposal_elapsed) = {
+            let _snapshot_boundary = rt.snapshot_terminal_boundary().await;
+            let apply_started = Instant::now();
+            let apply_outcome = match disposition {
+                DeliveryDisposition::AlreadyApplied => StrictCommitApplyOutcome::AlreadyApplied,
+                DeliveryDisposition::Apply => {
+                    rt.apply_repository_commit_once(
+                        version,
+                        op,
+                        StrictLogMetadata {
+                            op_id_hi: buf.op_id.0,
+                            op_id_lo: buf.op_id.1,
+                            ts_final: buf.ts_final,
+                        },
+                    )
+                    .await
+                }
+            };
+            let apply_elapsed = apply_started.elapsed();
+            metrics::record_pipeline_stage(
+                ReplicationPipelineKind::Strict,
+                ReplicationPipelineStage::RepoApply,
+                apply_elapsed,
             );
-            {
-                let mut state = rt.state.lock();
-                // A version/ledger conflict cannot be repaired by blindly
-                // replaying the same buffered commit. Re-enter the history
-                // election first so a peer snapshot can reconcile the
-                // repository version and durable operation-id ledger.
-                state.finish_delivering_commit(buf.op_id);
-                state.request_history_election();
-                state.buffer_commit(buf.op_id, buf.ts_final, buf.op_msgpack);
-            }
-            rt.wake_delivery_and_clock_tick();
-            let runtime = rt.clone();
-            tokio::spawn(async move {
-                runtime.try_bootstrap_catchup().await;
-            });
-            continue;
-        }
-        if disposition == DeliveryDisposition::Apply {
-            let delivery_op_id = buf.op_id;
-            let delivery_result = rt
-                .with_terminal_journal_mutation(move |journal| {
-                    journal.finish_delivery(delivery_op_id, version)
-                })
-                .await;
-            if let Err(error) = delivery_result {
-                rt.record_terminal_journal_failure(&error);
+            if apply_outcome == StrictCommitApplyOutcome::Failed {
+                rt.net
+                    .report_strict_replication_repository_capability_loss();
                 warn!(
                     topic = %rt.topic,
                     op_id_hi = buf.op_id.0,
                     op_id_lo = buf.op_id.1,
-                    %error,
-                    "strict delivery completion could not be persisted"
+                    ts_final = buf.ts_final,
+                    "strict delivery repository application failed; rearming history election before retry"
                 );
-                let mut state = rt.state.lock();
-                state.finish_delivering_commit(buf.op_id);
-                state.request_history_election();
-                state.buffer_commit(buf.op_id, buf.ts_final, buf.op_msgpack);
+                {
+                    let mut state = rt.state.lock();
+                    // A version/ledger conflict cannot be repaired by blindly
+                    // replaying the same buffered commit. Re-enter the history
+                    // election first so a peer snapshot can reconcile the
+                    // repository version and durable operation-id ledger.
+                    state.finish_delivering_commit(buf.op_id);
+                    state.request_history_election();
+                    state.buffer_commit(buf.op_id, buf.ts_final, buf.op_msgpack);
+                }
+                rt.wake_delivery_and_clock_tick();
+                let runtime = rt.clone();
+                tokio::spawn(async move {
+                    runtime.try_bootstrap_catchup().await;
+                });
                 continue;
             }
-        }
+            #[cfg(test)]
+            rt.pause_delivery_after_repository_apply().await;
+            if disposition == DeliveryDisposition::Apply {
+                let delivery_op_id = buf.op_id;
+                let delivery_result = rt
+                    .with_terminal_journal_mutation(move |journal| {
+                        journal.finish_delivery(delivery_op_id, version)
+                    })
+                    .await;
+                if let Err(error) = delivery_result {
+                    rt.record_terminal_journal_failure(&error);
+                    warn!(
+                        topic = %rt.topic,
+                        op_id_hi = buf.op_id.0,
+                        op_id_lo = buf.op_id.1,
+                        %error,
+                        "strict delivery completion could not be persisted"
+                    );
+                    let mut state = rt.state.lock();
+                    state.finish_delivering_commit(buf.op_id);
+                    state.request_history_election();
+                    state.buffer_commit(buf.op_id, buf.ts_final, buf.op_msgpack);
+                    continue;
+                }
+            }
+            // Fire local proposer's waker, if any, and clear the proposal.
+            let (waker, local_proposal_elapsed) = {
+                let mut s = rt.state.lock();
+                s.finish_delivering_commit(buf.op_id);
+                s.applied_operations.insert(buf.op_id, version);
+                if buf.ts_final > s.delivered_high_water {
+                    s.delivered_high_water = buf.ts_final;
+                }
+                let proposal = s.proposals.remove(&buf.op_id);
+                let elapsed = proposal.as_ref().map(|p| p.started_at.elapsed());
+                let waker = proposal.and_then(|p| p.waker);
+                (waker, elapsed)
+            };
+            (apply_outcome, apply_elapsed, waker, local_proposal_elapsed)
+        };
         if apply_outcome == StrictCommitApplyOutcome::AlreadyApplied {
             debug!(
                 topic = %rt.topic,
@@ -11889,19 +12040,6 @@ async fn run_delivery_pass<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>>) {
                 "strict delivery replay was already applied by the repository"
             );
         }
-        // Fire local proposer's waker, if any, and clear the proposal.
-        let (waker, local_proposal_elapsed) = {
-            let mut s = rt.state.lock();
-            s.finish_delivering_commit(buf.op_id);
-            s.applied_operations.insert(buf.op_id, version);
-            if buf.ts_final > s.delivered_high_water {
-                s.delivered_high_water = buf.ts_final;
-            }
-            let proposal = s.proposals.remove(&buf.op_id);
-            let elapsed = proposal.as_ref().map(|p| p.started_at.elapsed());
-            let waker = proposal.and_then(|p| p.waker);
-            (waker, elapsed)
-        };
         let _ = rt.reconcile_peer_admissions();
         // Advertise the repository version only after the durable apply. The
         // pre-delivery tick may have carried the old head after the commit
@@ -18270,6 +18408,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v7_snapshot_boundary_waits_for_delivery_finalization() {
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V7);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V7));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V7);
+        net.set_epoch(2, 1);
+        let repo = BlockingStrictRepo::new();
+        let rt = StrictRuntime::new(
+            repo.clone(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let op_id = make_op_id(1, 1, 100);
+        {
+            let mut state = rt.state.lock();
+            assert!(state.mark_committed(op_id, 10));
+            state.buffer_commit(
+                op_id,
+                10,
+                Bytes::from(rmp_serde::to_vec(&1_000u64).unwrap()),
+            );
+            state.clock = 20;
+            state.peer_clocks.insert(1, 20);
+            state.peer_clocks.insert(2, 20);
+        }
+        let (after_apply_tx, after_apply_rx) = oneshot::channel();
+        let (resume_finalization_tx, resume_finalization_rx) = oneshot::channel();
+        *rt.delivery_after_repository_apply_hook.lock() =
+            Some((after_apply_tx, resume_finalization_rx));
+
+        let delivery = tokio::spawn({
+            let rt = rt.clone();
+            async move { run_delivery_pass(&rt).await }
+        });
+        repo.delivery_started.notified().await;
+        repo.release_delivery.notify_one();
+        after_apply_rx.await.expect("repository apply completed");
+
+        let mut snapshot = tokio::spawn({
+            let rt = rt.clone();
+            async move { rt.capture_snapshot_terminal_boundary().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut snapshot)
+                .await
+                .is_err(),
+            "a snapshot must wait rather than observe the repository after apply but before its terminal ledger is finalized"
+        );
+
+        resume_finalization_tx
+            .send(())
+            .expect("resume delivery finalization");
+        delivery.await.expect("delivery task");
+        let boundary = tokio::time::timeout(Duration::from_secs(1), snapshot)
+            .await
+            .expect("snapshot capture remained blocked after delivery")
+            .expect("snapshot task")
+            .expect("V7 snapshot boundary");
+        assert_eq!(boundary.history_metadata.version, 1);
+        assert_eq!(boundary.applied_operations.get(&op_id), Some(&1));
+        let terminal_cut = rt.terminal_journal.lock().await.terminal_cut();
+        assert_eq!(boundary.terminal_cut, terminal_cut);
+        assert!(
+            rt.terminal_journal
+                .lock()
+                .await
+                .get(op_id)
+                .is_some_and(|record| record.is_delivered())
+        );
+    }
+
+    #[tokio::test]
     async fn v2_stale_pending_commits_after_capability_negotiation() {
         let cfg = ReplicationConfig::default().with_pending_propose_ttl(Duration::from_millis(1));
         let (rt, net, _repo) = v1_runtime(cfg.clone());
@@ -18570,6 +18784,7 @@ mod tests {
                 snapshot_sha256: Bytes::new(),
                 rank: rank.clone(),
                 terminal_decision_generation: 7,
+                terminal_cut: None,
                 last_used_at: Instant::now(),
             },
         );
@@ -23168,6 +23383,7 @@ mod tests {
     }
 
     async fn elected_source_snapshot_replaces_retired_prefix_with_terminal_checkpoint(
+        protocol_version: u32,
         sink_version: u64,
         sink_last_operation: u64,
         exercise_failed_install_retry: bool,
@@ -23180,9 +23396,9 @@ mod tests {
         let source_net = MockNet::new(1, vec![1, 8]);
         source_net.set_epoch(1, 11);
         source_net.set_epoch(8, 88);
-        source_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
-        source_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
-        source_net.set_peer_strict_replication_protocol_version(8, STRICT_PROTOCOL_VERSION_V5);
+        source_net.set_strict_replication_protocol_version(protocol_version);
+        source_net.set_local_strict_replication_protocol_version(Some(protocol_version));
+        source_net.set_peer_strict_replication_protocol_version(8, protocol_version);
         source_net.set_strict_protocol_state_dir(Some(source_dir.path().to_path_buf()));
         source_net.set_alive(vec![1]);
         let source_repo = CountingStrictRepo::new();
@@ -23239,17 +23455,37 @@ mod tests {
         run_delivery_pass(&source).await;
         assert_eq!(source_repo.current_version(), SOURCE_VERSION);
         let source_cut = source.terminal_journal.lock().await.terminal_cut();
-        let (snapshot_version, snapshot_envelope) = {
-            let (snapshot_version, snapshot) = source_repo.snapshot().unwrap();
-            let envelope = super::super::catchup::encode_s2s_snapshot_envelope(
-                &source,
-                snapshot_version,
-                snapshot,
-            )
-            .unwrap();
-            (snapshot_version, envelope)
-        };
+        let (snapshot_version, snapshot_envelope, envelope_cut) =
+            if protocol_version >= STRICT_PROTOCOL_VERSION_V7 {
+                let boundary = source
+                    .capture_snapshot_terminal_boundary()
+                    .await
+                    .expect("V7 source snapshot boundary");
+                let snapshot_version = boundary.history_metadata.version;
+                let envelope_cut = boundary.terminal_cut;
+                let envelope = super::super::catchup::encode_bound_s2s_snapshot_envelope(
+                    boundary.repository_snapshot,
+                    boundary.applied_operations,
+                    boundary.retired_operations,
+                    envelope_cut,
+                )
+                .expect("V7 source snapshot envelope");
+                (snapshot_version, envelope, Some(envelope_cut))
+            } else {
+                let (snapshot_version, snapshot) = source_repo.snapshot().unwrap();
+                let envelope = super::super::catchup::encode_s2s_snapshot_envelope(
+                    &source,
+                    snapshot_version,
+                    snapshot,
+                )
+                .unwrap();
+                (snapshot_version, envelope, None)
+            };
         assert_eq!(snapshot_version, SOURCE_VERSION);
+        assert_eq!(
+            envelope_cut,
+            (protocol_version >= STRICT_PROTOCOL_VERSION_V7).then_some(source_cut)
+        );
         source_net.set_alive(vec![1, 8]);
 
         let sink_dir = tempfile::TempDir::new().unwrap();
@@ -23279,9 +23515,9 @@ mod tests {
         let sink_net = MockNet::new(8, vec![1, 8]);
         sink_net.set_epoch(1, 11);
         sink_net.set_epoch(8, 88);
-        sink_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
-        sink_net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
-        sink_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V5);
+        sink_net.set_strict_replication_protocol_version(protocol_version);
+        sink_net.set_local_strict_replication_protocol_version(Some(protocol_version));
+        sink_net.set_peer_strict_replication_protocol_version(1, protocol_version);
         sink_net.set_strict_protocol_state_dir(Some(sink_dir.path().to_path_buf()));
         let sink_repo = CountingStrictRepo::new();
         *sink_repo.state.lock() = (
@@ -23297,13 +23533,14 @@ mod tests {
             CancellationToken::new(),
             Arc::new(ReplicationConfig::default()),
         );
-        {
+        let initial_sink_cut = {
             let journal = sink.terminal_journal.lock().await;
             assert_eq!(journal.checkpoint_repository_version(), sink_version);
             assert_eq!(journal.terminal_cut().generation(), 0);
             assert_eq!(journal.record_count(), 0);
             assert!(journal.is_retired(source_prefix));
-        }
+            journal.terminal_cut()
+        };
 
         {
             let mut state = sink.state.lock();
@@ -23416,12 +23653,41 @@ mod tests {
             })
             .expect("terminal checkpoint ACK confirmation");
         super::super::catchup::recv_v3_terminal_sync_ack(&sink, 1, 11, terminal_confirmation).await;
-        assert!(
-            sink.v3_sync
-                .lock()
-                .staged_checkpoint_for_repository(PeerIncarnation::new(1, 11), snapshot_version)
-                .is_some()
+        let staged_cut = sink
+            .v3_sync
+            .lock()
+            .staged_checkpoint_for_repository(PeerIncarnation::new(1, 11), snapshot_version)
+            .map(|checkpoint| checkpoint.target_cut())
+            .expect("elected source checkpoint staged for its repository image");
+        assert_eq!(staged_cut, source_cut);
+        let decoded_envelope =
+            super::super::catchup::decode_s2s_snapshot_envelope(snapshot_envelope.clone())
+                .expect("snapshot envelope decodes");
+        assert_eq!(
+            decoded_envelope.terminal_cut,
+            (protocol_version >= STRICT_PROTOCOL_VERSION_V7).then_some(staged_cut),
+            "V7 binds the repository image to the elected terminal cut while V5/V6 retain their V1 envelope"
         );
+
+        if protocol_version < STRICT_PROTOCOL_VERSION_V7 {
+            super::super::catchup::install_snapshot_candidate(
+                &sink,
+                1,
+                source_rank,
+                snapshot_version,
+                snapshot_envelope,
+                Instant::now(),
+                Some(PeerIncarnation::new(1, 11)),
+            )
+            .await;
+            assert_eq!(sink_repo.current_version(), sink_version);
+            assert_eq!(
+                sink.terminal_journal.lock().await.terminal_cut(),
+                initial_sink_cut
+            );
+            assert!(sink.repository_base_required());
+            return;
+        }
 
         if exercise_failed_install_retry {
             sink_repo.fail_snapshot_installs("injected post-journal snapshot failure");
@@ -23566,8 +23832,22 @@ mod tests {
 
     #[tokio::test]
     async fn newer_snapshot_replaces_retired_prefix_with_elected_source_terminal_checkpoint() {
+        for protocol_version in [STRICT_PROTOCOL_VERSION_V5, STRICT_PROTOCOL_VERSION_V6] {
+            elected_source_snapshot_replaces_retired_prefix_with_terminal_checkpoint(
+                protocol_version,
+                9_525,
+                9_525,
+                false,
+                false,
+            )
+            .await;
+        }
         elected_source_snapshot_replaces_retired_prefix_with_terminal_checkpoint(
-            9_525, 9_525, true, false,
+            STRICT_PROTOCOL_VERSION_V7,
+            9_525,
+            9_525,
+            true,
+            false,
         )
         .await;
     }
@@ -23575,7 +23855,11 @@ mod tests {
     #[tokio::test]
     async fn equal_head_snapshot_replaces_divergent_compacted_terminal_lineage() {
         elected_source_snapshot_replaces_retired_prefix_with_terminal_checkpoint(
-            9_540, 9_540, true, true,
+            STRICT_PROTOCOL_VERSION_V7,
+            9_540,
+            9_540,
+            true,
+            true,
         )
         .await;
     }

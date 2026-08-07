@@ -35,6 +35,7 @@ pub async fn handle_user_stats(
     let sender_id = sender.get_session_id();
     let server_id = sender.server_id();
     let local_node_id = server.get_clients().local_node_id();
+    let sender_is_superuser = sender.is_superuser();
     let stats_only = msg.stats_only.unwrap_or(false);
     let sender_raw = u32::from(sender_id);
 
@@ -61,8 +62,8 @@ pub async fn handle_user_stats(
             let has_root_ban = root_perms.contains(shitspeak_state::ACLPermissions::Ban);
             details = has_root_ban;
             local = has_root_ban || target_channel == sender.get_current_channel_id();
-            expose_certificate_identity =
-                has_root_ban && server.get_certificate_hash_privacy().is_none();
+            expose_certificate_identity = sender_is_superuser
+                || (has_root_ban && server.get_certificate_hash_privacy().is_none());
             if !has_root_ban {
                 let target_channel_perms = crate::client::acl::compute_permissions_for_client(
                     server,
@@ -349,8 +350,8 @@ impl UserStatsResponder for ServerUserStatsResponder {
             let has_root_ban = root_perms.contains(shitspeak_state::ACLPermissions::Ban);
             details = has_root_ban;
             local = has_root_ban || target_channel == actor.get_current_channel_id();
-            expose_certificate_identity =
-                has_root_ban && server.get_certificate_hash_privacy().is_none();
+            expose_certificate_identity = actor.is_superuser()
+                || (has_root_ban && server.get_certificate_hash_privacy().is_none());
             if !has_root_ban {
                 let target_channel_perms = crate::client::acl::compute_permissions_for_client(
                     &server,

@@ -3631,7 +3631,7 @@ async fn newer_admission_metadata_starts_repository_catchup() {
 }
 
 #[tokio::test]
-async fn newer_promoted_admission_metadata_resumes_after_election_closes() {
+async fn newer_promoted_admission_foreign_checkpoint_rearms_after_election_closes() {
     let net = MockNet::new(1, vec![1, 2, 3]);
     net.set_epoch(1, 11);
     net.set_epoch(2, 22);
@@ -3700,10 +3700,12 @@ async fn newer_promoted_admission_metadata_resumes_after_election_closes() {
     );
 
     rt.finish_history_election_for_test();
+    rt.reconcile_peer_admissions();
     assert!(!rt.peer_incarnation_is_admitted(2, 22));
     resume_deferred_v3_admissions(&rt).await;
 
-    assert!(net.drain_captures().into_iter().any(|frame| matches!(
+    assert!(rt.state.lock().history_election_blocks_steady_state());
+    assert!(net.drain_captures().into_iter().all(|frame| !matches!(
         frame,
         CapturedFrame::StrictUnicast {
             dst: 2,
