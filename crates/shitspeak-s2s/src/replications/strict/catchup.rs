@@ -4973,7 +4973,7 @@ async fn admission_foreign_checkpoint_requires_global_election<R: StrictReplicab
     let requires_election =
         admission_requires_elected_checkpoint(remote_cut, local_cut, known_source_cut);
     if requires_election {
-        let _ = rt.request_global_history_election();
+        let _ = rt.request_foreign_checkpoint_election(remote_rank, remote_cut);
     }
     requires_election
 }
@@ -7508,7 +7508,7 @@ mod tests {
         strict::{
             runtime::{HistoryRank, SnapshotFormat, SnapshotTransfer, StrictRuntime, make_op_id},
             sync_v3::PeerIncarnation,
-            terminal_journal::{FrozenTarget, TerminalJournal, TerminalResolver},
+            terminal_journal::{FrozenTarget, TerminalCut, TerminalJournal, TerminalResolver},
         },
         test_support::{CapturedFrame, CountingStrictRepo, MockNet},
     };
@@ -8363,6 +8363,216 @@ mod tests {
             )),
             "an ahead foreign checkpoint must re-enter elected recovery instead of starting an unranked admission session"
         );
+    }
+
+    fn foreign_checkpoint_probe_response(
+        rt: &StrictRuntime<CountingStrictRepo>,
+        from: NodeIdentifier,
+        cut: TerminalCut,
+        rank: HistoryRank,
+        reason: super::StrictCatchupReason,
+    ) -> StrictHistoryProbeResp {
+        StrictHistoryProbeResp {
+            responder_node: from as u32,
+            expected_requester_boot_epoch: rt.boot_epoch,
+            request_nonce: 0,
+            repository_version: rank.version,
+            terminal_repository_base_version: rank.terminal_repository_base_version,
+            history_freshness: rank.freshness,
+            runtime_started_at: rank.runtime_started_at,
+            history_node: from as u32,
+            terminal_cut: Some(super::cut_to_wire(cut)),
+            reason: reason as i32,
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_foreign_checkpoint_admission_does_not_rearm_election_or_burst_ticks() {
+        let (rt, net, repo) = test_runtime(1, ReplicationConfig::default());
+        *repo.state.lock() = (1, vec![(1, 1, None)]);
+        net.set_alive(vec![1, 2, 3]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        net.set_epoch(3, 1);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V4);
+        rt.seed_membership_snapshot([
+            MemberIncarnation::new(1, 1),
+            MemberIncarnation::new(2, 1),
+            MemberIncarnation::new(3, 1),
+        ]);
+
+        let mut checkpointed = TerminalJournal::in_memory("channels");
+        checkpointed
+            .upsert_abort_decision(make_op_id(2, 1, 1), 1)
+            .expect("remote terminal abort");
+        checkpointed.checkpoint(1).expect("remote checkpoint");
+        let remote_cut = checkpointed.terminal_cut();
+        let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+        assert_ne!(
+            remote_cut.journal_id(),
+            local_cut.journal_id(),
+            "fixture requires a foreign terminal lineage"
+        );
+        assert_ne!(
+            remote_cut.terminal_set_digest(),
+            local_cut.terminal_set_digest(),
+            "fixture requires a divergent terminal set"
+        );
+        let peer = PeerIncarnation::new(2, 1);
+        let rank = HistoryRank {
+            version: repo.current_version(),
+            freshness: repo.history_metadata().freshness,
+            runtime_started_at: rt.boot_epoch,
+            node_id: 2,
+            terminal_repository_base_version: 1,
+        };
+
+        // Every round models one admission-cadence probe response carrying
+        // the identical foreign checkpoint. The first response must promote
+        // a global election; identical repeats must not re-arm it, because
+        // a local node that beats every equal-rank peer can never elect the
+        // divergent source and each re-arm re-probes every peer and bursts
+        // clock ticks at them.
+        for round in 0..4 {
+            let nonce = rt
+                .v3_sync
+                .lock()
+                .record_history_nonce(
+                    peer,
+                    super::StrictCatchupReason::Admission as i32,
+                    rt.cfg.pending_propose_ttl(),
+                )
+                .expect("admission history nonce");
+            let mut response = foreign_checkpoint_probe_response(
+                &rt,
+                2,
+                remote_cut,
+                rank,
+                super::StrictCatchupReason::Admission,
+            );
+            response.request_nonce = nonce;
+            super::recv_v3_history_probe_resp(&rt, 2, 1, response).await;
+            for _ in 0..32 {
+                tokio::task::yield_now().await;
+            }
+
+            // A re-armed election sends a fresh correlated probe to every
+            // live peer; count every probe frame across both drains. If the
+            // response did re-arm an election, complete it with metadata-only
+            // responses from every probed peer so the next round starts from
+            // the same finished-election state.
+            let mut probes = Vec::new();
+            let mut election_frames = Vec::new();
+            for frame in net.drain_captures() {
+                if let CapturedFrame::StrictUnicast {
+                    dst,
+                    body: StrictBody::HistoryProbeReq(request),
+                    ..
+                } = frame
+                {
+                    probes.push((dst, request.request_nonce));
+                }
+                election_frames.push(frame);
+            }
+            for (dst, probe_nonce) in &probes {
+                let mut response = foreign_checkpoint_probe_response(
+                    &rt,
+                    *dst,
+                    remote_cut,
+                    rank,
+                    super::StrictCatchupReason::HistoryElection,
+                );
+                response.request_nonce = *probe_nonce;
+                super::recv_v3_history_probe_resp(&rt, *dst, 1, response).await;
+            }
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            election_frames.extend(net.drain_captures());
+            let promoted_election = !probes.is_empty();
+            if round == 0 {
+                assert!(
+                    promoted_election,
+                    "the first foreign checkpoint must promote a global election"
+                );
+            } else {
+                assert!(
+                    election_frames.iter().all(|frame| !matches!(
+                        frame,
+                        CapturedFrame::StrictUnicast {
+                            body: StrictBody::HistoryProbeReq(_),
+                            ..
+                        } | CapturedFrame::StrictUnicast {
+                            body: StrictBody::ClockTick(_),
+                            ..
+                        } | CapturedFrame::StrictMulticast {
+                            body: StrictBody::ClockTick(_),
+                            ..
+                        }
+                    )),
+                    "repeated identical foreign checkpoints must not re-arm the election, re-probe every peer, or burst clock ticks"
+                );
+            }
+            assert!(
+                election_frames.iter().all(|frame| !matches!(
+                    frame,
+                    CapturedFrame::StrictUnicast {
+                        body: StrictBody::TerminalSyncReq(_),
+                        ..
+                    }
+                )),
+                "a foreign checkpoint must never downgrade into an unranked checkpoint transfer"
+            );
+            assert!(!rt.peer_incarnation_is_admitted(2, 1));
+            assert!(!rt.state.lock().history_election_pending());
+        }
+
+        // A changed foreign lineage must still promote a fresh election:
+        // the re-arm guard cannot suppress recovery for an advanced peer.
+        checkpointed
+            .upsert_abort_decision(make_op_id(2, 1, 2), 2)
+            .expect("advanced remote terminal abort");
+        checkpointed.checkpoint(2).expect("advanced remote checkpoint");
+        let advanced_cut = checkpointed.terminal_cut();
+        assert_ne!(
+            advanced_cut.terminal_set_digest(),
+            remote_cut.terminal_set_digest(),
+            "fixture requires an advanced foreign lineage"
+        );
+        let nonce = rt
+            .v3_sync
+            .lock()
+            .record_history_nonce(
+                peer,
+                super::StrictCatchupReason::Admission as i32,
+                rt.cfg.pending_propose_ttl(),
+            )
+            .expect("admission history nonce");
+        let mut response = foreign_checkpoint_probe_response(
+            &rt,
+            2,
+            advanced_cut,
+            rank,
+            super::StrictCatchupReason::Admission,
+        );
+        response.request_nonce = nonce;
+        super::recv_v3_history_probe_resp(&rt, 2, 1, response).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            rt.state.lock().history_election_pending(),
+            "an advanced foreign lineage must promote a fresh global election"
+        );
+        assert!(net.drain_captures().into_iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::HistoryProbeReq(_),
+                ..
+            }
+        )));
     }
 
     #[tokio::test]

@@ -64,9 +64,9 @@ use super::sync_v3::{
     cut_to_wire, source_cut_covers,
 };
 use super::terminal_journal::{
-    DeliveryDisposition, FrozenTarget, TerminalCut, TerminalDecision as JournalTerminalDecision,
-    TerminalJournal, TerminalJournalError, TerminalJournalRecord, TerminalJournalSnapshotEntry,
-    TerminalResolver, TerminalTransition,
+    DIGEST_LEN, JOURNAL_ID_LEN, DeliveryDisposition, FrozenTarget, TerminalCut,
+    TerminalDecision as JournalTerminalDecision, TerminalJournal, TerminalJournalError,
+    TerminalJournalRecord, TerminalJournalSnapshotEntry, TerminalResolver, TerminalTransition,
 };
 use super::{
     HistoryMetadata, StrictCommitApplyOutcome, StrictLogMetadata, StrictReplicable,
@@ -1622,6 +1622,32 @@ impl HistoryRank {
             std::cmp::Reverse(other.runtime_started_at),
             std::cmp::Reverse(other.node_id),
         )
+    }
+}
+
+/// Identity of a foreign terminal lineage that promoted a cluster-wide
+/// election from the admission path. A completed election that could not
+/// displace the local lineage must not be re-armed for the identical tuple:
+/// it would only re-probe every peer and re-burst clock ticks without
+/// changing the outcome. Any change to the lineage or rank clears this
+/// identity and promotes a fresh election, so a healed or advanced peer
+/// still recovers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ForeignCheckpointLineage {
+    journal_id: [u8; JOURNAL_ID_LEN],
+    terminal_set_digest: [u8; DIGEST_LEN],
+    version: u64,
+    freshness: i64,
+}
+
+impl ForeignCheckpointLineage {
+    fn of(rank: HistoryRank, cut: TerminalCut) -> Self {
+        Self {
+            journal_id: *cut.journal_id(),
+            terminal_set_digest: *cut.terminal_set_digest(),
+            version: rank.version,
+            freshness: rank.freshness,
+        }
     }
 }
 
@@ -3616,6 +3642,12 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// heal, so the initial attempt may fail with NoRoute and we rely on
     /// later membership events to drive a retry).
     pub(super) last_bootstrap_attempt: Mutex<Option<Instant>>,
+    /// The exact foreign lineage that last promoted a cluster-wide election
+    /// from the admission path. Suppresses identical re-arms until the
+    /// lineage or rank changes (or the election times out), so an unresolved
+    /// terminal fork cannot turn admission responses into a probe and
+    /// clock-tick storm.
+    last_foreign_checkpoint_election: Mutex<Option<ForeignCheckpointLineage>>,
     /// Per-peer admission request throttle for periodic reconciliation.
     /// Descriptor and proposal processing never owns admission fanout.
     last_admission_probe_at: Mutex<HashMap<NodeIdentifier, Instant>>,
@@ -4222,6 +4254,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             resolution_ack_broadcasts: Mutex::new(HashSet::new()),
             weak_self: Mutex::new(None),
             last_bootstrap_attempt: Mutex::new(None),
+            last_foreign_checkpoint_election: Mutex::new(None),
             last_admission_probe_at: Mutex::new(HashMap::new()),
             delivery_blocked_log: Mutex::new(DeliveryBlockedLogState::default()),
             shutdown,
@@ -4465,6 +4498,32 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             });
         }
         true
+    }
+
+    /// Promote a cluster-wide election from an admission response, but only
+    /// once per distinct foreign lineage. Re-arming for the identical
+    /// lineage after a completed election can never change the outcome: a
+    /// local node that beats every equal-rank peer cannot elect the
+    /// divergent source, so each re-arm only re-probes every live peer and
+    /// bursts clock ticks at them. A changed lineage or rank promotes a
+    /// fresh election immediately, preserving recovery for healed routes.
+    pub(super) fn request_foreign_checkpoint_election(
+        &self,
+        remote_rank: HistoryRank,
+        remote_cut: TerminalCut,
+    ) -> bool {
+        let lineage = ForeignCheckpointLineage::of(remote_rank, remote_cut);
+        {
+            let remembered = self.last_foreign_checkpoint_election.lock();
+            if *remembered == Some(lineage) {
+                return false;
+            }
+        }
+        let requested = self.request_global_history_election();
+        if requested {
+            *self.last_foreign_checkpoint_election.lock() = Some(lineage);
+        }
+        requested
     }
 
     pub(crate) fn wake_delivery_and_clock_tick(&self) {
@@ -12780,16 +12839,17 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
         }
         loop {
             let peers = bootstrap_reachable_peers(rt.net.as_ref(), rt.self_id);
-            let (should_probe, snapshot_request, history_membership_expanded) = {
+            let (should_probe, snapshot_request, history_membership_expanded, election_timed_out) = {
                 let mut state = rt.state.lock();
                 let expanded = state.observe_history_alive_peers(peers.iter().copied());
                 let snapshot_request =
                     state.reconcile_history_election_reachability(peers.iter().copied());
-                if state.history_election_timed_out(
+                let election_timed_out = state.history_election_timed_out(
                     Instant::now(),
                     interval.saturating_mul(5),
                     rt.cfg.pending_propose_ttl(),
-                ) {
+                );
+                if election_timed_out {
                     metrics::record_strict_history_election_event(
                         StrictHistoryElectionEvent::TimedOut,
                     );
@@ -12809,8 +12869,16 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
                     state.can_start_history_election(),
                     snapshot_request,
                     expanded,
+                    election_timed_out,
                 )
             };
+            if election_timed_out {
+                // A timeout means the election never heard from every probed
+                // peer, so a later response for the same foreign lineage is
+                // not proof the outcome is known. Clear the admission re-arm
+                // guard so a healed route still promotes a fresh election.
+                *rt.last_foreign_checkpoint_election.lock() = None;
+            }
             if history_membership_expanded {
                 rt.wake_clock_tick_loop();
             }

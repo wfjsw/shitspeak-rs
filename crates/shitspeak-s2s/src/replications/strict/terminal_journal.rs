@@ -25,8 +25,8 @@ use super::terminal_journal_sqlite::{SqliteTerminalJournalError, SqliteTerminalJ
 const JOURNAL_DIRECTORY: &str = "strict-terminal-journal";
 const JOURNAL_VERSION: u32 = 2;
 const LEGACY_JOURNAL_VERSION: u32 = 1;
-const JOURNAL_ID_LEN: usize = 16;
-const DIGEST_LEN: usize = 32;
+pub(crate) const JOURNAL_ID_LEN: usize = 16;
+pub(crate) const DIGEST_LEN: usize = 32;
 const EMPTY_CHAIN_DIGEST: [u8; DIGEST_LEN] = [0; DIGEST_LEN];
 
 /// An operation identifier encoded by strict protocol messages as `(hi, lo)`.
