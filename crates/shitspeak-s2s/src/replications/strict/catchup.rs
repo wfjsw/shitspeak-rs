@@ -8534,7 +8534,9 @@ mod tests {
         checkpointed
             .upsert_abort_decision(make_op_id(2, 1, 2), 2)
             .expect("advanced remote terminal abort");
-        checkpointed.checkpoint(2).expect("advanced remote checkpoint");
+        checkpointed
+            .checkpoint(2)
+            .expect("advanced remote checkpoint");
         let advanced_cut = checkpointed.terminal_cut();
         assert_ne!(
             advanced_cut.terminal_set_digest(),

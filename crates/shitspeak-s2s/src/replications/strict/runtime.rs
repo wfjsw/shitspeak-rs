@@ -64,7 +64,7 @@ use super::sync_v3::{
     cut_to_wire, source_cut_covers,
 };
 use super::terminal_journal::{
-    DIGEST_LEN, JOURNAL_ID_LEN, DeliveryDisposition, FrozenTarget, TerminalCut,
+    DIGEST_LEN, DeliveryDisposition, FrozenTarget, JOURNAL_ID_LEN, TerminalCut,
     TerminalDecision as JournalTerminalDecision, TerminalJournal, TerminalJournalError,
     TerminalJournalRecord, TerminalJournalSnapshotEntry, TerminalResolver, TerminalTransition,
 };
@@ -4501,26 +4501,35 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     }
 
     /// Promote a cluster-wide election from an admission response, but only
-    /// once per distinct foreign lineage. Re-arming for the identical
-    /// lineage after a completed election can never change the outcome: a
-    /// local node that beats every equal-rank peer cannot elect the
-    /// divergent source, so each re-arm only re-probes every live peer and
-    /// bursts clock ticks at them. A changed lineage or rank promotes a
-    /// fresh election immediately, preserving recovery for healed routes.
+    /// once per distinct foreign lineage when the repeated election provably
+    /// cannot change the outcome. Re-arming for the identical lineage after
+    /// a completed election can never change the outcome: a local node that
+    /// beats every equal-rank peer cannot elect the divergent source, so
+    /// each re-arm only re-probes every live peer and bursts clock ticks at
+    /// them. A changed lineage, an ahead peer, or a required repository base
+    /// promotes a fresh election immediately, preserving recovery for healed
+    /// or advanced routes.
     pub(super) fn request_foreign_checkpoint_election(
         &self,
         remote_rank: HistoryRank,
         remote_cut: TerminalCut,
     ) -> bool {
+        let local_rank = HistoryRank::local(self);
+        // A completed election can only select the remote when its rank
+        // beats the local rank, or when a required repository base
+        // authorizes a lower-ranked source. Otherwise it provably finishes
+        // local_won and re-arming only re-probes every peer and bursts
+        // clock ticks at them.
+        let futile = !remote_rank.beats(local_rank) && !self.repository_base_required();
         let lineage = ForeignCheckpointLineage::of(remote_rank, remote_cut);
-        {
+        if futile {
             let remembered = self.last_foreign_checkpoint_election.lock();
             if *remembered == Some(lineage) {
                 return false;
             }
         }
         let requested = self.request_global_history_election();
-        if requested {
+        if requested && futile {
             *self.last_foreign_checkpoint_election.lock() = Some(lineage);
         }
         requested
