@@ -3788,7 +3788,7 @@ async fn empty_remote_terminal_cut_cannot_admit_peer_missing_local_abort_fence()
 }
 
 #[tokio::test]
-async fn delayed_election_response_with_divergent_cut_continues_admission_sync() {
+async fn delayed_election_response_with_divergent_cut_rearms_election() {
     let (rt, net) = runtime(1, ReplicationConfig::default());
     rt.seed_membership_snapshot([MemberIncarnation::new(1, 11), MemberIncarnation::new(2, 22)]);
     assert!(!rt.peer_incarnation_is_admitted(2, 22));
@@ -3808,9 +3808,9 @@ async fn delayed_election_response_with_divergent_cut_continues_admission_sync()
 
     // `runtime()` deliberately leaves the election collector idle. This
     // models a promoted admission nonce whose election completed before the
-    // peer's response arrived. A divergent cut must continue through the
-    // admission terminal-sync path instead of being dropped by the closed
-    // collector.
+    // peer's response arrived. A divergent cut must rearm a new global
+    // election; admission is not authorized to synchronize that foreign
+    // lineage on its own.
     let remote_cut = crate::replications::proto::StrictTerminalCut {
         journal_id: Bytes::from_static(&[7; 16]),
         generation: 1,
@@ -3836,7 +3836,8 @@ async fn delayed_election_response_with_divergent_cut_continues_admission_sync()
     )
     .await;
 
-    assert!(net.drain_captures().into_iter().any(|frame| matches!(
+    assert!(rt.state.lock().history_election_pending());
+    assert!(net.drain_captures().into_iter().all(|frame| !matches!(
         frame,
         CapturedFrame::StrictUnicast {
             dst: 2,

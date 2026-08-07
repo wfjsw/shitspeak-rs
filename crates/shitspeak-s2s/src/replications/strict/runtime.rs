@@ -4305,6 +4305,36 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         self.clock_tick_signal.notify_one();
     }
 
+    /// Start a cluster-wide election as soon as an admission response reveals
+    /// a terminal lineage that admission is not allowed to install.
+    pub(super) fn request_global_history_election(&self) -> bool {
+        let requested = {
+            let mut state = self.state.lock();
+            if state.history_election_blocks_steady_state() {
+                false
+            } else {
+                state.request_history_election();
+                true
+            }
+        };
+        if !requested {
+            return false;
+        }
+        // This is a verified foreign lineage, not a membership flap. Bypass
+        // the bootstrap retry throttle so admission cannot leave recovery idle.
+        *self.last_bootstrap_attempt.lock() = None;
+        self.wake_clock_tick_loop();
+        let weak = self.weak_self.lock().clone();
+        if let Some(weak) = weak {
+            tokio::spawn(async move {
+                if let Some(rt) = weak.upgrade() {
+                    rt.try_bootstrap_catchup().await;
+                }
+            });
+        }
+        true
+    }
+
     pub(crate) fn wake_delivery_and_clock_tick(&self) {
         self.deliver_signal.notify_one();
         self.wake_clock_tick_loop();

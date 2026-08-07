@@ -4441,6 +4441,22 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         terminal_set_digest = ?response_cut.terminal_set_digest(),
         "strict history probe response accepted"
     );
+    // A promoted nonce already has election authority below; let it feed
+    // the collector rather than deferring the same response twice.
+    if reason == StrictCatchupReason::Admission
+        && !election_pending
+        && admission_foreign_checkpoint_requires_global_election(rt, peer, rank, response_cut).await
+    {
+        // A foreign checkpoint is one complete terminal lineage. An admission
+        // probe has not ranked the cluster, so it must not start the terminal
+        // transfer that would later reject the checkpoint as unranked. Start
+        // a full election instead; its fresh correlated probe can select and
+        // stage this source before the repository image is installed.
+        rt.v3_history
+            .lock()
+            .defer_admission(peer, rank, response_cut);
+        return;
+    }
     let repair_reason = accepted_probe
         .repair_reason()
         .or_else(|| {
@@ -4619,6 +4635,29 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         .lock()
         .defer_until_terminal(source_peer, rank, source_cut, reason);
     request_v3_terminal_sync_toward(rt, source_node, reason, Some(source_cut)).await;
+}
+
+async fn admission_foreign_checkpoint_requires_global_election<R: StrictReplicable>(
+    rt: &StrictRuntime<R>,
+    peer: PeerIncarnation,
+    remote_rank: HistoryRank,
+    remote_cut: TerminalCut,
+) -> bool {
+    let local_rank = HistoryRank::local(rt);
+    if remote_rank.version < local_rank.version
+        || (remote_rank.version == local_rank.version
+            && remote_rank.freshness < local_rank.freshness)
+    {
+        return false;
+    }
+    let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+    let known_source_cut = rt.v3_sync.lock().known_source_cut(peer);
+    let requires_election =
+        admission_requires_elected_checkpoint(remote_cut, local_cut, known_source_cut);
+    if requires_election {
+        let _ = rt.request_global_history_election();
+    }
+    requires_election
 }
 
 /// Resume admission evidence that shared a promoted history-election nonce.
@@ -7760,7 +7799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generation_zero_terminal_digest_mismatch_starts_sync_before_admission() {
+    async fn generation_zero_terminal_digest_mismatch_promotes_election_before_admission() {
         let (rt, net, repo) = test_runtime(1, ReplicationConfig::default());
         *repo.state.lock() = (1, vec![(1, 1, None)]);
         net.set_epoch(1, 1);
@@ -7795,6 +7834,10 @@ mod tests {
                 .terminal_cut()
                 .terminal_set_digest()
         );
+        // A concurrent bootstrap may already own the election. The admission
+        // response must still be deferred instead of falling through to an
+        // unranked terminal checkpoint request.
+        rt.state.lock().request_history_election();
         net.drain_captures();
 
         super::recv_v3_history_probe_resp(
@@ -7821,7 +7864,11 @@ mod tests {
             "a mismatched terminal-set checkpoint cannot satisfy admission"
         );
         assert!(
-            net.drain_captures().into_iter().any(|frame| matches!(
+            rt.state.lock().history_election_pending(),
+            "a foreign checkpoint must promote a global election before admission"
+        );
+        assert!(
+            net.drain_captures().into_iter().all(|frame| !matches!(
                 frame,
                 CapturedFrame::StrictUnicast {
                     dst: 2,
@@ -7829,7 +7876,7 @@ mod tests {
                     ..
                 }
             )),
-            "generation zero with a different terminal-set digest must start checkpoint sync"
+            "admission must not start an unranked checkpoint transfer"
         );
     }
 
@@ -11084,5 +11131,142 @@ mod tests {
             source_net.drain_captures().is_empty(),
             "a requester without v2 terminal generations must not receive history that can outlive a fence"
         );
+    }
+    #[tokio::test]
+    async fn admission_foreign_checkpoint_one_version_behind_promotes_to_elected_snapshot() {
+        let (source, source_net, source_repo) = test_runtime(1, ReplicationConfig::default());
+        let (sink, sink_net, sink_repo) = test_runtime(2, ReplicationConfig::default());
+        configure_v5_peer(&source_net, 1, 2);
+        configure_v5_peer(&sink_net, 2, 1);
+        populate_repo(&source_repo, 2, 10);
+        populate_repo(&sink_repo, 1, 20);
+        {
+            let mut journal = source.terminal_journal.lock().await;
+            journal
+                .upsert_abort_decision(make_op_id(1, 1, 1), 10)
+                .expect("source abort");
+            journal.checkpoint(2).expect("source checkpoint");
+        }
+        *sink.last_bootstrap_attempt.lock() = Some(Instant::now());
+
+        super::request_v3_history_probe(
+            &sink,
+            source.self_id,
+            super::StrictCatchupReason::Admission,
+        )
+        .await;
+        let admission_probe = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::HistoryProbeReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("admission history probe");
+        super::recv_v3_history_probe_req(&source, sink.self_id, 1, admission_probe).await;
+        let admission_response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::HistoryProbeResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("admission history response");
+        super::recv_v3_history_probe_resp(&sink, source.self_id, 1, admission_response).await;
+
+        let election_probe = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                let captures = sink_net.drain_captures();
+                assert!(!captures.iter().any(|frame| matches!(
+                    frame,
+                    CapturedFrame::StrictUnicast {
+                        body: StrictBody::TerminalSyncReq(request),
+                        ..
+                    } if super::StrictCatchupReason::try_from(request.reason).ok()
+                        == Some(super::StrictCatchupReason::Admission)
+                )));
+                if let Some(request) = captures.into_iter().find_map(|frame| match frame {
+                    CapturedFrame::StrictUnicast {
+                        body: StrictBody::HistoryProbeReq(request),
+                        ..
+                    } => Some(request),
+                    _ => None,
+                }) {
+                    return request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreign admission checkpoint must immediately start election");
+        assert_eq!(
+            super::StrictCatchupReason::try_from(election_probe.reason).ok(),
+            Some(super::StrictCatchupReason::HistoryElection)
+        );
+        super::recv_v3_history_probe_req(&source, sink.self_id, 1, election_probe).await;
+        let election_response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::HistoryProbeResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("election history response");
+        super::recv_v3_history_probe_resp(&sink, source.self_id, 1, election_response).await;
+
+        let checkpoint_request = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::TerminalSyncReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("elected terminal checkpoint request");
+        assert_eq!(
+            super::StrictCatchupReason::try_from(checkpoint_request.reason).ok(),
+            Some(super::StrictCatchupReason::HistoryElection)
+        );
+        super::recv_v3_terminal_sync_req(&source, sink.self_id, 1, checkpoint_request).await;
+        let checkpoint_page = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::TerminalSyncPage(page),
+                    ..
+                } => Some(page),
+                _ => None,
+            })
+            .expect("elected terminal checkpoint page");
+        finish_terminal_checkpoint_handshake(
+            &source,
+            &source_net,
+            &sink,
+            &sink_net,
+            checkpoint_page,
+        )
+        .await;
+
+        assert!(sink_net.drain_captures().into_iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 1,
+                body: StrictBody::CatchupReq(ref request),
+                ..
+            } if request.force_snapshot
+                && request.chunk_token == super::HISTORY_ELECTION_SNAPSHOT_TOKEN
+        )));
     }
 }
