@@ -1910,6 +1910,101 @@ async fn active_history_election_stages_checkpoint_for_admission_started_client(
     assert!(journal.is_retired(conflicting));
 }
 
+/// Production regression: node 4 (eu.mumble.winterco.cn) ran a history
+/// election against the cluster (gen 4103) while its own strict terminal
+/// journal was divergent (gen 7, five retired origins) and had already
+/// retired the cluster's current op range. Every elected terminal sync
+/// failed 140/140 with "strict terminal commit rejected by durable journal
+/// ... is retired by checkpoint", and peers kept admission-probing it
+/// forever. The elected source advanced its cut between the probe (which
+/// deferred the elected source_cut) and the checkpoint page render, so the
+/// sink no longer matched the exact-elected staging gate and fell into the
+/// per-op apply path, where its own stale retired-origin floor rejected the
+/// incoming ops. The elected checkpoint must still be staged as a wholesale
+/// journal replacement even when the deferred cut is slightly behind the
+/// page target.
+#[tokio::test]
+async fn exact_elected_checkpoint_stages_when_source_advanced_over_retired_floor() {
+    let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
+    let (source, source_net) = runtime(1, config.clone());
+    let (sink, sink_net) = runtime(2, config);
+    // The source applies a first op, the sink captures that cut as its
+    // elected source obligation, and then the source advances one more
+    // generation before rendering the checkpoint page.
+    assert!(source.apply_catchup_terminal_state(terminal_abort(1)).await);
+    let deferred_cut = source.terminal_journal.lock().await.terminal_cut();
+    assert!(source.apply_catchup_terminal_state(terminal_abort(2)).await);
+    let advanced_cut = source.terminal_journal.lock().await.terminal_cut();
+    assert_ne!(deferred_cut, advanced_cut);
+
+    // The sink's divergent journal has a retired-origin floor covering the
+    // source's current op (the production divergence: node 4 retired the
+    // cluster's live op range).
+    let source_op = make_op_id(1, 11, 2);
+    let retired_floor = make_op_id(1, 30, 1);
+    {
+        let mut journal = sink.terminal_journal.lock().await;
+        journal
+            .upsert_abort_decision(retired_floor, 2)
+            .expect("retirement floor decision");
+        journal.checkpoint(0).expect("retirement checkpoint");
+        assert!(journal.is_retired(source_op));
+    }
+
+    // Exact elected HistoryElection intent: the sink elected node 1 as the
+    // repository source and defers its terminal obligation at the cut it
+    // observed during the election.
+    let peer = PeerIncarnation::new(1, 11);
+    sink.state.lock().begin_history_election([1]);
+    sink.v3_history.lock().defer_until_terminal(
+        peer,
+        HistoryRank {
+            version: 1,
+            freshness: 1,
+            runtime_started_at: 11,
+            node_id: 1,
+            terminal_repository_base_version: 0,
+        },
+        deferred_cut,
+        StrictCatchupReason::HistoryElection,
+    );
+    request_v3_terminal_sync_toward(
+        &sink,
+        1,
+        StrictCatchupReason::HistoryElection,
+        Some(deferred_cut),
+    )
+    .await;
+    let request = terminal_request(sink_net.drain_captures().pop().expect("elected request"));
+    recv_v3_terminal_sync_req(&source, 2, 22, request).await;
+    let page = terminal_page(source_net.drain_captures().pop().expect("checkpoint page"));
+    assert_eq!(
+        StrictTerminalPageKind::try_from(page.kind).ok(),
+        Some(StrictTerminalPageKind::Checkpoint)
+    );
+    assert_eq!(
+        page.target_cut.as_ref().and_then(cut_from_wire),
+        Some(advanced_cut),
+        "the responder must render the checkpoint at its current (advanced) cut"
+    );
+
+    recv_v3_terminal_sync_page(&sink, 1, 11, page).await;
+
+    // The elected checkpoint must be staged and acknowledged, not applied
+    // per-op (which would reject the locally-retired op and fail the session
+    // forever, exactly like production).
+    assert!(
+        sink_net.drain_captures().into_iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncAck(_),
+                ..
+            }
+        )),
+        "the elected checkpoint must be staged and acknowledged even after the source advanced"
+    );
+}
+
 #[tokio::test]
 async fn terminal_checkpoint_buffers_commit_from_disjoint_frozen_partition() {
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);

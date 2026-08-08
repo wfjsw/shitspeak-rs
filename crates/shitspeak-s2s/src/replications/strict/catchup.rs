@@ -7020,7 +7020,19 @@ pub(super) async fn recv_v3_terminal_sync_page<R: StrictReplicable>(
                         .pending_after_terminal(peer)
                         .is_some_and(|intent| {
                             intent.reason() == StrictCatchupReason::HistoryElection
-                                && intent.source_cut() == target
+                                // The probe that deferred this intent captured
+                                // the source cut at probe time. The elected
+                                // source may legitimately advance its journal
+                                // before rendering the checkpoint page, so a
+                                // page whose target covers the deferred cut on
+                                // the same lineage is still the exact elected
+                                // checkpoint. Requiring strict equality made a
+                                // sink with a divergent local journal fall into
+                                // the per-op apply path, where its own stale
+                                // retired-origin floor rejected the incoming
+                                // ops as "retired by checkpoint" and the
+                                // elected terminal sync failed forever.
+                                && source_cut_covers(target, intent.source_cut())
                         })
                 };
                 // Checkpoint authority is fixed by the correlated election
