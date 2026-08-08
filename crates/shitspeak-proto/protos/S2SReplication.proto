@@ -147,6 +147,12 @@ message StrictHeadAck {
   uint64 repository_version         = 5;
   bytes  terminal_set_digest        = 6;
   int64  history_freshness           = 7;
+  // Journal lineage of the acknowledged terminal cut. Legacy peers that
+  // predate this field leave it empty; peers that send it must match the
+  // exact lineage, otherwise a same-digest divergent journal could satisfy
+  // the checkpoint quorum.
+  bytes  journal_id                 = 8;
+  uint64 generation                 = 9;
 }
 
 // ------- Strict pairwise repair (v3) -------

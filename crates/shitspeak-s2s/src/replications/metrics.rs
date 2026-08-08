@@ -603,6 +603,7 @@ pub(crate) enum StrictHeadEvent {
     EvidenceRepositoryVersionMismatch,
     EvidenceFreshnessMismatch,
     EvidenceTerminalDigestMismatch,
+    EvidenceJournalLineageMismatch,
     AckAccepted,
     AckRejectedEnvelope,
     AckRejectedDigest,
@@ -617,11 +618,12 @@ impl StrictHeadEvent {
             Self::EvidenceRepositoryVersionMismatch => 1,
             Self::EvidenceFreshnessMismatch => 2,
             Self::EvidenceTerminalDigestMismatch => 3,
-            Self::AckAccepted => 4,
-            Self::AckRejectedEnvelope => 5,
-            Self::AckRejectedDigest => 6,
-            Self::AckRejectedIdentity => 7,
-            Self::TickAttempted => 8,
+            Self::EvidenceJournalLineageMismatch => 4,
+            Self::AckAccepted => 5,
+            Self::AckRejectedEnvelope => 6,
+            Self::AckRejectedDigest => 7,
+            Self::AckRejectedIdentity => 8,
+            Self::TickAttempted => 9,
         }
     }
 
@@ -631,11 +633,78 @@ impl StrictHeadEvent {
             Self::EvidenceRepositoryVersionMismatch => "evidence_repository_version_mismatch",
             Self::EvidenceFreshnessMismatch => "evidence_freshness_mismatch",
             Self::EvidenceTerminalDigestMismatch => "evidence_terminal_digest_mismatch",
+            Self::EvidenceJournalLineageMismatch => "evidence_journal_lineage_mismatch",
             Self::AckAccepted => "ack_accepted",
             Self::AckRejectedEnvelope => "ack_rejected_envelope",
             Self::AckRejectedDigest => "ack_rejected_digest",
             Self::AckRejectedIdentity => "ack_rejected_identity",
             Self::TickAttempted => "tick_attempted",
+        }
+    }
+}
+
+/// Bounded outcomes in the strict terminal-lineage divergence and recovery
+/// path. Divergence is the state where a peer advertises a journal lineage
+/// foreign to the local terminal set; recovery routes it through a ranked
+/// history election instead of per-operation terminal sync.
+///
+/// Never replace these labels with topic, peer, transfer, journal, or digest
+/// data: those values are deliberately excluded from the Prometheus surface
+/// and belong in structured logs instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictTerminalDivergenceEvent {
+    ForeignLineageDropped,
+    ForeignLineageElectionRequested,
+    ForeignLineageElectionDeduped,
+    ForcedCheckpointAbandonedWork,
+    ForcedCheckpointSent,
+    StalledElectionRemoteWon,
+    StalledElectionNoCandidate,
+    StalledElectionKeptArmed,
+    StalledElectionSourceUnsatisfied,
+    TerminalDivergenceSuppressedSameLineage,
+    TerminalDivergenceSuppressedLaggingGeneration,
+    TerminalDivergenceSuppressedBehindPeer,
+}
+
+impl StrictTerminalDivergenceEvent {
+    fn index(self) -> usize {
+        match self {
+            Self::ForeignLineageDropped => 0,
+            Self::ForeignLineageElectionRequested => 1,
+            Self::ForeignLineageElectionDeduped => 2,
+            Self::ForcedCheckpointAbandonedWork => 3,
+            Self::ForcedCheckpointSent => 4,
+            Self::StalledElectionRemoteWon => 5,
+            Self::StalledElectionNoCandidate => 6,
+            Self::StalledElectionKeptArmed => 7,
+            Self::StalledElectionSourceUnsatisfied => 8,
+            Self::TerminalDivergenceSuppressedSameLineage => 9,
+            Self::TerminalDivergenceSuppressedLaggingGeneration => 10,
+            Self::TerminalDivergenceSuppressedBehindPeer => 11,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ForeignLineageDropped => "foreign_lineage_dropped",
+            Self::ForeignLineageElectionRequested => "foreign_lineage_election_requested",
+            Self::ForeignLineageElectionDeduped => "foreign_lineage_election_deduped",
+            Self::ForcedCheckpointAbandonedWork => "forced_checkpoint_abandoned_work",
+            Self::ForcedCheckpointSent => "forced_checkpoint_sent",
+            Self::StalledElectionRemoteWon => "stalled_election_remote_won",
+            Self::StalledElectionNoCandidate => "stalled_election_no_candidate",
+            Self::StalledElectionKeptArmed => "stalled_election_kept_armed",
+            Self::StalledElectionSourceUnsatisfied => "stalled_election_source_unsatisfied",
+            Self::TerminalDivergenceSuppressedSameLineage => {
+                "terminal_divergence_suppressed_same_lineage"
+            }
+            Self::TerminalDivergenceSuppressedLaggingGeneration => {
+                "terminal_divergence_suppressed_lagging_generation"
+            }
+            Self::TerminalDivergenceSuppressedBehindPeer => {
+                "terminal_divergence_suppressed_behind_peer"
+            }
         }
     }
 }
@@ -792,7 +861,8 @@ const STRICT_PROBE_METRIC_COUNT: usize =
     STRICT_PROBE_KIND_COUNT * CATCHUP_REASON_COUNT * STRICT_PROBE_OUTCOME_COUNT;
 const STRICT_ADMISSION_EVENT_COUNT: usize = 8;
 const STRICT_HISTORY_ELECTION_EVENT_COUNT: usize = 8;
-const STRICT_HEAD_EVENT_COUNT: usize = 9;
+const STRICT_HEAD_EVENT_COUNT: usize = 10;
+const STRICT_TERMINAL_DIVERGENCE_EVENT_COUNT: usize = 12;
 const CATCHUP_REASONS: [CatchupReason; CATCHUP_REASON_COUNT] = [
     CatchupReason::HistoryElection,
     CatchupReason::Admission,
@@ -928,11 +998,27 @@ const STRICT_HEAD_EVENTS: [StrictHeadEvent; STRICT_HEAD_EVENT_COUNT] = [
     StrictHeadEvent::EvidenceRepositoryVersionMismatch,
     StrictHeadEvent::EvidenceFreshnessMismatch,
     StrictHeadEvent::EvidenceTerminalDigestMismatch,
+    StrictHeadEvent::EvidenceJournalLineageMismatch,
     StrictHeadEvent::AckAccepted,
     StrictHeadEvent::AckRejectedEnvelope,
     StrictHeadEvent::AckRejectedDigest,
     StrictHeadEvent::AckRejectedIdentity,
     StrictHeadEvent::TickAttempted,
+];
+const STRICT_TERMINAL_DIVERGENCE_EVENTS: [StrictTerminalDivergenceEvent;
+    STRICT_TERMINAL_DIVERGENCE_EVENT_COUNT] = [
+    StrictTerminalDivergenceEvent::ForeignLineageDropped,
+    StrictTerminalDivergenceEvent::ForeignLineageElectionRequested,
+    StrictTerminalDivergenceEvent::ForeignLineageElectionDeduped,
+    StrictTerminalDivergenceEvent::ForcedCheckpointAbandonedWork,
+    StrictTerminalDivergenceEvent::ForcedCheckpointSent,
+    StrictTerminalDivergenceEvent::StalledElectionRemoteWon,
+    StrictTerminalDivergenceEvent::StalledElectionNoCandidate,
+    StrictTerminalDivergenceEvent::StalledElectionKeptArmed,
+    StrictTerminalDivergenceEvent::StalledElectionSourceUnsatisfied,
+    StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedSameLineage,
+    StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedLaggingGeneration,
+    StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedBehindPeer,
 ];
 const REPLICATION_PIPELINE_KIND_COUNT: usize = 4;
 const REPLICATION_PIPELINE_STAGE_COUNT: usize = 12;
@@ -1014,6 +1100,9 @@ static STRICT_HISTORY_ELECTION_EVENTS_TOTAL: [AtomicU64; STRICT_HISTORY_ELECTION
     [const { AtomicU64::new(0) }; STRICT_HISTORY_ELECTION_EVENT_COUNT];
 static STRICT_HEAD_EVENTS_TOTAL: [AtomicU64; STRICT_HEAD_EVENT_COUNT] =
     [const { AtomicU64::new(0) }; STRICT_HEAD_EVENT_COUNT];
+static STRICT_TERMINAL_DIVERGENCE_EVENTS_TOTAL: [AtomicU64;
+    STRICT_TERMINAL_DIVERGENCE_EVENT_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_TERMINAL_DIVERGENCE_EVENT_COUNT];
 
 static REPLICATION_PIPELINE_STAGE_EVENTS: [[AtomicU64; REPLICATION_PIPELINE_STAGE_COUNT];
     REPLICATION_PIPELINE_KIND_COUNT] =
@@ -1426,6 +1515,10 @@ pub(crate) fn record_strict_head_event(event: StrictHeadEvent) {
     increment(&STRICT_HEAD_EVENTS_TOTAL[event.index()], 1);
 }
 
+pub(crate) fn record_strict_terminal_divergence_event(event: StrictTerminalDivergenceEvent) {
+    increment(&STRICT_TERMINAL_DIVERGENCE_EVENTS_TOTAL[event.index()], 1);
+}
+
 pub(crate) fn record_pipeline_stage(
     kind: ReplicationPipelineKind,
     stage: ReplicationPipelineStage,
@@ -1766,6 +1859,13 @@ fn strict_convergence_event_metric_samples() -> Vec<PrometheusSample> {
             "shitspeak_s2s_strict_replication_head_events_total",
             vec![("event".to_owned(), event.label().to_owned())],
             STRICT_HEAD_EVENTS_TOTAL[event.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    for event in STRICT_TERMINAL_DIVERGENCE_EVENTS {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_divergence_events_total",
+            vec![("event".to_owned(), event.label().to_owned())],
+            STRICT_TERMINAL_DIVERGENCE_EVENTS_TOTAL[event.index()].load(Ordering::Relaxed) as f64,
         ));
     }
     samples
@@ -2289,6 +2389,9 @@ mod tests {
         record_strict_admission_event(StrictAdmissionEvent::HistoryProofTerminalMismatch);
         record_strict_history_election_event(StrictHistoryElectionEvent::Rearmed);
         record_strict_head_event(StrictHeadEvent::AckRejectedIdentity);
+        record_strict_terminal_divergence_event(
+            StrictTerminalDivergenceEvent::ForeignLineageDropped,
+        );
 
         let samples = strict_convergence_event_metric_samples();
         assert!(samples.iter().any(|sample| {
@@ -2318,6 +2421,11 @@ mod tests {
         assert!(samples.iter().any(|sample| {
             sample.name() == "shitspeak_s2s_strict_replication_head_events_total"
                 && sample.labels() == [("event".to_owned(), "ack_rejected_identity".to_owned())]
+                && sample.value() >= 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_divergence_events_total"
+                && sample.labels() == [("event".to_owned(), "foreign_lineage_dropped".to_owned())]
                 && sample.value() >= 1.0
         }));
         for sample in samples {

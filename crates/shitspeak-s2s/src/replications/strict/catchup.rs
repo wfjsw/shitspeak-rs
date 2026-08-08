@@ -26,7 +26,7 @@ use super::super::metrics::{
     self, CatchupMode, CatchupPhase, CatchupReason, ReplicationPipelineKind,
     ReplicationPipelineStage, StrictAdmissionEvent, StrictCatchupDuplicateOutcome,
     StrictCatchupSessionEvent, StrictCatchupSessionOutcome, StrictProbeKind, StrictProbeOutcome,
-    StrictSnapshotReceiveEvent, StrictSnapshotResponderEvent,
+    StrictSnapshotReceiveEvent, StrictSnapshotResponderEvent, StrictTerminalDivergenceEvent,
 };
 use super::super::proto::{
     CatchupOp, StrictBody, StrictCatchupReason, StrictCatchupReq, StrictCatchupResp,
@@ -4602,6 +4602,15 @@ async fn preserve_v3_history_probe_obligation<R: StrictReplicable>(
         // independent enough to repair immediately.
         return;
     }
+    if source_cut.journal_id() != local_cut.journal_id()
+        && source_cut.terminal_set_digest() != local_cut.terminal_set_digest()
+    {
+        // A foreign journal lineage is one complete divergent history. The
+        // main probe-response decision routes it through the ranked election
+        // (or drops it when the peer is behind); a per-operation terminal
+        // sync toward it would adopt the wrong lineage out of band.
+        return;
+    }
     rt.v3_history
         .lock()
         .defer_until_terminal(peer, rank, source_cut, reason);
@@ -4869,6 +4878,43 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         && source_cut.journal_id() != local_cut.journal_id()
         && rank.version >= repository_version;
     let repository_base_required = rt.repository_base_required();
+    // A foreign journal lineage (different id and non-equal set digest) is
+    // one complete divergent history. A per-operation terminal sync toward
+    // it would adopt the peer's lineage out of band — exactly the endless
+    // wrong-direction catchup seen when a partitioned minority mints its
+    // own journal. Only a ranked election may authorize replacing the local
+    // lineage, and only when the peer's rank is ahead; a behind or equal
+    // peer recovers toward the majority through its own tick-receive view.
+    let foreign_lineage = !terminal_equal
+        && source_cut.journal_id() != local_cut.journal_id()
+        && !source_already_known;
+    if foreign_lineage && reason != StrictCatchupReason::HistoryElection {
+        if rank.beats(HistoryRank::local(rt)) || rt.repository_base_required() {
+            let _ = rt.request_foreign_checkpoint_election(rank, source_cut);
+        } else {
+            metrics::record_strict_terminal_divergence_event(
+                StrictTerminalDivergenceEvent::ForeignLineageDropped,
+            );
+            warn!(
+                topic = %rt.topic,
+                peer = source_peer.node(),
+                peer_boot_epoch = source_peer.boot_epoch(),
+                reason = ?reason,
+                local_repository_version = local_history.version,
+                local_history_freshness = local_history.freshness,
+                remote_repository_version = rank.version,
+                remote_history_freshness = rank.freshness,
+                local_terminal_journal_id = ?local_cut.journal_id(),
+                local_terminal_generation = local_cut.generation(),
+                local_terminal_set_digest = ?local_cut.terminal_set_digest(),
+                remote_terminal_journal_id = ?source_cut.journal_id(),
+                remote_terminal_generation = source_cut.generation(),
+                remote_terminal_set_digest = ?source_cut.terminal_set_digest(),
+                "strict foreign terminal lineage dropped; behind peer must recover toward the majority lineage"
+            );
+        }
+        return;
+    }
     let history_needed = rank.version > repository_version
         || freshness_replacement_needed
         || repository_base_required
@@ -5516,6 +5562,20 @@ pub(super) async fn request_v3_terminal_sync_toward<R: StrictReplicable>(
     }
     let wire = {
         let mut sync = rt.v3_sync.lock();
+        if force_elected_checkpoint {
+            if sync.has_session_work(peer) || sync.has_periodic_work(peer) {
+                metrics::record_strict_terminal_divergence_event(
+                    StrictTerminalDivergenceEvent::ForcedCheckpointAbandonedWork,
+                );
+                warn!(
+                    topic = %rt.topic,
+                    peer = peer.node(),
+                    peer_boot_epoch = peer.boot_epoch(),
+                    desired_journal_id = ?desired_cut.map(|cut| *cut.journal_id()),
+                    "strict history election abandoning opposing session work for forced checkpoint"
+                );
+            }
+        }
         if force_elected_checkpoint && !sync.force_checkpoint_from_zero(peer) {
             if sync.coalesce_terminal_intent_if_active(peer, reason as i32, desired_cut) {
                 metrics::record_strict_catchup_session_event(
@@ -5556,6 +5616,11 @@ pub(super) async fn request_v3_terminal_sync_toward<R: StrictReplicable>(
             );
             return;
         };
+        if force_elected_checkpoint {
+            metrics::record_strict_terminal_divergence_event(
+                StrictTerminalDivergenceEvent::ForcedCheckpointSent,
+            );
+        }
         wire
     };
     start_reducer_owned_terminal_client(rt, peer, reason, desired_cut, wire).await;

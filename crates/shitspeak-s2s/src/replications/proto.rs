@@ -831,6 +831,8 @@ mod tests {
             repository_version: 55,
             terminal_set_digest: Bytes::from_static(b"set-55"),
             history_freshness: 13,
+            journal_id: Bytes::from_static(&[9; 16]),
+            generation: 4,
         });
 
         assert_eq!(roundtrip_strict_body(body.clone()), body);

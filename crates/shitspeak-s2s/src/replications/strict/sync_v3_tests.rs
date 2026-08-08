@@ -14,6 +14,7 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    StrictReplicable,
     catchup::{
         apply_response, recv_v3_clock_probe_req, recv_v3_clock_probe_resp,
         recv_v3_history_probe_resp, recv_v3_terminal_sync_ack, recv_v3_terminal_sync_page,
@@ -1099,6 +1100,203 @@ async fn unrecognized_higher_restart_cut_cannot_claim_a_restored_responder_is_up
     );
     assert_ne!(page.transfer_id, 0);
     assert_eq!(page.target_cut, Some(cut_to_wire(target)));
+}
+
+#[tokio::test]
+async fn foreign_lineage_terminal_fence_never_starts_terminal_sync_toward_the_peer() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+    let peer = PeerIncarnation::new(2, 22);
+    // A partitioned minority checkpoint mints a fresh journal id at
+    // generation zero with an empty chain digest and its own terminal-set
+    // digest: the wire-valid foreign lineage that used to fall through to a
+    // per-operation terminal sync (endless wrong-direction catchup).
+    let foreign_cut = TerminalCut::new([0xEE; 16], 0, [0; 32], [0xCC; 32]);
+    let metadata = rt.repo.history_metadata();
+    assert_ne!(
+        foreign_cut.journal_id(),
+        rt.terminal_journal.lock().await.terminal_cut().journal_id(),
+        "fixture must model a fresh divergent lineage"
+    );
+
+    request_v3_history_probe(&rt, 2, StrictCatchupReason::TerminalFence).await;
+    let request_nonce = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(request),
+                ..
+            } => Some(request.request_nonce),
+            _ => None,
+        })
+        .expect("terminal-fence history probe request");
+
+    // Majority side: the peer is not ahead, so the foreign lineage must be
+    // dropped entirely instead of being adopted through terminal sync.
+    recv_v3_history_probe_resp(
+        &rt,
+        2,
+        22,
+        StrictHistoryProbeResp {
+            responder_node: 2,
+            expected_requester_boot_epoch: 11,
+            request_nonce,
+            repository_version: metadata.version,
+            terminal_repository_base_version: 0,
+            history_freshness: metadata.freshness,
+            runtime_started_at: 22,
+            history_node: 2,
+            terminal_cut: Some(cut_to_wire(foreign_cut)),
+            reason: StrictCatchupReason::TerminalFence as i32,
+        },
+    )
+    .await;
+
+    let captures = net.drain_captures();
+    assert!(
+        !captures.iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::TerminalSyncReq(_),
+                ..
+            }
+        )),
+        "a rank-behind foreign lineage must never be adopted through per-operation terminal sync"
+    );
+    assert!(
+        !rt.state.lock().history_election_blocks_steady_state(),
+        "a rank-behind foreign lineage must not re-arm the election on the majority side"
+    );
+    assert!(
+        rt.v3_sync
+            .lock()
+            .known_source_cut(peer)
+            .is_none_or(|known| known.journal_id() != foreign_cut.journal_id()),
+        "the foreign lineage must not be remembered as a locally known source cut"
+    );
+
+    // Minority side: the same foreign lineage from an ahead peer must promote
+    // the ranked election (never a terminal sync) so the divergent node pulls
+    // the majority's elected checkpoint.
+    request_v3_history_probe(&rt, 2, StrictCatchupReason::TerminalFence).await;
+    let request_nonce = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(request),
+                ..
+            } => Some(request.request_nonce),
+            _ => None,
+        })
+        .expect("second terminal-fence history probe request");
+
+    recv_v3_history_probe_resp(
+        &rt,
+        2,
+        22,
+        StrictHistoryProbeResp {
+            responder_node: 2,
+            expected_requester_boot_epoch: 11,
+            request_nonce,
+            repository_version: metadata.version,
+            terminal_repository_base_version: 0,
+            history_freshness: metadata.freshness.saturating_add(1),
+            runtime_started_at: 22,
+            history_node: 2,
+            terminal_cut: Some(cut_to_wire(foreign_cut)),
+            reason: StrictCatchupReason::TerminalFence as i32,
+        },
+    )
+    .await;
+
+    let captures = net.drain_captures();
+    assert!(
+        !captures.iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::TerminalSyncReq(_),
+                ..
+            }
+        )),
+        "an ahead foreign lineage must be elected, never per-operation terminal synced"
+    );
+    assert!(
+        rt.state.lock().history_election_blocks_steady_state(),
+        "an ahead foreign lineage must promote the ranked election"
+    );
+}
+
+#[tokio::test]
+async fn forced_checkpoint_abandons_opposing_terminal_client_and_sends_fresh_request() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+    let peer = PeerIncarnation::new(2, 22);
+    // An active per-operation terminal client toward the elected source (for
+    // example from a terminal fence) must not silently block the forced
+    // cursor-zero checkpoint replacement: the ranked election outranks
+    // steady-state repair, and every transfer naming the old lineage must be
+    // abandoned before the fresh lineage can be pulled.
+    request_v3_terminal_sync(&rt, 2, StrictCatchupReason::TerminalFence).await;
+    assert!(
+        net.drain_captures().into_iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::TerminalSyncReq(_),
+                ..
+            }
+        )),
+        "fixture: the terminal-fence trigger must open an active outbound client"
+    );
+    assert!(
+        rt.v3_sync.lock().has_session_work(peer),
+        "fixture: the terminal-fence trigger must leave a non-idle reducer session"
+    );
+    let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+    let foreign_cut = TerminalCut::new([0xEE; 16], local_cut.generation(), [0xDD; 32], [0xCC; 32]);
+    assert_ne!(
+        foreign_cut.journal_id(),
+        local_cut.journal_id(),
+        "fixture must model a foreign journal lineage"
+    );
+
+    request_v3_terminal_sync_toward(
+        &rt,
+        2,
+        StrictCatchupReason::HistoryElection,
+        Some(foreign_cut),
+    )
+    .await;
+
+    let replacement = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::TerminalSyncReq(request),
+                ..
+            } => Some(request),
+            _ => None,
+        })
+        .expect("the forced checkpoint must send a fresh terminal sync request");
+    assert_eq!(
+        replacement.expected_cursor, 0,
+        "the forced checkpoint must start from cursor zero after abandoning opposing work"
+    );
+    assert_eq!(
+        replacement.requester_terminal_set_digest.as_ref(),
+        rt.terminal_journal
+            .lock()
+            .await
+            .terminal_cut()
+            .terminal_set_digest(),
+        "the replacement must advertise the local (pre-checkpoint) terminal set"
+    );
 }
 
 #[tokio::test]

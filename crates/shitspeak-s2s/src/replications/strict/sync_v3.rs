@@ -673,16 +673,55 @@ impl SyncV3State {
             .or_else(|| self.durable_source_cuts.get(&peer.node).copied())
     }
 
+    /// Cancel every opposing transfer toward a peer that a ranked election has
+    /// selected as a foreign checkpoint source. A forced cursor-zero checkpoint
+    /// replaces the local journal lineage, so any transfer that still names the
+    /// old lineage (outbound client, inbound responder, final-ACK handshake, or
+    /// coalesced dirty intent) must not block the replacement.
+    pub(super) fn abandon_checkpoint_replacement_work(&mut self, peer: PeerIncarnation) {
+        if let Some(session) = self.clients.remove(&peer) {
+            record_ended_client(
+                session.started_reason,
+                StrictCatchupSessionOutcome::Cancelled,
+            );
+        }
+        if let Some(session) = self.finalizing_clients.remove(&peer) {
+            record_ended_client(
+                session.started_reason,
+                StrictCatchupSessionOutcome::Cancelled,
+            );
+        }
+        self.responders.remove(&peer);
+        self.deferred_clients.remove(&peer);
+        self.expired_deferred_clients.remove(&peer);
+        self.pending_collision_resumes.remove(&peer);
+        if let Some(wire) = self.sessions.get(&peer).and_then(SessionState::active_wire) {
+            // Expire the lifecycle wire so its retry identity is cancelled and
+            // the session becomes idle; the forced trigger then opens a fresh
+            // cursor-zero wire.
+            let _ = self.transition_session(
+                peer,
+                SessionEvent::TransferExpired {
+                    epoch: PeerEpoch::new(peer.boot_epoch),
+                    wire,
+                },
+            );
+        }
+        self.reset_terminal_baseline(peer);
+    }
+
     /// Discard a previously installed delta baseline when an elected source
-    /// must provide a complete foreign checkpoint image. This is only valid
-    /// before starting a new idle client for the same incarnation.
+    /// must provide a complete foreign checkpoint image. An active opposing
+    /// session toward the elected source is abandoned first: the ranked
+    /// election outranks steady-state repair, and the checkpoint replacement
+    /// is only safe once every transfer naming the old lineage has stopped.
     pub(super) fn force_checkpoint_from_zero(&mut self, peer: PeerIncarnation) -> bool {
         if self
             .sessions
             .get(&peer)
             .is_some_and(|session| !session.is_idle())
         {
-            return false;
+            self.abandon_checkpoint_replacement_work(peer);
         }
         self.reset_terminal_baseline(peer);
         true

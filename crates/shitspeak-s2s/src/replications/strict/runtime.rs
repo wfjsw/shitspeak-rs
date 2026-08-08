@@ -30,7 +30,7 @@ use super::super::metrics::{
     self, CatchupMode, CatchupPhase, CatchupReason, ReplicationPipelineKind,
     ReplicationPipelineStage, StrictAdmissionEvent, StrictCatchupBackpressureEvent,
     StrictCatchupLane, StrictCatchupSendOutcome, StrictCatchupSessionOutcome, StrictHeadEvent,
-    StrictHistoryElectionEvent,
+    StrictHistoryElectionEvent, StrictTerminalDivergenceEvent,
 };
 use super::super::proto::{
     self as repl_proto, REPLICATION_SERVICE_TAG, StrictAccept, StrictAcceptAck,
@@ -72,7 +72,7 @@ use super::{
     HistoryMetadata, StrictCommitApplyOutcome, StrictLogMetadata, StrictReplicable,
     StrictSnapshotError,
 };
-use crate::overlay::{LaneId, MembershipEvent, OverlayNetwork, OverlaySendOptions};
+use crate::overlay::{LaneId, MemberStatus, MembershipEvent, OverlayNetwork, OverlaySendOptions};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{MessageClass, OriginSignature, RoutingMetric, ServiceLevel};
 
@@ -1268,6 +1268,30 @@ pub(super) fn validate_v3_metadata_control(
     net.encoded_strict_payload_len(topic, body)
 }
 
+/// Reconcile one overlay member against the known strict participant set.
+///
+/// A graceful-leave tombstone is the only definitive removal signal the
+/// LSDB exposes. Members that merely become unreachable (Failed, or an
+/// LSA that has not refreshed) stay in the known set so a partitioned
+/// minority can never rotate the terminal journal alone.
+fn reconcile_known_participant(
+    known: &mut HashSet<NodeIdentifier>,
+    node_id: NodeIdentifier,
+    status: MemberStatus,
+    strict_enabled: bool,
+    protocol_version: u32,
+) {
+    if status == MemberStatus::Left {
+        known.remove(&node_id);
+        return;
+    }
+    if strict_enabled
+        && replication_protocol::strict_participant_version_supported(protocol_version)
+    {
+        known.insert(node_id);
+    }
+}
+
 #[async_trait]
 impl StrictNet for OverlayStrictNet {
     async fn send_unicast(
@@ -1428,22 +1452,14 @@ impl StrictNet for OverlayStrictNet {
     fn strict_participant_count(&self) -> usize {
         let mut known = self.known_participants.lock();
         for member in self.overlay.members().into_iter() {
-            if !member.status().is_reachable() {
-                // A graceful-leave tombstone is the only definitive removal
-                // signal the LSDB exposes. Members that merely become
-                // unreachable stay in the known set so a partitioned minority
-                // can never rotate the terminal journal alone.
-                known.remove(&member.node_id());
-                continue;
-            }
             let capabilities = Self::member_replication_capabilities(&member);
-            if capabilities.strict_enabled()
-                && replication_protocol::strict_participant_version_supported(
-                    capabilities.strict_participant_protocol_version(),
-                )
-            {
-                known.insert(member.node_id());
-            }
+            reconcile_known_participant(
+                &mut known,
+                member.node_id(),
+                member.status(),
+                capabilities.strict_enabled(),
+                capabilities.strict_participant_protocol_version(),
+            );
         }
         if self.local_replication_capabilities().strict_enabled() {
             known.insert(self.overlay.local_node_id());
@@ -3049,6 +3065,81 @@ impl StrictState {
         }
     }
 
+    /// Conclude an election whose probe watchdog fired before every pending
+    /// peer responded. The rank ordering is deterministic cluster-wide, so the
+    /// best responsive rank is the same winner any reachable peer would
+    /// select. A divergent node whose pending set includes a silently-down
+    /// member must recover toward the majority lineage instead of stalling
+    /// forever behind that member's missing reply.
+    ///
+    /// Returns a snapshot request the caller must send after releasing the
+    /// state lock, or `None` when no responsive rank may be installed.
+    pub fn conclude_stalled_history_election(&mut self) -> Option<HistoryElectionSnapshotRequest> {
+        let best_rank = match &mut self.history_election_phase {
+            HistoryElectionPhase::Probing {
+                best_remote_rank, ..
+            } => best_remote_rank.take(),
+            _ => return None,
+        };
+        let Some(best_rank) = best_rank else {
+            if self.repository_base_required() {
+                // The required repository base is still missing and no
+                // responsive peer can provide it. Keep the election armed so
+                // a healed or advanced route promotes a fresh attempt.
+                self.history_election_phase = HistoryElectionPhase::Idle;
+                self.history_election_requested = true;
+                metrics::record_strict_terminal_divergence_event(
+                    StrictTerminalDivergenceEvent::StalledElectionKeptArmed,
+                );
+                warn!(
+                    "strict stalled history election kept armed: required repository base still missing with no responsive rank"
+                );
+                return None;
+            }
+            self.finish_history_election();
+            metrics::record_strict_terminal_divergence_event(
+                StrictTerminalDivergenceEvent::StalledElectionNoCandidate,
+            );
+            warn!(
+                "strict stalled history election finished local: no responsive peer rank could displace the local lineage"
+            );
+            return None;
+        };
+        if self.repository_base_required()
+            && !self.repository_candidate_satisfies_requirement(best_rank)
+        {
+            self.history_election_phase = HistoryElectionPhase::Idle;
+            self.history_election_requested = true;
+            metrics::record_strict_terminal_divergence_event(
+                StrictTerminalDivergenceEvent::StalledElectionSourceUnsatisfied,
+            );
+            warn!(
+                peer = best_rank.node_id,
+                remote_version = best_rank.version,
+                remote_freshness = best_rank.freshness,
+                "strict stalled history election kept armed: best responsive rank cannot satisfy the required repository base"
+            );
+            return None;
+        }
+        let request = HistoryElectionSnapshotRequest::new(best_rank.node_id, best_rank);
+        self.history_election_phase = HistoryElectionPhase::FetchingSnapshot {
+            peer: request.peer(),
+            expected_rank: request.expected_rank(),
+            started_at: Instant::now(),
+        };
+        metrics::record_strict_history_election_event(StrictHistoryElectionEvent::RemoteWon);
+        metrics::record_strict_terminal_divergence_event(
+            StrictTerminalDivergenceEvent::StalledElectionRemoteWon,
+        );
+        warn!(
+            peer = best_rank.node_id,
+            remote_version = best_rank.version,
+            remote_freshness = best_rank.freshness,
+            "strict stalled history election recovered toward the best responsive rank"
+        );
+        Some(request)
+    }
+
     pub fn abandon_history_election_peer(
         &mut self,
         peer: NodeIdentifier,
@@ -3595,6 +3686,34 @@ struct HeadEvidenceIdentity {
     repository_version: u64,
     history_freshness: i64,
     terminal_set_digest: [u8; 32],
+    journal_id: Option<[u8; JOURNAL_ID_LEN]>,
+    generation: u64,
+}
+
+impl HeadEvidenceIdentity {
+    fn from_head(history_metadata: HistoryMetadata, terminal_cut: &TerminalCut) -> Self {
+        Self {
+            repository_version: history_metadata.version,
+            history_freshness: history_metadata.freshness,
+            terminal_set_digest: *terminal_cut.terminal_set_digest(),
+            journal_id: Some(*terminal_cut.journal_id()),
+            generation: terminal_cut.generation(),
+        }
+    }
+
+    /// Whether an ack-derived identity proves observation of this head.
+    /// A legacy ack that cannot echo the journal lineage still proves the
+    /// repository head (rolling compatibility); once the lineage is present
+    /// it must match exactly, so a same-digest divergent journal can never
+    /// satisfy the checkpoint quorum.
+    fn observes(&self, observed: &HeadEvidenceIdentity) -> bool {
+        self.repository_version == observed.repository_version
+            && self.history_freshness == observed.history_freshness
+            && self.terminal_set_digest == observed.terminal_set_digest
+            && observed.journal_id.is_none_or(|journal_id| {
+                self.journal_id == Some(journal_id) && self.generation == observed.generation
+            })
+    }
 }
 
 #[derive(Debug)]
@@ -4100,11 +4219,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let metadata = head.history_metadata;
         let current_cut = head.terminal_cut;
         drop(head);
-        let identity = HeadEvidenceIdentity {
-            repository_version: metadata.version,
-            history_freshness: metadata.freshness,
-            terminal_set_digest: *current_cut.terminal_set_digest(),
-        };
+        let identity = HeadEvidenceIdentity::from_head(metadata, &current_cut);
         if !self.head_evidence.lock().as_ref().is_some_and(|evidence| {
             evidence.identity == identity
                 && live_peers
@@ -4270,11 +4385,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let initial_history_metadata = repo.history_metadata();
         let initial_terminal_cut = journal.terminal_cut();
         let initial_head_evidence = LocalHeadEvidence {
-            identity: HeadEvidenceIdentity {
-                repository_version: initial_history_metadata.version,
-                history_freshness: initial_history_metadata.freshness,
-                terminal_set_digest: *initial_terminal_cut.terminal_set_digest(),
-            },
+            identity: HeadEvidenceIdentity::from_head(
+                initial_history_metadata,
+                &initial_terminal_cut,
+            ),
             acknowledged_by: HashSet::new(),
             retries: HashMap::new(),
         };
@@ -4583,12 +4697,28 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if futile {
             let remembered = self.last_foreign_checkpoint_election.lock();
             if *remembered == Some(lineage) {
+                metrics::record_strict_terminal_divergence_event(
+                    StrictTerminalDivergenceEvent::ForeignLineageElectionDeduped,
+                );
                 return false;
             }
         }
         let requested = self.request_global_history_election();
         if requested && futile {
             *self.last_foreign_checkpoint_election.lock() = Some(lineage);
+        }
+        if requested {
+            metrics::record_strict_terminal_divergence_event(
+                StrictTerminalDivergenceEvent::ForeignLineageElectionRequested,
+            );
+            warn!(
+                topic = %self.topic,
+                peer = remote_rank.node_id,
+                remote_version = remote_rank.version,
+                remote_freshness = remote_rank.freshness,
+                lineage = ?lineage,
+                "strict foreign terminal lineage promoted a cluster-wide history election"
+            );
         }
         requested
     }
@@ -10240,16 +10370,101 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         true
     }
 
+    /// Start a ranked history election when a clock tick advertises a
+    /// terminal lineage foreign to the local journal.
+    ///
+    /// A partitioned minority that rotated its own journal mints a fresh
+    /// lineage whose journal id and set digest differ from the majority.
+    /// Version/freshness alone cannot detect this divergence: both sides
+    /// agree on the repository head. Only the lower-ranked side requests the
+    /// election, so the divergent node pulls the majority's elected
+    /// checkpoint instead of the majority adopting the minority's stale
+    /// lineage through per-operation terminal sync.
+    fn request_history_election_for_terminal_divergence(
+        &self,
+        from: NodeIdentifier,
+        origin_boot_epoch: u64,
+        tick: &StrictClockTick,
+    ) -> bool {
+        if node_from_u32(tick.src_node) != Some(from)
+            || !self.head_evidence_supported_by(from)
+            || self.net.member_boot_epoch(from) != Some(origin_boot_epoch)
+        {
+            return false;
+        }
+        let Some(remote_cut) = tick.terminal_cut.as_ref().and_then(cut_from_wire) else {
+            return false;
+        };
+        let local = self.repo.history_metadata();
+        if tick.repository_version != local.version || tick.history_freshness != local.freshness {
+            // Both sides must already agree on the repository head. A version
+            // or freshness gap is detected and repaired by the existing
+            // rank-divergence and repository-gap paths; firing here would
+            // start an election for an ordinary ahead peer and wipe its
+            // admitted clock evidence.
+            return false;
+        }
+        let suppressed_event = {
+            let Ok(journal) = self.terminal_journal.try_lock() else {
+                return false;
+            };
+            let local_cut = journal.terminal_cut();
+            if local_cut.journal_id() == remote_cut.journal_id()
+                || local_cut.terminal_set_digest() == remote_cut.terminal_set_digest()
+            {
+                // Same lineage, or an equal terminal set within it: the
+                // existing repair and admission paths cover this. Only a
+                // truly foreign lineage needs a ranked election to reconcile.
+                Some(StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedSameLineage)
+            } else if remote_cut.generation() < local_cut.generation() {
+                // A peer that shares this journal's record history lags by a
+                // generation. Its advertised prefix cut authenticates to the
+                // same terminal-set digest as the local journal's cut at that
+                // generation. Transient generation skew like this is repaired
+                // by the normal admission paths and must not start a pull
+                // election that wipes the peer's admitted clock evidence.
+                journal
+                    .terminal_cut_at(remote_cut.generation())
+                    .is_some_and(|historical| {
+                        historical.terminal_set_digest() == remote_cut.terminal_set_digest()
+                    })
+                    .then_some(
+                        StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedLaggingGeneration,
+                    )
+            } else {
+                None
+            }
+        };
+        if let Some(event) = suppressed_event {
+            metrics::record_strict_terminal_divergence_event(event);
+            return false;
+        }
+        let remote_rank = HistoryRank {
+            version: tick.repository_version,
+            freshness: tick.history_freshness,
+            runtime_started_at: origin_boot_epoch,
+            node_id: from,
+            terminal_repository_base_version: 0,
+        };
+        let local_rank = HistoryRank::local(self);
+        if !remote_rank.beats(local_rank) && !self.repository_base_required() {
+            metrics::record_strict_terminal_divergence_event(
+                StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedBehindPeer,
+            );
+            // A behind or equal peer cannot displace the local lineage; it
+            // recovers toward the majority through its own tick-receive
+            // view of this node's higher-ranked lineage.
+            return false;
+        }
+        self.request_foreign_checkpoint_election(remote_rank, remote_cut)
+    }
+
     fn remember_advertised_head(
         &self,
         history_metadata: HistoryMetadata,
         terminal_cut: TerminalCut,
     ) {
-        let identity = HeadEvidenceIdentity {
-            repository_version: history_metadata.version,
-            history_freshness: history_metadata.freshness,
-            terminal_set_digest: *terminal_cut.terminal_set_digest(),
-        };
+        let identity = HeadEvidenceIdentity::from_head(history_metadata, &terminal_cut);
         {
             let mut evidence = self.head_evidence.lock();
             if evidence
@@ -10271,6 +10486,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             repository_version = identity.repository_version,
             history_freshness = identity.history_freshness,
             terminal_set_digest = ?identity.terminal_set_digest,
+            journal_id = ?identity.journal_id,
+            generation = identity.generation,
             "strict local head evidence changed"
         );
     }
@@ -10290,11 +10507,13 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let Some(remote_cut) = tick.terminal_cut.as_ref().and_then(cut_from_wire) else {
             return None;
         };
-        let remote_identity = HeadEvidenceIdentity {
-            repository_version: tick.repository_version,
-            history_freshness: tick.history_freshness,
-            terminal_set_digest: *remote_cut.terminal_set_digest(),
-        };
+        let remote_identity = HeadEvidenceIdentity::from_head(
+            HistoryMetadata {
+                version: tick.repository_version,
+                freshness: tick.history_freshness,
+            },
+            &remote_cut,
+        );
         let local_identity = self
             .head_evidence
             .lock()
@@ -10318,6 +10537,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }) {
                 metrics::record_strict_head_event(StrictHeadEvent::EvidenceTerminalDigestMismatch);
             }
+            if local_identity.is_none_or(|local| {
+                local.journal_id != remote_identity.journal_id
+                    || local.generation != remote_identity.generation
+            }) {
+                metrics::record_strict_head_event(StrictHeadEvent::EvidenceJournalLineageMismatch);
+            }
             let changed = self
                 .head_mismatch_observations
                 .lock()
@@ -10331,9 +10556,13 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     local_repository_version = ?local_identity.map(|local| local.repository_version),
                     local_history_freshness = ?local_identity.map(|local| local.history_freshness),
                     local_terminal_set_digest = ?local_identity.map(|local| local.terminal_set_digest),
+                    local_journal_id = ?local_identity.and_then(|local| local.journal_id),
+                    local_generation = ?local_identity.map(|local| local.generation),
                     remote_repository_version = remote_identity.repository_version,
                     remote_history_freshness = remote_identity.history_freshness,
                     remote_terminal_set_digest = ?remote_identity.terminal_set_digest,
+                    remote_journal_id = ?remote_identity.journal_id,
+                    remote_generation = remote_identity.generation,
                     "strict head evidence mismatch"
                 );
             }
@@ -10348,6 +10577,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             repository_version: remote_identity.repository_version,
             terminal_set_digest: Bytes::copy_from_slice(&remote_identity.terminal_set_digest),
             history_freshness: remote_identity.history_freshness,
+            journal_id: remote_identity
+                .journal_id
+                .map(|id| Bytes::copy_from_slice(&id))
+                .unwrap_or_default(),
+            generation: remote_identity.generation,
         })
     }
 
@@ -10387,16 +10621,21 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             );
             return;
         };
+        let journal_id = (!ack.journal_id.is_empty())
+            .then(|| <[u8; JOURNAL_ID_LEN]>::try_from(ack.journal_id.as_ref()).ok())
+            .flatten();
         let identity = HeadEvidenceIdentity {
             repository_version: ack.repository_version,
             history_freshness: ack.history_freshness,
             terminal_set_digest,
+            journal_id,
+            generation: ack.generation,
         };
         let peer = PeerIncarnation::new(from, origin_boot_epoch);
         let (identity_matches, inserted) = {
             let mut evidence = self.head_evidence.lock();
             match evidence.as_mut() {
-                Some(current) if current.identity == identity => {
+                Some(current) if current.identity.observes(&identity) => {
                     current.retries.remove(&peer);
                     (true, current.acknowledged_by.insert(peer))
                 }
@@ -10412,6 +10651,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 repository_version = identity.repository_version,
                 history_freshness = identity.history_freshness,
                 terminal_set_digest = ?identity.terminal_set_digest,
+                journal_id = ?identity.journal_id,
+                generation = identity.generation,
                 rejection = "identity",
                 "strict head acknowledgement rejected"
             );
@@ -11435,13 +11676,18 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                     origin_boot_epoch,
                     &t,
                 );
+                let foreign_checkpoint_election = self
+                    .request_history_election_for_terminal_divergence(from, origin_boot_epoch, &t);
                 // A clock tick is a delivery watermark only after its
                 // advertised terminal cut has been synchronized. Otherwise a
                 // reordered tick could release a later buffered commit before
                 // the earlier terminal decision arrives.
                 let delivery_fenced =
                     history_probe.is_some() && t.repository_version > self.repo.current_version();
-                if (head_ack.is_some() || history_probe.is_some() || history_election)
+                if (head_ack.is_some()
+                    || history_probe.is_some()
+                    || history_election
+                    || foreign_checkpoint_election)
                     && let Some(weak) = self.weak_self.lock().clone()
                 {
                     tokio::spawn(async move {
@@ -11465,7 +11711,7 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                                 )
                                 .await;
                             }
-                            if history_election {
+                            if history_election || foreign_checkpoint_election {
                                 runtime.try_bootstrap_catchup().await;
                             }
                         }
@@ -12909,7 +13155,7 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
             let (should_probe, snapshot_request, history_membership_expanded, election_timed_out) = {
                 let mut state = rt.state.lock();
                 let expanded = state.observe_history_alive_peers(peers.iter().copied());
-                let snapshot_request =
+                let mut snapshot_request =
                     state.reconcile_history_election_reachability(peers.iter().copied());
                 let election_timed_out = state.history_election_timed_out(
                     Instant::now(),
@@ -12925,12 +13171,17 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
                         "strict history election timed out"
                     );
                     // A probe may be accepted by the transport while its
-                    // response is lost on a transient route. Re-arming the
-                    // request in the same loop would keep every node in an
-                    // election forever. Close this attempt and let normal
-                    // anti-entropy (or a later membership/divergence event)
-                    // schedule another one.
-                    state.finish_history_election();
+                    // response is lost on a transient route. Close this
+                    // attempt with the best responsive rank (the deterministic
+                    // cluster-wide winner) so a divergent node recovers toward
+                    // the majority lineage even when a silently-down peer kept
+                    // the pending set non-empty. Only when no responsive rank
+                    // is usable does the attempt end without a snapshot fetch.
+                    snapshot_request =
+                        snapshot_request.or_else(|| state.conclude_stalled_history_election());
+                    if snapshot_request.is_none() {
+                        state.finish_history_election();
+                    }
                 }
                 (
                     state.can_start_history_election(),
@@ -17413,6 +17664,99 @@ mod tests {
     }
 
     #[test]
+    fn stalled_history_election_concludes_with_the_best_responsive_rank() {
+        let mut state = StrictState::new();
+        state.begin_history_election([2, 3]);
+        let local_rank = HistoryRank {
+            version: 8,
+            freshness: 0,
+            runtime_started_at: 100,
+            node_id: 1,
+            terminal_repository_base_version: 0,
+        };
+        let rank_from_2 = HistoryRank {
+            version: 9,
+            freshness: 10,
+            runtime_started_at: 20,
+            node_id: 2,
+            terminal_repository_base_version: 0,
+        };
+        // Peer 2 responds; peer 3 stays silent yet remains reachable in the
+        // membership view, so reachability reconciliation cannot prune it and
+        // the pending set never empties (production: a divergent node probes a
+        // silently-down member while the majority answers).
+        assert_eq!(
+            state.record_history_probe_response(2, rank_from_2, local_rank),
+            HistoryProbeResponseOutcome::Pending
+        );
+        assert!(
+            state
+                .reconcile_history_election_reachability([2, 3])
+                .is_none()
+        );
+
+        // The probe watchdog fires. The stalled election must conclude with
+        // the best responsive rank (the deterministic cluster-wide winner)
+        // instead of finishing with the local lineage and stranding the
+        // divergent node forever.
+        let request = state
+            .conclude_stalled_history_election()
+            .expect("responsive winner must be fetched");
+        assert_eq!(request.peer(), 2);
+        assert_eq!(request.expected_rank(), rank_from_2);
+        assert!(state.history_election_active());
+        assert!(!state.can_start_history_election());
+    }
+
+    #[test]
+    fn stalled_history_election_without_a_responsive_winner_finishes_local() {
+        let mut state = StrictState::new();
+        state.begin_history_election([2, 3]);
+        assert!(
+            state
+                .reconcile_history_election_reachability([2, 3])
+                .is_none()
+        );
+        assert!(state.conclude_stalled_history_election().is_none());
+        assert!(!state.history_election_pending());
+        assert!(!state.history_election_active());
+    }
+
+    #[test]
+    fn stalled_history_election_fetches_authorized_source_when_repository_base_required() {
+        let mut state = StrictState::new();
+        state.require_repository_base(9);
+        state.begin_history_election([2, 3]);
+        let local_rank = HistoryRank {
+            version: 8,
+            freshness: 0,
+            runtime_started_at: 100,
+            node_id: 1,
+            terminal_repository_base_version: 0,
+        };
+        let authorized_rank = HistoryRank {
+            version: 9,
+            freshness: 5,
+            runtime_started_at: 20,
+            node_id: 2,
+            terminal_repository_base_version: 0,
+        };
+        assert_eq!(
+            state.record_history_probe_response_with_source_authorization(
+                2,
+                authorized_rank,
+                local_rank,
+                true,
+            ),
+            HistoryProbeResponseOutcome::Pending
+        );
+        let request = state
+            .conclude_stalled_history_election()
+            .expect("authorized repository source must be fetched");
+        assert_eq!(request.peer(), 2);
+    }
+
+    #[test]
     fn history_election_rearms_when_its_snapshot_source_loses_reachability() {
         let mut state = StrictState::new();
         state.begin_history_election([2]);
@@ -20090,6 +20434,8 @@ mod tests {
                 repository_version,
                 terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
                 history_freshness: 0,
+                journal_id: Bytes::copy_from_slice(cut.journal_id()),
+                generation: cut.generation(),
             },
         );
         assert!(rt.unacknowledged_head_peers().is_empty());
@@ -20262,6 +20608,8 @@ mod tests {
                 repository_version: metadata.version,
                 terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
                 history_freshness: metadata.freshness,
+                journal_id: Bytes::copy_from_slice(cut.journal_id()),
+                generation: cut.generation(),
             },
         );
         assert!(rt.unacknowledged_head_peers().is_empty());
@@ -20350,6 +20698,8 @@ mod tests {
                 repository_version,
                 terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
                 history_freshness: 0,
+                journal_id: Bytes::copy_from_slice(cut.journal_id()),
+                generation: cut.generation(),
             }),
         )
         .await;
@@ -20437,6 +20787,8 @@ mod tests {
                 repository_version: repository_version.saturating_add(1),
                 terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
                 history_freshness: 0,
+                journal_id: Bytes::copy_from_slice(cut.journal_id()),
+                generation: cut.generation(),
             },
         );
         assert!(!rt.unacknowledged_head_peers().is_empty());
@@ -20506,10 +20858,56 @@ mod tests {
                 repository_version: metadata.version,
                 terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
                 history_freshness: 8,
+                journal_id: Bytes::copy_from_slice(cut.journal_id()),
+                generation: cut.generation(),
             },
         );
 
         assert!(!rt.unacknowledged_head_peers().is_empty());
+        assert!(!rt.clock_tick_needed());
+    }
+
+    #[tokio::test]
+    async fn foreign_journal_lineage_does_not_acknowledge_local_evidence() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        rt.state.lock().peer_clocks.insert(2, 1);
+        let cut = rt.terminal_journal.lock().await.terminal_cut();
+        let metadata = rt.repo.history_metadata();
+        rt.remember_advertised_head(metadata, cut);
+
+        // Identical repository version, freshness, and terminal-set digest,
+        // but a journal lineage this node never observed. The pre-fix head
+        // identity ignored the journal, so this divergent ack would have
+        // satisfied the checkpoint quorum and let a partitioned minority
+        // rotate the terminal journal against the majority.
+        let foreign_cut = TerminalCut::new(
+            [0xEE; JOURNAL_ID_LEN],
+            cut.generation(),
+            [0xDD; DIGEST_LEN],
+            *cut.terminal_set_digest(),
+        );
+        rt.recv_head_ack(
+            2,
+            1,
+            StrictHeadAck {
+                src_node: 2,
+                src_boot_epoch: 1,
+                expected_target_node: 1,
+                expected_target_boot_epoch: 1,
+                repository_version: metadata.version,
+                terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
+                history_freshness: metadata.freshness,
+                journal_id: Bytes::copy_from_slice(foreign_cut.journal_id()),
+                generation: foreign_cut.generation(),
+            },
+        );
+        assert!(
+            !rt.unacknowledged_head_peers().is_empty(),
+            "a foreign-lineage acknowledgement must not acknowledge the local head"
+        );
         assert!(!rt.clock_tick_needed());
     }
 
@@ -20569,6 +20967,134 @@ mod tests {
         assert!(
             rt.request_history_election_for_clock_rank_divergence(2, 1, &tick),
             "divergence must request another election after the active one finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_divergence_tick_starts_election_only_from_the_rank_behind_side() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        let metadata = rt.repo.history_metadata();
+        let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+        // A partitioned minority checkpoint mints a fresh journal id at
+        // generation zero with an empty chain digest and its own terminal-set
+        // digest. That is the exact wire-valid foreign lineage that the
+        // version/freshness rank comparison cannot detect.
+        let foreign_cut = TerminalCut::new(
+            [0xEE; JOURNAL_ID_LEN],
+            0,
+            [0; DIGEST_LEN],
+            [0xCC; DIGEST_LEN],
+        );
+        assert_ne!(
+            foreign_cut.journal_id(),
+            local_cut.journal_id(),
+            "fixture must model a fresh divergent lineage"
+        );
+        assert_ne!(
+            foreign_cut.terminal_set_digest(),
+            local_cut.terminal_set_digest(),
+            "fixture must model a divergent terminal set"
+        );
+        let foreign_tick = |freshness| StrictClockTick {
+            src_node: 2,
+            repository_version: metadata.version,
+            history_freshness: freshness,
+            terminal_cut: Some(cut_to_wire(foreign_cut)),
+            ..Default::default()
+        };
+        // Majority side: peer 2 shares the repository head but its foreign
+        // lineage is not ahead (equal rank, node 1 wins the tiebreak). The
+        // majority must neither adopt the stale lineage nor start a pull
+        // election; the rank-behind peer recovers on its own side.
+        assert!(
+            !rt.request_history_election_for_terminal_divergence(
+                2,
+                1,
+                &foreign_tick(metadata.freshness),
+            ),
+            "a rank-behind foreign lineage must not make the majority request an election"
+        );
+        assert!(
+            !rt.state.lock().history_election_blocks_steady_state(),
+            "an equal-rank foreign lineage must not disturb the majority"
+        );
+        // An ordinary version gap must stay on the existing repair paths and
+        // never start a terminal-divergence election that wipes admitted
+        // peer clocks.
+        assert!(
+            !rt.request_history_election_for_terminal_divergence(
+                2,
+                1,
+                &foreign_tick(metadata.freshness.saturating_add(1)),
+            ),
+            "a freshness gap must be handled by the existing rank-divergence path"
+        );
+        assert!(
+            !rt.state.lock().history_election_blocks_steady_state(),
+            "a freshness gap must not start a terminal-divergence election"
+        );
+        // A peer that shares the local journal's record history but lags by
+        // a generation advertises a prefix cut: its journal id differs, yet
+        // its terminal-set digest matches the local journal's authenticated
+        // cut at the peer's generation. That is transient generation skew
+        // inside a converging history and must not start an election, even
+        // when the peer's boot rank is ahead.
+        rt.terminal_journal
+            .lock()
+            .await
+            .upsert_abort_decision((1, 1), 1)
+            .expect("fixture terminal decision must apply");
+        let prefix_cut = rt
+            .terminal_journal
+            .lock()
+            .await
+            .terminal_cut_at(0)
+            .expect("the fixture journal must retain generation zero");
+        let lagging_prefix_cut = TerminalCut::new(
+            [0xDD; JOURNAL_ID_LEN],
+            0,
+            [0; DIGEST_LEN],
+            *prefix_cut.terminal_set_digest(),
+        );
+        assert_ne!(
+            lagging_prefix_cut.journal_id(),
+            rt.terminal_journal.lock().await.terminal_cut().journal_id(),
+            "fixture must model a peer journal id distinct from the local lineage"
+        );
+        let lagging_tick = StrictClockTick {
+            src_node: 2,
+            repository_version: metadata.version,
+            history_freshness: metadata.freshness,
+            terminal_cut: Some(cut_to_wire(lagging_prefix_cut)),
+            ..Default::default()
+        };
+        // Minority side: the majority tick sender booted earlier, so its rank
+        // is ahead even with an equal repository head. The divergent node
+        // must request the ranked pull election that stages the majority's
+        // elected checkpoint.
+        net.set_epoch(2, 0);
+        assert!(
+            !rt.request_history_election_for_terminal_divergence(2, 0, &lagging_tick),
+            "a lagging prefix of the local record history must not start an election"
+        );
+        assert!(
+            !rt.state.lock().history_election_blocks_steady_state(),
+            "generation skew inside a shared history must not disturb steady state"
+        );
+        assert!(
+            rt.request_history_election_for_terminal_divergence(
+                2,
+                0,
+                &foreign_tick(metadata.freshness),
+            ),
+            "an ahead foreign lineage must trigger the ranked pull election"
+        );
+        assert!(
+            rt.state.lock().history_election_blocks_steady_state(),
+            "the divergent minority must request the election"
         );
     }
 
@@ -20764,16 +21290,31 @@ mod tests {
         .await;
 
         let captures = net.drain_captures();
-        assert!(captures.iter().any(|frame| {
-            matches!(
-                frame,
-                CapturedFrame::StrictUnicast {
-                    dst: 2,
-                    body: StrictBody::TerminalSyncReq(_),
-                    ..
-                }
-            )
-        }));
+        // The peer's lower-version foreign lineage is one complete divergent
+        // history. Even while an election overlaps, the majority must not
+        // adopt it through per-operation terminal sync (the wrong-direction
+        // catchup flood): a behind peer recovers toward the majority through
+        // its own tick-receive view.
+        assert!(
+            !captures.iter().any(|frame| {
+                matches!(
+                    frame,
+                    CapturedFrame::StrictUnicast {
+                        dst: 2,
+                        body: StrictBody::TerminalSyncReq(_),
+                        ..
+                    }
+                )
+            }),
+            "a lower-version foreign lineage must never be terminal-synced toward"
+        );
+        assert!(
+            rt.v3_sync
+                .lock()
+                .known_source_cut(PeerIncarnation::new(2, 1))
+                .is_none_or(|known| known.journal_id() != remote_cut.journal_id()),
+            "the foreign lineage must not be remembered as a locally known source cut"
+        );
         assert!(
             captures.iter().all(|frame| !matches!(
                 frame,
@@ -20897,6 +21438,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reconcile_known_participant_keeps_failed_members_and_removes_only_left_tombstones() {
+        let mut known: HashSet<NodeIdentifier> = [1, 2, 3].into_iter().collect();
+        // A partitioned minority ages the majority out of its local LSDB as
+        // Failed. Keeping Failed members in the known set is what preserves
+        // the fast quorum, so a lone reachable peer can never rotate the
+        // terminal journal alone.
+        reconcile_known_participant(
+            &mut known,
+            2,
+            MemberStatus::Failed,
+            true,
+            STRICT_PROTOCOL_VERSION_V4,
+        );
+        assert!(
+            known.contains(&2),
+            "Failed members must stay in the known participant set"
+        );
+        reconcile_known_participant(
+            &mut known,
+            3,
+            MemberStatus::Alive,
+            true,
+            STRICT_PROTOCOL_VERSION_V4,
+        );
+        assert!(
+            known.contains(&3),
+            "Alive strict members must stay in the known participant set"
+        );
+        // A graceful-leave tombstone is the only definitive removal signal.
+        reconcile_known_participant(
+            &mut known,
+            1,
+            MemberStatus::Left,
+            true,
+            STRICT_PROTOCOL_VERSION_V4,
+        );
+        assert!(
+            !known.contains(&1),
+            "a Left tombstone must remove the member from the known set"
+        );
+        // Deprecated or strict-disabled members are never admitted.
+        reconcile_known_participant(&mut known, 4, MemberStatus::Alive, true, 0);
+        assert!(
+            !known.contains(&4),
+            "a deprecated protocol must not enlarge the known set"
+        );
+        reconcile_known_participant(
+            &mut known,
+            5,
+            MemberStatus::Alive,
+            false,
+            STRICT_PROTOCOL_VERSION_V4,
+        );
+        assert!(
+            !known.contains(&5),
+            "a strict-disabled member must not enlarge the known set"
+        );
+    }
+
     #[tokio::test]
     async fn restarted_peer_must_acknowledge_head_as_new_incarnation() {
         let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
@@ -20914,6 +21515,8 @@ mod tests {
             repository_version,
             terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
             history_freshness: 0,
+            journal_id: Bytes::copy_from_slice(cut.journal_id()),
+            generation: cut.generation(),
         };
         rt.remember_advertised_head(rt.repo.history_metadata(), cut);
         rt.recv_head_ack(2, 1, ack(1));
@@ -21020,6 +21623,8 @@ mod tests {
                 repository_version: metadata.version,
                 terminal_set_digest: Bytes::copy_from_slice(cut.terminal_set_digest()),
                 history_freshness: metadata.freshness,
+                journal_id: Bytes::copy_from_slice(cut.journal_id()),
+                generation: cut.generation(),
             },
         );
         assert!(
