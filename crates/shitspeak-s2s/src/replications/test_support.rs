@@ -126,6 +126,11 @@ pub struct MockNet {
     bulk_send_outcomes: Mutex<VecDeque<MockBulkSendOutcome>>,
     pub edge_rtts: Mutex<Vec<Duration>>,
     route_rtts: Mutex<std::collections::HashMap<NodeIdentifier, Duration>>,
+    /// Known strict replication participants (including currently unreachable
+    /// members). None derives the participant count from the alive set plus
+    /// the local node, preserving the legacy behavior where every live peer
+    /// must acknowledge the head before rotation.
+    strict_participants: Mutex<Option<Vec<NodeIdentifier>>>,
 }
 
 impl MockNet {
@@ -151,7 +156,12 @@ impl MockNet {
             bulk_send_outcomes: Mutex::new(VecDeque::new()),
             edge_rtts: Mutex::new(Vec::new()),
             route_rtts: Mutex::new(Default::default()),
+            strict_participants: Mutex::new(None),
         })
+    }
+
+    pub fn set_strict_participants(&self, participants: impl IntoIterator<Item = NodeIdentifier>) {
+        *self.strict_participants.lock() = Some(participants.into_iter().collect());
     }
 
     pub fn set_edge_rtts(&self, rtts: Vec<Duration>) {
@@ -484,6 +494,15 @@ impl StrictNet for MockNet {
 
     fn alive_members(&self) -> Vec<NodeIdentifier> {
         self.alive.lock().clone()
+    }
+
+    fn strict_participant_count(&self) -> usize {
+        if let Some(participants) = self.strict_participants.lock().as_ref() {
+            return participants.len();
+        }
+        let mut participants: HashSet<_> = self.alive.lock().iter().copied().collect();
+        participants.insert(self.self_id);
+        participants.len()
     }
 
     fn member_boot_epoch(&self, node: NodeIdentifier) -> Option<u64> {

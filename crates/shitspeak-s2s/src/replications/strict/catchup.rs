@@ -1254,14 +1254,17 @@ async fn respond_with_snapshot_transfer<R: StrictReplicable>(
                 return;
             }
         };
-    // A V3 transfer's elected repository target is immutable. A V7 terminal
-    // cut does not prove that the receiver staged its matching terminal
-    // checkpoint, so a later image could leave its terminal journal behind.
-    if req
-        .history_transfer
-        .as_ref()
-        .is_some_and(|correlation| correlation.target_version != transfer.version)
-    {
+    // A V3 transfer's elected repository target is immutable for legacy
+    // formats. A V7 bound-envelope image carries the full terminal cut, so a
+    // later repository version on the same terminal lineage is safe: the
+    // receiver stages its checkpoint against the envelope terminal cut and
+    // the terminal fence check below still guards a changed cut.
+    let immutable_target_invalid = transfer.terminal_cut.is_none()
+        && req
+            .history_transfer
+            .as_ref()
+            .is_some_and(|correlation| correlation.target_version != transfer.version);
+    if immutable_target_invalid {
         {
             let mut transfers = rt.snapshot_transfers.lock();
             if transfers
@@ -9331,8 +9334,291 @@ mod tests {
         );
     }
 
+    /// Production regression: node 4 (eu.mumble.winterco.cn) ran a history
+    /// election against the cluster (gen 4103) while its own strict terminal
+    /// journal was divergent (gen 7, five retired origins) and had already
+    /// retired the cluster's current op range. Every elected terminal sync
+    /// failed 140/140 with "strict terminal commit rejected by durable journal
+    /// ... is retired by checkpoint". The elected source advanced its cut
+    /// between the probe (which deferred the elected source_cut) and the
+    /// checkpoint page render. The page is now staged as a wholesale journal
+    /// replacement even when the deferred cut is slightly behind the page
+    /// target (see exact_elected_checkpoint_stages_when_source_advanced_over_retired_floor),
+    /// but the repository replacement then rearmed forever because
+    /// bind_staged_checkpoint_to_repository required the staged cut to equal
+    /// the deferred probe cut exactly. The staged checkpoint is still the
+    /// exact elected replacement for the deferred intent, so binding must
+    /// accept a staged target that covers the deferred cut on the same
+    /// lineage, and the elected snapshot must install the source lineage over
+    /// the divergent journal.
     #[tokio::test]
-    async fn v7_bound_snapshot_past_elected_target_is_rejected() {
+    async fn elected_checkpoint_snapshot_completes_when_source_advanced_over_retired_floor() {
+        let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
+        let (source, source_net, source_repo) = test_runtime(1, config.clone());
+        let (sink, sink_net, sink_repo) = test_runtime(2, config);
+        configure_v7_peer(&source_net, 1, 2);
+        configure_v7_peer(&sink_net, 2, 1);
+        populate_repo(&source_repo, 1, 10);
+        populate_repo(&sink_repo, 1, 20);
+
+        // The source applies a first op; the sink's election probe captures
+        // that cut as the elected source obligation.
+        let source_op_1 = make_op_id(1, 1, 1);
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(source_op_1))
+                .await
+        );
+        let deferred_cut = source.terminal_journal.lock().await.terminal_cut();
+
+        // The sink's divergent journal has a retired-origin floor covering the
+        // source's live op (the production divergence: node 4 retired the
+        // cluster's live op range).
+        let source_op_2 = make_op_id(1, 1, 2);
+        let retired_floor = make_op_id(1, 30, 1);
+        {
+            let mut journal = sink.terminal_journal.lock().await;
+            journal
+                .upsert_abort_decision(retired_floor, 2)
+                .expect("retirement floor decision");
+            journal.checkpoint(0).expect("retirement checkpoint");
+            assert!(journal.is_retired(source_op_2));
+            assert_ne!(
+                journal.terminal_cut().journal_id(),
+                deferred_cut.journal_id(),
+                "the sink must be on a divergent journal lineage"
+            );
+        }
+
+        // The sink runs the real election probe against node 1. The probe
+        // response defers the exact elected intent at the cut observed at
+        // probe time (deferred_cut) and transitions the election into
+        // FetchingSnapshot, exactly as in production.
+        let peer = PeerIncarnation::new(1, 1);
+        {
+            let mut state = sink.state.lock();
+            state.request_history_election();
+            state.begin_history_election([source.self_id]);
+        }
+        super::request_v3_history_probe(
+            &sink,
+            source.self_id,
+            super::StrictCatchupReason::HistoryElection,
+        )
+        .await;
+        let probe_request = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::HistoryProbeReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("history election request");
+        super::recv_v3_history_probe_req(&source, sink.self_id, 1, probe_request).await;
+        let probe_response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::HistoryProbeResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("history election response");
+        let probed_cut = super::cut_from_wire(
+            probe_response
+                .terminal_cut
+                .as_ref()
+                .expect("probe terminal cut"),
+        )
+        .expect("valid probe cut");
+        assert_eq!(
+            probed_cut, deferred_cut,
+            "the probe must capture the source cut before it advances"
+        );
+        super::recv_v3_history_probe_resp(&sink, source.self_id, 1, probe_response).await;
+
+        // The source advances its journal before rendering the elected
+        // checkpoint page (production: the elected source committed more
+        // decisions between the probe and the checkpoint render).
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(source_op_2))
+                .await
+        );
+        let advanced_cut = source.terminal_journal.lock().await.terminal_cut();
+        assert_ne!(deferred_cut, advanced_cut);
+
+        let rank = sink
+            .v3_history
+            .lock()
+            .pending_after_terminal(peer)
+            .expect("deferred elected terminal intent")
+            .rank();
+        let request = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::TerminalSyncReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("elected terminal sync request");
+        super::recv_v3_terminal_sync_req(&source, 2, 1, request).await;
+        let page = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::TerminalSyncPage(page),
+                    ..
+                } => Some(page),
+                _ => None,
+            })
+            .expect("elected checkpoint page");
+        assert_eq!(
+            super::StrictTerminalPageKind::try_from(page.kind).ok(),
+            Some(super::StrictTerminalPageKind::Checkpoint)
+        );
+        assert_eq!(
+            page.target_cut.as_ref().and_then(super::cut_from_wire),
+            Some(advanced_cut),
+            "the responder must render the checkpoint at its current (advanced) cut"
+        );
+
+        // The elected checkpoint must be staged and acknowledged, not applied
+        // per-op (which would reject the locally-retired op and fail forever).
+        super::recv_v3_terminal_sync_page(&sink, 1, 1, page).await;
+        let ack = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::TerminalSyncAck(ack),
+                    ..
+                } => Some(ack),
+                _ => None,
+            })
+            .expect("terminal checkpoint ack");
+        super::recv_v3_terminal_sync_ack(&source, 2, 1, ack).await;
+        let confirmation = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::TerminalSyncAck(ack),
+                    ..
+                } => Some(ack),
+                _ => None,
+            })
+            .expect("terminal checkpoint confirmation");
+        super::recv_v3_terminal_sync_ack(&sink, 1, 1, confirmation).await;
+
+        // The staged checkpoint is bound to the repository replacement even
+        // though its target (advanced) is ahead of the deferred probe cut.
+        assert!(
+            sink.v3_sync
+                .lock()
+                .staged_checkpoint_for_repository(peer, rank.version)
+                .is_some(),
+            "the elected checkpoint must be bound to the repository image when the source advanced"
+        );
+
+        let history_request = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::CatchupReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("elected checkpoint must request the repository snapshot, not rearm");
+        assert!(history_request.force_snapshot);
+        assert_eq!(
+            history_request.chunk_token,
+            super::HISTORY_ELECTION_SNAPSHOT_TOKEN
+        );
+
+        // Drive the snapshot: the source serves the V7 envelope bound to its
+        // advanced cut; the sink installs it as a wholesale journal
+        // replacement, clearing its stale retired-origin floor.
+        respond_to_request(&source, 2, history_request).await;
+        let history_response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::CatchupResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("forced snapshot response");
+        assert!(history_response.too_old_use_snapshot);
+        apply_response(&sink, 1, history_response).await;
+
+        let final_ack = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::CatchupReq(request),
+                    ..
+                } if request
+                    .history_transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.final_ack) =>
+                {
+                    Some(request)
+                }
+                _ => None,
+            })
+            .expect("history final ACK");
+        respond_to_request(&source, 2, final_ack).await;
+        let confirmation = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::CatchupResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("history final ACK confirmation");
+        apply_response(&sink, 1, confirmation).await;
+
+        assert_eq!(sink_repo.log(), source_repo.log());
+        let sink_cut = sink.terminal_journal.lock().await.terminal_cut();
+        assert_eq!(
+            sink_cut, advanced_cut,
+            "the diverged journal must be replaced by the elected source lineage"
+        );
+        assert!(
+            !sink.terminal_journal.lock().await.is_retired(source_op_2),
+            "the stale retired-origin floor must be cleared by the elected replacement"
+        );
+        assert!(!sink.repository_base_required());
+        assert!(!sink.state.lock().history_election_pending());
+        assert!(
+            sink_net.drain_captures().is_empty(),
+            "a converged elected replacement must not restart metadata catchup"
+        );
+    }
+    #[tokio::test]
+    async fn v7_bound_snapshot_serves_advanced_repository_past_stale_probe_target() {
         let (source, source_net, source_repo) = test_runtime(1, ReplicationConfig::default());
         configure_v7_peer(&source_net, 1, 2);
         populate_repo(&source_repo, 2, 10);
@@ -9357,6 +9643,11 @@ mod tests {
             },
         );
 
+        // The V3 correlation still names the probe-time repository rank (1),
+        // while the pinned image was rendered after the source applied op v2
+        // on the same terminal lineage. The bound V7 envelope carries the
+        // full terminal cut, so the source must serve the advanced image
+        // instead of rejecting it into an endless catchup probe loop.
         let request = StrictCatchupReq {
             src_node: 2,
             since_version: 1,
@@ -9373,6 +9664,161 @@ mod tests {
                 request_nonce: 12,
                 expected_cursor: 0,
                 target_version: 1,
+                reason: StrictCatchupReason::HistoryElection as i32,
+                acknowledged_request_nonce: 0,
+                final_ack: false,
+            }),
+        };
+
+        respond_to_request(&source, 2, request).await;
+        let response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::CatchupResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("history-election V7 snapshot response");
+
+        assert!(!response.snapshot_transfer_rejected);
+        assert_eq!(response.snapshot_version, 2);
+        assert_eq!(response.snapshot_transfer_id, transfer_id);
+        assert!(!response.snapshot_msgpack.is_empty());
+        assert!(
+            source.snapshot_transfers.lock().contains_key(&2),
+            "the pinned V7 image must survive a stale-probe correlation"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_transfer_stale_probe_target_is_rejected() {
+        let (source, source_net, source_repo) = test_runtime(1, ReplicationConfig::default());
+        configure_v7_peer(&source_net, 1, 2);
+        populate_repo(&source_repo, 2, 10);
+        let mut rank = HistoryRank::local(&source);
+        rank.version = 2;
+        rank.freshness = 12;
+        let transfer_id = super::next_snapshot_transfer_id(&source, SnapshotFormat::S2sEnvelope);
+        let snapshot = Bytes::from_static(b"legacy-envelope-snapshot");
+        source.snapshot_transfers.lock().insert(
+            2,
+            SnapshotTransfer {
+                id: transfer_id,
+                format: SnapshotFormat::S2sEnvelope,
+                version: 2,
+                snapshot_sha256: super::snapshot_sha256(&snapshot),
+                snapshot_msgpack: snapshot,
+                rank,
+                terminal_decision_generation: 0,
+                terminal_cut: None,
+                last_used_at: Instant::now(),
+            },
+        );
+
+        // Without the V7 terminal binding, a later image cannot be matched to
+        // the checkpoint the receiver staged for its probe-time target. The
+        // immutable elected target must stay strict so the receiver re-probes
+        // instead of installing an unbound newer image.
+        let request = StrictCatchupReq {
+            src_node: 2,
+            since_version: 1,
+            chunk_token: super::HISTORY_ELECTION_SNAPSHOT_TOKEN,
+            force_snapshot: true,
+            history_probe_only: false,
+            terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
+            terminal_decision_generation: 0,
+            snapshot_transfer_id: transfer_id,
+            snapshot_chunk_cursor: 0,
+            history_transfer: Some(StrictHistoryTransferReq {
+                expected_responder_boot_epoch: source.boot_epoch,
+                transfer_id: 11,
+                request_nonce: 12,
+                expected_cursor: 0,
+                target_version: 1,
+                reason: StrictCatchupReason::HistoryElection as i32,
+                acknowledged_request_nonce: 0,
+                final_ack: false,
+            }),
+        };
+
+        respond_to_request(&source, 2, request).await;
+        let response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::CatchupResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("history-election legacy snapshot response");
+
+        assert!(response.snapshot_transfer_rejected);
+        assert!(response.snapshot_msgpack.is_empty());
+        assert!(!source.snapshot_transfers.lock().contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn v7_bound_snapshot_rejects_a_changed_terminal_cut() {
+        let (source, source_net, source_repo) = test_runtime(1, ReplicationConfig::default());
+        configure_v7_peer(&source_net, 1, 2);
+        populate_repo(&source_repo, 2, 10);
+        let mut rank = HistoryRank::local(&source);
+        rank.version = 2;
+        rank.freshness = 12;
+        let transfer_id = super::next_snapshot_transfer_id(&source, SnapshotFormat::S2sEnvelope);
+        let snapshot = Bytes::from_static(b"bound-v7-snapshot");
+        let captured_cut = source.terminal_journal.lock().await.terminal_cut();
+        source.snapshot_transfers.lock().insert(
+            2,
+            SnapshotTransfer {
+                id: transfer_id,
+                format: SnapshotFormat::S2sEnvelope,
+                version: 2,
+                snapshot_sha256: super::snapshot_sha256(&snapshot),
+                snapshot_msgpack: snapshot,
+                rank,
+                terminal_decision_generation: 0,
+                terminal_cut: Some(captured_cut),
+                last_used_at: Instant::now(),
+            },
+        );
+        // The terminal lineage advances after the image was captured. The
+        // bound envelope no longer matches the durable fence, so the source
+        // must invalidate the transfer rather than serve a foreign cut.
+        source
+            .terminal_journal
+            .lock()
+            .await
+            .upsert_abort_decision(make_op_id(1, 1, 1), 1)
+            .expect("advance the terminal cut");
+        assert_ne!(
+            source.terminal_journal.lock().await.terminal_cut(),
+            captured_cut
+        );
+
+        let request = StrictCatchupReq {
+            src_node: 2,
+            since_version: 2,
+            chunk_token: super::HISTORY_ELECTION_SNAPSHOT_TOKEN,
+            force_snapshot: true,
+            history_probe_only: false,
+            terminal_state_cursor: super::TERMINAL_STATE_CURSOR_SKIP,
+            terminal_decision_generation: 1,
+            snapshot_transfer_id: transfer_id,
+            snapshot_chunk_cursor: 0,
+            history_transfer: Some(StrictHistoryTransferReq {
+                expected_responder_boot_epoch: source.boot_epoch,
+                transfer_id: 11,
+                request_nonce: 12,
+                expected_cursor: 0,
+                target_version: 2,
                 reason: StrictCatchupReason::HistoryElection as i32,
                 acknowledged_request_nonce: 0,
                 final_ack: false,

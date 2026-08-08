@@ -765,6 +765,12 @@ impl SyncV3State {
         true
     }
 
+    /// Bind the staged elected checkpoint to the repository image that will
+    /// replace the local lineage. The deferred election intent captured the
+    /// source cut at probe time, while the staged checkpoint may target a
+    /// later cut on the same immutable lineage (the source advanced before
+    /// rendering the checkpoint page). A staged target that covers the
+    /// deferred cut is still the exact elected replacement.
     pub(super) fn bind_staged_checkpoint_to_repository(
         &mut self,
         peer: PeerIncarnation,
@@ -774,7 +780,7 @@ impl SyncV3State {
         let Some(checkpoint) = self
             .staged_checkpoints
             .get_mut(&peer)
-            .filter(|checkpoint| checkpoint.target_cut == target_cut)
+            .filter(|checkpoint| source_cut_covers(checkpoint.target_cut, target_cut))
         else {
             return false;
         };

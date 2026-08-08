@@ -539,6 +539,14 @@ pub(crate) trait StrictNet: Send + Sync + 'static {
         Ok(repl_proto::wrap_strict(topic, body.clone()).encoded_len())
     }
     fn alive_members(&self) -> Vec<NodeIdentifier>;
+    /// Total number of strict replication participants known to this node,
+    /// including members that are currently unreachable. A terminal journal
+    /// rotation retires the local op range permanently, so it is only safe
+    /// when a fast quorum of this known membership is present and
+    /// acknowledges the identical head. A partitioned minority must never
+    /// rotate: the retirement floor would cover ops the majority still holds
+    /// live and per-op reconciliation would be impossible forever.
+    fn strict_participant_count(&self) -> usize;
     fn member_boot_epoch(&self, _node: NodeIdentifier) -> Option<u64> {
         None
     }
@@ -645,6 +653,13 @@ pub(crate) struct OverlayStrictNet {
     consensus_rtt_margin: Duration,
     transport_ttl_min: Duration,
     transport_ttl_max: Duration,
+    /// Strict participants observed with a live (non-tombstone) LSA in this
+    /// process, including members that later became unreachable. The terminal
+    /// journal rotation quorum must be evaluated against this monotonic set
+    /// rather than the current LSDB view: a partition ages peer LSAs out of
+    /// the local view, so a minority could otherwise rotate alone and
+    /// permanently retire ops the majority still holds live.
+    known_participants: Mutex<HashSet<NodeIdentifier>>,
 }
 
 struct StrictOriginProofMetadata<'a> {
@@ -768,6 +783,7 @@ impl OverlayStrictNet {
             consensus_rtt_margin: cfg.strict_consensus_rtt_margin(),
             transport_ttl_min: cfg.strict_transport_ttl_min(),
             transport_ttl_max: cfg.strict_transport_ttl_max(),
+            known_participants: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1407,6 +1423,32 @@ impl StrictNet for OverlayStrictNet {
             .into_iter()
             .map(|target| target.node)
             .collect()
+    }
+
+    fn strict_participant_count(&self) -> usize {
+        let mut known = self.known_participants.lock();
+        for member in self.overlay.members().into_iter() {
+            if !member.status().is_reachable() {
+                // A graceful-leave tombstone is the only definitive removal
+                // signal the LSDB exposes. Members that merely become
+                // unreachable stay in the known set so a partitioned minority
+                // can never rotate the terminal journal alone.
+                known.remove(&member.node_id());
+                continue;
+            }
+            let capabilities = Self::member_replication_capabilities(&member);
+            if capabilities.strict_enabled()
+                && replication_protocol::strict_participant_version_supported(
+                    capabilities.strict_participant_protocol_version(),
+                )
+            {
+                known.insert(member.node_id());
+            }
+        }
+        if self.local_replication_capabilities().strict_enabled() {
+            known.insert(self.overlay.local_node_id());
+        }
+        known.len()
     }
 
     fn strict_replication_protocol_version(&self) -> u32 {
@@ -4036,6 +4078,22 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     < STRICT_PROTOCOL_VERSION_V5
                     || self.net.member_boot_epoch(node).is_none())
         }) {
+            return;
+        }
+        // A terminal journal rotation retires the local op range permanently,
+        // so it must never happen from a partitioned minority view. Every
+        // locally-visible peer acknowledging the identical head is not enough
+        // once the LSDB view has aged out the majority: require a fast quorum
+        // of the full known participant set to be present and acknowledging.
+        let participants = self.net.strict_participant_count().max(1);
+        if live_peers.len().saturating_add(1) < fast_quorum_size(participants) {
+            debug!(
+                topic = %self.topic,
+                live_peers = live_peers.len(),
+                participants,
+                quorum = fast_quorum_size(participants),
+                "deferring terminal journal checkpoint until a fast quorum of known participants is present"
+            );
             return;
         }
         let head = self.repository_terminal_head.lock().await;
@@ -20728,6 +20786,114 @@ mod tests {
                 }
             )),
             "the evidence peer must not start a competing repository client while election owns source selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_is_deferred_until_a_fast_quorum_of_known_participants_is_present() {
+        // A partitioned node ages the majority out of its local LSDB view, so
+        // rotating against only the peers it can still see would permanently
+        // retire ops the majority still holds live. Rotation must wait for a
+        // fast quorum of the full known participant set.
+        let net = MockNet::new(4, vec![4, 8]);
+        net.set_strict_participants(vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        for node in 1..=9 {
+            net.set_epoch(node, 7);
+        }
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            4,
+            7,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.finish_history_election_for_test();
+        fill_terminal_journal_for_checkpoint(&rt).await;
+        let cut_before = rt.terminal_journal.lock().await.terminal_cut();
+        rt.remember_advertised_head(rt.repo.history_metadata(), cut_before);
+        {
+            let mut evidence = rt.head_evidence.lock();
+            evidence
+                .as_mut()
+                .expect("head evidence must be staged")
+                .acknowledged_by
+                .insert(PeerIncarnation::new(8, 7));
+        }
+        rt.maybe_checkpoint_terminal_journal().await;
+        let journal = rt.terminal_journal.lock().await;
+        assert_eq!(
+            journal.checkpoint_epoch(),
+            0,
+            "a partitioned minority must never rotate the terminal journal"
+        );
+        assert_eq!(
+            journal.terminal_cut().journal_id(),
+            cut_before.journal_id(),
+            "journal identity must be unchanged while below fast quorum"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_proceeds_when_a_fast_quorum_of_known_participants_acknowledges() {
+        let net = MockNet::new(4, vec![4, 8]);
+        net.set_epoch(4, 7);
+        net.set_epoch(8, 7);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
+        net.set_peer_strict_replication_protocol_version(8, STRICT_PROTOCOL_VERSION_V5);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            4,
+            7,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.finish_history_election_for_test();
+        fill_terminal_journal_for_checkpoint(&rt).await;
+        let cut_before = rt.terminal_journal.lock().await.terminal_cut();
+        rt.remember_advertised_head(rt.repo.history_metadata(), cut_before);
+        {
+            let mut evidence = rt.head_evidence.lock();
+            evidence
+                .as_mut()
+                .expect("head evidence must be staged")
+                .acknowledged_by
+                .insert(PeerIncarnation::new(8, 7));
+        }
+        rt.maybe_checkpoint_terminal_journal().await;
+        let journal = rt.terminal_journal.lock().await;
+        assert_eq!(
+            journal.checkpoint_epoch(),
+            1,
+            "a fast quorum of known participants must rotate the terminal journal"
+        );
+        assert_ne!(
+            journal.terminal_cut().journal_id(),
+            cut_before.journal_id(),
+            "rotation must mint a fresh journal identity"
+        );
+    }
+
+    async fn fill_terminal_journal_for_checkpoint(rt: &StrictRuntime<CountingStrictRepo>) {
+        let filled = rt
+            .with_terminal_journal_mutation(move |journal| {
+                for counter in 0..STRICT_TERMINAL_CHECKPOINT_RECORDS {
+                    journal
+                        .upsert_abort_decision(make_op_id(1, 7, counter as u64), 1)
+                        .expect("abort record must stage");
+                }
+                journal.record_count()
+            })
+            .await;
+        assert!(
+            filled >= STRICT_TERMINAL_CHECKPOINT_RECORDS,
+            "journal must hold enough terminal records to rotate"
         );
     }
 
