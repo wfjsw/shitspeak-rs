@@ -44,12 +44,10 @@ use super::super::proto::{
 use super::super::protocol::{
     self as replication_protocol, ProtocolMember, ReplicationProtocolCapabilities,
     STRICT_PROTOCOL_VERSION_V1, STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V4,
-    STRICT_PROTOCOL_VERSION_V5,
+    STRICT_PROTOCOL_VERSION_V5, STRICT_PROTOCOL_VERSION_V6,
 };
 #[cfg(test)]
-use super::super::protocol::{
-    STRICT_PROTOCOL_VERSION_V3, STRICT_PROTOCOL_VERSION_V6, STRICT_PROTOCOL_VERSION_V7,
-};
+use super::super::protocol::{STRICT_PROTOCOL_VERSION_V3, STRICT_PROTOCOL_VERSION_V7};
 use super::super::topic::ErasedStrictRuntime;
 pub(crate) use super::bulk_pacing::BulkPageIdentity;
 use super::bulk_pacing::{BulkAdmissionError, BulkPacer};
@@ -2030,6 +2028,10 @@ pub(crate) struct StrictState {
     /// True when startup or partition-heal convergence still needs election.
     history_election_requested: bool,
     history_election_phase: HistoryElectionPhase,
+    /// Changes whenever an election invalidates the repository cut used by
+    /// admission. It prevents an in-flight pre-election poll from imposing
+    /// its retry delay on the first post-election proof.
+    history_election_generation: u64,
     /// Lowest repository version covered by the durable terminal-journal
     /// checkpoint. A lower repository is missing the base beneath every
     /// retained terminal suffix and must be replaced before delivery.
@@ -2081,10 +2083,47 @@ enum PeerAdmissionPhase {
 struct PendingAdmissionProbe {
     peer: NodeIdentifier,
     boot_epoch: u64,
+    history_election_generation: u64,
     needs_history: bool,
     needs_clock: bool,
     required_history: HistoryMetadata,
     clock_gt: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionProbeObligation {
+    boot_epoch: u64,
+    history_election_generation: u64,
+    required_history: HistoryMetadata,
+    clock_gt: u64,
+    repository_base_required_version: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AdmissionProbeSchedule {
+    obligation: AdmissionProbeObligation,
+    history_attempts: u32,
+    clock_attempts: u32,
+    next_history_at: Instant,
+    next_clock_at: Instant,
+}
+
+impl AdmissionProbeSchedule {
+    fn new(obligation: AdmissionProbeObligation, now: Instant) -> Self {
+        Self {
+            obligation,
+            history_attempts: 0,
+            clock_attempts: 0,
+            next_history_at: now,
+            next_clock_at: now,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AdmissionProbesDue {
+    history: bool,
+    clock: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2145,6 +2184,7 @@ impl StrictState {
             retired_operations: BTreeMap::new(),
             history_election_requested: true,
             history_election_phase: HistoryElectionPhase::Idle,
+            history_election_generation: 0,
             repository_base_required_version: None,
             pending_repository_image_install: None,
             history_alive_peers: HashSet::new(),
@@ -2946,6 +2986,7 @@ impl StrictState {
         }
         self.history_election_requested = true;
         self.history_election_phase = HistoryElectionPhase::Idle;
+        self.history_election_generation = self.history_election_generation.wrapping_add(1);
         // The repository cut is unstable until this election completes.
         // Immediately revoke all peer proof state so a divergence-triggered
         // election cannot deadlock behind an already-admitted stale clock.
@@ -3809,9 +3850,10 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// admission responses into a probe and clock-tick storm. Route or
     /// membership expansion re-arms history recovery independently.
     last_foreign_checkpoint_election: Mutex<Option<ForeignCheckpointLineage>>,
-    /// Per-peer admission request throttle for periodic reconciliation.
-    /// Descriptor and proposal processing never owns admission fanout.
-    last_admission_probe_at: Mutex<HashMap<NodeIdentifier, Instant>>,
+    /// Per-peer, per-frozen-obligation admission retry schedule. History and
+    /// clock retries back off independently; changed obligation identity
+    /// retries immediately.
+    admission_probe_schedules: Mutex<HashMap<NodeIdentifier, AdmissionProbeSchedule>>,
     delivery_blocked_log: Mutex<DeliveryBlockedLogState>,
     pub(super) shutdown: CancellationToken,
     pub(super) cfg: Arc<ReplicationConfig>,
@@ -4427,7 +4469,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             weak_self: Mutex::new(None),
             last_bootstrap_attempt: Mutex::new(None),
             last_foreign_checkpoint_election: Mutex::new(None),
-            last_admission_probe_at: Mutex::new(HashMap::new()),
+            admission_probe_schedules: Mutex::new(HashMap::new()),
             delivery_blocked_log: Mutex::new(DeliveryBlockedLogState::default()),
             shutdown,
             cfg,
@@ -4570,8 +4612,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
 
     fn pending_admission_probes(&self) -> Vec<PendingAdmissionProbe> {
         let _ = self.reconcile_peer_admissions();
-        self.state
-            .lock()
+        let state = self.state.lock();
+        let history_election_generation = state.history_election_generation;
+        state
             .peer_admissions
             .iter()
             .filter_map(|(node, admission)| {
@@ -4599,6 +4642,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 Some(PendingAdmissionProbe {
                     peer: *node,
                     boot_epoch: admission.boot_epoch,
+                    history_election_generation,
                     needs_history: !history_ready,
                     needs_clock: !clock_ready,
                     required_history,
@@ -4616,18 +4660,65 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .collect()
     }
 
-    fn admission_probe_due(&self, peer: NodeIdentifier) -> bool {
+    fn retain_current_admission_probe_schedules(&self, probes: &[PendingAdmissionProbe]) {
+        self.admission_probe_schedules
+            .lock()
+            .retain(|node, schedule| {
+                probes.iter().any(|probe| {
+                    probe.peer == *node && probe.boot_epoch == schedule.obligation.boot_epoch
+                })
+            });
+    }
+
+    fn admission_probe_retry_delay(&self, attempts: u32) -> Duration {
+        let base = self.cfg.strict_bootstrap_retry_interval();
+        let cap = self.cfg.strict_steady_state_catchup_interval().max(base);
+        let shift = attempts.saturating_add(1).min(31);
+        base.saturating_mul(1u32 << shift).min(cap)
+    }
+
+    fn admission_probes_due(
+        &self,
+        probe: PendingAdmissionProbe,
+        repository_base_required_version: Option<u64>,
+    ) -> AdmissionProbesDue {
         let now = Instant::now();
-        let interval = self.cfg.strict_bootstrap_retry_interval();
-        let mut last = self.last_admission_probe_at.lock();
-        if last
-            .get(&peer)
-            .is_some_and(|previous| now.duration_since(*previous) < interval)
-        {
-            return false;
+        let obligation = AdmissionProbeObligation {
+            boot_epoch: probe.boot_epoch,
+            history_election_generation: probe.history_election_generation,
+            required_history: probe.required_history,
+            clock_gt: probe.clock_gt,
+            repository_base_required_version,
+        };
+        let mut schedules = self.admission_probe_schedules.lock();
+        let schedule = schedules
+            .entry(probe.peer)
+            .or_insert_with(|| AdmissionProbeSchedule::new(obligation, now));
+        if schedule.obligation != obligation {
+            *schedule = AdmissionProbeSchedule::new(obligation, now);
         }
-        last.insert(peer, now);
-        true
+
+        let history = probe.needs_history && now >= schedule.next_history_at;
+        if history {
+            schedule.next_history_at =
+                now + self.admission_probe_retry_delay(schedule.history_attempts);
+            schedule.history_attempts = schedule.history_attempts.saturating_add(1);
+        } else if !probe.needs_history {
+            schedule.history_attempts = 0;
+            schedule.next_history_at = now;
+        }
+
+        let clock = probe.needs_clock && now >= schedule.next_clock_at;
+        if clock {
+            schedule.next_clock_at =
+                now + self.admission_probe_retry_delay(schedule.clock_attempts);
+            schedule.clock_attempts = schedule.clock_attempts.saturating_add(1);
+        } else if !probe.needs_clock {
+            schedule.clock_attempts = 0;
+            schedule.next_clock_at = now;
+        }
+
+        AdmissionProbesDue { history, clock }
     }
 
     pub(crate) fn wake_clock_tick_loop(&self) {
@@ -4658,6 +4749,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if !requested {
             return false;
         }
+        self.admission_probe_schedules.lock().clear();
         // This is a verified foreign lineage, not a membership flap. Bypass
         // the bootstrap retry throttle so admission cannot leave recovery idle.
         *self.last_bootstrap_attempt.lock() = None;
@@ -11292,6 +11384,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             | MembershipEvent::Left(member)
             | MembershipEvent::Restarted(member) => member,
         };
+        self.admission_probe_schedules
+            .lock()
+            .remove(&member.node_id());
         let failed_coord = matches!(
             transition,
             MembershipTransition::Removed | MembershipTransition::Restarted
@@ -13217,6 +13312,45 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
     });
 }
 
+/// Raise a pre-V6 responder near the frozen barrier before requesting proof.
+async fn send_pre_v6_admission_clock_advance<R: StrictReplicable>(
+    rt: &Arc<StrictRuntime<R>>,
+    dst: NodeIdentifier,
+    src_clock: u64,
+) {
+    if rt.net.strict_replication_protocol_version() >= STRICT_PROTOCOL_VERSION_V6
+        || !rt.can_originate_v2()
+    {
+        return;
+    }
+    // V4/V5 clock probes cannot carry requester_clock. A coherent directed
+    // tick raises an aligned responder to the frozen barrier before its probe
+    // response. A receiver missing this terminal cut fences the watermark and
+    // synchronizes history before a later bounded retry.
+    let (history_metadata, terminal_cut) = coherent_advertised_head(rt).await;
+    rt.remember_advertised_head(history_metadata, terminal_cut);
+    let advance = StrictBody::ClockTick(StrictClockTick {
+        src_node: rt.self_id as u32,
+        src_clock,
+        repository_version: history_metadata.version,
+        terminal_cut: Some(cut_to_wire(terminal_cut)),
+        history_freshness: history_metadata.freshness,
+    });
+    if let Err(error) = rt
+        .net
+        .send_redundant_catchup_unicast(
+            dst,
+            &rt.topic,
+            advance,
+            CatchupReason::Admission,
+            CatchupPhase::Metadata,
+        )
+        .await
+    {
+        debug!(%error, dst, "strict pre-v6 admission clock advance failed");
+    }
+}
+
 /// Retry metadata and directed-clock evidence for every routed incarnation
 /// awaiting admission. This cadence is independent of the coarser ordinary
 /// anti-entropy loop so a healed route cannot pin liveness until 30 seconds.
@@ -13231,9 +13365,14 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
     // solely from the elected candidate.
     super::catchup::resume_deferred_v3_admissions(rt).await;
     let probes = rt.pending_admission_probes();
+    rt.retain_current_admission_probe_schedules(&probes);
+    if probes.is_empty() {
+        return;
+    }
     let local_history = rt.repo.history_metadata();
     let local_version = local_history.version;
     let local_clock = rt.state.lock().clock;
+    let repository_base_required_version = rt.repository_base_required_version();
     for probe in probes {
         let dst = probe.peer;
         if rt.net.peer_strict_replication_protocol_version(dst) < STRICT_PROTOCOL_VERSION_V2
@@ -13242,7 +13381,8 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
             continue;
         }
         if rt.v3_repair_supported_by(dst) {
-            if !rt.admission_probe_due(dst) {
+            let due = rt.admission_probes_due(probe, repository_base_required_version);
+            if !due.history && !due.clock {
                 continue;
             }
             debug!(
@@ -13255,15 +13395,16 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
                 local_history_freshness = local_history.freshness,
                 local_clock,
                 clock_gt = probe.clock_gt,
-                needs_history = probe.needs_history,
-                needs_clock = probe.needs_clock,
+                needs_history = due.history,
+                needs_clock = due.clock,
                 protocol = "v3",
                 "strict admission proof retry"
             );
             // Admission metadata is bounded and nonce-coalesced. It may
             // coexist with a terminal responder; suppressing the missing
             // proof behind responder lifetime can strand admission.
-            if probe.needs_clock {
+            if due.clock {
+                send_pre_v6_admission_clock_advance(rt, dst, local_clock).await;
                 super::catchup::request_v3_clock_probe(
                     rt,
                     dst,
@@ -13271,7 +13412,7 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
                 )
                 .await;
             }
-            if probe.needs_history {
+            if due.history {
                 super::catchup::request_v3_history_probe(
                     rt,
                     dst,
@@ -13288,7 +13429,8 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
         if !rt.can_originate_v2() {
             continue;
         }
-        if !rt.admission_probe_due(dst) {
+        let due = rt.admission_probes_due(probe, repository_base_required_version);
+        if !due.history && !due.clock {
             continue;
         }
         debug!(
@@ -13301,11 +13443,14 @@ async fn request_admission_probes<R: StrictReplicable>(rt: &Arc<StrictRuntime<R>
             local_history_freshness = local_history.freshness,
             local_clock,
             clock_gt = probe.clock_gt,
-            needs_history = probe.needs_history,
-            needs_clock = probe.needs_clock,
+            needs_history = due.history,
+            needs_clock = due.clock,
             protocol = "v2",
             "strict admission proof retry"
         );
+        if due.clock {
+            send_pre_v6_admission_clock_advance(rt, dst, local_clock).await;
+        }
         let req = StrictCatchupReq {
             src_node: rt.self_id as u32,
             // Besides asking for the peer's metadata, advertise the local
@@ -15562,6 +15707,145 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn one_v5_directed_clock_advance_avoids_linear_admission_probe_retries() {
+        const BARRIER: u64 = 10_000;
+
+        let requester_net = MockNet::new(1, vec![1, 2]);
+        requester_net.set_epoch(1, 11);
+        requester_net.set_epoch(2, 22);
+        requester_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        requester_net
+            .set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
+        requester_net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V5);
+        requester_net.set_alive(vec![1, 2]);
+        requester_net.set_live_reliable_routes([1, 2]);
+        let requester = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            11,
+            "channels".to_owned(),
+            requester_net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        requester.finish_history_election_for_test();
+        {
+            let mut state = requester.state.lock();
+            state.clock = BARRIER;
+            state.delivered_high_water = BARRIER;
+        }
+        requester.seed_membership_snapshot([
+            MemberIncarnation::new(1, 11),
+            MemberIncarnation::new(2, 22),
+        ]);
+        {
+            let mut state = requester.state.lock();
+            state.freeze_ready_admission_cuts(HistoryMetadata {
+                version: 0,
+                freshness: 0,
+            });
+            assert!(!state.observe_admission_history(
+                2,
+                22,
+                HistoryMetadata {
+                    version: 0,
+                    freshness: 0,
+                },
+            ));
+        }
+
+        let responder_net = MockNet::new(2, vec![1, 2]);
+        responder_net.set_epoch(1, 11);
+        responder_net.set_epoch(2, 22);
+        responder_net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        responder_net
+            .set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
+        responder_net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V5);
+        let responder = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            2,
+            22,
+            "channels".to_owned(),
+            responder_net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        responder.finish_history_election_for_test();
+        responder.seed_membership_snapshot([
+            MemberIncarnation::new(1, 11),
+            MemberIncarnation::new(2, 22),
+        ]);
+        responder
+            .state
+            .lock()
+            .peer_admissions
+            .get_mut(&1)
+            .unwrap()
+            .phase = PeerAdmissionPhase::Admitted;
+
+        request_admission_probes(&requester).await;
+        let captures = requester_net.drain_captures();
+        let advance = captures
+            .iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::ClockTick(tick),
+                    ..
+                } => Some(tick.clone()),
+                _ => None,
+            })
+            .expect("pre-v6 admission sends one directed clock advance");
+        let request = captures
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::ClockProbeReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("admission clock probe");
+        assert_eq!(advance.src_clock, BARRIER);
+        let advance_cut = advance
+            .terminal_cut
+            .as_ref()
+            .and_then(cut_from_wire)
+            .expect("pre-v6 directed advance carries coherent head evidence");
+        responder
+            .v3_sync
+            .lock()
+            .remember_source_cut(PeerIncarnation::new(1, 11), advance_cut);
+
+        responder
+            .dispatch(1, 11, true, StrictBody::ClockTick(advance))
+            .await;
+        super::super::catchup::recv_v3_clock_probe_req(&responder, 1, 11, request).await;
+        let response = responder_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::ClockProbeResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("clock probe response");
+        assert!(response.src_clock > BARRIER);
+        super::super::catchup::recv_v3_clock_probe_resp(&requester, 2, 22, response);
+
+        assert!(requester.peer_incarnation_is_admitted(2, 22));
+        request_admission_probes(&requester).await;
+        assert!(
+            requester_net.drain_captures().is_empty(),
+            "one directed advance plus one probe must complete admission without a retry storm",
+        );
+    }
+
     #[test]
     fn clock_probe_requester_clock_waits_for_the_v6_cluster_floor() {
         const REQUESTER_CLOCK: u64 = 10_000;
@@ -17708,6 +17992,256 @@ mod tests {
             "an incomplete snapshot must not let the identical foreign lineage rearm the election",
         );
         rt.shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn unchanged_rejected_admission_history_backs_off_fresh_nonces() {
+        let interval = Duration::from_millis(10);
+        let (rt, net, repo) = v1_runtime(
+            ReplicationConfig::default()
+                .with_strict_bootstrap_retry_interval(interval)
+                .with_strict_steady_state_catchup_interval(Duration::from_millis(80)),
+        );
+        *repo.state.lock() = (1, vec![(1, 1, None)]);
+        enable_v5_floor_with_v4_participants(&net, [1, 2]);
+        net.set_alive(vec![1, 2]);
+        net.set_live_reliable_routes([1, 2]);
+        net.set_epoch(2, 1);
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 1)]);
+        rt.finish_history_election_for_test();
+        rt.reconcile_peer_admissions();
+        rt.state.lock().observe_admission_clock(2, 1, u64::MAX);
+
+        let mut checkpointed = TerminalJournal::in_memory("channels");
+        checkpointed
+            .upsert_abort_decision((2, 1), 1)
+            .expect("remote terminal abort");
+        checkpointed.checkpoint(1).expect("remote checkpoint");
+        let remote_cut = checkpointed.terminal_cut();
+        let local_rank = HistoryRank::local(&rt);
+        let remote_rank = HistoryRank {
+            node_id: 2,
+            terminal_repository_base_version: local_rank.version,
+            ..local_rank
+        };
+
+        request_admission_probes(&rt).await;
+        let initial_request = net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::HistoryProbeReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("initial admission history request");
+        let response_for = |request_nonce| repl_proto::StrictHistoryProbeResp {
+            responder_node: 2,
+            expected_requester_boot_epoch: 1,
+            request_nonce,
+            repository_version: remote_rank.version,
+            terminal_repository_base_version: remote_rank.terminal_repository_base_version,
+            history_freshness: remote_rank.freshness,
+            runtime_started_at: remote_rank.runtime_started_at,
+            history_node: 2,
+            terminal_cut: Some(cut_to_wire(remote_cut)),
+            reason: StrictCatchupReason::Admission as i32,
+        };
+
+        // Keep the promotion deterministic; the test owns election
+        // completion so it can isolate the post-response admission cadence.
+        let weak_self = rt.weak_self.lock().take();
+        super::super::catchup::recv_v3_history_probe_resp(
+            &rt,
+            2,
+            1,
+            response_for(initial_request.request_nonce),
+        )
+        .await;
+        *rt.weak_self.lock() = weak_self;
+        assert!(rt.state.lock().history_election_pending());
+        rt.finish_history_election_for_test();
+        rt.reconcile_peer_admissions();
+        rt.state.lock().observe_admission_clock(2, 1, u64::MAX);
+        net.drain_captures();
+
+        request_admission_probes(&rt).await;
+        let post_election_request = net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::HistoryProbeReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("election completion must recheck admission immediately");
+        super::super::catchup::recv_v3_history_probe_resp(
+            &rt,
+            2,
+            1,
+            response_for(post_election_request.request_nonce),
+        )
+        .await;
+        net.drain_captures();
+
+        {
+            let mut schedules = rt.admission_probe_schedules.lock();
+            let schedule = schedules.get_mut(&2).expect("admission probe schedule");
+            assert_eq!(schedule.history_attempts, 1);
+            schedule.next_history_at = Instant::now();
+        }
+
+        let recheck_started_at = Instant::now();
+        request_admission_probes(&rt).await;
+        let recheck = net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::HistoryProbeReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("first bounded admission history recheck");
+        super::super::catchup::recv_v3_history_probe_resp(
+            &rt,
+            2,
+            1,
+            response_for(recheck.request_nonce),
+        )
+        .await;
+        net.drain_captures();
+
+        let next_history_at = {
+            let schedules = rt.admission_probe_schedules.lock();
+            let schedule = schedules.get(&2).expect("retained admission schedule");
+            assert_eq!(schedule.history_attempts, 2);
+            schedule.next_history_at
+        };
+        assert!(
+            next_history_at >= recheck_started_at + interval.saturating_mul(4),
+            "the unchanged history obligation must exponentially increase its recheck delay",
+        );
+
+        // An active topic changes its local head between polls. That does not
+        // make the peer's unchanged rejected lineage admissible.
+        {
+            let mut repository = repo.state.lock();
+            repository.0 = repository.0.saturating_add(1);
+        }
+        for _ in 0..4 {
+            request_admission_probes(&rt).await;
+        }
+        assert!(
+            net.drain_captures().into_iter().all(|frame| !matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::HistoryProbeReq(_)
+                        | StrictBody::ClockProbeReq(_)
+                        | StrictBody::ClockTick(_),
+                    ..
+                } | CapturedFrame::StrictMulticast {
+                    body: StrictBody::ClockTick(_),
+                    ..
+                }
+            )),
+            "bootstrap polling must not create fresh proof nonces or clock traffic during backoff",
+        );
+
+        rt.admission_probe_schedules
+            .lock()
+            .get_mut(&2)
+            .expect("retained admission schedule")
+            .next_history_at = Instant::now();
+        request_admission_probes(&rt).await;
+        assert!(
+            net.drain_captures().into_iter().any(|frame| matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::HistoryProbeReq(_),
+                    ..
+                }
+            )),
+            "the bounded recheck must preserve recovery discovery",
+        );
+    }
+
+    #[test]
+    fn admission_proofs_back_off_independently_and_reset_for_changed_obligation() {
+        let interval = Duration::from_millis(10);
+        let (rt, _net, _repo) = v1_runtime(
+            ReplicationConfig::default()
+                .with_strict_bootstrap_retry_interval(interval)
+                .with_strict_steady_state_catchup_interval(Duration::from_millis(80)),
+        );
+        let local_history = rt.repo.history_metadata();
+        let probe = PendingAdmissionProbe {
+            peer: 2,
+            boot_epoch: 1,
+            history_election_generation: 0,
+            needs_history: true,
+            needs_clock: true,
+            required_history: local_history,
+            clock_gt: 7,
+        };
+        assert_eq!(
+            rt.admission_probes_due(probe, None),
+            AdmissionProbesDue {
+                history: true,
+                clock: true,
+            }
+        );
+
+        rt.admission_probe_schedules
+            .lock()
+            .get_mut(&2)
+            .expect("admission probe schedule")
+            .next_clock_at = Instant::now();
+        let second_clock_attempt_started_at = Instant::now();
+        assert_eq!(
+            rt.admission_probes_due(probe, None),
+            AdmissionProbesDue {
+                history: false,
+                clock: true,
+            },
+            "history backoff must not suppress clock progress",
+        );
+
+        let next_clock_at = rt
+            .admission_probe_schedules
+            .lock()
+            .get(&2)
+            .expect("admission probe schedule")
+            .next_clock_at;
+        assert!(
+            next_clock_at >= second_clock_attempt_started_at + interval.saturating_mul(4),
+            "an unchanged clock obligation must exponentially back off fresh nonces",
+        );
+
+        let changed_probe = PendingAdmissionProbe {
+            required_history: HistoryMetadata {
+                freshness: local_history.freshness.saturating_add(1),
+                ..local_history
+            },
+            ..probe
+        };
+        assert_eq!(
+            rt.admission_probes_due(changed_probe, None),
+            AdmissionProbesDue {
+                history: true,
+                clock: true,
+            },
+            "a changed frozen obligation must retry immediately",
+        );
     }
 
     #[test]
