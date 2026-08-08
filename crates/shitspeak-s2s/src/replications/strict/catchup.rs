@@ -4873,7 +4873,7 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         || freshness_replacement_needed
         || repository_base_required
         || checkpoint_replacement_needed;
-    let next_action = if !source_satisfied {
+    let next_action = if !source_satisfied || checkpoint_replacement_needed {
         "terminal_sync"
     } else if history_needed {
         "repository_transfer"
@@ -4929,7 +4929,14 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         // or the already-satisfied fast path can start repository transfer.
         rt.require_repository_base(terminal_repository_base_version);
     }
-    if source_satisfied {
+    // A previously authenticated source cut proves the source lineage, not
+    // the local lineage. When the elected source owns a different journal
+    // that must replace the local one, repository history cannot start until
+    // the exact elected checkpoint has been staged: installing the repository
+    // base directly would reject local delivered commits that are absent from
+    // the source image and rearm forever. Route such divergence through the
+    // terminal sync so the checkpoint is staged first.
+    if source_satisfied && !checkpoint_replacement_needed {
         rt.v3_sync
             .lock()
             .remember_source_cut(source_peer, source_cut);
@@ -5101,6 +5108,21 @@ async fn start_v3_repository_after_terminal<R: StrictReplicable>(
             .v3_sync
             .lock()
             .bind_staged_checkpoint_to_repository(peer, source_cut, rank.version);
+    // A foreign journal lineage can only be replaced by the exact staged
+    // elected checkpoint. A known source cut is not enough: it authenticates
+    // the source lineage, while the local journal may still own delivered
+    // commits that a direct repository-base install would reject as absent
+    // from the source image. Restart source selection so the election defers
+    // a fresh intent and the terminal sync stages the checkpoint first.
+    let terminal_replacement_needed = reason == StrictCatchupReason::HistoryElection && {
+        let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+        source_cut.journal_id() != local_cut.journal_id()
+            && source_cut.terminal_set_digest() != local_cut.terminal_set_digest()
+    };
+    if terminal_replacement_needed && !staged_checkpoint_bound {
+        rearm_history_election(rt);
+        return false;
+    }
     if !source_known && !staged_checkpoint_bound {
         // Repository history may only begin after the exact metadata source
         // cut has been durably validated or staged as the exact elected
@@ -9617,6 +9639,285 @@ mod tests {
             "a converged elected replacement must not restart metadata catchup"
         );
     }
+
+    /// Production regression: node restarted on a
+    /// divergent journal lineage (generation 0, a fresh journal id) while the
+    /// healthy majority ran generation 4103 of the cluster lineage. The node
+    /// had already authenticated the majority source cut, so the convergence
+    /// decision computed source_already_known=true even though its own
+    /// journal was a different lineage with delivered commits. The decision
+    /// then skipped terminal checkpoint staging entirely and started the
+    /// repository snapshot transfer directly; installing that base without
+    /// the staged elected checkpoint rejected the local delivered commits as
+    /// absent from the source image ("strict terminal journal cannot
+    /// checkpoint before every commit is delivered") and rearmed the election
+    /// forever, flooding the cluster with strict catchup probes. A known
+    /// source cut proves the source lineage, not the local lineage: a journal
+    /// replacement must still stage the exact elected checkpoint before any
+    /// repository history.
+    #[tokio::test]
+    async fn known_divergent_source_cut_stages_elected_checkpoint_before_repository() {
+        let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
+        let (source, source_net, source_repo) = test_runtime(1, config.clone());
+        let (sink, sink_net, sink_repo) = test_runtime(2, config);
+        configure_v7_peer(&source_net, 1, 2);
+        configure_v7_peer(&sink_net, 2, 1);
+        populate_repo(&source_repo, 1, 10);
+        populate_repo(&sink_repo, 1, 10);
+
+        // The source owns a complete foreign lineage with one terminal
+        // decision; the sink owns a divergent lineage that already delivered
+        // its own commit (production: the minority journal kept delivering
+        // while the cluster advanced elsewhere).
+        let source_op = make_op_id(1, 1, 1);
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(source_op))
+                .await
+        );
+        let source_cut = source.terminal_journal.lock().await.terminal_cut();
+        let sink_op = make_op_id(2, 1, 1);
+        sink.with_terminal_journal_mutation(move |journal| {
+            journal.upsert_commit_decision(sink_op, 1, 99, b"local-commit".to_vec())?;
+            journal.merge_legacy_delivery_checkpoint(
+                1,
+                &std::collections::BTreeMap::from([(sink_op, 1)]),
+            )
+        })
+        .await
+        .expect("sink divergent delivered commit");
+        let sink_cut = sink.terminal_journal.lock().await.terminal_cut();
+        assert_ne!(
+            sink_cut.journal_id(),
+            source_cut.journal_id(),
+            "the sink must be on a divergent journal lineage"
+        );
+        assert!(
+            sink.terminal_journal
+                .lock()
+                .await
+                .get(sink_op)
+                .unwrap()
+                .is_delivered(),
+            "the sink's divergent commit must be delivered so a non-staged install rejects it"
+        );
+
+        // The sink has already authenticated the source cut (e.g. a prior
+        // probe or delta), making source_already_known=true even though its
+        // own journal is a different lineage.
+        let peer = PeerIncarnation::new(1, 1);
+        sink.v3_sync.lock().remember_source_cut(peer, source_cut);
+
+        {
+            let mut state = sink.state.lock();
+            state.request_history_election();
+            state.begin_history_election([source.self_id]);
+        }
+        super::request_v3_history_probe(
+            &sink,
+            source.self_id,
+            super::StrictCatchupReason::HistoryElection,
+        )
+        .await;
+        let probe_request = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::HistoryProbeReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("history election request");
+        super::recv_v3_history_probe_req(&source, sink.self_id, 1, probe_request).await;
+        let probe_response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::HistoryProbeResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("history election response");
+        super::recv_v3_history_probe_resp(&sink, source.self_id, 1, probe_response).await;
+
+        // A known source cut must not bypass the elected checkpoint: the sink
+        // has to stage the source lineage before it can install the
+        // repository image. Pre-fix the decision skipped straight to the
+        // repository transfer and the snapshot install failed forever.
+        let mut frames = sink_net.drain_captures();
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::TerminalSyncReq(_),
+                    ..
+                }
+            )),
+            "a divergent journal with a known source cut must stage the elected checkpoint"
+        );
+        assert!(
+            !frames.iter().any(|frame| matches!(
+                frame,
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::CatchupReq(_),
+                    ..
+                }
+            )),
+            "a divergent journal must not start repository history before staging"
+        );
+        let request = frames
+            .drain(..)
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::TerminalSyncReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("elected terminal sync request");
+
+        // Complete the elected terminal checkpoint: the source renders the
+        // checkpoint page; the sink stages and acknowledges it.
+        let rank = sink
+            .v3_history
+            .lock()
+            .pending_after_terminal(peer)
+            .expect("deferred elected terminal intent")
+            .rank();
+        super::recv_v3_terminal_sync_req(&source, sink.self_id, 1, request).await;
+        let page = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::TerminalSyncPage(page),
+                    ..
+                } => Some(page),
+                _ => None,
+            })
+            .expect("elected checkpoint page");
+        super::recv_v3_terminal_sync_page(&sink, 1, 1, page).await;
+        let ack = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::TerminalSyncAck(ack),
+                    ..
+                } => Some(ack),
+                _ => None,
+            })
+            .expect("terminal checkpoint ack");
+        super::recv_v3_terminal_sync_ack(&source, sink.self_id, 1, ack).await;
+        let confirmation = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    body: StrictBody::TerminalSyncAck(ack),
+                    ..
+                } => Some(ack),
+                _ => None,
+            })
+            .expect("terminal checkpoint confirmation");
+        super::recv_v3_terminal_sync_ack(&sink, 1, 1, confirmation).await;
+
+        assert!(
+            sink.v3_sync
+                .lock()
+                .staged_checkpoint_for_repository(peer, rank.version)
+                .is_some(),
+            "the staged elected checkpoint must bind to the repository replacement"
+        );
+
+        // Repository history may now transfer and install the source lineage
+        // over the divergent journal without rejecting the delivered commit.
+        let history_request = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::CatchupReq(request),
+                    ..
+                } => Some(request),
+                _ => None,
+            })
+            .expect("staged checkpoint must request the repository snapshot");
+        assert!(history_request.force_snapshot);
+        respond_to_request(&source, 2, history_request).await;
+        let history_response = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::CatchupResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("forced snapshot response");
+        assert!(history_response.too_old_use_snapshot);
+        apply_response(&sink, 1, history_response).await;
+
+        let final_ack = sink_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 1,
+                    body: StrictBody::CatchupReq(request),
+                    ..
+                } if request
+                    .history_transfer
+                    .as_ref()
+                    .is_some_and(|transfer| transfer.final_ack) =>
+                {
+                    Some(request)
+                }
+                _ => None,
+            })
+            .expect("history final ACK");
+        respond_to_request(&source, 2, final_ack).await;
+        let confirmation = source_net
+            .drain_captures()
+            .into_iter()
+            .find_map(|frame| match frame {
+                CapturedFrame::StrictUnicast {
+                    dst: 2,
+                    body: StrictBody::CatchupResp(response),
+                    ..
+                } => Some(response),
+                _ => None,
+            })
+            .expect("history final ACK confirmation");
+        apply_response(&sink, 1, confirmation).await;
+
+        assert_eq!(sink_repo.log(), source_repo.log());
+        assert_eq!(
+            sink.terminal_journal.lock().await.terminal_cut(),
+            source_cut,
+            "the divergent journal must be replaced by the elected source lineage"
+        );
+        assert!(
+            sink.terminal_journal.lock().await.get(sink_op).is_none(),
+            "the stale divergent delivered commit must be replaced by the source lineage"
+        );
+        assert!(!sink.repository_base_required());
+        assert!(!sink.state.lock().history_election_pending());
+        assert!(
+            sink_net.drain_captures().is_empty(),
+            "a converged elected replacement must not restart metadata catchup"
+        );
+    }
+
     #[tokio::test]
     async fn v7_bound_snapshot_serves_advanced_repository_past_stale_probe_target() {
         let (source, source_net, source_repo) = test_runtime(1, ReplicationConfig::default());
