@@ -25,8 +25,8 @@ use super::{
         send_v3_metadata_control,
     },
     runtime::{
-        HistoryRank, STRICT_V3_CONTROL_MAX_ENCODED_BYTES, StrictRuntime, is_v3_metadata_control,
-        make_op_id,
+        HistoryElectionSnapshotRequest, HistoryRank, STRICT_V3_CONTROL_MAX_ENCODED_BYTES,
+        StrictRuntime, is_v3_metadata_control, make_op_id,
     },
     session_reducer::{
         Cursor as SessionCursor, CursorKind as SessionCursorKind, Cut as SessionCut,
@@ -108,6 +108,111 @@ fn only_the_reserved_empty_history_response_shape_is_control_metadata() {
             ..confirmation
         }
     )));
+}
+
+#[tokio::test]
+async fn stalled_v3_election_resumes_ranked_checkpoint_instead_of_legacy_snapshot() {
+    let (sink, net) = runtime(2, ReplicationConfig::default());
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+    let peer = PeerIncarnation::new(1, 11);
+    let source_cut = TerminalCut::new([1; 16], 7, [2; 32], [3; 32]);
+    let rank = HistoryRank {
+        version: 10,
+        freshness: 20,
+        runtime_started_at: 11,
+        node_id: 1,
+        terminal_repository_base_version: 10,
+    };
+    {
+        let mut state = sink.state.lock();
+        state.request_history_election();
+        state.begin_history_election([1, 9]);
+    }
+    assert!(
+        sink.record_v3_history_election_rank(peer, rank, source_cut, true)
+            .is_none(),
+        "the silent peer must keep the election probe pending",
+    );
+
+    let request = sink
+        .state
+        .lock()
+        .conclude_stalled_history_election()
+        .expect("best responsive rank");
+    sink.send_history_snapshot_request(request)
+        .await
+        .expect("stalled election dispatch");
+
+    let frames = net.drain_captures();
+    assert!(
+        frames.iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 1,
+                body: StrictBody::TerminalSyncReq(request),
+                ..
+            } if request.expected_cursor == 0
+        )),
+        "a stalled V3 winner must resume the elected terminal-checkpoint protocol: {frames:?}",
+    );
+    assert!(
+        !frames.iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::CatchupReq(request),
+                ..
+            } if request.force_snapshot && request.history_transfer.is_none()
+        )),
+        "the legacy snapshot path applies checkpoint states per operation and can hit retired floors",
+    );
+    assert_eq!(
+        sink.v3_history
+            .lock()
+            .pending_after_terminal(peer)
+            .expect("elected terminal prerequisite")
+            .reason(),
+        StrictCatchupReason::HistoryElection,
+    );
+}
+
+#[tokio::test]
+async fn stale_v3_election_incarnation_rearms_without_legacy_snapshot() {
+    let (sink, net) = runtime(2, ReplicationConfig::default());
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+    let peer = PeerIncarnation::new(1, 11);
+    let source_cut = TerminalCut::new([1; 16], 7, [2; 32], [3; 32]);
+    let rank = HistoryRank {
+        version: 10,
+        freshness: 20,
+        runtime_started_at: 11,
+        node_id: 1,
+        terminal_repository_base_version: 10,
+    };
+    sink.v3_history
+        .lock()
+        .record_probe_candidate(peer, rank, source_cut);
+    let request = HistoryElectionSnapshotRequest::new(1, rank);
+
+    net.set_epoch(1, 12);
+    sink.send_history_snapshot_request(request)
+        .await
+        .expect("stale election dispatch");
+
+    let frames = net.drain_captures();
+    assert!(
+        !frames.iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::CatchupReq(request),
+                ..
+            } if request.force_snapshot && request.history_transfer.is_none()
+        )),
+        "a restarted V3 winner must be re-probed, never sent a legacy snapshot request: {frames:?}",
+    );
+    assert!(
+        sink.state.lock().can_start_history_election(),
+        "the stale exact-incarnation candidate must rearm the election",
+    );
 }
 
 #[tokio::test]

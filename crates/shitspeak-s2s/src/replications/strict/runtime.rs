@@ -4824,12 +4824,19 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         &self,
         request: HistoryElectionSnapshotRequest,
     ) -> Result<(), ReplicationError> {
-        if !self.can_originate_v2()
-            || !replication_protocol::strict_participant_version_supported(
-                self.net
-                    .peer_strict_replication_protocol_version(request.peer()),
-            )
-        {
+        if !self.can_originate_v2() {
+            return Ok(());
+        }
+        if self.v3_repair_protocol_supported_by(request.peer()) {
+            if !super::catchup::resume_v3_history_snapshot_request(self, request).await {
+                self.state.lock().request_history_election();
+            }
+            return Ok(());
+        }
+        if !replication_protocol::strict_participant_version_supported(
+            self.net
+                .peer_strict_replication_protocol_version(request.peer()),
+        ) {
             return Ok(());
         }
         let body = StrictBody::CatchupReq(StrictCatchupReq {
@@ -5038,7 +5045,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// participants. A relay can forward the opaque authenticated body, while
     /// both endpoints must advertise a supported durable-head capability and
     /// locally retain the repair-journal contract.
-    pub(super) fn v3_repair_supported_by(&self, peer: NodeIdentifier) -> bool {
+    fn v3_repair_protocol_supported_by(&self, peer: NodeIdentifier) -> bool {
         self.terminal_storage_ready()
             && self.repo.strict_replication_protocol_version() >= STRICT_PROTOCOL_VERSION_V2
             && replication_protocol::strict_participant_version_supported(
@@ -5047,7 +5054,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             && replication_protocol::strict_participant_version_supported(
                 self.net.peer_strict_replication_protocol_version(peer),
             )
-            && self.net.member_boot_epoch(peer).is_some()
+    }
+
+    pub(super) fn v3_repair_supported_by(&self, peer: NodeIdentifier) -> bool {
+        self.v3_repair_protocol_supported_by(peer) && self.net.member_boot_epoch(peer).is_some()
     }
 
     fn head_evidence_supported_by(&self, peer: NodeIdentifier) -> bool {
@@ -18435,7 +18445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_history_election_fetches_only_best_snapshot() {
+    async fn strict_history_election_rearms_v3_winner_without_correlated_candidate() {
         let net = MockNet::new(1, vec![1, 2, 3]);
         enable_v5_floor_with_v4_participants(&net, [2, 3]);
         net.set_epoch(2, 1);
@@ -18483,21 +18493,11 @@ mod tests {
             .await;
 
         let captures = net.drain_captures();
-        assert_eq!(captures.len(), 1);
-        match &captures[0] {
-            crate::replications::test_support::CapturedFrame::StrictUnicast {
-                dst, body, ..
-            } => {
-                assert_eq!(*dst, 2);
-                let StrictBody::CatchupReq(req) = body else {
-                    panic!("expected catchup request, got {body:?}");
-                };
-                assert!(!req.history_probe_only);
-                assert!(req.force_snapshot);
-                assert_eq!(req.chunk_token, HISTORY_ELECTION_SNAPSHOT_TOKEN);
-            }
-            other => panic!("unexpected capture: {other:?}"),
-        }
+        assert!(
+            captures.is_empty(),
+            "a supported participant without an exact V3 candidate must never receive a legacy snapshot request: {captures:?}",
+        );
+        assert!(rt.state.lock().can_start_history_election());
     }
 
     #[tokio::test]
@@ -18531,7 +18531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_history_election_ignores_non_winning_snapshot_response() {
+    async fn strict_history_election_ignores_legacy_snapshot_after_candidate_rearm() {
         let net = MockNet::new(1, vec![1, 2, 3]);
         enable_v5_floor_with_v4_participants(&net, [2, 3]);
         net.set_epoch(2, 1);
@@ -18554,7 +18554,8 @@ mod tests {
         rt.recv_catchup_resp(3, strict_probe_resp(3, 9, 100, 40))
             .await;
         let captures = net.drain_captures();
-        assert_eq!(captures.len(), 1);
+        assert!(captures.is_empty());
+        assert!(rt.state.lock().can_start_history_election());
 
         let rank_from_3 = HistoryRank {
             version: 9,
@@ -18569,12 +18570,7 @@ mod tests {
 
         assert_eq!(repo.current_version(), 0);
         assert_eq!(repo.log(), Vec::<(u64, u64)>::new());
-        let fetching = rt
-            .state
-            .lock()
-            .history_election_fetching_snapshot()
-            .expect("winning fetch should still be in progress");
-        assert_eq!(fetching.peer(), 2);
+        assert!(rt.state.lock().can_start_history_election());
         assert!(net.drain_captures().is_empty());
     }
 

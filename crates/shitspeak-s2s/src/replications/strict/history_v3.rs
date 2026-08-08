@@ -143,6 +143,46 @@ mod tests {
     }
 
     #[test]
+    fn history_election_owns_repository_intent_across_terminal_fence_repair() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let rank = HistoryRank {
+            version: 100,
+            freshness: 10,
+            runtime_started_at: 20,
+            node_id: 2,
+            terminal_repository_base_version: 90,
+        };
+        let source_cut = TerminalCut::new([1; 16], 2, [2; 32], [3; 32]);
+
+        // A shared probe processes its repair side-obligation before feeding
+        // the same authenticated response into the ranked election.
+        state.defer_until_terminal(peer, rank, source_cut, StrictCatchupReason::TerminalFence);
+        state.defer_until_terminal(peer, rank, source_cut, StrictCatchupReason::HistoryElection);
+        assert_eq!(
+            state
+                .pending_after_terminal(peer)
+                .expect("elected repository intent")
+                .reason(),
+            StrictCatchupReason::HistoryElection,
+            "ranked repository ownership must replace an operational repair reason",
+        );
+
+        // Further terminal work may promote the active terminal client's
+        // operational priority, but it must not revoke ranked repository
+        // replacement authority.
+        state.defer_until_terminal(peer, rank, source_cut, StrictCatchupReason::TerminalFence);
+        assert_eq!(
+            state
+                .pending_after_terminal(peer)
+                .expect("retained elected repository intent")
+                .reason(),
+            StrictCatchupReason::HistoryElection,
+            "terminal repair must not replace an elected repository intent",
+        );
+    }
+
+    #[test]
     fn deferred_terminal_sync_preserves_exact_desired_cut() {
         let peer = PeerIncarnation::new(2, 11);
         let mut state = HistoryV3State::default();
@@ -641,7 +681,13 @@ impl HistoryV3State {
         self.pending
             .entry(peer)
             .and_modify(|current| {
-                let higher_priority = transfer_preempts(reason, current.reason);
+                let election_ownership_changed = reason == StrictCatchupReason::HistoryElection
+                    && current.reason != StrictCatchupReason::HistoryElection;
+                let election_ownership_preserved = current.reason
+                    == StrictCatchupReason::HistoryElection
+                    && reason != StrictCatchupReason::HistoryElection;
+                let higher_priority = !election_ownership_preserved
+                    && (election_ownership_changed || transfer_preempts(reason, current.reason));
                 let same_intent_advanced = reason == current.reason
                     && (rank.beats(current.rank)
                         || (source_cut.journal_id() == current.source_cut.journal_id()
