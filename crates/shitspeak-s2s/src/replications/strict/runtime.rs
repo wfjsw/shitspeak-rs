@@ -3805,9 +3805,9 @@ pub struct StrictRuntime<R: StrictReplicable> {
     pub(super) last_bootstrap_attempt: Mutex<Option<Instant>>,
     /// The exact foreign lineage that last promoted a cluster-wide election
     /// from the admission path. Suppresses identical re-arms until the
-    /// lineage or rank changes (or the election times out), so an unresolved
-    /// terminal fork cannot turn admission responses into a probe and
-    /// clock-tick storm.
+    /// lineage or rank changes, so an unresolved terminal fork cannot turn
+    /// admission responses into a probe and clock-tick storm. Route or
+    /// membership expansion re-arms history recovery independently.
     last_foreign_checkpoint_election: Mutex<Option<ForeignCheckpointLineage>>,
     /// Per-peer admission request throttle for periodic reconciliation.
     /// Descriptor and proposal processing never owns admission fanout.
@@ -13152,7 +13152,7 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
         }
         loop {
             let peers = bootstrap_reachable_peers(rt.net.as_ref(), rt.self_id);
-            let (should_probe, snapshot_request, history_membership_expanded, election_timed_out) = {
+            let (should_probe, snapshot_request, history_membership_expanded) = {
                 let mut state = rt.state.lock();
                 let expanded = state.observe_history_alive_peers(peers.iter().copied());
                 let mut snapshot_request =
@@ -13170,33 +13170,28 @@ fn spawn_bootstrap_retry_loop<R: StrictReplicable>(rt: Arc<StrictRuntime<R>>) {
                         topic = %rt.topic,
                         "strict history election timed out"
                     );
-                    // A probe may be accepted by the transport while its
-                    // response is lost on a transient route. Close this
-                    // attempt with the best responsive rank (the deterministic
-                    // cluster-wide winner) so a divergent node recovers toward
-                    // the majority lineage even when a silently-down peer kept
-                    // the pending set non-empty. Only when no responsive rank
-                    // is usable does the attempt end without a snapshot fetch.
-                    snapshot_request =
-                        snapshot_request.or_else(|| state.conclude_stalled_history_election());
-                    if snapshot_request.is_none() {
+                    if state.history_election_fetching_snapshot().is_some() {
+                        // The elected source did not complete recovery. End
+                        // this attempt without forgetting the foreign lineage
+                        // that admission already promoted.
                         state.finish_history_election();
+                    } else {
+                        // A probe may be accepted by the transport while its
+                        // response is lost on a transient route. Close this
+                        // attempt with the best responsive rank (the
+                        // deterministic cluster-wide winner) so a divergent
+                        // node recovers toward the majority lineage even when
+                        // a silently-down peer kept the pending set non-empty.
+                        snapshot_request =
+                            snapshot_request.or_else(|| state.conclude_stalled_history_election());
                     }
                 }
                 (
                     state.can_start_history_election(),
                     snapshot_request,
                     expanded,
-                    election_timed_out,
                 )
             };
-            if election_timed_out {
-                // A timeout means the election never heard from every probed
-                // peer, so a later response for the same foreign lineage is
-                // not proof the outcome is known. Clear the admission re-arm
-                // guard so a healed route still promotes a fresh election.
-                *rt.last_foreign_checkpoint_election.lock() = None;
-            }
             if history_membership_expanded {
                 rt.wake_clock_tick_loop();
             }
@@ -17631,6 +17626,88 @@ mod tests {
             !state.history_election_timed_out(now, Duration::from_millis(500), snapshot_timeout,),
             "the repository transfer must not inherit the terminal-sync timeout"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_snapshot_keeps_identical_foreign_lineage_deduped() {
+        let interval = Duration::from_millis(10);
+        let snapshot_timeout = Duration::from_millis(20);
+        let (rt, net, _repo) = v1_runtime(
+            ReplicationConfig::default()
+                .with_strict_bootstrap_retry_interval(interval)
+                .with_pending_propose_ttl(snapshot_timeout),
+        );
+        enable_v5_floor_with_v4_participants(&net, [1, 2, 3]);
+        net.set_alive(vec![1, 2, 3]);
+        net.set_live_reliable_routes([1, 2, 3]);
+        net.set_epoch(3, 1);
+
+        let local_rank = HistoryRank::local(&rt);
+        let foreign_rank = HistoryRank {
+            runtime_started_at: local_rank.runtime_started_at.saturating_add(1),
+            node_id: 2,
+            ..local_rank
+        };
+        let foreign_cut = TerminalCut::new(
+            [0xEE; JOURNAL_ID_LEN],
+            0,
+            [0; DIGEST_LEN],
+            [0xCC; DIGEST_LEN],
+        );
+
+        // Keep the first promotion deterministic: production normally starts
+        // bootstrap asynchronously from this callback, while this fixture
+        // installs the exact stalled election state directly below.
+        let weak_self = rt.weak_self.lock().take();
+        assert!(rt.request_foreign_checkpoint_election(foreign_rank, foreign_cut));
+        *rt.weak_self.lock() = weak_self;
+
+        let recovery_rank = HistoryRank {
+            version: local_rank.version.saturating_add(1),
+            freshness: local_rank.freshness,
+            runtime_started_at: local_rank.runtime_started_at,
+            node_id: 3,
+            terminal_repository_base_version: local_rank.version,
+        };
+        {
+            let mut state = rt.state.lock();
+            state.begin_history_election([2, 3]);
+            assert_eq!(
+                state.record_history_probe_response(3, recovery_rank, local_rank),
+                HistoryProbeResponseOutcome::Pending,
+            );
+            let request = state
+                .conclude_stalled_history_election()
+                .expect("the responsive recovery source must win the stalled probe");
+            assert_eq!(request.peer(), 3);
+            let HistoryElectionPhase::FetchingSnapshot { started_at, .. } =
+                &mut state.history_election_phase
+            else {
+                panic!("stalled election must await the winning snapshot");
+            };
+            *started_at = Instant::now() - snapshot_timeout;
+        }
+
+        spawn_bootstrap_retry_loop(rt.clone());
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let initial_jitter =
+            strict_timer_start_jitter(rt.self_id, &rt.topic, StrictTimerLane::Admission, interval);
+        tokio::time::advance(initial_jitter + interval).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !rt.state.lock().history_election_pending(),
+            "the incomplete snapshot attempt must time out before the duplicate response",
+        );
+
+        assert!(
+            !rt.request_foreign_checkpoint_election(foreign_rank, foreign_cut),
+            "an incomplete snapshot must not let the identical foreign lineage rearm the election",
+        );
+        rt.shutdown.cancel();
     }
 
     #[test]
