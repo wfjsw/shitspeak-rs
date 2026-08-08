@@ -76,6 +76,15 @@ impl TerminalCut {
         &self.terminal_set_digest
     }
 
+    pub(crate) fn is_empty_terminal_set(&self) -> bool {
+        if self.generation != 0 || self.chain_digest != EMPTY_CHAIN_DIGEST {
+            return false;
+        }
+        let empty_active = TerminalSetCommitment::empty().digest();
+        let empty_retired = compute_retired_set_digest(&BTreeMap::new());
+        self.terminal_set_digest == combined_terminal_set_digest(empty_retired, empty_active)
+    }
+
     /// Compare the authenticated ordered position while deliberately ignoring
     /// the set digest. Intermediate v3 delta pages carry the source chain
     /// position, but the complete canonical set digest is only authenticated
@@ -3429,6 +3438,23 @@ mod tests {
         take_terminal_set_digest_derivations, take_terminal_set_digest_record_visits,
         take_terminal_set_preview_node_reads, take_terminal_state_derivations,
     };
+
+    #[test]
+    fn empty_terminal_set_excludes_generation_zero_retired_checkpoint() {
+        let empty = TerminalJournal::in_memory("empty");
+        assert!(empty.terminal_cut().is_empty_terminal_set());
+
+        let mut checkpointed = TerminalJournal::in_memory("checkpointed");
+        checkpointed
+            .upsert_abort_decision((1, 1), 1)
+            .expect("terminal decision");
+        checkpointed.checkpoint(1).expect("checkpoint");
+        assert_eq!(checkpointed.terminal_cut().generation(), 0);
+        assert!(
+            !checkpointed.terminal_cut().is_empty_terminal_set(),
+            "retired-origin commitment makes a generation-zero checkpoint populated"
+        );
+    }
 
     #[test]
     fn in_memory_journal_tracks_promise_accept_and_commit() {

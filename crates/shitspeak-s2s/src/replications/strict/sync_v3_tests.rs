@@ -130,6 +130,7 @@ async fn stalled_v3_election_resumes_ranked_checkpoint_instead_of_legacy_snapsho
     }
     assert!(
         sink.record_v3_history_election_rank(peer, rank, source_cut, true)
+            .await
             .is_none(),
         "the silent peer must keep the election probe pending",
     );
@@ -1334,6 +1335,245 @@ async fn foreign_lineage_terminal_fence_never_starts_terminal_sync_toward_the_pe
         rt.state.lock().history_election_blocks_steady_state(),
         "an ahead foreign lineage must promote the ranked election"
     );
+}
+
+#[tokio::test]
+async fn equal_history_empty_foreign_lineage_cannot_fence_a_complete_donor() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+    {
+        let mut journal = rt.terminal_journal.lock().await;
+        journal
+            .upsert_abort_decision((1, 1), 1)
+            .expect("local terminal decision");
+    }
+    let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+    assert!(
+        local_cut.generation() > 0,
+        "fixture must model the complete majority lineage"
+    );
+    let empty_foreign_cut = TerminalJournal::in_memory("empty-foreign").terminal_cut();
+    let metadata = rt.repo.history_metadata();
+    {
+        let mut state = rt.state.lock();
+        state.request_history_election();
+        state.begin_history_election([2]);
+    }
+
+    request_v3_history_probe(&rt, 2, StrictCatchupReason::HistoryElection).await;
+    let request_nonce = net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::HistoryProbeReq(request),
+                ..
+            } => Some(request.request_nonce),
+            _ => None,
+        })
+        .expect("history-election probe request");
+
+    recv_v3_history_probe_resp(
+        &rt,
+        2,
+        22,
+        StrictHistoryProbeResp {
+            responder_node: 2,
+            expected_requester_boot_epoch: 11,
+            request_nonce,
+            repository_version: metadata.version,
+            terminal_repository_base_version: metadata.version,
+            history_freshness: metadata.freshness,
+            // This peer wins the old repository-only rank through the stable
+            // runtime tie-breaker despite having an empty replacement journal.
+            runtime_started_at: 1,
+            history_node: 2,
+            terminal_cut: Some(cut_to_wire(empty_foreign_cut)),
+            reason: StrictCatchupReason::HistoryElection as i32,
+        },
+    )
+    .await;
+
+    assert!(
+        !rt.repository_base_required(),
+        "an equal-history empty journal must not poison a complete snapshot donor"
+    );
+    assert!(
+        rt.begin_snapshot_capture().is_some(),
+        "the complete node must remain available as a snapshot donor"
+    );
+    assert!(
+        !rt.state.lock().history_election_blocks_steady_state(),
+        "the complete local terminal lineage must win the equal-history election"
+    );
+    assert!(
+        !net.drain_captures().into_iter().any(|frame| matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::TerminalSyncReq(_),
+                ..
+            }
+        )),
+        "the empty foreign checkpoint must not start replacement synchronization"
+    );
+}
+
+#[tokio::test]
+async fn equal_history_populated_lineage_beats_empty_lineage_in_any_response_order() {
+    for populated_first in [true, false] {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_epoch(1, 11);
+        net.set_epoch(2, 22);
+        net.set_epoch(3, 33);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            11,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.finish_history_election_for_test();
+        let metadata = rt.repo.history_metadata();
+        let mut populated_journal = TerminalJournal::in_memory("populated-remote");
+        populated_journal
+            .upsert_abort_decision((2, 1), 1)
+            .expect("remote terminal decision");
+        let populated_cut = populated_journal.terminal_cut();
+        let empty_cut = TerminalJournal::in_memory("empty-remote").terminal_cut();
+        let populated_rank = HistoryRank {
+            version: metadata.version,
+            freshness: metadata.freshness,
+            // The complete source deliberately loses the repository-only
+            // runtime tie-breaker to both local and the empty source.
+            runtime_started_at: 99,
+            node_id: 2,
+            terminal_repository_base_version: metadata.version,
+        };
+        let empty_rank = HistoryRank {
+            runtime_started_at: 1,
+            node_id: 3,
+            ..populated_rank
+        };
+        {
+            let mut state = rt.state.lock();
+            state.request_history_election();
+            state.begin_history_election([2, 3]);
+        }
+
+        let selected = if populated_first {
+            assert!(
+                rt.record_v3_history_election_rank(
+                    PeerIncarnation::new(2, 22),
+                    populated_rank,
+                    populated_cut,
+                    true,
+                )
+                .await
+                .is_none()
+            );
+            rt.record_v3_history_election_rank(
+                PeerIncarnation::new(3, 33),
+                empty_rank,
+                empty_cut,
+                true,
+            )
+            .await
+        } else {
+            assert!(
+                rt.record_v3_history_election_rank(
+                    PeerIncarnation::new(3, 33),
+                    empty_rank,
+                    empty_cut,
+                    true,
+                )
+                .await
+                .is_none()
+            );
+            rt.record_v3_history_election_rank(
+                PeerIncarnation::new(2, 22),
+                populated_rank,
+                populated_cut,
+                true,
+            )
+            .await
+        }
+        .expect("one remote source must win the completed election");
+
+        assert_eq!(selected.peer(), PeerIncarnation::new(2, 22));
+        assert_eq!(selected.source_cut(), populated_cut);
+    }
+}
+
+#[tokio::test]
+async fn election_revalidates_empty_winner_after_local_terminal_state_becomes_populated() {
+    let net = MockNet::new(1, vec![1, 2, 3]);
+    net.set_epoch(1, 11);
+    net.set_epoch(2, 22);
+    net.set_epoch(3, 33);
+    let rt = StrictRuntime::new(
+        CountingStrictRepo::new(),
+        1,
+        11,
+        "channels".to_owned(),
+        net,
+        CancellationToken::new(),
+        Arc::new(ReplicationConfig::default()),
+    );
+    rt.finish_history_election_for_test();
+    let metadata = rt.repo.history_metadata();
+    let first_cut = TerminalJournal::in_memory("first-empty").terminal_cut();
+    let second_cut = TerminalJournal::in_memory("second-empty").terminal_cut();
+    let first_rank = HistoryRank {
+        version: metadata.version,
+        freshness: metadata.freshness,
+        runtime_started_at: 1,
+        node_id: 2,
+        terminal_repository_base_version: metadata.version,
+    };
+    let second_rank = HistoryRank {
+        runtime_started_at: 2,
+        node_id: 3,
+        ..first_rank
+    };
+    {
+        let mut state = rt.state.lock();
+        state.request_history_election();
+        state.begin_history_election([2, 3]);
+    }
+
+    assert!(
+        rt.record_v3_history_election_rank(
+            PeerIncarnation::new(2, 22),
+            first_rank,
+            first_cut,
+            true,
+        )
+        .await
+        .is_none()
+    );
+    rt.terminal_journal
+        .lock()
+        .await
+        .upsert_abort_decision((1, 1), 1)
+        .expect("concurrent local terminal decision");
+
+    assert!(
+        rt.record_v3_history_election_rank(
+            PeerIncarnation::new(3, 33),
+            second_rank,
+            second_cut,
+            true,
+        )
+        .await
+        .is_none(),
+        "an empty winner cached before the local fence must be rejected after the fence appears"
+    );
+    let state = rt.state.lock();
+    assert!(state.history_election_pending());
+    assert!(!state.history_election_active());
 }
 
 #[tokio::test]

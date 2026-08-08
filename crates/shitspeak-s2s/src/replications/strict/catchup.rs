@@ -4841,8 +4841,9 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
                 // pending lineage.
                 true
             };
-        let Some(selected) =
-            rt.record_v3_history_election_rank(peer, rank, response_cut, pending_source_authorized)
+        let Some(selected) = rt
+            .record_v3_history_election_rank(peer, rank, response_cut, pending_source_authorized)
+            .await
         else {
             return;
         };
@@ -4909,6 +4910,18 @@ async fn converge_v3_history_source<R: StrictReplicable>(
     let source_satisfied = terminal_equal || source_already_known;
     let local_history = rt.repo.history_metadata();
     let repository_version = local_history.version;
+    if reason == StrictCatchupReason::HistoryElection
+        && (rank.version, rank.freshness) == (local_history.version, local_history.freshness)
+        && source_cut.is_empty_terminal_set()
+        && !local_cut.is_empty_terminal_set()
+    {
+        // Revalidate the winner at the convergence boundary. A terminal
+        // decision can land after its probe response but before the last peer
+        // completes the election; an empty cached candidate must not erase
+        // that newly populated local fence.
+        rearm_history_election(rt);
+        return false;
+    }
     let freshness_replacement_needed = reason == StrictCatchupReason::HistoryElection
         && rank.version == local_history.version
         && rank.freshness > local_history.freshness;
@@ -4992,9 +5005,6 @@ async fn converge_v3_history_source<R: StrictReplicable>(
         next_action,
         "strict history probe convergence decision"
     );
-    if checkpoint_replacement_needed {
-        rt.require_repository_base(rank.version);
-    }
     let terminal_repository_base_version =
         if rank.terminal_repository_base_version == 0 && history_needed {
             // Rolling compatibility with pre-field V5 peers: zero can mean either
@@ -5010,8 +5020,9 @@ async fn converge_v3_history_source<R: StrictReplicable>(
         && history_needed
         && repository_version < terminal_repository_base_version
     {
-        // Latch the prefix requirement before either terminal synchronization
-        // or the already-satisfied fast path can start repository transfer.
+        // A terminal suffix whose repository base is genuinely newer than the
+        // local image must be fenced before synchronization can install it.
+        // Equal-head foreign checkpoints remain donor-safe until staged.
         rt.require_repository_base(terminal_repository_base_version);
     }
     // A previously authenticated source cut proves the source lineage, not
@@ -8560,6 +8571,11 @@ mod tests {
             .expect("remote terminal abort");
         checkpointed.checkpoint(1).expect("remote checkpoint");
         let remote_cut = checkpointed.terminal_cut();
+        rt.terminal_journal
+            .lock()
+            .await
+            .upsert_abort_decision(make_op_id(1, 1, 1), 1)
+            .expect("local terminal abort");
         let local_cut = rt.terminal_journal.lock().await.terminal_cut();
         assert_ne!(
             remote_cut.journal_id(),

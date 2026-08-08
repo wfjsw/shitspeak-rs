@@ -1681,6 +1681,21 @@ impl HistoryRank {
     }
 }
 
+fn history_probe_candidate_beats(
+    candidate: HistoryRank,
+    candidate_terminal_populated: bool,
+    current: HistoryRank,
+    current_terminal_populated: bool,
+) -> bool {
+    if (candidate.version, candidate.freshness) == (current.version, current.freshness)
+        && candidate_terminal_populated != current_terminal_populated
+    {
+        candidate_terminal_populated
+    } else {
+        candidate.beats(current)
+    }
+}
+
 /// Identity of a foreign terminal lineage that promoted a cluster-wide
 /// election from the admission path. A completed election that could not
 /// displace the local lineage must not be re-armed for the identical tuple:
@@ -1742,7 +1757,7 @@ enum HistoryElectionPhase {
     Idle,
     Probing {
         pending_peers: HashSet<NodeIdentifier>,
-        best_remote_rank: Option<HistoryRank>,
+        best_remote_rank: Option<(HistoryRank, bool)>,
         started_at: Instant,
     },
     FetchingSnapshot {
@@ -3071,7 +3086,7 @@ impl StrictState {
                 pending_peers.retain(|peer| reachable_peers.contains(peer));
                 if best_remote_rank
                     .as_ref()
-                    .is_some_and(|rank| !reachable_peers.contains(&rank.node_id))
+                    .is_some_and(|(rank, _)| !reachable_peers.contains(&rank.node_id))
                 {
                     *best_remote_rank = None;
                 }
@@ -3119,7 +3134,7 @@ impl StrictState {
         let best_rank = match &mut self.history_election_phase {
             HistoryElectionPhase::Probing {
                 best_remote_rank, ..
-            } => best_remote_rank.take(),
+            } => best_remote_rank.take().map(|(rank, _)| rank),
             _ => return None,
         };
         let Some(best_rank) = best_rank else {
@@ -3198,7 +3213,7 @@ impl StrictState {
         let best_rank = match &self.history_election_phase {
             HistoryElectionPhase::Probing {
                 best_remote_rank, ..
-            } => *best_remote_rank,
+            } => best_remote_rank.map(|(rank, _)| rank),
             _ => None,
         };
         let Some(best_rank) = best_rank else {
@@ -3227,6 +3242,8 @@ impl StrictState {
             remote_rank,
             local_rank,
             true,
+            false,
+            false,
         )
     }
 
@@ -3236,6 +3253,8 @@ impl StrictState {
         remote_rank: HistoryRank,
         local_rank: HistoryRank,
         pending_source_authorized: bool,
+        remote_terminal_populated: bool,
+        terminal_source_preferred: bool,
     ) -> HistoryProbeResponseOutcome {
         let required_version = self.repository_base_required_version;
         let pending_install = self.pending_repository_image_install;
@@ -3250,20 +3269,27 @@ impl StrictState {
                     return HistoryProbeResponseOutcome::Ignored;
                 }
                 *started_at = Instant::now();
-                let eligible = if repository_base_required {
-                    pending_source_authorized
-                        && required_version.is_none_or(|required| remote_rank.version >= required)
-                        && pending_install.is_none_or(|pending| {
-                            (remote_rank.version, remote_rank.freshness)
-                                >= (pending.version, pending.freshness)
-                        })
-                } else {
-                    remote_rank.beats(local_rank)
-                };
+                let eligible = pending_source_authorized
+                    && if repository_base_required {
+                        required_version.is_none_or(|required| remote_rank.version >= required)
+                            && pending_install.is_none_or(|pending| {
+                                (remote_rank.version, remote_rank.freshness)
+                                    >= (pending.version, pending.freshness)
+                            })
+                    } else {
+                        terminal_source_preferred || remote_rank.beats(local_rank)
+                    };
                 if eligible {
                     let replace = match best_remote_rank {
-                        Some(current) => pending_install.map_or_else(
-                            || remote_rank.beats(*current),
+                        Some((current, current_terminal_populated)) => pending_install.map_or_else(
+                            || {
+                                history_probe_candidate_beats(
+                                    remote_rank,
+                                    remote_terminal_populated,
+                                    *current,
+                                    *current_terminal_populated,
+                                )
+                            },
                             |pending| {
                                 let pending = (pending.version, pending.freshness);
                                 let candidate_exact =
@@ -3271,13 +3297,18 @@ impl StrictState {
                                 let current_exact = (current.version, current.freshness) == pending;
                                 (candidate_exact && !current_exact)
                                     || (candidate_exact == current_exact
-                                        && remote_rank.beats(*current))
+                                        && history_probe_candidate_beats(
+                                            remote_rank,
+                                            remote_terminal_populated,
+                                            *current,
+                                            *current_terminal_populated,
+                                        ))
                             },
                         ),
                         None => true,
                     };
                     if replace {
-                        *best_remote_rank = Some(remote_rank);
+                        *best_remote_rank = Some((remote_rank, remote_terminal_populated));
                     }
                 }
             }
@@ -3292,7 +3323,7 @@ impl StrictState {
                 pending_peers,
                 best_remote_rank,
                 ..
-            } if pending_peers.is_empty() => *best_remote_rank,
+            } if pending_peers.is_empty() => best_remote_rank.map(|(rank, _)| rank),
             HistoryElectionPhase::Probing { .. } => {
                 metrics::record_strict_history_election_event(
                     StrictHistoryElectionEvent::ResponsePending,
@@ -5320,17 +5351,38 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// Record one metadata-only v3 election response. Repository and
     /// admission state are deliberately not changed here: only the elected
     /// source may proceed to terminal synchronization and history transfer.
-    pub(super) fn record_v3_history_election_rank(
+    pub(super) async fn record_v3_history_election_rank(
         &self,
         peer: PeerIncarnation,
         remote_rank: HistoryRank,
         source_cut: TerminalCut,
         pending_source_authorized: bool,
     ) -> Option<HistoryProbeCandidate> {
+        let local_rank = HistoryRank::local(self);
+        let (terminal_source_authorized, remote_terminal_populated, terminal_source_preferred) =
+            if (remote_rank.version, remote_rank.freshness)
+                == (local_rank.version, local_rank.freshness)
+            {
+                let local_cut = self.terminal_journal.lock().await.terminal_cut();
+                let local_terminal_populated = !local_cut.is_empty_terminal_set();
+                let remote_terminal_populated = !source_cut.is_empty_terminal_set();
+                // A restarted peer can retain the repository head while losing
+                // every active and retired terminal fence. Its empty journal must
+                // not displace a non-empty equal-head lineage merely through the
+                // runtime/node tie-breakers. Generation zero alone is not enough:
+                // a real checkpoint retains a non-empty retired-set commitment.
+                (
+                    !local_terminal_populated || remote_terminal_populated,
+                    remote_terminal_populated,
+                    remote_terminal_populated && !local_terminal_populated,
+                )
+            } else {
+                (true, !source_cut.is_empty_terminal_set(), false)
+            };
+        let source_authorized = pending_source_authorized && terminal_source_authorized;
         self.v3_history
             .lock()
             .record_probe_candidate(peer, remote_rank, source_cut);
-        let local_rank = HistoryRank::local(self);
         let outcome = self
             .state
             .lock()
@@ -5338,11 +5390,13 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 peer.node(),
                 remote_rank,
                 local_rank,
-                pending_source_authorized,
+                source_authorized,
+                remote_terminal_populated,
+                terminal_source_preferred,
             );
         let (selected, outcome_label, selected_peer) = match outcome {
             HistoryProbeResponseOutcome::FetchSnapshot(request) => {
-                let selected = self
+                let mut selected = self
                     .net
                     .member_boot_epoch(request.peer())
                     .and_then(|epoch| {
@@ -5351,6 +5405,29 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                             request.expected_rank(),
                         )
                     });
+                let selected_terminal_stale = if let Some(candidate) = selected.as_ref() {
+                    let current_local_rank = HistoryRank::local(self);
+                    if (candidate.rank().version, candidate.rank().freshness)
+                        == (current_local_rank.version, current_local_rank.freshness)
+                        && candidate.source_cut().is_empty_terminal_set()
+                    {
+                        !self
+                            .terminal_journal
+                            .lock()
+                            .await
+                            .terminal_cut()
+                            .is_empty_terminal_set()
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if selected_terminal_stale {
+                    selected = None;
+                    self.state.lock().request_history_election();
+                    self.wake_delivery_and_clock_tick();
+                }
                 if selected.is_none() {
                     // The election result is unusable without the exact
                     // responder incarnation and terminal cut that produced
@@ -5361,7 +5438,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 let selected_peer = selected
                     .as_ref()
                     .map(|candidate| (candidate.peer().node(), candidate.peer().boot_epoch()));
-                let outcome_label = if selected.is_some() {
+                let outcome_label = if selected_terminal_stale {
+                    "selected_terminal_stale"
+                } else if selected.is_some() {
                     "remote_selected"
                 } else {
                     "selected_missing"
@@ -5390,6 +5469,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             remote_terminal_generation = source_cut.generation(),
             remote_terminal_set_digest = ?source_cut.terminal_set_digest(),
             pending_source_authorized,
+            terminal_source_authorized,
             outcome = outcome_label,
             selected_peer = ?selected_peer,
             "strict history election rank decision"
@@ -17699,6 +17779,8 @@ mod tests {
                 same_tuple_wrong_lineage,
                 local_rank,
                 false,
+                false,
+                false,
             ),
             HistoryProbeResponseOutcome::Pending,
             "repository metadata alone must not authorize a different terminal lineage"
@@ -17711,7 +17793,7 @@ mod tests {
         };
         let HistoryProbeResponseOutcome::FetchSnapshot(request) = state
             .record_history_probe_response_with_source_authorization(
-                3, authorized, local_rank, true,
+                3, authorized, local_rank, true, false, false,
             )
         else {
             panic!("the exact metadata from the authorized pending lineage must win");
@@ -18368,6 +18450,8 @@ mod tests {
                 authorized_rank,
                 local_rank,
                 true,
+                false,
+                false,
             ),
             HistoryProbeResponseOutcome::Pending
         );
@@ -25072,7 +25156,21 @@ mod tests {
         );
         assert_eq!(terminal_page.checkpoint_states.len(), 2);
         assert!(!terminal_page.has_more);
-        assert!(sink.repository_base_required());
+        if sink_version == snapshot_version {
+            assert!(
+                !sink.repository_base_required(),
+                "an equal-head checkpoint that is only in flight must not fence this node as a donor"
+            );
+            assert!(
+                sink.begin_snapshot_capture().is_some(),
+                "the election phase already fences local writes while snapshots remain available"
+            );
+        } else {
+            assert!(
+                sink.repository_base_required(),
+                "a newer terminal suffix must fence delivery over the older repository image"
+            );
+        }
         assert_eq!(
             sink.v3_sync
                 .lock()
@@ -25108,6 +25206,10 @@ mod tests {
             })
             .expect("terminal checkpoint ACK confirmation");
         super::super::catchup::recv_v3_terminal_sync_ack(&sink, 1, 11, terminal_confirmation).await;
+        assert!(
+            sink.repository_base_required(),
+            "binding the staged checkpoint must fence snapshots before repository transfer"
+        );
         let staged_cut = sink
             .v3_sync
             .lock()
