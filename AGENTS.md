@@ -14,7 +14,7 @@ When dealing a regression / correctness hole, whether it is a new problem or is 
 
 ## Strict replication incident handling
 
-When fixing a strict replication problem, first pull the affected nodes' live state files through SSH. Reproduce the complete relevant node state in a local cluster, including each strict repository and terminal state; clients and network latency do not need to be emulated. Observe the reported symptom in that local cluster before implementing the fix. Do not consider the work finished until the same local-cluster reproduction demonstrates that the symptom is fully resolved.
+When fixing a strict replication problem, first pull the affected nodes' live state files through SSH. Reproduce only each node's strict channel repository and strict terminal journal state in a local cluster; clients and network latency do not need to be emulated. Seed addresses and advertised IPs may be changed as needed to form the local cluster. Observe the reported symptom in that local cluster before implementing the fix. Do not consider the work finished until the same local-cluster reproduction demonstrates that the symptom is fully resolved.
 
 ## Batch the test
 

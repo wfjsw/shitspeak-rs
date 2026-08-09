@@ -28,6 +28,8 @@ pub trait ErasedStrictRuntime: Send + Sync + 'static {
     /// strict v2 advertisement. This is intentionally independent of the
     /// local LSA value so the manager can probe before it promotes the LSA.
     fn strict_v2_advertisement_prerequisites_ready(&self) -> bool;
+    #[cfg(any(test, feature = "test-support"))]
+    fn snapshot_capture_available_for_test(&self) -> bool;
     /// Cancel any background work owned by this topic.
     fn shutdown(&self);
 }

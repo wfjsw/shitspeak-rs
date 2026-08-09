@@ -1707,6 +1707,7 @@ fn history_probe_candidate_beats(
 pub(super) struct ForeignCheckpointLineage {
     journal_id: [u8; JOURNAL_ID_LEN],
     terminal_set_digest: [u8; DIGEST_LEN],
+    terminal_populated: bool,
     version: u64,
     freshness: i64,
 }
@@ -1716,10 +1717,39 @@ impl ForeignCheckpointLineage {
         Self {
             journal_id: *cut.journal_id(),
             terminal_set_digest: *cut.terminal_set_digest(),
+            terminal_populated: !cut.is_empty_terminal_set(),
             version: rank.version,
             freshness: rank.freshness,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ForeignCheckpointTrigger {
+    peer: PeerIncarnation,
+    rank: HistoryRank,
+    lineage: ForeignCheckpointLineage,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ForeignCheckpointDominator {
+    peer: PeerIncarnation,
+    rank: HistoryRank,
+    source_cut: TerminalCut,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ForeignCheckpointElectionMemo {
+    Futile(ForeignCheckpointLineage),
+    Pending {
+        trigger: ForeignCheckpointTrigger,
+        election_generation: u64,
+    },
+    Dominated {
+        trigger: ForeignCheckpointTrigger,
+        winner: ForeignCheckpointDominator,
+        local_head: HeadEvidenceIdentity,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3875,12 +3905,13 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// heal, so the initial attempt may fail with NoRoute and we rely on
     /// later membership events to drive a retry).
     pub(super) last_bootstrap_attempt: Mutex<Option<Instant>>,
-    /// The exact foreign lineage that last promoted a cluster-wide election
-    /// from the admission path. Suppresses identical re-arms until the
-    /// lineage or rank changes, so an unresolved terminal fork cannot turn
-    /// admission responses into a probe and clock-tick storm. Route or
-    /// membership expansion re-arms history recovery independently.
-    last_foreign_checkpoint_election: Mutex<Option<ForeignCheckpointLineage>>,
+    /// The exact foreign lineage from each peer that last promoted a
+    /// cluster-wide election from the admission path. Suppresses identical
+    /// re-arms until that peer's lineage or rank changes, so distinct losing
+    /// checkpoint peers cannot evict one another and turn admission responses
+    /// into a probe and clock-tick storm. The map is bounded by peer node IDs;
+    /// removal or restart clears that peer's entry.
+    foreign_checkpoint_elections: Mutex<HashMap<NodeIdentifier, ForeignCheckpointElectionMemo>>,
     /// Per-peer, per-frozen-obligation admission retry schedule. History and
     /// clock retries back off independently; changed obligation identity
     /// retries immediately.
@@ -4499,7 +4530,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             resolution_ack_broadcasts: Mutex::new(HashSet::new()),
             weak_self: Mutex::new(None),
             last_bootstrap_attempt: Mutex::new(None),
-            last_foreign_checkpoint_election: Mutex::new(None),
+            foreign_checkpoint_elections: Mutex::new(HashMap::new()),
             admission_probe_schedules: Mutex::new(HashMap::new()),
             delivery_blocked_log: Mutex::new(DeliveryBlockedLogState::default()),
             shutdown,
@@ -4765,21 +4796,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         }
     }
 
-    /// Start a cluster-wide election as soon as an admission response reveals
-    /// a terminal lineage that admission is not allowed to install.
-    pub(super) fn request_global_history_election(&self) -> bool {
-        let requested = {
-            let mut state = self.state.lock();
-            if state.history_election_blocks_steady_state() {
-                false
-            } else {
-                state.request_history_election();
-                true
-            }
-        };
-        if !requested {
-            return false;
-        }
+    fn start_requested_history_election(&self) {
         self.admission_probe_schedules.lock().clear();
         // This is a verified foreign lineage, not a membership flap. Bypass
         // the bootstrap retry throttle so admission cannot leave recovery idle.
@@ -4792,7 +4809,50 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 }
             });
         }
-        true
+    }
+
+    fn foreign_checkpoint_dominator_is_current(
+        &self,
+        head: &RepositoryTerminalHead,
+        repository_base_required: bool,
+        trigger: ForeignCheckpointTrigger,
+        winner: ForeignCheckpointDominator,
+        local_head: HeadEvidenceIdentity,
+        remote_rank: HistoryRank,
+        lineage: ForeignCheckpointLineage,
+    ) -> bool {
+        if trigger.rank != remote_rank
+            || trigger.lineage != lineage
+            || self.net.member_boot_epoch(trigger.peer.node()) != Some(trigger.peer.boot_epoch())
+            || self.net.member_boot_epoch(winner.peer.node()) != Some(winner.peer.boot_epoch())
+            || !self
+                .net
+                .has_live_route(winner.peer.node(), ServiceLevel::Reliable)
+            || !history_probe_candidate_beats(
+                winner.rank,
+                !winner.source_cut.is_empty_terminal_set(),
+                remote_rank,
+                lineage.terminal_populated,
+            )
+            || repository_base_required
+        {
+            return false;
+        }
+        let winner_is_current = self
+            .v3_history
+            .lock()
+            .probe_candidate(winner.peer, winner.rank)
+            .is_some_and(|candidate| candidate.source_cut() == winner.source_cut);
+        if !winner_is_current {
+            return false;
+        }
+        HeadEvidenceIdentity::from_head(head.history_metadata, &head.terminal_cut) == local_head
+            && winner.source_cut == head.terminal_cut
+            && (winner.rank.version, winner.rank.freshness)
+                == (
+                    head.history_metadata.version,
+                    head.history_metadata.freshness,
+                )
     }
 
     /// Promote a cluster-wide election from an admission response, but only
@@ -4804,33 +4864,97 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// them. A changed lineage, an ahead peer, or a required repository base
     /// promotes a fresh election immediately, preserving recovery for healed
     /// or advanced routes.
-    pub(super) fn request_foreign_checkpoint_election(
+    pub(super) async fn request_foreign_checkpoint_election(
         &self,
+        trigger_peer: PeerIncarnation,
         remote_rank: HistoryRank,
         remote_cut: TerminalCut,
     ) -> bool {
-        let local_rank = HistoryRank::local(self);
-        // A completed election can only select the remote when its rank
-        // beats the local rank, or when a required repository base
-        // authorizes a lower-ranked source. Otherwise it provably finishes
-        // local_won and re-arming only re-probes every peer and bursts
-        // clock ticks at them.
-        let futile = !remote_rank.beats(local_rank) && !self.repository_base_required();
+        if trigger_peer.node() != remote_rank.node_id
+            || self.net.member_boot_epoch(trigger_peer.node()) != Some(trigger_peer.boot_epoch())
+        {
+            return false;
+        }
         let lineage = ForeignCheckpointLineage::of(remote_rank, remote_cut);
-        if futile {
-            let remembered = self.last_foreign_checkpoint_election.lock();
-            if *remembered == Some(lineage) {
+        let trigger = ForeignCheckpointTrigger {
+            peer: trigger_peer,
+            rank: remote_rank,
+            lineage,
+        };
+        let requested = {
+            // Keep the authoritative repository/terminal head fixed until the
+            // election request and its trigger memo have one linearized outcome.
+            let head = self.repository_terminal_head.lock().await;
+            if remote_cut.journal_id() == head.terminal_cut.journal_id()
+                || remote_cut.terminal_set_digest() == head.terminal_cut.terminal_set_digest()
+            {
+                return false;
+            }
+            let local_rank =
+                HistoryRank::from_metadata(head.history_metadata, self.boot_epoch, self.self_id);
+            let mut state = self.state.lock();
+            let repository_base_required = state.repository_base_required();
+            // A completed election can only select the remote when its rank
+            // beats the local rank, or when a required repository base
+            // authorizes a lower-ranked source. Otherwise it provably finishes
+            // local_won and re-arming only re-probes every peer and bursts
+            // clock ticks at them.
+            let futile = !history_probe_candidate_beats(
+                remote_rank,
+                !remote_cut.is_empty_terminal_set(),
+                local_rank,
+                !head.terminal_cut.is_empty_terminal_set(),
+            ) && !repository_base_required;
+            let remembered = self
+                .foreign_checkpoint_elections
+                .lock()
+                .get(&trigger_peer.node())
+                .copied();
+            let deduped = match remembered {
+                Some(ForeignCheckpointElectionMemo::Futile(remembered)) if futile => {
+                    remembered == lineage
+                }
+                Some(ForeignCheckpointElectionMemo::Dominated {
+                    trigger,
+                    winner,
+                    local_head,
+                }) => self.foreign_checkpoint_dominator_is_current(
+                    &head,
+                    repository_base_required,
+                    trigger,
+                    winner,
+                    local_head,
+                    remote_rank,
+                    lineage,
+                ),
+                _ => false,
+            };
+            if deduped {
                 metrics::record_strict_terminal_divergence_event(
                     StrictTerminalDivergenceEvent::ForeignLineageElectionDeduped,
                 );
                 return false;
             }
-        }
-        let requested = self.request_global_history_election();
-        if requested && futile {
-            *self.last_foreign_checkpoint_election.lock() = Some(lineage);
-        }
+            if state.history_election_blocks_steady_state() {
+                false
+            } else {
+                state.request_history_election();
+                let memo = if futile {
+                    ForeignCheckpointElectionMemo::Futile(lineage)
+                } else {
+                    ForeignCheckpointElectionMemo::Pending {
+                        trigger,
+                        election_generation: state.history_election_generation,
+                    }
+                };
+                self.foreign_checkpoint_elections
+                    .lock()
+                    .insert(trigger_peer.node(), memo);
+                true
+            }
+        };
         if requested {
+            self.start_requested_history_election();
             metrics::record_strict_terminal_divergence_event(
                 StrictTerminalDivergenceEvent::ForeignLineageElectionRequested,
             );
@@ -4844,6 +4968,70 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             );
         }
         requested
+    }
+
+    pub(super) async fn finish_history_election_with_exact_winner(
+        &self,
+        winner_peer: PeerIncarnation,
+        winner_rank: HistoryRank,
+        winner_cut: TerminalCut,
+    ) {
+        let head_guard = self.repository_terminal_head.lock().await;
+        let head = *head_guard;
+        let local_head = HeadEvidenceIdentity::from_head(head.history_metadata, &head.terminal_cut);
+        let winner = ForeignCheckpointDominator {
+            peer: winner_peer,
+            rank: winner_rank,
+            source_cut: winner_cut,
+        };
+        let mut state = self.state.lock();
+        let phase_matches = matches!(
+            state.history_election_phase,
+            HistoryElectionPhase::FetchingSnapshot {
+                peer,
+                expected_rank,
+                ..
+            } if peer == winner_peer.node() && expected_rank == winner_rank
+        );
+        let exact_live_winner = phase_matches
+            && !state.repository_base_required()
+            && (winner_rank.version, winner_rank.freshness)
+                == (
+                    head.history_metadata.version,
+                    head.history_metadata.freshness,
+                )
+            && winner_cut == head.terminal_cut
+            && self.net.member_boot_epoch(winner_peer.node()) == Some(winner_peer.boot_epoch())
+            && self
+                .net
+                .has_live_route(winner_peer.node(), ServiceLevel::Reliable);
+        if exact_live_winner {
+            let generation = state.history_election_generation;
+            for memo in self.foreign_checkpoint_elections.lock().values_mut() {
+                let ForeignCheckpointElectionMemo::Pending {
+                    trigger,
+                    election_generation,
+                } = *memo
+                else {
+                    continue;
+                };
+                if election_generation == generation
+                    && history_probe_candidate_beats(
+                        winner_rank,
+                        !winner_cut.is_empty_terminal_set(),
+                        trigger.rank,
+                        trigger.lineage.terminal_populated,
+                    )
+                {
+                    *memo = ForeignCheckpointElectionMemo::Dominated {
+                        trigger,
+                        winner,
+                        local_head,
+                    };
+                }
+            }
+        }
+        state.finish_history_election();
     }
 
     pub(crate) fn wake_delivery_and_clock_tick(&self) {
@@ -6336,10 +6524,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 return TerminalInstallResult::Rejected;
             }
         };
+        let repository_head = self.repository_terminal_head.lock().await;
+        let durable_required_repository_base_version = record.required_repository_base_version();
+        let repository_base_missing = durable_required_repository_base_version
+            .is_some_and(|required| repository_head.history_metadata.version < required);
         if !journal_changed {
             let state_changed = {
                 let mut state = self.state.lock();
-                if let Some(required_version) = required_repository_base_version {
+                if repository_base_missing {
+                    let required_version = durable_required_repository_base_version
+                        .expect("a missing repository base must have a required version");
                     state.require_repository_base(required_version);
                 }
                 hydrate_terminal_journal_record(&mut state, op_id, &record, true);
@@ -6354,10 +6548,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let mut state_changed = false;
         {
             let mut state = self.state.lock();
-            if let Some(required_version) = required_repository_base_version {
+            if repository_base_missing {
+                let required_version = durable_required_repository_base_version
+                    .expect("a missing repository base must have a required version");
                 // The journal already durably records this dependency. Raise
-                // the in-memory gate under the same lock before the imported
-                // commit can enter the delivery buffer.
+                // the in-memory gate while the authoritative repository head
+                // is locked, before the imported commit can enter delivery.
                 state.require_repository_base(required_version);
             }
             let decision = TerminalDecision::Commit(AcceptedValue {
@@ -10562,7 +10758,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// election, so the divergent node pulls the majority's elected
     /// checkpoint instead of the majority adopting the minority's stale
     /// lineage through per-operation terminal sync.
-    fn request_history_election_for_terminal_divergence(
+    async fn request_history_election_for_terminal_divergence(
         &self,
         from: NodeIdentifier,
         origin_boot_epoch: u64,
@@ -10577,27 +10773,34 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let Some(remote_cut) = tick.terminal_cut.as_ref().and_then(cut_from_wire) else {
             return false;
         };
-        let local = self.repo.history_metadata();
-        if tick.repository_version != local.version || tick.history_freshness != local.freshness {
-            // Both sides must already agree on the repository head. A version
-            // or freshness gap is detected and repaired by the existing
-            // rank-divergence and repository-gap paths; firing here would
-            // start an election for an ordinary ahead peer and wipe its
-            // admitted clock evidence.
-            return false;
-        }
-        let suppressed_event = {
-            let Ok(journal) = self.terminal_journal.try_lock() else {
+        let (suppressed_event, local_rank) = {
+            let head = self.repository_terminal_head.lock().await;
+            if tick.repository_version != head.history_metadata.version
+                || tick.history_freshness != head.history_metadata.freshness
+            {
+                // Both sides must already agree on the repository head. A version
+                // or freshness gap is detected and repaired by the existing
+                // rank-divergence and repository-gap paths; firing here would
+                // start an election for an ordinary ahead peer and wipe its
+                // admitted clock evidence.
                 return false;
-            };
-            let local_cut = journal.terminal_cut();
+            }
+            let journal = self.terminal_journal.lock().await;
+            let local_cut = head.terminal_cut;
             if local_cut.journal_id() == remote_cut.journal_id()
                 || local_cut.terminal_set_digest() == remote_cut.terminal_set_digest()
             {
                 // Same lineage, or an equal terminal set within it: the
                 // existing repair and admission paths cover this. Only a
                 // truly foreign lineage needs a ranked election to reconcile.
-                Some(StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedSameLineage)
+                (
+                    Some(StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedSameLineage),
+                    HistoryRank::from_metadata(
+                        head.history_metadata,
+                        self.boot_epoch,
+                        self.self_id,
+                    ),
+                )
             } else if remote_cut.generation() < local_cut.generation() {
                 // A peer that shares this journal's record history lags by a
                 // generation. Its advertised prefix cut authenticates to the
@@ -10605,16 +10808,30 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 // generation. Transient generation skew like this is repaired
                 // by the normal admission paths and must not start a pull
                 // election that wipes the peer's admitted clock evidence.
-                journal
-                    .terminal_cut_at(remote_cut.generation())
-                    .is_some_and(|historical| {
-                        historical.terminal_set_digest() == remote_cut.terminal_set_digest()
-                    })
-                    .then_some(
-                        StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedLaggingGeneration,
-                    )
+                (
+                    journal
+                        .terminal_cut_at(remote_cut.generation())
+                        .is_some_and(|historical| {
+                            historical.terminal_set_digest() == remote_cut.terminal_set_digest()
+                        })
+                        .then_some(
+                            StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedLaggingGeneration,
+                        ),
+                    HistoryRank::from_metadata(
+                        head.history_metadata,
+                        self.boot_epoch,
+                        self.self_id,
+                    ),
+                )
             } else {
-                None
+                (
+                    None,
+                    HistoryRank::from_metadata(
+                        head.history_metadata,
+                        self.boot_epoch,
+                        self.self_id,
+                    ),
+                )
             }
         };
         if let Some(event) = suppressed_event {
@@ -10628,7 +10845,6 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             node_id: from,
             terminal_repository_base_version: 0,
         };
-        let local_rank = HistoryRank::local(self);
         if !remote_rank.beats(local_rank) && !self.repository_base_required() {
             metrics::record_strict_terminal_divergence_event(
                 StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedBehindPeer,
@@ -10638,7 +10854,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             // view of this node's higher-ranked lineage.
             return false;
         }
-        self.request_foreign_checkpoint_election(remote_rank, remote_cut)
+        self.request_foreign_checkpoint_election(
+            PeerIncarnation::new(from, origin_boot_epoch),
+            remote_rank,
+            remote_cut,
+        )
+        .await
     }
 
     fn remember_advertised_head(
@@ -11487,6 +11708,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             MembershipTransition::Removed | MembershipTransition::Restarted
         );
         if peer_removed {
+            self.foreign_checkpoint_elections
+                .lock()
+                .retain(|node, memo| {
+                    *node != member.node_id()
+                        && !matches!(
+                            memo,
+                            ForeignCheckpointElectionMemo::Dominated { winner, .. }
+                                if winner.peer.node() == member.node_id()
+                        )
+                });
             if let Some(evidence) = self.head_evidence.lock().as_mut() {
                 evidence
                     .acknowledged_by
@@ -11862,7 +12093,8 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
                     &t,
                 );
                 let foreign_checkpoint_election = self
-                    .request_history_election_for_terminal_divergence(from, origin_boot_epoch, &t);
+                    .request_history_election_for_terminal_divergence(from, origin_boot_epoch, &t)
+                    .await;
                 // A clock tick is a delivery watermark only after its
                 // advertised terminal cut has been synchronized. Otherwise a
                 // reordered tick could release a later buffered commit before
@@ -12059,6 +12291,11 @@ impl<R: StrictReplicable> ErasedStrictRuntime for StrictRuntime<R> {
 
     fn strict_v2_advertisement_prerequisites_ready(&self) -> bool {
         StrictRuntime::strict_v2_advertisement_prerequisites_ready(self)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn snapshot_capture_available_for_test(&self) -> bool {
+        self.begin_snapshot_capture().is_some()
     }
 
     fn shutdown(&self) {
@@ -17616,6 +17853,7 @@ mod tests {
         net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
         net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
         net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V5);
+        net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V5);
         net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
         let repo = CountingStrictRepo::new();
         *repo.state.lock() = (10, vec![(10, 110, None)]);
@@ -18018,12 +18256,19 @@ mod tests {
         net.set_live_reliable_routes([1, 2, 3]);
         net.set_epoch(3, 1);
 
+        rt.with_terminal_journal_mutation(|journal| {
+            journal.upsert_abort_decision(make_op_id(1, 1, 1), 1)
+        })
+        .await
+        .expect("local terminal abort");
+
         let local_rank = HistoryRank::local(&rt);
         let foreign_rank = HistoryRank {
             runtime_started_at: local_rank.runtime_started_at.saturating_add(1),
             node_id: 2,
             ..local_rank
         };
+        net.set_epoch(2, foreign_rank.runtime_started_at);
         let foreign_cut = TerminalCut::new(
             [0xEE; JOURNAL_ID_LEN],
             0,
@@ -18035,7 +18280,14 @@ mod tests {
         // bootstrap asynchronously from this callback, while this fixture
         // installs the exact stalled election state directly below.
         let weak_self = rt.weak_self.lock().take();
-        assert!(rt.request_foreign_checkpoint_election(foreign_rank, foreign_cut));
+        assert!(
+            rt.request_foreign_checkpoint_election(
+                PeerIncarnation::new(2, foreign_rank.runtime_started_at),
+                foreign_rank,
+                foreign_cut,
+            )
+            .await
+        );
         *rt.weak_self.lock() = weak_self;
 
         let recovery_rank = HistoryRank {
@@ -18080,7 +18332,12 @@ mod tests {
         );
 
         assert!(
-            !rt.request_foreign_checkpoint_election(foreign_rank, foreign_cut),
+            !rt.request_foreign_checkpoint_election(
+                PeerIncarnation::new(2, foreign_rank.runtime_started_at),
+                foreign_rank,
+                foreign_cut,
+            )
+            .await,
             "an incomplete snapshot must not let the identical foreign lineage rearm the election",
         );
         rt.shutdown.cancel();
@@ -18094,7 +18351,12 @@ mod tests {
                 .with_strict_bootstrap_retry_interval(interval)
                 .with_strict_steady_state_catchup_interval(Duration::from_millis(80)),
         );
-        *repo.state.lock() = (1, vec![(1, 1, None)]);
+        rt.apply_repository_commit(1, 1).await;
+        rt.with_terminal_journal_mutation(|journal| {
+            journal.upsert_abort_decision(make_op_id(1, 1, 1), 1)
+        })
+        .await
+        .expect("local terminal abort");
         enable_v5_floor_with_v4_participants(&net, [1, 2]);
         net.set_alive(vec![1, 2]);
         net.set_live_reliable_routes([1, 2]);
@@ -18153,7 +18415,6 @@ mod tests {
             response_for(initial_request.request_nonce),
         )
         .await;
-        *rt.weak_self.lock() = weak_self;
         assert!(rt.state.lock().history_election_pending());
         rt.finish_history_election_for_test();
         rt.reconcile_peer_admissions();
@@ -18225,10 +18486,9 @@ mod tests {
 
         // An active topic changes its local head between polls. That does not
         // make the peer's unchanged rejected lineage admissible.
-        {
-            let mut repository = repo.state.lock();
-            repository.0 = repository.0.saturating_add(1);
-        }
+        let next_repository_version = repo.current_version().saturating_add(1);
+        rt.apply_repository_commit(next_repository_version, next_repository_version)
+            .await;
         for _ in 0..4 {
             request_admission_probes(&rt).await;
         }
@@ -18265,6 +18525,7 @@ mod tests {
             )),
             "the bounded recheck must preserve recovery discovery",
         );
+        *rt.weak_self.lock() = weak_self;
     }
 
     #[test]
@@ -21705,7 +21966,8 @@ mod tests {
                 2,
                 1,
                 &foreign_tick(metadata.freshness),
-            ),
+            )
+            .await,
             "a rank-behind foreign lineage must not make the majority request an election"
         );
         assert!(
@@ -21720,7 +21982,8 @@ mod tests {
                 2,
                 1,
                 &foreign_tick(metadata.freshness.saturating_add(1)),
-            ),
+            )
+            .await,
             "a freshness gap must be handled by the existing rank-divergence path"
         );
         assert!(
@@ -21733,10 +21996,8 @@ mod tests {
         // cut at the peer's generation. That is transient generation skew
         // inside a converging history and must not start an election, even
         // when the peer's boot rank is ahead.
-        rt.terminal_journal
-            .lock()
+        rt.with_terminal_journal_mutation(|journal| journal.upsert_abort_decision((1, 1), 1))
             .await
-            .upsert_abort_decision((1, 1), 1)
             .expect("fixture terminal decision must apply");
         let prefix_cut = rt
             .terminal_journal
@@ -21768,7 +22029,8 @@ mod tests {
         // elected checkpoint.
         net.set_epoch(2, 0);
         assert!(
-            !rt.request_history_election_for_terminal_divergence(2, 0, &lagging_tick),
+            !rt.request_history_election_for_terminal_divergence(2, 0, &lagging_tick)
+                .await,
             "a lagging prefix of the local record history must not start an election"
         );
         assert!(
@@ -21780,13 +22042,357 @@ mod tests {
                 2,
                 0,
                 &foreign_tick(metadata.freshness),
-            ),
+            )
+            .await,
             "an ahead foreign lineage must trigger the ranked pull election"
         );
         assert!(
             rt.state.lock().history_election_blocks_steady_state(),
             "the divergent minority must request the election"
         );
+    }
+
+    #[tokio::test]
+    async fn alternating_futile_retired_checkpoint_lineages_start_each_election_once() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V5);
+        net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V5);
+        net.set_epoch(2, 1);
+        net.set_epoch(3, 1);
+
+        // Production had an active generation-4106 lineage alongside two
+        // wire-distinct, valid generation-zero checkpoints at the same
+        // repository version/freshness. Model those representations with a
+        // small journal so this regression stays independent of live files.
+        let retired = [
+            make_op_id(15, 30, 1),
+            make_op_id(15, 30, 2),
+            make_op_id(15, 30, 3),
+        ];
+        rt.with_terminal_journal_mutation(move |local| {
+            for op_id in retired {
+                local
+                    .upsert_abort_decision(op_id, 2)
+                    .expect("active terminal decision");
+            }
+            assert_eq!(local.terminal_cut().generation(), retired.len() as u64);
+        })
+        .await;
+        let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+        let metadata = rt.repo.history_metadata();
+        let checkpoint = |topic: &str| {
+            let mut checkpointed = TerminalJournal::in_memory(topic);
+            for op_id in retired {
+                checkpointed
+                    .upsert_abort_decision(op_id, 2)
+                    .expect("checkpoint terminal decision");
+            }
+            checkpointed
+                .checkpoint(metadata.version)
+                .expect("valid retired checkpoint");
+            checkpointed
+        };
+        let checkpoint_a = checkpoint("retired-checkpoint-a");
+        let checkpoint_b = checkpoint("retired-checkpoint-b");
+        let cut_a = checkpoint_a.terminal_cut();
+        let cut_b = checkpoint_b.terminal_cut();
+        for checkpointed in [&checkpoint_a, &checkpoint_b] {
+            assert_eq!(checkpointed.terminal_cut().generation(), 0);
+            assert!(!checkpointed.terminal_cut().is_empty_terminal_set());
+            assert_eq!(
+                checkpointed.checkpoint_repository_version(),
+                metadata.version
+            );
+            assert!(
+                retired
+                    .into_iter()
+                    .all(|op_id| checkpointed.is_retired(op_id))
+            );
+            assert_ne!(
+                checkpointed.terminal_cut().journal_id(),
+                local_cut.journal_id()
+            );
+            assert_ne!(
+                checkpointed.terminal_cut().terminal_set_digest(),
+                local_cut.terminal_set_digest()
+            );
+        }
+        assert_ne!(cut_a.journal_id(), cut_b.journal_id());
+
+        // At the equal repository head both peers lose deterministically to
+        // the local rank, so each checkpoint can only finish local-won and
+        // cannot repair or replace any state.
+        let local_rank = HistoryRank::local(&rt);
+        let losing_rank_a = HistoryRank {
+            node_id: local_rank.node_id.saturating_add(1),
+            ..local_rank
+        };
+        let losing_rank_b = HistoryRank {
+            node_id: local_rank.node_id.saturating_add(2),
+            ..local_rank
+        };
+        assert!(!losing_rank_a.beats(local_rank));
+        assert!(!losing_rank_b.beats(local_rank));
+        let weak_self = rt.weak_self.lock().take();
+        assert!(
+            rt.request_foreign_checkpoint_election(
+                PeerIncarnation::new(losing_rank_a.node_id, 1),
+                losing_rank_a,
+                cut_a,
+            )
+            .await,
+            "checkpoint A may start its first deterministic local-won election"
+        );
+        assert!(rt.state.lock().history_election_pending());
+        rt.finish_history_election_for_test();
+        assert!(
+            rt.request_foreign_checkpoint_election(
+                PeerIncarnation::new(losing_rank_b.node_id, 1),
+                losing_rank_b,
+                cut_b,
+            )
+            .await,
+            "checkpoint B may start its first deterministic local-won election"
+        );
+        rt.finish_history_election_for_test();
+
+        // A single remembered lineage lets A evict B and B evict A forever.
+        // Re-observing A after both futile outcomes must remain quiescent.
+        assert!(
+            !rt.request_foreign_checkpoint_election(
+                PeerIncarnation::new(losing_rank_a.node_id, 1),
+                losing_rank_a,
+                cut_a,
+            )
+            .await,
+            "alternating checkpoint lineages must not restart completed local-won elections"
+        );
+        assert!(!rt.state.lock().history_election_pending());
+        *rt.weak_self.lock() = weak_self;
+    }
+
+    #[tokio::test]
+    async fn populated_foreign_checkpoint_is_not_futile_against_empty_local_head() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        enable_v5_floor_with_v4_participants(&net, [1, 2]);
+        net.set_epoch(2, 1);
+        net.set_alive(vec![1, 2]);
+        net.set_live_reliable_routes([1, 2]);
+
+        let mut populated = TerminalJournal::in_memory("populated-foreign-checkpoint");
+        populated
+            .upsert_abort_decision(make_op_id(2, 1, 1), 1)
+            .expect("foreign terminal abort");
+        let remote_cut = populated.terminal_cut();
+        assert!(!remote_cut.is_empty_terminal_set());
+        assert!(
+            rt.repository_terminal_head
+                .lock()
+                .await
+                .terminal_cut
+                .is_empty_terminal_set()
+        );
+
+        let local_rank = HistoryRank::local(&rt);
+        let remote_rank = HistoryRank {
+            node_id: 2,
+            ..local_rank
+        };
+        assert!(!remote_rank.beats(local_rank));
+        let peer = PeerIncarnation::new(2, 1);
+        let weak_self = rt.weak_self.lock().take();
+
+        assert!(
+            rt.request_foreign_checkpoint_election(peer, remote_rank, remote_cut)
+                .await
+        );
+        assert!(matches!(
+            rt.foreign_checkpoint_elections.lock().get(&2),
+            Some(ForeignCheckpointElectionMemo::Pending { .. })
+        ));
+        *rt.weak_self.lock() = weak_self;
+    }
+
+    #[tokio::test]
+    async fn populated_exact_winner_dominates_empty_higher_rank_trigger() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        enable_v5_floor_with_v4_participants(&net, [1, 2, 3]);
+        net.set_epoch(2, 1);
+        net.set_epoch(3, 1);
+        net.set_alive(vec![1, 2, 3]);
+        net.set_live_reliable_routes([1, 2, 3]);
+
+        rt.with_terminal_journal_mutation(|journal| {
+            journal.upsert_abort_decision(make_op_id(1, 1, 1), 1)
+        })
+        .await
+        .expect("local terminal abort");
+        let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+        assert!(!local_cut.is_empty_terminal_set());
+        let trigger_cut = TerminalJournal::in_memory("empty-foreign-trigger").terminal_cut();
+        assert!(trigger_cut.is_empty_terminal_set());
+
+        let metadata = rt.repo.history_metadata();
+        let trigger_rank = HistoryRank {
+            version: metadata.version,
+            freshness: metadata.freshness,
+            runtime_started_at: 0,
+            node_id: 2,
+            terminal_repository_base_version: metadata.version,
+        };
+        let winner_rank = HistoryRank {
+            runtime_started_at: 1,
+            node_id: 3,
+            ..trigger_rank
+        };
+        assert!(trigger_rank.beats(winner_rank));
+        assert!(!winner_rank.beats(trigger_rank));
+
+        rt.require_repository_base(metadata.version);
+        let weak_self = rt.weak_self.lock().take();
+        let trigger_peer = PeerIncarnation::new(2, 1);
+        let winner_peer = PeerIncarnation::new(3, 1);
+        assert!(
+            rt.request_foreign_checkpoint_election(trigger_peer, trigger_rank, trigger_cut)
+                .await
+        );
+        rt.state.lock().begin_history_election([2, 3]);
+        assert!(
+            rt.record_v3_history_election_rank(trigger_peer, trigger_rank, trigger_cut, true)
+                .await
+                .is_none()
+        );
+        let selected = rt
+            .record_v3_history_election_rank(winner_peer, winner_rank, local_cut, true)
+            .await
+            .expect("populated exact winner");
+        assert_eq!(selected.peer(), winner_peer);
+
+        assert!(rt.finish_repository_base_install(metadata.version));
+        rt.finish_history_election_with_exact_winner(winner_peer, winner_rank, local_cut)
+            .await;
+        assert!(
+            !rt.request_foreign_checkpoint_election(trigger_peer, trigger_rank, trigger_cut)
+                .await,
+            "the population-preferred exact winner must dedupe the losing empty trigger"
+        );
+        *rt.weak_self.lock() = weak_self;
+    }
+
+    #[tokio::test]
+    async fn exact_live_winner_dedupes_pairwise_ahead_global_loser() {
+        let (rt, net, _repo) = v1_runtime(ReplicationConfig::default());
+        enable_v5_floor_with_v4_participants(&net, [1, 2, 3]);
+        net.set_epoch(2, 1);
+        net.set_epoch(3, 1);
+        net.set_alive(vec![1, 2, 3]);
+        net.set_live_reliable_routes([1, 2, 3]);
+
+        let op_id = make_op_id(15, 30, 1);
+        rt.with_terminal_journal_mutation(move |journal| {
+            journal
+                .upsert_abort_decision(op_id, 2)
+                .expect("local active decision");
+        })
+        .await;
+        let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+        let metadata = rt.repo.history_metadata();
+
+        let mut checkpoint = TerminalJournal::in_memory("global-loser-checkpoint");
+        checkpoint
+            .upsert_abort_decision(op_id, 2)
+            .expect("checkpoint decision");
+        checkpoint
+            .checkpoint(metadata.version)
+            .expect("retired checkpoint");
+        let trigger_cut = checkpoint.terminal_cut();
+        assert_ne!(trigger_cut.journal_id(), local_cut.journal_id());
+
+        let trigger_rank = HistoryRank {
+            version: metadata.version,
+            freshness: metadata.freshness,
+            runtime_started_at: 0,
+            node_id: 3,
+            terminal_repository_base_version: metadata.version,
+        };
+        let winner_rank = HistoryRank {
+            node_id: 2,
+            ..trigger_rank
+        };
+        assert!(trigger_rank.beats(HistoryRank::local(&rt)));
+        assert!(winner_rank.beats(trigger_rank));
+
+        let weak_self = rt.weak_self.lock().take();
+        let trigger_peer = PeerIncarnation::new(3, 1);
+        let winner_peer = PeerIncarnation::new(2, 1);
+        assert!(
+            rt.request_foreign_checkpoint_election(trigger_peer, trigger_rank, trigger_cut)
+                .await
+        );
+        rt.state.lock().begin_history_election([2, 3]);
+        assert!(
+            rt.record_v3_history_election_rank(trigger_peer, trigger_rank, trigger_cut, true)
+                .await
+                .is_none()
+        );
+        let selected = rt
+            .record_v3_history_election_rank(winner_peer, winner_rank, local_cut, true)
+            .await
+            .expect("globally dominant exact source");
+        assert_eq!(selected.peer(), winner_peer);
+
+        rt.finish_history_election_with_exact_winner(winner_peer, winner_rank, local_cut)
+            .await;
+        assert!(!rt.state.lock().history_election_pending());
+        let contended_request = {
+            let _head = rt.repository_terminal_head.lock().await;
+            let runtime = rt.clone();
+            let request = tokio::spawn(async move {
+                runtime
+                    .request_foreign_checkpoint_election(trigger_peer, trigger_rank, trigger_cut)
+                    .await
+            });
+            tokio::task::yield_now().await;
+            assert!(
+                !request.is_finished(),
+                "witness validation must await the authoritative head boundary"
+            );
+            request
+        };
+        assert!(
+            !contended_request.await.expect("contended witness request"),
+            "the same globally losing trigger must reuse the live exact winner witness"
+        );
+
+        let changed_head_request = {
+            let mut head = rt.repository_terminal_head.lock().await;
+            let runtime = rt.clone();
+            let request = tokio::spawn(async move {
+                runtime
+                    .request_foreign_checkpoint_election(trigger_peer, trigger_rank, trigger_cut)
+                    .await
+            });
+            tokio::task::yield_now().await;
+            assert!(
+                !request.is_finished(),
+                "foreign election decision must remain behind a terminal mutation boundary"
+            );
+            let mut journal = rt.terminal_journal.lock().await;
+            journal
+                .upsert_abort_decision(make_op_id(15, 30, 2), 2)
+                .expect("concurrent local terminal advance");
+            head.terminal_cut = journal.terminal_cut();
+            request
+        };
+        assert!(
+            changed_head_request
+                .await
+                .expect("changed-head witness request"),
+            "the request must observe the terminal head published before the boundary releases"
+        );
+        *rt.weak_self.lock() = weak_self;
     }
 
     #[tokio::test]
@@ -24594,6 +25200,134 @@ mod tests {
                 .get(op_id)
                 .and_then(TerminalJournalRecord::required_repository_base_version),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn imported_terminal_commit_at_current_repository_base_keeps_snapshots_available() {
+        let repository_version = 9_525;
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        let repo = CountingStrictRepo::new();
+        repo.state.lock().0 = repository_version;
+        let rt = StrictRuntime::new(
+            repo.clone(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.finish_history_election_for_test();
+        assert!(rt.begin_snapshot_capture().is_some());
+
+        let op_id = make_op_id(2, 1, 74);
+        assert!(
+            rt.apply_catchup_terminal_commit_with_repository_base(
+                StrictTerminalState {
+                    coord_node: 2,
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                    ballot: 1,
+                    outcome: Some(StrictTerminalOutcome::Commit(StrictDecisionCommit {
+                        ts_final: 74,
+                        op_msgpack: Bytes::from(rmp_serde::to_vec(&174u64).unwrap()),
+                    })),
+                    resolver_node: 0,
+                    resolver_boot_epoch: 0,
+                    frozen_targets: Vec::new(),
+                },
+                repository_version,
+            )
+            .await,
+            "the terminal commit must import at its already-present repository base"
+        );
+
+        assert_eq!(rt.repo.current_version(), repository_version);
+        assert_eq!(
+            rt.terminal_journal
+                .lock()
+                .await
+                .get(op_id)
+                .and_then(TerminalJournalRecord::required_repository_base_version),
+            Some(repository_version),
+            "the durable record must retain its repository dependency"
+        );
+        assert!(
+            !rt.repository_base_required(),
+            "a dependency equal to the current repository version is already satisfied"
+        );
+        assert!(
+            rt.begin_snapshot_capture().is_some(),
+            "an already-satisfied imported fence must not disable snapshot donation"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_durable_terminal_commit_uses_its_strongest_repository_base() {
+        let repository_version = 95;
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+        let repo = CountingStrictRepo::new();
+        repo.state.lock().0 = repository_version;
+        let rt = StrictRuntime::new(
+            repo,
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.finish_history_election_for_test();
+
+        let op_id = make_op_id(2, 1, 75);
+        let terminal = StrictTerminalState {
+            coord_node: 2,
+            op_id_hi: op_id.0,
+            op_id_lo: op_id.1,
+            ballot: 1,
+            outcome: Some(StrictTerminalOutcome::Commit(StrictDecisionCommit {
+                ts_final: 75,
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&175u64).unwrap()),
+            })),
+            resolver_node: 0,
+            resolver_boot_epoch: 0,
+            frozen_targets: Vec::new(),
+        };
+        assert!(
+            rt.apply_catchup_terminal_commit_with_repository_base(terminal.clone(), 100)
+                .await
+        );
+        assert!(rt.repository_base_required());
+
+        assert!(rt.finish_repository_base_install(100));
+        assert!(!rt.repository_base_required());
+        assert!(
+            rt.apply_catchup_terminal_commit_with_repository_base(terminal, 90)
+                .await
+        );
+
+        assert_eq!(
+            rt.terminal_journal
+                .lock()
+                .await
+                .get(op_id)
+                .and_then(TerminalJournalRecord::required_repository_base_version),
+            Some(100)
+        );
+        assert!(
+            rt.repository_base_required(),
+            "the already-durable record's stronger base must remain fenced"
+        );
+        assert!(
+            !rt.state.lock().commit_buffer.contains_key(&(75, op_id)),
+            "the commit must not enter delivery below its durable base"
         );
     }
 

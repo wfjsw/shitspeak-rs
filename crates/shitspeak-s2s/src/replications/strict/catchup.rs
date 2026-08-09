@@ -4750,6 +4750,9 @@ pub(super) async fn recv_v3_history_probe_resp<R: StrictReplicable>(
         return;
     }
     let response_cut = valid_cut.expect("validated terminal cut");
+    rt.v3_history
+        .lock()
+        .observe_authenticated_probe(peer, rank, response_cut);
     metrics::record_strict_probe_event(
         StrictProbeKind::History,
         effective_metric_reason,
@@ -4942,7 +4945,9 @@ async fn converge_v3_history_source<R: StrictReplicable>(
         && !source_already_known;
     if foreign_lineage && reason != StrictCatchupReason::HistoryElection {
         if rank.beats(HistoryRank::local(rt)) || rt.repository_base_required() {
-            let _ = rt.request_foreign_checkpoint_election(rank, source_cut);
+            let _ = rt
+                .request_foreign_checkpoint_election(source_peer, rank, source_cut)
+                .await;
         } else {
             metrics::record_strict_terminal_divergence_event(
                 StrictTerminalDivergenceEvent::ForeignLineageDropped,
@@ -5045,7 +5050,8 @@ async fn converge_v3_history_source<R: StrictReplicable>(
         }
         accept_v3_history_metadata_if_admissible(rt, source_peer, rank, source_cut).await;
         if reason == StrictCatchupReason::HistoryElection {
-            rt.state.lock().finish_history_election();
+            rt.finish_history_election_with_exact_winner(source_peer, rank, source_cut)
+                .await;
             // Election metadata can also own a retained admission proof. The
             // completed election just made the repository cut stable, so
             // freeze it and consume that side obligation immediately instead
@@ -5079,7 +5085,9 @@ async fn admission_foreign_checkpoint_requires_global_election<R: StrictReplicab
     let requires_election =
         admission_requires_elected_checkpoint(remote_cut, local_cut, known_source_cut);
     if requires_election {
-        let _ = rt.request_foreign_checkpoint_election(remote_rank, remote_cut);
+        let _ = rt
+            .request_foreign_checkpoint_election(peer, remote_rank, remote_cut)
+            .await;
     }
     requires_election
 }
@@ -5135,40 +5143,17 @@ pub(super) async fn resume_deferred_v3_admissions<R: StrictReplicable>(rt: &Stri
             // repository image and will rearm the same recovery loop.
             continue;
         }
-        let local_cut = rt.terminal_journal.lock().await.terminal_cut();
-        let terminal_equal = source_cut.terminal_set_digest() == local_cut.terminal_set_digest();
-        let known_source_cut = rt.v3_sync.lock().known_source_cut(peer);
-        let source_known =
-            known_source_cut.is_some_and(|known| source_cut_covers(known, source_cut));
-        let terminal_satisfied = terminal_equal || source_known;
-        let history_needed = rank.version > rt.repo.current_version();
-        if terminal_satisfied {
-            rt.v3_sync.lock().remember_source_cut(peer, source_cut);
-            if history_needed {
-                rt.v3_history.lock().defer_until_terminal(
-                    peer,
-                    rank,
-                    source_cut,
-                    StrictCatchupReason::Admission,
-                );
-                start_v3_repository_after_terminal(rt, peer, None).await;
-                continue;
-            }
-            accept_v3_history_metadata_if_admissible(rt, peer, rank, source_cut).await;
-            continue;
-        }
-        rt.v3_history.lock().defer_until_terminal(
+        // Replay retained metadata through the same convergence gate as an
+        // immediate response. In particular, a rank-behind foreign checkpoint
+        // must wait to recover toward the elected lineage; replaying it as an
+        // unranked admission terminal sync could replace the winning lineage.
+        let _ = Box::pin(converge_v3_history_source(
+            rt,
             peer,
             rank,
             source_cut,
             StrictCatchupReason::Admission,
-        );
-        request_v3_terminal_sync_toward(
-            rt,
-            peer.node(),
-            StrictCatchupReason::Admission,
-            Some(source_cut),
-        )
+        ))
         .await;
     }
 }
@@ -8527,6 +8512,90 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn newer_same_rank_cut_supersedes_stale_deferred_admission_after_exact_convergence() {
+        let (rt, net, repo) = test_runtime(1, ReplicationConfig::default());
+        *repo.state.lock() = (1, vec![(1, 1, None)]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 0);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+        net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
+        rt.seed_membership_snapshot([MemberIncarnation::new(1, 1), MemberIncarnation::new(2, 0)]);
+
+        // The same authenticated peer first advertises an old, retired
+        // checkpoint lineage, then its newer active lineage without changing
+        // repository version or freshness. This mirrors a peer completing
+        // terminal recovery while admission metadata from its previous cut is
+        // still retained by the election.
+        let op_id = make_op_id(2, 0, 1);
+        let mut old_checkpoint = TerminalJournal::in_memory("old-peer-checkpoint");
+        old_checkpoint
+            .upsert_abort_decision(op_id, 1)
+            .expect("old peer terminal abort");
+        old_checkpoint.checkpoint(1).expect("old peer checkpoint");
+        let old_cut = old_checkpoint.terminal_cut();
+
+        let mut newer_active = TerminalJournal::in_memory("newer-peer-active");
+        newer_active
+            .upsert_abort_decision(op_id, 1)
+            .expect("newer peer terminal abort");
+        let newer_cut = newer_active.terminal_cut();
+        assert_ne!(old_cut.journal_id(), newer_cut.journal_id());
+        assert_ne!(
+            old_cut.terminal_set_digest(),
+            newer_cut.terminal_set_digest(),
+            "fixture requires wire-distinct checkpoint and active cuts"
+        );
+
+        let peer = PeerIncarnation::new(2, 0);
+        let rank = HistoryRank {
+            version: repo.current_version(),
+            freshness: repo.history_metadata().freshness,
+            runtime_started_at: 0,
+            node_id: 2,
+            terminal_repository_base_version: 1,
+        };
+        assert!(rank.beats(HistoryRank::local(&rt)));
+        rt.state.lock().request_history_election();
+        {
+            let mut history = rt.v3_history.lock();
+            history.observe_authenticated_probe(peer, rank, old_cut);
+            history.defer_admission(peer, rank, old_cut);
+            history.observe_authenticated_probe(peer, rank, newer_cut);
+            history.defer_admission(peer, rank, newer_cut);
+            assert_eq!(
+                history
+                    .probe_candidate(peer, rank)
+                    .expect("latest probe candidate")
+                    .source_cut(),
+                newer_cut,
+                "the exact-incarnation candidate must reflect the latest observation"
+            );
+        }
+
+        // Model the elected terminal transfer having converged the local
+        // journal exactly to the peer's newer active cut before admission
+        // replay resumes.
+        rt.with_terminal_journal_mutation(move |journal| *journal = newer_active)
+            .await;
+        assert_eq!(rt.terminal_journal.lock().await.terminal_cut(), newer_cut);
+        rt.state.lock().finish_history_election();
+        rt.reconcile_peer_admissions();
+        assert!(rt.state.lock().peer_incarnation_awaits_history_proof(2, 0));
+        net.drain_captures();
+
+        super::resume_deferred_v3_admissions(&rt).await;
+
+        assert!(
+            !rt.state.lock().history_election_blocks_steady_state(),
+            "stale checkpoint metadata must not rearm an ahead election after exact convergence to the peer's newer cut"
+        );
+        assert!(
+            !rt.state.lock().peer_incarnation_awaits_history_proof(2, 0),
+            "the newer exact cut must satisfy the retained history proof"
+        );
+    }
+
     fn foreign_checkpoint_probe_response(
         rt: &StrictRuntime<CountingStrictRepo>,
         from: NodeIdentifier,
@@ -8551,7 +8620,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_foreign_checkpoint_admission_does_not_rearm_election_or_burst_ticks() {
         let (rt, net, repo) = test_runtime(1, ReplicationConfig::default());
-        *repo.state.lock() = (1, vec![(1, 1, None)]);
+        rt.apply_repository_commit(1, 1).await;
         net.set_alive(vec![1, 2, 3]);
         net.set_epoch(1, 1);
         net.set_epoch(2, 1);
@@ -8571,11 +8640,11 @@ mod tests {
             .expect("remote terminal abort");
         checkpointed.checkpoint(1).expect("remote checkpoint");
         let remote_cut = checkpointed.terminal_cut();
-        rt.terminal_journal
-            .lock()
-            .await
-            .upsert_abort_decision(make_op_id(1, 1, 1), 1)
-            .expect("local terminal abort");
+        rt.with_terminal_journal_mutation(|journal| {
+            journal.upsert_abort_decision(make_op_id(1, 1, 1), 1)
+        })
+        .await
+        .expect("local terminal abort");
         let local_cut = rt.terminal_journal.lock().await.terminal_cut();
         assert_ne!(
             remote_cut.journal_id(),

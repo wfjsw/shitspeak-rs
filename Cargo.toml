@@ -60,7 +60,7 @@ rayon = "1"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "x509-parser", "pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["charset", "http2", "rustls", "stream"] }
 rmp-serde = "1"
-rusqlite = { version = "0", features = ["bundled"] }
+rusqlite = { version = "0", features = ["bundled", "serialize"] }
 rustc-hash = "2"
 rustls = "0"
 rustls-pemfile = "2"

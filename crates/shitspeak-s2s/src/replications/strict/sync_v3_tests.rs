@@ -4354,6 +4354,98 @@ async fn newer_promoted_admission_foreign_checkpoint_rearms_after_election_close
 }
 
 #[tokio::test]
+async fn deferred_behind_foreign_checkpoint_does_not_start_unranked_admission_sync() {
+    let (rt, net) = runtime(1, ReplicationConfig::default());
+    rt.seed_membership_snapshot([MemberIncarnation::new(1, 11), MemberIncarnation::new(2, 22)]);
+
+    // The high-ranked local replica owns an active terminal lineage. A
+    // lower-ranked peer's compacted checkpoint cannot be adopted through
+    // admission: the peer must recover toward this node's lineage instead.
+    {
+        let mut local = rt.terminal_journal.lock().await;
+        local
+            .upsert_abort_decision(make_op_id(1, 11, 1), 2)
+            .expect("local terminal abort");
+        assert!(local.terminal_cut().generation() > 0);
+    }
+    let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+    let local_rank = rt.v3_history_rank();
+    let mut checkpointed = TerminalJournal::in_memory("behind-retired-checkpoint");
+    checkpointed
+        .upsert_abort_decision(make_op_id(2, 22, 1), 2)
+        .expect("remote terminal abort");
+    checkpointed
+        .checkpoint(local_rank.version)
+        .expect("remote retired checkpoint");
+    let remote_cut = checkpointed.terminal_cut();
+    assert_eq!(remote_cut.generation(), 0);
+    assert!(!remote_cut.is_empty_terminal_set());
+    assert_ne!(remote_cut.journal_id(), local_cut.journal_id());
+    assert_ne!(
+        remote_cut.terminal_set_digest(),
+        local_cut.terminal_set_digest()
+    );
+    let remote_rank = HistoryRank {
+        freshness: local_rank.freshness.saturating_sub(1),
+        runtime_started_at: 22,
+        node_id: 2,
+        terminal_repository_base_version: local_rank.version,
+        ..local_rank
+    };
+    assert!(!remote_rank.beats(local_rank));
+
+    let peer = PeerIncarnation::new(2, 22);
+    rt.state.lock().request_history_election();
+    rt.v3_history
+        .lock()
+        .defer_admission(peer, remote_rank, remote_cut);
+    rt.finish_history_election_for_test();
+    rt.reconcile_peer_admissions();
+    assert!(rt.state.lock().peer_incarnation_awaits_history_proof(2, 22));
+    assert!(!rt.peer_incarnation_is_admitted(2, 22));
+    // Production replay can overlap unrelated unresolved local work. Add it
+    // only after the stable local admission cut has been frozen so the test
+    // reaches the deferred-history branch under investigation.
+    {
+        let unresolved = make_op_id(1, 11, 2);
+        let mut local = rt.terminal_journal.lock().await;
+        local
+            .upsert_promise(unresolved, 3)
+            .expect("local unresolved promise");
+        assert!(
+            local
+                .get(unresolved)
+                .is_some_and(|record| !record.is_terminal())
+        );
+    }
+    net.drain_captures();
+
+    resume_deferred_v3_admissions(&rt).await;
+
+    assert!(
+        !rt.state.lock().history_election_blocks_steady_state(),
+        "a lower-ranked foreign checkpoint must not start another local pull election"
+    );
+    assert!(
+        rt.state.lock().peer_incarnation_awaits_history_proof(2, 22),
+        "the behind peer must remain awaiting recovery toward the local lineage"
+    );
+    assert!(!rt.peer_incarnation_is_admitted(2, 22));
+    assert!(
+        net.drain_captures().into_iter().all(|frame| !matches!(
+            frame,
+            CapturedFrame::StrictUnicast {
+                dst: 2,
+                body: StrictBody::TerminalSyncReq(request),
+                ..
+            } if StrictCatchupReason::try_from(request.reason).ok()
+                == Some(StrictCatchupReason::Admission)
+        )),
+        "deferred admission must not bypass ranked convergence with an unranked terminal sync"
+    );
+}
+
+#[tokio::test]
 async fn empty_remote_terminal_cut_cannot_admit_peer_missing_local_abort_fence() {
     let (rt, net) = runtime(1, ReplicationConfig::default());
     rt.terminal_journal

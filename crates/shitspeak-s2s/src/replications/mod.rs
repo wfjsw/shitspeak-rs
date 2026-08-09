@@ -537,6 +537,20 @@ impl ReplicationManager {
         self.inner.strict_capability_activation_ready()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn strict_snapshot_capture_available_for_test(&self, topic: &str) -> Option<bool> {
+        let mut available = None;
+        self.inner.strict_topics.iter_sync(|candidate, runtime| {
+            if candidate == topic {
+                available = Some(runtime.snapshot_capture_available_for_test());
+                false
+            } else {
+                true
+            }
+        });
+        available
+    }
+
     pub fn install_strict_runtime(
         &self,
         topic: String,

@@ -504,6 +504,36 @@ mod tests {
         assert_eq!(deferred[0].source_cut(), newer_cut);
         assert!(state.take_deferred_admissions().is_empty());
     }
+
+    #[test]
+    fn refreshed_elected_source_replaces_equal_rank_foreign_lineage_intent() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let rank = HistoryRank {
+            version: 3,
+            freshness: 4,
+            runtime_started_at: 5,
+            node_id: 2,
+            terminal_repository_base_version: 3,
+        };
+        let checkpoint_cut = TerminalCut::new([1; 16], 0, [0; 32], [2; 32]);
+        let active_cut = TerminalCut::new([3; 16], 7, [4; 32], [5; 32]);
+
+        state.defer_until_terminal(
+            peer,
+            rank,
+            checkpoint_cut,
+            StrictCatchupReason::HistoryElection,
+        );
+        state.defer_until_terminal(peer, rank, active_cut, StrictCatchupReason::HistoryElection);
+
+        let refreshed = state
+            .take_after_terminal(peer)
+            .expect("refreshed elected intent");
+        assert_eq!(refreshed.rank(), rank);
+        assert_eq!(refreshed.reason(), StrictCatchupReason::HistoryElection);
+        assert_eq!(refreshed.source_cut(), active_cut);
+    }
 }
 
 impl PendingHistoryIntent {
@@ -686,13 +716,16 @@ impl HistoryV3State {
                 let election_ownership_preserved = current.reason
                     == StrictCatchupReason::HistoryElection
                     && reason != StrictCatchupReason::HistoryElection;
+                let elected_source_refreshed = current.reason
+                    == StrictCatchupReason::HistoryElection
+                    && reason == StrictCatchupReason::HistoryElection;
                 let higher_priority = !election_ownership_preserved
                     && (election_ownership_changed || transfer_preempts(reason, current.reason));
                 let same_intent_advanced = reason == current.reason
                     && (rank.beats(current.rank)
                         || (source_cut.journal_id() == current.source_cut.journal_id()
                             && source_cut.generation() > current.source_cut.generation()));
-                if higher_priority || same_intent_advanced {
+                if elected_source_refreshed || higher_priority || same_intent_advanced {
                     *current = replacement;
                 }
             })
@@ -713,6 +746,28 @@ impl HistoryV3State {
                 source_cut,
             },
         );
+    }
+
+    /// Record the newest nonce-authenticated metadata for one peer. A fresh
+    /// response is authoritative over an older retained admission candidate,
+    /// even when the repository rank stayed equal while the peer installed a
+    /// different terminal lineage. Requeue paths deliberately continue to use
+    /// `defer_admission`, which cannot overwrite a different equal-rank cut.
+    pub(super) fn observe_authenticated_probe(
+        &mut self,
+        peer: PeerIncarnation,
+        rank: HistoryRank,
+        source_cut: TerminalCut,
+    ) {
+        let candidate = HistoryProbeCandidate {
+            peer,
+            rank,
+            source_cut,
+        };
+        self.probe_candidates.insert(peer, candidate);
+        if let Some(deferred) = self.deferred_admissions.get_mut(&peer) {
+            *deferred = candidate;
+        }
     }
 
     /// Retain the admission half of a metadata probe whose nonce was promoted
