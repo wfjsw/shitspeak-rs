@@ -44,7 +44,11 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     ) -> Result<(), ReplicationError> {
         let fence_timeout = self.cfg.propose_ttl();
         let deadline = TokioInstant::now() + fence_timeout;
-        while self.state.lock().history_election_blocks_steady_state() {
+        loop {
+            let election_blocked = self.state.lock().history_election_blocks_steady_state();
+            if !election_blocked && self.recovery_is_healthy() {
+                break;
+            }
             if TokioInstant::now() >= deadline {
                 return Err(ReplicationError::ProposeTimeout(fence_timeout));
             }
@@ -75,7 +79,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         }
 
         // Election can be rearmed while waiting for capacity.
-        if self.state.lock().history_election_blocks_steady_state() {
+        let election_blocked = self.state.lock().history_election_blocks_steady_state();
+        if election_blocked || !self.recovery_is_healthy() {
             return Err(ReplicationError::ProposeTimeout(fence_timeout));
         }
         if TokioInstant::now() >= deadline {
@@ -88,6 +93,9 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         let network_snapshot = self
             .wait_for_v2_protocol_snapshot(deadline, fence_timeout)
             .await?;
+        if !self.recovery_is_healthy() {
+            return Err(ReplicationError::ProposeTimeout(fence_timeout));
+        }
 
         let encode_started_at = Instant::now();
         let encoded = rmp_serde::to_vec(&op);
@@ -135,6 +143,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // Register the proposal and advance our local clock.
         let started_at = Instant::now();
         let (ts_propose, src_clock) = {
+            let _recovery_start_guard = self.strict_work_recovery_gate.lock();
+            if !self.recovery_is_healthy() {
+                return Err(ReplicationError::ProposeTimeout(fence_timeout));
+            }
             let mut s = self.state.lock();
             // This check and proposal insertion must be one state-lock
             // transaction. Membership recovery may rearm the fence after
@@ -171,6 +183,7 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                     _permit: permit,
                 },
             );
+            s.note_strict_work_started();
             // Keep a local prepared record after the caller-visible proposal
             // times out. Its v2 descriptor is the coordinator's durable
             // evidence for automatic terminal resolution.
@@ -186,6 +199,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             );
             (ts_propose, s.clock)
         };
+        if !self.recovery_is_healthy() {
+            let mut state = self.state.lock();
+            state.pending_proposes.remove(&op_id);
+            state.proposals.remove(&op_id);
+            return Err(ReplicationError::ProposeTimeout(fence_timeout));
+        }
         if !self
             .persist_v2_pending_descriptor(op_id, ts_propose, op_msgpack.clone(), &frozen_targets)
             .await

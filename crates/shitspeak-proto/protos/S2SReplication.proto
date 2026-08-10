@@ -61,6 +61,17 @@ message StrictMessage {
     // bound so a delayed acknowledgement cannot clear evidence for a
     // replacement process at either node.
     StrictHeadAck            head_ack             = 25;
+    // Protocol v8 foreign-lineage recovery is deliberately isolated from
+    // ordinary catchup and pairwise terminal repair. Older binaries ignore
+    // these bodies instead of silently falling back to a legacy transfer.
+    StrictRecoveryProbeReq    recovery_probe_req    = 26;
+    StrictRecoveryProbeResp   recovery_probe_resp   = 27;
+    StrictRecoveryTerminalReq recovery_terminal_req = 28;
+    StrictRecoveryTerminalPage recovery_terminal_page = 29;
+    StrictRecoveryTerminalAck recovery_terminal_ack = 30;
+    StrictRecoverySnapshotReq recovery_snapshot_req = 31;
+    StrictRecoverySnapshotPage recovery_snapshot_page = 32;
+    StrictRecoverySnapshotAck recovery_snapshot_ack = 33;
   }
   // End-to-end origin proof for routed strict traffic. The signature binds
   // the topic, oneof body, logical source node, and source boot epoch; it is
@@ -129,11 +140,12 @@ message StrictCommit {
 }
 
 message StrictClockTick {
-  uint32 src_node                = 1;
-  uint64 src_clock               = 2;
-  uint64 repository_version      = 3;
-  StrictTerminalCut terminal_cut = 4;
-  int64 history_freshness        = 5;
+  uint32 src_node                         = 1;
+  uint64 src_clock                        = 2;
+  uint64 repository_version               = 3;
+  StrictTerminalCut terminal_cut          = 4;
+  int64 history_freshness                 = 5;
+  uint64 terminal_repository_base_version = 6;
 }
 
 // Acknowledges that `src_node` durably observes the target incarnation's
@@ -147,12 +159,13 @@ message StrictHeadAck {
   uint64 repository_version         = 5;
   bytes  terminal_set_digest        = 6;
   int64  history_freshness           = 7;
-  // Journal lineage of the acknowledged terminal cut. Legacy peers that
-  // predate this field leave it empty; peers that send it must match the
-  // exact lineage, otherwise a same-digest divergent journal could satisfy
-  // the checkpoint quorum.
+  // Exact journal lineage of the acknowledged terminal cut. Protocol v8
+  // requires this field; an empty or different lineage is rejected.
   bytes  journal_id                 = 8;
   uint64 generation                 = 9;
+  // Ordered terminal representation at `generation`. Protocol v8 requires
+  // this exact digest; terminal-set equality alone does not certify a cut.
+  bytes  chain_digest               = 10;
 }
 
 // ------- Strict pairwise repair (v3) -------
@@ -202,9 +215,9 @@ message StrictClockProbeReq {
   uint64 expected_responder_boot_epoch = 2;
   uint64 request_nonce                 = 3;
   StrictCatchupReason reason            = 4;
-  // Requester's current Tempo clock. This additive field is encoded only
-  // after the strict participant floor reaches v6; rolling v5/v6 clusters
-  // retain zero-clock probe semantics until the coordinated upgrade finishes.
+  // Requester's current Tempo clock. Mandatory-v8 participants always support
+  // this additive field; a lower advertised version is rejected before strict
+  // traffic is dispatched.
   uint64 requester_clock               = 5;
 }
 
@@ -308,6 +321,128 @@ message StrictTerminalSyncAck {
   uint64 transfer_id                   = 3;
   uint64 request_nonce                 = 4;
   StrictTerminalCut target_cut         = 5;
+}
+
+// ------- Strict foreign-lineage recovery (v8) -------
+
+// The logical target certified by a recovery quorum. Repository equality is
+// only one component: the terminal-set digest is always certified with it.
+message StrictRecoveryTarget {
+  uint64 repository_version = 1;
+  int64  history_freshness = 2;
+  bytes  terminal_set_digest = 3;
+}
+
+// Durable recovery correlation shared by every v8 message. `attempt_id` is
+// an opaque, nonempty durable identifier. Transport ids, nonces, and cursors
+// are intentionally kept outside this context and may be regenerated after a
+// restart while the attempt id remains unchanged.
+message StrictRecoveryContext {
+  uint32 requester_node = 1;
+  uint64 requester_boot_epoch = 2;
+  bytes  attempt_id = 3;
+  uint64 expected_donor_boot_epoch = 4;
+  StrictRecoveryTarget target = 5;
+}
+
+enum StrictRecoveryStatus {
+  STRICT_RECOVERY_STATUS_UNSPECIFIED          = 0;
+  STRICT_RECOVERY_STATUS_OK                   = 1;
+  STRICT_RECOVERY_STATUS_TARGET_MOVED         = 2;
+  STRICT_RECOVERY_STATUS_INCARNATION_MISMATCH = 3;
+  STRICT_RECOVERY_STATUS_RESOURCE_LIMIT       = 4;
+  STRICT_RECOVERY_STATUS_RETRYABLE_FAILURE    = 5;
+}
+
+// Certification probe. A request has no certified target yet, so its
+// context.target is absent. A response supplies the responder's attested
+// logical target and full representation cut.
+message StrictRecoveryProbeReq {
+  StrictRecoveryContext context = 1;
+  uint64 request_nonce = 2;
+}
+
+message StrictRecoveryProbeResp {
+  StrictRecoveryContext context = 1;
+  uint32 responder_node = 2;
+  uint64 responder_boot_epoch = 3;
+  uint64 request_nonce = 4;
+  StrictRecoveryStatus status = 5;
+  StrictTerminalCut terminal_cut = 6;
+  uint64 runtime_started_at = 7;
+  uint32 history_node = 8;
+}
+
+// An exact checkpoint transfer for the donor cut selected by the
+// coordinator. The initial request must use transfer_id=0 and
+// expected_cursor=0. Continuations retain the transfer identity and advance
+// only to an authenticated page's next_cursor.
+message StrictRecoveryTerminalReq {
+  StrictRecoveryContext context = 1;
+  StrictTerminalCut target_cut = 2;
+  uint64 transfer_id = 3;
+  uint64 request_nonce = 4;
+  uint64 expected_cursor = 5;
+}
+
+message StrictRecoveryTerminalPage {
+  StrictRecoveryContext context = 1;
+  uint32 responder_node = 2;
+  uint64 responder_boot_epoch = 3;
+  StrictRecoveryStatus status = 4;
+  StrictTerminalCut target_cut = 5;
+  uint64 transfer_id = 6;
+  uint64 request_nonce = 7;
+  uint64 cursor = 8;
+  uint64 next_cursor = 9;
+  bytes checkpoint_digest = 10;
+  repeated StrictTerminalState checkpoint_states = 11;
+  bool has_more = 12;
+}
+
+message StrictRecoveryTerminalAck {
+  StrictRecoveryContext context = 1;
+  StrictTerminalCut target_cut = 2;
+  uint64 transfer_id = 3;
+  uint64 request_nonce = 4;
+  uint64 acknowledged_cursor = 5;
+  bool final_ack = 6;
+}
+
+// Repository image transfer bound to the same immutable terminal cut. The
+// snapshot bytes contain the repository envelope; snapshot_digest covers the
+// complete envelope, not only the current page.
+message StrictRecoverySnapshotReq {
+  StrictRecoveryContext context = 1;
+  StrictTerminalCut target_cut = 2;
+  uint64 transfer_id = 3;
+  uint64 request_nonce = 4;
+  uint64 expected_cursor = 5;
+}
+
+message StrictRecoverySnapshotPage {
+  StrictRecoveryContext context = 1;
+  uint32 responder_node = 2;
+  uint64 responder_boot_epoch = 3;
+  StrictRecoveryStatus status = 4;
+  StrictTerminalCut target_cut = 5;
+  uint64 transfer_id = 6;
+  uint64 request_nonce = 7;
+  uint64 cursor = 8;
+  uint64 next_cursor = 9;
+  uint64 total_bytes = 10;
+  bytes snapshot_digest = 11;
+  bytes snapshot_bytes = 12;
+  bool has_more = 13;
+}
+
+message StrictRecoverySnapshotAck {
+  StrictRecoveryContext context = 1;
+  StrictTerminalCut target_cut = 2;
+  uint64 transfer_id = 3;
+  uint64 request_nonce = 4;
+  uint64 acknowledged_cursor = 5;
+  bool final_ack = 6;
 }
 
 message StrictCatchupReq {

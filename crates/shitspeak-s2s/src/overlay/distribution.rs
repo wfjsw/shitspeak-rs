@@ -803,6 +803,8 @@ pub(crate) struct DistributionPlane {
     routing_generations: Mutex<HashMap<StableTreeScope, u64>>,
     scope_activity: Mutex<HashMap<TreeScope, Instant>>,
     tree_edge_bindings: Mutex<HashMap<TreeEdgeBindingKey, TreeEdgeBinding>>,
+    #[cfg(test)]
+    control_publishes: Mutex<u64>,
 }
 
 impl DistributionPlane {
@@ -1676,12 +1678,21 @@ impl DistributionPlane {
         }
         pending.insert(key, PendingAcks { remaining });
         drop(pending);
+        #[cfg(test)]
+        {
+            *self.control_publishes.lock() += 1;
+        }
         distribution_metrics::record_control_publish(key.profile);
         distribution_metrics::set_pending_acks(key.profile, remaining_count);
         if remaining_count == 0 {
             self.activate_candidate(key);
         }
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn control_publish_count_for_test(&self) -> u64 {
+        *self.control_publishes.lock()
     }
 
     /// Forget a failed publish so the next source frame can retry the exact
@@ -2857,6 +2868,20 @@ mod tests {
             !plane.begin_publish(key, [2, 3]),
             "an active exact tree must remain active for subsequent frames"
         );
+    }
+
+    #[test]
+    fn control_publish_test_counter_is_plane_local() {
+        let first = DistributionPlane::default();
+        let second = DistributionPlane::default();
+
+        assert!(first.begin_publish(key(12, 1), [2]));
+        assert_eq!(first.control_publish_count_for_test(), 1);
+        assert_eq!(second.control_publish_count_for_test(), 0);
+
+        assert!(second.begin_publish(key(13, 1), [2]));
+        assert_eq!(first.control_publish_count_for_test(), 1);
+        assert_eq!(second.control_publish_count_for_test(), 1);
     }
 
     #[test]

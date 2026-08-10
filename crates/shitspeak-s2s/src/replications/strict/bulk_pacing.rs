@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 use super::super::metrics::{self, StrictCatchupThrottleReason};
 use shitspeak_core::NodeIdentifier;
@@ -38,6 +39,14 @@ pub(crate) enum BulkPageIdentity {
         transfer_id: u64,
         request_nonce: u64,
     },
+    RecoveryTerminal {
+        transfer_id: u64,
+        request_nonce: u64,
+    },
+    RecoverySnapshot {
+        transfer_id: u64,
+        request_nonce: u64,
+    },
 }
 
 impl BulkPageIdentity {
@@ -54,6 +63,20 @@ impl BulkPageIdentity {
             request_nonce,
         }
     }
+
+    pub(crate) fn recovery_terminal(transfer_id: u64, request_nonce: u64) -> Self {
+        Self::RecoveryTerminal {
+            transfer_id,
+            request_nonce,
+        }
+    }
+
+    pub(crate) fn recovery_snapshot(transfer_id: u64, request_nonce: u64) -> Self {
+        Self::RecoverySnapshot {
+            transfer_id,
+            request_nonce,
+        }
+    }
 }
 
 struct HopBudget {
@@ -66,7 +89,6 @@ struct ReservationRecord {
     key: LogicalPageKey,
     next_hop: NodeIdentifier,
     bytes: usize,
-    retained: bool,
 }
 
 #[derive(Default)]
@@ -92,14 +114,28 @@ pub(super) enum BulkAdmissionError {
 pub(super) struct BulkPacer {
     max_in_flight_bytes: usize,
     rate_bytes_per_second: u64,
+    shutdown: CancellationToken,
     state: Mutex<BulkPacerState>,
 }
 
 impl BulkPacer {
     pub(super) fn new(max_in_flight_bytes: usize, rate_bytes_per_second: u64) -> Arc<Self> {
+        Self::new_with_shutdown(
+            max_in_flight_bytes,
+            rate_bytes_per_second,
+            CancellationToken::new(),
+        )
+    }
+
+    pub(super) fn new_with_shutdown(
+        max_in_flight_bytes: usize,
+        rate_bytes_per_second: u64,
+        shutdown: CancellationToken,
+    ) -> Arc<Self> {
         Arc::new(Self {
             max_in_flight_bytes: max_in_flight_bytes.max(1),
             rate_bytes_per_second: rate_bytes_per_second.max(1),
+            shutdown,
             state: Mutex::new(BulkPacerState::default()),
         })
     }
@@ -136,8 +172,10 @@ impl BulkPacer {
         // by the overlay, while the requester keeps the correlated protocol
         // session alive until the page arrives.
         if state.outstanding_by_key.contains_key(&key) {
-            return Err(BulkAdmissionError::Busy {
-                retry_after: Duration::from_millis(10),
+            return Ok(BulkReservation {
+                pacer: Arc::clone(self),
+                id: None,
+                release_on_drop: false,
             });
         }
 
@@ -177,14 +215,13 @@ impl BulkPacer {
                 key: key.clone(),
                 next_hop,
                 bytes: encoded_bytes,
-                retained: false,
             },
         );
         state.outstanding_by_key.insert(key, id);
         metrics::record_strict_catchup_bulk_in_flight_bytes_delta(encoded_bytes as isize);
         Ok(BulkReservation {
             pacer: Arc::clone(self),
-            id,
+            id: Some(id),
             release_on_drop: true,
         })
     }
@@ -204,16 +241,12 @@ impl BulkPacer {
         };
         let mut state = self.state.lock();
         if let Some(id) = state.outstanding_by_key.get(&key).copied() {
-            // A delayed ACK must not refund a newer page which is still in
-            // the act of being enqueued. Protocol handlers call this method
-            // only after validating transfer/nonce/cursor correlation.
-            let retained = state
-                .reservations
-                .get(&id)
-                .is_some_and(|record| record.retained);
-            if retained {
-                Self::release_locked(&mut state, id);
-            }
+            // The logical key includes the exact transfer and request nonce,
+            // so it cannot name a newer page. The receiver may authenticate
+            // the page before the transport send future returns; release that
+            // in-progress reservation now. A later retain/drop observes that
+            // the id is gone and safely becomes a no-op.
+            Self::release_locked(&mut state, id);
         }
     }
 
@@ -239,12 +272,7 @@ impl BulkPacer {
     }
 
     fn retain(&self, id: u64) -> bool {
-        let mut state = self.state.lock();
-        let Some(record) = state.reservations.get_mut(&id) else {
-            return false;
-        };
-        record.retained = true;
-        true
+        self.state.lock().reservations.contains_key(&id)
     }
 
     fn release_locked(state: &mut BulkPacerState, id: u64) -> bool {
@@ -303,20 +331,31 @@ fn refill_rate_tokens(
 /// failed and cancelled attempts release immediately.
 pub(super) struct BulkReservation {
     pacer: Arc<BulkPacer>,
-    id: u64,
+    id: Option<u64>,
     release_on_drop: bool,
 }
 
 impl BulkReservation {
+    pub(super) fn is_coalesced(&self) -> bool {
+        self.id.is_none()
+    }
+
     pub(super) fn retain_until(mut self, ttl: Duration) {
-        if !self.pacer.retain(self.id) {
+        let Some(id) = self.id else {
+            return;
+        };
+        if !self.pacer.retain(id) {
             return;
         }
         self.release_on_drop = false;
         let pacer = Arc::clone(&self.pacer);
-        let id = self.id;
+        let shutdown = pacer.shutdown.clone();
         tokio::spawn(async move {
-            sleep(ttl).await;
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {}
+                _ = sleep(ttl) => {}
+            }
             pacer.release(id);
         });
     }
@@ -324,8 +363,10 @@ impl BulkReservation {
 
 impl Drop for BulkReservation {
     fn drop(&mut self) {
-        if self.release_on_drop {
-            self.pacer.release(self.id);
+        if self.release_on_drop
+            && let Some(id) = self.id
+        {
+            self.pacer.release(id);
         }
     }
 }
@@ -352,6 +393,90 @@ mod tests {
             .try_reserve(14, "e", BulkPageIdentity::Legacy, 2, 16 * 1024)
             .expect("page should fit after refund");
         drop(fifth);
+    }
+
+    #[tokio::test]
+    async fn retained_exact_page_retry_coalesces_instead_of_reporting_backpressure() {
+        let pacer = BulkPacer::new(64 * 1024, 1024 * 1024 * 1024);
+        let page = BulkPageIdentity::recovery_terminal(17, 91);
+        pacer
+            .try_reserve(10, "topic", page, 2, 16 * 1024)
+            .expect("first page should reserve")
+            .retain_until(Duration::from_secs(10));
+
+        let replay = pacer
+            .try_reserve(10, "topic", page, 2, 16 * 1024)
+            .expect("an exact retained replay must coalesce");
+        assert!(
+            replay.is_coalesced(),
+            "an exact retained replay is already in flight and must coalesce as success"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_ack_before_send_retain_releases_the_exact_in_progress_reservation() {
+        let pacer = BulkPacer::new(8 * 1024, 1024 * 1024 * 1024);
+        let page = BulkPageIdentity::recovery_terminal(17, 91);
+        let reservation = pacer
+            .try_reserve(10, "topic", page, 2, 8 * 1024)
+            .expect("page should reserve the full hop budget");
+
+        // A loopback-fast receiver can authenticate and ACK the page while
+        // the transport send future is still returning to retain it.
+        pacer.acknowledge(10, "topic", page);
+        reservation.retain_until(Duration::from_secs(10));
+
+        let replacement = pacer
+            .try_reserve(
+                10,
+                "topic",
+                BulkPageIdentity::recovery_terminal(17, 92),
+                2,
+                8 * 1024,
+            )
+            .expect("the early ACK must make the full budget immediately reusable");
+        {
+            let state = pacer.state.lock();
+            assert_eq!(state.reservations.len(), 1);
+            assert_eq!(
+                state.hops.get(&2).map(|hop| hop.in_flight_bytes),
+                Some(8 * 1024)
+            );
+            assert!(!state.outstanding_by_key.contains_key(&LogicalPageKey {
+                destination: 10,
+                topic: "topic".to_owned(),
+                page,
+            }));
+        }
+        let _replacement = replacement;
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_retained_pages_without_waiting_for_ttl() {
+        let shutdown = CancellationToken::new();
+        let pacer = BulkPacer::new_with_shutdown(8 * 1024, 1024 * 1024 * 1024, shutdown.clone());
+        pacer
+            .try_reserve(
+                10,
+                "topic",
+                BulkPageIdentity::recovery_terminal(17, 91),
+                2,
+                8 * 1024,
+            )
+            .expect("page should reserve")
+            .retain_until(Duration::from_secs(60));
+
+        shutdown.cancel();
+        for _ in 0..16 {
+            if pacer.state.lock().reservations.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            pacer.state.lock().reservations.is_empty(),
+            "shutdown must cancel TTL waits and release bulk gauges before runtime teardown"
+        );
     }
 
     #[test]

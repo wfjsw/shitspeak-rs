@@ -6,6 +6,7 @@
 //! operation-bearing synchronization visible.
 
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -21,11 +22,10 @@ use super::{
         recv_v3_terminal_sync_req, register_v3_clock_probe_retry_if_current,
         register_v3_history_probe_retry_if_current, request_v3_clock_probe,
         request_v3_history_probe, request_v3_terminal_sync, request_v3_terminal_sync_toward,
-        respond_to_request, resume_deferred_v3_admissions, retry_v3_terminal_transmissions,
-        send_v3_metadata_control,
+        respond_to_request, retry_v3_terminal_transmissions, send_v3_metadata_control,
     },
     runtime::{
-        HistoryElectionSnapshotRequest, HistoryRank, STRICT_V3_CONTROL_MAX_ENCODED_BYTES,
+        HistoryProbeResponseOutcome, HistoryRank, STRICT_V3_CONTROL_MAX_ENCODED_BYTES,
         StrictRuntime, is_v3_metadata_control, make_op_id,
     },
     session_reducer::{
@@ -36,8 +36,8 @@ use super::{
         TriggerOrigin as SessionTriggerOrigin, WireIdentity as SessionWireIdentity,
     },
     sync_v3::{
-        InboundTerminalSyncDisposition, PeerIncarnation, ResponderSession, SourceTransitionOutcome,
-        SyncV3State, cut_from_wire, cut_to_wire,
+        InboundTerminalSyncDisposition, InitialTerminalResponderDisposition, PeerIncarnation,
+        ResponderSession, SourceTransitionOutcome, SyncV3State, cut_from_wire, cut_to_wire,
     },
     terminal_journal::{TerminalCut, TerminalJournal},
 };
@@ -53,9 +53,7 @@ use crate::replications::{
         StrictTerminalState, StrictTerminalSyncAck, StrictTerminalSyncPage, StrictTerminalSyncReq,
         StrictTerminalSyncStatus,
     },
-    protocol::{
-        STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V4, STRICT_PROTOCOL_VERSION_V5,
-    },
+    protocol::{STRICT_PROTOCOL_VERSION_V2, STRICT_PROTOCOL_VERSION_V8},
     test_support::{
         CapturedFrame, CountingStrictRepo, MockBulkSendOutcome, MockNet, StrictSendLane,
         StrictSendOutcome,
@@ -70,11 +68,11 @@ fn runtime(
     let net = MockNet::new(self_id, vec![1, 2]);
     net.set_epoch(1, 11);
     net.set_epoch(2, 22);
-    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
-    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V8);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V8));
     net.set_peer_strict_replication_protocol_version(
         if self_id == 1 { 2 } else { 1 },
-        STRICT_PROTOCOL_VERSION_V4,
+        STRICT_PROTOCOL_VERSION_V8,
     );
     let repo = CountingStrictRepo::new();
     let rt = StrictRuntime::new(
@@ -88,6 +86,26 @@ fn runtime(
     );
     rt.finish_history_election_for_test();
     (rt, net)
+}
+
+async fn share_empty_terminal_lineage(
+    source: &Arc<StrictRuntime<CountingStrictRepo>>,
+    sink: &Arc<StrictRuntime<CountingStrictRepo>>,
+) {
+    let source_cut = source.terminal_journal.lock().await.terminal_cut();
+    assert_eq!(source_cut.generation(), 0, "source fixture must be empty");
+    sink.with_terminal_journal_mutation(move |journal| {
+        journal.install_staged_repository_checkpoint(
+            0,
+            0,
+            source_cut,
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+    })
+    .await
+    .expect("install shared empty terminal lineage");
 }
 
 #[test]
@@ -113,9 +131,10 @@ fn only_the_reserved_empty_history_response_shape_is_control_metadata() {
 #[tokio::test]
 async fn stalled_v3_election_resumes_ranked_checkpoint_instead_of_legacy_snapshot() {
     let (sink, net) = runtime(2, ReplicationConfig::default());
-    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V8);
     let peer = PeerIncarnation::new(1, 11);
-    let source_cut = TerminalCut::new([1; 16], 7, [2; 32], [3; 32]);
+    let local_cut = sink.terminal_journal.lock().await.terminal_cut();
+    let source_cut = TerminalCut::new(*local_cut.journal_id(), 7, [2; 32], [3; 32]);
     let rank = HistoryRank {
         version: 10,
         freshness: 20,
@@ -179,7 +198,7 @@ async fn stalled_v3_election_resumes_ranked_checkpoint_instead_of_legacy_snapsho
 #[tokio::test]
 async fn stale_v3_election_incarnation_rearms_without_legacy_snapshot() {
     let (sink, net) = runtime(2, ReplicationConfig::default());
-    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V8);
     let peer = PeerIncarnation::new(1, 11);
     let source_cut = TerminalCut::new([1; 16], 7, [2; 32], [3; 32]);
     let rank = HistoryRank {
@@ -192,7 +211,24 @@ async fn stale_v3_election_incarnation_rearms_without_legacy_snapshot() {
     sink.v3_history
         .lock()
         .record_probe_candidate(peer, rank, source_cut);
-    let request = HistoryElectionSnapshotRequest::new(1, rank);
+    let request = {
+        let local_rank = HistoryRank {
+            version: 1,
+            freshness: 2,
+            runtime_started_at: 30,
+            node_id: 2,
+            terminal_repository_base_version: 1,
+        };
+        let mut state = sink.state.lock();
+        state.rearm_history_election();
+        state.begin_history_election([1]);
+        let HistoryProbeResponseOutcome::FetchSnapshot(request) =
+            state.record_history_probe_response(1, rank, local_rank)
+        else {
+            panic!("remote rank should produce the current snapshot request");
+        };
+        request
+    };
 
     net.set_epoch(1, 12);
     sink.send_history_snapshot_request(request)
@@ -214,6 +250,63 @@ async fn stale_v3_election_incarnation_rearms_without_legacy_snapshot() {
         sink.state.lock().can_start_history_election(),
         "the stale exact-incarnation candidate must rearm the election",
     );
+}
+
+#[tokio::test]
+async fn queued_snapshot_request_cannot_reset_a_fresh_history_election() {
+    let (sink, net) = runtime(2, ReplicationConfig::default());
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V8);
+    net.set_epoch(1, 11);
+    let peer = PeerIncarnation::new(1, 11);
+    let source_cut = TerminalCut::new([1; 16], 7, [2; 32], [3; 32]);
+    let local_rank = HistoryRank {
+        version: 1,
+        freshness: 2,
+        runtime_started_at: 30,
+        node_id: 2,
+        terminal_repository_base_version: 1,
+    };
+    let remote_rank = HistoryRank {
+        version: 10,
+        freshness: 20,
+        runtime_started_at: 11,
+        node_id: 1,
+        terminal_repository_base_version: 10,
+    };
+    sink.v3_history
+        .lock()
+        .record_probe_candidate(peer, remote_rank, source_cut);
+    let stale_request = {
+        let mut state = sink.state.lock();
+        state.rearm_history_election();
+        state.begin_history_election([1]);
+        let HistoryProbeResponseOutcome::FetchSnapshot(request) =
+            state.record_history_probe_response(1, remote_rank, local_rank)
+        else {
+            panic!("remote rank should produce the queued snapshot request");
+        };
+        state.rearm_history_election();
+        state.begin_history_election([1]);
+        assert!(state.history_election_active());
+        assert!(!state.can_start_history_election());
+        request
+    };
+
+    // The queued request belongs to the old incarnation as well as the old
+    // election. Its asynchronous failure must not rearm/reset the fresh probe.
+    net.set_epoch(1, 12);
+    sink.send_history_snapshot_request(stale_request)
+        .await
+        .expect("stale queued request is a no-op");
+
+    let state = sink.state.lock();
+    assert!(state.history_election_active());
+    assert!(state.history_election_fetching_snapshot().is_none());
+    assert!(
+        !state.can_start_history_election(),
+        "the stale queued request reset the fresh probing election"
+    );
+    assert!(net.drain_captures().is_empty());
 }
 
 #[tokio::test]
@@ -456,7 +549,7 @@ async fn inbound_history_yields_opposing_terminal_client_then_resumes_it_after_f
 }
 
 #[tokio::test]
-async fn crossed_terminal_resume_is_backpressured_instead_of_cursor_mismatch_looping() {
+async fn newer_crossed_terminal_resume_preempts_abandoned_responder_without_waiting_for_ttl() {
     let retry_delay = Duration::from_millis(20);
     let ttl = Duration::from_millis(400);
     let config = ReplicationConfig::default()
@@ -467,6 +560,7 @@ async fn crossed_terminal_resume_is_backpressured_instead_of_cursor_mismatch_loo
         .with_pending_propose_ttl(ttl);
     let (lower, lower_net) = runtime(1, config.clone());
     let (higher, higher_net) = runtime(2, config);
+    share_empty_terminal_lineage(&lower, &higher).await;
     lower
         .terminal_journal
         .lock()
@@ -576,7 +670,7 @@ async fn crossed_terminal_resume_is_backpressured_instead_of_cursor_mismatch_loo
 
     recv_v3_terminal_sync_ack(&lower, 2, 22, confirmation).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
-    recv_v3_terminal_sync_req(&lower, 2, 22, higher_initial).await;
+    recv_v3_terminal_sync_req(&lower, 2, 22, higher_initial.clone()).await;
     let cached_page = lower_net
         .drain_captures()
         .into_iter()
@@ -589,83 +683,9 @@ async fn crossed_terminal_resume_is_backpressured_instead_of_cursor_mismatch_loo
         })
         .expect("lower node must cache the delayed crossed request");
     assert_eq!(cached_page.status, StrictTerminalSyncStatus::Ok as i32);
+    assert!(lower_net.drain_bulk_acknowledgements().is_empty());
 
     recv_v3_terminal_sync_req(&lower, 2, 22, resumed.clone()).await;
-    let deflection = lower_net
-        .drain_captures()
-        .into_iter()
-        .find_map(|frame| match frame {
-            CapturedFrame::StrictUnicast {
-                body: StrictBody::TerminalSyncPage(page),
-                ..
-            } => Some(page),
-            _ => None,
-        })
-        .expect("active responder must deflect the unmatched resumed request");
-    assert_eq!(
-        deflection.status,
-        StrictTerminalSyncStatus::ResourceLimit as i32,
-        "an unmatched initial request must back off without entering the CursorMismatch retry loop"
-    );
-    recv_v3_terminal_sync_page(&higher, 1, 11, deflection).await;
-    let client = higher
-        .v3_sync
-        .lock()
-        .client(PeerIncarnation::new(1, 11))
-        .cloned()
-        .expect("advisory deflection must retain the resumed client");
-    assert_eq!(client.pending_nonce(), resumed.request_nonce);
-
-    // The original resumed-client lease expires before the retained responder.
-    // A correlated collision response must extend that exact client and retry
-    // without resetting its nonce or backoff.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    retry_v3_terminal_transmissions(&higher).await;
-    let retained_retry = higher_net
-        .drain_captures()
-        .into_iter()
-        .find_map(|frame| match frame {
-            CapturedFrame::StrictUnicast {
-                body: StrictBody::TerminalSyncReq(request),
-                ..
-            } => Some(request),
-            _ => None,
-        })
-        .expect("collision response must keep the exact retry alive");
-    assert_eq!(retained_retry, resumed);
-    recv_v3_terminal_sync_req(&lower, 2, 22, retained_retry).await;
-    let second_deflection = lower_net
-        .drain_captures()
-        .into_iter()
-        .find_map(|frame| match frame {
-            CapturedFrame::StrictUnicast {
-                body: StrictBody::TerminalSyncPage(page),
-                ..
-            } => Some(page),
-            _ => None,
-        })
-        .expect("retained responder must keep deflecting until expiry");
-    assert_eq!(
-        second_deflection.status,
-        StrictTerminalSyncStatus::ResourceLimit as i32
-    );
-    recv_v3_terminal_sync_page(&higher, 1, 11, second_deflection).await;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    retry_v3_terminal_transmissions(&higher).await;
-    let post_expiry_retry = higher_net
-        .drain_captures()
-        .into_iter()
-        .find_map(|frame| match frame {
-            CapturedFrame::StrictUnicast {
-                body: StrictBody::TerminalSyncReq(request),
-                ..
-            } => Some(request),
-            _ => None,
-        })
-        .expect("exact retry must outlive the stale responder");
-    assert_eq!(post_expiry_retry, resumed);
-    recv_v3_terminal_sync_req(&lower, 2, 22, post_expiry_retry).await;
     let recovery_page = lower_net
         .drain_captures()
         .into_iter()
@@ -676,8 +696,38 @@ async fn crossed_terminal_resume_is_backpressured_instead_of_cursor_mismatch_loo
             } => Some(page),
             _ => None,
         })
-        .expect("request must proceed after the stale responder expires");
-    assert_eq!(recovery_page.status, StrictTerminalSyncStatus::Ok as i32);
+        .expect("newer resumed request must preempt the abandoned responder");
+    assert_eq!(
+        recovery_page.status,
+        StrictTerminalSyncStatus::Ok as i32,
+        "a newer same-incarnation request must not wait for the abandoned responder TTL"
+    );
+    let released = lower_net.drain_bulk_acknowledgements();
+    assert!(released.iter().any(|(dst, _, page)| {
+        *dst == 2
+            && *page
+                == super::runtime::BulkPageIdentity::terminal(
+                    cached_page.transfer_id,
+                    cached_page.request_nonce,
+                )
+    }));
+
+    recv_v3_terminal_sync_req(&lower, 2, 22, higher_initial).await;
+    let stale_rejection = lower_net
+        .drain_captures()
+        .into_iter()
+        .find_map(|frame| match frame {
+            CapturedFrame::StrictUnicast {
+                body: StrictBody::TerminalSyncPage(page),
+                ..
+            } => Some(page),
+            _ => None,
+        })
+        .expect("delayed abandoned request must receive a stale rejection");
+    assert_eq!(
+        stale_rejection.status,
+        StrictTerminalSyncStatus::TransferExpired as i32
+    );
     recv_v3_terminal_sync_page(&higher, 1, 11, recovery_page).await;
     let recovery_ack = higher_net
         .drain_captures()
@@ -1008,11 +1058,11 @@ async fn already_known_source_cut_returns_up_to_date_without_allocating_transfer
 }
 
 #[tokio::test]
-async fn satisfied_terminal_cut_latches_repository_base_before_snapshot_fetch() {
+async fn satisfied_terminal_cut_uses_incremental_history_from_exact_v8_base() {
     let (rt, net) = runtime(1, ReplicationConfig::default());
-    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V5);
-    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V5));
-    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V5);
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V8);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V8));
+    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V8);
     let peer = PeerIncarnation::new(2, 22);
     let source_cut = rt.terminal_journal.lock().await.terminal_cut();
     {
@@ -1044,8 +1094,8 @@ async fn satisfied_terminal_cut_latches_repository_base_before_snapshot_fetch() 
             expected_requester_boot_epoch: 11,
             request_nonce,
             repository_version: 9_525,
-            // Pre-field V5 peers decode with zero here. Their complete head
-            // is the conservative base when it exceeds the terminal lineage.
+            // Protocol v8 makes this field mandatory. Zero is the exact
+            // genesis repository base, not an omitted legacy value.
             terminal_repository_base_version: 0,
             history_freshness: 9_525,
             runtime_started_at: 22,
@@ -1057,8 +1107,8 @@ async fn satisfied_terminal_cut_latches_repository_base_before_snapshot_fetch() 
     .await;
 
     assert!(
-        rt.repository_base_required(),
-        "an already-satisfied terminal cut must not bypass the repository-base fence"
+        !rt.repository_base_required(),
+        "an exact genesis base must not be widened into a snapshot fence"
     );
     assert!(rt.state.lock().can_bootstrap_catchup());
     assert!(
@@ -1072,7 +1122,8 @@ async fn satisfied_terminal_cut_latches_repository_base_before_snapshot_fetch() 
         CapturedFrame::StrictUnicast {
             dst: 2,
             body: StrictBody::CatchupReq(StrictCatchupReq {
-                force_snapshot: true,
+                force_snapshot: false,
+                since_version: 0,
                 ..
             }),
             ..
@@ -1081,9 +1132,10 @@ async fn satisfied_terminal_cut_latches_repository_base_before_snapshot_fetch() 
 }
 
 #[tokio::test]
-async fn abort_heavy_terminal_cut_still_latches_legacy_repository_base() {
+async fn abort_heavy_terminal_cut_still_latches_explicit_repository_base() {
     let (rt, net) = runtime(1, ReplicationConfig::default());
-    let source_cut = TerminalCut::new([2; 16], 10_000, [2; 32], [3; 32]);
+    let local_cut = rt.terminal_journal.lock().await.terminal_cut();
+    let source_cut = TerminalCut::new(*local_cut.journal_id(), 10_000, [2; 32], [3; 32]);
     {
         let mut state = rt.state.lock();
         state.request_history_election();
@@ -1113,7 +1165,7 @@ async fn abort_heavy_terminal_cut_still_latches_legacy_repository_base() {
             expected_requester_boot_epoch: 11,
             request_nonce,
             repository_version: 9_525,
-            terminal_repository_base_version: 0,
+            terminal_repository_base_version: 9_525,
             history_freshness: 9_525,
             runtime_started_at: 22,
             history_node: 2,
@@ -1125,7 +1177,7 @@ async fn abort_heavy_terminal_cut_still_latches_legacy_repository_base() {
 
     assert!(
         rt.repository_base_required(),
-        "an omitted V5 base field must conservatively require the source head even when terminal generation is higher"
+        "the explicit V8 base must require the source head even when terminal generation is higher"
     );
 }
 
@@ -1209,7 +1261,7 @@ async fn unrecognized_higher_restart_cut_cannot_claim_a_restored_responder_is_up
 }
 
 #[tokio::test]
-async fn foreign_lineage_terminal_fence_never_starts_terminal_sync_toward_the_peer() {
+async fn foreign_lineage_terminal_fence_hands_off_to_v8_without_v3_terminal_sync() {
     let (rt, net) = runtime(1, ReplicationConfig::default());
     let peer = PeerIncarnation::new(2, 22);
     // A partitioned minority checkpoint mints a fresh journal id at
@@ -1238,8 +1290,7 @@ async fn foreign_lineage_terminal_fence_never_starts_terminal_sync_toward_the_pe
         })
         .expect("terminal-fence history probe request");
 
-    // Majority side: the peer is not ahead, so the foreign lineage must be
-    // dropped entirely instead of being adopted through terminal sync.
+    // Foreign lineage ownership is independent of the old repository rank.
     recv_v3_history_probe_resp(
         &rt,
         2,
@@ -1283,76 +1334,38 @@ async fn foreign_lineage_terminal_fence_never_starts_terminal_sync_toward_the_pe
         "the foreign lineage must not be remembered as a locally known source cut"
     );
 
-    // Minority side: the same foreign lineage from an ahead peer must promote
-    // the ranked election (never a terminal sync) so the divergent node pulls
-    // the majority's elected checkpoint.
-    request_v3_history_probe(&rt, 2, StrictCatchupReason::TerminalFence).await;
-    let request_nonce = net
-        .drain_captures()
-        .into_iter()
-        .find_map(|frame| match frame {
-            CapturedFrame::StrictUnicast {
-                dst: 2,
-                body: StrictBody::HistoryProbeReq(request),
-                ..
-            } => Some(request.request_nonce),
-            _ => None,
-        })
-        .expect("second terminal-fence history probe request");
-
-    recv_v3_history_probe_resp(
-        &rt,
-        2,
-        22,
-        StrictHistoryProbeResp {
-            responder_node: 2,
-            expected_requester_boot_epoch: 11,
-            request_nonce,
-            repository_version: metadata.version,
-            terminal_repository_base_version: 0,
-            history_freshness: metadata.freshness.saturating_add(1),
-            runtime_started_at: 22,
-            history_node: 2,
-            terminal_cut: Some(cut_to_wire(foreign_cut)),
-            reason: StrictCatchupReason::TerminalFence as i32,
-        },
-    )
-    .await;
-
-    let captures = net.drain_captures();
     assert!(
-        !captures.iter().any(|frame| matches!(
-            frame,
-            CapturedFrame::StrictUnicast {
-                dst: 2,
-                body: StrictBody::TerminalSyncReq(_),
-                ..
-            }
-        )),
-        "an ahead foreign lineage must be elected, never per-operation terminal synced"
-    );
-    assert!(
-        rt.state.lock().history_election_blocks_steady_state(),
-        "an ahead foreign lineage must promote the ranked election"
+        rt.recovery_is_healthy(),
+        "a mature majority witness must remain healthy to donate its certified lineage"
     );
 }
 
 #[tokio::test]
-async fn equal_history_empty_foreign_lineage_cannot_fence_a_complete_donor() {
-    let (rt, net) = runtime(1, ReplicationConfig::default());
-    {
-        let mut journal = rt.terminal_journal.lock().await;
-        journal
-            .upsert_abort_decision((1, 1), 1)
-            .expect("local terminal decision");
-    }
-    let local_cut = rt.terminal_journal.lock().await.terminal_cut();
-    assert!(
-        local_cut.generation() > 0,
-        "fixture must model the complete majority lineage"
+async fn equal_history_empty_foreign_lineage_fences_donation_during_v8_recovery() {
+    let quiet_interval = Duration::from_millis(1);
+    let (rt, net) = runtime(
+        1,
+        ReplicationConfig::default().with_strict_bootstrap_retry_interval(quiet_interval),
     );
+    let local_cut = rt.terminal_journal.lock().await.terminal_cut();
     let empty_foreign_cut = TerminalJournal::in_memory("empty-foreign").terminal_cut();
+    assert_eq!(local_cut.generation(), 0);
+    assert_eq!(empty_foreign_cut.generation(), 0);
+    assert_ne!(
+        local_cut.journal_id(),
+        empty_foreign_cut.journal_id(),
+        "different topics must retain distinct deterministic bootstrap lineages"
+    );
     let metadata = rt.repo.history_metadata();
+    let foreign_rank = HistoryRank {
+        version: metadata.version,
+        freshness: metadata.freshness,
+        // The peer wins the equal representation through the stable runtime
+        // tie-breaker while both repositories and terminal sets are empty.
+        runtime_started_at: 1,
+        node_id: 2,
+        terminal_repository_base_version: metadata.version,
+    };
     {
         let mut state = rt.state.lock();
         state.request_history_election();
@@ -1384,10 +1397,8 @@ async fn equal_history_empty_foreign_lineage_cannot_fence_a_complete_donor() {
             repository_version: metadata.version,
             terminal_repository_base_version: metadata.version,
             history_freshness: metadata.freshness,
-            // This peer wins the old repository-only rank through the stable
-            // runtime tie-breaker despite having an empty replacement journal.
-            runtime_started_at: 1,
-            history_node: 2,
+            runtime_started_at: foreign_rank.runtime_started_at,
+            history_node: u32::from(foreign_rank.node_id),
             terminal_cut: Some(cut_to_wire(empty_foreign_cut)),
             reason: StrictCatchupReason::HistoryElection as i32,
         },
@@ -1395,16 +1406,30 @@ async fn equal_history_empty_foreign_lineage_cannot_fence_a_complete_donor() {
     .await;
 
     assert!(
+        rt.recovery_is_healthy(),
+        "the first authenticated observation only establishes the quiet interval"
+    );
+    tokio::time::sleep(quiet_interval + Duration::from_millis(5)).await;
+    assert!(
+        rt.request_foreign_checkpoint_election(
+            PeerIncarnation::new(2, 22),
+            foreign_rank,
+            empty_foreign_cut,
+        )
+        .await,
+        "v8 must retain ownership through the continuous quiet interval"
+    );
+    assert!(
         !rt.repository_base_required(),
         "an equal-history empty journal must not poison a complete snapshot donor"
     );
     assert!(
-        rt.begin_snapshot_capture().is_some(),
-        "the complete node must remain available as a snapshot donor"
+        rt.begin_snapshot_capture().is_none(),
+        "a node in V8 recovery must remain fenced from snapshot donation"
     );
     assert!(
-        !rt.state.lock().history_election_blocks_steady_state(),
-        "the complete local terminal lineage must win the equal-history election"
+        !rt.recovery_is_healthy(),
+        "the foreign lineage must be handed to the mandatory V8 coordinator"
     );
     assert!(
         !net.drain_captures().into_iter().any(|frame| matches!(
@@ -1577,14 +1602,12 @@ async fn election_revalidates_empty_winner_after_local_terminal_state_becomes_po
 }
 
 #[tokio::test]
-async fn forced_checkpoint_abandons_opposing_terminal_client_and_sends_fresh_request() {
+async fn elected_same_lineage_target_coalesces_behind_active_terminal_client() {
     let (rt, net) = runtime(1, ReplicationConfig::default());
     let peer = PeerIncarnation::new(2, 22);
-    // An active per-operation terminal client toward the elected source (for
-    // example from a terminal fence) must not silently block the forced
-    // cursor-zero checkpoint replacement: the ranked election outranks
-    // steady-state repair, and every transfer naming the old lineage must be
-    // abandoned before the fresh lineage can be pulled.
+    // An active per-operation terminal client toward the elected source keeps
+    // its wire identity. The higher-priority elected target coalesces behind
+    // it and is resumed by the subordinate session reducer.
     request_v3_terminal_sync(&rt, 2, StrictCatchupReason::TerminalFence).await;
     assert!(
         net.drain_captures().into_iter().any(|frame| matches!(
@@ -1602,46 +1625,30 @@ async fn forced_checkpoint_abandons_opposing_terminal_client_and_sends_fresh_req
         "fixture: the terminal-fence trigger must leave a non-idle reducer session"
     );
     let local_cut = rt.terminal_journal.lock().await.terminal_cut();
-    let foreign_cut = TerminalCut::new([0xEE; 16], local_cut.generation(), [0xDD; 32], [0xCC; 32]);
-    assert_ne!(
-        foreign_cut.journal_id(),
-        local_cut.journal_id(),
-        "fixture must model a foreign journal lineage"
+    let elected_cut = TerminalCut::new(
+        *local_cut.journal_id(),
+        local_cut.generation().saturating_add(1),
+        [0xDD; 32],
+        [0xCC; 32],
     );
 
     request_v3_terminal_sync_toward(
         &rt,
         2,
         StrictCatchupReason::HistoryElection,
-        Some(foreign_cut),
+        Some(elected_cut),
     )
     .await;
 
-    let replacement = net
-        .drain_captures()
-        .into_iter()
-        .find_map(|frame| match frame {
-            CapturedFrame::StrictUnicast {
-                dst: 2,
-                body: StrictBody::TerminalSyncReq(request),
-                ..
-            } => Some(request),
-            _ => None,
-        })
-        .expect("the forced checkpoint must send a fresh terminal sync request");
+    assert!(net.drain_captures().is_empty());
+    let sync = rt.v3_sync.lock();
+    let client = sync.client(peer).expect("active terminal client");
     assert_eq!(
-        replacement.expected_cursor, 0,
-        "the forced checkpoint must start from cursor zero after abandoning opposing work"
+        client.started_reason(),
+        StrictCatchupReason::TerminalFence as i32
     );
-    assert_eq!(
-        replacement.requester_terminal_set_digest.as_ref(),
-        rt.terminal_journal
-            .lock()
-            .await
-            .terminal_cut()
-            .terminal_set_digest(),
-        "the replacement must advertise the local (pre-checkpoint) terminal set"
-    );
+    assert_eq!(client.reason(), StrictCatchupReason::TerminalFence as i32);
+    assert_eq!(client.desired_cut(), Some(elected_cut));
 }
 
 #[tokio::test]
@@ -1650,10 +1657,10 @@ async fn history_election_syncs_from_the_winner_not_the_last_responder() {
     net.set_epoch(1, 11);
     net.set_epoch(2, 22);
     net.set_epoch(3, 33);
-    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
-    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
-    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
-    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V4);
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V8);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V8));
+    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V8);
+    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V8);
     let rt = StrictRuntime::new(
         CountingStrictRepo::new(),
         1,
@@ -1690,15 +1697,16 @@ async fn history_election_syncs_from_the_winner_not_the_last_responder() {
     }
     assert_ne!(nonce_2, 0);
     assert_ne!(nonce_3, 0);
+    let local_journal_id = *rt.terminal_journal.lock().await.terminal_cut().journal_id();
     let winner_cut = crate::replications::proto::StrictTerminalCut {
-        journal_id: Bytes::from_static(&[2; 16]),
+        journal_id: Bytes::copy_from_slice(&local_journal_id),
         generation: 1,
         chain_digest: Bytes::from_static(&[2; 32]),
         terminal_set_digest: Bytes::from_static(&[2; 32]),
     };
     let expected_winner_cut = cut_from_wire(&winner_cut).expect("winner cut");
     let last_cut = crate::replications::proto::StrictTerminalCut {
-        journal_id: Bytes::from_static(&[3; 16]),
+        journal_id: Bytes::copy_from_slice(&local_journal_id),
         generation: 1,
         chain_digest: Bytes::from_static(&[3; 32]),
         terminal_set_digest: Bytes::from_static(&[3; 32]),
@@ -1774,16 +1782,14 @@ async fn history_election_promotes_an_existing_periodic_probe_without_omitting_i
     net.set_epoch(1, 11);
     net.set_epoch(2, 22);
     net.set_epoch(3, 33);
-    // New rounds require the cumulative V5 cluster floor. Keep the endpoint
-    // advertisements at the V4 support floor so this remains a focused
-    // cumulative-repair coordinator test rather than accidentally disabling
-    // bootstrap origination.
+    // Keep every participant at the mandatory V8 floor so this remains a
+    // focused cumulative-repair coordinator test.
     net.set_strict_replication_protocol_version(
         crate::replications::protocol::STRICT_PROTOCOL_VERSION_CURRENT,
     );
-    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
-    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
-    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V4);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V8));
+    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V8);
+    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V8);
     let rt = StrictRuntime::new(
         CountingStrictRepo::new(),
         1,
@@ -2179,6 +2185,7 @@ async fn duplicate_final_page_is_suppressed_without_another_ack_or_continuation(
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
     let (source, source_net) = runtime(1, config.clone());
     let (sink, sink_net) = runtime(2, config);
+    share_empty_terminal_lineage(&source, &sink).await;
     for sequence in 1..=4 {
         assert!(
             source
@@ -2218,6 +2225,7 @@ async fn delayed_duplicate_page_does_not_block_the_active_continuation() {
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(1);
     let (source, source_net) = runtime(1, config.clone());
     let (sink, sink_net) = runtime(2, config);
+    share_empty_terminal_lineage(&source, &sink).await;
     for sequence in 1..=3 {
         assert!(
             source
@@ -2260,11 +2268,318 @@ async fn delayed_duplicate_page_does_not_block_the_active_continuation() {
 }
 
 #[tokio::test]
+async fn elected_same_lineage_terminal_progress_serializes_with_the_snapshot_watchdog() {
+    let config = ReplicationConfig::default().with_strict_max_catchup_ops(1);
+    let (source, source_net) = runtime(1, config.clone());
+    let (sink, sink_net) = runtime(2, config);
+    share_empty_terminal_lineage(&source, &sink).await;
+    for sequence in 1..=3 {
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(sequence))
+                .await
+        );
+    }
+    let source_cut = source.terminal_journal.lock().await.terminal_cut();
+    let rank = HistoryRank {
+        version: 1,
+        freshness: 1,
+        runtime_started_at: 11,
+        node_id: 1,
+        terminal_repository_base_version: 0,
+    };
+    let election_request = {
+        let local_rank = HistoryRank::local(&sink);
+        let mut state = sink.state.lock();
+        state.request_history_election();
+        state.begin_history_election([1]);
+        match state.record_history_probe_response(1, rank, local_rank) {
+            HistoryProbeResponseOutcome::FetchSnapshot(request) => request,
+            outcome => panic!("expected elected source, got {outcome:?}"),
+        }
+    };
+    {
+        let state = sink.state.lock();
+        assert!(state.history_election_terminal_progress_is_current(
+            1,
+            election_request.election_generation(),
+        ));
+        assert!(!state.history_election_terminal_progress_is_current(
+            9,
+            election_request.election_generation(),
+        ));
+        assert!(!state.history_election_terminal_progress_is_current(
+            1,
+            election_request.election_generation().wrapping_add(1),
+        ));
+    }
+    let peer = PeerIncarnation::new(1, 11);
+    sink.v3_history
+        .lock()
+        .defer_until_terminal_with_election_generation(
+            peer,
+            rank,
+            source_cut,
+            StrictCatchupReason::HistoryElection,
+            Some(election_request.election_generation()),
+        );
+
+    request_v3_terminal_sync_toward(
+        &sink,
+        1,
+        StrictCatchupReason::HistoryElection,
+        Some(source_cut),
+    )
+    .await;
+    let request = terminal_request(sink_net.drain_captures().pop().expect("elected request"));
+    recv_v3_terminal_sync_req(&source, 2, 22, request).await;
+    let first_page = terminal_page(
+        source_net
+            .drain_captures()
+            .pop()
+            .expect("first elected terminal page"),
+    );
+    assert!(first_page.has_more, "fixture needs forward page progress");
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(sink.state.lock().history_election_timed_out(
+        Instant::now(),
+        Duration::ZERO,
+        Duration::from_millis(20),
+    ));
+
+    let receiving = {
+        let _watchdog_guard = sink.history_election_application_gate.lock().await;
+        let sink_for_page = Arc::clone(&sink);
+        let receiving = tokio::spawn(async move {
+            recv_v3_terminal_sync_page(&sink_for_page, 1, 11, first_page).await;
+        });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !receiving.is_finished(),
+            "elected terminal progress must serialize with the election watchdog"
+        );
+        receiving
+    };
+    receiving.await.expect("terminal page callback");
+
+    assert!(
+        !sink.state.lock().history_election_timed_out(
+            Instant::now(),
+            Duration::ZERO,
+            Duration::from_millis(20),
+        ),
+        "accepted elected terminal progress must refresh the snapshot deadline"
+    );
+}
+
+#[tokio::test]
+async fn elected_terminal_nonprogress_pages_do_not_refresh_the_snapshot_deadline() {
+    let config = ReplicationConfig::default().with_strict_max_catchup_ops(1);
+    let (source, source_net) = runtime(1, config.clone());
+    let (sink, sink_net) = runtime(2, config);
+    share_empty_terminal_lineage(&source, &sink).await;
+    for sequence in 1..=3 {
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(sequence))
+                .await
+        );
+    }
+    let source_cut = source.terminal_journal.lock().await.terminal_cut();
+    let rank = HistoryRank {
+        version: 1,
+        freshness: 1,
+        runtime_started_at: 11,
+        node_id: 1,
+        terminal_repository_base_version: 0,
+    };
+    let election_request = {
+        let local_rank = HistoryRank::local(&sink);
+        let mut state = sink.state.lock();
+        state.request_history_election();
+        state.begin_history_election([1]);
+        match state.record_history_probe_response(1, rank, local_rank) {
+            HistoryProbeResponseOutcome::FetchSnapshot(request) => request,
+            outcome => panic!("expected elected source, got {outcome:?}"),
+        }
+    };
+    let peer = PeerIncarnation::new(1, 11);
+    sink.v3_history
+        .lock()
+        .defer_until_terminal_with_election_generation(
+            peer,
+            rank,
+            source_cut,
+            StrictCatchupReason::HistoryElection,
+            Some(election_request.election_generation()),
+        );
+    request_v3_terminal_sync_toward(
+        &sink,
+        1,
+        StrictCatchupReason::HistoryElection,
+        Some(source_cut),
+    )
+    .await;
+    let request = terminal_request(sink_net.drain_captures().pop().expect("elected request"));
+    recv_v3_terminal_sync_req(&source, 2, 22, request).await;
+    let first_page = terminal_page(
+        source_net
+            .drain_captures()
+            .pop()
+            .expect("first elected terminal page"),
+    );
+    assert!(first_page.has_more);
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let timed_out = || {
+        sink.state.lock().history_election_timed_out(
+            Instant::now(),
+            Duration::ZERO,
+            Duration::from_millis(20),
+        )
+    };
+    assert!(timed_out());
+
+    let mut resource_limited = first_page.clone();
+    resource_limited.status = StrictTerminalSyncStatus::ResourceLimit as i32;
+    recv_v3_terminal_sync_page(&sink, 1, 11, resource_limited).await;
+    assert!(timed_out(), "RESOURCE_LIMIT is not transfer progress");
+
+    let mut malformed = first_page.clone();
+    malformed.image_digest = Bytes::from_static(b"not-the-target-digest");
+    recv_v3_terminal_sync_page(&sink, 1, 11, malformed).await;
+    assert!(timed_out(), "a malformed page is not transfer progress");
+
+    recv_v3_terminal_sync_page(&sink, 1, 11, first_page.clone()).await;
+    assert!(!timed_out(), "the valid forward page must refresh progress");
+    let continuation = terminal_request(
+        sink_net
+            .drain_captures()
+            .pop()
+            .expect("terminal continuation"),
+    );
+    assert_ne!(continuation.request_nonce, first_page.request_nonce);
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(timed_out());
+    recv_v3_terminal_sync_page(&sink, 1, 11, first_page).await;
+    assert!(timed_out(), "a duplicate page must not refresh progress");
+}
+
+#[tokio::test]
+async fn stale_elected_terminal_page_cannot_refresh_or_mutate_a_fresh_election() {
+    let config = ReplicationConfig::default().with_strict_max_catchup_ops(1);
+    let (source, source_net) = runtime(1, config.clone());
+    let (sink, sink_net) = runtime(2, config);
+    share_empty_terminal_lineage(&source, &sink).await;
+    for sequence in 1..=3 {
+        assert!(
+            source
+                .apply_catchup_terminal_state(terminal_abort(sequence))
+                .await
+        );
+    }
+    let initial_sink_cut = sink.terminal_journal.lock().await.terminal_cut();
+    let source_cut = source.terminal_journal.lock().await.terminal_cut();
+    let rank = HistoryRank {
+        version: 1,
+        freshness: 1,
+        runtime_started_at: 11,
+        node_id: 1,
+        terminal_repository_base_version: 0,
+    };
+    let old_request = {
+        let local_rank = HistoryRank::local(&sink);
+        let mut state = sink.state.lock();
+        state.request_history_election();
+        state.begin_history_election([1]);
+        match state.record_history_probe_response(1, rank, local_rank) {
+            HistoryProbeResponseOutcome::FetchSnapshot(request) => request,
+            outcome => panic!("expected elected source, got {outcome:?}"),
+        }
+    };
+    let peer = PeerIncarnation::new(1, 11);
+    sink.v3_history
+        .lock()
+        .defer_until_terminal_with_election_generation(
+            peer,
+            rank,
+            source_cut,
+            StrictCatchupReason::HistoryElection,
+            Some(old_request.election_generation()),
+        );
+    request_v3_terminal_sync_toward(
+        &sink,
+        1,
+        StrictCatchupReason::HistoryElection,
+        Some(source_cut),
+    )
+    .await;
+    let request = terminal_request(
+        sink_net
+            .drain_captures()
+            .pop()
+            .expect("old elected request"),
+    );
+    recv_v3_terminal_sync_req(&source, 2, 22, request).await;
+    let old_page = terminal_page(
+        source_net
+            .drain_captures()
+            .pop()
+            .expect("old elected terminal page"),
+    );
+
+    let fresh_request = {
+        let local_rank = HistoryRank::local(&sink);
+        let mut state = sink.state.lock();
+        state.rearm_history_election();
+        state.begin_history_election([1]);
+        match state.record_history_probe_response(1, rank, local_rank) {
+            HistoryProbeResponseOutcome::FetchSnapshot(request) => request,
+            outcome => panic!("expected fresh elected source, got {outcome:?}"),
+        }
+    };
+    assert_ne!(
+        fresh_request.election_generation(),
+        old_request.election_generation()
+    );
+    sink.v3_history
+        .lock()
+        .defer_until_terminal_with_election_generation(
+            peer,
+            rank,
+            source_cut,
+            StrictCatchupReason::HistoryElection,
+            Some(fresh_request.election_generation()),
+        );
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    recv_v3_terminal_sync_page(&sink, 1, 11, old_page).await;
+
+    assert!(sink.state.lock().history_election_timed_out(
+        Instant::now(),
+        Duration::ZERO,
+        Duration::from_millis(20),
+    ));
+    assert_eq!(
+        sink.terminal_journal.lock().await.terminal_cut(),
+        initial_sink_cut,
+        "a stale elected page must not mutate terminal state"
+    );
+    assert!(sink_net.drain_captures().is_empty());
+}
+
+#[tokio::test]
 async fn checkpoint_completes_when_requester_has_additional_local_fences() {
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
     let (source, source_net) = runtime(1, config.clone());
     let (sink, sink_net) = runtime(2, config);
+    share_empty_terminal_lineage(&source, &sink).await;
     assert!(source.apply_catchup_terminal_state(terminal_abort(1)).await);
+    assert!(sink.apply_catchup_terminal_state(terminal_abort(1)).await);
     assert!(sink.apply_catchup_terminal_state(terminal_abort(2)).await);
 
     request_v3_terminal_sync(&sink, 1, StrictCatchupReason::SteadyState).await;
@@ -2306,84 +2621,14 @@ async fn checkpoint_completes_when_requester_has_additional_local_fences() {
     );
 }
 
-async fn retired_checkpoint_conflict_requests_history_election(reason: StrictCatchupReason) {
-    let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
-    let (source, source_net) = runtime(1, config.clone());
-    let (sink, sink_net) = runtime(2, config);
-    let safe = make_op_id(1, 11, 1);
-    let conflicting = make_op_id(2, 22, 1);
-    let retired_floor = make_op_id(2, 30, 1);
-
-    assert!(source.apply_catchup_terminal_state(terminal_abort(1)).await);
-    assert!(
-        source
-            .apply_catchup_terminal_state(StrictTerminalState {
-                coord_node: 2,
-                op_id_hi: conflicting.0,
-                op_id_lo: conflicting.1,
-                ballot: 2,
-                outcome: Some(StrictTerminalOutcome::Abort(StrictDecisionAbort {})),
-                resolver_node: 0,
-                resolver_boot_epoch: 0,
-                frozen_targets: Vec::new(),
-            })
-            .await
-    );
-    {
-        let mut journal = sink.terminal_journal.lock().await;
-        journal
-            .upsert_abort_decision(retired_floor, 2)
-            .expect("retirement floor decision");
-        journal.checkpoint(0).expect("retirement checkpoint");
-        assert!(journal.is_retired(conflicting));
-    }
-
-    request_v3_terminal_sync(&sink, 1, reason).await;
-    let request = terminal_request(sink_net.drain_captures().pop().expect("initial request"));
-    recv_v3_terminal_sync_req(&source, 2, 22, request.clone()).await;
-    let page = terminal_page(source_net.drain_captures().pop().expect("checkpoint page"));
-    assert_eq!(
-        StrictTerminalPageKind::try_from(page.kind).ok(),
-        Some(StrictTerminalPageKind::Checkpoint)
-    );
-    assert_eq!(page.checkpoint_states.len(), 2);
-
-    recv_v3_terminal_sync_page(&sink, 1, 11, page).await;
-
-    let peer = PeerIncarnation::new(1, 11);
-    assert!(sink.state.lock().history_election_pending());
-    assert!(sink.v3_sync.lock().client(peer).is_none());
-    assert!(!sink.v3_retries.lock().request_is_current(peer, &request));
-    assert!(sink_net.drain_captures().into_iter().all(|frame| !matches!(
-        frame,
-        CapturedFrame::StrictUnicast {
-            body: StrictBody::TerminalSyncAck(_),
-            ..
-        }
-    )));
-    let journal = sink.terminal_journal.lock().await;
-    assert!(journal.get(safe).is_none());
-    assert!(journal.is_retired(conflicting));
-}
-
-#[tokio::test]
-async fn admission_checkpoint_retired_conflict_requests_history_election() {
-    retired_checkpoint_conflict_requests_history_election(StrictCatchupReason::Admission).await;
-}
-
-#[tokio::test]
-async fn repository_gap_checkpoint_retired_conflict_requests_history_election() {
-    retired_checkpoint_conflict_requests_history_election(StrictCatchupReason::RepositoryGap).await;
-}
-
 #[tokio::test]
 async fn active_history_election_stages_checkpoint_for_admission_started_client() {
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
     let (source, source_net) = runtime(1, config.clone());
     let (sink, sink_net) = runtime(2, config);
+    share_empty_terminal_lineage(&source, &sink).await;
     let source_op = make_op_id(1, 11, 1);
     let conflicting = make_op_id(2, 22, 1);
-    let retired_floor = make_op_id(2, 30, 1);
     assert!(source.apply_catchup_terminal_state(terminal_abort(1)).await);
     assert!(
         source
@@ -2400,31 +2645,47 @@ async fn active_history_election_stages_checkpoint_for_admission_started_client(
             .await
     );
     let source_cut = source.terminal_journal.lock().await.terminal_cut();
-    {
-        let mut journal = sink.terminal_journal.lock().await;
-        journal
-            .upsert_abort_decision(retired_floor, 2)
-            .expect("retirement floor decision");
-        journal.checkpoint(0).expect("retirement checkpoint");
-        assert!(journal.is_retired(conflicting));
-    }
 
+    {
+        let mut state = sink.state.lock();
+        state.rearm_history_election();
+        state.begin_history_election([1]);
+    }
     request_v3_terminal_sync(&sink, 1, StrictCatchupReason::Admission).await;
     let request = terminal_request(sink_net.drain_captures().pop().expect("admission request"));
     let peer = PeerIncarnation::new(1, 11);
-    sink.state.lock().begin_history_election([1]);
-    sink.v3_history.lock().defer_until_terminal(
-        peer,
-        HistoryRank {
-            version: 1,
-            freshness: 1,
-            runtime_started_at: 11,
-            node_id: 1,
+    let rank = HistoryRank {
+        version: 1,
+        freshness: 1,
+        runtime_started_at: 11,
+        node_id: 1,
+        terminal_repository_base_version: 0,
+    };
+    let election_generation = {
+        let local_rank = HistoryRank {
+            version: 0,
+            freshness: 0,
+            runtime_started_at: 22,
+            node_id: 2,
             terminal_repository_base_version: 0,
-        },
-        source_cut,
-        StrictCatchupReason::HistoryElection,
-    );
+        };
+        let mut state = sink.state.lock();
+        let HistoryProbeResponseOutcome::FetchSnapshot(request) =
+            state.record_history_probe_response(1, rank, local_rank)
+        else {
+            panic!("remote rank should produce the current snapshot request");
+        };
+        request.election_generation()
+    };
+    sink.v3_history
+        .lock()
+        .defer_until_terminal_with_election_generation(
+            peer,
+            rank,
+            source_cut,
+            StrictCatchupReason::HistoryElection,
+            Some(election_generation),
+        );
     request_v3_terminal_sync(&sink, 1, StrictCatchupReason::HistoryElection).await;
     assert!(sink_net.drain_captures().is_empty());
     {
@@ -2450,40 +2711,18 @@ async fn active_history_election_stages_checkpoint_for_admission_started_client(
     )));
     let journal = sink.terminal_journal.lock().await;
     assert!(journal.get(source_op).is_none());
-    assert!(journal.is_retired(conflicting));
+    assert!(journal.get(conflicting).is_none());
 }
 
-/// Production regression: node 4 (eu.mumble.winterco.cn) ran a history
-/// election against the cluster (gen 4103) while its own strict terminal
-/// journal was divergent (gen 7, five retired origins) and had already
-/// retired the cluster's current op range. Every elected terminal sync
-/// failed 140/140 with "strict terminal commit rejected by durable journal
-/// ... is retired by checkpoint", and peers kept admission-probing it
-/// forever. The elected source advanced its cut between the probe (which
-/// deferred the elected source_cut) and the checkpoint page render, so the
-/// sink no longer matched the exact-elected staging gate and fell into the
-/// per-op apply path, where its own stale retired-origin floor rejected the
-/// incoming ops. The elected checkpoint must still be staged as a wholesale
-/// journal replacement even when the deferred cut is slightly behind the
-/// page target.
+/// A divergent retired lineage is owned by mandatory V8 recovery, never by
+/// the subordinate V3 terminal session.
 #[tokio::test]
-async fn exact_elected_checkpoint_stages_when_source_advanced_over_retired_floor() {
+async fn divergent_retired_floor_hands_elected_recovery_to_v8() {
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
-    let (source, source_net) = runtime(1, config.clone());
+    let (source, _source_net) = runtime(1, config.clone());
     let (sink, sink_net) = runtime(2, config);
-    // The source applies a first op, the sink captures that cut as its
-    // elected source obligation, and then the source advances one more
-    // generation before rendering the checkpoint page.
     assert!(source.apply_catchup_terminal_state(terminal_abort(1)).await);
     let deferred_cut = source.terminal_journal.lock().await.terminal_cut();
-    assert!(source.apply_catchup_terminal_state(terminal_abort(2)).await);
-    let advanced_cut = source.terminal_journal.lock().await.terminal_cut();
-    assert_ne!(deferred_cut, advanced_cut);
-
-    // The sink's divergent journal has a retired-origin floor covering the
-    // source's current op (the production divergence: node 4 retired the
-    // cluster's live op range).
-    let source_op = make_op_id(1, 11, 2);
     let retired_floor = make_op_id(1, 30, 1);
     {
         let mut journal = sink.terminal_journal.lock().await;
@@ -2491,26 +2730,7 @@ async fn exact_elected_checkpoint_stages_when_source_advanced_over_retired_floor
             .upsert_abort_decision(retired_floor, 2)
             .expect("retirement floor decision");
         journal.checkpoint(0).expect("retirement checkpoint");
-        assert!(journal.is_retired(source_op));
     }
-
-    // Exact elected HistoryElection intent: the sink elected node 1 as the
-    // repository source and defers its terminal obligation at the cut it
-    // observed during the election.
-    let peer = PeerIncarnation::new(1, 11);
-    sink.state.lock().begin_history_election([1]);
-    sink.v3_history.lock().defer_until_terminal(
-        peer,
-        HistoryRank {
-            version: 1,
-            freshness: 1,
-            runtime_started_at: 11,
-            node_id: 1,
-            terminal_repository_base_version: 0,
-        },
-        deferred_cut,
-        StrictCatchupReason::HistoryElection,
-    );
     request_v3_terminal_sync_toward(
         &sink,
         1,
@@ -2518,34 +2738,17 @@ async fn exact_elected_checkpoint_stages_when_source_advanced_over_retired_floor
         Some(deferred_cut),
     )
     .await;
-    let request = terminal_request(sink_net.drain_captures().pop().expect("elected request"));
-    recv_v3_terminal_sync_req(&source, 2, 22, request).await;
-    let page = terminal_page(source_net.drain_captures().pop().expect("checkpoint page"));
-    assert_eq!(
-        StrictTerminalPageKind::try_from(page.kind).ok(),
-        Some(StrictTerminalPageKind::Checkpoint)
-    );
-    assert_eq!(
-        page.target_cut.as_ref().and_then(cut_from_wire),
-        Some(advanced_cut),
-        "the responder must render the checkpoint at its current (advanced) cut"
-    );
-
-    recv_v3_terminal_sync_page(&sink, 1, 11, page).await;
-
-    // The elected checkpoint must be staged and acknowledged, not applied
-    // per-op (which would reject the locally-retired op and fail the session
-    // forever, exactly like production).
     assert!(
-        sink_net.drain_captures().into_iter().any(|frame| matches!(
+        sink_net.drain_captures().into_iter().all(|frame| !matches!(
             frame,
             CapturedFrame::StrictUnicast {
-                body: StrictBody::TerminalSyncAck(_),
+                body: StrictBody::TerminalSyncReq(_),
                 ..
             }
         )),
-        "the elected checkpoint must be staged and acknowledged even after the source advanced"
+        "divergent recovery must not start a legacy V3 terminal transfer"
     );
+    assert!(!sink.recovery_is_healthy());
 }
 
 #[tokio::test]
@@ -2553,6 +2756,7 @@ async fn terminal_checkpoint_buffers_commit_from_disjoint_frozen_partition() {
     let config = ReplicationConfig::default().with_strict_max_catchup_ops(32);
     let (source, source_net) = runtime(1, config.clone());
     let (sink, sink_net) = runtime(2, config);
+    share_empty_terminal_lineage(&source, &sink).await;
     let op_id = make_op_id(1, 11, 77);
     let committed = StrictTerminalState {
         coord_node: 1,
@@ -2572,8 +2776,9 @@ async fn terminal_checkpoint_buffers_commit_from_disjoint_frozen_partition() {
             boot_epoch: 11,
         }],
     };
-    assert!(source.apply_catchup_terminal_state(committed).await);
+    assert!(source.apply_catchup_terminal_state(terminal_abort(2)).await);
     assert!(sink.apply_catchup_terminal_state(terminal_abort(2)).await);
+    assert!(source.apply_catchup_terminal_state(committed).await);
 
     request_v3_terminal_sync(&sink, 1, StrictCatchupReason::TerminalFence).await;
     let request = terminal_request(sink_net.drain_captures().pop().expect("initial request"));
@@ -2726,6 +2931,7 @@ fn failed_client_cleanup_does_not_expire_coalesced_dirty_followup() {
         peer,
         StrictCatchupReason::TerminalFence as i32,
         None,
+        None,
         initial_wire.nonce().get(),
         initial_wire.cursor().value(),
         ttl,
@@ -2859,7 +3065,8 @@ async fn invalid_correlated_history_response_cleans_up_and_rearms_election() {
 async fn correlated_transfer_expiry_rearms_exact_pending_terminal_repair() {
     let (sink, net) = runtime(2, ReplicationConfig::default());
     let peer = PeerIncarnation::new(1, 11);
-    let source_cut = TerminalCut::new([7; 16], 9, [8; 32], [9; 32]);
+    let local_cut = sink.terminal_journal.lock().await.terminal_cut();
+    let source_cut = TerminalCut::new(*local_cut.journal_id(), 9, [8; 32], [9; 32]);
     sink.v3_history.lock().defer_until_terminal(
         peer,
         HistoryRank {
@@ -2927,8 +3134,9 @@ async fn correlated_transfer_expiry_rearms_exact_pending_terminal_repair() {
 async fn correlated_cursor_mismatch_restarts_exact_terminal_repair_from_zero() {
     let (sink, net) = runtime(2, ReplicationConfig::default());
     let peer = PeerIncarnation::new(1, 11);
-    let source_cut = TerminalCut::new([7; 16], 9, [8; 32], [9; 32]);
-    let stale_baseline = TerminalCut::new([7; 16], 4, [4; 32], [5; 32]);
+    let local_cut = sink.terminal_journal.lock().await.terminal_cut();
+    let source_cut = TerminalCut::new(*local_cut.journal_id(), 9, [8; 32], [9; 32]);
+    let stale_baseline = TerminalCut::new(*local_cut.journal_id(), 4, [4; 32], [5; 32]);
     sink.v3_sync
         .lock()
         .remember_source_cut(peer, stale_baseline);
@@ -3013,7 +3221,8 @@ async fn capacity_resource_limit_keeps_bounded_exact_terminal_retry() {
         .with_pending_propose_ttl(ttl);
     let (sink, net) = runtime(2, config);
     let peer = PeerIncarnation::new(1, 11);
-    let desired_cut = TerminalCut::new([7; 16], 9, [8; 32], [9; 32]);
+    let local_cut = sink.terminal_journal.lock().await.terminal_cut();
+    let desired_cut = TerminalCut::new(*local_cut.journal_id(), 9, [8; 32], [9; 32]);
     request_v3_terminal_sync_toward(
         &sink,
         1,
@@ -3071,19 +3280,42 @@ async fn capacity_resource_limit_keeps_bounded_exact_terminal_retry() {
 async fn correlated_incarnation_mismatch_rearms_pending_elected_history() {
     let (sink, net) = runtime(2, ReplicationConfig::default());
     let peer = PeerIncarnation::new(1, 11);
-    let source_cut = TerminalCut::new([7; 16], 9, [8; 32], [9; 32]);
-    sink.v3_history.lock().defer_until_terminal(
-        peer,
-        HistoryRank {
-            version: 10,
-            freshness: 20,
-            runtime_started_at: 30,
-            node_id: 1,
-            terminal_repository_base_version: 10,
-        },
-        source_cut,
-        StrictCatchupReason::HistoryElection,
-    );
+    let local_cut = sink.terminal_journal.lock().await.terminal_cut();
+    let source_cut = TerminalCut::new(*local_cut.journal_id(), 9, [8; 32], [9; 32]);
+    let rank = HistoryRank {
+        version: 10,
+        freshness: 20,
+        runtime_started_at: 30,
+        node_id: 1,
+        terminal_repository_base_version: 10,
+    };
+    let election_generation = {
+        let local_rank = HistoryRank {
+            version: 1,
+            freshness: 2,
+            runtime_started_at: 22,
+            node_id: 2,
+            terminal_repository_base_version: 1,
+        };
+        let mut state = sink.state.lock();
+        state.rearm_history_election();
+        state.begin_history_election([1]);
+        let HistoryProbeResponseOutcome::FetchSnapshot(request) =
+            state.record_history_probe_response(1, rank, local_rank)
+        else {
+            panic!("remote rank should produce the current snapshot request");
+        };
+        request.election_generation()
+    };
+    sink.v3_history
+        .lock()
+        .defer_until_terminal_with_election_generation(
+            peer,
+            rank,
+            source_cut,
+            StrictCatchupReason::HistoryElection,
+            Some(election_generation),
+        );
     request_v3_terminal_sync_toward(
         &sink,
         1,
@@ -3092,7 +3324,13 @@ async fn correlated_incarnation_mismatch_rearms_pending_elected_history() {
     )
     .await;
     let initial = terminal_request(net.drain_captures().pop().expect("initial request"));
-    assert!(!sink.state.lock().history_election_pending());
+    assert!(
+        sink.state
+            .lock()
+            .history_election_fetching_snapshot()
+            .is_some(),
+        "fixture must retain the exact elected snapshot owner"
+    );
 
     recv_v3_terminal_sync_page(
         &sink,
@@ -3120,6 +3358,13 @@ async fn correlated_incarnation_mismatch_rearms_pending_elected_history() {
     assert!(
         sink.state.lock().history_election_pending(),
         "the invalid elected incarnation must rearm source ranking"
+    );
+    assert!(
+        sink.state
+            .lock()
+            .history_election_fetching_snapshot()
+            .is_none(),
+        "rearming must retire the invalid elected snapshot owner"
     );
 }
 
@@ -3220,6 +3465,7 @@ fn terminal_intent_deferred_behind_reducer_history_preserves_exact_desired_cut()
         peer,
         StrictCatchupReason::TerminalFence as i32,
         Some(desired_cut),
+        None,
     ));
     assert_eq!(
         state.take_deferred_client(peer),
@@ -3328,7 +3574,15 @@ fn active_terminal_responder_allows_one_bounded_clock_probe() {
     let target = TerminalCut::new([1; 16], 1, [2; 32], [3; 32]);
     state.insert_responder(
         peer,
-        ResponderSession::new(9, None, target, StrictTerminalPageKind::Checkpoint, 10, ttl),
+        ResponderSession::new(
+            9,
+            None,
+            target,
+            StrictTerminalPageKind::Checkpoint,
+            10,
+            StrictCatchupReason::TerminalFence as i32,
+            ttl,
+        ),
     );
     assert!(state.has_checkpoint_blocking_work());
 
@@ -3363,6 +3617,146 @@ fn active_terminal_responder_allows_one_bounded_clock_probe() {
 }
 
 #[test]
+fn newer_terminal_responder_start_preempts_same_reason_and_tombstones_older_nonce() {
+    let mut state = SyncV3State::default();
+    let peer = PeerIncarnation::new(2, 22);
+    let ttl = Duration::from_secs(30);
+    let target = TerminalCut::new([1; 16], 1, [2; 32], [3; 32]);
+    state.insert_responder(
+        peer,
+        ResponderSession::new(
+            9,
+            None,
+            target,
+            StrictTerminalPageKind::Checkpoint,
+            10,
+            StrictCatchupReason::HistoryElection as i32,
+            ttl,
+        ),
+    );
+
+    assert_eq!(
+        state.prepare_initial_terminal_responder(
+            peer,
+            11,
+            StrictCatchupReason::HistoryElection as i32,
+        ),
+        InitialTerminalResponderDisposition::Preempted {
+            released_bulk_page: None,
+        }
+    );
+    state.insert_responder(
+        peer,
+        ResponderSession::new(
+            10,
+            None,
+            target,
+            StrictTerminalPageKind::Checkpoint,
+            11,
+            StrictCatchupReason::HistoryElection as i32,
+            ttl,
+        ),
+    );
+    assert_eq!(
+        state.prepare_initial_terminal_responder(
+            peer,
+            10,
+            StrictCatchupReason::TerminalFence as i32,
+        ),
+        InitialTerminalResponderDisposition::Stale,
+        "a delayed older nonce must not regain ownership even at higher priority"
+    );
+}
+
+#[test]
+fn terminal_responder_start_preemption_preserves_reason_priority() {
+    let mut state = SyncV3State::default();
+    let peer = PeerIncarnation::new(2, 22);
+    let ttl = Duration::from_secs(30);
+    let target = TerminalCut::new([1; 16], 1, [2; 32], [3; 32]);
+    state.insert_responder(
+        peer,
+        ResponderSession::new(
+            9,
+            None,
+            target,
+            StrictTerminalPageKind::Checkpoint,
+            10,
+            StrictCatchupReason::TerminalFence as i32,
+            ttl,
+        ),
+    );
+
+    assert_eq!(
+        state
+            .prepare_initial_terminal_responder(peer, 11, StrictCatchupReason::SteadyState as i32,),
+        InitialTerminalResponderDisposition::Backpressure,
+        "a lower-priority start must not displace terminal-fence donation"
+    );
+    assert_eq!(
+        state.prepare_initial_terminal_responder(
+            peer,
+            12,
+            StrictCatchupReason::TerminalFence as i32,
+        ),
+        InitialTerminalResponderDisposition::Preempted {
+            released_bulk_page: None,
+        }
+    );
+}
+
+#[test]
+fn wrapped_terminal_responder_nonce_preempts_pre_wrap_start() {
+    let mut state = SyncV3State::default();
+    let peer = PeerIncarnation::new(2, 22);
+    let ttl = Duration::from_secs(30);
+    let target = TerminalCut::new([1; 16], 1, [2; 32], [3; 32]);
+    state.insert_responder(
+        peer,
+        ResponderSession::new(
+            9,
+            None,
+            target,
+            StrictTerminalPageKind::Checkpoint,
+            u64::MAX - 1,
+            StrictCatchupReason::HistoryElection as i32,
+            ttl,
+        ),
+    );
+
+    assert_eq!(
+        state.prepare_initial_terminal_responder(
+            peer,
+            1,
+            StrictCatchupReason::HistoryElection as i32,
+        ),
+        InitialTerminalResponderDisposition::Preempted {
+            released_bulk_page: None,
+        }
+    );
+    state.insert_responder(
+        peer,
+        ResponderSession::new(
+            10,
+            None,
+            target,
+            StrictTerminalPageKind::Checkpoint,
+            1,
+            StrictCatchupReason::HistoryElection as i32,
+            ttl,
+        ),
+    );
+    assert_eq!(
+        state.prepare_initial_terminal_responder(
+            peer,
+            u64::MAX - 1,
+            StrictCatchupReason::HistoryElection as i32,
+        ),
+        InitialTerminalResponderDisposition::Stale
+    );
+}
+
+#[test]
 fn active_terminal_client_allows_one_bounded_clock_probe() {
     let mut state = SyncV3State::default();
     let peer = PeerIncarnation::new(2, 22);
@@ -3391,7 +3785,15 @@ fn responder_expiry_releases_deferred_reverse_intent() {
     let target = TerminalCut::new([1; 16], 1, [2; 32], [3; 32]);
     state.insert_responder(
         peer,
-        ResponderSession::new(9, None, target, StrictTerminalPageKind::Checkpoint, 10, ttl),
+        ResponderSession::new(
+            9,
+            None,
+            target,
+            StrictTerminalPageKind::Checkpoint,
+            10,
+            StrictCatchupReason::TerminalFence as i32,
+            ttl,
+        ),
     );
     assert!(
         state
@@ -3431,6 +3833,7 @@ fn payload_cache_expiry_reconciles_reducer_and_stops_periodic_suppression() {
     state.begin_terminal_client_cache(
         peer,
         StrictCatchupReason::TerminalFence as i32,
+        None,
         None,
         wire.nonce().get(),
         wire.cursor().value(),
@@ -3486,6 +3889,7 @@ fn terminal_trigger_expires_stale_client_before_reducer_transition() {
     state.begin_terminal_client_cache(
         peer,
         StrictCatchupReason::TerminalFence as i32,
+        None,
         None,
         initial_wire.nonce().get(),
         initial_wire.cursor().value(),
@@ -3722,6 +4126,7 @@ fn peer_restart_retains_only_the_reusable_durable_source_cut() {
     state.begin_terminal_client_cache(
         old_peer,
         StrictCatchupReason::SteadyState as i32,
+        None,
         None,
         old_wire.nonce().get(),
         old_wire.cursor().value(),
@@ -4082,9 +4487,9 @@ async fn lost_clock_probe_retries_one_nonce_while_terminal_transfer_remains_acti
 #[tokio::test]
 async fn duplicate_v4_pairwise_clock_probe_request_replays_one_clock_response() {
     let (rt, net) = runtime(2, ReplicationConfig::default());
-    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
-    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
-    net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V4);
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V8);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V8));
+    net.set_peer_strict_replication_protocol_version(1, STRICT_PROTOCOL_VERSION_V8);
     let request = StrictClockProbeReq {
         src_node: 1,
         expected_responder_boot_epoch: 22,
@@ -4269,183 +4674,6 @@ async fn newer_admission_metadata_starts_repository_catchup() {
 }
 
 #[tokio::test]
-async fn newer_promoted_admission_foreign_checkpoint_rearms_after_election_closes() {
-    let net = MockNet::new(1, vec![1, 2, 3]);
-    net.set_epoch(1, 11);
-    net.set_epoch(2, 22);
-    net.set_epoch(3, 33);
-    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V4);
-    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V4));
-    net.set_peer_strict_replication_protocol_version(2, STRICT_PROTOCOL_VERSION_V4);
-    net.set_peer_strict_replication_protocol_version(3, STRICT_PROTOCOL_VERSION_V4);
-    let rt = StrictRuntime::new(
-        CountingStrictRepo::new(),
-        1,
-        11,
-        "channels".to_owned(),
-        net.clone(),
-        CancellationToken::new(),
-        Arc::new(ReplicationConfig::default()),
-    );
-    rt.finish_history_election_for_test();
-    rt.seed_membership_snapshot([
-        MemberIncarnation::new(1, 11),
-        MemberIncarnation::new(2, 22),
-        MemberIncarnation::new(3, 33),
-    ]);
-
-    request_v3_history_probe(&rt, 2, StrictCatchupReason::Admission).await;
-    let admission_request = net
-        .drain_captures()
-        .into_iter()
-        .find_map(|frame| match frame {
-            CapturedFrame::StrictUnicast {
-                dst: 2,
-                body: StrictBody::HistoryProbeReq(request),
-                ..
-            } => Some(request),
-            _ => None,
-        })
-        .expect("admission history request");
-    {
-        let mut state = rt.state.lock();
-        state.request_history_election();
-        state.begin_history_election([2, 3]);
-    }
-    request_v3_history_probe(&rt, 2, StrictCatchupReason::HistoryElection).await;
-    let remote_cut = TerminalCut::new([7; 16], 1, [8; 32], [9; 32]);
-    recv_v3_history_probe_resp(
-        &rt,
-        2,
-        22,
-        StrictHistoryProbeResp {
-            responder_node: 2,
-            expected_requester_boot_epoch: 11,
-            request_nonce: admission_request.request_nonce,
-            repository_version: 1,
-            terminal_repository_base_version: 0,
-            history_freshness: 1,
-            runtime_started_at: 22,
-            history_node: 2,
-            terminal_cut: Some(cut_to_wire(remote_cut)),
-            reason: StrictCatchupReason::Admission as i32,
-        },
-    )
-    .await;
-    assert!(
-        net.drain_captures().is_empty(),
-        "incomplete election defers repair"
-    );
-
-    rt.finish_history_election_for_test();
-    rt.reconcile_peer_admissions();
-    assert!(!rt.peer_incarnation_is_admitted(2, 22));
-    resume_deferred_v3_admissions(&rt).await;
-
-    assert!(rt.state.lock().history_election_blocks_steady_state());
-    assert!(net.drain_captures().into_iter().all(|frame| !matches!(
-        frame,
-        CapturedFrame::StrictUnicast {
-            dst: 2,
-            body: StrictBody::TerminalSyncReq(_),
-            ..
-        }
-    )));
-}
-
-#[tokio::test]
-async fn deferred_behind_foreign_checkpoint_does_not_start_unranked_admission_sync() {
-    let (rt, net) = runtime(1, ReplicationConfig::default());
-    rt.seed_membership_snapshot([MemberIncarnation::new(1, 11), MemberIncarnation::new(2, 22)]);
-
-    // The high-ranked local replica owns an active terminal lineage. A
-    // lower-ranked peer's compacted checkpoint cannot be adopted through
-    // admission: the peer must recover toward this node's lineage instead.
-    {
-        let mut local = rt.terminal_journal.lock().await;
-        local
-            .upsert_abort_decision(make_op_id(1, 11, 1), 2)
-            .expect("local terminal abort");
-        assert!(local.terminal_cut().generation() > 0);
-    }
-    let local_cut = rt.terminal_journal.lock().await.terminal_cut();
-    let local_rank = rt.v3_history_rank();
-    let mut checkpointed = TerminalJournal::in_memory("behind-retired-checkpoint");
-    checkpointed
-        .upsert_abort_decision(make_op_id(2, 22, 1), 2)
-        .expect("remote terminal abort");
-    checkpointed
-        .checkpoint(local_rank.version)
-        .expect("remote retired checkpoint");
-    let remote_cut = checkpointed.terminal_cut();
-    assert_eq!(remote_cut.generation(), 0);
-    assert!(!remote_cut.is_empty_terminal_set());
-    assert_ne!(remote_cut.journal_id(), local_cut.journal_id());
-    assert_ne!(
-        remote_cut.terminal_set_digest(),
-        local_cut.terminal_set_digest()
-    );
-    let remote_rank = HistoryRank {
-        freshness: local_rank.freshness.saturating_sub(1),
-        runtime_started_at: 22,
-        node_id: 2,
-        terminal_repository_base_version: local_rank.version,
-        ..local_rank
-    };
-    assert!(!remote_rank.beats(local_rank));
-
-    let peer = PeerIncarnation::new(2, 22);
-    rt.state.lock().request_history_election();
-    rt.v3_history
-        .lock()
-        .defer_admission(peer, remote_rank, remote_cut);
-    rt.finish_history_election_for_test();
-    rt.reconcile_peer_admissions();
-    assert!(rt.state.lock().peer_incarnation_awaits_history_proof(2, 22));
-    assert!(!rt.peer_incarnation_is_admitted(2, 22));
-    // Production replay can overlap unrelated unresolved local work. Add it
-    // only after the stable local admission cut has been frozen so the test
-    // reaches the deferred-history branch under investigation.
-    {
-        let unresolved = make_op_id(1, 11, 2);
-        let mut local = rt.terminal_journal.lock().await;
-        local
-            .upsert_promise(unresolved, 3)
-            .expect("local unresolved promise");
-        assert!(
-            local
-                .get(unresolved)
-                .is_some_and(|record| !record.is_terminal())
-        );
-    }
-    net.drain_captures();
-
-    resume_deferred_v3_admissions(&rt).await;
-
-    assert!(
-        !rt.state.lock().history_election_blocks_steady_state(),
-        "a lower-ranked foreign checkpoint must not start another local pull election"
-    );
-    assert!(
-        rt.state.lock().peer_incarnation_awaits_history_proof(2, 22),
-        "the behind peer must remain awaiting recovery toward the local lineage"
-    );
-    assert!(!rt.peer_incarnation_is_admitted(2, 22));
-    assert!(
-        net.drain_captures().into_iter().all(|frame| !matches!(
-            frame,
-            CapturedFrame::StrictUnicast {
-                dst: 2,
-                body: StrictBody::TerminalSyncReq(request),
-                ..
-            } if StrictCatchupReason::try_from(request.reason).ok()
-                == Some(StrictCatchupReason::Admission)
-        )),
-        "deferred admission must not bypass ranked convergence with an unranked terminal sync"
-    );
-}
-
-#[tokio::test]
 async fn empty_remote_terminal_cut_cannot_admit_peer_missing_local_abort_fence() {
     let (rt, net) = runtime(1, ReplicationConfig::default());
     rt.terminal_journal
@@ -4520,8 +4748,12 @@ async fn empty_remote_terminal_cut_cannot_admit_peer_missing_local_abort_fence()
 }
 
 #[tokio::test]
-async fn delayed_election_response_with_divergent_cut_rearms_election() {
-    let (rt, net) = runtime(1, ReplicationConfig::default());
+async fn delayed_election_response_with_divergent_cut_hands_off_to_v8() {
+    let quiet_interval = Duration::from_millis(1);
+    let (rt, net) = runtime(
+        1,
+        ReplicationConfig::default().with_strict_bootstrap_retry_interval(quiet_interval),
+    );
     rt.seed_membership_snapshot([MemberIncarnation::new(1, 11), MemberIncarnation::new(2, 22)]);
     assert!(!rt.peer_incarnation_is_admitted(2, 22));
 
@@ -4540,14 +4772,20 @@ async fn delayed_election_response_with_divergent_cut_rearms_election() {
 
     // `runtime()` deliberately leaves the election collector idle. This
     // models a promoted admission nonce whose election completed before the
-    // peer's response arrived. A divergent cut must rearm a new global
-    // election; admission is not authorized to synchronize that foreign
+    // peer's response arrived. A divergent cut must enter mandatory V8
+    // recovery; admission is not authorized to synchronize that foreign
     // lineage on its own.
-    let remote_cut = crate::replications::proto::StrictTerminalCut {
-        journal_id: Bytes::from_static(&[7; 16]),
-        generation: 1,
-        chain_digest: Bytes::from_static(&[8; 32]),
-        terminal_set_digest: Bytes::from_static(&[9; 32]),
+    let mut remote_journal = TerminalJournal::in_memory("delayed-divergent");
+    remote_journal
+        .upsert_abort_decision((2, 1), 1)
+        .expect("remote terminal decision");
+    let remote_cut = remote_journal.terminal_cut();
+    let remote_rank = HistoryRank {
+        version: 0,
+        freshness: 0,
+        runtime_started_at: 22,
+        node_id: 2,
+        terminal_repository_base_version: 0,
     };
     recv_v3_history_probe_resp(
         &rt,
@@ -4562,13 +4800,27 @@ async fn delayed_election_response_with_divergent_cut_rearms_election() {
             history_freshness: 0,
             runtime_started_at: 22,
             history_node: 2,
-            terminal_cut: Some(remote_cut),
+            terminal_cut: Some(cut_to_wire(remote_cut)),
             reason: StrictCatchupReason::HistoryElection as i32,
         },
     )
     .await;
 
-    assert!(rt.state.lock().history_election_pending());
+    assert!(
+        rt.recovery_is_healthy(),
+        "the delayed response first establishes the continuous quiet interval"
+    );
+    tokio::time::sleep(quiet_interval + Duration::from_millis(5)).await;
+    assert!(
+        rt.request_foreign_checkpoint_election(
+            PeerIncarnation::new(2, 22),
+            remote_rank,
+            remote_cut,
+        )
+        .await,
+        "the same delayed observation must remain owned by v8"
+    );
+    assert!(!rt.recovery_is_healthy());
     assert!(net.drain_captures().into_iter().all(|frame| !matches!(
         frame,
         CapturedFrame::StrictUnicast {

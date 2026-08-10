@@ -46,6 +46,35 @@ impl Default for V3RetryState {
 }
 
 impl V3RetryState {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn history_request_diagnostics(&self) -> Vec<(NodeIdentifier, u64, u64, u64, u32)> {
+        let mut requests = self
+            .history_requests
+            .iter()
+            .filter_map(|(peer, scheduled)| {
+                let transfer = scheduled.message.history_transfer.as_ref()?;
+                Some((
+                    peer.node(),
+                    peer.boot_epoch(),
+                    transfer.transfer_id,
+                    transfer.request_nonce,
+                    scheduled.attempt,
+                ))
+            })
+            .collect::<Vec<_>>();
+        requests.sort_unstable_by_key(|(node, epoch, ..)| (*node, *epoch));
+        requests
+    }
+
+    pub(super) fn cancel_all(&mut self) {
+        self.requests.clear();
+        self.final_acks.clear();
+        self.history_requests.clear();
+        self.history_final_acks.clear();
+        self.clock_probes.clear();
+        self.history_probes.clear();
+    }
+
     /// Whether any correlated V3 transmission can still be retried with a
     /// cut, cursor, or snapshot identity captured before a checkpoint.
     pub(super) fn has_checkpoint_blocking_work(&self, now: Instant) -> bool {
@@ -323,6 +352,19 @@ impl V3RetryState {
 
     pub(super) fn cancel_history_request(&mut self, peer: PeerIncarnation) {
         self.history_requests.remove(&peer);
+    }
+
+    pub(super) fn cancel_history_transfer(&mut self, peer: PeerIncarnation, transfer_id: u64) {
+        if self.history_requests.get(&peer).is_some_and(|pending| {
+            pending
+                .message
+                .history_transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.transfer_id == transfer_id)
+        }) {
+            self.history_requests.remove(&peer);
+        }
+        self.history_final_acks.remove(&(peer, transfer_id));
     }
 
     pub(super) fn register_history_final_ack(

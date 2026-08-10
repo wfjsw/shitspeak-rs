@@ -247,7 +247,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
-    let local_geo =
+    let (local_geo, geo_retry_task) =
         start_observability_geo_resolution(config.s2s.geo.manual_geo(), shutdown_rx.clone());
     let mut metrics_source =
         S2sTopologyMetricsSource::new(overlay.clone(), transport.clone(), local_geo.clone());
@@ -308,10 +308,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
         "s2s overlay forwarder started"
     );
 
-    tokio::signal::ctrl_c().await?;
-    info!("received Ctrl-C, shutting down s2s overlay forwarder");
+    let ctrl_c_result = tokio::signal::ctrl_c().await;
+    match &ctrl_c_result {
+        Ok(()) => info!("received Ctrl-C, shutting down s2s overlay forwarder"),
+        Err(error) => warn!(%error, "Ctrl-C listener failed; shutting down s2s overlay forwarder"),
+    }
 
     let _ = shutdown_tx.send(());
+    if let Some(task) = geo_retry_task {
+        let _ = task.await;
+    }
     if let Some(task) = status_task {
         let _ = task.await;
     }
@@ -328,6 +334,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     transport.shutdown().await;
 
     info!("s2s overlay forwarder stopped");
+    ctrl_c_result?;
     Ok(())
 }
 

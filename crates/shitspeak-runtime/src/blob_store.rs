@@ -645,7 +645,7 @@ async fn scan_existing_session_blobs(root: &Path) -> SessionBlobIndex {
                 .modified()
                 .ok()
                 .and_then(|mtime| mtime.elapsed().ok())
-                .map(|age| std::time::Instant::now() - age)
+                .map(|age| instant_from_file_age(std::time::Instant::now(), age))
                 .unwrap_or_else(std::time::Instant::now);
             index.total_bytes = index.total_bytes.saturating_add(size);
             index
@@ -656,6 +656,10 @@ async fn scan_existing_session_blobs(root: &Path) -> SessionBlobIndex {
     index
 }
 
+fn instant_from_file_age(now: std::time::Instant, age: std::time::Duration) -> std::time::Instant {
+    now.checked_sub(age).unwrap_or(now)
+}
+
 fn is_lower_hex(b: u8) -> bool {
     b.is_ascii_hexdigit()
 }
@@ -663,6 +667,12 @@ fn is_lower_hex(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_age_older_than_monotonic_clock_uptime_is_bounded() {
+        let now = std::time::Instant::now();
+        assert_eq!(instant_from_file_age(now, std::time::Duration::MAX), now);
+    }
     use std::sync::Arc;
 
     fn test_dir(label: &str) -> PathBuf {

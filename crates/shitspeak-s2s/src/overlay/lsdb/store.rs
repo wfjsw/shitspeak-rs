@@ -43,10 +43,11 @@ use shitspeak_proto::s2s_overlay_proto::link_state_advert_capabilities as lsa_ca
 /// This bounds every entry before count-based flood and sync batching.
 pub(crate) const MAX_UPPER_LAYER_CAPABILITIES_BYTES: usize = 4 * 1024;
 
-/// Deprecated field-16 value retained for rolling-upgrade compatibility.
-/// Replication owns the authoritative participant version in the opaque
-/// upper-layer capability envelope.
-pub const STRICT_REPLICATION_PROTOCOL_VERSION: u32 = 2;
+/// Repository capability contract required by the current strict protocol.
+/// The authoritative participant version is carried in replication's opaque
+/// capability envelope; the deprecated field mirrors v8 and cannot activate
+/// an older recovery path.
+pub const STRICT_REPLICATION_PROTOCOL_VERSION: u32 = 8;
 
 /// Deprecated field-17 value retained while upgrading from the transitional
 /// transit-version build. Current overlay forwarding keeps L3 payloads opaque.
@@ -1101,6 +1102,24 @@ impl LinkStateDb {
         std::mem::take(&mut *self.dirty_origins.write())
     }
 
+    /// Remove one active origin for deterministic failure injection.
+    ///
+    /// The durable admission floor deliberately remains unchanged, so an
+    /// already-observed LSA cannot resurrect the failed incarnation. The
+    /// caller owns membership-event ordering and change notification.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn remove_active_origin_for_test(&self, origin: NodeIdentifier) -> Option<LsaEntry> {
+        let removed = self
+            .inner
+            .write()
+            .remove(&origin)
+            .filter(|entry| !entry.tombstone);
+        if removed.is_some() {
+            self.mark_dirty(origin);
+        }
+        removed
+    }
+
     pub fn get(&self, origin: NodeIdentifier) -> Option<LsaEntry> {
         self.inner.read().get(&origin).cloned()
     }
@@ -1984,6 +2003,29 @@ mod tests {
         let (failed, _) = db.sweep(Duration::from_secs(30), Duration::from_secs(120));
         assert_eq!(failed, vec![1u16]);
         assert_eq!(db.drain_dirty_origins(), HashSet::from([1]));
+    }
+
+    #[test]
+    fn targeted_failure_removes_only_requested_active_origin() {
+        let floor = Arc::new(LsaFloor::new(0, None));
+        let db = LinkStateDb::new(floor.clone());
+        db.admit(entry(1, 100, 5, false));
+        db.admit(entry(2, 100, 1, false));
+        db.admit(entry(3, 100, 9, true));
+        db.drain_dirty_origins();
+
+        let removed = db
+            .remove_active_origin_for_test(2)
+            .expect("active origin removed");
+
+        assert_eq!(removed.origin, 2);
+        assert_eq!(db.active_origins(), vec![1]);
+        assert!(db.get(1).is_some());
+        assert!(db.get(2).is_none());
+        assert!(db.get(3).is_some(), "unrelated tombstone is preserved");
+        assert_eq!(db.drain_dirty_origins(), HashSet::from([2]));
+        assert_eq!(floor.get(2).unwrap().boot_epoch, 100);
+        assert!(db.remove_active_origin_for_test(3).is_none());
     }
 
     #[test]

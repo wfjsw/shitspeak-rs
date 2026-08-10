@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use super::protocol::STRICT_PROTOCOL_VERSION_CURRENT;
+
 type Publisher = dyn Fn(u32) + Send + Sync;
 
 #[derive(Clone, Copy, Debug)]
@@ -22,13 +24,13 @@ struct ParticipantState {
 }
 
 impl ParticipantState {
-    fn advertised_version(self, supported_version: u32) -> u32 {
+    fn advertised_version(self) -> u32 {
         if self.participant_enabled
             && self.durable_state_ready
             && self.repository_registration_ready
             && !self.permanently_disabled
         {
-            supported_version
+            STRICT_PROTOCOL_VERSION_CURRENT
         } else {
             0
         }
@@ -36,7 +38,6 @@ impl ParticipantState {
 }
 
 pub(crate) struct StrictParticipantCapability {
-    supported_version: u32,
     state: Mutex<ParticipantState>,
     publisher: Arc<Publisher>,
 }
@@ -45,11 +46,9 @@ impl StrictParticipantCapability {
     pub(crate) fn new(
         participant_enabled: bool,
         durable_state_ready: bool,
-        supported_version: u32,
         publisher: impl Fn(u32) + Send + Sync + 'static,
     ) -> Arc<Self> {
         Arc::new(Self {
-            supported_version,
             state: Mutex::new(ParticipantState {
                 participant_enabled,
                 durable_state_ready,
@@ -66,7 +65,7 @@ impl StrictParticipantCapability {
     }
 
     pub(crate) fn protocol_version(&self) -> u32 {
-        self.state.lock().advertised_version(self.supported_version)
+        self.state.lock().advertised_version()
     }
 
     pub(crate) fn begin_repository_registration(&self) {
@@ -74,7 +73,7 @@ impl StrictParticipantCapability {
             let mut state = self.state.lock();
             state.repository_registration_ready = false;
             state.repository_registration_rearm_permitted = true;
-            state.advertised_version(self.supported_version)
+            state.advertised_version()
         };
         (self.publisher)(version);
     }
@@ -89,7 +88,7 @@ impl StrictParticipantCapability {
                 state.repository_registration_rearm_permitted = false;
             }
             state.repository_registration_ready = ready;
-            state.advertised_version(self.supported_version)
+            state.advertised_version()
         };
         (self.publisher)(version);
         ready
@@ -105,7 +104,7 @@ impl StrictParticipantCapability {
             }
             state.repository_registration_ready = false;
             state.repository_registration_rearm_permitted = false;
-            state.advertised_version(self.supported_version)
+            state.advertised_version()
         };
         (self.publisher)(version);
     }
@@ -117,7 +116,7 @@ impl StrictParticipantCapability {
                 return;
             }
             state.durable_state_ready = ready;
-            state.advertised_version(self.supported_version)
+            state.advertised_version()
         };
         (self.publisher)(version);
     }
@@ -129,7 +128,7 @@ impl StrictParticipantCapability {
                 return;
             }
             state.permanently_disabled = true;
-            state.advertised_version(self.supported_version)
+            state.advertised_version()
         };
         (self.publisher)(version);
     }
@@ -142,7 +141,7 @@ mod tests {
     use super::*;
 
     fn capability(durable: bool, published: Arc<AtomicU32>) -> Arc<StrictParticipantCapability> {
-        StrictParticipantCapability::new(true, durable, 2, move |version| {
+        StrictParticipantCapability::new(true, durable, move |version| {
             published.store(version, Ordering::Relaxed);
         })
     }
@@ -159,8 +158,14 @@ mod tests {
         assert_eq!(capability.protocol_version(), 0);
 
         capability.update_durable_state_ready(true);
-        assert_eq!(capability.protocol_version(), 2);
-        assert_eq!(published.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            capability.protocol_version(),
+            STRICT_PROTOCOL_VERSION_CURRENT
+        );
+        assert_eq!(
+            published.load(Ordering::Relaxed),
+            STRICT_PROTOCOL_VERSION_CURRENT
+        );
     }
 
     #[test]
@@ -168,7 +173,10 @@ mod tests {
         let capability = capability(true, Arc::new(AtomicU32::new(0)));
         capability.begin_repository_registration();
         assert!(capability.update_repository_registration_ready(true));
-        assert_eq!(capability.protocol_version(), 2);
+        assert_eq!(
+            capability.protocol_version(),
+            STRICT_PROTOCOL_VERSION_CURRENT
+        );
 
         capability.report_repository_capability_loss();
         assert_eq!(capability.protocol_version(), 0);
@@ -177,7 +185,10 @@ mod tests {
 
         capability.begin_repository_registration();
         assert!(capability.update_repository_registration_ready(true));
-        assert_eq!(capability.protocol_version(), 2);
+        assert_eq!(
+            capability.protocol_version(),
+            STRICT_PROTOCOL_VERSION_CURRENT
+        );
     }
 
     #[test]
@@ -193,7 +204,7 @@ mod tests {
 
     #[test]
     fn disabled_participant_never_advertises_a_participant_version() {
-        let capability = StrictParticipantCapability::new(false, true, 2, |_| {});
+        let capability = StrictParticipantCapability::new(false, true, |_| {});
         capability.begin_repository_registration();
         assert!(capability.update_repository_registration_ready(true));
         assert_eq!(capability.protocol_version(), 0);

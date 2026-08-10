@@ -9,6 +9,9 @@ pub(crate) mod bulk_pacing;
 pub mod catchup;
 pub(crate) mod history_v3;
 pub mod propose;
+pub(crate) mod recovery_reducer;
+pub(crate) mod recovery_staging;
+pub(crate) mod recovery_v8_runtime;
 pub(crate) mod retry_v3;
 pub mod runtime;
 pub(crate) mod session_reducer;
@@ -18,6 +21,10 @@ pub(crate) mod terminal_journal_sqlite;
 
 #[cfg(test)]
 mod checkpoint_design_tests;
+#[cfg(test)]
+mod recovery_crash_tests;
+#[cfg(test)]
+mod recovery_v8_runtime_tests;
 #[cfg(test)]
 mod sync_v3_tests;
 #[cfg(test)]
@@ -156,10 +163,10 @@ pub trait StrictReplicable: Send + Sync + 'static {
 
     /// Highest strict protocol version this repository can apply safely.
     ///
-    /// Version 1 requires an atomic operation-id ledger that survives the
+    /// Protocol v8 requires an atomic operation-id ledger that survives the
     /// repository's normal snapshot/recovery path. The conservative default
-    /// keeps generic implementations on the legacy protocol until they opt
-    /// into that contract.
+    /// keeps generic implementations outside strict participation until they
+    /// opt into the complete current contract.
     fn strict_replication_protocol_version(&self) -> u32 {
         0
     }
@@ -218,9 +225,9 @@ pub trait StrictReplicable: Send + Sync + 'static {
 
     /// Apply a strict operation once using its stable operation id.
     ///
-    /// Implementations advertising protocol v1 must override this method
+    /// Implementations advertising protocol v8 must override this method
     /// with an atomic, durable operation-id claim. The default preserves the
-    /// legacy trait contract for implementations which remain on v0.
+    /// nonparticipant trait contract for implementations which remain on v0.
     async fn apply_committed_once(
         &self,
         version: u64,
@@ -265,6 +272,19 @@ pub struct StrictDebugState {
     can_start_election: bool,
     history_probe_pending_peers: Option<usize>,
     history_alive_peers: usize,
+    history_election_phase: &'static str,
+    history_election_peer: Option<shitspeak_core::NodeIdentifier>,
+    history_client_transfers: Vec<(shitspeak_core::NodeIdentifier, u64, i32, u64, u64, bool)>,
+    history_pending_intents: Vec<(shitspeak_core::NodeIdentifier, u64, i32, u64, u64)>,
+    history_retry_requests: Vec<(shitspeak_core::NodeIdentifier, u64, u64, u64, u32)>,
+    terminal_client_transfers: Vec<(
+        shitspeak_core::NodeIdentifier,
+        u64,
+        &'static str,
+        i32,
+        u64,
+        u64,
+    )>,
     clock: u64,
     earliest_pending: Option<((u64, u64), u64, shitspeak_core::NodeIdentifier)>,
     earliest_pending_promise_ballot: Option<u64>,
@@ -290,6 +310,49 @@ pub struct StrictDebugState {
     pending_admission_proofs: Vec<(shitspeak_core::NodeIdentifier, bool, bool)>,
     highest_admission_barrier: u64,
     active_recoveries: usize,
+    recovery_healthy: bool,
+    recovery_phase: &'static str,
+    recovery_attempt_id: Option<u64>,
+    recovery_progress_deadline_ms: Option<u64>,
+    recovery_progress_remaining_ms: Option<u64>,
+    recovery_frozen_denominator: usize,
+    recovery_certificate_witnesses: usize,
+    recovery_donor: Option<(u64, u64)>,
+    recovery_donor_index: usize,
+    recovery_failure_count: usize,
+    recovery_last_failure: Option<&'static str>,
+    terminal_storage_healthy: bool,
+}
+
+/// Exact replication-owned delivery checkpoint paired with a strict
+/// repository image. The sorted vectors make equality deterministic while
+/// keeping the runtime's mutable maps encapsulated.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictDeliveryCheckpointDebug {
+    applied: Vec<((u64, u64), u64)>,
+    retired: Vec<(u64, u64)>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl StrictDeliveryCheckpointDebug {
+    pub(crate) fn from_maps(
+        applied: std::collections::BTreeMap<(u64, u64), u64>,
+        retired: std::collections::BTreeMap<u64, u64>,
+    ) -> Self {
+        Self {
+            applied: applied.into_iter().collect(),
+            retired: retired.into_iter().collect(),
+        }
+    }
+
+    pub fn applied(&self) -> &[((u64, u64), u64)] {
+        &self.applied
+    }
+
+    pub fn retired(&self) -> &[(u64, u64)] {
+        &self.retired
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -308,6 +371,39 @@ impl StrictDebugState {
     }
     pub fn history_alive_peers(&self) -> usize {
         self.history_alive_peers
+    }
+    pub fn history_election_phase(&self) -> &'static str {
+        self.history_election_phase
+    }
+    pub fn history_election_peer(&self) -> Option<shitspeak_core::NodeIdentifier> {
+        self.history_election_peer
+    }
+    pub fn history_client_transfers(
+        &self,
+    ) -> &[(shitspeak_core::NodeIdentifier, u64, i32, u64, u64, bool)] {
+        &self.history_client_transfers
+    }
+    pub fn history_retry_requests(
+        &self,
+    ) -> &[(shitspeak_core::NodeIdentifier, u64, u64, u64, u32)] {
+        &self.history_retry_requests
+    }
+    pub fn history_pending_intents(
+        &self,
+    ) -> &[(shitspeak_core::NodeIdentifier, u64, i32, u64, u64)] {
+        &self.history_pending_intents
+    }
+    pub fn terminal_client_transfers(
+        &self,
+    ) -> &[(
+        shitspeak_core::NodeIdentifier,
+        u64,
+        &'static str,
+        i32,
+        u64,
+        u64,
+    )] {
+        &self.terminal_client_transfers
     }
     pub fn clock(&self) -> u64 {
         self.clock
@@ -379,6 +475,42 @@ impl StrictDebugState {
     }
     pub fn active_recoveries(&self) -> usize {
         self.active_recoveries
+    }
+    pub fn recovery_healthy(&self) -> bool {
+        self.recovery_healthy
+    }
+    pub fn recovery_phase(&self) -> &'static str {
+        self.recovery_phase
+    }
+    pub fn recovery_attempt_id(&self) -> Option<u64> {
+        self.recovery_attempt_id
+    }
+    pub fn recovery_progress_deadline_ms(&self) -> Option<u64> {
+        self.recovery_progress_deadline_ms
+    }
+    pub fn recovery_progress_remaining_ms(&self) -> Option<u64> {
+        self.recovery_progress_remaining_ms
+    }
+    pub fn recovery_frozen_denominator(&self) -> usize {
+        self.recovery_frozen_denominator
+    }
+    pub fn recovery_certificate_witnesses(&self) -> usize {
+        self.recovery_certificate_witnesses
+    }
+    pub fn recovery_donor(&self) -> Option<(u64, u64)> {
+        self.recovery_donor
+    }
+    pub fn recovery_donor_index(&self) -> usize {
+        self.recovery_donor_index
+    }
+    pub fn recovery_failure_count(&self) -> usize {
+        self.recovery_failure_count
+    }
+    pub fn recovery_last_failure(&self) -> Option<&'static str> {
+        self.recovery_last_failure
+    }
+    pub fn terminal_storage_healthy(&self) -> bool {
+        self.terminal_storage_healthy
     }
 }
 
@@ -467,7 +599,28 @@ impl<R: StrictReplicable> StrictHandle<R> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn terminal_cut_for_test(&self) -> terminal_journal::TerminalCut {
+        self.runtime.terminal_journal.lock().await.terminal_cut()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn debug_state(&self) -> StrictDebugState {
         self.runtime.debug_state()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn apply_committed_and_publish_head_for_test(&self, version: u64, op: R::Op) {
+        self.runtime.repo.apply_committed(version, op).await;
+        self.runtime.with_terminal_journal_mutation(|_| ()).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn drive_admission_probes_for_test(&self) {
+        self.runtime.drive_admission_probes_for_test().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_recovery_for_test(&self) -> bool {
+        self.runtime.request_recovery_for_test()
     }
 }

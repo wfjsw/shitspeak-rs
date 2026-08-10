@@ -18,13 +18,16 @@ pub use pb::{
     StrictDecisionAbort, StrictDecisionCommit, StrictFrozenTarget, StrictHeadAck,
     StrictHistoryProbeReq, StrictHistoryProbeResp, StrictHistoryTransferReq,
     StrictHistoryTransferResp, StrictMessage, StrictOriginAuth, StrictPendingValue, StrictPropose,
-    StrictProposeAck, StrictProposeV1, StrictRecoveryAck, StrictRecoveryCommit, StrictRecoveryReq,
-    StrictResolutionAck, StrictResolutionHint, StrictResolutionPrepare, StrictTerminalCut,
-    StrictTerminalDelta, StrictTerminalPageKind, StrictTerminalState, StrictTerminalSyncAck,
-    StrictTerminalSyncPage, StrictTerminalSyncReq, StrictTerminalSyncStatus,
-    blob_message::Body as BlobBody, owner_message::Body as OwnerBody,
-    replication_message::Body as ReplBody, strict_decision::Outcome as StrictDecisionOutcome,
-    strict_message::Body as StrictBody,
+    StrictProposeAck, StrictProposeV1, StrictRecoveryAck, StrictRecoveryCommit,
+    StrictRecoveryContext, StrictRecoveryProbeReq, StrictRecoveryProbeResp, StrictRecoveryReq,
+    StrictRecoverySnapshotAck, StrictRecoverySnapshotPage, StrictRecoverySnapshotReq,
+    StrictRecoveryStatus, StrictRecoveryTarget, StrictRecoveryTerminalAck,
+    StrictRecoveryTerminalPage, StrictRecoveryTerminalReq, StrictResolutionAck,
+    StrictResolutionHint, StrictResolutionPrepare, StrictTerminalCut, StrictTerminalDelta,
+    StrictTerminalPageKind, StrictTerminalState, StrictTerminalSyncAck, StrictTerminalSyncPage,
+    StrictTerminalSyncReq, StrictTerminalSyncStatus, blob_message::Body as BlobBody,
+    owner_message::Body as OwnerBody, replication_message::Body as ReplBody,
+    strict_decision::Outcome as StrictDecisionOutcome, strict_message::Body as StrictBody,
     strict_resolution_ack::Observed as StrictResolutionObserved,
     strict_terminal_state::Outcome as StrictTerminalOutcome,
 };
@@ -822,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_strict_v4_head_ack_binds_both_incarnations_and_head() {
+    fn roundtrip_strict_v8_head_ack_binds_both_incarnations_and_exact_cut() {
         let body = StrictBody::HeadAck(StrictHeadAck {
             src_node: 3,
             src_boot_epoch: 18,
@@ -833,9 +836,129 @@ mod tests {
             history_freshness: 13,
             journal_id: Bytes::from_static(&[9; 16]),
             generation: 4,
+            chain_digest: Bytes::from_static(&[7; 32]),
         });
 
         assert_eq!(roundtrip_strict_body(body.clone()), body);
+    }
+
+    #[test]
+    fn roundtrip_strict_v8_foreign_lineage_recovery_bodies() {
+        let target = StrictRecoveryTarget {
+            repository_version: 55,
+            history_freshness: 123,
+            terminal_set_digest: Bytes::from_static(b"terminal-set"),
+        };
+        let probe_context = StrictRecoveryContext {
+            requester_node: 3,
+            requester_boot_epoch: 18,
+            attempt_id: Bytes::from_static(b"durable-attempt"),
+            expected_donor_boot_epoch: 24,
+            target: None,
+        };
+        let transfer_context = StrictRecoveryContext {
+            target: Some(target),
+            ..probe_context.clone()
+        };
+        let target_cut = StrictTerminalCut {
+            journal_id: Bytes::from_static(b"journal-lineage"),
+            generation: 41,
+            chain_digest: Bytes::from_static(b"chain-41"),
+            terminal_set_digest: Bytes::from_static(b"terminal-set"),
+        };
+
+        let bodies = vec![
+            StrictBody::RecoveryProbeReq(StrictRecoveryProbeReq {
+                context: Some(probe_context),
+                request_nonce: 101,
+            }),
+            StrictBody::RecoveryProbeResp(StrictRecoveryProbeResp {
+                context: Some(transfer_context.clone()),
+                responder_node: 7,
+                responder_boot_epoch: 24,
+                request_nonce: 101,
+                status: StrictRecoveryStatus::Ok as i32,
+                terminal_cut: Some(target_cut.clone()),
+                runtime_started_at: 11,
+                history_node: 7,
+            }),
+            StrictBody::RecoveryTerminalReq(StrictRecoveryTerminalReq {
+                context: Some(transfer_context.clone()),
+                target_cut: Some(target_cut.clone()),
+                transfer_id: 88,
+                request_nonce: 102,
+                expected_cursor: 0,
+            }),
+            StrictBody::RecoveryTerminalPage(StrictRecoveryTerminalPage {
+                context: Some(transfer_context.clone()),
+                responder_node: 7,
+                responder_boot_epoch: 24,
+                status: StrictRecoveryStatus::Ok as i32,
+                target_cut: Some(target_cut.clone()),
+                transfer_id: 88,
+                request_nonce: 102,
+                cursor: 0,
+                next_cursor: 1,
+                checkpoint_digest: Bytes::from_static(b"checkpoint-digest"),
+                checkpoint_states: vec![StrictTerminalState::default()],
+                has_more: false,
+            }),
+            StrictBody::RecoveryTerminalAck(StrictRecoveryTerminalAck {
+                context: Some(transfer_context.clone()),
+                target_cut: Some(target_cut.clone()),
+                transfer_id: 88,
+                request_nonce: 102,
+                acknowledged_cursor: 0,
+                final_ack: true,
+            }),
+            StrictBody::RecoverySnapshotReq(StrictRecoverySnapshotReq {
+                context: Some(transfer_context.clone()),
+                target_cut: Some(target_cut.clone()),
+                transfer_id: 89,
+                request_nonce: 103,
+                expected_cursor: 0,
+            }),
+            StrictBody::RecoverySnapshotPage(StrictRecoverySnapshotPage {
+                context: Some(transfer_context.clone()),
+                responder_node: 7,
+                responder_boot_epoch: 24,
+                status: StrictRecoveryStatus::Ok as i32,
+                target_cut: Some(target_cut.clone()),
+                transfer_id: 89,
+                request_nonce: 103,
+                cursor: 0,
+                next_cursor: 8,
+                total_bytes: 8,
+                snapshot_digest: Bytes::from_static(b"snapshot-digest"),
+                snapshot_bytes: Bytes::from_static(b"snapshot"),
+                has_more: false,
+            }),
+            StrictBody::RecoverySnapshotAck(StrictRecoverySnapshotAck {
+                context: Some(transfer_context),
+                target_cut: Some(target_cut),
+                transfer_id: 89,
+                request_nonce: 103,
+                acknowledged_cursor: 0,
+                final_ack: true,
+            }),
+        ];
+
+        for body in bodies {
+            assert_eq!(roundtrip_strict_body(body.clone()), body);
+        }
+
+        for (value, name) in [
+            (1, "STRICT_RECOVERY_STATUS_OK"),
+            (2, "STRICT_RECOVERY_STATUS_TARGET_MOVED"),
+            (3, "STRICT_RECOVERY_STATUS_INCARNATION_MISMATCH"),
+            (4, "STRICT_RECOVERY_STATUS_RESOURCE_LIMIT"),
+            (5, "STRICT_RECOVERY_STATUS_RETRYABLE_FAILURE"),
+        ] {
+            assert_eq!(
+                StrictRecoveryStatus::try_from(value).unwrap().as_str_name(),
+                name
+            );
+        }
     }
 
     #[test]
@@ -900,11 +1023,20 @@ mod tests {
             StrictBody::ClockTick(StrictClockTick {
                 src_node: 1,
                 src_clock: 999,
+                terminal_repository_base_version: 41,
                 ..Default::default()
             }),
         );
         let bytes = encode(&tick).unwrap();
-        decode(&bytes).unwrap();
+        let back = decode(&bytes).unwrap();
+        let Some(ReplBody::Strict(StrictMessage {
+            body: Some(StrictBody::ClockTick(tick)),
+            ..
+        })) = back.body
+        else {
+            panic!()
+        };
+        assert_eq!(tick.terminal_repository_base_version, 41);
 
         let req = wrap_strict(
             "channels",

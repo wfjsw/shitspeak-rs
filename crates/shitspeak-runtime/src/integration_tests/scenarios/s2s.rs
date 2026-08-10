@@ -32,8 +32,7 @@ use shitspeak_s2s::testing::{
 use shitspeak_s2s_transport::{
     MessageClass, PeerAddress, SendOptions, ServiceLevel, TransportKind,
 };
-use shitspeak_state::Channel;
-use shitspeak_state::{BanEntry, BanOp};
+use shitspeak_state::{BanEntry, BanOp, Channel, ChannelOp};
 
 const S2S_DEADLINE: Duration = Duration::from_secs(10);
 const CLIENT_DEADLINE: Duration = Duration::from_secs(4);
@@ -2081,17 +2080,20 @@ async fn s2s_remote_channel_entry_updates_receiver_user_channel_cache() {
     wait_for_s2s_pair(&a, &b).await;
     register_pair_users(&a, &b);
 
-    a.server
-        .get_channels()
-        .create_channel(Channel::new(
-            42,
-            "Remote cached channel".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
-        .await
-        .expect("create channel on node A");
+    let proposal = a
+        .server
+        .s2s_manager()
+        .propose_channel_op(
+            None,
+            ChannelOp::CreateChannel {
+                channel: Channel::new(42, "Remote cached channel".to_owned(), 0, 0, Some(0)),
+            },
+        )
+        .await;
+    assert!(
+        proposal.is_proposed(),
+        "strict channel proposal should survive startup convergence: {proposal:?}"
+    );
     let channel_replicated = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
@@ -2100,9 +2102,20 @@ async fn s2s_remote_channel_entry_updates_receiver_user_channel_cache() {
         })
     })
     .await;
+    let a_strict_debug = a
+        .server
+        .s2s_manager()
+        .strict_channel_debug_state_for_test(None);
+    let b_strict_debug = b
+        .server
+        .s2s_manager()
+        .strict_channel_debug_state_for_test(None);
     assert!(
         channel_replicated,
-        "node B should learn the channel before Bob enters it"
+        "node B should learn the channel before Bob enters it; versions: a={} b={}; \
+         strict: a={a_strict_debug:#?} b={b_strict_debug:#?}",
+        a.server.get_channels().current_version(),
+        b.server.get_channels().current_version(),
     );
 
     let bob = TestClient::connect_and_authenticate(&b, "bob", None)
@@ -2346,27 +2359,48 @@ async fn s2s_cross_node_moderator_move_projects_from_target_owner_log() {
     wait_for_s2s_pair(&a, &b).await;
     register_pair_users(&a, &b);
 
-    a.server
-        .get_channels()
-        .create_channel(Channel::new(
-            DESTINATION_CHANNEL,
-            "Remote move destination".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
-        .await
-        .expect("create destination channel");
+    let proposal = a
+        .server
+        .s2s_manager()
+        .propose_channel_op(
+            None,
+            ChannelOp::CreateChannel {
+                channel: Channel::new(
+                    DESTINATION_CHANNEL,
+                    "Remote move destination".to_owned(),
+                    0,
+                    0,
+                    Some(0),
+                ),
+            },
+        )
+        .await;
     assert!(
-        wait_until(S2S_DEADLINE, || {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(b.server.get_channels().get_channel(DESTINATION_CHANNEL))
-                    .is_some()
-            })
+        proposal.is_proposed(),
+        "strict destination proposal should survive startup convergence: {proposal:?}"
+    );
+    let destination_replicated = wait_until(S2S_DEADLINE, || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(b.server.get_channels().get_channel(DESTINATION_CHANNEL))
+                .is_some()
         })
-        .await,
-        "target owner should replicate the destination channel"
+    })
+    .await;
+    let a_strict_debug = a
+        .server
+        .s2s_manager()
+        .strict_channel_debug_state_for_test(None);
+    let b_strict_debug = b
+        .server
+        .s2s_manager()
+        .strict_channel_debug_state_for_test(None);
+    assert!(
+        destination_replicated,
+        "target owner should replicate the destination channel; versions: a={} b={}; \
+         strict: a={a_strict_debug:#?} b={b_strict_debug:#?}",
+        a.server.get_channels().current_version(),
+        b.server.get_channels().current_version(),
     );
 
     let alice = TestClient::connect_and_authenticate(&a, "alice", None)
@@ -4129,9 +4163,20 @@ async fn s2s_divergent_channel_layout_converges_before_client_integration() {
         })
     })
     .await;
+    let a_strict_debug = a
+        .server
+        .s2s_manager()
+        .strict_channel_debug_state_for_test(None);
+    let b_strict_debug = b
+        .server
+        .s2s_manager()
+        .strict_channel_debug_state_for_test(None);
     assert!(
         channel_layout_converged,
-        "servers should converge on A's channel layout before client integration"
+        "servers should converge on A's channel layout before client integration; \
+         versions: a={} b={}; strict: a={a_strict_debug:#?} b={b_strict_debug:#?}",
+        a.server.get_channels().current_version(),
+        b.server.get_channels().current_version(),
     );
 
     let bob_received_repaired_layout = tokio::time::timeout(S2S_DEADLINE, async {

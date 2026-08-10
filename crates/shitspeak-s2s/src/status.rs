@@ -1772,6 +1772,61 @@ impl<'a> PrometheusWriter<'a> {
             "counter",
         );
         self.header(
+            "shitspeak_s2s_strict_replication_recovery_phase_topics",
+            "Current strict recovery topics by bounded coordinator phase.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_recovery_progress_age_ms",
+            "Maximum milliseconds since authenticated progress among strict recovery topics in each phase.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_recovery_donor_sessions_active",
+            "Active protocol-v8 donor sessions by bounded transfer kind.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_recovery_attempts_total",
+            "Strict foreign-lineage recovery attempts started.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_recovery_coalesced_triggers_total",
+            "Strict recovery triggers coalesced into an active attempt by bounded event.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_recovery_retransmits_total",
+            "Strict recovery wire identities retransmitted by bounded coordinator phase.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_recovery_donor_switches_total",
+            "Strict recovery donor switches by bounded reason.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_recovery_certificate_failures_total",
+            "Strict recovery certificate failures by bounded reason.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_recovery_stale_events_total",
+            "Attempt-correlated strict recovery callbacks ignored by bounded event class.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_recovery_completion_duration_ms_total",
+            "Accumulated duration in milliseconds of completed strict recovery attempts.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_strict_replication_recovery_completion_duration_count",
+            "Number of completed strict recovery attempts included in the duration total.",
+            "counter",
+        );
+        self.header(
             "shitspeak_s2s_distribution_events_total",
             "Distribution-tree control, forwarding, deadline, and fallback events.",
             "counter",
@@ -3764,6 +3819,49 @@ mod tests {
         assert!(
             rendered
                 .contains("# TYPE shitspeak_s2s_strict_replication_head_events_total counter\n")
+        );
+        assert!(
+            rendered
+                .contains("# TYPE shitspeak_s2s_strict_replication_recovery_phase_topics gauge\n")
+        );
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_strict_replication_recovery_progress_age_ms gauge\n"
+            )
+        );
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_recovery_donor_sessions_active gauge\n"
+        ));
+        assert!(
+            rendered.contains(
+                "# TYPE shitspeak_s2s_strict_replication_recovery_attempts_total counter\n"
+            )
+        );
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_recovery_coalesced_triggers_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_recovery_retransmits_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_recovery_donor_switches_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_recovery_certificate_failures_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_recovery_stale_events_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_recovery_completion_duration_ms_total counter\n"
+        ));
+        assert!(rendered.contains(
+            "# TYPE shitspeak_s2s_strict_replication_recovery_completion_duration_count counter\n"
+        ));
+        assert!(
+            rendered.contains(
+                "shitspeak_s2s_strict_replication_recovery_phase_topics{phase=\"healthy\"}"
+            )
         );
         assert!(rendered.contains(
             "# TYPE shitspeak_s2s_strict_replication_catchup_session_starts_total counter\n"

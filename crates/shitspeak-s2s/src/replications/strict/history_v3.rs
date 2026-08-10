@@ -22,6 +22,7 @@ pub(super) struct PendingHistoryIntent {
     rank: HistoryRank,
     reason: StrictCatchupReason,
     source_cut: TerminalCut,
+    election_generation: Option<u64>,
 }
 
 #[cfg(test)]
@@ -115,6 +116,88 @@ mod tests {
             .into_parts();
         assert_eq!(preempted, Some(StrictCatchupReason::Admission));
         assert_ne!(election.transfer_id, admission.transfer_id);
+    }
+
+    #[test]
+    fn newer_history_election_generation_preempts_abandoned_client() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let first = state
+            .begin_transfer_with_election_generation(
+                peer,
+                100,
+                0,
+                StrictCatchupReason::HistoryElection,
+                Duration::from_secs(30),
+                StrictCatchupReason::HistoryElection,
+                Some(41),
+            )
+            .expect("first election transfer")
+            .into_parts()
+            .0;
+
+        assert!(
+            state
+                .begin_transfer_with_election_generation(
+                    peer,
+                    100,
+                    0,
+                    StrictCatchupReason::HistoryElection,
+                    Duration::from_secs(30),
+                    StrictCatchupReason::HistoryElection,
+                    Some(41),
+                )
+                .is_none(),
+            "a duplicate from the same election must not reset progress"
+        );
+
+        let (replacement, preempted) = state
+            .begin_transfer_with_election_generation(
+                peer,
+                100,
+                0,
+                StrictCatchupReason::HistoryElection,
+                Duration::from_secs(30),
+                StrictCatchupReason::HistoryElection,
+                Some(42),
+            )
+            .expect("a newer election must replace its abandoned predecessor")
+            .into_parts();
+        assert_eq!(preempted, Some(StrictCatchupReason::HistoryElection));
+        assert_ne!(replacement.transfer_id, first.transfer_id);
+    }
+
+    #[test]
+    fn wrapped_history_election_generation_preempts_pre_wrap_client() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let first = state
+            .begin_transfer_with_election_generation(
+                peer,
+                100,
+                0,
+                StrictCatchupReason::HistoryElection,
+                Duration::from_secs(30),
+                StrictCatchupReason::HistoryElection,
+                Some(u64::MAX - 1),
+            )
+            .expect("pre-wrap election transfer")
+            .into_parts()
+            .0;
+        let replacement = state
+            .begin_transfer_with_election_generation(
+                peer,
+                100,
+                0,
+                StrictCatchupReason::HistoryElection,
+                Duration::from_secs(30),
+                StrictCatchupReason::HistoryElection,
+                Some(1),
+            )
+            .expect("post-wrap election must replace its predecessor")
+            .into_parts()
+            .0;
+        assert_ne!(replacement.transfer_id, first.transfer_id);
     }
 
     #[test]
@@ -405,6 +488,100 @@ mod tests {
     }
 
     #[test]
+    fn newer_history_election_server_transfer_preempts_abandoned_election_page() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let abandoned = StrictHistoryTransferReq {
+            transfer_id: 10,
+            request_nonce: 20,
+            reason: StrictCatchupReason::HistoryElection as i32,
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.begin_server_request(peer, &abandoned, Duration::from_secs(30)),
+            HistoryServerRequest::Build { .. }
+        ));
+        assert!(state.cache_server_response(peer, &abandoned, StrictCatchupResp::default(), None,));
+
+        let replacement = StrictHistoryTransferReq {
+            transfer_id: 11,
+            request_nonce: 21,
+            reason: StrictCatchupReason::HistoryElection as i32,
+            ..Default::default()
+        };
+        let HistoryServerRequest::Build { preempted_pages } =
+            state.begin_server_request(peer, &replacement, Duration::from_secs(30))
+        else {
+            panic!("a newer election generation must not wait for the abandoned page TTL");
+        };
+        assert_eq!(preempted_pages, vec![(10, 20)]);
+        assert!(matches!(
+            state.begin_server_request(peer, &abandoned, Duration::from_secs(30)),
+            HistoryServerRequest::Suppress
+        ));
+    }
+
+    #[test]
+    fn delayed_older_history_election_cannot_preempt_newer_server_transfer() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let newer = StrictHistoryTransferReq {
+            transfer_id: 11,
+            request_nonce: 21,
+            reason: StrictCatchupReason::HistoryElection as i32,
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.begin_server_request(peer, &newer, Duration::from_secs(30)),
+            HistoryServerRequest::Build { .. }
+        ));
+
+        let delayed_older = StrictHistoryTransferReq {
+            transfer_id: 10,
+            request_nonce: 20,
+            reason: StrictCatchupReason::HistoryElection as i32,
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.begin_server_request(peer, &delayed_older, Duration::from_secs(30)),
+            HistoryServerRequest::Reject
+        ));
+    }
+
+    #[test]
+    fn wrapped_history_election_transfer_id_preempts_pre_wrap_page() {
+        let peer = PeerIncarnation::new(2, 11);
+        let mut state = HistoryV3State::default();
+        let pre_wrap = StrictHistoryTransferReq {
+            transfer_id: u64::MAX - 1,
+            request_nonce: u64::MAX,
+            reason: StrictCatchupReason::HistoryElection as i32,
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.begin_server_request(peer, &pre_wrap, Duration::from_secs(30)),
+            HistoryServerRequest::Build { .. }
+        ));
+
+        let post_wrap = StrictHistoryTransferReq {
+            transfer_id: 1,
+            request_nonce: 2,
+            reason: StrictCatchupReason::HistoryElection as i32,
+            ..Default::default()
+        };
+        let HistoryServerRequest::Build { preempted_pages } =
+            state.begin_server_request(peer, &post_wrap, Duration::from_secs(30))
+        else {
+            panic!("post-wrap transfer identity must supersede the pre-wrap page");
+        };
+        assert_eq!(preempted_pages, vec![(u64::MAX - 1, u64::MAX)]);
+        assert!(matches!(
+            state.begin_server_request(peer, &pre_wrap, Duration::from_secs(30)),
+            HistoryServerRequest::Suppress
+        ));
+    }
+
+    #[test]
     fn acknowledged_server_page_is_a_tombstone_not_active_transfer() {
         let peer = PeerIncarnation::new(2, 11);
         let mut state = HistoryV3State::default();
@@ -548,6 +725,10 @@ impl PendingHistoryIntent {
     pub(super) fn source_cut(self) -> TerminalCut {
         self.source_cut
     }
+
+    pub(super) fn election_generation(self) -> Option<u64> {
+        self.election_generation
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -555,6 +736,7 @@ pub(super) struct HistoryProbeCandidate {
     peer: PeerIncarnation,
     rank: HistoryRank,
     source_cut: TerminalCut,
+    election_generation: Option<u64>,
 }
 
 impl HistoryProbeCandidate {
@@ -569,6 +751,15 @@ impl HistoryProbeCandidate {
     pub(super) fn source_cut(self) -> TerminalCut {
         self.source_cut
     }
+
+    pub(super) fn election_generation(self) -> Option<u64> {
+        self.election_generation
+    }
+
+    pub(super) fn with_election_generation(mut self, election_generation: u64) -> Self {
+        self.election_generation = Some(election_generation);
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -579,6 +770,7 @@ struct HistoryClient {
     target_version: u64,
     reason: StrictCatchupReason,
     metric_reason: StrictCatchupReason,
+    election_generation: Option<u64>,
     processing_nonce: Option<u64>,
     ttl: Duration,
     expires_at: Instant,
@@ -617,7 +809,9 @@ pub(super) enum HistoryServerRequest {
 
 pub(super) struct FinishedHistoryClient {
     peer: PeerIncarnation,
+    transfer_id: u64,
     metric_reason: StrictCatchupReason,
+    election_generation: Option<u64>,
     final_ack: Option<StrictCatchupReq>,
 }
 
@@ -636,8 +830,14 @@ impl FinishedHistoryClient {
     pub(super) fn peer(&self) -> PeerIncarnation {
         self.peer
     }
+    pub(super) fn transfer_id(&self) -> u64 {
+        self.transfer_id
+    }
     pub(super) fn metric_reason(&self) -> StrictCatchupReason {
         self.metric_reason
+    }
+    pub(super) fn election_generation(&self) -> Option<u64> {
+        self.election_generation
     }
     pub(super) fn take_final_ack(&mut self) -> Option<StrictCatchupReq> {
         self.final_ack.take()
@@ -679,11 +879,65 @@ fn transfer_preempts(candidate: StrictCatchupReason, current: StrictCatchupReaso
             && current == StrictCatchupReason::Admission)
 }
 
+/// Compare transfer identities allocated by one authenticated boot
+/// incarnation. The half-range rule preserves ordering across `u64` wrap and
+/// treats the ambiguous midpoint as stale.
+fn transfer_id_is_newer(candidate: u64, current: u64) -> bool {
+    let distance = candidate.wrapping_sub(current);
+    distance != 0 && distance <= u64::MAX / 2
+}
+
 impl HistoryV3State {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn client_diagnostics(&self) -> Vec<(NodeIdentifier, u64, i32, u64, u64, bool)> {
+        let mut clients = self
+            .clients
+            .iter()
+            .map(|(peer, client)| {
+                (
+                    peer.node(),
+                    peer.boot_epoch(),
+                    client.reason as i32,
+                    client.next_cursor,
+                    client.target_version,
+                    client.processing_nonce.is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        clients.sort_unstable_by_key(|(node, epoch, ..)| (*node, *epoch));
+        clients
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn pending_diagnostics(&self) -> Vec<(NodeIdentifier, u64, i32, u64, u64)> {
+        let mut pending = self
+            .pending
+            .iter()
+            .map(|(peer, intent)| {
+                (
+                    peer.node(),
+                    peer.boot_epoch(),
+                    intent.reason as i32,
+                    intent.rank.version,
+                    intent.source_cut.generation(),
+                )
+            })
+            .collect::<Vec<_>>();
+        pending.sort_unstable_by_key(|(node, epoch, ..)| (*node, *epoch));
+        pending
+    }
+
+    /// Whether this node is still consuming a repository image from a peer.
+    /// Server pages are donation work and must not suppress a local rank
+    /// escalation.
+    pub(super) fn has_live_client_work(&self, now: Instant) -> bool {
+        self.clients.values().any(|client| client.expires_at > now)
+    }
+
     /// Whether a repository transfer still owns a fixed cursor/image whose
     /// accompanying terminal lineage must not be rotated underneath it.
     pub(super) fn has_checkpoint_blocking_work(&self, now: Instant) -> bool {
-        self.clients.values().any(|client| client.expires_at > now)
+        self.has_live_client_work(now)
             || self
                 .server_pages
                 .values()
@@ -703,10 +957,22 @@ impl HistoryV3State {
         source_cut: TerminalCut,
         reason: StrictCatchupReason,
     ) {
+        self.defer_until_terminal_with_election_generation(peer, rank, source_cut, reason, None);
+    }
+
+    pub(super) fn defer_until_terminal_with_election_generation(
+        &mut self,
+        peer: PeerIncarnation,
+        rank: HistoryRank,
+        source_cut: TerminalCut,
+        reason: StrictCatchupReason,
+        election_generation: Option<u64>,
+    ) {
         let replacement = PendingHistoryIntent {
             rank,
             reason,
             source_cut,
+            election_generation,
         };
         self.pending
             .entry(peer)
@@ -744,6 +1010,7 @@ impl HistoryV3State {
                 peer,
                 rank,
                 source_cut,
+                election_generation: None,
             },
         );
     }
@@ -763,6 +1030,7 @@ impl HistoryV3State {
             peer,
             rank,
             source_cut,
+            election_generation: None,
         };
         self.probe_candidates.insert(peer, candidate);
         if let Some(deferred) = self.deferred_admissions.get_mut(&peer) {
@@ -783,6 +1051,7 @@ impl HistoryV3State {
             peer,
             rank,
             source_cut,
+            election_generation: None,
         };
         self.deferred_admissions
             .entry(peer)
@@ -839,8 +1108,38 @@ impl HistoryV3State {
         _inherited_session: bool,
         metric_reason: StrictCatchupReason,
     ) -> Option<StartedHistoryTransfer> {
+        self.begin_transfer_with_election_generation(
+            peer,
+            target_version,
+            cursor,
+            reason,
+            ttl,
+            metric_reason,
+            None,
+        )
+    }
+
+    pub(super) fn begin_transfer_with_election_generation(
+        &mut self,
+        peer: PeerIncarnation,
+        target_version: u64,
+        cursor: u64,
+        reason: StrictCatchupReason,
+        ttl: Duration,
+        metric_reason: StrictCatchupReason,
+        election_generation: Option<u64>,
+    ) -> Option<StartedHistoryTransfer> {
         let preempted_metric_reason = match self.clients.get(&peer) {
-            Some(current) if transfer_preempts(reason, current.reason) => {
+            Some(current)
+                if transfer_preempts(reason, current.reason)
+                    || (reason == StrictCatchupReason::HistoryElection
+                        && current.reason == StrictCatchupReason::HistoryElection
+                        && election_generation
+                            .zip(current.election_generation)
+                            .is_some_and(|(candidate, existing)| {
+                                transfer_id_is_newer(candidate, existing)
+                            })) =>
+            {
                 Some(current.metric_reason)
             }
             Some(_) => return None,
@@ -860,6 +1159,7 @@ impl HistoryV3State {
                 target_version,
                 reason,
                 metric_reason,
+                election_generation,
                 processing_nonce: None,
                 ttl,
                 expires_at: Instant::now() + ttl,
@@ -918,6 +1218,43 @@ impl HistoryV3State {
             .get(&peer)
             .filter(|client| client.processing_nonce.is_some())
             .map(|client| client.target_version)
+    }
+
+    pub(super) fn processing_election_generation(&self, peer: PeerIncarnation) -> Option<u64> {
+        self.clients
+            .get(&peer)
+            .filter(|client| client.processing_nonce.is_some())
+            .and_then(|client| client.election_generation)
+    }
+
+    pub(super) fn active_election_transfer(
+        &self,
+        node: NodeIdentifier,
+    ) -> Option<(PeerIncarnation, u64)> {
+        self.clients.iter().find_map(|(peer, client)| {
+            (peer.node() == node && client.election_generation.is_some())
+                .then_some((*peer, client.transfer_id))
+        })
+    }
+
+    pub(super) fn cancel_transfer(
+        &mut self,
+        peer: PeerIncarnation,
+        transfer_id: u64,
+    ) -> Option<FinishedHistoryClient> {
+        let client = self
+            .clients
+            .get(&peer)
+            .filter(|client| client.transfer_id == transfer_id)
+            .copied()?;
+        self.clients.remove(&peer);
+        Some(FinishedHistoryClient {
+            peer,
+            transfer_id: client.transfer_id,
+            metric_reason: client.metric_reason,
+            election_generation: client.election_generation,
+            final_ack: None,
+        })
     }
 
     pub(super) fn has_server_transfer(&self, peer: PeerIncarnation) -> bool {
@@ -1021,7 +1358,9 @@ impl HistoryV3State {
         });
         Some(FinishedHistoryClient {
             peer,
+            transfer_id: client.transfer_id,
             metric_reason: client.metric_reason,
+            election_generation: client.election_generation,
             final_ack,
         })
     }
@@ -1038,7 +1377,37 @@ impl HistoryV3State {
                 let client = self.clients.remove(&peer)?;
                 Some(FinishedHistoryClient {
                     peer,
+                    transfer_id: client.transfer_id,
                     metric_reason: client.metric_reason,
+                    election_generation: client.election_generation,
+                    final_ack: None,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn cancel_election_generation(
+        &mut self,
+        election_generation: u64,
+    ) -> Vec<FinishedHistoryClient> {
+        self.pending
+            .retain(|_, intent| intent.election_generation != Some(election_generation));
+        let peers = self
+            .clients
+            .iter()
+            .filter_map(|(peer, client)| {
+                (client.election_generation == Some(election_generation)).then_some(*peer)
+            })
+            .collect::<Vec<_>>();
+        peers
+            .into_iter()
+            .filter_map(|peer| {
+                let client = self.clients.remove(&peer)?;
+                Some(FinishedHistoryClient {
+                    peer,
+                    transfer_id: client.transfer_id,
+                    metric_reason: client.metric_reason,
+                    election_generation: client.election_generation,
                     final_ack: None,
                 })
             })
@@ -1084,9 +1453,17 @@ impl HistoryV3State {
             }
             page.acknowledged = true;
         } else {
-            let can_preempt = self.server_pages.iter().all(|((known_peer, _, _), page)| {
-                *known_peer != peer || page.acknowledged || transfer_preempts(reason, page.reason)
-            });
+            let can_preempt =
+                self.server_pages
+                    .iter()
+                    .all(|((known_peer, transfer_id, _), page)| {
+                        *known_peer != peer
+                            || page.acknowledged
+                            || transfer_preempts(reason, page.reason)
+                            || (reason == StrictCatchupReason::HistoryElection
+                                && page.reason == StrictCatchupReason::HistoryElection
+                                && transfer_id_is_newer(request.transfer_id, *transfer_id))
+                    });
             if !can_preempt {
                 return HistoryServerRequest::Reject;
             }
@@ -1241,7 +1618,9 @@ impl HistoryV3State {
                 let client = self.clients.remove(&peer)?;
                 Some(FinishedHistoryClient {
                     peer,
+                    transfer_id: client.transfer_id,
                     metric_reason: client.metric_reason,
+                    election_generation: client.election_generation,
                     final_ack: None,
                 })
             })
@@ -1259,9 +1638,24 @@ impl HistoryV3State {
             .drain()
             .map(|(peer, client)| FinishedHistoryClient {
                 peer,
+                transfer_id: client.transfer_id,
                 metric_reason: client.metric_reason,
+                election_generation: client.election_generation,
                 final_ack: None,
             })
             .collect()
+    }
+
+    /// Cancel every ephemeral history-election/transfer obligation. Foreign
+    /// lineage recovery owns its own durable attempt and must not leave an
+    /// older history callback able to rearm or install repository state.
+    pub(super) fn cancel_all(&mut self) -> Vec<FinishedHistoryClient> {
+        let finished = self.cancel_clients();
+        self.probe_candidates.clear();
+        self.pending.clear();
+        self.server_pages.clear();
+        self.deferred_terminal.clear();
+        self.deferred_admissions.clear();
+        finished
     }
 }

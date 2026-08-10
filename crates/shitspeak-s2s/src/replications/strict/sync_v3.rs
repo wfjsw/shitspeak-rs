@@ -59,6 +59,7 @@ pub(super) struct ClientSession {
     // eventual decrement must use the label that owns the gauge slot.
     started_reason: i32,
     reason: i32,
+    election_generation: Option<u64>,
     dirty: bool,
     collision_extension_available: bool,
     staged_checkpoint_states: Option<Vec<StrictTerminalState>>,
@@ -95,6 +96,7 @@ pub(super) struct ResponderSession {
     final_nonce: Option<u64>,
     cached_nonce: Option<u64>,
     cached_page: Option<StrictTerminalSyncPage>,
+    reason: i32,
     expires_at: Instant,
 }
 
@@ -152,6 +154,12 @@ struct CompletedResponder {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct ResponderStartTombstone {
+    request_nonce: u64,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct PendingSourceTransition {
     previous_cut: TerminalCut,
     resulting_cut: TerminalCut,
@@ -187,6 +195,17 @@ pub(super) enum InboundTerminalSyncDisposition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InitialTerminalResponderDisposition {
+    Accept,
+    Existing,
+    Backpressure,
+    Stale,
+    Preempted {
+        released_bulk_page: Option<(u64, u64)>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SourceTransitionOutcome {
     Advanced,
     Duplicate,
@@ -216,6 +235,18 @@ fn reason_preempts(candidate: i32, current: i32) -> bool {
             && StrictCatchupReason::try_from(current).ok() == Some(StrictCatchupReason::Admission))
 }
 
+/// Compare request nonces allocated by one authenticated boot incarnation.
+/// The half-range rule preserves ordering across `u64` wrap and treats the
+/// ambiguous midpoint as unordered.
+fn request_nonce_is_newer(candidate: u64, current: u64) -> bool {
+    let distance = candidate.wrapping_sub(current);
+    distance != 0 && distance <= u64::MAX / 2
+}
+
+fn newer_responder_start_preempts(candidate_reason: i32, current_reason: i32) -> bool {
+    candidate_reason == current_reason || reason_preempts(candidate_reason, current_reason)
+}
+
 fn cut_advances(candidate: TerminalCut, baseline: TerminalCut) -> bool {
     candidate.journal_id() != baseline.journal_id()
         || candidate.generation() > baseline.generation()
@@ -232,7 +263,12 @@ pub(super) fn source_cut_covers(candidate: TerminalCut, required: TerminalCut) -
 }
 
 impl ClientSession {
-    fn merge_intent(&mut self, reason: i32, desired_cut: Option<TerminalCut>) {
+    fn merge_intent(
+        &mut self,
+        reason: i32,
+        desired_cut: Option<TerminalCut>,
+        election_generation: Option<u64>,
+    ) {
         if reason_preempts(reason, self.reason) {
             self.reason = reason;
         }
@@ -260,6 +296,9 @@ impl ClientSession {
             {
                 self.desired_cut = Some(desired);
             }
+        }
+        if self.election_generation.is_none() {
+            self.election_generation = election_generation;
         }
     }
 
@@ -297,6 +336,10 @@ impl ClientSession {
 
     pub(super) fn started_reason(&self) -> i32 {
         self.started_reason
+    }
+
+    pub(super) fn election_generation(&self) -> Option<u64> {
+        self.election_generation
     }
 
     pub(super) fn dirty(&self) -> bool {
@@ -359,6 +402,7 @@ impl ResponderSession {
         target_cut: TerminalCut,
         kind: StrictTerminalPageKind,
         initial_nonce: u64,
+        reason: i32,
         ttl: Duration,
     ) -> Self {
         Self {
@@ -377,6 +421,7 @@ impl ResponderSession {
             final_nonce: None,
             cached_nonce: None,
             cached_page: None,
+            reason,
             expires_at: Instant::now() + ttl,
         }
     }
@@ -420,6 +465,20 @@ impl ResponderSession {
 
     pub(super) fn matches_initial_nonce(&self, nonce: u64) -> bool {
         self.initial_nonce == nonce
+    }
+
+    fn initial_nonce(&self) -> u64 {
+        self.initial_nonce
+    }
+
+    fn reason(&self) -> i32 {
+        self.reason
+    }
+
+    fn cached_bulk_page_identity(&self) -> Option<(u64, u64)> {
+        let page = self.cached_page.as_ref()?;
+        (!page.checkpoint_states.is_empty() || !page.deltas.is_empty())
+            .then_some((self.transfer_id, self.cached_nonce?))
     }
 
     pub(super) fn cached_page_nonce(&self) -> Option<u64> {
@@ -489,6 +548,7 @@ pub(super) struct SyncV3State {
     expired_deferred_clients: HashSet<PeerIncarnation>,
     pending_collision_resumes: HashSet<PeerIncarnation>,
     completed_responders: HashMap<PeerIncarnation, CompletedResponder>,
+    responder_start_tombstones: HashMap<PeerIncarnation, ResponderStartTombstone>,
     staged_checkpoints: HashMap<PeerIncarnation, StagedTerminalCheckpoint>,
 }
 
@@ -511,12 +571,74 @@ impl Default for SyncV3State {
             expired_deferred_clients: HashSet::new(),
             pending_collision_resumes: HashSet::new(),
             completed_responders: HashMap::new(),
+            responder_start_tombstones: HashMap::new(),
             staged_checkpoints: HashMap::new(),
         }
     }
 }
 
 impl SyncV3State {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn client_diagnostics(
+        &self,
+    ) -> Vec<(NodeIdentifier, u64, &'static str, i32, u64, u64)> {
+        let mut clients = self
+            .clients
+            .iter()
+            .map(|(peer, client)| {
+                (
+                    peer.node(),
+                    peer.boot_epoch(),
+                    "active",
+                    client.reason(),
+                    client.transfer_id(),
+                    client.pending_nonce(),
+                )
+            })
+            .chain(self.finalizing_clients.iter().map(|(peer, client)| {
+                (
+                    peer.node(),
+                    peer.boot_epoch(),
+                    "finalizing",
+                    client.reason(),
+                    client.transfer_id(),
+                    client.pending_nonce(),
+                )
+            }))
+            .chain(self.deferred_clients.iter().map(|(peer, intent)| {
+                (
+                    peer.node(),
+                    peer.boot_epoch(),
+                    "deferred",
+                    intent.reason,
+                    0,
+                    0,
+                )
+            }))
+            .collect::<Vec<_>>();
+        clients.sort_unstable_by_key(|(node, epoch, role, ..)| (*node, *epoch, *role));
+        clients
+    }
+
+    /// Whether this node still owns requester-side metadata or terminal work.
+    /// Responder-only sessions are donation work and must not indefinitely
+    /// suppress a local history-rank escalation.
+    pub(super) fn has_live_client_work(&self, now: Instant) -> bool {
+        self.history_nonces
+            .values()
+            .any(|pending| pending.expires_at > now)
+            || self.clients.values().any(|client| client.expires_at > now)
+            || self
+                .finalizing_clients
+                .values()
+                .any(|client| client.expires_at > now)
+            || self.deferred_clients.keys().any(|peer| {
+                self.responders
+                    .get(peer)
+                    .is_some_and(|responder| responder.expires_at > now)
+            })
+    }
+
     /// Whether rotating the local terminal-journal lineage could invalidate
     /// correlated terminal work that still names the current lineage.
     pub(super) fn has_checkpoint_blocking_work(&self) -> bool {
@@ -650,6 +772,8 @@ impl SyncV3State {
         }
         self.completed_responders
             .retain(|_, completed| completed.expires_at > now);
+        self.responder_start_tombstones
+            .retain(|_, tombstone| tombstone.expires_at > now);
         self.clock_nonces.retain(|_, nonce| nonce.expires_at > now);
         self.clock_probe_responses.retain(|_, responses| {
             responses.retain(|response| response.expires_at > now);
@@ -671,60 +795,6 @@ impl SyncV3State {
             .get(&peer)
             .copied()
             .or_else(|| self.durable_source_cuts.get(&peer.node).copied())
-    }
-
-    /// Cancel every opposing transfer toward a peer that a ranked election has
-    /// selected as a foreign checkpoint source. A forced cursor-zero checkpoint
-    /// replaces the local journal lineage, so any transfer that still names the
-    /// old lineage (outbound client, inbound responder, final-ACK handshake, or
-    /// coalesced dirty intent) must not block the replacement.
-    pub(super) fn abandon_checkpoint_replacement_work(&mut self, peer: PeerIncarnation) {
-        if let Some(session) = self.clients.remove(&peer) {
-            record_ended_client(
-                session.started_reason,
-                StrictCatchupSessionOutcome::Cancelled,
-            );
-        }
-        if let Some(session) = self.finalizing_clients.remove(&peer) {
-            record_ended_client(
-                session.started_reason,
-                StrictCatchupSessionOutcome::Cancelled,
-            );
-        }
-        self.responders.remove(&peer);
-        self.deferred_clients.remove(&peer);
-        self.expired_deferred_clients.remove(&peer);
-        self.pending_collision_resumes.remove(&peer);
-        if let Some(wire) = self.sessions.get(&peer).and_then(SessionState::active_wire) {
-            // Expire the lifecycle wire so its retry identity is cancelled and
-            // the session becomes idle; the forced trigger then opens a fresh
-            // cursor-zero wire.
-            let _ = self.transition_session(
-                peer,
-                SessionEvent::TransferExpired {
-                    epoch: PeerEpoch::new(peer.boot_epoch),
-                    wire,
-                },
-            );
-        }
-        self.reset_terminal_baseline(peer);
-    }
-
-    /// Discard a previously installed delta baseline when an elected source
-    /// must provide a complete foreign checkpoint image. An active opposing
-    /// session toward the elected source is abandoned first: the ranked
-    /// election outranks steady-state repair, and the checkpoint replacement
-    /// is only safe once every transfer naming the old lineage has stopped.
-    pub(super) fn force_checkpoint_from_zero(&mut self, peer: PeerIncarnation) -> bool {
-        if self
-            .sessions
-            .get(&peer)
-            .is_some_and(|session| !session.is_idle())
-        {
-            self.abandon_checkpoint_replacement_work(peer);
-        }
-        self.reset_terminal_baseline(peer);
-        true
     }
 
     /// Reset a rejected terminal cursor after the correlated payload client
@@ -1233,14 +1303,15 @@ impl SyncV3State {
         peer: PeerIncarnation,
         reason: i32,
         desired_cut: Option<TerminalCut>,
+        election_generation: Option<u64>,
     ) -> bool {
         self.expire(Instant::now());
         if let Some(active) = self.clients.get_mut(&peer) {
-            active.merge_intent(reason, desired_cut);
+            active.merge_intent(reason, desired_cut, election_generation);
             return true;
         }
         if let Some(finalizing) = self.finalizing_clients.get_mut(&peer) {
-            finalizing.merge_intent(reason, desired_cut);
+            finalizing.merge_intent(reason, desired_cut, election_generation);
             return true;
         }
         if self.responders.contains_key(&peer) {
@@ -1278,11 +1349,11 @@ impl SyncV3State {
     ) -> Option<(u64, Option<TerminalCut>)> {
         self.expire(Instant::now());
         if let Some(active) = self.clients.get_mut(&peer) {
-            active.merge_intent(reason, desired_cut);
+            active.merge_intent(reason, desired_cut, None);
             return None;
         }
         if let Some(finalizing) = self.finalizing_clients.get_mut(&peer) {
-            finalizing.merge_intent(reason, desired_cut);
+            finalizing.merge_intent(reason, desired_cut, None);
             return None;
         }
         if self.responders.contains_key(&peer) {
@@ -1316,6 +1387,7 @@ impl SyncV3State {
                 kind: None,
                 started_reason: reason,
                 reason,
+                election_generation: None,
                 dirty: false,
                 collision_extension_available: false,
                 staged_checkpoint_states: None,
@@ -1332,6 +1404,7 @@ impl SyncV3State {
         peer: PeerIncarnation,
         reason: i32,
         desired_cut: Option<TerminalCut>,
+        election_generation: Option<u64>,
         nonce: u64,
         cursor: u64,
         ttl: Duration,
@@ -1350,6 +1423,7 @@ impl SyncV3State {
                 kind: None,
                 started_reason: reason,
                 reason,
+                election_generation,
                 dirty: false,
                 collision_extension_available,
                 staged_checkpoint_states: None,
@@ -1563,7 +1637,67 @@ impl SyncV3State {
     }
 
     pub(super) fn insert_responder(&mut self, peer: PeerIncarnation, session: ResponderSession) {
+        self.responder_start_tombstones.insert(
+            peer,
+            ResponderStartTombstone {
+                request_nonce: session.initial_nonce(),
+                expires_at: session.expires_at,
+            },
+        );
         self.responders.insert(peer, session);
+    }
+
+    /// Classify a cursor-zero responder start from one authenticated boot
+    /// incarnation. A newer start may replace an abandoned responder only
+    /// when it preserves or raises the active reason's priority. Older starts
+    /// remain tombstoned so delayed network copies cannot displace the winner.
+    pub(super) fn prepare_initial_terminal_responder(
+        &mut self,
+        peer: PeerIncarnation,
+        request_nonce: u64,
+        reason: i32,
+    ) -> InitialTerminalResponderDisposition {
+        if let Some(active) = self.responders.get(&peer).cloned() {
+            if active.matches_initial_nonce(request_nonce) {
+                return InitialTerminalResponderDisposition::Existing;
+            }
+            if request_nonce_is_newer(active.initial_nonce(), request_nonce) {
+                return InitialTerminalResponderDisposition::Stale;
+            }
+            if !request_nonce_is_newer(request_nonce, active.initial_nonce()) {
+                return InitialTerminalResponderDisposition::Backpressure;
+            }
+            if !newer_responder_start_preempts(reason, active.reason()) {
+                return InitialTerminalResponderDisposition::Backpressure;
+            }
+
+            let released_bulk_page = active.cached_bulk_page_identity();
+            self.responders.remove(&peer);
+            if let Some(wire) = self.sessions.get(&peer).and_then(SessionState::active_wire) {
+                let _ = self.transition_session(
+                    peer,
+                    SessionEvent::TransferExpired {
+                        epoch: PeerEpoch::new(peer.boot_epoch()),
+                        wire,
+                    },
+                );
+            }
+            return InitialTerminalResponderDisposition::Preempted { released_bulk_page };
+        }
+
+        let Some(tombstone) = self.responder_start_tombstones.get(&peer).copied() else {
+            return InitialTerminalResponderDisposition::Accept;
+        };
+        if request_nonce == tombstone.request_nonce
+            || request_nonce_is_newer(tombstone.request_nonce, request_nonce)
+        {
+            return InitialTerminalResponderDisposition::Stale;
+        }
+        if !request_nonce_is_newer(request_nonce, tombstone.request_nonce) {
+            return InitialTerminalResponderDisposition::Backpressure;
+        }
+        // With no active responder, priority no longer blocks a newer start.
+        InitialTerminalResponderDisposition::Accept
     }
 
     pub(super) fn remove_responder(&mut self, peer: PeerIncarnation) -> Option<ResponderSession> {
@@ -1605,6 +1739,13 @@ impl SyncV3State {
                 initial_nonce: session.initial_nonce,
                 final_nonce,
                 target_cut,
+                expires_at: Instant::now() + ttl,
+            },
+        );
+        self.responder_start_tombstones.insert(
+            peer,
+            ResponderStartTombstone {
+                request_nonce: session.initial_nonce,
                 expires_at: Instant::now() + ttl,
             },
         );
@@ -1714,6 +1855,8 @@ impl SyncV3State {
             .retain(|peer| peer.node != node);
         self.completed_responders
             .retain(|peer, _| peer.node != node);
+        self.responder_start_tombstones
+            .retain(|peer, _| peer.node != node);
         self.staged_checkpoints.retain(|peer, _| peer.node != node);
     }
 
@@ -1735,6 +1878,21 @@ impl SyncV3State {
         self.pending_collision_resumes.clear();
         self.staged_checkpoints.clear();
         self.sessions.clear();
+    }
+
+    /// Remove all ephemeral terminal/history transfer ownership before the
+    /// protocol-v8 recovery coordinator takes over a foreign lineage.
+    pub(super) fn cancel_all_ephemeral(&mut self) {
+        self.cancel_clients();
+        self.known_source_cuts.clear();
+        self.pending_source_transitions.clear();
+        self.source_transition_history.clear();
+        self.clock_nonces.clear();
+        self.clock_probe_responses.clear();
+        self.history_nonces.clear();
+        self.responders.clear();
+        self.completed_responders.clear();
+        self.responder_start_tombstones.clear();
     }
 }
 

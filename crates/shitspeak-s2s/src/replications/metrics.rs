@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::status::PrometheusSample;
 
@@ -779,6 +779,170 @@ pub(crate) enum StrictResolutionOutcome {
     Abort,
 }
 
+/// Bounded phases of the protocol-v8 foreign-lineage recovery coordinator.
+///
+/// Topics and attempt identifiers are deliberately not metric labels. A live
+/// topic registers one [`StrictRecoveryMetrics`] source and scrape-time
+/// aggregation reports how many topics occupy each phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictRecoveryPhase {
+    Healthy,
+    Certifying,
+    FetchingTerminalCheckpoint,
+    FetchingRepositorySnapshot,
+    Prepared,
+    Installing,
+    Verifying,
+    Backoff,
+}
+
+impl StrictRecoveryPhase {
+    fn index(self) -> usize {
+        match self {
+            Self::Healthy => 0,
+            Self::Certifying => 1,
+            Self::FetchingTerminalCheckpoint => 2,
+            Self::FetchingRepositorySnapshot => 3,
+            Self::Prepared => 4,
+            Self::Installing => 5,
+            Self::Verifying => 6,
+            Self::Backoff => 7,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Certifying => "certifying",
+            Self::FetchingTerminalCheckpoint => "fetching_terminal_checkpoint",
+            Self::FetchingRepositorySnapshot => "fetching_repository_snapshot",
+            Self::Prepared => "prepared",
+            Self::Installing => "installing",
+            Self::Verifying => "verifying",
+            Self::Backoff => "backoff",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictRecoveryTrigger {
+    TerminalFence,
+    Admission,
+    ClockTick,
+    Membership,
+    DuplicateRequest,
+}
+
+impl StrictRecoveryTrigger {
+    fn index(self) -> usize {
+        match self {
+            Self::TerminalFence => 0,
+            Self::Admission => 1,
+            Self::ClockTick => 2,
+            Self::Membership => 3,
+            Self::DuplicateRequest => 4,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::TerminalFence => "terminal_fence",
+            Self::Admission => "admission",
+            Self::ClockTick => "clock_tick",
+            Self::Membership => "membership",
+            Self::DuplicateRequest => "duplicate_request",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictRecoveryDonorSwitchReason {
+    IncarnationLost,
+    RouteLost,
+    TargetMoved,
+    NoProgress,
+}
+
+impl StrictRecoveryDonorSwitchReason {
+    fn index(self) -> usize {
+        match self {
+            Self::IncarnationLost => 0,
+            Self::RouteLost => 1,
+            Self::TargetMoved => 2,
+            Self::NoProgress => 3,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::IncarnationLost => "incarnation_lost",
+            Self::RouteLost => "route_lost",
+            Self::TargetMoved => "target_moved",
+            Self::NoProgress => "no_progress",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictRecoveryCertificateFailure {
+    NoQuorum,
+    ConflictingTarget,
+    InvalidAttestation,
+    UnsupportedParticipant,
+}
+
+impl StrictRecoveryCertificateFailure {
+    fn index(self) -> usize {
+        match self {
+            Self::NoQuorum => 0,
+            Self::ConflictingTarget => 1,
+            Self::InvalidAttestation => 2,
+            Self::UnsupportedParticipant => 3,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoQuorum => "no_quorum",
+            Self::ConflictingTarget => "conflicting_target",
+            Self::InvalidAttestation => "invalid_attestation",
+            Self::UnsupportedParticipant => "unsupported_participant",
+        }
+    }
+}
+
+/// Bounded classes of attempt-correlated callbacks ignored as stale.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictRecoveryStaleEvent {
+    Probe,
+    TerminalPage,
+    SnapshotPage,
+    Retry,
+    Install,
+}
+
+impl StrictRecoveryStaleEvent {
+    fn index(self) -> usize {
+        match self {
+            Self::Probe => 0,
+            Self::TerminalPage => 1,
+            Self::SnapshotPage => 2,
+            Self::Retry => 3,
+            Self::Install => 4,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Probe => "probe",
+            Self::TerminalPage => "terminal_page",
+            Self::SnapshotPage => "snapshot_page",
+            Self::Retry => "retry",
+            Self::Install => "install",
+        }
+    }
+}
+
 impl StrictResolutionOutcome {
     fn index(self) -> usize {
         match self {
@@ -863,6 +1027,11 @@ const STRICT_ADMISSION_EVENT_COUNT: usize = 8;
 const STRICT_HISTORY_ELECTION_EVENT_COUNT: usize = 8;
 const STRICT_HEAD_EVENT_COUNT: usize = 10;
 const STRICT_TERMINAL_DIVERGENCE_EVENT_COUNT: usize = 12;
+const STRICT_RECOVERY_PHASE_COUNT: usize = 8;
+const STRICT_RECOVERY_TRIGGER_COUNT: usize = 5;
+const STRICT_RECOVERY_DONOR_SWITCH_REASON_COUNT: usize = 4;
+const STRICT_RECOVERY_CERTIFICATE_FAILURE_COUNT: usize = 4;
+const STRICT_RECOVERY_STALE_EVENT_COUNT: usize = 5;
 const CATCHUP_REASONS: [CatchupReason; CATCHUP_REASON_COUNT] = [
     CatchupReason::HistoryElection,
     CatchupReason::Admission,
@@ -1020,6 +1189,44 @@ const STRICT_TERMINAL_DIVERGENCE_EVENTS: [StrictTerminalDivergenceEvent;
     StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedLaggingGeneration,
     StrictTerminalDivergenceEvent::TerminalDivergenceSuppressedBehindPeer,
 ];
+const STRICT_RECOVERY_PHASES: [StrictRecoveryPhase; STRICT_RECOVERY_PHASE_COUNT] = [
+    StrictRecoveryPhase::Healthy,
+    StrictRecoveryPhase::Certifying,
+    StrictRecoveryPhase::FetchingTerminalCheckpoint,
+    StrictRecoveryPhase::FetchingRepositorySnapshot,
+    StrictRecoveryPhase::Prepared,
+    StrictRecoveryPhase::Installing,
+    StrictRecoveryPhase::Verifying,
+    StrictRecoveryPhase::Backoff,
+];
+const STRICT_RECOVERY_TRIGGERS: [StrictRecoveryTrigger; STRICT_RECOVERY_TRIGGER_COUNT] = [
+    StrictRecoveryTrigger::TerminalFence,
+    StrictRecoveryTrigger::Admission,
+    StrictRecoveryTrigger::ClockTick,
+    StrictRecoveryTrigger::Membership,
+    StrictRecoveryTrigger::DuplicateRequest,
+];
+const STRICT_RECOVERY_DONOR_SWITCH_REASONS: [StrictRecoveryDonorSwitchReason;
+    STRICT_RECOVERY_DONOR_SWITCH_REASON_COUNT] = [
+    StrictRecoveryDonorSwitchReason::IncarnationLost,
+    StrictRecoveryDonorSwitchReason::RouteLost,
+    StrictRecoveryDonorSwitchReason::TargetMoved,
+    StrictRecoveryDonorSwitchReason::NoProgress,
+];
+const STRICT_RECOVERY_CERTIFICATE_FAILURES: [StrictRecoveryCertificateFailure;
+    STRICT_RECOVERY_CERTIFICATE_FAILURE_COUNT] = [
+    StrictRecoveryCertificateFailure::NoQuorum,
+    StrictRecoveryCertificateFailure::ConflictingTarget,
+    StrictRecoveryCertificateFailure::InvalidAttestation,
+    StrictRecoveryCertificateFailure::UnsupportedParticipant,
+];
+const STRICT_RECOVERY_STALE_EVENTS: [StrictRecoveryStaleEvent; STRICT_RECOVERY_STALE_EVENT_COUNT] = [
+    StrictRecoveryStaleEvent::Probe,
+    StrictRecoveryStaleEvent::TerminalPage,
+    StrictRecoveryStaleEvent::SnapshotPage,
+    StrictRecoveryStaleEvent::Retry,
+    StrictRecoveryStaleEvent::Install,
+];
 const REPLICATION_PIPELINE_KIND_COUNT: usize = 4;
 const REPLICATION_PIPELINE_STAGE_COUNT: usize = 12;
 const STRICT_RESOLUTION_OUTCOME_COUNT: usize = 2;
@@ -1103,6 +1310,23 @@ static STRICT_HEAD_EVENTS_TOTAL: [AtomicU64; STRICT_HEAD_EVENT_COUNT] =
 static STRICT_TERMINAL_DIVERGENCE_EVENTS_TOTAL: [AtomicU64;
     STRICT_TERMINAL_DIVERGENCE_EVENT_COUNT] =
     [const { AtomicU64::new(0) }; STRICT_TERMINAL_DIVERGENCE_EVENT_COUNT];
+static STRICT_RECOVERY_ATTEMPTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STRICT_RECOVERY_COALESCED_TRIGGERS_TOTAL: [AtomicU64; STRICT_RECOVERY_TRIGGER_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_RECOVERY_TRIGGER_COUNT];
+static STRICT_RECOVERY_RETRANSMITS_TOTAL: [AtomicU64; STRICT_RECOVERY_PHASE_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_RECOVERY_PHASE_COUNT];
+static STRICT_RECOVERY_DONOR_SWITCHES_TOTAL: [AtomicU64;
+    STRICT_RECOVERY_DONOR_SWITCH_REASON_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_RECOVERY_DONOR_SWITCH_REASON_COUNT];
+static STRICT_RECOVERY_CERTIFICATE_FAILURES_TOTAL: [AtomicU64;
+    STRICT_RECOVERY_CERTIFICATE_FAILURE_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_RECOVERY_CERTIFICATE_FAILURE_COUNT];
+static STRICT_RECOVERY_STALE_EVENTS_TOTAL: [AtomicU64; STRICT_RECOVERY_STALE_EVENT_COUNT] =
+    [const { AtomicU64::new(0) }; STRICT_RECOVERY_STALE_EVENT_COUNT];
+static STRICT_RECOVERY_COMPLETION_DURATION_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STRICT_RECOVERY_COMPLETION_DURATION_COUNT: AtomicU64 = AtomicU64::new(0);
+static STRICT_RECOVERY_SEND_ATTEMPTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STRICT_RECOVERY_SEND_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static REPLICATION_PIPELINE_STAGE_EVENTS: [[AtomicU64; REPLICATION_PIPELINE_STAGE_COUNT];
     REPLICATION_PIPELINE_KIND_COUNT] =
@@ -1137,6 +1361,106 @@ static STRICT_REPLICATION_TERMINAL_DECISIONS: [AtomicU64; STRICT_RESOLUTION_OUTC
 static STRICT_REPLICATION_FENCE_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 static STRICT_ADMISSION_METRIC_SOURCES: LazyLock<Mutex<Vec<Weak<StrictAdmissionMetrics>>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+static STRICT_RECOVERY_METRIC_SOURCES: LazyLock<Mutex<Vec<Weak<StrictRecoveryMetrics>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static STRICT_RECOVERY_METRIC_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Per-topic recovery gauges aggregated without exposing topic cardinality.
+pub(crate) struct StrictRecoveryMetrics {
+    phase: AtomicUsize,
+    /// Milliseconds since the process-local metric epoch, plus one. Zero means
+    /// the topic is healthy and has no active progress deadline.
+    last_progress_ms: AtomicU64,
+    donor_terminal_sessions: AtomicUsize,
+    donor_snapshot_sessions: AtomicUsize,
+}
+
+impl Default for StrictRecoveryMetrics {
+    fn default() -> Self {
+        Self {
+            phase: AtomicUsize::new(StrictRecoveryPhase::Healthy.index()),
+            last_progress_ms: AtomicU64::new(0),
+            donor_terminal_sessions: AtomicUsize::new(0),
+            donor_snapshot_sessions: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl StrictRecoveryMetrics {
+    /// Changes the topic's recovery phase and starts that phase's progress
+    /// clock. Subsequent refreshes must use [`Self::record_authenticated_progress`].
+    pub(crate) fn set_phase(&self, phase: StrictRecoveryPhase) {
+        let progress_ms = if phase == StrictRecoveryPhase::Healthy {
+            0
+        } else {
+            strict_recovery_now_ms()
+        };
+        self.last_progress_ms.store(progress_ms, Ordering::Relaxed);
+        self.phase.store(phase.index(), Ordering::Release);
+    }
+
+    /// Refreshes progress age after authenticated progress for the current
+    /// attempt. Coalesced triggers, route activity, and unauthenticated frames
+    /// must not call this method.
+    pub(crate) fn record_authenticated_progress(&self) {
+        if self.phase.load(Ordering::Acquire) != StrictRecoveryPhase::Healthy.index() {
+            self.last_progress_ms
+                .store(strict_recovery_now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn set_donor_sessions(&self, terminal: usize, snapshot: usize) {
+        self.donor_terminal_sessions
+            .store(terminal, Ordering::Relaxed);
+        self.donor_snapshot_sessions
+            .store(snapshot, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, now_ms: u64) -> (StrictRecoveryPhase, u64, usize, usize) {
+        let phase_index = self.phase.load(Ordering::Acquire);
+        let phase = STRICT_RECOVERY_PHASES
+            .get(phase_index)
+            .copied()
+            .unwrap_or(StrictRecoveryPhase::Healthy);
+        let last_progress_ms = self.last_progress_ms.load(Ordering::Relaxed);
+        let progress_age_ms = if phase == StrictRecoveryPhase::Healthy || last_progress_ms == 0 {
+            0
+        } else {
+            now_ms.saturating_sub(last_progress_ms)
+        };
+        (
+            phase,
+            progress_age_ms,
+            self.donor_terminal_sessions.load(Ordering::Relaxed),
+            self.donor_snapshot_sessions.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn progress_marker_for_test(&self) -> u64 {
+        self.last_progress_ms.load(Ordering::Relaxed)
+    }
+}
+
+fn strict_recovery_now_ms() -> u64 {
+    STRICT_RECOVERY_METRIC_CLOCK
+        .elapsed()
+        .as_millis()
+        .min((u64::MAX - 1) as u128) as u64
+        + 1
+}
+
+pub(crate) fn register_strict_recovery_metrics(
+    initial_phase: StrictRecoveryPhase,
+) -> Arc<StrictRecoveryMetrics> {
+    let source = Arc::new(StrictRecoveryMetrics::default());
+    source.set_phase(initial_phase);
+    STRICT_RECOVERY_METRIC_SOURCES
+        .lock()
+        .unwrap()
+        .push(Arc::downgrade(&source));
+    source
+}
 
 /// Per-runtime admission gauges aggregated at scrape time.
 ///
@@ -1519,6 +1843,51 @@ pub(crate) fn record_strict_terminal_divergence_event(event: StrictTerminalDiver
     increment(&STRICT_TERMINAL_DIVERGENCE_EVENTS_TOTAL[event.index()], 1);
 }
 
+pub(crate) fn record_strict_recovery_attempt() {
+    increment(&STRICT_RECOVERY_ATTEMPTS_TOTAL, 1);
+}
+
+pub(crate) fn record_strict_recovery_coalesced_trigger(trigger: StrictRecoveryTrigger) {
+    increment(
+        &STRICT_RECOVERY_COALESCED_TRIGGERS_TOTAL[trigger.index()],
+        1,
+    );
+}
+
+pub(crate) fn record_strict_recovery_retransmit(phase: StrictRecoveryPhase) {
+    increment(&STRICT_RECOVERY_RETRANSMITS_TOTAL[phase.index()], 1);
+}
+
+pub(crate) fn record_strict_recovery_donor_switch(reason: StrictRecoveryDonorSwitchReason) {
+    increment(&STRICT_RECOVERY_DONOR_SWITCHES_TOTAL[reason.index()], 1);
+}
+
+pub(crate) fn record_strict_recovery_certificate_failure(
+    failure: StrictRecoveryCertificateFailure,
+) {
+    increment(
+        &STRICT_RECOVERY_CERTIFICATE_FAILURES_TOTAL[failure.index()],
+        1,
+    );
+}
+
+pub(crate) fn record_strict_recovery_stale_event(event: StrictRecoveryStaleEvent) {
+    increment(&STRICT_RECOVERY_STALE_EVENTS_TOTAL[event.index()], 1);
+}
+
+pub(crate) fn record_strict_recovery_completion(duration: Duration) {
+    let duration_ms = duration.as_millis().min(u64::MAX as u128) as u64;
+    increment(&STRICT_RECOVERY_COMPLETION_DURATION_MS_TOTAL, duration_ms);
+    increment(&STRICT_RECOVERY_COMPLETION_DURATION_COUNT, 1);
+}
+
+/// Records one physical protocol-v8 recovery send attempt. Redundant control
+/// copies call this once per route; bulk pages call it once per enqueue.
+pub(crate) fn record_strict_recovery_send_attempt(bytes: usize) {
+    increment(&STRICT_RECOVERY_SEND_ATTEMPTS_TOTAL, 1);
+    increment(&STRICT_RECOVERY_SEND_BYTES_TOTAL, bytes as u64);
+}
+
 pub(crate) fn record_pipeline_stage(
     kind: ReplicationPipelineKind,
     stage: ReplicationPipelineStage,
@@ -1814,7 +2183,114 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         aggregate_strict_admission_metrics(),
     ));
     samples.extend(strict_convergence_event_metric_samples());
+    samples.extend(strict_recovery_metric_samples());
 
+    samples
+}
+
+fn strict_recovery_metric_samples() -> Vec<PrometheusSample> {
+    let now_ms = strict_recovery_now_ms();
+    let mut phase_topics = [0usize; STRICT_RECOVERY_PHASE_COUNT];
+    let mut progress_age_ms = [0u64; STRICT_RECOVERY_PHASE_COUNT];
+    let mut donor_terminal_sessions = 0usize;
+    let mut donor_snapshot_sessions = 0usize;
+    let mut sources = STRICT_RECOVERY_METRIC_SOURCES.lock().unwrap();
+    sources.retain(|source| {
+        let Some(source) = source.upgrade() else {
+            return false;
+        };
+        let (phase, age_ms, terminal_sessions, snapshot_sessions) = source.snapshot(now_ms);
+        phase_topics[phase.index()] = phase_topics[phase.index()].saturating_add(1);
+        progress_age_ms[phase.index()] = progress_age_ms[phase.index()].max(age_ms);
+        donor_terminal_sessions = donor_terminal_sessions.saturating_add(terminal_sessions);
+        donor_snapshot_sessions = donor_snapshot_sessions.saturating_add(snapshot_sessions);
+        true
+    });
+
+    let mut samples = Vec::new();
+    for (kind, active) in [
+        ("terminal", donor_terminal_sessions),
+        ("snapshot", donor_snapshot_sessions),
+    ] {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_recovery_donor_sessions_active",
+            vec![("kind".to_owned(), kind.to_owned())],
+            active as f64,
+        ));
+    }
+    for phase in STRICT_RECOVERY_PHASES {
+        let labels = vec![("phase".to_owned(), phase.label().to_owned())];
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_recovery_phase_topics",
+            labels.clone(),
+            phase_topics[phase.index()] as f64,
+        ));
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_recovery_progress_age_ms",
+            labels.clone(),
+            progress_age_ms[phase.index()] as f64,
+        ));
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_recovery_retransmits_total",
+            labels,
+            STRICT_RECOVERY_RETRANSMITS_TOTAL[phase.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_recovery_attempts_total",
+        Vec::new(),
+        STRICT_RECOVERY_ATTEMPTS_TOTAL.load(Ordering::Relaxed) as f64,
+    ));
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_recovery_send_attempts_total",
+        Vec::new(),
+        STRICT_RECOVERY_SEND_ATTEMPTS_TOTAL.load(Ordering::Relaxed) as f64,
+    ));
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_recovery_send_bytes_total",
+        Vec::new(),
+        STRICT_RECOVERY_SEND_BYTES_TOTAL.load(Ordering::Relaxed) as f64,
+    ));
+    for trigger in STRICT_RECOVERY_TRIGGERS {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_recovery_coalesced_triggers_total",
+            vec![("event".to_owned(), trigger.label().to_owned())],
+            STRICT_RECOVERY_COALESCED_TRIGGERS_TOTAL[trigger.index()].load(Ordering::Relaxed)
+                as f64,
+        ));
+    }
+    for reason in STRICT_RECOVERY_DONOR_SWITCH_REASONS {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_recovery_donor_switches_total",
+            vec![("reason".to_owned(), reason.label().to_owned())],
+            STRICT_RECOVERY_DONOR_SWITCHES_TOTAL[reason.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    for failure in STRICT_RECOVERY_CERTIFICATE_FAILURES {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_recovery_certificate_failures_total",
+            vec![("reason".to_owned(), failure.label().to_owned())],
+            STRICT_RECOVERY_CERTIFICATE_FAILURES_TOTAL[failure.index()].load(Ordering::Relaxed)
+                as f64,
+        ));
+    }
+    for event in STRICT_RECOVERY_STALE_EVENTS {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_strict_replication_recovery_stale_events_total",
+            vec![("event".to_owned(), event.label().to_owned())],
+            STRICT_RECOVERY_STALE_EVENTS_TOTAL[event.index()].load(Ordering::Relaxed) as f64,
+        ));
+    }
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_recovery_completion_duration_ms_total",
+        Vec::new(),
+        STRICT_RECOVERY_COMPLETION_DURATION_MS_TOTAL.load(Ordering::Relaxed) as f64,
+    ));
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_strict_replication_recovery_completion_duration_count",
+        Vec::new(),
+        STRICT_RECOVERY_COMPLETION_DURATION_COUNT.load(Ordering::Relaxed) as f64,
+    ));
     samples
 }
 
@@ -2060,6 +2536,125 @@ fn strict_protocol_metric_samples(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_recovery_metrics_register_in_restored_phase() {
+        let source = register_strict_recovery_metrics(StrictRecoveryPhase::Installing);
+
+        let (phase, _, _, _) = source.snapshot(strict_recovery_now_ms());
+        assert_eq!(phase, StrictRecoveryPhase::Installing);
+    }
+
+    #[test]
+    fn strict_recovery_metrics_use_bounded_phase_and_event_labels() {
+        let source = register_strict_recovery_metrics(StrictRecoveryPhase::Healthy);
+        source.set_phase(StrictRecoveryPhase::FetchingTerminalCheckpoint);
+        source.record_authenticated_progress();
+        source.set_donor_sessions(2, 1);
+        record_strict_recovery_attempt();
+        record_strict_recovery_coalesced_trigger(StrictRecoveryTrigger::TerminalFence);
+        record_strict_recovery_retransmit(StrictRecoveryPhase::FetchingTerminalCheckpoint);
+        record_strict_recovery_donor_switch(StrictRecoveryDonorSwitchReason::NoProgress);
+        record_strict_recovery_certificate_failure(
+            StrictRecoveryCertificateFailure::ConflictingTarget,
+        );
+        record_strict_recovery_stale_event(StrictRecoveryStaleEvent::TerminalPage);
+        record_strict_recovery_completion(Duration::from_millis(123));
+        record_strict_recovery_send_attempt(321);
+
+        let samples = strict_recovery_metric_samples();
+        let has_sample = |name: &str, key: &str, value: &str| {
+            samples.iter().any(|sample| {
+                sample.name() == name
+                    && sample.labels() == [(key.to_owned(), value.to_owned())]
+                    && sample.value() >= 1.0
+            })
+        };
+        assert!(has_sample(
+            "shitspeak_s2s_strict_replication_recovery_phase_topics",
+            "phase",
+            "fetching_terminal_checkpoint"
+        ));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_recovery_progress_age_ms"
+                && sample.labels()
+                    == [(
+                        "phase".to_owned(),
+                        "fetching_terminal_checkpoint".to_owned(),
+                    )]
+                && sample.value() >= 0.0
+        }));
+        assert!(has_sample(
+            "shitspeak_s2s_strict_replication_recovery_donor_sessions_active",
+            "kind",
+            "terminal"
+        ));
+        assert!(has_sample(
+            "shitspeak_s2s_strict_replication_recovery_donor_sessions_active",
+            "kind",
+            "snapshot"
+        ));
+        assert!(has_sample(
+            "shitspeak_s2s_strict_replication_recovery_coalesced_triggers_total",
+            "event",
+            "terminal_fence"
+        ));
+        assert!(has_sample(
+            "shitspeak_s2s_strict_replication_recovery_retransmits_total",
+            "phase",
+            "fetching_terminal_checkpoint"
+        ));
+        assert!(has_sample(
+            "shitspeak_s2s_strict_replication_recovery_donor_switches_total",
+            "reason",
+            "no_progress"
+        ));
+        assert!(has_sample(
+            "shitspeak_s2s_strict_replication_recovery_certificate_failures_total",
+            "reason",
+            "conflicting_target"
+        ));
+        assert!(has_sample(
+            "shitspeak_s2s_strict_replication_recovery_stale_events_total",
+            "event",
+            "terminal_page"
+        ));
+        assert!(samples.iter().any(|sample| {
+            sample.name()
+                == "shitspeak_s2s_strict_replication_recovery_completion_duration_ms_total"
+                && sample.value() >= 123.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_recovery_completion_duration_count"
+                && sample.value() >= 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_recovery_send_attempts_total"
+                && sample.value() >= 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_strict_replication_recovery_send_bytes_total"
+                && sample.value() >= 321.0
+        }));
+    }
+
+    #[test]
+    fn strict_recovery_wire_accounting_records_each_physical_attempt() {
+        let attempts_before = STRICT_RECOVERY_SEND_ATTEMPTS_TOTAL.load(Ordering::Relaxed);
+        let bytes_before = STRICT_RECOVERY_SEND_BYTES_TOTAL.load(Ordering::Relaxed);
+
+        record_strict_recovery_send_attempt(101);
+        record_strict_recovery_send_attempt(101);
+
+        assert!(
+            STRICT_RECOVERY_SEND_ATTEMPTS_TOTAL.load(Ordering::Relaxed)
+                >= attempts_before.saturating_add(2)
+        );
+        assert!(
+            STRICT_RECOVERY_SEND_BYTES_TOTAL.load(Ordering::Relaxed)
+                >= bytes_before.saturating_add(202)
+        );
+    }
 
     #[test]
     fn v3_wire_dimensions_map_only_to_bounded_metric_values() {

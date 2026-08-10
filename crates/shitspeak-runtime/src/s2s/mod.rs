@@ -1519,6 +1519,15 @@ impl S2SManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn strict_channel_debug_state_for_test(
+        &self,
+        server_id: Option<&str>,
+    ) -> Option<s2s_replications::strict::StrictDebugState> {
+        self.channel_replication_handle(server_id.unwrap_or(DEFAULT_SERVER_ID))
+            .map(|handle| handle.debug_state())
+    }
+
     fn channel_blob_replication_handle(
         &self,
         server_id: &str,
@@ -1766,6 +1775,7 @@ impl S2SManager {
             channel_blob_replications,
             session_blob_replication,
             bridge_tasks,
+            client_snapshot_deferrals,
         ) = match server_handle.as_ref() {
             Some(server) => {
                 self.register_repositories(
@@ -1783,7 +1793,15 @@ impl S2SManager {
             }
             None => {
                 warn!("s2s repository replication skipped: server handle dropped");
-                (HashMap::new(), None, None, HashMap::new(), None, Vec::new())
+                (
+                    HashMap::new(),
+                    None,
+                    None,
+                    HashMap::new(),
+                    None,
+                    Vec::new(),
+                    ClientSnapshotDeferralGuard::default(),
+                )
             }
         };
 
@@ -1805,7 +1823,7 @@ impl S2SManager {
             warn!(
                 required_version = s2s_overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
                 expected_topics = ?expected_strict_topics,
-                "strict replication remains at v0 until every expected repository and its authenticated v2 frame prerequisites are ready"
+                "strict replication remains at v0 until every expected repository and its authenticated strict-frame prerequisites are ready"
             );
         }
 
@@ -1876,7 +1894,7 @@ impl S2SManager {
             })));
         }
 
-        start_observability_geo_retry(local_geo.clone(), shutdown.clone());
+        let geo_retry_task = start_observability_geo_retry(local_geo.clone(), shutdown.clone());
         let status_task = self.status_http_listen.and_then(|listen| {
             match s2s_status::spawn_status_server(
                 listen,
@@ -1896,6 +1914,9 @@ impl S2SManager {
         info!(node = overlay.local_node_id(), "s2s runtime started");
 
         let _ = shutdown.changed().await;
+        if let Some(task) = geo_retry_task {
+            let _ = task.await;
+        }
 
         let bridge_tasks = {
             let mut state = self.state.write();
@@ -1915,17 +1936,22 @@ impl S2SManager {
             state.gateway_tx = None;
             bridge_tasks
         };
-        for task in bridge_tasks {
+        for task in &bridge_tasks {
             task.abort();
+        }
+        for task in bridge_tasks {
+            let _ = task.await;
         }
         if let Some(task) = status_task {
             task.abort();
+            let _ = task.await;
         }
 
         replications.set_strict_topic_resolver(None);
         replications.set_blob_topic_resolver(None);
         application.shutdown().await;
         replications.shutdown().await;
+        client_snapshot_deferrals.shutdown().await;
         overlay.shutdown().await;
         transport.shutdown().await;
 
@@ -1950,6 +1976,7 @@ impl S2SManager {
         HashMap<String, s2s_replications::BlobHandle<ChannelBlobReplicationAdapter>>,
         Option<s2s_replications::BlobHandle<SessionBlobReplicationAdapter>>,
         Vec<JoinHandle<()>>,
+        ClientSnapshotDeferralGuard,
     ) {
         let bans = Arc::new(BanReplicationAdapter::new(server.get_bans().clone()));
         let clients = Arc::new(ClientReplicationAdapter::new(
@@ -1957,6 +1984,7 @@ impl S2SManager {
             server.get_channels().clone(),
             replications.local_boot_epoch(),
         ));
+        let client_snapshot_deferrals = clients.snapshot_deferrals.clone();
 
         let mut channel_handles = HashMap::new();
         if let Err(e) = self.register_channel_replication_scope_into(
@@ -2043,6 +2071,7 @@ impl S2SManager {
             channel_blob_handles,
             session_blob_handle,
             bridge_tasks,
+            client_snapshot_deferrals,
         )
     }
 
@@ -2160,27 +2189,50 @@ impl S2SManager {
     }
 }
 
-pub fn start_observability_geo_resolution(
+pub(crate) fn start_observability_geo_resolution(
     configured_geo: Option<NodeGeo>,
     shutdown: watch::Receiver<()>,
-) -> SharedNodeGeo {
+) -> (SharedNodeGeo, Option<JoinHandle<()>>) {
     let local_geo = SharedNodeGeo::new(configured_geo);
-    start_observability_geo_retry(local_geo.clone(), shutdown);
-    local_geo
+    let retry_task = start_observability_geo_retry(local_geo.clone(), shutdown);
+    (local_geo, retry_task)
 }
 
-fn start_observability_geo_retry(local_geo: SharedNodeGeo, shutdown: watch::Receiver<()>) {
-    if local_geo.get().is_some() {
-        return;
-    }
-
-    tokio::spawn(retry_observability_geo_until_resolved(
+fn start_observability_geo_retry(
+    local_geo: SharedNodeGeo,
+    shutdown: watch::Receiver<()>,
+) -> Option<JoinHandle<()>> {
+    start_observability_geo_retry_with_probe(
         local_geo,
         shutdown,
         OBSERVABILITY_GEO_RETRY_INITIAL_INTERVAL,
         OBSERVABILITY_GEO_RETRY_CAP,
         || async { shitspeak_s2s_transport::discover_public_geo().await },
-    ));
+    )
+}
+
+fn start_observability_geo_retry_with_probe<F, Fut>(
+    local_geo: SharedNodeGeo,
+    shutdown: watch::Receiver<()>,
+    retry_initial_interval: Duration,
+    retry_cap: Duration,
+    probe: F,
+) -> Option<JoinHandle<()>>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Option<NodeGeo>> + Send + 'static,
+{
+    if local_geo.get().is_some() {
+        return None;
+    }
+
+    Some(tokio::spawn(retry_observability_geo_until_resolved(
+        local_geo,
+        shutdown,
+        retry_initial_interval,
+        retry_cap,
+        probe,
+    )))
 }
 
 async fn retry_observability_geo_until_resolved<F, Fut>(
@@ -3526,13 +3578,14 @@ impl StrictReplicable for ChannelReplicationAdapter {
                 "s2s channel snapshot requires a multi-thread Tokio runtime",
             )
         })?;
-        let (version, channels, freshness, strict_operation_ids) = strict_snapshot.into_parts();
+        let (version, channels, freshness, _legacy_operation_ids) = strict_snapshot.into_parts();
         let bytes = rmp_serde::to_vec(&ChannelSnapshot {
             channels,
             freshness,
-            // Frozen compatibility ledger for pre-v5 receivers. New applied
-            // operation ownership lives in the S2S checkpoint envelope.
-            strict_operation_ids,
+            // Protocol v8 owns applied-operation identity in the outer S2S
+            // checkpoint envelope. Canonical repository images must not vary
+            // with this receiver-local, frozen pre-v5 migration ledger.
+            strict_operation_ids: Vec::new(),
         })
         .map(Bytes::from)
         .map_err(|error| {
@@ -3891,12 +3944,14 @@ impl StrictReplicable for BanReplicationAdapter {
                 s2s_replications::strict::StrictSnapshotError::new(message)
             }
         })?;
-        let (version, entries, freshness, strict_operation_ids) = strict_snapshot.into_parts();
+        let (version, entries, freshness, _legacy_operation_ids) = strict_snapshot.into_parts();
         let bytes = rmp_serde::to_vec(&BanSnapshot {
             entries,
             freshness,
-            // Frozen compatibility ledger for pre-v5 snapshot decoders.
-            strict_operation_ids,
+            // Protocol v8 owns applied-operation identity in the outer S2S
+            // checkpoint envelope. Canonical repository images must not vary
+            // with this receiver-local, frozen pre-v5 migration ledger.
+            strict_operation_ids: Vec::new(),
         })
         .map(Bytes::from)
         .map_err(|error| {
@@ -4030,9 +4085,10 @@ struct ClientReplicationAdapter {
     snapshot_deferrals: ClientSnapshotDeferralGuard,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ClientSnapshotDeferralGuard {
     state: Arc<Mutex<ClientSnapshotDeferralState>>,
+    timers: Arc<Mutex<ClientSnapshotDeferralTimers>>,
 }
 
 #[derive(Default)]
@@ -4047,6 +4103,34 @@ struct ClientSnapshotDeferral {
     version: u64,
     deferred_at: tokio::time::Instant,
     error_emitted: bool,
+}
+
+#[derive(Default)]
+struct ClientSnapshotDeferralTimers {
+    closed: bool,
+    by_origin: HashMap<NodeIdentifier, (u64, tokio::task::AbortHandle)>,
+    tasks: tokio::task::JoinSet<()>,
+}
+
+impl ClientSnapshotDeferralTimers {
+    fn reap_finished(&mut self) {
+        while let Some(result) = self.tasks.try_join_next() {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                warn!(%error, "client snapshot deferral watchdog panicked");
+            }
+        }
+    }
+}
+
+impl Default for ClientSnapshotDeferralGuard {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ClientSnapshotDeferralState::default())),
+            timers: Arc::new(Mutex::new(ClientSnapshotDeferralTimers::default())),
+        }
+    }
 }
 
 impl ClientSnapshotDeferralGuard {
@@ -4079,7 +4163,29 @@ impl ClientSnapshotDeferralGuard {
         };
 
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        let mut timers = self.timers.lock();
+        timers.reap_finished();
+        if timers.closed {
+            let mut state = self.state.lock();
+            if state
+                .by_origin
+                .get(&origin)
+                .is_some_and(|deferred| deferred.generation == generation)
+            {
+                state.by_origin.remove(&origin);
+            }
+            return;
+        }
+        if !self
+            .state
+            .lock()
+            .by_origin
+            .get(&origin)
+            .is_some_and(|deferred| deferred.generation == generation)
+        {
+            return;
+        }
+        let task = timers.tasks.spawn(async move {
             tokio::time::sleep_until(deadline).await;
             let overdue = {
                 let mut state = state.lock();
@@ -4106,10 +4212,50 @@ impl ClientSnapshotDeferralGuard {
                 );
             }
         });
+        timers.by_origin.insert(origin, (generation, task));
     }
 
     fn clear(&self, origin: NodeIdentifier) {
-        self.state.lock().by_origin.remove(&origin);
+        let generation = self
+            .state
+            .lock()
+            .by_origin
+            .remove(&origin)
+            .map(|deferred| deferred.generation);
+        let Some(generation) = generation else {
+            return;
+        };
+        let task = {
+            let mut timers = self.timers.lock();
+            timers.reap_finished();
+            match timers.by_origin.get(&origin) {
+                Some((task_generation, _)) if *task_generation == generation => {
+                    timers.by_origin.remove(&origin).map(|(_, task)| task)
+                }
+                _ => None,
+            }
+        };
+        if let Some(task) = task {
+            task.abort();
+        }
+    }
+
+    async fn shutdown(&self) {
+        let mut tasks = {
+            let mut timers = self.timers.lock();
+            timers.closed = true;
+            timers.tasks.abort_all();
+            timers.by_origin.clear();
+            std::mem::take(&mut timers.tasks)
+        };
+        self.state.lock().by_origin.clear();
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                warn!(%error, "client snapshot deferral watchdog panicked during shutdown");
+            }
+        }
     }
 
     #[cfg(test)]
@@ -4122,6 +4268,16 @@ impl ClientSnapshotDeferralGuard {
                 deferred.error_emitted,
             )
         })
+    }
+
+    #[cfg(test)]
+    fn pending_timer_count(&self) -> usize {
+        self.timers.lock().tasks.len()
+    }
+
+    #[cfg(test)]
+    fn active_timer_count(&self) -> usize {
+        self.timers.lock().by_origin.len()
     }
 }
 
@@ -4587,6 +4743,38 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     #[tracing_test::traced_test]
+    async fn observability_geo_retry_is_owned_and_drains_on_shutdown() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let local_geo = SharedNodeGeo::new(None);
+        let probe_started = Arc::new(tokio::sync::Notify::new());
+        let retry_task = start_observability_geo_retry_with_probe(
+            local_geo,
+            shutdown_rx,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            {
+                let probe_started = Arc::clone(&probe_started);
+                move || {
+                    let probe_started = Arc::clone(&probe_started);
+                    async move {
+                        probe_started.notify_one();
+                        std::future::pending::<Option<NodeGeo>>().await
+                    }
+                }
+            },
+        )
+        .expect("missing geo must start an owned retry task");
+
+        probe_started.notified().await;
+        assert!(!retry_task.is_finished());
+        let _ = shutdown_tx.send(());
+        retry_task
+            .await
+            .expect("owned geo retry task must drain on shutdown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
     async fn client_snapshot_deferral_guard_errors_once_per_continuous_interval() {
         let guard = ClientSnapshotDeferralGuard::default();
 
@@ -4634,6 +4822,58 @@ mod tests {
 
         guard.clear(1);
         assert_eq!(guard.status(1), None);
+
+        guard.shutdown().await;
+        assert_eq!(guard.pending_timer_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_snapshot_deferral_guard_shutdown_joins_pending_timers() {
+        let guard = ClientSnapshotDeferralGuard::default();
+
+        guard.record_deferred(1, 42, 10);
+        guard.record_deferred(2, 43, 11);
+        tokio::task::yield_now().await;
+        assert_eq!(guard.pending_timer_count(), 2);
+        assert_eq!(guard.active_timer_count(), 2);
+
+        guard.clear(1);
+        assert_eq!(guard.active_timer_count(), 1);
+        assert_eq!(guard.status(1), None);
+        assert!(guard.status(2).is_some());
+
+        guard.record_deferred(1, 44, 12);
+        assert_eq!(guard.active_timer_count(), 2);
+
+        guard.shutdown().await;
+
+        assert_eq!(guard.pending_timer_count(), 0);
+        assert_eq!(guard.active_timer_count(), 0);
+        assert_eq!(guard.status(1), None);
+        assert_eq!(guard.status(2), None);
+        tokio::time::advance(S2S_CLIENT_SNAPSHOT_DEFER_ERROR_AFTER).await;
+        tokio::task::yield_now().await;
+        assert_eq!(guard.pending_timer_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_snapshot_deferral_guard_reaps_finished_timers() {
+        let guard = ClientSnapshotDeferralGuard::default();
+
+        guard.record_deferred(1, 42, 10);
+        tokio::time::advance(S2S_CLIENT_SNAPSHOT_DEFER_ERROR_AFTER).await;
+        tokio::task::yield_now().await;
+        assert_eq!(guard.pending_timer_count(), 1);
+
+        guard.record_deferred(2, 43, 11);
+        assert_eq!(
+            guard.pending_timer_count(),
+            1,
+            "registering a new watchdog must reap completed owned tasks"
+        );
+
+        guard.shutdown().await;
+        assert_eq!(guard.pending_timer_count(), 0);
     }
 
     #[test]
@@ -4911,8 +5151,81 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn current_protocol_repository_snapshots_ignore_distinct_legacy_ledgers() {
+        let left_channels = test_channel_repo(1);
+        left_channels
+            .merge_strict_operation_ids(vec![StrictOperationId::new(101, 102)])
+            .await
+            .unwrap();
+        let right_channels = test_channel_repo(2);
+        right_channels
+            .merge_strict_operation_ids(vec![StrictOperationId::new(201, 202)])
+            .await
+            .unwrap();
+        let left_channel_adapter = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            Arc::clone(&left_channels),
+            None,
+        );
+        let right_channel_adapter = ChannelReplicationAdapter::new(
+            DEFAULT_SERVER_ID.to_owned(),
+            Arc::clone(&right_channels),
+            None,
+        );
+
+        let left_channel_snapshot = left_channel_adapter
+            .snapshot_with_metadata()
+            .expect("capture left channel snapshot");
+        let right_channel_snapshot = right_channel_adapter
+            .snapshot_with_metadata()
+            .expect("capture right channel snapshot");
+        assert_eq!(left_channel_snapshot, right_channel_snapshot);
+        let decoded_channels: ChannelSnapshot = rmp_serde::from_slice(&left_channel_snapshot.1)
+            .expect("decode canonical channel snapshot");
+        assert!(decoded_channels.strict_operation_ids.is_empty());
+        assert_eq!(
+            left_channels.strict_operation_ids(),
+            vec![StrictOperationId::new(101, 102)]
+        );
+        assert_eq!(
+            right_channels.strict_operation_ids(),
+            vec![StrictOperationId::new(201, 202)]
+        );
+
+        let left_bans = BanRepository::new_in_memory(1);
+        left_bans
+            .merge_strict_operation_ids(&[StrictOperationId::new(301, 302)])
+            .unwrap();
+        let right_bans = BanRepository::new_in_memory(2);
+        right_bans
+            .merge_strict_operation_ids(&[StrictOperationId::new(401, 402)])
+            .unwrap();
+        let left_ban_adapter = BanReplicationAdapter::new(Arc::clone(&left_bans));
+        let right_ban_adapter = BanReplicationAdapter::new(Arc::clone(&right_bans));
+
+        let left_ban_snapshot = left_ban_adapter
+            .snapshot_with_metadata()
+            .expect("capture left ban snapshot");
+        let right_ban_snapshot = right_ban_adapter
+            .snapshot_with_metadata()
+            .expect("capture right ban snapshot");
+        assert_eq!(left_ban_snapshot, right_ban_snapshot);
+        let decoded_bans: BanSnapshot =
+            rmp_serde::from_slice(&left_ban_snapshot.1).expect("decode canonical ban snapshot");
+        assert!(decoded_bans.strict_operation_ids.is_empty());
+        assert_eq!(
+            left_bans.strict_operation_ids().unwrap(),
+            vec![StrictOperationId::new(301, 302)]
+        );
+        assert_eq!(
+            right_bans.strict_operation_ids().unwrap(),
+            vec![StrictOperationId::new(401, 402)]
+        );
+    }
+
     #[tokio::test]
-    async fn v5_snapshot_adapters_preserve_legacy_repository_ledgers() {
+    async fn current_protocol_snapshot_adapters_preserve_receiver_legacy_ledgers() {
         let channels = test_channel_repo(1);
         let channel_adapter = ChannelReplicationAdapter::new(
             DEFAULT_SERVER_ID.to_owned(),

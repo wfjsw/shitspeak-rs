@@ -14,14 +14,16 @@ use tokio::time::timeout;
 
 use crate::overlay::{OverlayNetwork, STRICT_REPLICATION_PROTOCOL_VERSION, SeedPeer};
 use crate::replications::proto::{self as repl_proto, OwnerBody, OwnerOp, REPLICATION_SERVICE_TAG};
-use crate::replications::protocol::STRICT_PROTOCOL_VERSION_CURRENT;
+use crate::replications::protocol::{STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V8};
+use crate::replications::strict::terminal_journal::{TerminalCut, TerminalJournal};
 use crate::replications::strict::{
     HistoryMetadata, LogSlice, StrictCommitApplyOutcome, StrictLogEntry, StrictLogMetadata,
     StrictSnapshotError,
 };
 use crate::replications::test_support::{CountingOwnerRepo, CountingStrictRepo};
 use crate::replications::{
-    OwnerReplicable, ReplicationConfig, ReplicationError, ReplicationManager, StrictReplicable,
+    OwnerReplicable, ReplicationConfig, ReplicationError, ReplicationManager, StrictHandle,
+    StrictReplicable,
 };
 use crate::testing::chaos::{FaultSelector, MessageType};
 use crate::testing::{loopback, overlay_cfg, transport_cfg, wait_for_full_routing, wait_until};
@@ -258,6 +260,262 @@ fn block_in_place_or_current<T>(f: impl FnOnce(&tokio::runtime::Handle) -> T) ->
     Some(tokio::task::block_in_place(|| f(&handle)))
 }
 
+fn strict_terminal_journal_path(root: &std::path::Path, topic: &str) -> std::path::PathBuf {
+    root.join("strict-terminal-journal")
+        .join(format!("topic-{}.sqlite3", hex::encode(topic.as_bytes())))
+}
+
+fn read_strict_terminal_cut(root: &std::path::Path, topic: &str) -> Option<TerminalCut> {
+    let connection = rusqlite::Connection::open_with_flags(
+        strict_terminal_journal_path(root, topic),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let (journal_id, generation, chain_digest, terminal_set_digest): (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    ) = connection
+        .query_row(
+            "SELECT journal_id, generation, chain_digest, terminal_set_digest
+             FROM journal_metadata
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .ok()?;
+    Some(TerminalCut::new(
+        journal_id.try_into().ok()?,
+        u64::from_be_bytes(generation.try_into().ok()?),
+        chain_digest.try_into().ok()?,
+        terminal_set_digest.try_into().ok()?,
+    ))
+}
+
+fn counting_strict_repository_envelopes_match(
+    left: &CountingStrictRepo,
+    right: &CountingStrictRepo,
+) -> bool {
+    match (
+        left.snapshot_with_metadata(),
+        right.snapshot_with_metadata(),
+    ) {
+        (Ok((left_metadata, left_bytes)), Ok((right_metadata, right_bytes))) => {
+            left_metadata == right_metadata && left_bytes == right_bytes
+        }
+        _ => false,
+    }
+}
+
+async fn activate_mandatory_strict_protocol(cluster: &ReplCluster) {
+    const CAPABILITY_TOPIC: &str = "__integration-strict-v8-capability";
+
+    for index in 0..cluster.managers.len() {
+        cluster
+            .register_strict(index, CAPABILITY_TOPIC, CountingStrictRepo::new_current())
+            .expect("register mandatory strict-v8 capability fixture");
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            cluster
+                .managers
+                .iter()
+                .all(|manager| manager.strict_capability_activation_ready())
+                && strict_protocol_floors(cluster)
+                    .iter()
+                    .all(|(_, version)| *version == STRICT_PROTOCOL_VERSION_CURRENT)
+                && cluster.cluster.nodes.iter().all(|observer| {
+                    observer.overlay.members().iter().all(|member| {
+                        !member.replication_services().strict()
+                            || member.strict_replication_protocol_version()
+                                == STRICT_PROTOCOL_VERSION_CURRENT
+                    })
+                })
+        })
+        .await,
+        "mandatory strict-v8 capability did not reach every observer: floors={:?}",
+        strict_protocol_floors(cluster),
+    );
+}
+
+fn strict_v8_recovery_config() -> ReplicationConfig {
+    ReplicationConfig::default()
+        .with_delivery_tick_interval(Duration::from_millis(25))
+        .with_fallback_clock_tick(Duration::from_millis(50))
+        .with_min_clock_tick(Duration::from_millis(25))
+        .with_max_clock_tick(Duration::from_millis(100))
+        .with_strict_bootstrap_retry_interval(Duration::from_millis(50))
+}
+
+fn seed_shared_empty_terminal_lineage(cluster: &ReplCluster, topic: &str, witness_count: usize) {
+    assert!(witness_count >= 2);
+    {
+        let mut journal =
+            TerminalJournal::load(Some(cluster.persistence_dir(0).to_path_buf()), topic)
+                .expect("create first witness terminal journal");
+        journal
+            .checkpoint(0)
+            .expect("persist first witness generation-zero lineage");
+        assert_eq!(journal.terminal_cut().generation(), 0);
+    }
+    let source = strict_terminal_journal_path(cluster.persistence_dir(0), topic);
+    for index in 1..witness_count {
+        let destination = strict_terminal_journal_path(cluster.persistence_dir(index), topic);
+        std::fs::create_dir_all(destination.parent().expect("terminal journal parent"))
+            .expect("create witness terminal journal directory");
+        std::fs::copy(&source, destination).expect("copy shared witness terminal lineage");
+    }
+}
+
+async fn establish_v8_witnesses(
+    cluster: &ReplCluster,
+    topic: &str,
+    witness_count: usize,
+) -> (
+    Vec<Arc<CountingStrictRepo>>,
+    Vec<StrictHandle<CountingStrictRepo>>,
+    TerminalCut,
+) {
+    // Protocol v8 fails closed for every known strict participant. Nodes that
+    // will join `topic` later still need one capable repository registered so
+    // they advertise v8 instead of transient participant version zero while
+    // the witness lineage is prepared.
+    let capability_topic = format!("{topic}-v8-capability");
+    for index in witness_count..cluster.managers.len() {
+        cluster
+            .register_strict(index, &capability_topic, CountingStrictRepo::new_current())
+            .expect("activate v8 capability for a later recovery participant");
+    }
+    seed_shared_empty_terminal_lineage(cluster, topic, witness_count);
+    {
+        let mut journal =
+            TerminalJournal::load(Some(cluster.persistence_dir(0).to_path_buf()), topic)
+                .expect("reopen witness terminal journal");
+        journal
+            .upsert_abort_decision((1, 1), 1)
+            .expect("seed a terminal witness decision");
+        assert_eq!(journal.terminal_cut().generation(), 1);
+    }
+    let witness_source = strict_terminal_journal_path(cluster.persistence_dir(0), topic);
+    for index in 1..witness_count {
+        let destination = strict_terminal_journal_path(cluster.persistence_dir(index), topic);
+        std::fs::copy(&witness_source, destination)
+            .expect("copy compacted witness terminal lineage");
+    }
+    let repos = (0..witness_count)
+        .map(|_| CountingStrictRepo::new_current())
+        .collect::<Vec<_>>();
+    let handles = repos
+        .iter()
+        .enumerate()
+        .map(|(index, repo)| {
+            cluster
+                .register_strict(index, topic, repo.clone())
+                .expect("register strict recovery witness")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            cluster
+                .managers
+                .iter()
+                .all(|manager| manager.strict_capability_activation_ready())
+                && strict_protocol_floors(cluster)
+                    .iter()
+                    .all(|(_, version)| *version == STRICT_PROTOCOL_VERSION_CURRENT)
+        })
+        .await,
+        "v8 participant capability floor did not activate: floors={:?}",
+        strict_protocol_floors(cluster)
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            handles.iter().all(|handle| {
+                let state = handle.debug_state();
+                state.recovery_healthy() && state.admitted_peers() == witness_count - 1
+            })
+        })
+        .await,
+        "v8 witnesses did not admit one another: states={:?}",
+        handles
+            .iter()
+            .map(|handle| handle.debug_state())
+            .collect::<Vec<_>>()
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            let cuts = (0..witness_count)
+                .map(|index| read_strict_terminal_cut(cluster.persistence_dir(index), topic))
+                .collect::<Vec<_>>();
+            cuts[0].is_some() && cuts.windows(2).all(|pair| pair[0] == pair[1])
+        })
+        .await,
+        "witness terminal cuts did not converge"
+    );
+    let cut = read_strict_terminal_cut(cluster.persistence_dir(0), topic)
+        .expect("established witness terminal cut");
+    (repos, handles, cut)
+}
+
+async fn prepare_current_repository_with_foreign_journal(
+    cluster: &ReplCluster,
+    topic: &str,
+    node_index: usize,
+    source: &CountingStrictRepo,
+    witness_cut: &TerminalCut,
+) -> (Arc<CountingStrictRepo>, TerminalCut) {
+    let repo = CountingStrictRepo::new_current();
+    let (metadata, snapshot) = source
+        .snapshot_with_metadata()
+        .expect("capture current witness repository");
+    repo.install_snapshot(metadata.version, snapshot)
+        .await
+        .expect("seed current repository on fresh node");
+    let foreign_cut = {
+        let mut journal = TerminalJournal::load(
+            Some(cluster.persistence_dir(node_index).to_path_buf()),
+            topic,
+        )
+        .expect("create foreign terminal journal");
+        journal
+            .checkpoint(metadata.version)
+            .expect("persist foreign generation-zero lineage");
+        journal.terminal_cut()
+    };
+    assert_eq!(foreign_cut.generation(), 0);
+    assert_ne!(foreign_cut.journal_id(), witness_cut.journal_id());
+    (repo, foreign_cut)
+}
+
+fn strict_v8_recovery_is_exact(
+    cluster: &ReplCluster,
+    topic: &str,
+    repos: &[Arc<CountingStrictRepo>],
+    handles: &[StrictHandle<CountingStrictRepo>],
+) -> bool {
+    let Some(reference_repo) = repos.first() else {
+        return false;
+    };
+    if !repos
+        .iter()
+        .all(|repo| counting_strict_repository_envelopes_match(reference_repo, repo))
+        || !handles
+            .iter()
+            .all(|handle| handle.debug_state().recovery_healthy())
+    {
+        return false;
+    }
+    let cuts = (0..repos.len())
+        .map(|index| read_strict_terminal_cut(cluster.persistence_dir(index), topic))
+        .collect::<Vec<_>>();
+    cuts[0].is_some() && cuts.windows(2).all(|pair| pair[0] == pair[1])
+}
+
 fn channel_create_op(node_id: u16, channel: Channel) -> ChannelOperation {
     ChannelOperation {
         server_id: DEFAULT_SERVER_ID.to_owned(),
@@ -467,6 +725,7 @@ async fn strict_capability_activation_is_automatic_and_floor_stable() {
 
     let ban_repos: Vec<Arc<CountingStrictRepo>> =
         (0..3).map(|_| CountingStrictRepo::new()).collect();
+    seed_shared_empty_terminal_lineage(&cluster, "bans", 3);
     let mut ban_handles = Vec::new();
     for (idx, repo) in ban_repos.iter().enumerate() {
         ban_handles.push(cluster.register_strict(idx, "bans", repo.clone()).unwrap());
@@ -534,6 +793,15 @@ async fn strict_concurrent_proposers_total_order() {
     })
     .await;
     assert!(warmed, "all nodes must apply the warm-up proposal");
+    let warm_cuts = [
+        handles[0].terminal_cut_for_test().await,
+        handles[1].terminal_cut_for_test().await,
+        handles[2].terminal_cut_for_test().await,
+    ];
+    assert!(
+        warm_cuts.windows(2).all(|pair| pair[0] == pair[1]),
+        "the shared v8 bootstrap lineage must be exact before concurrent work: {warm_cuts:?}"
+    );
 
     let tasks: Vec<_> = [(handles[0].clone(), 1000), (handles[1].clone(), 2000)]
         .into_iter()
@@ -555,8 +823,13 @@ async fn strict_concurrent_proposers_total_order() {
             .expect("concurrent proposer hung")
             .expect("concurrent proposer panicked");
         if let Err(error) = result {
+            let cuts = [
+                handles[0].terminal_cut_for_test().await,
+                handles[1].terminal_cut_for_test().await,
+                handles[2].terminal_cut_for_test().await,
+            ];
             panic!(
-                "concurrent proposer {base} failed: {error:?}, node10={:?}, node20={:?}, node30={:?}",
+                "concurrent proposer {base} failed: {error:?}, cuts={cuts:?}, node10={:?}, node20={:?}, node30={:?}",
                 handles[0].debug_state(),
                 handles[1].debug_state(),
                 handles[2].debug_state(),
@@ -568,7 +841,23 @@ async fn strict_concurrent_proposers_total_order() {
         repos.iter().all(|r| r.current_version() == 21)
     })
     .await;
-    assert!(ok, "all nodes must reach version 21");
+    if !ok {
+        let cuts = [
+            handles[0].terminal_cut_for_test().await,
+            handles[1].terminal_cut_for_test().await,
+            handles[2].terminal_cut_for_test().await,
+        ];
+        panic!(
+            "all nodes must reach version 21: versions={:?}, cuts={cuts:?}, node10={:?}, node20={:?}, node30={:?}",
+            repos
+                .iter()
+                .map(|repo| repo.current_version())
+                .collect::<Vec<_>>(),
+            handles[0].debug_state(),
+            handles[1].debug_state(),
+            handles[2].debug_state(),
+        );
+    }
 
     let log0 = repos[0].log();
     assert_eq!(
@@ -585,6 +874,32 @@ async fn strict_concurrent_proposers_total_order() {
         );
     }
 
+    let terminal_convergence = timeout(Duration::from_secs(60), async {
+        loop {
+            let first = handles[0].terminal_cut_for_test().await;
+            let second = handles[1].terminal_cut_for_test().await;
+            let third = handles[2].terminal_cut_for_test().await;
+            if first == second && second == third {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    if terminal_convergence.is_err() {
+        let cuts = [
+            handles[0].terminal_cut_for_test().await,
+            handles[1].terminal_cut_for_test().await,
+            handles[2].terminal_cut_for_test().await,
+        ];
+        panic!(
+            "quiescent replicas did not converge on one exact terminal cut: cuts={cuts:?}, node10={:?}, node20={:?}, node30={:?}",
+            handles[0].debug_state(),
+            handles[1].debug_state(),
+            handles[2].debug_state(),
+        );
+    }
+
     cluster.shutdown().await;
 }
 
@@ -598,7 +913,10 @@ async fn strict_route_change_between_propose_ack_and_commit_converges() {
         .with_propose_ttl(Duration::from_secs(30))
         .with_pending_propose_ttl(Duration::from_secs(45));
     let cluster = ReplCluster::build_full_mesh_fast_failure_with_config(&[1, 2, 3, 4], cfg).await;
-    let repos: Vec<Arc<CountingStrictRepo>> = (0..4).map(|_| CountingStrictRepo::new()).collect();
+    activate_mandatory_strict_protocol(&cluster).await;
+    seed_shared_empty_terminal_lineage(&cluster, "channels-route-change", 4);
+    let repos: Vec<Arc<CountingStrictRepo>> =
+        (0..4).map(|_| CountingStrictRepo::new_current()).collect();
     let mut handles = Vec::new();
     for (idx, repo) in repos.iter().enumerate() {
         handles.push(
@@ -832,8 +1150,11 @@ async fn strict_rejoining_peer_does_not_pin_buffered_delivery() {
 async fn strict_same_id_restart_clears_old_pending_proposal() {
     let cfg = ReplicationConfig::default()
         .with_propose_ttl(Duration::from_secs(20))
-        .with_pending_propose_ttl(Duration::from_secs(30));
+        .with_pending_propose_ttl(Duration::from_secs(30))
+        .with_strict_bootstrap_retry_interval(Duration::from_millis(50));
     let mut cluster = ReplCluster::build_full_mesh_with_config(&[1, 2, 3], cfg.clone()).await;
+    activate_mandatory_strict_protocol(&cluster).await;
+    seed_shared_empty_terminal_lineage(&cluster, "channels-restart", 3);
     let repos: Vec<Arc<CountingStrictRepo>> =
         (0..3).map(|_| CountingStrictRepo::new_current()).collect();
     let mut handles = Vec::new();
@@ -940,8 +1261,9 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
         cluster.manager(0).strict_protocol_version(),
         cluster.manager(1).strict_protocol_version()
     );
-    assert!(
-        wait_until(Duration::from_secs(8), || {
+    let admission_started_at = Instant::now();
+    let admission_converged = loop {
+        let converged = {
             let peers_ready = handles.iter().all(|handle| {
                 let state = handle.debug_state();
                 !state.election_pending()
@@ -957,8 +1279,18 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
                 && restarted.admitted_peers() == 2
                 && restarted.awaiting_local_cut_peers() == 0
                 && restarted.awaiting_peer_proof_peers() == 0
-        })
-        .await,
+        };
+        if converged || admission_started_at.elapsed() >= Duration::from_secs(8) {
+            break converged;
+        }
+        for handle in &handles {
+            handle.drive_admission_probes_for_test().await;
+        }
+        new_handle.drive_admission_probes_for_test().await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(
+        admission_converged,
         "restarted strict admission did not converge: node2={:?}, node3={:?}, restarted={:?}",
         handles[0].debug_state(),
         handles[1].debug_state(),
@@ -1011,6 +1343,8 @@ async fn strict_same_id_restart_clears_old_pending_proposal() {
 async fn strict_late_join_catches_up_via_log() {
     use std::collections::HashSet;
     let cluster = ReplCluster::build_full_mesh_fast_failure(&[1, 2, 3]).await;
+    activate_mandatory_strict_protocol(&cluster).await;
+    seed_shared_empty_terminal_lineage(&cluster, "channels", 3);
 
     // Partition C from {A, B} so A and B's `alive_members` drops C.
     cluster.cluster.partition(&[1, 2], &[3]);
@@ -1067,17 +1401,531 @@ async fn strict_late_join_catches_up_via_log() {
 
     // Now register on C — catchup_bootstrap fires with current_version=0.
     let repo_c = CountingStrictRepo::new_current();
-    let _h_c = cluster
+    let h_c = cluster
         .register_strict(2, "channels", repo_c.clone())
         .unwrap();
 
     let ok = wait_until(Duration::from_secs(10), || repo_c.current_version() == 10).await;
-    assert!(ok, "late join must catch up to version 10");
+    assert!(
+        ok,
+        "late join must catch up to version 10: versions={:?}, states={:?}",
+        [
+            repo_a.current_version(),
+            repo_b.current_version(),
+            repo_c.current_version()
+        ],
+        [h_a.debug_state(), h_b.debug_state(), h_c.debug_state()]
+    );
     assert_eq!(
         repo_c.log(),
         repo_a.log(),
         "late-joined replica must have identical log to peers"
     );
+    cluster.shutdown().await;
+}
+
+/// A repository head that is already current must not allow a fresh foreign
+/// terminal lineage to bypass v8 recovery. Duplicate clock/admission traffic
+/// remains enabled throughout recovery to prove that repeated triggers
+/// coalesce instead of restarting the active attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_v8_current_repository_with_foreign_fresh_journal_recovers() {
+    assert!(
+        STRICT_PROTOCOL_VERSION_CURRENT >= STRICT_PROTOCOL_VERSION_V8,
+        "this scenario requires strict recovery v8"
+    );
+
+    let cfg = ReplicationConfig::default()
+        .with_delivery_tick_interval(Duration::from_millis(25))
+        .with_fallback_clock_tick(Duration::from_millis(50))
+        .with_min_clock_tick(Duration::from_millis(25))
+        .with_max_clock_tick(Duration::from_millis(100))
+        .with_strict_bootstrap_retry_interval(Duration::from_millis(50));
+    let cluster = ReplCluster::build_full_mesh_with_config(&[1, 2, 3], cfg).await;
+
+    // The two witnesses are established replicas of one healthy lineage.
+    // Seed that shared empty lineage before either runtime owns its journal.
+    let witness_cut = {
+        let mut journal =
+            TerminalJournal::load(Some(cluster.persistence_dir(0).to_path_buf()), "channels")
+                .expect("create healthy witness terminal journal");
+        journal
+            .checkpoint(0)
+            .expect("persist healthy witness generation-zero lineage");
+        assert_eq!(journal.terminal_cut().generation(), 0);
+        journal.terminal_cut()
+    };
+    let witness_b_path = strict_terminal_journal_path(cluster.persistence_dir(1), "channels");
+    std::fs::create_dir_all(
+        witness_b_path
+            .parent()
+            .expect("witness journal parent directory"),
+    )
+    .expect("create second witness journal directory");
+    std::fs::copy(
+        strict_terminal_journal_path(cluster.persistence_dir(0), "channels"),
+        witness_b_path,
+    )
+    .expect("seed second witness with the healthy terminal lineage");
+
+    let foreign_fresh_cut = {
+        let mut journal =
+            TerminalJournal::load(Some(cluster.persistence_dir(2).to_path_buf()), "channels")
+                .expect("create fresh foreign terminal journal");
+        journal
+            .checkpoint(0)
+            .expect("persist foreign generation-zero lineage");
+        journal.terminal_cut()
+    };
+    assert_eq!(foreign_fresh_cut.generation(), 0);
+    assert_ne!(foreign_fresh_cut.journal_id(), witness_cut.journal_id());
+
+    // All participants register the topic in one activation pass. The fresh
+    // node's repository is already equal to both witnesses (the empty current
+    // envelope), while its pre-created generation-zero terminal lineage is
+    // foreign. This avoids relying on a pre-v8 partial-participant window.
+    let repo_a = CountingStrictRepo::new_current();
+    let repo_b = CountingStrictRepo::new_current();
+    let repo_c = CountingStrictRepo::new_current();
+    let handle_a = cluster
+        .register_strict(0, "channels", repo_a.clone())
+        .unwrap();
+    let handle_b = cluster
+        .register_strict(1, "channels", repo_b.clone())
+        .unwrap();
+    assert!(counting_strict_repository_envelopes_match(&repo_c, &repo_a));
+
+    // Clock ticks are ordinary strict Data frames in the chaos classifier.
+    // Duplicating every inbound tick keeps admission/fence triggers arriving
+    // for the full duration of recovery without manufacturing private runtime
+    // callbacks in the test.
+    let fresh_node = cluster.cluster.node(3);
+    for witness in [1, 2] {
+        fresh_node.chaos.set_duplication(
+            FaultSelector::new(witness, TransportKind::Tcp, MessageType::Data),
+            1,
+        );
+    }
+
+    let handle_c = cluster
+        .register_strict(2, "channels", repo_c.clone())
+        .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(45), || {
+            let cuts = (0..3)
+                .map(|index| read_strict_terminal_cut(cluster.persistence_dir(index), "channels"))
+                .collect::<Vec<_>>();
+            repo_c.current_version() == 0
+                && counting_strict_repository_envelopes_match(&repo_c, &repo_a)
+                && cuts[0].is_some()
+                && cuts.windows(2).all(|pair| pair[0] == pair[1])
+                && cuts[2] != Some(foreign_fresh_cut)
+                && handle_c.debug_state().admitted_peers() == 2
+        })
+        .await,
+        "fresh node did not recover the exact repository envelope and four-field terminal cut: versions={:?}, cuts={:?}, states={:?}",
+        [
+            repo_a.current_version(),
+            repo_b.current_version(),
+            repo_c.current_version()
+        ],
+        (0..3)
+            .map(|index| read_strict_terminal_cut(cluster.persistence_dir(index), "channels"))
+            .collect::<Vec<_>>(),
+        [
+            handle_a.debug_state(),
+            handle_b.debug_state(),
+            handle_c.debug_state()
+        ]
+    );
+
+    let recovered_version = timeout(Duration::from_secs(20), handle_c.propose(42))
+        .await
+        .expect("post-recovery strict write timed out")
+        .expect("post-recovery strict write failed");
+    assert_eq!(recovered_version, 1);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            repo_a.current_version() == recovered_version
+                && repo_b.current_version() == recovered_version
+                && repo_c.current_version() == recovered_version
+                && counting_strict_repository_envelopes_match(&repo_a, &repo_b)
+                && counting_strict_repository_envelopes_match(&repo_a, &repo_c)
+                && (0..3)
+                    .map(|index| {
+                        read_strict_terminal_cut(cluster.persistence_dir(index), "channels")
+                    })
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .all(|cuts| cuts[0].is_some() && cuts[0] == cuts[1])
+        })
+        .await,
+        "post-recovery strict write did not preserve exact convergence"
+    );
+
+    cluster.shutdown().await;
+}
+
+/// A recovery attempt must remain fenced while authenticated witness
+/// attestations are unavailable, then converge without a new external trigger
+/// after quorum responses become available.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_v8_no_quorum_then_witness_restoration_recovers() {
+    const TOPIC: &str = "channels-v8-no-quorum";
+    let cluster =
+        ReplCluster::build_full_mesh_with_config(&[1, 2, 3, 4], strict_v8_recovery_config()).await;
+    let (mut repos, mut handles, witness_cut) = establish_v8_witnesses(&cluster, TOPIC, 3).await;
+    let (fresh_repo, foreign_cut) = prepare_current_repository_with_foreign_journal(
+        &cluster,
+        TOPIC,
+        3,
+        &repos[0],
+        &witness_cut,
+    )
+    .await;
+
+    // Remove every witness route only after the four-participant capability
+    // floor is established. The attempt therefore freezes a denominator of
+    // three external witnesses but cannot receive an attestation through an
+    // alternate localhost route.
+    cluster.cluster.partition(&[1, 2, 3], &[4]);
+    let fresh_handle = cluster
+        .register_strict(3, TOPIC, fresh_repo.clone())
+        .expect("register no-quorum recovering node");
+    let _ = fresh_handle.request_recovery_for_test();
+
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            let state = fresh_handle.debug_state();
+            state.recovery_attempt_id().is_some()
+                && !state.recovery_healthy()
+                && state.recovery_frozen_denominator() == 3
+        })
+        .await,
+        "recovering node did not remain fenced without fast quorum: {:?}",
+        fresh_handle.debug_state()
+    );
+    assert_eq!(
+        read_strict_terminal_cut(cluster.persistence_dir(3), TOPIC),
+        Some(foreign_cut),
+        "uncertified recovery mutated the foreign journal"
+    );
+    assert_eq!(fresh_repo.current_version(), repos[0].current_version());
+
+    cluster.cluster.heal_partition(&[1, 2, 3], &[4]);
+    repos.push(fresh_repo);
+    handles.push(fresh_handle);
+    assert!(
+        wait_until(Duration::from_secs(45), || {
+            strict_v8_recovery_is_exact(&cluster, TOPIC, &repos, &handles)
+        })
+        .await,
+        "recovery did not resume after witness restoration: states={:?}",
+        handles
+            .iter()
+            .map(|handle| handle.debug_state())
+            .collect::<Vec<_>>()
+    );
+
+    cluster.shutdown().await;
+}
+
+/// If the certified donor advances after attesting but before serving the
+/// exact cursor-zero checkpoint, TARGET_MOVED must force recertification. The
+/// recovering node may adopt only the newly certified repository envelope and
+/// terminal cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_v8_target_advancement_during_recovery_recertifies() {
+    const TOPIC: &str = "channels-v8-target-moved";
+    let cluster =
+        ReplCluster::build_full_mesh_with_config(&[1, 2, 3, 4], strict_v8_recovery_config()).await;
+    let (mut repos, mut handles, witness_cut) = establish_v8_witnesses(&cluster, TOPIC, 3).await;
+    let (fresh_repo, foreign_cut) = prepare_current_repository_with_foreign_journal(
+        &cluster,
+        TOPIC,
+        3,
+        &repos[0],
+        &witness_cut,
+    )
+    .await;
+
+    let mut terminal_requests = Vec::new();
+    for receiver in 1u16..=3 {
+        for physical_sender in 1u16..=4 {
+            let selector = FaultSelector::new(
+                physical_sender,
+                TransportKind::Tcp,
+                MessageType::StrictRecoveryTerminalReq,
+            );
+            cluster.cluster.node(receiver).chaos.hold(selector);
+            terminal_requests.push((receiver, selector));
+        }
+    }
+    for physical_sender in 1u16..=4 {
+        let selector = FaultSelector::new(
+            physical_sender,
+            TransportKind::Tcp,
+            MessageType::StrictRecoveryTerminalPage,
+        );
+        cluster.cluster.node(4).chaos.hold(selector);
+        terminal_requests.push((4, selector));
+    }
+    for physical_sender in 1u16..=4 {
+        let selector = FaultSelector::new(
+            physical_sender,
+            TransportKind::Tcp,
+            MessageType::StrictRecoveryTerminalPage,
+        );
+        cluster.cluster.node(4).chaos.hold(selector);
+        terminal_requests.push((4, selector));
+    }
+    let fresh_handle = cluster
+        .register_strict(3, TOPIC, fresh_repo.clone())
+        .expect("register target-moved recovering node");
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            fresh_handle.debug_state().recovery_phase() == "fetching_terminal_checkpoint"
+        })
+        .await,
+        "recovery did not reach the held exact-checkpoint request: {:?}",
+        fresh_handle.debug_state()
+    );
+    assert_eq!(
+        read_strict_terminal_cut(cluster.persistence_dir(3), TOPIC),
+        Some(foreign_cut)
+    );
+
+    let advanced_version = 1;
+    for handle in &handles {
+        handle
+            .apply_committed_and_publish_head_for_test(advanced_version, 202)
+            .await;
+    }
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            repos
+                .iter()
+                .all(|repo| repo.current_version() == advanced_version)
+        })
+        .await,
+        "healthy target did not advance before releasing checkpoint request"
+    );
+    for (node_id, selector) in terminal_requests {
+        cluster.cluster.node(node_id).chaos.release(selector);
+    }
+
+    repos.push(fresh_repo);
+    handles.push(fresh_handle);
+    assert!(
+        wait_until(Duration::from_secs(45), || {
+            strict_v8_recovery_is_exact(&cluster, TOPIC, &repos, &handles)
+                && repos
+                    .iter()
+                    .all(|repo| repo.current_version() == advanced_version)
+        })
+        .await,
+        "TARGET_MOVED did not recertify the advanced exact target: versions={:?}, states={:?}",
+        repos
+            .iter()
+            .map(|repo| repo.current_version())
+            .collect::<Vec<_>>(),
+        handles
+            .iter()
+            .map(|handle| handle.debug_state())
+            .collect::<Vec<_>>()
+    );
+
+    cluster.shutdown().await;
+}
+
+/// Losing the selected donor's incarnation during checkpoint transfer must
+/// retain the logical certificate and deterministically continue with another
+/// certified witness. Healing the route afterwards must leave all replicas on
+/// the same exact representation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_v8_donor_route_loss_fails_over_to_certified_witness() {
+    const TOPIC: &str = "channels-v8-donor-route-loss";
+    let cluster = ReplCluster::build_full_mesh_fast_failure_with_config(
+        &[1, 2, 3, 4],
+        strict_v8_recovery_config(),
+    )
+    .await;
+    let (mut repos, mut handles, witness_cut) = establish_v8_witnesses(&cluster, TOPIC, 3).await;
+    let (fresh_repo, _) = prepare_current_repository_with_foreign_journal(
+        &cluster,
+        TOPIC,
+        3,
+        &repos[0],
+        &witness_cut,
+    )
+    .await;
+
+    // Hold every physical route into every possible donor. This makes donor
+    // selection observable even on localhost, where an exact checkpoint can
+    // otherwise complete between two polling iterations.
+    let mut terminal_requests = Vec::new();
+    for receiver in 1u16..=3 {
+        for physical_sender in 1u16..=4 {
+            let selector = FaultSelector::new(
+                physical_sender,
+                TransportKind::Tcp,
+                MessageType::StrictRecoveryTerminalReq,
+            );
+            cluster.cluster.node(receiver).chaos.hold(selector);
+            terminal_requests.push((receiver, selector));
+        }
+    }
+    // Also hold every checkpoint page at the requester. A redundant request
+    // can already be queued below a donor's inbound chaos filter when the
+    // test installs its request barriers; the response barrier makes the
+    // observable FetchingTerminalCheckpoint boundary deterministic even on
+    // localhost without changing the recovery protocol's timing.
+    for physical_sender in 1u16..=4 {
+        let selector = FaultSelector::new(
+            physical_sender,
+            TransportKind::Tcp,
+            MessageType::StrictRecoveryTerminalPage,
+        );
+        cluster.cluster.node(4).chaos.hold(selector);
+        terminal_requests.push((4, selector));
+    }
+    let fresh_handle = cluster
+        .register_strict(3, TOPIC, fresh_repo.clone())
+        .expect("register donor-loss recovering node");
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            let state = fresh_handle.debug_state();
+            state.recovery_phase() == "fetching_terminal_checkpoint"
+                && state.recovery_donor().is_some()
+        })
+        .await,
+        "recovery did not select and request from a certified donor: {:?}",
+        fresh_handle.debug_state()
+    );
+    let selected = u16::try_from(
+        fresh_handle
+            .debug_state()
+            .recovery_donor()
+            .expect("selected donor request")
+            .0,
+    )
+    .expect("selected donor node id");
+
+    let survivors = [1u16, 2, 3, 4]
+        .into_iter()
+        .filter(|node_id| *node_id != selected)
+        .collect::<Vec<_>>();
+    cluster.cluster.partition(&[selected], &survivors);
+    for (node_id, selector) in terminal_requests {
+        cluster.cluster.node(node_id).chaos.release(selector);
+    }
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            !cluster
+                .cluster
+                .node(4)
+                .overlay
+                .alive_members()
+                .contains(&selected)
+        })
+        .await,
+        "recovering node did not observe selected donor {selected} as lost"
+    );
+    assert!(
+        wait_until(Duration::from_secs(45), || {
+            fresh_handle.debug_state().recovery_healthy()
+                && counting_strict_repository_envelopes_match(&repos[0], &fresh_repo)
+                && read_strict_terminal_cut(cluster.persistence_dir(3), TOPIC)
+                    == read_strict_terminal_cut(cluster.persistence_dir(0), TOPIC)
+        })
+        .await,
+        "recovery did not fail over from donor {selected}: {:?}",
+        fresh_handle.debug_state()
+    );
+
+    cluster.cluster.heal_partition(&[selected], &survivors);
+    assert!(
+        wait_for_full_routing(&cluster.cluster, Duration::from_secs(12)).await,
+        "donor route did not heal"
+    );
+    repos.push(fresh_repo);
+    handles.push(fresh_handle);
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            strict_v8_recovery_is_exact(&cluster, TOPIC, &repos, &handles)
+        })
+        .await,
+        "healed donor did not retain exact recovered representation"
+    );
+
+    cluster.shutdown().await;
+}
+
+/// Two foreign fresh nodes may recover simultaneously as long as the frozen
+/// participant set contains three healthy witnesses. Neither recovering node
+/// is needed as a witness for the other's certificate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn strict_v8_two_concurrent_fresh_nodes_recover_independently() {
+    const TOPIC: &str = "channels-v8-concurrent-fresh";
+    let cluster =
+        ReplCluster::build_full_mesh_with_config(&[1, 2, 3, 4, 5], strict_v8_recovery_config())
+            .await;
+    let (mut repos, mut handles, witness_cut) = establish_v8_witnesses(&cluster, TOPIC, 3).await;
+    let (fresh_four, foreign_four) = prepare_current_repository_with_foreign_journal(
+        &cluster,
+        TOPIC,
+        3,
+        &repos[0],
+        &witness_cut,
+    )
+    .await;
+    let (fresh_five, foreign_five) = prepare_current_repository_with_foreign_journal(
+        &cluster,
+        TOPIC,
+        4,
+        &repos[0],
+        &witness_cut,
+    )
+    .await;
+    assert_ne!(foreign_four.journal_id(), foreign_five.journal_id());
+
+    let handle_four = cluster
+        .register_strict(3, TOPIC, fresh_four.clone())
+        .expect("register first concurrent fresh node");
+    let handle_five = cluster
+        .register_strict(4, TOPIC, fresh_five.clone())
+        .expect("register second concurrent fresh node");
+    repos.extend([fresh_four, fresh_five]);
+    handles.extend([handle_four, handle_five]);
+
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            strict_v8_recovery_is_exact(&cluster, TOPIC, &repos, &handles)
+        })
+        .await,
+        "concurrent fresh nodes did not independently converge: states={:?}",
+        handles
+            .iter()
+            .map(|handle| handle.debug_state())
+            .collect::<Vec<_>>()
+    );
+
+    let post_recovery_version = handles[4]
+        .propose(402)
+        .await
+        .expect("post-concurrent-recovery proposal");
+    assert_eq!(post_recovery_version, 1);
+    assert!(
+        wait_until(Duration::from_secs(12), || {
+            repos
+                .iter()
+                .all(|repo| repo.current_version() == post_recovery_version)
+        })
+        .await,
+        "post-recovery write did not reach all concurrent replicas"
+    );
+
     cluster.shutdown().await;
 }
 
@@ -1174,7 +2022,10 @@ async fn strict_quorum_lost_on_partition() {
         .with_propose_ttl(Duration::from_secs(30))
         .with_pending_propose_ttl(Duration::from_secs(45));
     let cluster = ReplCluster::build_full_mesh_fast_failure_with_config(&[1, 2, 3, 4], cfg).await;
-    let repos: Vec<Arc<CountingStrictRepo>> = (0..4).map(|_| CountingStrictRepo::new()).collect();
+    activate_mandatory_strict_protocol(&cluster).await;
+    seed_shared_empty_terminal_lineage(&cluster, "channels", 4);
+    let repos: Vec<Arc<CountingStrictRepo>> =
+        (0..4).map(|_| CountingStrictRepo::new_current()).collect();
     let mut handles = Vec::new();
     for (i, repo) in repos.iter().enumerate() {
         handles.push(
@@ -1577,7 +2428,10 @@ async fn strict_quorum_never_forms_times_out() {
 #[tokio::test]
 async fn strict_unreachable_node_during_replication_survives() {
     let cluster = ReplCluster::build_full_mesh(&[1, 2, 3, 4]).await;
-    let repos: Vec<Arc<CountingStrictRepo>> = (0..4).map(|_| CountingStrictRepo::new()).collect();
+    activate_mandatory_strict_protocol(&cluster).await;
+    seed_shared_empty_terminal_lineage(&cluster, "channels", 4);
+    let repos: Vec<Arc<CountingStrictRepo>> =
+        (0..4).map(|_| CountingStrictRepo::new_current()).collect();
     let mut handles = Vec::new();
     for (i, repo) in repos.iter().enumerate() {
         handles.push(
@@ -1651,8 +2505,12 @@ async fn strict_replication_survives_random_cross_node_link_failures() {
         .with_propose_ttl(Duration::from_secs(20))
         .with_pending_propose_ttl(Duration::from_secs(40));
     let cluster = ReplCluster::build_full_mesh_with_config(&node_ids, repl_cfg).await;
-    let repos: Vec<Arc<CountingStrictRepo>> =
-        node_ids.iter().map(|_| CountingStrictRepo::new()).collect();
+    activate_mandatory_strict_protocol(&cluster).await;
+    seed_shared_empty_terminal_lineage(&cluster, "channels", node_ids.len());
+    let repos: Vec<Arc<CountingStrictRepo>> = node_ids
+        .iter()
+        .map(|_| CountingStrictRepo::new_current())
+        .collect();
     let mut handles = Vec::new();
     for (i, repo) in repos.iter().enumerate() {
         handles.push(

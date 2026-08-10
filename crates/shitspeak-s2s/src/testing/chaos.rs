@@ -64,6 +64,14 @@ pub enum MessageType {
     StrictTerminalSyncReq,
     StrictTerminalSyncPage,
     StrictTerminalSyncAck,
+    StrictRecoveryProbeReq,
+    StrictRecoveryProbeResp,
+    StrictRecoveryTerminalReq,
+    StrictRecoveryTerminalPage,
+    StrictRecoveryTerminalAck,
+    StrictRecoverySnapshotReq,
+    StrictRecoverySnapshotPage,
+    StrictRecoverySnapshotAck,
     /// Compatibility name retained for existing scenarios.
     StrictProposeAck,
 }
@@ -130,6 +138,14 @@ fn classify_strict_body(body: &crate::replications::proto::StrictBody) -> Messag
         StrictBody::TerminalSyncReq(_) => MessageType::StrictTerminalSyncReq,
         StrictBody::TerminalSyncPage(_) => MessageType::StrictTerminalSyncPage,
         StrictBody::TerminalSyncAck(_) => MessageType::StrictTerminalSyncAck,
+        StrictBody::RecoveryProbeReq(_) => MessageType::StrictRecoveryProbeReq,
+        StrictBody::RecoveryProbeResp(_) => MessageType::StrictRecoveryProbeResp,
+        StrictBody::RecoveryTerminalReq(_) => MessageType::StrictRecoveryTerminalReq,
+        StrictBody::RecoveryTerminalPage(_) => MessageType::StrictRecoveryTerminalPage,
+        StrictBody::RecoveryTerminalAck(_) => MessageType::StrictRecoveryTerminalAck,
+        StrictBody::RecoverySnapshotReq(_) => MessageType::StrictRecoverySnapshotReq,
+        StrictBody::RecoverySnapshotPage(_) => MessageType::StrictRecoverySnapshotPage,
+        StrictBody::RecoverySnapshotAck(_) => MessageType::StrictRecoverySnapshotAck,
         _ => MessageType::Data,
     }
 }
@@ -677,8 +693,10 @@ mod tests {
     use super::*;
     use crate::replications::proto::{
         StrictBody, StrictClockProbeReq, StrictClockProbeResp, StrictHistoryProbeReq,
-        StrictHistoryProbeResp, StrictTerminalSyncAck, StrictTerminalSyncPage,
-        StrictTerminalSyncReq,
+        StrictHistoryProbeResp, StrictRecoveryProbeReq, StrictRecoveryProbeResp,
+        StrictRecoverySnapshotAck, StrictRecoverySnapshotPage, StrictRecoverySnapshotReq,
+        StrictRecoveryTerminalAck, StrictRecoveryTerminalPage, StrictRecoveryTerminalReq,
+        StrictTerminalSyncAck, StrictTerminalSyncPage, StrictTerminalSyncReq,
     };
     use shitspeak_s2s_transport::TransportKind;
 
@@ -712,6 +730,48 @@ mod tests {
             (
                 StrictBody::TerminalSyncAck(StrictTerminalSyncAck::default()),
                 MessageType::StrictTerminalSyncAck,
+            ),
+        ];
+
+        for (body, expected) in cases {
+            assert_eq!(classify_strict_body(&body), expected);
+        }
+    }
+
+    #[test]
+    fn classifies_v8_strict_recovery_bodies_independently() {
+        let cases = [
+            (
+                StrictBody::RecoveryProbeReq(StrictRecoveryProbeReq::default()),
+                MessageType::StrictRecoveryProbeReq,
+            ),
+            (
+                StrictBody::RecoveryProbeResp(StrictRecoveryProbeResp::default()),
+                MessageType::StrictRecoveryProbeResp,
+            ),
+            (
+                StrictBody::RecoveryTerminalReq(StrictRecoveryTerminalReq::default()),
+                MessageType::StrictRecoveryTerminalReq,
+            ),
+            (
+                StrictBody::RecoveryTerminalPage(StrictRecoveryTerminalPage::default()),
+                MessageType::StrictRecoveryTerminalPage,
+            ),
+            (
+                StrictBody::RecoveryTerminalAck(StrictRecoveryTerminalAck::default()),
+                MessageType::StrictRecoveryTerminalAck,
+            ),
+            (
+                StrictBody::RecoverySnapshotReq(StrictRecoverySnapshotReq::default()),
+                MessageType::StrictRecoverySnapshotReq,
+            ),
+            (
+                StrictBody::RecoverySnapshotPage(StrictRecoverySnapshotPage::default()),
+                MessageType::StrictRecoverySnapshotPage,
+            ),
+            (
+                StrictBody::RecoverySnapshotAck(StrictRecoverySnapshotAck::default()),
+                MessageType::StrictRecoverySnapshotAck,
             ),
         ];
 

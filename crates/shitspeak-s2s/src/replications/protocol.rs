@@ -24,9 +24,6 @@ pub(crate) const STRICT_PROTOCOL_VERSION_V2: u32 = 2;
 pub(crate) const STRICT_PROTOCOL_VERSION_V3: u32 = 3;
 /// Explicit incarnation-bound durable repository-head acknowledgement.
 pub(crate) const STRICT_PROTOCOL_VERSION_V4: u32 = 4;
-/// Old advertised participant capabilities predate durable repository-head
-/// acknowledgement and are no longer accepted as strict participants.
-pub(crate) const STRICT_PROTOCOL_VERSION_MINIMUM_SUPPORTED: u32 = STRICT_PROTOCOL_VERSION_V4;
 /// Replication-owned delivery checkpoints and bounded terminal-journal epochs.
 pub(crate) const STRICT_PROTOCOL_VERSION_V5: u32 = 5;
 /// Requester-clock propagation in pairwise clock probes.
@@ -34,16 +31,22 @@ pub(crate) const STRICT_PROTOCOL_VERSION_V6: u32 = 6;
 /// A repository snapshot envelope bound to the exact terminal cut elected for
 /// a foreign checkpoint replacement.
 pub(crate) const STRICT_PROTOCOL_VERSION_V7: u32 = 7;
+/// Topic-scoped, quorum-certified foreign-lineage recovery.
+pub(crate) const STRICT_PROTOCOL_VERSION_V8: u32 = 8;
+/// Recovery v8 is a no-rollback upgrade. This binary unconditionally rejects
+/// earlier strict-participant capabilities; no configuration gate can restore
+/// a pre-v8 recovery path.
+pub(crate) const STRICT_PROTOCOL_VERSION_MINIMUM_SUPPORTED: u32 = STRICT_PROTOCOL_VERSION_V8;
 /// Maximum strict participant capability advertised by this binary.
-pub(crate) const STRICT_PROTOCOL_VERSION_CURRENT: u32 = STRICT_PROTOCOL_VERSION_V7;
+pub(crate) const STRICT_PROTOCOL_VERSION_CURRENT: u32 = STRICT_PROTOCOL_VERSION_V8;
 
 pub(crate) fn strict_participant_version_supported(version: u32) -> bool {
     version >= STRICT_PROTOCOL_VERSION_MINIMUM_SUPPORTED
 }
 
-/// Gate requester-clock semantics on the cumulative cluster floor and the
-/// requester's own advertisement. During a rolling v5/v6 upgrade every probe
-/// retains the legacy zero-clock behavior until all participants advertise v6.
+/// Validate requester-clock semantics against both advertised versions.
+/// Production only admits v8 participants; the lower-version branch remains a
+/// fail-closed decoder guard for malformed or directly injected traffic.
 pub(crate) fn clock_probe_requester_clock(
     negotiated_version: u32,
     requester_version: u32,
@@ -301,6 +304,18 @@ pub(crate) fn strict_protocol_snapshot(
     let members: Vec<ProtocolMember> = members.into_iter().collect();
     let negotiated_version = strict_protocol_floor(&members, local_participant_version);
 
+    // An unsupported local participant cannot originate or accept strict
+    // work. Unsupported remote participants are excluded below; making them
+    // a cluster-wide floor blocker would unnecessarily disable healthy v8
+    // topics. Recovery applies its stricter complete-participant check before
+    // it can certify a foreign lineage.
+    if negotiated_version < STRICT_PROTOCOL_VERSION_MINIMUM_SUPPORTED {
+        return StrictProtocolSnapshot {
+            negotiated_version: 0,
+            targets: Vec::new(),
+        };
+    }
+
     let mut targets: Vec<_> = members
         .iter()
         .copied()
@@ -323,33 +338,34 @@ pub(crate) fn strict_protocol_snapshot(
 }
 
 pub(crate) fn strict_protocol_floor(members: &[ProtocolMember], local_version: Option<u32>) -> u32 {
-    let local_version =
-        local_version.filter(|version| strict_participant_version_supported(*version));
+    if local_version.is_some_and(|version| !strict_participant_version_supported(version)) {
+        return 0;
+    }
     let mut floor = local_version.unwrap_or(u32::MAX);
     let mut found = local_version.is_some();
     for member in members.iter().copied() {
-        if member.reachable()
-            && member.strict_participant()
-            && strict_participant_version_supported(member.participant_version())
-        {
-            found = true;
-            floor = floor.min(member.participant_version());
+        if !member.strict_participant() {
+            continue;
         }
+        if !strict_participant_version_supported(member.participant_version()) {
+            continue;
+        }
+        found = true;
+        floor = floor.min(member.participant_version());
     }
     if found { floor } else { 0 }
 }
 
-/// Count reachable strict participants below the required cumulative
-/// protocol version. Nonparticipants are not replication blockers.
+/// Count known strict participants below the required cumulative protocol
+/// version. Unreachable participants remain blockers until membership records
+/// a definitive departure; nonparticipants are not replication blockers.
 pub(crate) fn unsupported_protocol_peers(
     members: impl IntoIterator<Item = ProtocolMember>,
     required_version: u32,
 ) -> usize {
     members
         .into_iter()
-        .filter(|member| member.reachable())
         .filter(|member| member.strict_participant())
-        .filter(|member| strict_participant_version_supported(member.participant_version()))
         .filter(|member| member.participant_version() < required_version)
         .count()
 }
@@ -380,7 +396,8 @@ mod tests {
         assert_eq!(STRICT_PROTOCOL_VERSION_V5, 5);
         assert_eq!(STRICT_PROTOCOL_VERSION_V6, 6);
         assert_eq!(STRICT_PROTOCOL_VERSION_V7, 7);
-        assert_eq!(STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V7);
+        assert_eq!(STRICT_PROTOCOL_VERSION_V8, 8);
+        assert_eq!(STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V8);
     }
 
     #[test]
@@ -519,12 +536,12 @@ mod tests {
     fn nonparticipant_forwarder_does_not_lower_strict_floor_or_join_targets() {
         let snapshot = strict_protocol_snapshot(
             [
-                member(1, true, STRICT_PROTOCOL_VERSION_V4),
+                member(1, true, STRICT_PROTOCOL_VERSION_V8),
                 member(2, false, 0),
             ],
-            Some(STRICT_PROTOCOL_VERSION_V4),
+            Some(STRICT_PROTOCOL_VERSION_V8),
         );
-        assert_eq!(snapshot.negotiated_version, STRICT_PROTOCOL_VERSION_V4);
+        assert_eq!(snapshot.negotiated_version, STRICT_PROTOCOL_VERSION_V8);
         assert_eq!(
             snapshot.targets,
             [StrictProtocolTarget {
@@ -535,39 +552,77 @@ mod tests {
     }
 
     #[test]
-    fn pre_v4_participants_are_excluded_from_the_floor_and_targets() {
+    fn pre_v8_remote_participant_is_excluded_without_lowering_the_v8_floor() {
         let snapshot = strict_protocol_snapshot(
             [
-                member(1, true, STRICT_PROTOCOL_VERSION_V3),
-                member(2, true, STRICT_PROTOCOL_VERSION_V4),
+                member(1, true, STRICT_PROTOCOL_VERSION_V7),
+                member(2, true, STRICT_PROTOCOL_VERSION_V8),
             ],
-            Some(STRICT_PROTOCOL_VERSION_V6),
+            Some(STRICT_PROTOCOL_VERSION_V8),
         );
 
-        assert_eq!(snapshot.negotiated_version, STRICT_PROTOCOL_VERSION_V4);
+        assert_eq!(snapshot.negotiated_version, STRICT_PROTOCOL_VERSION_V8);
         assert_eq!(
             snapshot.targets,
             [StrictProtocolTarget {
                 node: 2,
                 boot_epoch: 1
-            }],
-            "V1-V3 advertised capabilities are deprecated strict participants"
+            }]
         );
     }
 
     #[test]
-    fn pre_v4_local_advertisement_is_not_a_strict_participant() {
+    fn unreachable_pre_v8_participant_remains_a_recovery_blocker_only() {
         let snapshot = strict_protocol_snapshot(
-            [member(1, true, STRICT_PROTOCOL_VERSION_V3)],
-            Some(STRICT_PROTOCOL_VERSION_V3),
+            [
+                ProtocolMember::new(1, 1, false, true, STRICT_PROTOCOL_VERSION_V7),
+                member(2, true, STRICT_PROTOCOL_VERSION_V8),
+            ],
+            Some(STRICT_PROTOCOL_VERSION_V8),
+        );
+
+        assert_eq!(snapshot.negotiated_version, STRICT_PROTOCOL_VERSION_V8);
+        assert_eq!(
+            snapshot.targets,
+            [StrictProtocolTarget {
+                node: 2,
+                boot_epoch: 1
+            }]
+        );
+        assert_eq!(
+            unsupported_protocol_peers(
+                [ProtocolMember::new(
+                    1,
+                    1,
+                    false,
+                    true,
+                    STRICT_PROTOCOL_VERSION_V7,
+                )],
+                STRICT_PROTOCOL_VERSION_V8,
+            ),
+            1,
+        );
+    }
+
+    #[test]
+    fn pre_v8_local_advertisement_is_not_a_strict_participant() {
+        let snapshot = strict_protocol_snapshot(
+            [
+                member(1, true, STRICT_PROTOCOL_VERSION_V7),
+                member(2, true, STRICT_PROTOCOL_VERSION_V8),
+            ],
+            Some(STRICT_PROTOCOL_VERSION_V7),
         );
 
         assert_eq!(snapshot.negotiated_version, 0);
         assert!(snapshot.targets.is_empty());
         assert_eq!(
             strict_protocol_floor(
-                &[member(1, true, STRICT_PROTOCOL_VERSION_V3)],
-                Some(STRICT_PROTOCOL_VERSION_V3),
+                &[
+                    member(1, true, STRICT_PROTOCOL_VERSION_V7),
+                    member(2, true, STRICT_PROTOCOL_VERSION_V8),
+                ],
+                Some(STRICT_PROTOCOL_VERSION_V7),
             ),
             0
         );
@@ -585,11 +640,11 @@ mod tests {
         assert_eq!(
             unsupported_protocol_peers(
                 [
-                    member(1, true, STRICT_PROTOCOL_VERSION_V3),
+                    member(1, true, STRICT_PROTOCOL_VERSION_V7),
                     member(2, false, 0),
-                    member(3, true, STRICT_PROTOCOL_VERSION_V4),
+                    member(3, true, STRICT_PROTOCOL_VERSION_V8),
                 ],
-                STRICT_PROTOCOL_VERSION_V5
+                STRICT_PROTOCOL_VERSION_V8
             ),
             1
         );

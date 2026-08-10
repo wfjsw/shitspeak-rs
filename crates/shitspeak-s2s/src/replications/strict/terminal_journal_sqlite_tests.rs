@@ -8,7 +8,12 @@ use super::{
     terminal_journal::{
         FrozenTarget, TerminalCut, TerminalJournal, TerminalJournalRecord, TerminalResolver,
     },
-    terminal_journal_sqlite::{SqliteTerminalJournalError, SqliteTerminalJournalStore},
+    terminal_journal_sqlite::{
+        DurableRecoveryArtifactIntent, DurableRecoveryAttempt, DurableRecoveryFailure,
+        DurableRecoveryParticipant, DurableRecoveryPhase, DurableRecoveryRepositoryMetadata,
+        DurableRecoveryTarget, DurableRecoveryWitness, SqliteTerminalJournalError,
+        SqliteTerminalJournalStore,
+    },
 };
 
 #[test]
@@ -27,7 +32,9 @@ fn schema_v1_migration_preserves_records_and_cut() {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "DROP TABLE journal_checkpoint;
+                "DROP TABLE strict_recovery_artifact;
+                 DROP TABLE strict_recovery_state;
+                 DROP TABLE journal_checkpoint;
                  DROP TABLE retired_origins;
                  PRAGMA user_version = 1;",
             )
@@ -52,7 +59,7 @@ fn schema_v1_migration_preserves_records_and_cut() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        5
     );
     for table in ["journal_checkpoint", "retired_origins"] {
         assert_eq!(
@@ -99,7 +106,9 @@ fn schema_v2_migration_preserves_checkpoint_and_defaults_install_complete() {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE journal_checkpoint RENAME TO journal_checkpoint_v3;
+                "DROP TABLE strict_recovery_artifact;
+                 DROP TABLE strict_recovery_state;
+                 ALTER TABLE journal_checkpoint RENAME TO journal_checkpoint_v3;
                  CREATE TABLE journal_checkpoint (
                      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                      epoch BLOB NOT NULL CHECK (length(epoch) = 8),
@@ -131,7 +140,7 @@ fn schema_v2_migration_preserves_checkpoint_and_defaults_install_complete() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        5
     );
     for column in [
         "repository_image_install_pending",
@@ -220,6 +229,395 @@ fn repository_image_install_marker_is_durable_and_coordinate_matched() {
         assert!(!pending);
         assert_eq!(freshness, 0);
     }
+}
+
+fn recovery_attempt(
+    phase: DurableRecoveryPhase,
+    attempt_id: [u8; 16],
+    cut: TerminalCut,
+) -> DurableRecoveryAttempt {
+    let first = DurableRecoveryParticipant::new(1, 101);
+    let second = DurableRecoveryParticipant::new(4, 404);
+    DurableRecoveryAttempt::new_with_electorate(
+        attempt_id,
+        phase,
+        4,
+        vec![1, 2, 3, 4],
+        Some(DurableRecoveryTarget::new(
+            9_540,
+            -17,
+            *cut.terminal_set_digest(),
+        )),
+        vec![
+            DurableRecoveryWitness::new(first, cut),
+            DurableRecoveryWitness::new(second, cut),
+        ],
+        vec![second, first],
+        Some(0),
+        Some(second),
+        Some(cut),
+        vec![DurableRecoveryFailure::new(first, "route-loss", 2)],
+    )
+    .unwrap()
+}
+
+#[test]
+fn schema_v5_is_activated_automatically() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("journal.sqlite3");
+    {
+        SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+    }
+
+    let connection = Connection::open(path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        5
+    );
+    for table in ["strict_recovery_state", "strict_recovery_artifact"] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn recovery_attempt_and_artifact_round_trip_exactly() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("journal.sqlite3");
+    let cut = TerminalCut::new([10; 16], 7, [11; 32], [12; 32]);
+    let attempt = recovery_attempt(DurableRecoveryPhase::Prepared, [13; 16], cut);
+    let artifact = DurableRecoveryArtifactIntent::new(
+        [13; 16],
+        root.path().join("recovery-stage.snapshot"),
+        [14; 32],
+        123_456,
+        DurableRecoveryRepositoryMetadata::new(9_540, -17),
+        cut,
+    );
+    {
+        let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        store.persist_recovery_attempt(&attempt).unwrap();
+        store.persist_recovery_artifact_intent(&artifact).unwrap();
+    }
+
+    let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+    assert_eq!(
+        store.load_recovery_attempt().unwrap(),
+        Some(attempt.clone())
+    );
+    assert_eq!(
+        store.load_recovery_artifact_intent().unwrap(),
+        Some(artifact.clone())
+    );
+    let first = attempt.witnesses()[0].participant();
+    assert_eq!(attempt.frozen_electorate(), &[1, 2, 3, 4]);
+    assert_eq!(first.node_id(), 1);
+    assert_eq!(first.boot_epoch(), 101);
+    assert_eq!(attempt.failure_history()[0].donor(), first);
+    assert_eq!(attempt.failure_history()[0].reason(), "route-loss");
+    assert_eq!(attempt.failure_history()[0].occurrences(), 2);
+    assert_eq!(attempt.current_donor_index(), Some(0));
+    assert_eq!(
+        attempt.current_donor(),
+        Some(DurableRecoveryParticipant::new(4, 404))
+    );
+    assert_eq!(attempt.representation_cut(), Some(cut));
+    assert_eq!(
+        artifact.staging_path(),
+        root.path().join("recovery-stage.snapshot")
+    );
+    assert_eq!(artifact.content_digest(), &[14; 32]);
+    assert_eq!(artifact.content_length(), 123_456);
+
+    assert!(store.clear_recovery_attempt(&[99; 16]).is_err());
+    assert_eq!(store.load_recovery_attempt().unwrap(), Some(attempt));
+    assert_eq!(
+        store.load_recovery_artifact_intent().unwrap(),
+        Some(artifact)
+    );
+    store.clear_recovery_attempt(&[13; 16]).unwrap();
+    assert!(store.load_recovery_attempt().unwrap().is_none());
+    assert!(store.load_recovery_artifact_intent().unwrap().is_none());
+}
+
+#[test]
+fn schema_v4_active_attempt_migrates_fail_closed_without_inventing_electorate() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("journal.sqlite3");
+    let cut = TerminalCut::new([15; 16], 3, [16; 32], [17; 32]);
+    let attempt = recovery_attempt(DurableRecoveryPhase::Prepared, [18; 16], cut);
+    {
+        let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        store.persist_recovery_attempt(&attempt).unwrap();
+    }
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE strict_recovery_state DROP COLUMN frozen_electorate;
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+    }
+
+    let store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+    let error = store
+        .load_recovery_attempt()
+        .expect_err("a v4 attempt has no trustworthy frozen electorate");
+    assert!(error.to_string().contains("frozen denominator"));
+}
+
+#[test]
+fn recovery_checkpoint_and_staged_intent_commit_together() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("journal.sqlite3");
+    let cut = TerminalCut::new([21; 16], 8, [22; 32], [23; 32]);
+    let attempt = recovery_attempt(DurableRecoveryPhase::Installing, [24; 16], cut);
+    let artifact = DurableRecoveryArtifactIntent::new(
+        [24; 16],
+        root.path().join("prepared.snapshot"),
+        [25; 32],
+        4_096,
+        DurableRecoveryRepositoryMetadata::new(9_540, -17),
+        cut,
+    );
+    let op_id = (26, 27);
+    let record = TerminalJournalRecord::default();
+    {
+        let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        store
+            .prepare_recovery_install(
+                [(&op_id, &record)],
+                9,
+                &BTreeMap::from([((1_u64 << 48) | 28, 29)]),
+                &cut,
+                &attempt,
+                &artifact,
+            )
+            .unwrap();
+    }
+
+    let store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+    let (records, loaded_cut, epoch, version, retired, pending, freshness) =
+        store.load().unwrap().unwrap().into_parts();
+    assert_eq!(records.get(&op_id), Some(&record));
+    assert_eq!(loaded_cut, cut);
+    assert_eq!(epoch, 9);
+    assert_eq!(version, 9_540);
+    assert_eq!(retired, BTreeMap::from([((1_u64 << 48) | 28, 29)]));
+    assert!(pending);
+    assert_eq!(freshness, -17);
+    assert_eq!(store.load_recovery_attempt().unwrap(), Some(attempt));
+    assert_eq!(
+        store.load_recovery_artifact_intent().unwrap(),
+        Some(artifact)
+    );
+}
+
+#[test]
+fn recovery_certificate_requires_sorted_distinct_witnesses_and_certified_donors() {
+    let cut = TerminalCut::new([31; 16], 0, [32; 32], [33; 32]);
+    let target = DurableRecoveryTarget::new(1, 2, [33; 32]);
+    let first = DurableRecoveryParticipant::new(1, 1);
+    let second = DurableRecoveryParticipant::new(2, 2);
+    assert!(
+        DurableRecoveryAttempt::new(
+            [34; 16],
+            DurableRecoveryPhase::Certifying,
+            2,
+            Some(target),
+            vec![
+                DurableRecoveryWitness::new(second, cut),
+                DurableRecoveryWitness::new(first, cut),
+            ],
+            vec![first],
+            Some(0),
+            Some(first),
+            Some(cut),
+            vec![],
+        )
+        .is_err()
+    );
+    assert!(
+        DurableRecoveryAttempt::new(
+            [34; 16],
+            DurableRecoveryPhase::Certifying,
+            2,
+            Some(target),
+            vec![DurableRecoveryWitness::new(first, cut)],
+            vec![second],
+            Some(0),
+            Some(second),
+            Some(cut),
+            vec![],
+        )
+        .is_err()
+    );
+    let restarted_first = DurableRecoveryParticipant::new(1, 2);
+    assert!(
+        DurableRecoveryAttempt::new_with_electorate(
+            [34; 16],
+            DurableRecoveryPhase::FetchingTerminalCheckpoint,
+            2,
+            vec![1, 2],
+            Some(target),
+            vec![
+                DurableRecoveryWitness::new(first, cut),
+                DurableRecoveryWitness::new(restarted_first, cut),
+            ],
+            vec![first],
+            Some(0),
+            Some(first),
+            Some(cut),
+            vec![],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn certifying_attempt_without_a_certificate_round_trips() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("journal.sqlite3");
+    let attempt = DurableRecoveryAttempt::new_certifying([35; 16], 4, vec![]).unwrap();
+    {
+        let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+        store.persist_recovery_attempt(&attempt).unwrap();
+    }
+
+    let store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+    let loaded = store.load_recovery_attempt().unwrap().unwrap();
+    assert_eq!(loaded, attempt);
+    assert_eq!(loaded.phase(), DurableRecoveryPhase::Certifying);
+    assert!(loaded.target().is_none());
+    assert!(loaded.witnesses().is_empty());
+    assert!(loaded.donor_order().is_empty());
+    assert_eq!(loaded.current_donor_index(), None);
+    assert_eq!(loaded.current_donor(), None);
+    assert_eq!(loaded.representation_cut(), None);
+}
+
+#[test]
+fn recovery_attempt_rejects_inconsistent_donor_progress() {
+    let cut = TerminalCut::new([36; 16], 1, [37; 32], [38; 32]);
+    let target = DurableRecoveryTarget::new(10, 11, [38; 32]);
+    let first = DurableRecoveryParticipant::new(1, 100);
+    let second = DurableRecoveryParticipant::new(2, 200);
+    let witnesses = vec![
+        DurableRecoveryWitness::new(first, cut),
+        DurableRecoveryWitness::new(second, cut),
+    ];
+    assert!(
+        DurableRecoveryAttempt::new(
+            [39; 16],
+            DurableRecoveryPhase::FetchingTerminalCheckpoint,
+            2,
+            Some(target),
+            witnesses.clone(),
+            vec![second, first],
+            Some(0),
+            Some(first),
+            Some(cut),
+            vec![],
+        )
+        .is_err()
+    );
+    assert!(
+        DurableRecoveryAttempt::new(
+            [39; 16],
+            DurableRecoveryPhase::FetchingTerminalCheckpoint,
+            2,
+            Some(target),
+            witnesses,
+            vec![second, first],
+            Some(2),
+            Some(first),
+            Some(cut),
+            vec![],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn finalize_recovery_install_is_exactly_guarded_and_atomic() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("journal.sqlite3");
+    let cut = TerminalCut::new([40; 16], 12, [41; 32], [42; 32]);
+    let installing = recovery_attempt(DurableRecoveryPhase::Installing, [43; 16], cut);
+    let verifying = recovery_attempt(DurableRecoveryPhase::Verifying, [43; 16], cut);
+    let metadata = DurableRecoveryRepositoryMetadata::new(9_540, -17);
+    let artifact = DurableRecoveryArtifactIntent::new(
+        [43; 16],
+        root.path().join("finalize.snapshot"),
+        [44; 32],
+        8_192,
+        metadata,
+        cut,
+    );
+    let mut store = SqliteTerminalJournalStore::open(&path, "channels").unwrap();
+    store
+        .prepare_recovery_install(
+            std::iter::empty(),
+            13,
+            &BTreeMap::new(),
+            &cut,
+            &installing,
+            &artifact,
+        )
+        .unwrap();
+    store.persist_recovery_attempt(&verifying).unwrap();
+
+    assert!(
+        store
+            .finalize_recovery_install(&[45; 16], 13, metadata, &cut)
+            .is_err()
+    );
+    assert!(
+        store
+            .finalize_recovery_install(
+                &[43; 16],
+                13,
+                DurableRecoveryRepositoryMetadata::new(9_541, -17),
+                &cut,
+            )
+            .is_err()
+    );
+    let wrong_cut = TerminalCut::new([46; 16], 12, [41; 32], [42; 32]);
+    assert!(
+        store
+            .finalize_recovery_install(&[43; 16], 13, metadata, &wrong_cut)
+            .is_err()
+    );
+    let (_, loaded_cut, _, _, _, pending, freshness) = store.load().unwrap().unwrap().into_parts();
+    assert_eq!(loaded_cut, cut);
+    assert!(pending);
+    assert_eq!(freshness, -17);
+    assert_eq!(store.load_recovery_attempt().unwrap(), Some(verifying));
+    assert_eq!(
+        store.load_recovery_artifact_intent().unwrap(),
+        Some(artifact)
+    );
+
+    store
+        .finalize_recovery_install(&[43; 16], 13, metadata, &cut)
+        .unwrap();
+    let (_, loaded_cut, _, _, _, pending, freshness) = store.load().unwrap().unwrap().into_parts();
+    assert_eq!(loaded_cut, cut);
+    assert!(!pending);
+    assert_eq!(freshness, 0);
+    assert!(store.load_recovery_attempt().unwrap().is_none());
+    assert!(store.load_recovery_artifact_intent().unwrap().is_none());
 }
 
 #[test]

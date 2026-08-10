@@ -29,3 +29,37 @@ pub use shitspeak_s2s_transport::testing::{
     s2s_network_test_guard,
 };
 pub use wait::{wait_for_full_alive_mesh, wait_for_full_routing, wait_until, wait_until_with};
+
+/// Write a valid, freshly checkpointed generation-zero terminal journal as a
+/// standalone SQLite fixture. This deliberately goes through the production
+/// journal and SQLite serialization paths instead of manufacturing rows in a
+/// test with schema-specific SQL.
+pub fn write_checkpoint_terminal_fixture(
+    destination: impl AsRef<std::path::Path>,
+    topic: &str,
+    repository_version: u64,
+) -> std::io::Result<()> {
+    let root = tempfile::TempDir::new()?;
+    {
+        let mut journal = crate::replications::strict::terminal_journal::TerminalJournal::load(
+            Some(root.path().to_path_buf()),
+            topic,
+        )
+        .map_err(std::io::Error::other)?;
+        journal
+            .checkpoint(repository_version)
+            .map_err(std::io::Error::other)?;
+    }
+
+    let source = root
+        .path()
+        .join("strict-terminal-journal")
+        .join(format!("topic-{}.sqlite3", hex::encode(topic.as_bytes())));
+    let connection =
+        rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(std::io::Error::other)?;
+    let image = connection
+        .serialize(rusqlite::MAIN_DB)
+        .map_err(std::io::Error::other)?;
+    std::fs::write(destination, &*image)
+}

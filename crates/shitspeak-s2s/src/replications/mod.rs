@@ -190,7 +190,7 @@ struct ManagerInner {
     cfg: Arc<ReplicationConfig>,
 }
 
-/// Manager-owned lifecycle state for local strict-v2 advertisement.
+/// Manager-owned lifecycle state for the mandatory local strict-v8 advertisement.
 ///
 /// `expected_topics` is the exact coordinated startup set when a caller has
 /// declared one. Direct manager users instead begin an implicit pass from
@@ -275,7 +275,7 @@ mod strict_capability_registry_tests {
         assert!(registry.start_implicit_registration_pass("channels"));
 
         // Mirrors the `Incapable` transition after a registered runtime fails
-        // its v2 probe.
+        // its mandatory strict-frame readiness probe.
         registry.activation_pending = false;
         registry.activation_completed = false;
 
@@ -323,7 +323,6 @@ impl ReplicationManager {
         let strict_participant_capability = StrictParticipantCapability::new(
             legacy_services.strict(),
             initial_durable_state_ready,
-            protocol::STRICT_PROTOCOL_VERSION_CURRENT,
             move |participant_version| {
                 let replication_capabilities = protocol::ReplicationProtocolCapabilities::new(
                     legacy_services.strict(),
@@ -360,6 +359,7 @@ impl ReplicationManager {
             overlay.clone(),
             strict_participant_capability.clone(),
             cfg.as_ref(),
+            shutdown.clone(),
         ));
         let owner_net: Arc<dyn OwnerNet> = Arc::new(OverlayOwnerNet {
             overlay: overlay.clone(),
@@ -458,10 +458,10 @@ impl ReplicationManager {
     /// used to propose ops.
     ///
     /// When no explicit expected-topic manifest was declared, the first
-    /// successfully installed topic automatically opens an inferred strict-v2
+    /// successfully installed topic automatically opens an inferred strict-v8
     /// capability pass. Call [`Self::set_expected_strict_topics`] when the
     /// application knows a complete startup set and requires that whole set to
-    /// be verified before the local LSA can advertise v2.
+    /// be verified before the local LSA can advertise v8.
     pub fn register_strict<R: StrictReplicable>(
         &self,
         topic: impl Into<String>,
@@ -524,14 +524,14 @@ impl ReplicationManager {
     /// Re-evaluate the manager-owned strict capability registry.
     ///
     /// Normal registration paths invoke this automatically. Once a
-    /// repository loss has withdrawn v2, this method remains fail-closed;
+    /// repository loss has withdrawn v8, this method remains fail-closed;
     /// only [`Self::set_expected_strict_topics`] opens a new coordinated
     /// re-registration pass.
     pub fn refresh_strict_capability_activation(&self) -> bool {
         self.inner.refresh_strict_capability_activation()
     }
 
-    /// Whether the local manager currently has an activated strict-v2
+    /// Whether the local manager currently has an activated strict-v8
     /// registry and the overlay is advertising the current protocol.
     pub fn strict_capability_activation_ready(&self) -> bool {
         self.inner.strict_capability_activation_ready()
@@ -549,6 +549,18 @@ impl ReplicationManager {
             }
         });
         available
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn strict_delivery_checkpoint_for_test(
+        &self,
+        topic: &str,
+    ) -> Option<strict::StrictDeliveryCheckpointDebug> {
+        let runtime = self
+            .inner
+            .strict_topics
+            .read_sync(topic, |_, runtime| runtime.clone())?;
+        runtime.delivery_checkpoint_for_test().await
     }
 
     pub fn install_strict_runtime(
@@ -790,9 +802,9 @@ impl ManagerInner {
             }
             StrictCapabilityReadiness::Incapable => {
                 // A registered runtime or its authenticated frame path cannot
-                // uphold v2. This revokes the current activation pass; only a
-                // later `set_expected_strict_topics` lifecycle setup may
-                // rearm it.
+                // uphold the mandatory v8 contract. This revokes the current
+                // activation pass; only a later `set_expected_strict_topics`
+                // lifecycle setup may rearm it.
                 registry.activation_pending = false;
                 registry.activation_completed = false;
                 self.strict_participant_capability
@@ -1304,9 +1316,25 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
                     let dispatch_started_at = Instant::now();
                     match frame.body {
                         InboundBody::Strict(b) => {
-                            let mut rt = inner.strict_topics
-                                .read_sync(&frame.topic, |_, v| v.clone());
-                            if rt.is_none() {
+                            let peer_supported = protocol::strict_participant_version_supported(
+                                inner
+                                    .strict_net
+                                    .peer_strict_replication_protocol_version(frame.from),
+                            );
+                            if !peer_supported {
+                                metrics::record_strict_fence_rejection();
+                                trace!(
+                                    peer = frame.from,
+                                    topic = %frame.topic,
+                                    "strict frame from a pre-v8 participant rejected"
+                                );
+                            }
+                            let mut rt = peer_supported.then(|| {
+                                inner
+                                    .strict_topics
+                                    .read_sync(&frame.topic, |_, v| v.clone())
+                            }).flatten();
+                            if peer_supported && rt.is_none() {
                                 if let Some(resolver) = inner.strict_topic_resolver.read().clone() {
                                     if inner.reserve_strict_topic(&frame.topic).is_ok() {
                                         let parts = StrictTopicRuntimeParts {
@@ -1359,7 +1387,7 @@ fn spawn_dispatch_task(mut rx: mpsc::UnboundedReceiver<InboundFrame>, inner: Arc
                                     b,
                                 )
                                 .await;
-                            } else {
+                            } else if peer_supported {
                                 trace!(topic=%frame.topic, "strict frame for unknown topic");
                             }
                         }

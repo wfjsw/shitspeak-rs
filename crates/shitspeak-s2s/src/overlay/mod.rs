@@ -624,6 +624,11 @@ impl OverlayNetwork {
         self.inner.cfg.peer_persistence_interval()
     }
 
+    #[cfg(test)]
+    pub(crate) fn distribution_control_publish_count_for_test(&self) -> u64 {
+        self.inner.distribution.control_publish_count_for_test()
+    }
+
     #[cfg(feature = "pre-release-workload")]
     pub fn pre_release_distribution_epoch(&self) -> u64 {
         self.inner.lsdb.distribution_epoch()
@@ -697,6 +702,22 @@ impl OverlayNetwork {
             .into_iter()
             .filter(|node| !self.is_node_quarantined(*node))
             .collect()
+    }
+
+    /// Deterministically inject failure of one active member.
+    ///
+    /// This is test-support only. Membership failure is emitted before the
+    /// shared LSDB change notification can wake asynchronous watchers, so
+    /// tests do not depend on localhost failure-detector timing.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_member_for_test(&self, node: NodeIdentifier) -> bool {
+        let Some(removed) = self.inner.lsdb.remove_active_origin_for_test(node) else {
+            return false;
+        };
+        self.inner.table.diff_and_emit(&HashSet::from([node]));
+        self.inner.lsdb.change_signal().notify_waiters();
+        debug_assert_eq!(removed.origin, node);
+        true
     }
 
     /// IDs of active members that advertise application voice service.

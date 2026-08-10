@@ -25,11 +25,16 @@ pub trait ErasedStrictRuntime: Send + Sync + 'static {
     /// Membership event broadcast — used to detect shrunk alive set.
     fn on_membership(&self, ev: &MembershipEvent);
     /// Whether this concrete topic can safely participate in the current
-    /// strict v2 advertisement. This is intentionally independent of the
-    /// local LSA value so the manager can probe before it promotes the LSA.
+    /// mandatory strict-v8 advertisement. This includes the cumulative v2
+    /// wire prerequisites and is intentionally independent of the local LSA
+    /// value so the manager can probe before it promotes the LSA.
     fn strict_v2_advertisement_prerequisites_ready(&self) -> bool;
     #[cfg(any(test, feature = "test-support"))]
     fn snapshot_capture_available_for_test(&self) -> bool;
+    #[cfg(any(test, feature = "test-support"))]
+    async fn delivery_checkpoint_for_test(
+        &self,
+    ) -> Option<super::strict::StrictDeliveryCheckpointDebug>;
     /// Cancel any background work owned by this topic.
     fn shutdown(&self);
 }

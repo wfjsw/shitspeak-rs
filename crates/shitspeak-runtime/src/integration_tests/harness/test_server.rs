@@ -221,10 +221,9 @@ impl TestStrictReplicationState {
             .parent()
             .expect("strict channel terminal journal has a parent directory");
         std::fs::create_dir_all(&terminal_directory)?;
-        copy_fixture_file(
-            &self.source_directory,
-            CHANNEL_TERMINAL_FIXTURE_FILE,
-            terminal_path,
+        copy_sqlite_main_image(
+            &self.source_directory.join(CHANNEL_TERMINAL_FIXTURE_FILE),
+            &terminal_path,
         )?;
         Ok(())
     }
@@ -246,6 +245,16 @@ fn copy_fixture_file(
     Ok(())
 }
 
+pub(crate) fn copy_sqlite_main_image(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let connection =
+        rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(std::io::Error::other)?;
+    let image = connection
+        .serialize(rusqlite::MAIN_DB)
+        .map_err(std::io::Error::other)?;
+    std::fs::write(destination, &*image)
+}
+
 fn capture_strict_state_files(
     blob_storage_directory: &Path,
     terminal_journal_path: &Path,
@@ -260,17 +269,9 @@ fn capture_strict_state_files(
         blob_storage_directory.join(CHANNEL_WAL_FILE),
         destination.join(CHANNEL_WAL_FILE),
     )?;
-    let connection = rusqlite::Connection::open_with_flags(
+    copy_sqlite_main_image(
         terminal_journal_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(std::io::Error::other)?;
-    let terminal_image = connection
-        .serialize(rusqlite::MAIN_DB)
-        .map_err(std::io::Error::other)?;
-    std::fs::write(
-        destination.join(CHANNEL_TERMINAL_FIXTURE_FILE),
-        &*terminal_image,
+        &destination.join(CHANNEL_TERMINAL_FIXTURE_FILE),
     )?;
     Ok(())
 }
@@ -522,11 +523,14 @@ mod tests {
         let source = TempDir::new().unwrap();
         std::fs::write(source.path().join(CHANNEL_SNAPSHOT_FILE), b"snapshot").unwrap();
         std::fs::write(source.path().join(CHANNEL_WAL_FILE), b"wal").unwrap();
-        std::fs::write(
-            source.path().join(CHANNEL_TERMINAL_FIXTURE_FILE),
-            b"terminal",
-        )
-        .unwrap();
+        let source_terminal = source.path().join(CHANNEL_TERMINAL_FIXTURE_FILE);
+        let terminal_connection = rusqlite::Connection::open(&source_terminal).unwrap();
+        terminal_connection
+            .execute_batch(
+                "CREATE TABLE terminal_state (value TEXT NOT NULL);
+                 INSERT INTO terminal_state VALUES ('terminal');",
+            )
+            .unwrap();
         std::fs::write(source.path().join("clients.snapshot.json"), b"ignored").unwrap();
 
         let blob_storage = TempDir::new().unwrap();
@@ -570,9 +574,15 @@ mod tests {
                 hex::encode(CHANNEL_REPLICATION_TOPIC.as_bytes())
             ))]
         );
+        let staged_terminal =
+            rusqlite::Connection::open(terminal_directory.join(&terminal_entries[0])).unwrap();
         assert_eq!(
-            std::fs::read(terminal_directory.join(&terminal_entries[0])).unwrap(),
-            b"terminal"
+            staged_terminal
+                .query_row("SELECT value FROM terminal_state", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "terminal"
         );
         assert_eq!(
             std::fs::read(source.path().join(CHANNEL_SNAPSHOT_FILE)).unwrap(),
@@ -583,12 +593,72 @@ mod tests {
             b"wal"
         );
         assert_eq!(
-            std::fs::read(source.path().join(CHANNEL_TERMINAL_FIXTURE_FILE)).unwrap(),
-            b"terminal"
+            terminal_connection
+                .query_row("SELECT value FROM terminal_state", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "terminal"
         );
         assert_eq!(
             std::fs::read(source.path().join("clients.snapshot.json")).unwrap(),
             b"ignored"
+        );
+    }
+
+    #[test]
+    fn strict_replication_state_staging_includes_wal_resident_terminal_updates() {
+        let source = TempDir::new().unwrap();
+        std::fs::write(source.path().join(CHANNEL_SNAPSHOT_FILE), b"snapshot").unwrap();
+        std::fs::write(source.path().join(CHANNEL_WAL_FILE), b"wal").unwrap();
+        let source_terminal = source.path().join(CHANNEL_TERMINAL_FIXTURE_FILE);
+        let source_connection = rusqlite::Connection::open(&source_terminal).unwrap();
+        source_connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE terminal_state (value TEXT NOT NULL);
+                 INSERT INTO terminal_state VALUES ('checkpointed');
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        let checkpointed_main = std::fs::read(&source_terminal).unwrap();
+        source_connection
+            .execute("UPDATE terminal_state SET value = 'wal-resident'", [])
+            .unwrap();
+        assert_eq!(std::fs::read(&source_terminal).unwrap(), checkpointed_main);
+        assert!(
+            std::fs::metadata(source_terminal.with_extension("sqlite3-wal"))
+                .unwrap()
+                .len()
+                > 32
+        );
+        let source_wal = std::fs::read(source_terminal.with_extension("sqlite3-wal")).unwrap();
+
+        let blob_storage = TempDir::new().unwrap();
+        let s2s_persistence = TempDir::new().unwrap();
+        TestStrictReplicationState::from_directory(source.path())
+            .stage_into(blob_storage.path(), s2s_persistence.path())
+            .unwrap();
+
+        let staged_terminal = s2s_persistence
+            .path()
+            .join(strict_channel_terminal_journal_relative_path());
+        assert!(!staged_terminal.with_extension("sqlite3-wal").exists());
+        assert!(!staged_terminal.with_extension("sqlite3-shm").exists());
+        let staged_connection = rusqlite::Connection::open(staged_terminal).unwrap();
+        assert_eq!(
+            staged_connection
+                .query_row("SELECT value FROM terminal_state", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "wal-resident"
+        );
+        assert_eq!(std::fs::read(&source_terminal).unwrap(), checkpointed_main);
+        assert_eq!(
+            std::fs::read(source_terminal.with_extension("sqlite3-wal")).unwrap(),
+            source_wal
         );
     }
 

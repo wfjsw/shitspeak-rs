@@ -20,7 +20,10 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::terminal_journal_sqlite::{SqliteTerminalJournalError, SqliteTerminalJournalStore};
+use super::terminal_journal_sqlite::{
+    DurableRecoveryArtifactIntent, DurableRecoveryAttempt, SqliteTerminalJournalError,
+    SqliteTerminalJournalStore,
+};
 
 const JOURNAL_DIRECTORY: &str = "strict-terminal-journal";
 const JOURNAL_VERSION: u32 = 2;
@@ -93,6 +96,15 @@ impl TerminalCut {
         self.journal_id == other.journal_id
             && self.generation == other.generation
             && self.chain_digest == other.chain_digest
+    }
+
+    /// Whether two advertised cuts cannot both represent one append-only
+    /// lineage. Different journal identities are always foreign. At the same
+    /// journal generation, every authenticated cut field must match exactly;
+    /// a chain or terminal-set mismatch is a fork owned by v8 recovery.
+    pub(crate) fn requires_lineage_recovery_from(&self, other: &Self) -> bool {
+        self.journal_id != other.journal_id
+            || (self.generation == other.generation && self != other)
     }
 }
 
@@ -555,7 +567,6 @@ impl TerminalJournalCheckpointPage {
         self.cursor
     }
 
-    #[cfg(test)]
     pub(crate) fn next_cursor(&self) -> u64 {
         self.next_cursor
     }
@@ -565,7 +576,6 @@ impl TerminalJournalCheckpointPage {
         &self.entries
     }
 
-    #[cfg(test)]
     pub(crate) fn has_more(&self) -> bool {
         self.has_more
     }
@@ -714,7 +724,6 @@ pub(crate) struct RepositoryImageInstallIntent {
 }
 
 impl RepositoryImageInstallIntent {
-    #[cfg(test)]
     pub(crate) fn checkpoint_epoch(self) -> u64 {
         self.checkpoint_epoch
     }
@@ -965,6 +974,129 @@ fn combined_terminal_set_digest(
 }
 
 impl TerminalJournal {
+    /// Validate the generation-ordered chain of a downloaded terminal image
+    /// without mutating the active journal. The terminal-set digest is
+    /// finalized later with the retired-origin ledger from the bound snapshot.
+    pub(crate) fn validate_staged_terminal_checkpoint(
+        source_cut: TerminalCut,
+        staged: &[StagedTerminalDecision],
+    ) -> Result<(), TerminalJournalError> {
+        let mut source = Self::in_memory("validated-v8-terminal-checkpoint");
+        source.journal_id = *source_cut.journal_id();
+        for entry in staged {
+            match (&entry.frozen_targets, entry.resolver) {
+                (Some(targets), Some(resolver)) => source.upsert_v2_decision(
+                    entry.op_id,
+                    targets,
+                    resolver,
+                    entry.decision.clone(),
+                    None,
+                )?,
+                (None, None) => source.upsert_decision(entry.op_id, entry.decision.clone())?,
+                _ => {
+                    return Err(TerminalJournalError::InvalidMetadata {
+                        path: PathBuf::new(),
+                        reason: "staged terminal identity is incomplete",
+                    });
+                }
+            };
+        }
+        if source.terminal_decision_generation != source_cut.generation()
+            || source.terminal_chain_digest != *source_cut.chain_digest()
+        {
+            return Err(TerminalJournalError::InvalidMetadata {
+                path: PathBuf::new(),
+                reason: "staged terminal checkpoint does not match its source chain",
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn persist_recovery_attempt(
+        &mut self,
+        attempt: &DurableRecoveryAttempt,
+    ) -> Result<(), TerminalJournalError> {
+        if let Some(store) = self.store.as_mut() {
+            store.persist_recovery_attempt(attempt)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn persist_recovery_artifact_intent(
+        &mut self,
+        intent: &DurableRecoveryArtifactIntent,
+    ) -> Result<(), TerminalJournalError> {
+        if let Some(store) = self.store.as_mut() {
+            store.persist_recovery_artifact_intent(intent)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn load_recovery_artifact_intent(
+        &self,
+    ) -> Result<Option<DurableRecoveryArtifactIntent>, TerminalJournalError> {
+        self.store
+            .as_ref()
+            .map(SqliteTerminalJournalStore::load_recovery_artifact_intent)
+            .transpose()
+            .map(Option::flatten)
+            .map_err(TerminalJournalError::from)
+    }
+
+    pub(crate) fn load_recovery_attempt(
+        &self,
+    ) -> Result<Option<DurableRecoveryAttempt>, TerminalJournalError> {
+        self.store
+            .as_ref()
+            .map(SqliteTerminalJournalStore::load_recovery_attempt)
+            .transpose()
+            .map(Option::flatten)
+            .map_err(TerminalJournalError::from)
+    }
+
+    pub(crate) fn clear_recovery_attempt(
+        &mut self,
+        attempt_id: &[u8; 16],
+    ) -> Result<(), TerminalJournalError> {
+        if let Some(store) = self.store.as_mut() {
+            store.clear_recovery_attempt(attempt_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finalize_recovery_install(
+        &mut self,
+        attempt_id: &[u8; 16],
+        intent: RepositoryImageInstallIntent,
+        cut: TerminalCut,
+    ) -> Result<(), TerminalJournalError> {
+        if !self.repository_image_install_pending
+            || intent.checkpoint_epoch != self.checkpoint_epoch
+            || intent.repository_version != self.checkpoint_repository_version
+            || intent.history_freshness != self.repository_image_install_freshness
+            || cut != self.terminal_cut()
+        {
+            return Err(TerminalJournalError::InvalidMetadata {
+                path: self.path.clone().unwrap_or_default(),
+                reason: "recovery finalization does not match active journal state",
+            });
+        }
+        if let Some(store) = self.store.as_mut() {
+            store.finalize_recovery_install(
+                attempt_id,
+                intent.checkpoint_epoch(),
+                super::terminal_journal_sqlite::DurableRecoveryRepositoryMetadata::new(
+                    intent.repository_version(),
+                    intent.history_freshness(),
+                ),
+                &cut,
+            )?;
+        }
+        self.repository_image_install_pending = false;
+        self.repository_image_install_freshness = 0;
+        Ok(())
+    }
+
     /// Load the current topic journal. Missing files are an empty journal.
     pub(crate) fn load(
         root: Option<PathBuf>,
@@ -973,7 +1105,7 @@ impl TerminalJournal {
         let topic = topic.into();
         let path = journal_path(root.as_deref(), &topic);
         let Some(path) = path else {
-            let journal_id = generate_journal_id()?;
+            let journal_id = bootstrap_journal_id(&topic);
             let terminal_set_commitment = TerminalSetCommitment::empty();
             let retired_set_digest = compute_retired_set_digest(&BTreeMap::new());
             let terminal_set_digest =
@@ -1096,7 +1228,7 @@ impl TerminalJournal {
             let loaded = match fs::read(&legacy_path) {
                 Ok(bytes) => load_records(&legacy_path, &topic, &bytes)?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    LoadedTerminalJournal::empty(generate_journal_id()?)
+                    LoadedTerminalJournal::empty(bootstrap_journal_id(&topic))
                 }
                 Err(source) => {
                     return Err(TerminalJournalError::Io {
@@ -1161,9 +1293,8 @@ impl TerminalJournal {
         })
     }
 
-    pub(crate) fn in_memory(_topic: impl Into<String>) -> Self {
-        let journal_id = generate_journal_id()
-            .expect("the system random generator must provide a terminal journal id");
+    pub(crate) fn in_memory(topic: impl Into<String>) -> Self {
+        let journal_id = bootstrap_journal_id(&topic.into());
         let terminal_set_commitment = TerminalSetCommitment::empty();
         let retired_set_digest = compute_retired_set_digest(&BTreeMap::new());
         let terminal_set_digest =
@@ -1196,6 +1327,43 @@ impl TerminalJournal {
     /// Whether updates are synchronously persisted to disk.
     pub(crate) fn durable_persistence_enabled(&self) -> bool {
         self.path.is_some()
+    }
+
+    /// Upgrade a genuinely pristine persisted pre-v8 journal from its former
+    /// random lineage to the deterministic per-topic v8 bootstrap lineage.
+    /// Populated, checkpointed, or recovery-owned journals retain their exact
+    /// identity and must converge through strict recovery instead.
+    pub(crate) fn normalize_pristine_bootstrap_lineage(
+        &mut self,
+        topic: &str,
+        repository_version: u64,
+        history_freshness: i64,
+    ) -> Result<bool, TerminalJournalError> {
+        let bootstrap_journal_id = bootstrap_journal_id(topic);
+        if repository_version != 0
+            || history_freshness != 0
+            || self.journal_id == bootstrap_journal_id
+            || self.terminal_decision_generation != 0
+            || self.terminal_chain_digest != EMPTY_CHAIN_DIGEST
+            || !self.terminal_cut().is_empty_terminal_set()
+            || !self.records.is_empty()
+            || self.checkpoint_epoch != 0
+            || self.checkpoint_repository_version != 0
+            || self.repository_image_install_pending
+            || self.repository_image_install_freshness != 0
+            || !self.retired_origins.is_empty()
+        {
+            return Ok(false);
+        }
+        let current_cut = self.terminal_cut();
+        let Some(store) = self.store.as_mut() else {
+            return Ok(false);
+        };
+        if !store.normalize_pristine_bootstrap_lineage(&current_cut, bootstrap_journal_id)? {
+            return Ok(false);
+        }
+        self.journal_id = bootstrap_journal_id;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -1316,21 +1484,25 @@ impl TerminalJournal {
             }
         }
         if delivered_versions.is_empty() {
-            return if has_undelivered_commit {
-                repository_version
-            } else {
-                0
-            };
+            return self
+                .checkpoint_repository_version
+                .max(if has_undelivered_commit {
+                    repository_version
+                } else {
+                    0
+                });
         }
         delivered_versions.sort_unstable();
         let contiguous = delivered_versions
             .windows(2)
             .all(|pair| pair[1] == pair[0].saturating_add(1));
-        if contiguous && delivered_versions.last() == Some(&repository_version) {
-            delivered_versions[0].saturating_sub(1)
-        } else {
-            repository_version
-        }
+        self.checkpoint_repository_version.max(
+            if contiguous && delivered_versions.last() == Some(&repository_version) {
+                delivered_versions[0].saturating_sub(1)
+            } else {
+                repository_version
+            },
+        )
     }
 
     pub(crate) fn delivery_version(&self, op_id: TerminalJournalOpId) -> Option<u64> {
@@ -1409,6 +1581,7 @@ impl TerminalJournal {
             None,
             delivered,
             incoming_retired,
+            None,
         )
     }
 
@@ -1462,6 +1635,65 @@ impl TerminalJournal {
             Some(*source_cut.terminal_set_digest()),
             delivered,
             incoming_retired,
+            None,
+        )
+    }
+
+    /// Validate a complete terminal image and atomically install it together
+    /// with the durable repository artifact intent for the same attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_staged_recovery_checkpoint(
+        &mut self,
+        repository_version: u64,
+        history_freshness: i64,
+        source_cut: TerminalCut,
+        staged: &[StagedTerminalDecision],
+        delivered: &BTreeMap<TerminalJournalOpId, u64>,
+        incoming_retired: &BTreeMap<u64, u64>,
+        attempt: &DurableRecoveryAttempt,
+        intent: &DurableRecoveryArtifactIntent,
+    ) -> Result<BTreeMap<u64, u64>, TerminalJournalError> {
+        Self::validate_staged_terminal_checkpoint(source_cut, staged)?;
+        let mut source = Self::in_memory("staged-v8-terminal-checkpoint");
+        source.journal_id = *source_cut.journal_id();
+        for entry in staged {
+            match (&entry.frozen_targets, entry.resolver) {
+                (Some(targets), Some(resolver)) => source.upsert_v2_decision(
+                    entry.op_id,
+                    targets,
+                    resolver,
+                    entry.decision.clone(),
+                    None,
+                )?,
+                (None, None) => source.upsert_decision(entry.op_id, entry.decision.clone())?,
+                _ => {
+                    return Err(TerminalJournalError::InvalidMetadata {
+                        path: self.path.clone().unwrap_or_default(),
+                        reason: "staged terminal identity is incomplete",
+                    });
+                }
+            };
+        }
+        if source.terminal_decision_generation != source_cut.generation()
+            || source.terminal_chain_digest != *source_cut.chain_digest()
+        {
+            return Err(TerminalJournalError::InvalidMetadata {
+                path: self.path.clone().unwrap_or_default(),
+                reason: "staged terminal checkpoint does not match its source chain",
+            });
+        }
+        self.install_repository_checkpoint_records(
+            repository_version,
+            history_freshness,
+            source.records,
+            *source_cut.journal_id(),
+            source_cut.generation(),
+            *source_cut.chain_digest(),
+            source.generation_index,
+            Some(*source_cut.terminal_set_digest()),
+            delivered,
+            incoming_retired,
+            Some((attempt, intent)),
         )
     }
 
@@ -1478,7 +1710,29 @@ impl TerminalJournal {
         expected_terminal_set_digest: Option<[u8; DIGEST_LEN]>,
         delivered: &BTreeMap<TerminalJournalOpId, u64>,
         incoming_retired: &BTreeMap<u64, u64>,
+        recovery_install: Option<(&DurableRecoveryAttempt, &DurableRecoveryArtifactIntent)>,
     ) -> Result<BTreeMap<u64, u64>, TerminalJournalError> {
+        let retired_origins = compact_retired_origins_by_node(incoming_retired.clone());
+        for (op_id, version) in delivered {
+            if *version > repository_version {
+                return Err(TerminalJournalError::ConflictingDeliveryVersion {
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                });
+            }
+            let node = op_id.0 >> 48;
+            let lower = node << 48;
+            let upper = lower | 0x0000_FFFF_FFFF_FFFF;
+            if retired_origins
+                .range(lower..=upper)
+                .next_back()
+                .is_some_and(|(origin, counter)| {
+                    op_id.0 < *origin || (op_id.0 == *origin && op_id.1 <= *counter)
+                })
+            {
+                return Err(TerminalJournalError::CheckpointHasOperationGaps);
+            }
+        }
         for (op_id, record) in &mut candidate {
             if !record.is_terminal() {
                 return Err(TerminalJournalError::CheckpointHasUnresolvedRecords);
@@ -1514,7 +1768,6 @@ impl TerminalJournal {
             .checkpoint_epoch
             .checked_add(1)
             .ok_or(TerminalJournalError::CheckpointEpochExhausted)?;
-        let retired_origins = compact_retired_origins_by_node(incoming_retired.clone());
         if candidate.keys().any(|op_id| {
             let node = op_id.0 >> 48;
             let lower = node << 48;
@@ -1556,14 +1809,25 @@ impl TerminalJournal {
         }
         let cut = TerminalCut::new(journal_id, generation, chain_digest, digest);
         if let Some(store) = self.store.as_mut() {
-            store.install_repository_base(
-                candidate.iter(),
-                epoch,
-                repository_version,
-                history_freshness,
-                &retired_origins,
-                &cut,
-            )?;
+            if let Some((attempt, intent)) = recovery_install {
+                store.prepare_recovery_install(
+                    candidate.iter(),
+                    epoch,
+                    &retired_origins,
+                    &cut,
+                    attempt,
+                    intent,
+                )?;
+            } else {
+                store.install_repository_base(
+                    candidate.iter(),
+                    epoch,
+                    repository_version,
+                    history_freshness,
+                    &retired_origins,
+                    &cut,
+                )?;
+            }
         }
 
         self.records = candidate;
@@ -2855,6 +3119,18 @@ fn generate_journal_id() -> Result<[u8; JOURNAL_ID_LEN], TerminalJournalError> {
         .ok_or(TerminalJournalError::JournalIdGeneration)
 }
 
+/// Give independent participants the same lineage for a truly fresh topic.
+/// Later checkpoint rotations remain random because they represent a new,
+/// repository-bound cut that must be certified before another node adopts it.
+fn bootstrap_journal_id(topic: &str) -> [u8; JOURNAL_ID_LEN] {
+    let mut image = Vec::with_capacity(38 + topic.len());
+    image.extend_from_slice(b"shitspeak-terminal-bootstrap-lineage-v8\0");
+    image.extend_from_slice(topic.as_bytes());
+    sha256(&image)[..JOURNAL_ID_LEN]
+        .try_into()
+        .expect("journal id is shorter than SHA-256")
+}
+
 fn derive_terminal_state(
     records: &mut BTreeMap<TerminalJournalOpId, TerminalJournalRecord>,
     journal_id: [u8; JOURNAL_ID_LEN],
@@ -3430,14 +3706,296 @@ mod tests {
     use std::{collections::BTreeMap, env, fs, process::Command};
 
     use bytes::Bytes;
+    use rusqlite::{Connection, params};
     use tempfile::TempDir;
 
     use super::{
         FrozenTarget, RepositoryImageInstallIntent, StagedTerminalDecision, TerminalDecision,
-        TerminalJournal, TerminalJournalError, TerminalResolver,
+        TerminalJournal, TerminalJournalError, TerminalResolver, journal_path,
         take_terminal_set_digest_derivations, take_terminal_set_digest_record_visits,
         take_terminal_set_preview_node_reads, take_terminal_state_derivations,
     };
+
+    fn persist_random_pristine_lineage(root: &TempDir, topic: &str) -> [u8; 16] {
+        {
+            TerminalJournal::load(Some(root.path().to_path_buf()), topic).unwrap();
+        }
+        let random_lineage = [0xA5; 16];
+        let path = journal_path(Some(root.path()), topic).expect("durable journal path");
+        let connection = Connection::open(path).unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE journal_metadata SET journal_id = ?1 WHERE singleton = 1",
+                    [random_lineage.as_slice()],
+                )
+                .unwrap(),
+            1
+        );
+        random_lineage
+    }
+
+    #[test]
+    fn fresh_journals_for_the_same_topic_share_the_v8_bootstrap_lineage() {
+        let first = TerminalJournal::in_memory("channels");
+        let second = TerminalJournal::in_memory("channels");
+
+        assert_eq!(
+            first.terminal_cut().journal_id(),
+            second.terminal_cut().journal_id()
+        );
+    }
+
+    #[test]
+    fn fresh_journals_for_different_topics_have_distinct_v8_bootstrap_lineages() {
+        let channels = TerminalJournal::in_memory("channels");
+        let users = TerminalJournal::in_memory("users");
+
+        assert_ne!(
+            channels.terminal_cut().journal_id(),
+            users.terminal_cut().journal_id()
+        );
+    }
+
+    #[test]
+    fn checkpoint_rotation_leaves_the_v8_bootstrap_lineage() {
+        let mut journal = TerminalJournal::in_memory("channels");
+        let bootstrap_journal_id = *journal.terminal_cut().journal_id();
+
+        journal.checkpoint(0).expect("checkpoint");
+
+        assert_ne!(journal.terminal_cut().journal_id(), &bootstrap_journal_id);
+    }
+
+    #[test]
+    fn newly_created_durable_journal_reopens_with_the_same_v8_bootstrap_lineage() {
+        let root = TempDir::new().expect("tempdir");
+        let expected_journal_id = *TerminalJournal::in_memory("channels")
+            .terminal_cut()
+            .journal_id();
+        let created_journal_id = {
+            let journal =
+                TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+            *journal.terminal_cut().journal_id()
+        };
+
+        let reopened = TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+
+        assert_eq!(created_journal_id, expected_journal_id);
+        assert_eq!(reopened.terminal_cut().journal_id(), &created_journal_id);
+    }
+
+    #[test]
+    fn persisted_random_pristine_lineage_normalizes_once_to_v8_bootstrap() {
+        let root = TempDir::new().unwrap();
+        let topic = "channels";
+        let random_lineage = persist_random_pristine_lineage(&root, topic);
+        let expected = *TerminalJournal::in_memory(topic)
+            .terminal_cut()
+            .journal_id();
+
+        {
+            let mut journal =
+                TerminalJournal::load(Some(root.path().to_path_buf()), topic).unwrap();
+            assert_eq!(journal.terminal_cut().journal_id(), &random_lineage);
+            assert!(
+                journal
+                    .normalize_pristine_bootstrap_lineage(topic, 0, 0)
+                    .unwrap()
+            );
+            assert_eq!(journal.terminal_cut().journal_id(), &expected);
+            assert!(
+                !journal
+                    .normalize_pristine_bootstrap_lineage(topic, 0, 0)
+                    .unwrap()
+            );
+        }
+
+        let reopened = TerminalJournal::load(Some(root.path().to_path_buf()), topic).unwrap();
+        assert_eq!(reopened.terminal_cut().journal_id(), &expected);
+    }
+
+    #[test]
+    fn pristine_lineage_normalization_requires_exactly_empty_repository_metadata() {
+        for (version, freshness) in [(1, 0), (0, 1), (1, -1)] {
+            let root = TempDir::new().unwrap();
+            let random_lineage = persist_random_pristine_lineage(&root, "channels");
+            let mut journal =
+                TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+
+            assert!(
+                !journal
+                    .normalize_pristine_bootstrap_lineage("channels", version, freshness)
+                    .unwrap()
+            );
+            assert_eq!(journal.terminal_cut().journal_id(), &random_lineage);
+        }
+    }
+
+    #[test]
+    fn pristine_lineage_normalization_rejects_retained_records_and_terminal_chain() {
+        let root = TempDir::new().unwrap();
+        persist_random_pristine_lineage(&root, "channels");
+        let mut journal =
+            TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+        journal.upsert_promise((1, 1), 1).unwrap();
+        let retained_lineage = *journal.terminal_cut().journal_id();
+        assert!(
+            !journal
+                .normalize_pristine_bootstrap_lineage("channels", 0, 0)
+                .unwrap()
+        );
+        assert_eq!(journal.terminal_cut().journal_id(), &retained_lineage);
+
+        journal.upsert_abort_decision((1, 1), 1).unwrap();
+        let terminal_lineage = *journal.terminal_cut().journal_id();
+        assert!(
+            !journal
+                .normalize_pristine_bootstrap_lineage("channels", 0, 0)
+                .unwrap()
+        );
+        assert_eq!(journal.terminal_cut().journal_id(), &terminal_lineage);
+    }
+
+    #[test]
+    fn pristine_lineage_normalization_preserves_compacted_generation_zero_journal() {
+        let root = TempDir::new().unwrap();
+        persist_random_pristine_lineage(&root, "channels");
+        let mut journal =
+            TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+        journal.upsert_abort_decision((1, 1), 1).unwrap();
+        journal.checkpoint(0).unwrap();
+        let compacted_cut = journal.terminal_cut();
+
+        assert_eq!(compacted_cut.generation(), 0);
+        assert_eq!(journal.record_count(), 0);
+        assert!(!compacted_cut.is_empty_terminal_set());
+        assert!(
+            !journal
+                .normalize_pristine_bootstrap_lineage("channels", 0, 0)
+                .unwrap()
+        );
+        assert_eq!(journal.terminal_cut(), compacted_cut);
+    }
+
+    #[test]
+    fn pristine_lineage_normalization_requires_zero_checkpoint_coordinates() {
+        for (epoch, repository_version) in [(1_u64, 0_u64), (0, 1)] {
+            let root = TempDir::new().unwrap();
+            let random_lineage = persist_random_pristine_lineage(&root, "channels");
+            let path = journal_path(Some(root.path()), "channels").unwrap();
+            Connection::open(path)
+                .unwrap()
+                .execute(
+                    "INSERT INTO journal_checkpoint
+                         (singleton, epoch, repository_version,
+                          repository_image_install_pending,
+                          repository_image_install_freshness)
+                     VALUES (1, ?1, ?2, 0, ?3)",
+                    params![
+                        epoch.to_be_bytes().as_slice(),
+                        repository_version.to_be_bytes().as_slice(),
+                        0_i64.to_be_bytes().as_slice(),
+                    ],
+                )
+                .unwrap();
+            let mut journal =
+                TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+
+            assert!(journal.terminal_cut().is_empty_terminal_set());
+            assert!(
+                !journal
+                    .normalize_pristine_bootstrap_lineage("channels", 0, 0)
+                    .unwrap()
+            );
+            assert_eq!(journal.terminal_cut().journal_id(), &random_lineage);
+        }
+    }
+
+    #[test]
+    fn pristine_lineage_normalization_rejects_pending_repository_install() {
+        let root = TempDir::new().unwrap();
+        let random_lineage = persist_random_pristine_lineage(&root, "channels");
+        let path = journal_path(Some(root.path()), "channels").unwrap();
+        Connection::open(path)
+            .unwrap()
+            .execute(
+                "INSERT INTO journal_checkpoint
+                     (singleton, epoch, repository_version,
+                      repository_image_install_pending,
+                      repository_image_install_freshness)
+                 VALUES (1, ?1, ?1, 1, ?2)",
+                params![
+                    0_u64.to_be_bytes().as_slice(),
+                    0_i64.to_be_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        let mut journal =
+            TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+
+        assert!(journal.pending_repository_image_install().is_some());
+        assert!(
+            !journal
+                .normalize_pristine_bootstrap_lineage("channels", 0, 0)
+                .unwrap()
+        );
+        assert_eq!(journal.terminal_cut().journal_id(), &random_lineage);
+    }
+
+    #[test]
+    fn pristine_lineage_normalization_rejects_durable_recovery_state_or_artifact() {
+        for artifact in [false, true] {
+            let root = TempDir::new().unwrap();
+            let random_lineage = persist_random_pristine_lineage(&root, "channels");
+            let path = journal_path(Some(root.path()), "channels").unwrap();
+            let connection = Connection::open(path).unwrap();
+            if artifact {
+                // Exercise the artifact guard independently. Normal stores
+                // create artifacts together with an attempt, but startup must
+                // also fail safe if a crash/corruption boundary leaves only
+                // the attempt-owned artifact row behind.
+                connection
+                    .execute_batch("PRAGMA foreign_keys = OFF;")
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO strict_recovery_artifact
+                             (singleton, attempt_id, staging_path, content_digest,
+                              content_length, repository_version, history_freshness,
+                              journal_id, generation, chain_digest, terminal_set_digest)
+                         VALUES (1, ?1, ?2, ?3, ?4, ?4, ?4, ?5, ?4, ?3, ?3)",
+                        params![
+                            [1_u8; 16].as_slice(),
+                            [2_u8].as_slice(),
+                            [3_u8; 32].as_slice(),
+                            0_u64.to_be_bytes().as_slice(),
+                            random_lineage.as_slice(),
+                        ],
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute(
+                        "INSERT INTO strict_recovery_state
+                             (singleton, attempt_id, phase, frozen_quorum_denominator,
+                              witnesses, donor_order, failure_history)
+                         VALUES (1, ?1, 1, ?2, X'90', X'90', X'90')",
+                        params![[1_u8; 16].as_slice(), 0_u64.to_be_bytes().as_slice()],
+                    )
+                    .unwrap();
+            }
+            let mut journal =
+                TerminalJournal::load(Some(root.path().to_path_buf()), "channels").unwrap();
+
+            assert!(
+                !journal
+                    .normalize_pristine_bootstrap_lineage("channels", 0, 0)
+                    .unwrap()
+            );
+            assert_eq!(journal.terminal_cut().journal_id(), &random_lineage);
+        }
+    }
 
     #[test]
     fn empty_terminal_set_excludes_generation_zero_retired_checkpoint() {
@@ -3540,6 +4098,10 @@ mod tests {
         let mut abort_only = TerminalJournal::in_memory("channels");
         abort_only.upsert_abort_decision((4, 1), 1).unwrap();
         assert_eq!(abort_only.repository_replay_base_version(6), 0);
+
+        let mut compacted = TerminalJournal::in_memory("channels");
+        compacted.checkpoint(6).unwrap();
+        assert_eq!(compacted.repository_replay_base_version(6), 6);
     }
 
     #[test]
@@ -3747,6 +4309,29 @@ mod tests {
         assert_eq!(reloaded.terminal_cut(), source_cut);
         assert_eq!(reloaded.checkpoint_repository_version(), 9_540);
         assert_eq!(reloaded.repository_base_required_version(), 9_540);
+    }
+
+    #[test]
+    fn repository_checkpoint_rejects_applied_operation_covered_by_retired_floor_before_mutation() {
+        let mut journal = TerminalJournal::in_memory("overlapping-delivery-checkpoint");
+        let before = journal.terminal_cut();
+
+        let error = journal
+            .install_repository_checkpoint(
+                40,
+                0,
+                &BTreeMap::from([((11, 3), 40)]),
+                &BTreeMap::from([(11, 3)]),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TerminalJournalError::CheckpointHasOperationGaps
+        ));
+        assert_eq!(journal.terminal_cut(), before);
+        assert!(journal.pending_repository_image_install().is_none());
+        assert!(journal.retired_origins().is_empty());
     }
 
     #[test]

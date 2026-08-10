@@ -19,11 +19,12 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use super::error::ReplicationError;
 use super::owner::runtime::OwnerNet;
 use super::proto::{OwnerBody, StrictBody};
-use super::strict::runtime::StrictNet;
+use super::strict::runtime::{BulkPageIdentity, StrictNet};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{SendError, ServiceLevel, TransportKind};
 
@@ -72,7 +73,26 @@ pub struct StrictSendObservation {
 pub enum MockBulkSendOutcome {
     Sent,
     Backpressure,
+    LocalPacerBusy(Duration),
+    BackpressureUntilAcknowledged,
     Failure,
+}
+
+/// Test barrier that exposes the interval after a bulk page is observable to
+/// its receiver but before the sender's await completes.
+pub struct MockBulkSendPause {
+    captured: Notify,
+    release: Notify,
+}
+
+impl MockBulkSendPause {
+    pub async fn wait_until_captured(&self) {
+        self.captured.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +143,9 @@ pub struct MockNet {
     owner_unicast_failures: Mutex<std::collections::HashSet<NodeIdentifier>>,
     pub captured: Mutex<Vec<CapturedFrame>>,
     strict_send_observations: Mutex<Vec<StrictSendObservation>>,
+    bulk_acknowledgements: Mutex<Vec<(NodeIdentifier, String, BulkPageIdentity)>>,
     bulk_send_outcomes: Mutex<VecDeque<MockBulkSendOutcome>>,
+    bulk_send_pause_after_capture: Mutex<Option<Arc<MockBulkSendPause>>>,
     pub edge_rtts: Mutex<Vec<Duration>>,
     route_rtts: Mutex<std::collections::HashMap<NodeIdentifier, Duration>>,
     /// Known strict replication participants (including currently unreachable
@@ -153,7 +175,9 @@ impl MockNet {
             owner_unicast_failures: Mutex::new(Default::default()),
             captured: Mutex::new(Vec::new()),
             strict_send_observations: Mutex::new(Vec::new()),
+            bulk_acknowledgements: Mutex::new(Vec::new()),
             bulk_send_outcomes: Mutex::new(VecDeque::new()),
+            bulk_send_pause_after_capture: Mutex::new(None),
             edge_rtts: Mutex::new(Vec::new()),
             route_rtts: Mutex::new(Default::default()),
             strict_participants: Mutex::new(None),
@@ -266,6 +290,12 @@ impl MockNet {
         std::mem::take(&mut *self.strict_send_observations.lock())
     }
 
+    pub(crate) fn drain_bulk_acknowledgements(
+        &self,
+    ) -> Vec<(NodeIdentifier, String, BulkPageIdentity)> {
+        std::mem::take(&mut *self.bulk_acknowledgements.lock())
+    }
+
     /// Replace the scripted outcomes for successive bulk sends. Once the
     /// script is exhausted, later sends succeed.
     pub fn script_bulk_send_outcomes(
@@ -273,6 +303,15 @@ impl MockNet {
         outcomes: impl IntoIterator<Item = MockBulkSendOutcome>,
     ) {
         *self.bulk_send_outcomes.lock() = outcomes.into_iter().collect();
+    }
+
+    pub fn pause_next_bulk_send_after_capture(&self) -> Arc<MockBulkSendPause> {
+        let pause = Arc::new(MockBulkSendPause {
+            captured: Notify::new(),
+            release: Notify::new(),
+        });
+        *self.bulk_send_pause_after_capture.lock() = Some(Arc::clone(&pause));
+        pause
     }
 
     pub fn strict_encoded_bytes_for_lane(&self, lane: StrictSendLane) -> usize {
@@ -413,6 +452,13 @@ impl StrictNet for MockNet {
         let outcome = match scripted {
             MockBulkSendOutcome::Sent => StrictSendOutcome::Sent,
             MockBulkSendOutcome::Backpressure => StrictSendOutcome::Backpressure,
+            MockBulkSendOutcome::LocalPacerBusy(_) => StrictSendOutcome::Backpressure,
+            MockBulkSendOutcome::BackpressureUntilAcknowledged
+                if self.bulk_acknowledgements.lock().is_empty() =>
+            {
+                StrictSendOutcome::Backpressure
+            }
+            MockBulkSendOutcome::BackpressureUntilAcknowledged => StrictSendOutcome::Sent,
             MockBulkSendOutcome::Failure => StrictSendOutcome::InjectedFailure,
         };
         self.observe_strict_send(
@@ -423,25 +469,41 @@ impl StrictNet for MockNet {
             Some(retry_delay),
             outcome,
         );
-        match scripted {
-            MockBulkSendOutcome::Sent => {
+        match outcome {
+            StrictSendOutcome::Sent => {
                 self.captured.lock().push(CapturedFrame::StrictUnicast {
                     dst,
                     topic: topic.to_owned(),
                     body,
                 });
+                let pause = { self.bulk_send_pause_after_capture.lock().take() };
+                if let Some(pause) = pause {
+                    pause.captured.notify_one();
+                    pause.release.notified().await;
+                }
                 Ok(())
             }
-            MockBulkSendOutcome::Backpressure => Err(ReplicationError::Overlay(
-                crate::overlay::OverlayError::Send(SendError::Backpressure {
-                    node: dst,
-                    transport: TransportKind::Tcp,
-                }),
-            )),
-            MockBulkSendOutcome::Failure => Err(ReplicationError::Malformed(
+            StrictSendOutcome::Backpressure => match scripted {
+                MockBulkSendOutcome::LocalPacerBusy(retry_after) => {
+                    Err(ReplicationError::StrictBulkAdmissionBusy { retry_after })
+                }
+                _ => Err(ReplicationError::Overlay(
+                    crate::overlay::OverlayError::Send(SendError::Backpressure {
+                        node: dst,
+                        transport: TransportKind::Tcp,
+                    }),
+                )),
+            },
+            StrictSendOutcome::InjectedFailure => Err(ReplicationError::Malformed(
                 "injected strict bulk unicast failure",
             )),
         }
+    }
+
+    fn acknowledge_bulk_unicast(&self, dst: NodeIdentifier, topic: &str, page: BulkPageIdentity) {
+        self.bulk_acknowledgements
+            .lock()
+            .push((dst, topic.to_owned(), page));
     }
 
     async fn send_multicast(
@@ -505,6 +567,24 @@ impl StrictNet for MockNet {
         participants.len()
     }
 
+    fn strict_participant_incarnations(&self) -> Vec<(NodeIdentifier, u64)> {
+        let mut participants: HashSet<_> = self
+            .strict_participants
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self.alive.lock().clone())
+            .into_iter()
+            .collect();
+        participants.insert(self.self_id);
+        let epochs = self.epochs.lock();
+        let mut incarnations = participants
+            .into_iter()
+            .map(|node| (node, epochs.get(&node).copied().unwrap_or_default()))
+            .collect::<Vec<_>>();
+        incarnations.sort_unstable_by_key(|(node, _)| *node);
+        incarnations
+    }
+
     fn member_boot_epoch(&self, node: NodeIdentifier) -> Option<u64> {
         self.epochs.lock().get(&node).copied()
     }
@@ -528,7 +608,35 @@ impl StrictNet for MockNet {
     }
 
     fn unsupported_active_protocol_peers(&self, required_version: u32) -> usize {
-        usize::from(*self.strict_protocol_version.lock() < required_version)
+        let negotiated_version = *self.strict_protocol_version.lock();
+        let local_version = self
+            .local_strict_protocol_version
+            .lock()
+            .unwrap_or(negotiated_version);
+        let peer_versions = self.strict_peer_protocol_versions.lock().clone();
+        let participants: HashSet<_> = self
+            .strict_participants
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self.alive.lock().clone())
+            .into_iter()
+            .chain([self.self_id])
+            .collect();
+
+        participants
+            .into_iter()
+            .filter(|participant| {
+                let version = if *participant == self.self_id {
+                    local_version
+                } else {
+                    peer_versions
+                        .get(participant)
+                        .copied()
+                        .unwrap_or(negotiated_version)
+                };
+                version < required_version
+            })
+            .count()
     }
 
     fn strict_protocol_state_dir(&self) -> Option<PathBuf> {
@@ -537,10 +645,6 @@ impl StrictNet for MockNet {
 
     fn max_replication_payload_bytes(&self) -> usize {
         *self.max_replication_payload_bytes.lock()
-    }
-
-    fn disable_strict_replication_protocol(&self) {
-        *self.strict_protocol_disable_reports.lock() += 1;
     }
 
     fn report_strict_replication_repository_capability_loss(&self) {
@@ -1142,7 +1246,7 @@ mod e2e_tests {
     use super::super::proto::{
         CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp, OwnerOp, StrictBody,
     };
-    use super::super::protocol::STRICT_PROTOCOL_VERSION_CURRENT;
+    use super::super::protocol::{STRICT_PROTOCOL_VERSION_CURRENT, STRICT_PROTOCOL_VERSION_V2};
     use super::super::strict::runtime::{StrictRuntime, make_op_id};
     use super::*;
     use std::time::Duration;
@@ -1291,12 +1395,10 @@ mod e2e_tests {
     async fn strict_recv_propose_emits_ack() {
         let op_id = make_op_id(1, 1, 1);
         let net = MockNet::new(2, vec![1, 2]);
-        net.set_strict_replication_protocol_version(
-            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
-        );
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_CURRENT);
         net.set_epoch(1, 1);
         net.set_epoch(2, 100);
-        let repo = CountingStrictRepo::new();
+        let repo = CountingStrictRepo::new_current();
         let rt = StrictRuntime::new(
             repo,
             2,
@@ -1320,7 +1422,7 @@ mod e2e_tests {
                 ts_propose: 50,
                 op_msgpack: Bytes::from(rmp_serde::to_vec(&7u64).unwrap()),
                 src_clock: 50,
-                protocol_version: crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+                protocol_version: STRICT_PROTOCOL_VERSION_V2,
                 frozen_targets: vec![
                     super::super::proto::StrictFrozenTarget {
                         node: 1,
@@ -1377,15 +1479,13 @@ mod e2e_tests {
     async fn strict_recv_propose_broadcasts_ack_when_initial_unicast_fails() {
         let op_id = make_op_id(1, 1, 2);
         let net = MockNet::new(2, vec![1, 2]);
-        net.set_strict_replication_protocol_version(
-            crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
-        );
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_CURRENT);
         net.set_epoch(1, 1);
         net.set_epoch(2, 100);
         net.fail_strict_unicasts_to([1]);
         let shutdown = CancellationToken::new();
         let rt = StrictRuntime::new(
-            CountingStrictRepo::new(),
+            CountingStrictRepo::new_current(),
             2,
             100,
             "channels".into(),
@@ -1406,7 +1506,7 @@ mod e2e_tests {
                 ts_propose: 50,
                 op_msgpack: Bytes::from(rmp_serde::to_vec(&7u64).unwrap()),
                 src_clock: 50,
-                protocol_version: crate::overlay::STRICT_REPLICATION_PROTOCOL_VERSION,
+                protocol_version: STRICT_PROTOCOL_VERSION_V2,
                 frozen_targets: vec![
                     super::super::proto::StrictFrozenTarget {
                         node: 1,

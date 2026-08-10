@@ -968,7 +968,7 @@ async fn distribution_tree_epoch_is_stable_across_metric_churn() {
         "source LSA did not advertise the injected RTT churn"
     );
 
-    let publishes_before = distribution_event_total(&cluster, 1, "control_publish");
+    let publishes_before = source.overlay.distribution_control_publish_count_for_test();
     source
         .overlay
         .send_multicast_tree_unordered_with_routing_metric_and_group_options(
@@ -990,7 +990,7 @@ async fn distribution_tree_epoch_is_stable_across_metric_churn() {
         .expect("receiver capture closed");
     assert_eq!(&msg.body[..], b"stable-epoch");
     assert_eq!(
-        distribution_event_total(&cluster, 1, "control_publish"),
+        source.overlay.distribution_control_publish_count_for_test(),
         publishes_before,
         "metric-only churn published a new distribution tree"
     );
