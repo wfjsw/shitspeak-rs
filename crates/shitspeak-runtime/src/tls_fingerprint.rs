@@ -1,6 +1,8 @@
 use std::io;
+use std::io::Cursor;
 
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 const TLS_HANDSHAKE_RECORD: u8 = 22;
 const TLS_CLIENT_HELLO_HANDSHAKE: u8 = 1;
@@ -8,8 +10,6 @@ const TLS_EXTENSION_SERVER_NAME: u16 = 0;
 const TLS_EXTENSION_ALPN: u16 = 16;
 const TLS_EXTENSION_SIGNATURE_ALGORITHMS: u16 = 13;
 const TLS_EXTENSION_SUPPORTED_VERSIONS: u16 = 43;
-const INITIAL_CLIENT_HELLO_PEEK_BYTES: usize = 4096;
-const MAX_CLIENT_HELLO_PEEK_BYTES: usize = 128 * 1024;
 const MAX_HANDSHAKE_BYTES: usize = 128 * 1024;
 
 enum ClientHelloRecordParse {
@@ -65,31 +65,91 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub async fn peek_tls_ja4(tcp_stream: &TcpStream) -> io::Result<Option<String>> {
-    let mut capacity = INITIAL_CLIENT_HELLO_PEEK_BYTES;
+/// Accept a TLS connection while retaining the complete ClientHello used to
+/// derive its JA4 fingerprint.
+///
+/// The ClientHello is consumed by rustls's pre-acceptor, then its resulting
+/// state is transferred to the normal rustls handshake. This avoids the
+/// timing-dependent `TcpStream::peek` capture that could miss a fragmented
+/// ClientHello.
+pub async fn accept_tls_with_ja4<IO>(
+    mut stream: IO,
+    tls_acceptor: &TlsAcceptor,
+) -> io::Result<(TlsStream<IO>, String)>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut acceptor = rustls::server::Acceptor::default();
+    let mut tls_records = Vec::new();
+
     loop {
-        let mut buffer = vec![0u8; capacity];
-        let len = tcp_stream.peek(&mut buffer).await?;
-        if len == 0 {
-            return Ok(None);
+        let mut record_header = [0u8; 5];
+        stream.read_exact(&mut record_header).await?;
+        if record_header[0] != TLS_HANDSHAKE_RECORD {
+            return Err(invalid_client_hello(
+                "TLS ClientHello did not begin with a handshake record",
+            ));
+        }
+        let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
+        let record_end = tls_records
+            .len()
+            .checked_add(record_header.len())
+            .and_then(|len| len.checked_add(record_len))
+            .ok_or_else(|| invalid_client_hello("TLS ClientHello size overflow"))?;
+        if record_end > MAX_HANDSHAKE_BYTES {
+            return Err(invalid_client_hello(
+                "TLS ClientHello exceeds the size limit",
+            ));
         }
 
-        match parse_tls_client_hello_records(&buffer[..len]) {
-            ClientHelloRecordParse::Complete(handshake) => {
-                return Ok(
-                    parse_client_hello(&handshake).map(|hello| ja4_from_client_hello(&hello))
-                );
+        let mut record = Vec::with_capacity(record_header.len() + record_len);
+        record.extend_from_slice(&record_header);
+        record.resize(record_header.len() + record_len, 0);
+        stream
+            .read_exact(&mut record[record_header.len()..])
+            .await?;
+        tls_records.extend_from_slice(&record);
+
+        let mut record_reader = Cursor::new(record.as_slice());
+        while (record_reader.position() as usize) < record.len() {
+            let bytes_read = acceptor.read_tls(&mut record_reader)?;
+            if bytes_read == 0 {
+                return Err(invalid_client_hello(
+                    "rustls stopped reading the TLS ClientHello record",
+                ));
             }
-            ClientHelloRecordParse::Invalid => return Ok(None),
-            ClientHelloRecordParse::Incomplete if len < capacity => return Ok(None),
-            ClientHelloRecordParse::Incomplete => {
-                if capacity >= MAX_CLIENT_HELLO_PEEK_BYTES {
-                    return Ok(None);
-                }
-                capacity = (capacity * 2).min(MAX_CLIENT_HELLO_PEEK_BYTES);
+        }
+
+        match acceptor.accept() {
+            Ok(Some(accepted)) => {
+                let ClientHelloRecordParse::Complete(handshake) =
+                    parse_tls_client_hello_records(&tls_records)
+                else {
+                    return Err(invalid_client_hello(
+                        "rustls accepted a ClientHello that could not be fingerprinted",
+                    ));
+                };
+                let client_hello = parse_client_hello(&handshake).ok_or_else(|| {
+                    invalid_client_hello("could not parse the accepted TLS ClientHello")
+                })?;
+                let tls_ja4 = ja4_from_client_hello(&client_hello);
+                let tls_stream = tokio_rustls::server::StartHandshake::from_parts(accepted, stream)
+                    .into_stream(tls_acceptor.config().clone())
+                    .await?;
+                return Ok((tls_stream, tls_ja4));
+            }
+            Ok(None) => {}
+            Err((error, _alert)) => {
+                return Err(invalid_client_hello(format!(
+                    "rustls rejected the TLS ClientHello: {error}"
+                )));
             }
         }
     }
+}
+
+fn invalid_client_hello(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 fn parse_tls_client_hello_records(input: &[u8]) -> ClientHelloRecordParse {
@@ -362,6 +422,57 @@ fn read_u24(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use rustls::RootCertStore;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+    use tokio_rustls::TlsConnector;
+
+    struct FragmentingIo {
+        inner: DuplexStream,
+        max_write_bytes: usize,
+    }
+
+    impl FragmentingIo {
+        fn new(inner: DuplexStream, max_write_bytes: usize) -> Self {
+            Self {
+                inner,
+                max_write_bytes,
+            }
+        }
+    }
+
+    impl AsyncRead for FragmentingIo {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FragmentingIo {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let len = buf.len().min(self.max_write_bytes);
+            Pin::new(&mut self.inner).poll_write(cx, &buf[..len])
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     #[test]
     fn ja4_excludes_sni_from_count_and_hash() {
@@ -386,6 +497,47 @@ mod tests {
         assert_eq!(
             ja4_from_client_hello(&without_sni),
             ja4_from_client_hello(&with_sni)
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_client_hello_is_fingerprinted_before_tls_accept() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate test certificate");
+        let cert_pem = certificate.cert.pem();
+        let cert_der = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+            .next()
+            .expect("certificate PEM entry")
+            .expect("parse certificate PEM");
+        let key_pem = certificate.key_pair.serialize_pem();
+        let key_der = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).expect("parse key PEM");
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("build server TLS config");
+        let server_acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).expect("add test certificate as root");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client_connector = TlsConnector::from(Arc::new(client_config));
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_handshake = accept_tls_with_ja4(server_io, &server_acceptor);
+        let client_handshake = client_connector.connect(
+            ServerName::try_from("localhost").expect("static server name"),
+            FragmentingIo::new(client_io, 1),
+        );
+        let (server_result, client_result) = tokio::join!(server_handshake, client_handshake);
+
+        let (_server_tls, tls_ja4) = server_result.expect("server TLS handshake");
+        let _client_tls = client_result.expect("client TLS handshake");
+        assert!(
+            tls_ja4.starts_with("t13x"),
+            "fragmented TLS ClientHello JA4: {tls_ja4}"
         );
     }
 

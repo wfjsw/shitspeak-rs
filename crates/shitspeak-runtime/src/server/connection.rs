@@ -899,13 +899,13 @@ impl Server {
             uses_proxy_protocol,
             "TLS handshake starting"
         );
-        let tls_ja4 = crate::tls_fingerprint::peek_tls_ja4(&tcp_stream).await?;
         let tls_acceptor = self.tls_acceptor.read().clone();
         // A slow/failed TLS handshake must not hold a connection slot (and a
-        // task) indefinitely: cap it with a deadline.
-        let tls_stream = tokio::time::timeout(
+        // task) indefinitely: cap ClientHello capture and the TLS handshake
+        // together with one deadline.
+        let (tls_stream, tls_ja4) = tokio::time::timeout(
             crate::rate_limits::TLS_HANDSHAKE_TIMEOUT,
-            tls_acceptor.accept(tcp_stream),
+            crate::tls_fingerprint::accept_tls_with_ja4(tcp_stream, &tls_acceptor),
         )
         .await
         .map_err(|_| {
@@ -931,7 +931,7 @@ impl Server {
                     client_addr,
                     local_addr,
                     server_id,
-                    tls_ja4,
+                    Some(tls_ja4),
                     uses_proxy_protocol,
                 );
                 if let Some(handler) = self.extensions.handle_c2s_alpn_stream(
@@ -963,7 +963,7 @@ impl Server {
             client_addr,
             local_addr,
             server_id,
-            tls_ja4,
+            Some(tls_ja4),
             uses_proxy_protocol,
         )
         .await
