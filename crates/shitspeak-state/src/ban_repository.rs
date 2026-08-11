@@ -242,7 +242,10 @@ impl BanLookupIndex {
 
         for entry in self.entries.values() {
             let expiry = ban_expiry(entry);
-            if entry.ban_ip {
+            // A default-route CIDR would ban every address in its family. Keep
+            // the entry for any independent identity criterion, but never
+            // index it as an IP ban.
+            if entry.ban_ip && entry.mask != 0 {
                 match entry.address {
                     IpAddr::V4(address) => {
                         let mask = entry.mask.min(IPV4_PREFIX_COUNT);
@@ -1830,6 +1833,81 @@ mod tests {
         repo.remove_ban(entry.address, entry.mask).await.unwrap();
         assert!(!repo.is_banned("198.51.100.42".parse().unwrap()).await);
         assert!(!repo.has_active_asn_bans());
+    }
+
+    #[tokio::test]
+    async fn default_route_ip_bans_are_ignored_but_normal_cidrs_are_enforced() {
+        let temp = tempfile::tempdir().unwrap();
+        let start = chrono::Utc::now().timestamp();
+        {
+            let repo = BanRepository::open(1, temp.path()).await.unwrap();
+            repo.add_ban(BanEntry {
+                address: "::".parse().unwrap(),
+                mask: 0,
+                name: None,
+                hash: None,
+                ban_certificate: false,
+                ban_ip: true,
+                reason: None,
+                start,
+                duration: 0,
+            })
+            .await
+            .unwrap();
+            repo.add_ban(BanEntry {
+                address: "0.0.0.0".parse().unwrap(),
+                mask: 0,
+                name: None,
+                hash: None,
+                ban_certificate: false,
+                ban_ip: true,
+                reason: None,
+                start,
+                duration: 0,
+            })
+            .await
+            .unwrap();
+            repo.add_ban(BanEntry {
+                address: "2001:db8:1234:5678::".parse().unwrap(),
+                mask: 64,
+                name: None,
+                hash: None,
+                ban_certificate: false,
+                ban_ip: true,
+                reason: None,
+                start,
+                duration: 0,
+            })
+            .await
+            .unwrap();
+            repo.add_ban(BanEntry {
+                address: "198.51.100.0".parse().unwrap(),
+                mask: 24,
+                name: None,
+                hash: None,
+                ban_certificate: false,
+                ban_ip: true,
+                reason: None,
+                start,
+                duration: 0,
+            })
+            .await
+            .unwrap();
+        }
+
+        let repo = BanRepository::open(1, temp.path()).await.unwrap();
+
+        assert!(
+            repo.is_banned("2001:db8:1234:5678::99".parse().unwrap())
+                .await
+        );
+        assert!(
+            !repo
+                .is_banned("2603:8081:1607:f280:20d6:d7fb:ad37:3e22".parse().unwrap())
+                .await
+        );
+        assert!(repo.is_banned("198.51.100.42".parse().unwrap()).await);
+        assert!(!repo.is_banned("203.0.113.42".parse().unwrap()).await);
     }
 
     #[tokio::test]

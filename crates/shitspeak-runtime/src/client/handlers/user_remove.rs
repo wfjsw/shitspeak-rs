@@ -10,6 +10,10 @@ use crate::{
     server::Server,
 };
 
+use super::{
+    BAN_REPOSITORY_REQUEST_ADMITTED, BAN_REPOSITORY_REQUEST_SUBMITTED, send_ban_repository_notice,
+};
+
 pub async fn handle_user_remove(
     server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
@@ -145,10 +149,20 @@ pub async fn handle_user_remove(
         let op = BanOp::AddBan {
             entry: entry.clone(),
         };
-        if !server.s2s_manager().propose_ban_op(op).await {
-            if let Err(e) = server.get_bans().add_ban(entry).await {
-                tracing::warn!("Failed to persist ban: {e}");
+        send_ban_repository_notice(sender, BAN_REPOSITORY_REQUEST_SUBMITTED).await?;
+        let admitted = if server.s2s_manager().propose_ban_op(op).await {
+            true
+        } else {
+            match server.get_bans().add_ban(entry).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!("Failed to persist ban: {error}");
+                    false
+                }
             }
+        };
+        if admitted {
+            send_ban_repository_notice(sender, BAN_REPOSITORY_REQUEST_ADMITTED).await?;
         }
         tracing::info!(
             "Ban added for session {:?} by {:?}: {}",

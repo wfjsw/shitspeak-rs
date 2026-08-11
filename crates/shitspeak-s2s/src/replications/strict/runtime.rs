@@ -24882,6 +24882,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quorum_certified_local_head_dedupes_repeated_foreign_checkpoint() {
+        let interval = Duration::from_millis(1);
+        let (rt, net, _repo) =
+            v1_runtime(ReplicationConfig::default().with_strict_bootstrap_retry_interval(interval));
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V8);
+        net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V8));
+        for peer in [2, 3] {
+            net.set_peer_strict_replication_protocol_version(peer, STRICT_PROTOCOL_VERSION_V8);
+            net.set_epoch(peer, 1);
+        }
+        net.set_alive(vec![1, 2, 3]);
+        net.set_live_reliable_routes([1, 2, 3]);
+
+        rt.with_terminal_journal_mutation(|journal| journal.upsert_abort_decision((2, 1), 1))
+            .await
+            .expect("local terminal fixture");
+        let (local_metadata, local_cut) = rt.recovery_advertised_head().await;
+        let target = LogicalTarget::new(
+            local_metadata.version,
+            local_metadata.freshness,
+            *local_cut.terminal_set_digest(),
+        );
+        for peer in [2, 3] {
+            rt.record_recovery_target_witness_for_test(PeerIncarnation::new(peer, 1), &target)
+                .await;
+        }
+        let remote_cut = TerminalCut::new(
+            [0xEE; JOURNAL_ID_LEN],
+            local_cut.generation().saturating_add(1),
+            [0xCC; DIGEST_LEN],
+            *local_cut.terminal_set_digest(),
+        );
+        let local_rank = HistoryRank::local(&rt);
+        let remote_rank = HistoryRank {
+            node_id: 2,
+            ..local_rank
+        };
+        let peer = PeerIncarnation::new(2, 1);
+
+        assert!(
+            rt.request_foreign_checkpoint_election(peer, remote_rank, remote_cut)
+                .await
+        );
+        tokio::time::sleep(interval + Duration::from_millis(5)).await;
+        assert!(
+            rt.request_foreign_checkpoint_election(peer, remote_rank, remote_cut)
+                .await
+        );
+        assert_eq!(
+            rt.recovery_coordinator.lock().phase(),
+            RecoveryPhase::Healthy,
+            "a stale foreign checkpoint must not restart recovery after a fast quorum confirmed the exact local head"
+        );
+        assert!(
+            rt.take_recovery_effects().is_empty(),
+            "deduped foreign evidence must not emit another recovery probe"
+        );
+    }
+
+    #[tokio::test]
     async fn foreign_checkpoint_waits_for_one_continuous_quiet_interval() {
         let interval = Duration::from_millis(80);
         let (rt, net, _repo) =

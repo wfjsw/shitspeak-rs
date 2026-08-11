@@ -10,6 +10,10 @@ use crate::{
     server::Server,
 };
 
+use super::{
+    BAN_REPOSITORY_REQUEST_ADMITTED, BAN_REPOSITORY_REQUEST_SUBMITTED, send_ban_repository_notice,
+};
+
 const BANNED_ADDRESS_LENGTH: usize = 16;
 const IPV4_MAPPED_MASK_OFFSET: u32 = 96;
 
@@ -157,10 +161,20 @@ pub async fn handle_ban_list(
         let op = BanOp::SetBans {
             entries: entries.clone(),
         };
-        if !server.s2s_manager().propose_ban_op(op).await {
-            if let Err(e) = server.get_bans().set_bans(entries).await {
-                tracing::warn!("Failed to persist ban list: {e}");
+        send_ban_repository_notice(sender, BAN_REPOSITORY_REQUEST_SUBMITTED).await?;
+        let admitted = if server.s2s_manager().propose_ban_op(op).await {
+            true
+        } else {
+            match server.get_bans().set_bans(entries).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!("Failed to persist ban list: {error}");
+                    false
+                }
             }
+        };
+        if admitted {
+            send_ban_repository_notice(sender, BAN_REPOSITORY_REQUEST_ADMITTED).await?;
         }
         tracing::info!(
             "Ban list update from session {:?} with {} entries",

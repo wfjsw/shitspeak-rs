@@ -2713,3 +2713,79 @@ async fn strict_live_channel_state_reproduces_and_resolves_dfw_jp_stall() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Ban repositories and strict terminal journals copied live through SSH"]
+async fn strict_live_ban_state_reproduces_jnb_dfw_admission_traffic() {
+    let _guard = s2s_network_test_guard().await;
+    let fixture_root = PathBuf::from(
+        std::env::var_os("SHITSPEAK_STRICT_LIVE_BAN_STATE_ROOT")
+            .expect("SHITSPEAK_STRICT_LIVE_BAN_STATE_ROOT is required"),
+    );
+    let nodes = [(8_u16, "node-4-dfw"), (15_u16, "node-15-jnb")];
+    let node_ids = nodes.map(|(node_id, _)| node_id);
+    let pki = Arc::new(mint_pki(&node_ids));
+    let addresses = join_all(node_ids.iter().map(|_| pick_free_port()))
+        .await
+        .into_iter()
+        .map(loopback)
+        .collect::<Vec<_>>();
+    let mut servers = Vec::with_capacity(nodes.len());
+    for (cert_index, (node_id, directory)) in nodes.iter().enumerate() {
+        let server = spawn_s2s_test_server_with_state(
+            TestServerOpts::default(),
+            Arc::clone(&pki),
+            *node_id,
+            cert_index,
+            production_s2s_config(addresses[cert_index], &addresses),
+            TestStrictReplicationState::from_directory(fixture_root.join(directory)),
+        )
+        .await;
+        servers.push((*node_id, server));
+    }
+    wait_for_cluster(&servers).await;
+
+    let initial_versions = servers
+        .iter()
+        .map(|(node_id, server)| (*node_id, server.server.get_bans().current_version()))
+        .collect::<HashMap<_, _>>();
+    assert_ne!(
+        initial_versions[&8], initial_versions[&15],
+        "copied incident fixture no longer has the reported Ban repository gap"
+    );
+    let sent_before = servers
+        .iter()
+        .map(|(_, server)| {
+            metric_total(
+                server,
+                "shitspeak_s2s_strict_replication_catchup_send_bytes_total",
+                &[],
+            )
+        })
+        .sum::<f64>();
+
+    tokio::time::sleep(Duration::from_secs(25)).await;
+
+    let final_versions = servers
+        .iter()
+        .map(|(node_id, server)| (*node_id, server.server.get_bans().current_version()))
+        .collect::<HashMap<_, _>>();
+    let sent_after = servers
+        .iter()
+        .map(|(_, server)| {
+            metric_total(
+                server,
+                "shitspeak_s2s_strict_replication_catchup_send_bytes_total",
+                &[],
+            )
+        })
+        .sum::<f64>();
+    assert!(
+        sent_after > sent_before,
+        "copied Ban-state replay did not issue strict catch-up traffic"
+    );
+    assert_ne!(
+        final_versions[&8], final_versions[&15],
+        "two-node Ban replay converged unexpectedly: initial={initial_versions:?}, final={final_versions:?}"
+    );
+}

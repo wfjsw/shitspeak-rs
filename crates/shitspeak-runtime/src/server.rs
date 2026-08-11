@@ -1756,7 +1756,7 @@ impl Server {
             authenticated_until,
             authentication_expiry_action,
         );
-        tracing::info!(
+        tracing::trace!(
             session = u32::from(client.get_session_id()),
             user_id = ?client.get_user_id(),
             display_name = ?client.display_name_opt(),

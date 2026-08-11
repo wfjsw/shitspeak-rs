@@ -46,10 +46,33 @@ use version::handle_version;
 use voice_target::handle_voice_target;
 
 use crate::{
+    client::Client,
     errors::{MessageHandlerError, MessageTypeNotForIncoming},
-    messages::{Message, errors::MessageProtocolError},
+    messages::{Message, encoder::TextMessage, errors::MessageProtocolError},
     server::Server,
 };
+
+pub(super) const BAN_REPOSITORY_REQUEST_SUBMITTED: &str =
+    "Ban list update submitted. Waiting for repository admission.";
+pub(super) const BAN_REPOSITORY_REQUEST_ADMITTED: &str = "Ban list update fully admitted.";
+
+pub(super) async fn send_ban_repository_notice(
+    sender: &Arc<Box<Client>>,
+    message: &'static str,
+) -> Result<(), MessageHandlerError> {
+    let notice = Message::TextMessage(
+        TextMessage {
+            actor: None,
+            session: vec![u32::from(sender.get_session_id())],
+            channel_id: Vec::new(),
+            tree_id: Vec::new(),
+            message: message.to_owned(),
+        }
+        .into(),
+    );
+    sender.write_proto_message_direct(&notice).await?;
+    Ok(())
+}
 
 fn channel_op_propose_failed(
     session: u32,

@@ -31,7 +31,9 @@ async fn moderator_can_add_ipv4_ban_from_ban_list() {
         .send(Message::BanList(shitspeak_proto::mumble_proto::BanList {
             bans: vec![shitspeak_proto::mumble_proto::ban_list::BanEntry {
                 address: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 203, 0, 113, 42],
-                mask: 24,
+                // Mumble encodes IPv4 bans as IPv4-mapped IPv6 addresses, so
+                // the 96-bit mapping prefix is included in the wire mask.
+                mask: 120,
                 name: None,
                 hash: None,
                 reason: Some("native-client regression".into()),
@@ -41,6 +43,26 @@ async fn moderator_can_add_ipv4_ban_from_ban_list() {
             query: Some(false),
         }))
         .await;
+
+    for expected in [
+        "Ban list update submitted. Waiting for repository admission.",
+        "Ban list update fully admitted.",
+    ] {
+        let notice = alice
+            .recv_until(
+                |message| matches!(message, Message::TextMessage(message) if message.message == expected),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("server should privately report ban update status");
+        let Message::TextMessage(notice) = notice else {
+            unreachable!("predicate only admits TextMessage notices");
+        };
+        assert_eq!(notice.actor, None);
+        assert_eq!(notice.session, vec![alice.session_id]);
+        assert!(notice.channel_id.is_empty());
+        assert!(notice.tree_id.is_empty());
+    }
 
     assert!(
         !alice.recv_closed(Duration::from_secs(2)).await,
@@ -490,6 +512,27 @@ async fn mod_bans_other_blocks_reconnect() {
     let bob_session = bob.session_id;
     let ban_reason = "banned for the test";
     alice.ban(bob_session, ban_reason).await;
+
+    for expected in [
+        "Ban list update submitted. Waiting for repository admission.",
+        "Ban list update fully admitted.",
+    ] {
+        let notice = alice
+            .recv_until(
+                |message| matches!(message, Message::TextMessage(message) if message.message == expected),
+                Duration::from_secs(2),
+            )
+            .await;
+        let Message::TextMessage(notice) = notice.unwrap_or_else(|| {
+            panic!("server should privately report ban request status: {expected}")
+        }) else {
+            unreachable!("predicate only admits TextMessage notices");
+        };
+        assert_eq!(notice.actor, None);
+        assert_eq!(notice.session, vec![alice.session_id]);
+        assert!(notice.channel_id.is_empty());
+        assert!(notice.tree_id.is_empty());
+    }
 
     let bob_observed = bob
         .recv_until(

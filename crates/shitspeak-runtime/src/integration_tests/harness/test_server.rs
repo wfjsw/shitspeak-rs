@@ -27,8 +27,11 @@ use shitspeak_s2s::testing::{Pki, install_provider_once, mint_pki};
 const CHANNEL_SNAPSHOT_FILE: &str = "channels.snapshot.json";
 const CHANNEL_WAL_FILE: &str = "channels.wal.jsonl";
 const CHANNEL_TERMINAL_FIXTURE_FILE: &str = "terminal-channels.sqlite3";
+const BANS_FIXTURE_FILE: &str = "bans.sqlite3";
+const BANS_TERMINAL_FIXTURE_FILE: &str = "terminal-bans.sqlite3";
 const STRICT_TERMINAL_JOURNAL_DIRECTORY: &str = "strict-terminal-journal";
 const CHANNEL_REPLICATION_TOPIC: &str = "channels";
+const BANS_REPLICATION_TOPIC: &str = "bans";
 
 #[derive(Debug, Clone)]
 pub struct TestServerOpts {
@@ -204,36 +207,59 @@ impl TestStrictReplicationState {
         blob_storage_directory: &Path,
         s2s_persistence_directory: &Path,
     ) -> std::io::Result<()> {
-        copy_fixture_file(
-            &self.source_directory,
-            CHANNEL_SNAPSHOT_FILE,
-            blob_storage_directory.join(CHANNEL_SNAPSHOT_FILE),
-        )?;
-        copy_fixture_file(
-            &self.source_directory,
-            CHANNEL_WAL_FILE,
-            blob_storage_directory.join(CHANNEL_WAL_FILE),
-        )?;
-
-        let terminal_path =
-            s2s_persistence_directory.join(strict_channel_terminal_journal_relative_path());
-        let terminal_directory = terminal_path
-            .parent()
-            .expect("strict channel terminal journal has a parent directory");
-        std::fs::create_dir_all(&terminal_directory)?;
-        copy_sqlite_main_image(
-            &self.source_directory.join(CHANNEL_TERMINAL_FIXTURE_FILE),
-            &terminal_path,
-        )?;
+        if self.source_directory.join(CHANNEL_SNAPSHOT_FILE).is_file() {
+            copy_fixture_file(
+                &self.source_directory,
+                CHANNEL_SNAPSHOT_FILE,
+                blob_storage_directory.join(CHANNEL_SNAPSHOT_FILE),
+            )?;
+            copy_fixture_file(
+                &self.source_directory,
+                CHANNEL_WAL_FILE,
+                blob_storage_directory.join(CHANNEL_WAL_FILE),
+            )?;
+            stage_terminal_fixture(
+                &self.source_directory.join(CHANNEL_TERMINAL_FIXTURE_FILE),
+                s2s_persistence_directory,
+                CHANNEL_REPLICATION_TOPIC,
+            )?;
+        }
+        if self.source_directory.join(BANS_FIXTURE_FILE).is_file() {
+            copy_fixture_file(
+                &self.source_directory,
+                BANS_FIXTURE_FILE,
+                blob_storage_directory.join("bans.db"),
+            )?;
+            stage_terminal_fixture(
+                &self.source_directory.join(BANS_TERMINAL_FIXTURE_FILE),
+                s2s_persistence_directory,
+                BANS_REPLICATION_TOPIC,
+            )?;
+        }
         Ok(())
     }
 }
 
 fn strict_channel_terminal_journal_relative_path() -> PathBuf {
-    PathBuf::from(STRICT_TERMINAL_JOURNAL_DIRECTORY).join(format!(
-        "topic-{}.sqlite3",
-        hex::encode(CHANNEL_REPLICATION_TOPIC.as_bytes())
-    ))
+    strict_terminal_journal_relative_path(CHANNEL_REPLICATION_TOPIC)
+}
+
+fn strict_terminal_journal_relative_path(topic: &str) -> PathBuf {
+    PathBuf::from(STRICT_TERMINAL_JOURNAL_DIRECTORY)
+        .join(format!("topic-{}.sqlite3", hex::encode(topic.as_bytes())))
+}
+
+fn stage_terminal_fixture(
+    source: &Path,
+    persistence_directory: &Path,
+    topic: &str,
+) -> std::io::Result<()> {
+    let destination = persistence_directory.join(strict_terminal_journal_relative_path(topic));
+    let directory = destination
+        .parent()
+        .expect("strict terminal journal has a parent directory");
+    std::fs::create_dir_all(directory)?;
+    copy_sqlite_main_image(source, &destination)
 }
 
 fn copy_fixture_file(
