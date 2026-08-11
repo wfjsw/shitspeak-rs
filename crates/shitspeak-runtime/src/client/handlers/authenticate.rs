@@ -51,17 +51,6 @@ pub async fn handle_authenticate(
         "Authenticate handler"
     );
 
-    // An expiry-triggered reauthentication owns the credential exchange.
-    // Ignore client Authenticate messages until that bounded backend call
-    // completes so they cannot start a second full login path concurrently.
-    if sender.is_reauthentication_in_progress() {
-        tracing::debug!(
-            session = u32::from(session),
-            "ignoring Authenticate while server reauthentication is in progress"
-        );
-        return Ok(());
-    }
-
     // ── Token-update path ─────────────────────────────────────────────────
     // An already-authenticated client can send Authenticate again to update
     // its access tokens.
@@ -82,6 +71,18 @@ pub async fn handle_authenticate(
         );
         return Ok(());
     }
+
+    // An expiry-triggered reauthentication owns the credential exchange.
+    // Ignore client Authenticate messages until that bounded backend call
+    // completes so they cannot start a second full login path concurrently.
+    if sender.is_reauthentication_in_progress() {
+        tracing::debug!(
+            session = u32::from(session),
+            "ignoring Authenticate while server reauthentication is in progress"
+        );
+        return Ok(());
+    }
+
 
     // ── Username required ─────────────────────────────────────────────────
     let username = msg.username.ok_or(RejectType::InvalidUsername)?;
