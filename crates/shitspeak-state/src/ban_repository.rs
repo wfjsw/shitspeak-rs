@@ -728,6 +728,13 @@ impl BanRepository {
     /// Check whether an IP address is banned.
     pub async fn is_banned(&self, addr: IpAddr) -> bool {
         let now = chrono::Utc::now().timestamp();
+        let addr = match addr {
+            IpAddr::V4(address) => IpAddr::V4(address),
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(address)),
+        };
         self.lookup_index.read().is_ip_banned(addr, now)
     }
 
@@ -1808,6 +1815,32 @@ mod tests {
         let repo = BanRepository::open(1, temp.path()).await.unwrap();
         assert!(!repo.is_banned("198.51.100.42".parse().unwrap()).await);
         assert!(!repo.is_identity_banned(Some("not-a-ban"), None));
+    }
+
+    #[tokio::test]
+    async fn reloaded_ipv4_cidr_bans_ipv4_mapped_ipv6_addresses() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let repo = BanRepository::open(1, temp.path()).await.unwrap();
+            repo.add_ban(BanEntry {
+                address: "81.68.0.0".parse().unwrap(),
+                mask: 14,
+                name: None,
+                hash: None,
+                ban_certificate: false,
+                ban_ip: true,
+                reason: None,
+                start: chrono::Utc::now().timestamp(),
+                duration: 0,
+            })
+            .await
+            .unwrap();
+        }
+
+        let repo = BanRepository::open(1, temp.path()).await.unwrap();
+        assert!(repo.is_banned("81.68.42.99".parse().unwrap()).await);
+        assert!(repo.is_banned("::ffff:81.68.42.99".parse().unwrap()).await);
+        assert!(!repo.is_banned("::ffff:81.72.0.1".parse().unwrap()).await);
     }
 
     #[tokio::test]

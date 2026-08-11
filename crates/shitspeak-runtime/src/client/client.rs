@@ -1364,7 +1364,13 @@ impl Client {
     }
 
     pub fn get_real_ip_address(&self) -> IpAddr {
-        self.real_ip_address
+        match self.real_ip_address {
+            IpAddr::V4(address) => IpAddr::V4(address),
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(address)),
+        }
     }
 
     pub(crate) fn tracing_span(&self) -> tracing::Span {
@@ -2510,7 +2516,25 @@ fn transport_closed_error() -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn real_ip_getter_unmaps_ipv4_mapped_ipv6_addresses() {
+        let mapped_address = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x5144, 0x2a63));
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        let client = Client::new_web_gateway(
+            ClientSessionIdentifier::from(0x0002_0001),
+            mapped_address,
+            SocketAddr::new(mapped_address, 64738),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            outbound_tx,
+        );
+
+        assert_eq!(
+            client.get_real_ip_address(),
+            IpAddr::V4(Ipv4Addr::new(81, 68, 42, 99))
+        );
+    }
 
     #[test]
     fn request_blob_queue_is_lazy_fifo_bounded_and_releases_after_drain() {
