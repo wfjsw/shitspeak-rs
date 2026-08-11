@@ -1728,14 +1728,15 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
                 donor: donor.clone(),
             });
         }
-        rt.finish_authoritative_recovery_install();
         if rt.recovery_coordinator.lock().phase()
             != super::recovery_reducer::RecoveryPhase::Verifying
         {
+            rt.finish_authoritative_recovery_install();
             schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
             return;
         }
         let Some(verifying_attempt) = durable_attempt(&rt) else {
+            rt.finish_authoritative_recovery_install();
             schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
             return;
         };
@@ -1746,6 +1747,7 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
             .await
         {
             rt.record_terminal_journal_failure(&error);
+            rt.finish_authoritative_recovery_install();
             schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
             return;
         }
@@ -1764,6 +1766,7 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
             Ok(completed) => completed,
             Err(error) => {
                 rt.record_terminal_journal_failure(&error);
+                rt.finish_authoritative_recovery_install();
                 schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
                 return;
             }
@@ -1784,7 +1787,9 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
                 ),
             });
             let _ = delete_recovery_staging_artifact(intent.staging_path());
+            rt.finish_authoritative_recovery_install();
         } else {
+            rt.finish_authoritative_recovery_install();
             schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
         }
     });
@@ -2035,7 +2040,6 @@ async fn install<R: StrictReplicable>(
         attempt,
         donor: donor.clone(),
     });
-    rt.finish_authoritative_recovery_install();
     finalize_install(rt, attempt, donor).await;
 }
 
@@ -2073,14 +2077,17 @@ async fn finalize_install<R: StrictReplicable>(
             || coordinator.phase() != RecoveryPhase::Verifying
             || coordinator.donor() != Some(&donor)
         {
+            rt.finish_authoritative_recovery_install();
             return;
         }
         let clients = rt.recovery_v8.clients.lock();
         let Some(client) = clients.get(&attempt) else {
+            rt.finish_authoritative_recovery_install();
             schedule_local_install_retry(rt, attempt, donor);
             return;
         };
         let Some((path, manifest)) = client.staging.clone() else {
+            rt.finish_authoritative_recovery_install();
             schedule_local_install_retry(rt, attempt, donor);
             return;
         };
@@ -2091,11 +2098,13 @@ async fn finalize_install<R: StrictReplicable>(
         freshness: target.history_freshness(),
     };
     let Ok(verified_artifact) = verify_recovery_staging_artifact(&path, manifest) else {
+        rt.finish_authoritative_recovery_install();
         schedule_local_install_retry(rt, attempt, donor);
         return;
     };
     let Ok(decoded) = decode_s2s_snapshot_envelope(verified_artifact.into_repository_image())
     else {
+        rt.finish_authoritative_recovery_install();
         schedule_local_install_retry(rt, attempt, donor);
         return;
     };
@@ -2104,6 +2113,7 @@ async fn finalize_install<R: StrictReplicable>(
         &decoded.applied_operations,
         &decoded.retired_operations,
     ) {
+        rt.finish_authoritative_recovery_install();
         schedule_local_install_retry(rt, attempt, donor);
         return;
     }
@@ -2117,10 +2127,12 @@ async fn finalize_install<R: StrictReplicable>(
             .installed_delivery_checkpoint_matches(&expected_applied, &expected_retired)
             .await
     {
+        rt.finish_authoritative_recovery_install();
         schedule_local_install_retry(rt, attempt, donor);
         return;
     }
     let Some(verifying_attempt) = durable_attempt(rt) else {
+        rt.finish_authoritative_recovery_install();
         schedule_local_install_retry(rt, attempt, donor);
         return;
     };
@@ -2131,6 +2143,7 @@ async fn finalize_install<R: StrictReplicable>(
         .await
     {
         rt.record_terminal_journal_failure(&error);
+        rt.finish_authoritative_recovery_install();
         schedule_local_install_retry(rt, attempt, donor);
         return;
     }
@@ -2149,6 +2162,7 @@ async fn finalize_install<R: StrictReplicable>(
         Ok(finalized) => finalized,
         Err(error) => {
             rt.record_terminal_journal_failure(&error);
+            rt.finish_authoritative_recovery_install();
             schedule_local_install_retry(rt, attempt, donor);
             return;
         }
@@ -2163,7 +2177,9 @@ async fn finalize_install<R: StrictReplicable>(
         });
         let _ = delete_recovery_staging_artifact(&path);
         rt.recovery_v8.clients.lock().remove(&attempt);
+        rt.finish_authoritative_recovery_install();
     } else {
+        rt.finish_authoritative_recovery_install();
         schedule_local_install_retry(rt, attempt, donor);
     }
 }

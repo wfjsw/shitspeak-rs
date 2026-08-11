@@ -488,6 +488,18 @@ fn fixture_history_freshness(directory: &Path) -> i64 {
     freshness
 }
 
+fn ban_fixture_version(directory: &Path) -> u64 {
+    let connection =
+        Connection::open(directory.join("bans.sqlite3")).expect("open copied Ban repository");
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM ban_operations",
+            [],
+            |row| row.get::<_, i64>(0).map(|version| version.max(0) as u64),
+        )
+        .expect("read copied Ban repository version")
+}
+
 fn configured_active_node_ids() -> Vec<u16> {
     let configured = std::env::var("SHITSPEAK_STRICT_LIVE_ACTIVE_NODE_IDS")
         .expect("SHITSPEAK_STRICT_LIVE_ACTIVE_NODE_IDS is required");
@@ -2765,6 +2777,16 @@ async fn strict_live_ban_state_resolves_jnb_dfw_staged_recovery() {
         captured_dfw_terminal.repository_image_install_pending,
         "the captured DFW Ban recovery must begin with its repository image pending"
     );
+    assert_eq!(
+        ban_fixture_version(&fixture_root.join("node-4-dfw")),
+        7,
+        "the copied DFW Ban repository must begin with the untagged incident v7 image"
+    );
+    assert_eq!(
+        ban_fixture_version(&fixture_root.join("node-15-jnb")),
+        certified_version,
+        "the copied JNB Ban repository must retain the certified recovery image"
+    );
     let node_ids = nodes.map(|(node_id, _)| node_id);
     let pki = Arc::new(mint_pki(&node_ids));
     let addresses = join_all(node_ids.iter().map(|_| pick_free_port()))
@@ -2787,21 +2809,17 @@ async fn strict_live_ban_state_resolves_jnb_dfw_staged_recovery() {
     }
     wait_for_cluster(&servers).await;
 
-    let initial_versions = servers
+    let startup_versions = servers
         .iter()
         .map(|(node_id, server)| (*node_id, server.server.get_bans().current_version()))
         .collect::<HashMap<_, _>>();
     assert_eq!(
-        initial_versions[&15], 5,
-        "the captured JNB Ban head must retain its recorded pre-recovery v5 image"
+        startup_versions[&15], certified_version,
+        "JNB must retain the certified recovery image after startup"
     );
     assert_eq!(
-        initial_versions[&8], 7,
-        "the captured DFW Ban head must be the untagged incident v7 image"
-    );
-    assert!(
-        initial_versions[&8] > certified_version,
-        "copied incident fixture no longer has the reported DFW Ban head ahead of JNB"
+        startup_versions[&8], certified_version,
+        "DFW must replace its untagged v7 image from the certified recovery artifact at startup"
     );
 
     assert!(
@@ -2825,6 +2843,16 @@ async fn strict_live_ban_state_resolves_jnb_dfw_staged_recovery() {
     let dfw_terminal_path = dfw
         .strict_terminal_journal_path("bans")
         .expect("DFW durable Ban terminal journal");
+    let durable_install_completed = wait_until(CONVERGENCE_DEADLINE, || {
+        read_terminal_status(&dfw_terminal_path)
+            .is_ok_and(|terminal| !terminal.repository_image_install_pending)
+    })
+    .await;
+    assert!(
+        durable_install_completed,
+        "DFW did not durably complete its Ban repository-image install: {:?}",
+        read_terminal_status(&dfw_terminal_path)
+    );
     let dfw_terminal = read_terminal_status(&dfw_terminal_path)
         .expect("read DFW Ban terminal status after recovery");
     assert_eq!(

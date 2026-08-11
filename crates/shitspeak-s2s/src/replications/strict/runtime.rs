@@ -4308,6 +4308,9 @@ pub struct StrictRuntime<R: StrictReplicable> {
     #[cfg(test)]
     delivery_after_repository_apply_hook:
         Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    #[cfg(test)]
+    authoritative_recovery_install_after_apply_hook:
+        Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 pub(super) struct SnapshotCaptureGuard<'a> {
@@ -4844,7 +4847,10 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         if self
             .authoritative_recovery_install_in_progress
             .load(Ordering::Acquire)
-            && !matches!(event, RecoveryEvent::Installed { .. })
+            && !matches!(
+                event,
+                RecoveryEvent::Installed { .. } | RecoveryEvent::Verified { .. }
+            )
         {
             self.deferred_authoritative_recovery_events
                 .lock()
@@ -5468,9 +5474,32 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             .repo
             .install_authoritative_recovery_snapshot(version, snapshot)
             .await;
+        #[cfg(test)]
+        self.wait_authoritative_recovery_install_after_apply().await;
         self.refresh_repository_terminal_head_after_repository_mutation(&mut head)
             .await;
         result
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_authoritative_recovery_install_after_apply(
+        &self,
+        reached: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    ) {
+        *self.authoritative_recovery_install_after_apply_hook.lock() = Some((reached, resume));
+    }
+
+    #[cfg(test)]
+    async fn wait_authoritative_recovery_install_after_apply(&self) {
+        let hook = self
+            .authoritative_recovery_install_after_apply_hook
+            .lock()
+            .take();
+        if let Some((reached, resume)) = hook {
+            let _ = reached.send(());
+            let _ = resume.await;
+        }
     }
 
     async fn maybe_checkpoint_terminal_journal(&self) {
@@ -5905,6 +5934,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             head_snapshot_after_boundary_acquired_hook: Mutex::new(None),
             #[cfg(test)]
             delivery_after_repository_apply_hook: Mutex::new(None),
+            #[cfg(test)]
+            authoritative_recovery_install_after_apply_hook: Mutex::new(None),
         });
         if let Some(violation) = arc.first_terminal_record_exceeding_catchup_budget() {
             // The journal remains authoritative for local delivery, but a

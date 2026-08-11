@@ -29,6 +29,11 @@ const CHANNEL_WAL_FILE: &str = "channels.wal.jsonl";
 const CHANNEL_TERMINAL_FIXTURE_FILE: &str = "terminal-channels.sqlite3";
 const BANS_FIXTURE_FILE: &str = "bans.sqlite3";
 const BANS_TERMINAL_FIXTURE_FILE: &str = "terminal-bans.sqlite3";
+/// The production recovery-stage pathname is node-local.  Fixtures keep its
+/// bytes under this stable name; staging rewrites the durable intent to the
+/// temporary test node's path before the runtime opens the journal.
+const BANS_RECOVERY_ARTIFACT_FIXTURE_FILE: &str = "recovery-bans.stage";
+const BANS_STAGED_RECOVERY_ARTIFACT_FILE: &str = "strict-recovery-bans.stage";
 const STRICT_TERMINAL_JOURNAL_DIRECTORY: &str = "strict-terminal-journal";
 const CHANNEL_REPLICATION_TOPIC: &str = "channels";
 const BANS_REPLICATION_TOPIC: &str = "bans";
@@ -229,19 +234,62 @@ impl TestStrictReplicationState {
             )?;
         }
         if self.source_directory.join(BANS_FIXTURE_FILE).is_file() {
-            copy_fixture_file(
-                &self.source_directory,
-                BANS_FIXTURE_FILE,
-                blob_storage_directory.join("bans.db"),
+            // A copied production Ban database can still have its newest
+            // image in SQLite's WAL.  Serialize through SQLite so the staged
+            // test database includes that image before the runtime starts.
+            copy_sqlite_main_image(
+                &self.source_directory.join(BANS_FIXTURE_FILE),
+                &blob_storage_directory.join("bans.db"),
             )?;
             stage_terminal_fixture(
                 &self.source_directory.join(BANS_TERMINAL_FIXTURE_FILE),
                 s2s_persistence_directory,
                 BANS_REPLICATION_TOPIC,
             )?;
+            stage_bans_recovery_artifact(&self.source_directory, s2s_persistence_directory)?;
         }
         Ok(())
     }
+}
+
+fn stage_bans_recovery_artifact(
+    source_directory: &Path,
+    persistence_directory: &Path,
+) -> std::io::Result<()> {
+    let source = source_directory.join(BANS_RECOVERY_ARTIFACT_FIXTURE_FILE);
+    if !source.is_file() {
+        return Ok(());
+    }
+
+    let destination = persistence_directory.join(BANS_STAGED_RECOVERY_ARTIFACT_FILE);
+    std::fs::copy(&source, &destination)?;
+    let terminal_path = persistence_directory.join(strict_terminal_journal_relative_path(
+        BANS_REPLICATION_TOPIC,
+    ));
+    rewrite_recovery_artifact_staging_path(&terminal_path, &destination)
+}
+
+fn rewrite_recovery_artifact_staging_path(
+    terminal_path: &Path,
+    staging_path: &Path,
+) -> std::io::Result<()> {
+    let staging_path = rmp_serde::to_vec_named(staging_path).map_err(std::io::Error::other)?;
+    let connection = rusqlite::Connection::open(terminal_path).map_err(std::io::Error::other)?;
+    let updated = connection
+        .execute(
+            "UPDATE strict_recovery_artifact SET staging_path = ?1 WHERE singleton = 1",
+            [staging_path],
+        )
+        .map_err(std::io::Error::other)?;
+    if updated != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Ban recovery artifact fixture exists but {terminal_path:?} has no durable artifact intent"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn strict_channel_terminal_journal_relative_path() -> PathBuf {
@@ -689,6 +737,106 @@ mod tests {
         assert_eq!(
             std::fs::read(source_terminal.with_extension("sqlite3-wal")).unwrap(),
             source_wal
+        );
+    }
+
+    #[test]
+    fn strict_replication_state_stages_ban_recovery_artifact_at_the_test_node_path() {
+        let source = TempDir::new().unwrap();
+        let source_bans = source.path().join(BANS_FIXTURE_FILE);
+        let source_bans_connection = rusqlite::Connection::open(&source_bans).unwrap();
+        source_bans_connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE ban_state (value TEXT NOT NULL);
+                 INSERT INTO ban_state VALUES ('v6');
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        source_bans_connection
+            .execute("UPDATE ban_state SET value = 'v7'", [])
+            .unwrap();
+        assert!(
+            std::fs::metadata(source_bans.with_extension("sqlite3-wal"))
+                .unwrap()
+                .len()
+                > 32,
+            "the newest Ban image must remain WAL-resident in the source fixture"
+        );
+        std::fs::write(
+            source.path().join(BANS_RECOVERY_ARTIFACT_FIXTURE_FILE),
+            b"certified recovery artifact",
+        )
+        .unwrap();
+        let source_terminal = source.path().join(BANS_TERMINAL_FIXTURE_FILE);
+        let source_path =
+            PathBuf::from("/opt/shitspeak-rs/state/s2s-state/strict-recovery-bans.stage");
+        let source_connection = rusqlite::Connection::open(&source_terminal).unwrap();
+        source_connection
+            .execute_batch(
+                "CREATE TABLE strict_recovery_artifact (
+                     singleton INTEGER PRIMARY KEY,
+                     staging_path BLOB NOT NULL
+                 );",
+            )
+            .unwrap();
+        source_connection
+            .execute(
+                "INSERT INTO strict_recovery_artifact (singleton, staging_path) VALUES (1, ?1)",
+                [rmp_serde::to_vec_named(&source_path).unwrap()],
+            )
+            .unwrap();
+
+        let blob_storage = TempDir::new().unwrap();
+        let s2s_persistence = TempDir::new().unwrap();
+        TestStrictReplicationState::from_directory(source.path())
+            .stage_into(blob_storage.path(), s2s_persistence.path())
+            .unwrap();
+
+        assert_eq!(
+            rusqlite::Connection::open(blob_storage.path().join("bans.db"))
+                .unwrap()
+                .query_row("SELECT value FROM ban_state", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "v7",
+            "Ban fixture staging must include the source database's WAL-resident image"
+        );
+        let staged_artifact = s2s_persistence
+            .path()
+            .join(BANS_STAGED_RECOVERY_ARTIFACT_FILE);
+        assert_eq!(
+            std::fs::read(&staged_artifact).unwrap(),
+            b"certified recovery artifact"
+        );
+        let staged_terminal = s2s_persistence
+            .path()
+            .join(strict_terminal_journal_relative_path(
+                BANS_REPLICATION_TOPIC,
+            ));
+        let staged_connection = rusqlite::Connection::open(staged_terminal).unwrap();
+        let staged_path = staged_connection
+            .query_row(
+                "SELECT staging_path FROM strict_recovery_artifact WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<PathBuf>(&staged_path).unwrap(),
+            staged_artifact
+        );
+        let source_path_blob = source_connection
+            .query_row(
+                "SELECT staging_path FROM strict_recovery_artifact WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rmp_serde::from_slice::<PathBuf>(&source_path_blob).unwrap(),
+            source_path
         );
     }
 

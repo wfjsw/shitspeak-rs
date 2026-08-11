@@ -1189,6 +1189,21 @@ impl BanRepository {
                 ));
             }
         }
+        if authoritative_recovery {
+            // A protocol-v8 recovery artifact replaces the complete
+            // repository image. Retaining an untagged local operation here
+            // would make durable_version_from_connection() and
+            // latest_timestamp() advertise that rejected image after the
+            // replacement, leaving strict recovery permanently Installing.
+            if let Err(error) = tx.execute("DELETE FROM ban_operations", []) {
+                self.mark_strict_durability_failed();
+                return Err(sqlite_io_error(error));
+            }
+            if let Err(error) = tx.execute("DELETE FROM ban_strict_op_ids", []) {
+                self.mark_strict_durability_failed();
+                return Err(sqlite_io_error(error));
+            }
+        }
         let set_bans = BanOp::SetBans { entries };
         if let Err(error) = apply_op_to_db(&tx, &set_bans) {
             self.mark_strict_durability_failed();
@@ -2612,5 +2627,47 @@ mod tests {
             repo.strict_operation_ids().unwrap(),
             vec![StrictOperationId::new(801, 802)]
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_recovery_snapshot_replaces_newer_operation_history() {
+        let repo = BanRepository::new_in_memory(1);
+        let local_operation_id = StrictOperationId::new(901, 902);
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                Arc::new(BanOperation {
+                    version: 7,
+                    node_id: 1,
+                    timestamp: 1_786_419_910,
+                    op: BanOp::AddBan {
+                        entry: test_ban("203.0.113.91", "untagged-local"),
+                    },
+                }),
+                StrictReplicationMetadata::new(
+                    local_operation_id.op_id_hi(),
+                    local_operation_id.op_id_lo(),
+                    1,
+                ),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+
+        repo.install_s2s_authoritative_recovery_snapshot_v8(
+            6,
+            vec![test_ban("203.0.113.92", "certified")],
+            1_786_418_705,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(repo.current_version(), 6);
+        assert_eq!(repo.latest_timestamp(), 1_786_418_705);
+        assert_eq!(
+            repo.get_active_bans().await,
+            vec![test_ban("203.0.113.92", "certified")]
+        );
+        assert!(repo.strict_operation_ids().unwrap().is_empty());
     }
 }

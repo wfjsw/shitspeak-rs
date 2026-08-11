@@ -9,6 +9,7 @@ use std::{
 
 use aws_lc_rs::digest::{SHA256, digest};
 use bytes::Bytes;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -4553,7 +4554,28 @@ async fn startup_install_replaces_newer_untagged_ban_image_with_certified_artifa
     );
     assert_eq!(local.current_version(), 7);
 
+    let (repository_replaced, repository_replaced_rx) = oneshot::channel();
+    let (resume_rollforward, resume_rollforward_rx) = oneshot::channel();
+    recovered.pause_authoritative_recovery_install_after_apply(
+        repository_replaced,
+        resume_rollforward_rx,
+    );
     spawn_startup_rollforward(recovered.clone());
+    repository_replaced_rx
+        .await
+        .expect("authoritative recovery artifact must replace the repository before finalization");
+    let attempt = recovered
+        .recovery_coordinator
+        .lock()
+        .attempt()
+        .expect("startup recovery remains active while its certified image is installing");
+    recovered.transition_recovery(RecoveryEvent::Cancel {
+        attempt,
+        now_ms: recovered.recovery_now_ms(),
+    });
+    resume_rollforward
+        .send(())
+        .expect("resume authoritative recovery rollforward");
     tokio::time::timeout(Duration::from_millis(100), async {
         while recovered.recovery_coordinator.lock().phase() != RecoveryPhase::Healthy {
             tokio::task::yield_now().await;
