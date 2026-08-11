@@ -1794,7 +1794,11 @@ fn default_web_audio_bitrate() -> u32 {
 
 impl Config {
     pub fn load() -> Self {
-        Self::build_config()
+        Self::load_from("config.toml")
+    }
+
+    pub fn load_from(path: impl AsRef<std::path::Path>) -> Self {
+        Self::build_config(path)
             .try_deserialize()
             .expect("Failed to load config.toml")
     }
@@ -1803,16 +1807,23 @@ impl Config {
     /// was read successfully, `Ok(None)` if the file doesn't exist, or an
     /// error if deserialization fails.
     pub fn reload() -> Result<Option<Self>, config::ConfigError> {
-        // Check if the file actually exists before trying to deserialize
-        if !std::path::Path::new("config.toml").exists() {
-            return Ok(None);
-        }
-        Self::build_config().try_deserialize().map(Some)
+        Self::reload_from("config.toml")
     }
 
-    fn build_config() -> ConfigCrate {
+    pub fn reload_from(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Option<Self>, config::ConfigError> {
+        let path = path.as_ref();
+        // Check if the file actually exists before trying to deserialize.
+        if !path.exists() {
+            return Ok(None);
+        }
+        Self::build_config(path).try_deserialize().map(Some)
+    }
+
+    fn build_config(path: impl AsRef<std::path::Path>) -> ConfigCrate {
         ConfigCrate::builder()
-            .add_source(File::with_name("config"))
+            .add_source(File::from(path.as_ref().to_path_buf()))
             // Preserve the original single-underscore nesting convention for
             // existing deployments, then layer the unambiguous form on top.
             .add_source(Environment::with_prefix("SHITSPEAK").separator("_"))

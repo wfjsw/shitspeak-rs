@@ -29,6 +29,7 @@ async-trait = "0"
 aws-lc-rs = "1"
 base64 = "0"
 bytes = { version = "1", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
 chrono = { version = "0", features = ["serde"] }
 cidr = "0"
 config = { version = "0", default-features = false, features = ["toml"] }
@@ -103,6 +104,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+clap = { workspace = true }
 shitspeak-runtime = { workspace = true }
 shitspeak-web = { workspace = true, optional = true }
 config = { workspace = true }

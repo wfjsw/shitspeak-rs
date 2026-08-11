@@ -174,18 +174,18 @@ struct ForwarderRepositories {
     bans: Arc<BanRepository>,
 }
 
-pub async fn run_forwarder() -> Result<(), Box<dyn Error>> {
+pub async fn run_forwarder(config_path: impl AsRef<Path>) -> Result<(), Box<dyn Error>> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
 
     let _logging_guard = logging::init("s2s-forwarder")?;
 
-    run().await
+    run(config_path).await
 }
 
-async fn run() -> Result<(), Box<dyn Error>> {
-    let config = load_config()?;
+async fn run(config_path: impl AsRef<Path>) -> Result<(), Box<dyn Error>> {
+    let config = load_config(config_path)?;
     if !config.s2s.is_enabled() {
         return Err("s2s-forwarder requires [s2s].enabled = true".into());
     }
@@ -338,9 +338,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn load_config() -> Result<ForwarderConfig, Box<dyn Error>> {
+fn load_config(config_path: impl AsRef<Path>) -> Result<ForwarderConfig, Box<dyn Error>> {
     Ok(config::Config::builder()
-        .add_source(config::File::with_name("config"))
+        .add_source(config::File::from(config_path.as_ref().to_path_buf()))
         .add_source(config::Environment::with_prefix("SHITSPEAK").separator("_"))
         .build()?
         .try_deserialize()?)

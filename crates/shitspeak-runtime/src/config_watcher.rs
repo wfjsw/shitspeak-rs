@@ -20,10 +20,11 @@ use crate::server::Server;
 pub fn spawn_config_watcher(
     server: Arc<Box<Server>>,
     shutdown: watch::Receiver<()>,
+    config_path: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        let path = Path::new("config.toml");
+        let path = config_path;
 
         // If the file doesn't exist at startup, log and exit.
         if !path.exists() {
@@ -130,7 +131,7 @@ pub fn spawn_config_watcher(
 
             if received && should_reload {
                 tracing::info!("config watcher: auth/config/TLS change detected, reloading...");
-                if let Err(e) = runtime.block_on(server.reload_config()) {
+                if let Err(e) = runtime.block_on(server.reload_config_from(&config_path)) {
                     tracing::error!("config watcher: reload failed: {e}");
                 }
                 watch_authenticator_directory(&mut watcher, &mut watched_dirs, &server);

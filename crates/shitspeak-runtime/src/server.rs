@@ -1947,7 +1947,14 @@ impl Server {
     /// Returns an error only if the config file is malformed or an added
     /// entrypoint cannot be bound; the old config stays in place.
     pub async fn reload_config(self: &Arc<Box<Self>>) -> Result<(), Box<dyn std::error::Error>> {
-        match Config::reload() {
+        self.reload_config_from("config.toml").await
+    }
+
+    pub async fn reload_config_from(
+        self: &Arc<Box<Self>>,
+        config_path: impl AsRef<std::path::Path>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match Config::reload_from(config_path) {
             Ok(Some(new_config)) => {
                 let _reload_guard = self.config_reload_lock.lock().await;
                 validate_visibility_config(&new_config)?;

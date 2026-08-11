@@ -4381,6 +4381,7 @@ version = "3.0.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "clap",
  "config",
  "criterion",
  "enumflags2",
