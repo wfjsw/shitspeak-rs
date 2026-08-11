@@ -1102,8 +1102,14 @@ impl BanRepository {
         freshness: i64,
         strict_operation_ids: Vec<StrictOperationId>,
     ) -> Result<(), io::Error> {
-        self.install_s2s_snapshot_inner(version, entries, freshness, Some(strict_operation_ids))
-            .await
+        self.install_s2s_snapshot_inner(
+            version,
+            entries,
+            freshness,
+            Some(strict_operation_ids),
+            false,
+        )
+        .await
     }
 
     /// Install a strict protocol v5 snapshot without consulting or modifying
@@ -1114,7 +1120,21 @@ impl BanRepository {
         entries: Vec<BanEntry>,
         freshness: i64,
     ) -> Result<(), io::Error> {
-        self.install_s2s_snapshot_inner(version, entries, freshness, None)
+        self.install_s2s_snapshot_inner(version, entries, freshness, None, false)
+            .await
+    }
+
+    /// Atomically replace the repository with an authenticated protocol-v8
+    /// recovery artifact. This is the sole snapshot path allowed to replace a
+    /// locally newer image: a durable recovery certificate has already
+    /// established the supplied image as authoritative.
+    pub async fn install_s2s_authoritative_recovery_snapshot_v8(
+        &self,
+        version: u64,
+        entries: Vec<BanEntry>,
+        freshness: i64,
+    ) -> Result<(), io::Error> {
+        self.install_s2s_snapshot_inner(version, entries, freshness, None, true)
             .await
     }
 
@@ -1124,6 +1144,7 @@ impl BanRepository {
         entries: Vec<BanEntry>,
         freshness: i64,
         strict_operation_ids: Option<Vec<StrictOperationId>>,
+        authoritative_recovery: bool,
     ) -> Result<(), io::Error> {
         let mut conn = self.conn.lock();
         let tx = match conn.transaction() {
@@ -1140,7 +1161,7 @@ impl BanRepository {
                 return Err(error);
             }
         };
-        if version < durable_version {
+        if version < durable_version && !authoritative_recovery {
             // The caller is behind this repository. Treat the stale snapshot
             // as an idempotent no-op so catchup can complete without replacing
             // newer durable state.

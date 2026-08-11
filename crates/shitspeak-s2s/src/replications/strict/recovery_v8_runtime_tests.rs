@@ -4323,6 +4323,264 @@ async fn startup_verifying_restart_completes_after_repository_was_already_replac
 }
 
 #[tokio::test]
+async fn startup_install_with_missing_staged_artifact_recovers_by_recertifying() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let net = MockNet::new(REQUESTER, vec![DONOR, REQUESTER, SECOND_WITNESS]);
+    for (node, epoch) in [
+        (DONOR, DONOR_EPOCH),
+        (REQUESTER, REQUESTER_EPOCH),
+        (SECOND_WITNESS, SECOND_WITNESS_EPOCH),
+    ] {
+        net.set_epoch(node, epoch);
+        net.set_peer_strict_replication_protocol_version(node, STRICT_PROTOCOL_VERSION_V8);
+    }
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V8);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V8));
+    net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
+    let local = CountingStrictRepo::new_current();
+    *local.state.lock() = (8, vec![(8, 222, None)]);
+
+    {
+        let setup = StrictRuntime::new(
+            local.clone(),
+            REQUESTER,
+            REQUESTER_EPOCH,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let cut = setup.terminal_journal.lock().await.terminal_cut();
+        let attempt = RecoveryAttemptId::new(REQUESTER_EPOCH, 74);
+        let attempt_id = attempt_bytes(attempt).as_ref().try_into().unwrap();
+        let donor = DurableRecoveryParticipant::new(DONOR, DONOR_EPOCH);
+        let witness = DurableRecoveryParticipant::new(SECOND_WITNESS, SECOND_WITNESS_EPOCH);
+        let durable_attempt = DurableRecoveryAttempt::new(
+            attempt_id,
+            DurableRecoveryPhase::Installing,
+            2,
+            Some(DurableRecoveryTarget::new(8, 0, *cut.terminal_set_digest())),
+            vec![
+                DurableRecoveryWitness::new(donor.clone(), cut),
+                DurableRecoveryWitness::new(witness.clone(), cut),
+            ],
+            vec![donor.clone(), witness],
+            Some(0),
+            Some(donor),
+            Some(cut),
+            vec![],
+        )
+        .unwrap();
+        let missing_staging_path = temp.path().join("missing-recovery-image.stage");
+        let intent = DurableRecoveryArtifactIntent::new(
+            attempt_id,
+            missing_staging_path.clone(),
+            [0xA7; 32],
+            1,
+            DurableRecoveryRepositoryMetadata::new(8, 0),
+            cut,
+        );
+        let mut journal = setup.terminal_journal.lock().await;
+        journal.persist_recovery_attempt(&durable_attempt).unwrap();
+        journal
+            .prepare_staged_recovery_checkpoint(
+                8,
+                0,
+                cut,
+                &[],
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &durable_attempt,
+                &intent,
+            )
+            .unwrap();
+        assert!(!missing_staging_path.exists());
+    }
+
+    let recovered = StrictRuntime::new(
+        local,
+        REQUESTER,
+        REQUESTER_EPOCH + 1,
+        "channels".to_owned(),
+        net,
+        CancellationToken::new(),
+        Arc::new(
+            ReplicationConfig::default()
+                .with_strict_bootstrap_retry_interval(Duration::from_millis(5)),
+        ),
+    );
+    assert_eq!(
+        recovered.recovery_coordinator.lock().phase(),
+        RecoveryPhase::Installing
+    );
+    assert!(recovered.pending_repository_image_install().is_some());
+
+    spawn_startup_rollforward(recovered.clone());
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while recovered.recovery_coordinator.lock().phase() == RecoveryPhase::Installing {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a missing durable staging artifact must not leave recovery installing forever");
+    assert_eq!(
+        recovered.recovery_coordinator.lock().phase(),
+        RecoveryPhase::Backoff,
+        "the missing artifact must abandon the irrecoverable install and recertify"
+    );
+    assert!(
+        recovered.pending_repository_image_install().is_some(),
+        "recertification must retain the repository-image fence"
+    );
+}
+
+#[tokio::test]
+async fn startup_install_replaces_newer_untagged_ban_image_with_certified_artifact() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let net = MockNet::new(REQUESTER, vec![DONOR, REQUESTER, SECOND_WITNESS]);
+    for (node, epoch) in [
+        (DONOR, DONOR_EPOCH),
+        (REQUESTER, REQUESTER_EPOCH),
+        (SECOND_WITNESS, SECOND_WITNESS_EPOCH),
+    ] {
+        net.set_epoch(node, epoch);
+        net.set_peer_strict_replication_protocol_version(node, STRICT_PROTOCOL_VERSION_V8);
+    }
+    net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V8);
+    net.set_local_strict_replication_protocol_version(Some(STRICT_PROTOCOL_VERSION_V8));
+    net.set_strict_protocol_state_dir(Some(temp.path().to_path_buf()));
+    let local = CountingStrictRepo::new_current();
+    *local.state.lock() = (6, vec![(6, 111, None)]);
+    local.ignore_stale_snapshot_installs();
+    let staging_path = temp.path().join("stale-recovery-image.stage");
+
+    {
+        let setup = StrictRuntime::new(
+            local.clone(),
+            REQUESTER,
+            REQUESTER_EPOCH,
+            "channels".to_owned(),
+            net.clone(),
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        let cut = setup.terminal_journal.lock().await.terminal_cut();
+        let attempt = RecoveryAttemptId::new(REQUESTER_EPOCH, 75);
+        let attempt_id = attempt_bytes(attempt).as_ref().try_into().unwrap();
+        let donor = DurableRecoveryParticipant::new(DONOR, DONOR_EPOCH);
+        let witness = DurableRecoveryParticipant::new(SECOND_WITNESS, SECOND_WITNESS_EPOCH);
+        let durable_attempt = DurableRecoveryAttempt::new(
+            attempt_id,
+            DurableRecoveryPhase::Installing,
+            2,
+            Some(DurableRecoveryTarget::new(6, 0, *cut.terminal_set_digest())),
+            vec![
+                DurableRecoveryWitness::new(donor.clone(), cut),
+                DurableRecoveryWitness::new(witness.clone(), cut),
+            ],
+            vec![donor.clone(), witness],
+            Some(0),
+            Some(donor),
+            Some(cut),
+            vec![],
+        )
+        .unwrap();
+        let (_, snapshot) = local.snapshot_with_metadata().unwrap();
+        let image = super::catchup::encode_bound_s2s_snapshot_envelope(
+            snapshot,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            cut,
+        )
+        .unwrap();
+        let manifest = write_recovery_staging_artifact(
+            &staging_path,
+            RecoveryStagingExpectation::new(
+                attempt.hi(),
+                attempt.lo(),
+                super::HistoryMetadata {
+                    version: 6,
+                    freshness: 0,
+                },
+                cut,
+            ),
+            &image,
+        )
+        .unwrap();
+        let intent = DurableRecoveryArtifactIntent::new(
+            attempt_id,
+            staging_path.clone(),
+            *manifest.content_digest(),
+            manifest.content_len(),
+            DurableRecoveryRepositoryMetadata::new(6, 0),
+            cut,
+        );
+        let mut journal = setup.terminal_journal.lock().await;
+        journal.persist_recovery_attempt(&durable_attempt).unwrap();
+        journal
+            .prepare_staged_recovery_checkpoint(
+                6,
+                0,
+                cut,
+                &[],
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &durable_attempt,
+                &intent,
+            )
+            .unwrap();
+    }
+
+    // The direct fallback advanced the local Ban repository after recovery
+    // staged v6. The untagged v7 image is not authoritative over the durable
+    // v8 certificate and must be replaced during roll-forward.
+    *local.state.lock() = (7, vec![(7, 222, None)]);
+    let recovered = StrictRuntime::new(
+        local.clone(),
+        REQUESTER,
+        REQUESTER_EPOCH + 1,
+        "channels".to_owned(),
+        net,
+        CancellationToken::new(),
+        Arc::new(
+            ReplicationConfig::default()
+                .with_strict_bootstrap_retry_interval(Duration::from_millis(5)),
+        ),
+    );
+    assert_eq!(
+        recovered.recovery_coordinator.lock().phase(),
+        RecoveryPhase::Installing
+    );
+    assert_eq!(local.current_version(), 7);
+
+    spawn_startup_rollforward(recovered.clone());
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while recovered.recovery_coordinator.lock().phase() != RecoveryPhase::Healthy {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the certified recovery artifact must replace the untagged image");
+    assert_eq!(
+        recovered.recovery_coordinator.lock().phase(),
+        RecoveryPhase::Healthy,
+    );
+    assert_eq!(
+        local.current_version(),
+        6,
+        "the v8-certified artifact must supersede the untagged v7 image"
+    );
+    assert_eq!(local.log(), vec![(6, 111)]);
+    assert!(recovered.pending_repository_image_install().is_none());
+    {
+        let journal = recovered.terminal_journal.lock().await;
+        assert!(journal.load_recovery_attempt().unwrap().is_none());
+        assert!(journal.load_recovery_artifact_intent().unwrap().is_none());
+    }
+    assert!(!staging_path.exists());
+}
+
+#[tokio::test]
 async fn durable_restore_preserves_ranked_donor_order_and_failure_history() {
     let temp = tempfile::TempDir::new().unwrap();
     let net = MockNet::new(REQUESTER, vec![DONOR, REQUESTER, SECOND_WITNESS]);

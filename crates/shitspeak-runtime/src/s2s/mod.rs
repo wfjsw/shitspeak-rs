@@ -128,6 +128,26 @@ pub struct S2SManager {
     state: RwLock<S2SRuntimeState>,
 }
 
+/// Result of attempting to commit a locally-originated ban through strict
+/// replication.
+///
+/// A direct repository write is safe only when this process has no strict ban
+/// runtime at all. Once a runtime is registered, a failed or fenced proposal
+/// must not bypass its recovery and repository-image fences.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BanProposalOutcome {
+    Admitted,
+    StrictUnavailable,
+    StrictFenced,
+    Failed,
+}
+
+impl BanProposalOutcome {
+    pub(crate) const fn permits_direct_repository_fallback(self) -> bool {
+        matches!(self, Self::StrictUnavailable)
+    }
+}
+
 #[derive(Default)]
 struct S2SRuntimeState {
     transport: Option<ConnectionManager>,
@@ -216,7 +236,7 @@ enum NativeToS2SCommand {
     },
     ProposeBan {
         op: BanOp,
-        respond: oneshot::Sender<bool>,
+        respond: oneshot::Sender<BanProposalOutcome>,
     },
     ProposeClientReplication(ClientStateLogEntry),
     RefreshVoiceRecipientIndex(RecipientIndexUpdate),
@@ -828,6 +848,13 @@ impl S2SRuntimeTask {
 }
 
 impl S2SManager {
+    /// Whether this process is configured to own the strict Ban topic. Until
+    /// its runtime has registered, submissions stay fenced: treating that
+    /// startup window as an absent runtime would permit an untagged write.
+    fn strict_ban_runtime_expected(&self) -> bool {
+        self.enabled && self.config_error.is_none() && self.transport_config.is_some()
+    }
+
     pub fn initialize(config: &shitspeak_runtime_config::Config) -> Self {
         let auto_advertise_host = config
             .register_hostname
@@ -1233,16 +1260,22 @@ impl S2SManager {
         }
     }
 
-    pub async fn propose_ban_op(&self, op: BanOp) -> bool {
+    pub async fn propose_ban_op(&self, op: BanOp) -> BanProposalOutcome {
         let Some(tx) = self.state.read().gateway_tx.clone() else {
-            return false;
+            return if self.state.read().ban_replication.is_some() {
+                BanProposalOutcome::Failed
+            } else if self.strict_ban_runtime_expected() {
+                BanProposalOutcome::StrictFenced
+            } else {
+                BanProposalOutcome::StrictUnavailable
+            };
         };
         let (respond, rx) = oneshot::channel();
         if !tx
             .send_lossless(NativeToS2SCommand::ProposeBan { op, respond })
             .await
         {
-            return false;
+            return BanProposalOutcome::Failed;
         }
         tokio::time::timeout(
             strict_proposal_gateway_response_timeout(&self.replication_config),
@@ -1251,12 +1284,19 @@ impl S2SManager {
         .await
         .ok()
         .and_then(Result::ok)
-        .unwrap_or(false)
+        .unwrap_or(BanProposalOutcome::Failed)
     }
 
-    async fn propose_ban_op_direct(&self, op: BanOp) -> bool {
+    async fn propose_ban_op_direct(&self, op: BanOp) -> BanProposalOutcome {
         let Some(handle) = self.state.read().ban_replication.clone() else {
-            return false;
+            return if self.strict_ban_runtime_expected() {
+                BanProposalOutcome::StrictFenced
+            } else {
+                BanProposalOutcome::StrictUnavailable
+            };
+        };
+        if !handle.accepts_new_proposals() {
+            return BanProposalOutcome::StrictFenced;
         };
         let operation = BanOperation {
             version: 0,
@@ -1265,10 +1305,10 @@ impl S2SManager {
             op,
         };
         match handle.propose(operation).await {
-            Ok(_) => true,
+            Ok(_) => BanProposalOutcome::Admitted,
             Err(e) => {
                 warn!(error = %e, "s2s ban op propose failed");
-                false
+                BanProposalOutcome::Failed
             }
         }
     }
@@ -3288,14 +3328,27 @@ async fn apply_user_remove_patch(
             start: chrono::Utc::now().timestamp(),
             duration: 0,
         };
-        if let Err(e) = server.get_bans().add_ban(entry).await {
-            warn!(error = %e, "s2s moderation failed to persist ban");
+        match server
+            .s2s_manager()
+            .propose_ban_op(BanOp::AddBan { entry })
+            .await
+        {
+            BanProposalOutcome::Admitted => {
+                info!(
+                    actor = actor_session,
+                    target = u32::from(target_id),
+                    "s2s moderation added ban"
+                );
+            }
+            outcome => {
+                warn!(
+                    actor = actor_session,
+                    target = u32::from(target_id),
+                    ?outcome,
+                    "s2s moderation rejected ban because strict replication did not admit it"
+                );
+            }
         }
-        info!(
-            actor = actor_session,
-            target = u32::from(target_id),
-            "s2s moderation added ban"
-        );
     }
 
     let actor_for_target =
@@ -3772,6 +3825,35 @@ impl StrictReplicable for ChannelReplicationAdapter {
                 }
             })
     }
+
+    async fn install_authoritative_recovery_snapshot(
+        &self,
+        version: u64,
+        snapshot: Bytes,
+    ) -> Result<(), s2s_replications::strict::StrictSnapshotError> {
+        let decoded: ChannelSnapshot = rmp_serde::from_slice(&snapshot).map_err(|error| {
+            s2s_replications::strict::StrictSnapshotError::new(format!(
+                "s2s channel recovery snapshot decode failed: {error}"
+            ))
+        })?;
+        self.repo
+            .install_s2s_authoritative_recovery_snapshot_v8_in_server(
+                &self.server_id,
+                version,
+                decoded.channels,
+                decoded.freshness,
+            )
+            .await
+            .map_err(|error| {
+                let message = format!("s2s channel recovery snapshot install failed: {error:?}");
+                match error {
+                    ChannelRepoError::WalIo(_) => {
+                        s2s_replications::strict::StrictSnapshotError::durability_failure(message)
+                    }
+                    _ => s2s_replications::strict::StrictSnapshotError::new(message),
+                }
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -4076,6 +4158,33 @@ impl StrictReplicable for BanReplicationAdapter {
             .await
             .map_err(|error| {
                 let message = format!("s2s ban snapshot install failed: {error}");
+                if self.repo.strict_durability_failure_observed() {
+                    s2s_replications::strict::StrictSnapshotError::durability_failure(message)
+                } else {
+                    s2s_replications::strict::StrictSnapshotError::new(message)
+                }
+            })
+    }
+
+    async fn install_authoritative_recovery_snapshot(
+        &self,
+        version: u64,
+        snapshot: Bytes,
+    ) -> Result<(), s2s_replications::strict::StrictSnapshotError> {
+        let decoded: BanSnapshot = rmp_serde::from_slice(&snapshot).map_err(|error| {
+            s2s_replications::strict::StrictSnapshotError::new(format!(
+                "s2s ban recovery snapshot decode failed: {error}"
+            ))
+        })?;
+        self.repo
+            .install_s2s_authoritative_recovery_snapshot_v8(
+                version,
+                decoded.entries,
+                decoded.freshness,
+            )
+            .await
+            .map_err(|error| {
+                let message = format!("s2s ban recovery snapshot install failed: {error}");
                 if self.repo.strict_durability_failure_observed() {
                     s2s_replications::strict::StrictSnapshotError::durability_failure(message)
                 } else {
@@ -4598,6 +4707,14 @@ mod tests {
 
     use super::*;
     use shitspeak_state::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig};
+
+    #[test]
+    fn only_an_absent_strict_ban_runtime_permits_a_direct_repository_fallback() {
+        assert!(BanProposalOutcome::StrictUnavailable.permits_direct_repository_fallback());
+        assert!(!BanProposalOutcome::Admitted.permits_direct_repository_fallback());
+        assert!(!BanProposalOutcome::StrictFenced.permits_direct_repository_fallback());
+        assert!(!BanProposalOutcome::Failed.permits_direct_repository_fallback());
+    }
 
     fn test_node_geo(latitude: f64) -> NodeGeo {
         NodeGeo::new(latitude, 0.0, None, None, None, "test").expect("valid coordinates")

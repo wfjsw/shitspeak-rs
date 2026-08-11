@@ -15,6 +15,7 @@ use crate::integration_tests::harness::{
     TestClient, TestS2sServerOpts, TestServer, TestServerOpts, spawn_s2s_test_server,
     spawn_s2s_test_server_with_config, test_client::ConnectError,
 };
+use crate::s2s::BanProposalOutcome;
 use crate::voice::codec::AudioPayload;
 use crate::voice::metrics::{
     VoiceRouteKind, VoiceRouteSource, route_metric_snapshot, route_resolution_metric_snapshot,
@@ -5200,8 +5201,12 @@ async fn s2s_ban_replication_propagates() {
             .propose_ban_op(BanOp::AddBan { entry }),
     )
     .await
-    .unwrap_or(false);
-    assert!(proposed, "Server A should accept the S2S ban proposal");
+    .unwrap_or(BanProposalOutcome::Failed);
+    assert_eq!(
+        proposed,
+        BanProposalOutcome::Admitted,
+        "Server A should accept the S2S ban proposal"
+    );
 
     let replicated = wait_until(S2S_DEADLINE, || {
         let bans = tokio::task::block_in_place(|| {

@@ -742,6 +742,7 @@ pub struct CountingStrictRepo {
     snapshot_install_failure: Mutex<Option<String>>,
     snapshot_install_durability_failure: Mutex<Option<String>>,
     snapshot_install_durability_failure_without_capability_loss: Mutex<Option<String>>,
+    ignore_stale_snapshot_installs: AtomicBool,
     strict_apply_failure: Mutex<bool>,
 }
 
@@ -785,6 +786,7 @@ impl CountingStrictRepo {
             snapshot_install_failure: Mutex::new(None),
             snapshot_install_durability_failure: Mutex::new(None),
             snapshot_install_durability_failure_without_capability_loss: Mutex::new(None),
+            ignore_stale_snapshot_installs: AtomicBool::new(false),
             strict_apply_failure: Mutex::new(false),
         })
     }
@@ -808,6 +810,13 @@ impl CountingStrictRepo {
 
     pub fn allow_snapshot_installs(&self) {
         *self.snapshot_install_failure.lock() = None;
+    }
+
+    /// Model repositories such as the Ban store, where a snapshot older than
+    /// the durable head is an idempotent successful no-op.
+    pub fn ignore_stale_snapshot_installs(&self) {
+        self.ignore_stale_snapshot_installs
+            .store(true, Ordering::Release);
     }
 
     pub fn fail_snapshot_installs_durably(&self, message: impl Into<String>) {
@@ -971,14 +980,58 @@ impl StrictReplicable for CountingStrictRepo {
             rmp_serde::from_slice(&snapshot).map_err(|error| {
                 StrictSnapshotError::new(format!("counting snapshot decode failed: {error}"))
             })?;
-        let mut s = self.state.lock();
-        s.0 = version;
-        s.1 = decoded
-            .entries
-            .into_iter()
-            .map(|(version, op)| (version, op, None))
-            .collect();
-        drop(s);
+        {
+            let mut s = self.state.lock();
+            if self.ignore_stale_snapshot_installs.load(Ordering::Acquire) && version < s.0 {
+                return Ok(());
+            }
+            s.0 = version;
+            s.1 = decoded
+                .entries
+                .into_iter()
+                .map(|(version, op)| (version, op, None))
+                .collect();
+        }
+        *self.strict_operation_ids.lock() = decoded.strict_operation_ids.into_iter().collect();
+        Ok(())
+    }
+
+    async fn install_authoritative_recovery_snapshot(
+        &self,
+        version: u64,
+        snapshot: Bytes,
+    ) -> Result<(), StrictSnapshotError> {
+        let _snapshot_guard = self.snapshot_guard.lock();
+        if let Some(message) = self
+            .snapshot_install_durability_failure_without_capability_loss
+            .lock()
+            .clone()
+        {
+            return Err(StrictSnapshotError::durability_failure(message));
+        }
+        if let Some(message) = self.snapshot_install_durability_failure.lock().clone() {
+            self.strict_repository_capable
+                .store(false, Ordering::Release);
+            return Err(StrictSnapshotError::durability_failure(message));
+        }
+        if let Some(message) = self.snapshot_install_failure.lock().clone() {
+            return Err(StrictSnapshotError::new(message));
+        }
+        let decoded: CountingStrictSnapshot =
+            rmp_serde::from_slice(&snapshot).map_err(|error| {
+                StrictSnapshotError::new(format!(
+                    "counting recovery snapshot decode failed: {error}"
+                ))
+            })?;
+        {
+            let mut s = self.state.lock();
+            s.0 = version;
+            s.1 = decoded
+                .entries
+                .into_iter()
+                .map(|(version, op)| (version, op, None))
+                .collect();
+        }
         *self.strict_operation_ids.lock() = decoded.strict_operation_ids.into_iter().collect();
         Ok(())
     }

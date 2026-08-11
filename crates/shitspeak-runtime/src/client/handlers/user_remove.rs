@@ -7,11 +7,13 @@ use crate::{
     errors::MessageHandlerError,
     messages::Message,
     messages::encoder::{PermissionDenied, UserRemove},
+    s2s::BanProposalOutcome,
     server::Server,
 };
 
 use super::{
-    BAN_REPOSITORY_REQUEST_ADMITTED, BAN_REPOSITORY_REQUEST_SUBMITTED, send_ban_repository_notice,
+    BAN_REPOSITORY_REQUEST_ADMITTED, BAN_REPOSITORY_REQUEST_REJECTED,
+    BAN_REPOSITORY_REQUEST_SUBMITTED, send_ban_repository_notice,
 };
 
 pub async fn handle_user_remove(
@@ -150,9 +152,8 @@ pub async fn handle_user_remove(
             entry: entry.clone(),
         };
         send_ban_repository_notice(sender, BAN_REPOSITORY_REQUEST_SUBMITTED).await?;
-        let admitted = if server.s2s_manager().propose_ban_op(op).await {
-            true
-        } else {
+        let proposal_outcome = server.s2s_manager().propose_ban_op(op).await;
+        let admitted = if proposal_outcome.permits_direct_repository_fallback() {
             match server.get_bans().add_ban(entry).await {
                 Ok(()) => true,
                 Err(error) => {
@@ -160,9 +161,13 @@ pub async fn handle_user_remove(
                     false
                 }
             }
+        } else {
+            proposal_outcome == BanProposalOutcome::Admitted
         };
         if admitted {
             send_ban_repository_notice(sender, BAN_REPOSITORY_REQUEST_ADMITTED).await?;
+        } else {
+            send_ban_repository_notice(sender, BAN_REPOSITORY_REQUEST_REJECTED).await?;
         }
         tracing::info!(
             "Ban added for session {:?} by {:?}: {}",

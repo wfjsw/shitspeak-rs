@@ -1643,7 +1643,10 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
         let terminal_prepared = rt.terminal_journal.lock().await.terminal_cut() == cut;
         if !terminal_prepared {
             rt.require_repository_image_install(expected_metadata);
-            schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
+            recertify_topic_after_local_recovery_failure(
+                rt.as_ref(),
+                "durable recovery artifact does not match its prepared terminal checkpoint",
+            );
             return;
         }
         let expectation =
@@ -1655,17 +1658,26 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
         );
         let Ok(artifact) = verify_recovery_staging_artifact(intent.staging_path(), manifest) else {
             rt.require_repository_image_install(expected_metadata);
-            schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
+            recertify_topic_after_local_recovery_failure(
+                rt.as_ref(),
+                "durable recovery staging artifact is missing or invalid",
+            );
             return;
         };
         let Ok(decoded) = decode_s2s_snapshot_envelope(artifact.into_repository_image()) else {
             rt.require_repository_image_install(expected_metadata);
-            schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
+            recertify_topic_after_local_recovery_failure(
+                rt.as_ref(),
+                "durable recovery staging artifact has an invalid snapshot envelope",
+            );
             return;
         };
         if decoded.terminal_cut != Some(cut) {
             rt.require_repository_image_install(expected_metadata);
-            schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
+            recertify_topic_after_local_recovery_failure(
+                rt.as_ref(),
+                "durable recovery snapshot envelope does not match its terminal checkpoint",
+            );
             return;
         }
         if !delivery_checkpoint_is_valid(
@@ -1674,17 +1686,25 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
             &decoded.retired_operations,
         ) {
             rt.require_repository_image_install(expected_metadata);
-            schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
+            recertify_topic_after_local_recovery_failure(
+                rt.as_ref(),
+                "durable recovery snapshot has an invalid delivery checkpoint",
+            );
             return;
         }
         let staged_repository_snapshot = decoded.repository_snapshot;
         let expected_applied: BTreeMap<_, _> = decoded.applied_operations.into_iter().collect();
         let expected_retired = decoded.retired_operations;
+        if !rt.begin_startup_authoritative_recovery_install(attempt) {
+            schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
+            return;
+        }
         if rt
-            .install_repository_snapshot(metadata.version(), staged_repository_snapshot)
+            .install_authoritative_recovery_snapshot(metadata.version(), staged_repository_snapshot)
             .await
             .is_err()
         {
+            rt.finish_authoritative_recovery_install();
             schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
             return;
         }
@@ -1697,6 +1717,7 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
                 .installed_delivery_checkpoint_matches(&expected_applied, &expected_retired)
                 .await
         {
+            rt.finish_authoritative_recovery_install();
             schedule_startup_rollforward_retry(std::sync::Arc::clone(&rt));
             return;
         }
@@ -1707,6 +1728,7 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
                 donor: donor.clone(),
             });
         }
+        rt.finish_authoritative_recovery_install();
         if rt.recovery_coordinator.lock().phase()
             != super::recovery_reducer::RecoveryPhase::Verifying
         {
@@ -1976,12 +1998,19 @@ async fn install<R: StrictReplicable>(
         schedule_local_install_retry(rt, attempt, donor);
         return;
     };
+    if !rt.begin_authoritative_recovery_install(attempt, &donor) {
+        return;
+    }
     let staged_repository_snapshot = decoded.repository_snapshot;
     if rt
-        .install_repository_snapshot(target.repository_version(), staged_repository_snapshot)
+        .install_authoritative_recovery_snapshot(
+            target.repository_version(),
+            staged_repository_snapshot,
+        )
         .await
         .is_err()
     {
+        rt.finish_authoritative_recovery_install();
         schedule_local_install_retry(rt, attempt, donor);
         return;
     }
@@ -1998,6 +2027,7 @@ async fn install<R: StrictReplicable>(
             .installed_delivery_checkpoint_matches(&applied, &retired)
             .await;
     if !verified {
+        rt.finish_authoritative_recovery_install();
         schedule_local_install_retry(rt, attempt, donor);
         return;
     }
@@ -2005,6 +2035,7 @@ async fn install<R: StrictReplicable>(
         attempt,
         donor: donor.clone(),
     });
+    rt.finish_authoritative_recovery_install();
     finalize_install(rt, attempt, donor).await;
 }
 

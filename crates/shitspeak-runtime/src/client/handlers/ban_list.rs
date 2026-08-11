@@ -7,11 +7,13 @@ use crate::{
     client::Client,
     errors::MessageHandlerError,
     messages::{Message, encoder::BanList},
+    s2s::BanProposalOutcome,
     server::Server,
 };
 
 use super::{
-    BAN_REPOSITORY_REQUEST_ADMITTED, BAN_REPOSITORY_REQUEST_SUBMITTED, send_ban_repository_notice,
+    BAN_REPOSITORY_REQUEST_ADMITTED, BAN_REPOSITORY_REQUEST_REJECTED,
+    BAN_REPOSITORY_REQUEST_SUBMITTED, send_ban_repository_notice,
 };
 
 const BANNED_ADDRESS_LENGTH: usize = 16;
@@ -162,9 +164,8 @@ pub async fn handle_ban_list(
             entries: entries.clone(),
         };
         send_ban_repository_notice(sender, BAN_REPOSITORY_REQUEST_SUBMITTED).await?;
-        let admitted = if server.s2s_manager().propose_ban_op(op).await {
-            true
-        } else {
+        let proposal_outcome = server.s2s_manager().propose_ban_op(op).await;
+        let admitted = if proposal_outcome.permits_direct_repository_fallback() {
             match server.get_bans().set_bans(entries).await {
                 Ok(()) => true,
                 Err(error) => {
@@ -172,9 +173,13 @@ pub async fn handle_ban_list(
                     false
                 }
             }
+        } else {
+            proposal_outcome == BanProposalOutcome::Admitted
         };
         if admitted {
             send_ban_repository_notice(sender, BAN_REPOSITORY_REQUEST_ADMITTED).await?;
+        } else {
+            send_ban_repository_notice(sender, BAN_REPOSITORY_REQUEST_REJECTED).await?;
         }
         tracing::info!(
             "Ban list update from session {:?} with {} entries",

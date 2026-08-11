@@ -159,8 +159,12 @@ impl TestServer {
     }
 
     pub fn strict_channel_terminal_journal_path(&self) -> Option<PathBuf> {
+        self.strict_terminal_journal_path(CHANNEL_REPLICATION_TOPIC)
+    }
+
+    pub fn strict_terminal_journal_path(&self, topic: &str) -> Option<PathBuf> {
         self.s2s_persistence_dir()
-            .map(|directory| directory.join(strict_channel_terminal_journal_relative_path()))
+            .map(|directory| directory.join(strict_terminal_journal_relative_path(topic)))
     }
 }
 

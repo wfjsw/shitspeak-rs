@@ -256,6 +256,27 @@ pub trait StrictReplicable: Send + Sync + 'static {
         version: u64,
         snapshot: Bytes,
     ) -> Result<(), StrictSnapshotError>;
+
+    /// Replace the repository from an already verified protocol-v8 recovery
+    /// artifact. Unlike ordinary catchup, this may replace a locally newer
+    /// image: the durable recovery certificate and bound terminal cut are the
+    /// authority for the replacement.
+    ///
+    /// The runtime invokes this only after it has verified the staged
+    /// artifact, its exact durable install intent, and the paired terminal
+    /// checkpoint. Repositories participating in protocol v8 must override
+    /// this with an atomic durable replacement. The conservative default
+    /// keeps older implementations fenced rather than treating a normal
+    /// snapshot install as authoritative.
+    async fn install_authoritative_recovery_snapshot(
+        &self,
+        _version: u64,
+        _snapshot: Bytes,
+    ) -> Result<(), StrictSnapshotError> {
+        Err(StrictSnapshotError::new(
+            "repository does not support authoritative protocol-v8 recovery snapshots",
+        ))
+    }
 }
 
 /// Caller-facing handle for a strict topic. Cloning is cheap (internally an
@@ -596,6 +617,12 @@ impl<R: StrictReplicable> StrictHandle<R> {
 
     pub fn local_node_id(&self) -> shitspeak_core::NodeIdentifier {
         self.runtime.self_id
+    }
+
+    /// Whether a new proposal may enter this strict runtime without bypassing
+    /// a recovery or repository-image fence.
+    pub fn accepts_new_proposals(&self) -> bool {
+        self.runtime.accepts_new_proposals()
     }
 
     #[cfg(any(test, feature = "test-support"))]

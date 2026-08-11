@@ -3910,6 +3910,7 @@ impl ChannelRepository {
             freshness,
             strict_operation_ids,
             true,
+            false,
         )
         .await
     }
@@ -3931,6 +3932,30 @@ impl ChannelRepository {
             freshness,
             Vec::new(),
             false,
+            false,
+        )
+        .await
+    }
+
+    /// Atomically replace the repository with an authenticated protocol-v8
+    /// recovery artifact. This is the sole snapshot path allowed to replace a
+    /// locally newer image: a durable recovery certificate has already
+    /// established the supplied image as authoritative.
+    pub async fn install_s2s_authoritative_recovery_snapshot_v8_in_server(
+        self: &Arc<Self>,
+        server_id: &str,
+        version: u64,
+        channels_snapshot: Vec<Channel>,
+        freshness: i64,
+    ) -> Result<(), ChannelRepoError> {
+        self.install_s2s_snapshot_candidate_in_server(
+            server_id,
+            version,
+            channels_snapshot,
+            freshness,
+            Vec::new(),
+            false,
+            true,
         )
         .await
     }
@@ -3943,10 +3968,11 @@ impl ChannelRepository {
         freshness: i64,
         strict_operation_ids: Vec<StrictOperationId>,
         require_legacy_id_superset: bool,
+        authoritative_recovery: bool,
     ) -> Result<(), ChannelRepoError> {
         let _strict_apply_guard = self.strict_apply_lock.lock().await;
         let current_version = self.current_version_in_server(server_id);
-        if version < current_version {
+        if version < current_version && !authoritative_recovery {
             tracing::debug!(
                 server_id,
                 current_version,

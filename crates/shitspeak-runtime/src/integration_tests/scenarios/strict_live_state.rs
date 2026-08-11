@@ -379,6 +379,12 @@ struct TerminalStatus {
     node_15_record_counters: Vec<u64>,
 }
 
+#[derive(Debug)]
+struct RecoveryArtifactStatus {
+    repository_version: u64,
+    history_freshness: u64,
+}
+
 impl TerminalStatus {
     fn cut(&self) -> TerminalCutStatus {
         TerminalCutStatus {
@@ -940,6 +946,22 @@ fn read_terminal_status(path: &Path) -> rusqlite::Result<TerminalStatus> {
         node_15_retired_floor,
         node_15_record_counters,
     })
+}
+
+fn read_recovery_artifact_status(path: &Path) -> rusqlite::Result<RecoveryArtifactStatus> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(Duration::from_secs(1))?;
+    connection.query_row(
+        "SELECT repository_version, history_freshness
+         FROM strict_recovery_artifact WHERE singleton = 1",
+        [],
+        |row| {
+            Ok(RecoveryArtifactStatus {
+                repository_version: decode_u64(row.get(0)?)?,
+                history_freshness: decode_u64(row.get(1)?)?,
+            })
+        },
+    )
 }
 
 fn metric_total(server: &TestServer, metric: &str, labels: &[(&str, &str)]) -> f64 {
@@ -2716,13 +2738,33 @@ async fn strict_live_channel_state_reproduces_and_resolves_dfw_jp_stall() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Ban repositories and strict terminal journals copied live through SSH"]
-async fn strict_live_ban_state_reproduces_jnb_dfw_admission_traffic() {
+async fn strict_live_ban_state_resolves_jnb_dfw_staged_recovery() {
     let _guard = s2s_network_test_guard().await;
     let fixture_root = PathBuf::from(
         std::env::var_os("SHITSPEAK_STRICT_LIVE_BAN_STATE_ROOT")
             .expect("SHITSPEAK_STRICT_LIVE_BAN_STATE_ROOT is required"),
     );
     let nodes = [(8_u16, "node-4-dfw"), (15_u16, "node-15-jnb")];
+    let captured_dfw_terminal_path = fixture_root
+        .join("node-4-dfw")
+        .join("terminal-bans.sqlite3");
+    let captured_dfw_terminal = read_terminal_status(&captured_dfw_terminal_path)
+        .expect("read captured DFW Ban terminal status");
+    let certified_artifact = read_recovery_artifact_status(&captured_dfw_terminal_path)
+        .expect("read captured DFW certified Ban recovery artifact");
+    let certified_version = certified_artifact.repository_version;
+    assert_eq!(
+        certified_version, 6,
+        "the captured DFW recovery artifact must name the incident's certified v6 image"
+    );
+    assert_eq!(
+        certified_artifact.history_freshness, 1_786_418_705,
+        "the captured DFW recovery artifact must retain the incident freshness"
+    );
+    assert!(
+        captured_dfw_terminal.repository_image_install_pending,
+        "the captured DFW Ban recovery must begin with its repository image pending"
+    );
     let node_ids = nodes.map(|(node_id, _)| node_id);
     let pki = Arc::new(mint_pki(&node_ids));
     let addresses = join_all(node_ids.iter().map(|_| pick_free_port()))
@@ -2749,43 +2791,55 @@ async fn strict_live_ban_state_reproduces_jnb_dfw_admission_traffic() {
         .iter()
         .map(|(node_id, server)| (*node_id, server.server.get_bans().current_version()))
         .collect::<HashMap<_, _>>();
-    assert_ne!(
-        initial_versions[&8], initial_versions[&15],
-        "copied incident fixture no longer has the reported Ban repository gap"
+    assert_eq!(
+        initial_versions[&15], 5,
+        "the captured JNB Ban head must retain its recorded pre-recovery v5 image"
     );
-    let sent_before = servers
-        .iter()
-        .map(|(_, server)| {
-            metric_total(
-                server,
-                "shitspeak_s2s_strict_replication_catchup_send_bytes_total",
-                &[],
-            )
-        })
-        .sum::<f64>();
-
-    tokio::time::sleep(Duration::from_secs(25)).await;
-
-    let final_versions = servers
-        .iter()
-        .map(|(node_id, server)| (*node_id, server.server.get_bans().current_version()))
-        .collect::<HashMap<_, _>>();
-    let sent_after = servers
-        .iter()
-        .map(|(_, server)| {
-            metric_total(
-                server,
-                "shitspeak_s2s_strict_replication_catchup_send_bytes_total",
-                &[],
-            )
-        })
-        .sum::<f64>();
+    assert_eq!(
+        initial_versions[&8], 7,
+        "the captured DFW Ban head must be the untagged incident v7 image"
+    );
     assert!(
-        sent_after > sent_before,
-        "copied Ban-state replay did not issue strict catch-up traffic"
+        initial_versions[&8] > certified_version,
+        "copied incident fixture no longer has the reported DFW Ban head ahead of JNB"
     );
-    assert_ne!(
-        final_versions[&8], final_versions[&15],
-        "two-node Ban replay converged unexpectedly: initial={initial_versions:?}, final={final_versions:?}"
+
+    assert!(
+        wait_until(CONVERGENCE_DEADLINE, || {
+            servers
+                .iter()
+                .all(|(_, server)| server.server.get_bans().current_version() == certified_version)
+        })
+        .await,
+        "the captured Ban-state replay did not restore DFW to the certified v6 image: {:?}",
+        servers
+            .iter()
+            .map(|(node_id, server)| (*node_id, server.server.get_bans().current_version()))
+            .collect::<HashMap<_, _>>()
     );
+
+    let dfw = servers
+        .iter()
+        .find_map(|(node_id, server)| (*node_id == 8).then_some(server))
+        .expect("DFW server");
+    let dfw_terminal_path = dfw
+        .strict_terminal_journal_path("bans")
+        .expect("DFW durable Ban terminal journal");
+    let dfw_terminal = read_terminal_status(&dfw_terminal_path)
+        .expect("read DFW Ban terminal status after recovery");
+    assert_eq!(
+        dfw_terminal.checkpoint_repository_version,
+        Some(certified_version)
+    );
+    assert!(
+        !dfw_terminal.repository_image_install_pending,
+        "DFW must complete its durable Ban repository-image install"
+    );
+
+    // Once the verified image and terminal checkpoint are installed, no
+    // admission proof retry may retain catchup traffic. The shared traffic
+    // snapshot includes every strict topic, so this also detects a Ban retry
+    // leaking beyond the completed recovery fence.
+    let quiet = wait_for_quiet(&servers).await;
+    assert_no_active_traffic(&quiet);
 }

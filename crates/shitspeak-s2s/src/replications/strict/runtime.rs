@@ -4228,6 +4228,11 @@ pub struct StrictRuntime<R: StrictReplicable> {
     /// topic. Payload/session components feed correlated events into this
     /// reducer and execute only the effects it emits.
     pub(super) recovery_coordinator: Mutex<StrictRecoveryCoordinator>,
+    /// Holds recovery-coordinator transitions that could supersede an
+    /// authoritative repository replacement until that replacement has
+    /// reached its atomic repository/terminal boundary.
+    authoritative_recovery_install_in_progress: AtomicBool,
+    deferred_authoritative_recovery_events: Mutex<Vec<RecoveryEvent>>,
     pub(super) recovery_v8: RecoveryV8Runtime,
     recovery_effects: Mutex<VecDeque<RecoveryEffect>>,
     recovery_effect_signal: Notify,
@@ -4382,6 +4387,13 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         replication_protocol::strict_participant_version_supported(
             self.net.local_strict_replication_protocol_version(),
         ) && self.recovery_coordinator.lock().phase() == RecoveryPhase::Healthy
+    }
+
+    /// New local work must not advance a repository that is awaiting a
+    /// recovery image, even if the recovery coordinator has not yet left its
+    /// healthy phase to begin that transfer.
+    pub(crate) fn accepts_new_proposals(&self) -> bool {
+        self.recovery_is_healthy() && !self.repository_base_required()
     }
 
     fn cancel_legacy_history_recovery(&self) {
@@ -4829,6 +4841,16 @@ impl<R: StrictReplicable> StrictRuntime<R> {
     /// for the protocol/persistence executors. Callbacks never mutate the
     /// coordinator directly.
     pub(super) fn transition_recovery(&self, event: RecoveryEvent) -> Vec<RecoveryEffect> {
+        if self
+            .authoritative_recovery_install_in_progress
+            .load(Ordering::Acquire)
+            && !matches!(event, RecoveryEvent::Installed { .. })
+        {
+            self.deferred_authoritative_recovery_events
+                .lock()
+                .push(event);
+            return Vec::new();
+        }
         let event = if !self.recovery_v8_capability_ready() {
             let (active_attempt, phase) = {
                 let coordinator = self.recovery_coordinator.lock();
@@ -5054,6 +5076,78 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             )
             && !self.state.lock().has_active_strict_work()
             && self.inbound_strict_work_in_progress.load(Ordering::Acquire) == 0
+    }
+
+    /// Revalidate immediately before an authoritative v8 repository
+    /// replacement. Artifact verification performs filesystem I/O outside
+    /// the coordinator lock, so a donor failure or a newer recovery can
+    /// supersede this install while that verification is in progress.
+    pub(super) fn recovery_install_is_current(
+        &self,
+        attempt: RecoveryAttemptId,
+        donor: &RecoveryParticipant,
+    ) -> bool {
+        let coordinator = self.recovery_coordinator.lock();
+        coordinator.attempt() == Some(attempt)
+            && coordinator.phase() == RecoveryPhase::Installing
+            && coordinator.donor() == Some(donor)
+    }
+
+    /// Enter the non-interruptible portion of a certified recovery install.
+    /// Recovery events received while this guard is active are retained and
+    /// reduced after the repository replacement completes, so a cancelled
+    /// attempt cannot install over the state of its successor.
+    pub(super) fn begin_authoritative_recovery_install(
+        &self,
+        attempt: RecoveryAttemptId,
+        donor: &RecoveryParticipant,
+    ) -> bool {
+        if self
+            .authoritative_recovery_install_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if self.recovery_install_is_current(attempt, donor) {
+            true
+        } else {
+            self.finish_authoritative_recovery_install();
+            false
+        }
+    }
+
+    /// Enter the startup variant of the certified recovery install boundary.
+    pub(super) fn begin_startup_authoritative_recovery_install(
+        &self,
+        attempt: RecoveryAttemptId,
+    ) -> bool {
+        if self
+            .authoritative_recovery_install_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if self.startup_recovery_install_is_current_and_quiescent(attempt) {
+            true
+        } else {
+            self.finish_authoritative_recovery_install();
+            false
+        }
+    }
+
+    pub(super) fn finish_authoritative_recovery_install(&self) {
+        if !self
+            .authoritative_recovery_install_in_progress
+            .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        let deferred = std::mem::take(&mut *self.deferred_authoritative_recovery_events.lock());
+        for event in deferred {
+            self.transition_recovery(event);
+        }
     }
 
     /// A repository-image marker written before protocol v8 has no staged
@@ -5355,6 +5449,25 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         super::recovery_v8_runtime::suppress_generation_zero_audit_after_repository_mutation(self);
         let mut head = self.repository_terminal_head.lock().await;
         let result = self.repo.install_snapshot(version, snapshot).await;
+        self.refresh_repository_terminal_head_after_repository_mutation(&mut head)
+            .await;
+        result
+    }
+
+    /// Install an already verified protocol-v8 recovery artifact. The caller
+    /// must hold the durable recovery fence; ordinary catchup continues to use
+    /// `install_repository_snapshot`, which preserves its stale-image guard.
+    pub(super) async fn install_authoritative_recovery_snapshot(
+        &self,
+        version: u64,
+        snapshot: Bytes,
+    ) -> Result<(), StrictSnapshotError> {
+        super::recovery_v8_runtime::suppress_generation_zero_audit_after_repository_mutation(self);
+        let mut head = self.repository_terminal_head.lock().await;
+        let result = self
+            .repo
+            .install_authoritative_recovery_snapshot(version, snapshot)
+            .await;
         self.refresh_repository_terminal_head_after_repository_mutation(&mut head)
             .await;
         result
@@ -5745,6 +5858,8 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             strict_work_recovery_gate: Mutex::new(()),
             inbound_strict_work_in_progress: AtomicU64::new(0),
             recovery_coordinator: Mutex::new(recovery_coordinator),
+            authoritative_recovery_install_in_progress: AtomicBool::new(false),
+            deferred_authoritative_recovery_events: Mutex::new(Vec::new()),
             recovery_v8: RecoveryV8Runtime::default(),
             recovery_effects: Mutex::new(recovery_effects),
             recovery_effect_signal: Notify::new(),
@@ -16579,6 +16694,21 @@ mod tests {
         );
         rt.finish_history_election_for_test();
         (rt, net, repo)
+    }
+
+    #[test]
+    fn pending_repository_image_fences_new_local_proposals() {
+        let (rt, _net, _repo) = v1_runtime(ReplicationConfig::default());
+        assert!(rt.accepts_new_proposals());
+
+        rt.require_repository_image_install(HistoryMetadata {
+            version: 1,
+            freshness: 1,
+        });
+
+        assert!(rt.repository_base_required());
+        assert!(rt.pending_repository_image_install().is_some());
+        assert!(!rt.accepts_new_proposals());
     }
 
     #[test]
