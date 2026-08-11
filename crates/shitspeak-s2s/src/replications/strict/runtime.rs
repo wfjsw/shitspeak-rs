@@ -16815,6 +16815,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_waits_for_an_authoritative_recovery_install_to_finish() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 2);
+        net.set_epoch(3, 3);
+        enable_v8_capabilities(&net, [2, 3]);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        assert!(rt.request_recovery(RecoveryTrigger::TerminalFence));
+        rt.take_recovery_effects();
+
+        let (attempt, target, cut) = {
+            let attempt = rt
+                .recovery_coordinator
+                .lock()
+                .attempt()
+                .expect("active recovery attempt");
+            let head = rt.repository_terminal_head.lock().await;
+            (
+                attempt,
+                LogicalTarget::new(
+                    head.history_metadata.version,
+                    head.history_metadata.freshness,
+                    *head.terminal_cut.terminal_set_digest(),
+                ),
+                crate::replications::strict::recovery_reducer::TerminalCut::new(
+                    *head.terminal_cut.journal_id(),
+                    head.terminal_cut.generation(),
+                    *head.terminal_cut.chain_digest(),
+                    *head.terminal_cut.terminal_set_digest(),
+                ),
+            )
+        };
+        let donor = RecoveryParticipant::new(2, 2);
+        let other_witness = RecoveryParticipant::new(3, 3);
+        let now_ms = rt.recovery_now_ms();
+        for (witness, rank) in [(donor.clone(), 2), (other_witness, 1)] {
+            rt.transition_recovery(RecoveryEvent::ProbeResponse {
+                attempt,
+                attestation: RecoveryAttestation::new(witness, target.clone(), cut.clone(), rank),
+                authenticated: true,
+                now_ms,
+            });
+        }
+        rt.transition_recovery(RecoveryEvent::TransferProgress {
+            attempt,
+            donor: donor.clone(),
+            kind: TransferKind::TerminalCheckpoint,
+            authenticated: true,
+            complete: true,
+            now_ms: now_ms.saturating_add(1),
+        });
+        rt.transition_recovery(RecoveryEvent::TransferProgress {
+            attempt,
+            donor: donor.clone(),
+            kind: TransferKind::RepositorySnapshot,
+            authenticated: true,
+            complete: true,
+            now_ms: now_ms.saturating_add(2),
+        });
+        rt.transition_recovery(RecoveryEvent::Prepared {
+            attempt,
+            donor: donor.clone(),
+        });
+        rt.transition_recovery(RecoveryEvent::InstallStarted {
+            attempt,
+            donor: donor.clone(),
+        });
+        assert_eq!(
+            rt.recovery_coordinator.lock().phase(),
+            RecoveryPhase::Installing
+        );
+        assert!(rt.begin_authoritative_recovery_install(attempt, &donor));
+
+        assert!(
+            rt.transition_recovery(RecoveryEvent::Cancel {
+                attempt,
+                now_ms: now_ms.saturating_add(3),
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            rt.recovery_coordinator.lock().phase(),
+            RecoveryPhase::Installing,
+            "cancellation must not interrupt the repository replacement"
+        );
+        assert_eq!(
+            rt.deferred_authoritative_recovery_events.lock().len(),
+            1,
+            "cancellation must be retained until installation completes"
+        );
+
+        rt.transition_recovery(RecoveryEvent::Installed { attempt, donor });
+        assert_eq!(
+            rt.recovery_coordinator.lock().phase(),
+            RecoveryPhase::Verifying,
+            "the installation completion must be reduced before the queued cancellation"
+        );
+
+        rt.finish_authoritative_recovery_install();
+        assert_eq!(
+            rt.recovery_coordinator.lock().phase(),
+            RecoveryPhase::Backoff,
+            "the queued cancellation must run after the authoritative install boundary"
+        );
+        assert!(rt.deferred_authoritative_recovery_events.lock().is_empty());
+    }
+
+    #[tokio::test]
     async fn recovery_progress_metric_advances_only_with_reducer_progress() {
         let net = MockNet::new(1, vec![1, 2, 3]);
         net.set_epoch(1, 1);
