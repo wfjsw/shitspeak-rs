@@ -11,6 +11,7 @@ use crate::{
 };
 
 const BANNED_ADDRESS_LENGTH: usize = 16;
+const IPV4_MAPPED_MASK_OFFSET: u32 = 96;
 
 fn decode_ban_address(address: &[u8]) -> Result<IpAddr, MessageHandlerError> {
     let address: [u8; BANNED_ADDRESS_LENGTH] = address.try_into().map_err(|_| {
@@ -40,6 +41,40 @@ fn encode_ban_address(address: IpAddr, ban_ip: bool) -> Vec<u8> {
             encoded.to_vec()
         }
         IpAddr::V6(address) => address.octets().to_vec(),
+    }
+}
+
+fn decode_ban_mask(address: IpAddr, ban_ip: bool, mask: u32) -> Result<u8, MessageHandlerError> {
+    if !ban_ip {
+        return Ok(0);
+    }
+
+    match address {
+        IpAddr::V4(_) => {
+            if !(IPV4_MAPPED_MASK_OFFSET..=IPV4_MAPPED_MASK_OFFSET + 32).contains(&mask) {
+                return Err(MessageHandlerError::protocol_violation(
+                    "ban list contains an invalid mask for its address family",
+                ));
+            }
+            Ok((mask - IPV4_MAPPED_MASK_OFFSET) as u8)
+        }
+        IpAddr::V6(_) if mask <= 128 => Ok(mask as u8),
+        IpAddr::V6(_) => Err(MessageHandlerError::protocol_violation(
+            "ban list contains an invalid mask for its address family",
+        )),
+    }
+}
+
+fn encode_ban_mask(address: IpAddr, ban_ip: bool, mask: u8) -> u32 {
+    if !ban_ip {
+        return 0;
+    }
+
+    match address {
+        // Mumble's IPv4 entries use an IPv4-mapped 16-byte HostAddress, so
+        // their wire masks include the 96-bit mapping prefix.
+        IpAddr::V4(_) => u32::from(mask) + IPV4_MAPPED_MASK_OFFSET,
+        IpAddr::V6(_) => u32::from(mask),
     }
 }
 
@@ -79,7 +114,7 @@ pub async fn handle_ban_list(
             .into_iter()
             .map(|b| shitspeak_proto::mumble_proto::ban_list::BanEntry {
                 address: encode_ban_address(b.address, b.ban_ip),
-                mask: if b.ban_ip { b.mask as u32 } else { 0 },
+                mask: encode_ban_mask(b.address, b.ban_ip, b.mask),
                 name: b.name.clone(),
                 hash: b.hash.clone(),
                 reason: b.reason.clone(),
@@ -101,15 +136,10 @@ pub async fn handle_ban_list(
             // IPv4 entries are IPv4-mapped IPv6 addresses, not UTF-8 text.
             let address = decode_ban_address(&b.address)?;
             let ban_ip = !address.is_unspecified();
-            let max_mask: u32 = if address.is_ipv4() { 32 } else { 128 };
-            if ban_ip && b.mask > max_mask {
-                return Err(MessageHandlerError::protocol_violation(
-                    "ban list contains an invalid mask for its address family",
-                ));
-            }
+            let mask = decode_ban_mask(address, ban_ip, b.mask)?;
             entries.push(BanEntry {
                 address,
-                mask: b.mask as u8,
+                mask,
                 name: b.name.clone(),
                 hash: b.hash.clone(),
                 ban_certificate: b.hash.is_some(),
@@ -140,4 +170,31 @@ pub async fn handle_ban_list(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use super::{decode_ban_address, decode_ban_mask, encode_ban_mask};
+
+    #[test]
+    fn ipv4_mapped_ban_masks_round_trip_at_the_mumble_protocol_boundary() {
+        let address =
+            decode_ban_address(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1]).unwrap();
+
+        assert_eq!(address, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(decode_ban_mask(address, true, 128).unwrap(), 32);
+        assert_eq!(encode_ban_mask(address, true, 32), 128);
+        assert!(decode_ban_mask(address, true, 32).is_err());
+    }
+
+    #[test]
+    fn ipv6_ban_masks_are_not_translated() {
+        let address = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+        assert_eq!(decode_ban_mask(address, true, 128).unwrap(), 128);
+        assert_eq!(encode_ban_mask(address, true, 128), 128);
+        assert!(decode_ban_mask(address, true, 129).is_err());
+    }
 }

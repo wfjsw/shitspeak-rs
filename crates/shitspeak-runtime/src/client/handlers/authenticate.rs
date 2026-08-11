@@ -21,11 +21,6 @@ use shitspeak_auth::{
 
 const AUTH_FINALIZATION_YIELD_EVERY: usize = 64;
 
-fn ban_hash_matches(banned: &str, certificate_hash: Option<&str>, tls_ja4: Option<&str>) -> bool {
-    certificate_hash.is_some_and(|hash| banned.eq_ignore_ascii_case(hash))
-        || tls_ja4.is_some_and(|ja4| banned.eq_ignore_ascii_case(ja4))
-}
-
 struct StagedUserChannelCacheWrite {
     cache_key: String,
     current_channel_id: u32,
@@ -83,7 +78,6 @@ pub async fn handle_authenticate(
         return Ok(());
     }
 
-
     // ── Username required ─────────────────────────────────────────────────
     let username = msg.username.ok_or(RejectType::InvalidUsername)?;
     let password = msg.password;
@@ -124,26 +118,34 @@ pub async fn handle_authenticate(
         );
         return Err(MessageHandlerError::BannedConnection);
     }
-    // Banned certificate hash or TLS JA4 fingerprint. Both are compared
-    // case-insensitively because hashes and fingerprints are hexadecimal/text
-    // identifiers, and ban-list clients may normalize their casing.
+    // Certificate hashes and TLS JA4 fingerprints use indexed,
+    // case-insensitive identity-ban lookup.
     let certificate_hash = sender.get_certificate_hash().map(hex::encode);
     let tls_ja4 = sender.tls_ja4().map(str::to_owned);
-    let banned_hash = server
+    if server
         .get_bans()
-        .get_active_bans()
-        .await
-        .iter()
-        .any(|entry| {
-            entry.ban_certificate
-                && entry.hash.as_deref().is_some_and(|banned| {
-                    ban_hash_matches(banned, certificate_hash.as_deref(), tls_ja4.as_deref())
-                })
-        });
-    if banned_hash {
+        .is_identity_banned(certificate_hash.as_deref(), tls_ja4.as_deref())
+    {
         tracing::info!(
             session = u32::from(session),
             "connection from banned certificate or TLS JA4 fingerprint rejected at authenticate"
+        );
+        return Err(MessageHandlerError::BannedConnection);
+    }
+    // An ASN is an explicit certificate-ban criterion only when the ban hash
+    // has the exact `AS<number>` form. Avoid GeoIP work for every other ban
+    // list, and deliberately ignore the ASN criterion when lookup fails.
+    if server.get_bans().has_active_asn_bans()
+        && server
+            .lookup_ip_geo_metadata(real_ip)
+            .await
+            .and_then(|metadata| metadata.asn())
+            .is_some_and(|asn| server.get_bans().is_asn_banned(asn))
+    {
+        tracing::info!(
+            %real_ip,
+            session = u32::from(session),
+            "connection from banned ASN rejected at authenticate"
         );
         return Err(MessageHandlerError::BannedConnection);
     }
@@ -931,7 +933,7 @@ async fn client_is_current(server: &Arc<Box<Server>>, client: &Arc<Box<Client>>)
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_comment_if_revision, apply_texture_if_revision, ban_hash_matches};
+    use super::{apply_comment_if_revision, apply_texture_if_revision};
     use crate::client::client_global_state::ClientGlobalState;
 
     #[test]
@@ -957,12 +959,5 @@ mod tests {
 
         assert!(state.get_texture_hash().is_none());
         assert!(state.get_comment_hash().is_none());
-    }
-
-    #[test]
-    fn ban_hash_matches_certificate_and_tls_ja4_case_insensitively() {
-        assert!(ban_hash_matches("AbCd", Some("aBcD"), None));
-        assert!(ban_hash_matches("AbCd", None, Some("aBcD")));
-        assert!(!ban_hash_matches("AbCd", Some("other"), Some("different")));
     }
 }

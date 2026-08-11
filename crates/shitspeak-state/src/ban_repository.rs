@@ -8,14 +8,14 @@
 //!
 //! The public interface is unchanged from the previous in-memory implementation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::broadcast;
@@ -185,12 +185,212 @@ pub enum BanOp {
     RemoveBan { address: IpAddr, mask: u8 },
 }
 
+const IPV4_PREFIX_COUNT: u8 = 32;
+const IPV6_PREFIX_COUNT: u8 = 128;
+
+/// In-memory lookup tables used on the authentication path. Address width is
+/// fixed, so checking every possible CIDR prefix is constant work regardless
+/// of the number of configured bans.
+#[derive(Default)]
+struct BanLookupIndex {
+    entries: HashMap<(IpAddr, u8), BanEntry>,
+    ipv4_prefixes: HashMap<(u8, u32), i64>,
+    ipv6_prefixes: HashMap<(u8, u128), i64>,
+    identity_hashes: HashMap<String, i64>,
+    asns: HashMap<u32, i64>,
+    has_permanent_asn_ban: bool,
+    latest_asn_expiry: i64,
+}
+
+impl BanLookupIndex {
+    fn from_entries(entries: Vec<BanEntry>) -> Self {
+        let mut index = Self::default();
+        index.replace_entries(entries);
+        index
+    }
+
+    fn apply_op(&mut self, op: &BanOp) {
+        match op {
+            BanOp::SetBans { entries } => self.replace_entries(entries.clone()),
+            BanOp::AddBan { entry } => {
+                self.entries
+                    .insert((entry.address, entry.mask), entry.clone());
+                self.rebuild();
+            }
+            BanOp::RemoveBan { address, mask } => {
+                self.entries.remove(&(*address, *mask));
+                self.rebuild();
+            }
+        }
+    }
+
+    fn replace_entries(&mut self, entries: Vec<BanEntry>) {
+        self.entries = entries
+            .into_iter()
+            .map(|entry| ((entry.address, entry.mask), entry))
+            .collect();
+        self.rebuild();
+    }
+
+    fn rebuild(&mut self) {
+        self.ipv4_prefixes.clear();
+        self.ipv6_prefixes.clear();
+        self.identity_hashes.clear();
+        self.asns.clear();
+        self.has_permanent_asn_ban = false;
+        self.latest_asn_expiry = 0;
+
+        for entry in self.entries.values() {
+            let expiry = ban_expiry(entry);
+            if entry.ban_ip {
+                match entry.address {
+                    IpAddr::V4(address) => {
+                        let mask = entry.mask.min(IPV4_PREFIX_COUNT);
+                        extend_ban_expiry(
+                            &mut self.ipv4_prefixes,
+                            (mask, ipv4_prefix(address, mask)),
+                            expiry,
+                        );
+                    }
+                    IpAddr::V6(address) => {
+                        let mask = entry.mask.min(IPV6_PREFIX_COUNT);
+                        extend_ban_expiry(
+                            &mut self.ipv6_prefixes,
+                            (mask, ipv6_prefix(address, mask)),
+                            expiry,
+                        );
+                    }
+                }
+            }
+            if entry.ban_certificate {
+                if let Some(hash) = entry.hash.as_deref() {
+                    if let Some(asn) = asn_from_ban_hash(hash) {
+                        extend_ban_expiry(&mut self.asns, asn, expiry);
+                        if expiry == 0 {
+                            self.has_permanent_asn_ban = true;
+                        } else {
+                            self.latest_asn_expiry = self.latest_asn_expiry.max(expiry);
+                        }
+                    } else {
+                        extend_ban_expiry(
+                            &mut self.identity_hashes,
+                            hash.to_ascii_lowercase(),
+                            expiry,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_ip_banned(&self, address: IpAddr, now: i64) -> bool {
+        match address {
+            IpAddr::V4(address) => (0..=IPV4_PREFIX_COUNT).any(|mask| {
+                self.ipv4_prefixes
+                    .get(&(mask, ipv4_prefix(address, mask)))
+                    .is_some_and(|expiry| ban_is_active(*expiry, now))
+            }),
+            IpAddr::V6(address) => (0..=IPV6_PREFIX_COUNT).any(|mask| {
+                self.ipv6_prefixes
+                    .get(&(mask, ipv6_prefix(address, mask)))
+                    .is_some_and(|expiry| ban_is_active(*expiry, now))
+            }),
+        }
+    }
+
+    fn is_identity_banned(
+        &self,
+        certificate_hash: Option<&str>,
+        tls_ja4: Option<&str>,
+        now: i64,
+    ) -> bool {
+        certificate_hash
+            .into_iter()
+            .chain(tls_ja4)
+            .map(str::to_ascii_lowercase)
+            .any(|identity| {
+                self.identity_hashes
+                    .get(&identity)
+                    .is_some_and(|expiry| ban_is_active(*expiry, now))
+            })
+    }
+
+    fn has_active_asn_bans(&self, now: i64) -> bool {
+        self.has_permanent_asn_ban || now < self.latest_asn_expiry
+    }
+
+    fn is_asn_banned(&self, asn: u32, now: i64) -> bool {
+        self.asns
+            .get(&asn)
+            .is_some_and(|expiry| ban_is_active(*expiry, now))
+    }
+}
+
+fn asn_from_ban_hash(hash: &str) -> Option<u32> {
+    let asn = hash.strip_prefix("AS")?;
+    (!asn.is_empty() && asn.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| asn.parse().ok())
+        .flatten()
+}
+
+fn ban_expiry(entry: &BanEntry) -> i64 {
+    if entry.duration == 0 {
+        0
+    } else {
+        entry
+            .start
+            .saturating_add(i64::try_from(entry.duration).unwrap_or(i64::MAX))
+    }
+}
+
+fn ban_is_active(expiry: i64, now: i64) -> bool {
+    expiry == 0 || now < expiry
+}
+
+fn extend_ban_expiry<K: std::cmp::Eq + std::hash::Hash>(
+    index: &mut HashMap<K, i64>,
+    key: K,
+    expiry: i64,
+) {
+    index
+        .entry(key)
+        .and_modify(|existing| {
+            if *existing == 0 || expiry == 0 {
+                *existing = 0;
+            } else {
+                *existing = (*existing).max(expiry);
+            }
+        })
+        .or_insert(expiry);
+}
+
+fn ipv4_prefix(address: std::net::Ipv4Addr, mask: u8) -> u32 {
+    let mask = mask.min(IPV4_PREFIX_COUNT);
+    if mask == 0 {
+        0
+    } else {
+        u32::from(address) & (u32::MAX << (IPV4_PREFIX_COUNT - mask))
+    }
+}
+
+fn ipv6_prefix(address: std::net::Ipv6Addr, mask: u8) -> u128 {
+    let mask = mask.min(IPV6_PREFIX_COUNT);
+    if mask == 0 {
+        0
+    } else {
+        u128::from(address) & (u128::MAX << (IPV6_PREFIX_COUNT - mask))
+    }
+}
+
 // ─── BanRepository ────────────────────────────────────────────────────────────
 
 pub struct BanRepository {
     node_id: u16,
     /// SQLite connection wrapped in a Mutex (rusqlite Connection is not Sync).
     conn: Mutex<Connection>,
+    /// Authentication-time ban lookups. Updated only after the corresponding
+    /// SQLite mutation commits successfully.
+    lookup_index: RwLock<BanLookupIndex>,
     version: AtomicU64,
     history_freshness: AtomicI64,
     /// Optional storage directory (for logging / future use).
@@ -334,10 +534,14 @@ impl BanRepository {
             .unwrap_or(0);
 
         let (tx, _) = broadcast::channel(256);
+        let lookup_index = BanLookupIndex::from_entries(
+            active_bans_from_connection(&conn, chrono::Utc::now().timestamp()).unwrap_or_default(),
+        );
 
         Self {
             node_id,
             conn: Mutex::new(conn),
+            lookup_index: RwLock::new(lookup_index),
             version: AtomicU64::new(max_version.max(snapshot_version)),
             history_freshness: AtomicI64::new(snapshot_freshness),
             storage_dir,
@@ -521,37 +725,37 @@ impl BanRepository {
     /// Check whether an IP address is banned.
     pub async fn is_banned(&self, addr: IpAddr) -> bool {
         let now = chrono::Utc::now().timestamp();
-        let conn = self.conn.lock();
+        self.lookup_index.read().is_ip_banned(addr, now)
+    }
 
-        // Get all non-expired bans and check CIDR matching in Rust.
-        // For very large ban lists, we could push CIDR matching into SQL
-        // with bit-shift arithmetic, but this is simpler and correct.
-        let mut stmt = conn
-            .prepare(
-                "SELECT address, mask FROM bans
-                 WHERE ban_ip != 0 AND (duration = 0 OR (start + duration) > ?1)",
-            )
-            .expect("query should be valid");
+    /// Check certificate-hash and TLS JA4 ban criteria without scanning the
+    /// ban list. ASN-style hashes are intentionally excluded here because
+    /// they require an IP-to-ASN lookup by the runtime.
+    pub fn is_identity_banned(
+        &self,
+        certificate_hash: Option<&str>,
+        tls_ja4: Option<&str>,
+    ) -> bool {
+        self.lookup_index.read().is_identity_banned(
+            certificate_hash,
+            tls_ja4,
+            chrono::Utc::now().timestamp(),
+        )
+    }
 
-        let result = stmt
-            .query_map(params![now], |row| {
-                let addr_str: String = row.get(0)?;
-                let mask: u8 = row.get(1)?;
-                Ok((addr_str, mask))
-            })
-            .expect("query should succeed");
+    /// Whether an active certificate-ban hash represents an ASN criterion.
+    /// Callers use this to avoid a GeoIP lookup unless one is required.
+    pub fn has_active_asn_bans(&self) -> bool {
+        self.lookup_index
+            .read()
+            .has_active_asn_bans(chrono::Utc::now().timestamp())
+    }
 
-        for row in result.flatten() {
-            let (ban_addr_str, mask) = row;
-            let ban_addr: IpAddr = match ban_addr_str.parse() {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            if ip_matches_cidr(ban_addr, mask, addr) {
-                return true;
-            }
-        }
-        false
+    /// Check an ASN resolved by the runtime against ASN-style certificate bans.
+    pub fn is_asn_banned(&self, asn: u32) -> bool {
+        self.lookup_index
+            .read()
+            .is_asn_banned(asn, chrono::Utc::now().timestamp())
     }
 
     // ── Mutation API ──────────────────────────────────────────────────────
@@ -761,6 +965,7 @@ impl BanRepository {
         self.version.fetch_max(op.version, Ordering::AcqRel);
         self.history_freshness
             .fetch_max(op.timestamp, Ordering::AcqRel);
+        self.apply_lookup_index(&op.op);
     }
 
     /// Atomically apply a strict ban operation at most once. The op-id claim,
@@ -861,6 +1066,7 @@ impl BanRepository {
         self.version.fetch_max(op.version, Ordering::AcqRel);
         self.history_freshness
             .fetch_max(op.timestamp, Ordering::AcqRel);
+        self.apply_lookup_index(&op.op);
         Ok(StrictOperationApplyOutcome::Applied)
     }
 
@@ -952,7 +1158,8 @@ impl BanRepository {
                 ));
             }
         }
-        if let Err(error) = apply_op_to_db(&tx, &BanOp::SetBans { entries }) {
+        let set_bans = BanOp::SetBans { entries };
+        if let Err(error) = apply_op_to_db(&tx, &set_bans) {
             self.mark_strict_durability_failed();
             return Err(sqlite_io_error(error));
         }
@@ -990,10 +1197,15 @@ impl BanRepository {
 
         self.version.store(version, Ordering::Release);
         self.history_freshness.store(freshness, Ordering::Release);
+        self.apply_lookup_index(&set_bans);
         Ok(())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
+
+    fn apply_lookup_index(&self, op: &BanOp) {
+        self.lookup_index.write().apply_op(op);
+    }
 
     fn make_op(&self, op: BanOp) -> BanOperation {
         BanOperation {
@@ -1085,6 +1297,7 @@ impl BanRepository {
         self.version.store(version, Ordering::Release);
         self.history_freshness
             .fetch_max(op.timestamp, Ordering::AcqRel);
+        self.apply_lookup_index(&op.op);
         Ok(op)
     }
 }
@@ -1187,7 +1400,7 @@ fn active_bans_from_connection(conn: &Connection, now: i64) -> Result<Vec<BanEnt
     let raw_entries = {
         let mut stmt = conn
             .prepare(
-                "SELECT address, mask, name, hash, reason, start, duration
+                "SELECT address, mask, name, hash, ban_certificate, ban_ip, reason, start, duration
                  FROM bans
                  WHERE duration = 0 OR (start + duration) > ?1",
             )
@@ -1199,9 +1412,11 @@ fn active_bans_from_connection(conn: &Connection, now: i64) -> Result<Vec<BanEnt
                     row.get::<_, i64>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             })
             .map_err(sqlite_io_error)?;
@@ -1211,37 +1426,39 @@ fn active_bans_from_connection(conn: &Connection, now: i64) -> Result<Vec<BanEnt
 
     raw_entries
         .into_iter()
-        .map(|(address, mask, name, hash, reason, start, duration)| {
-            let address = address.parse().map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid ban address in strict snapshot: {error}"),
-                )
-            })?;
-            let mask = u8::try_from(mask).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid ban mask in strict snapshot: {error}"),
-                )
-            })?;
-            let duration = u64::try_from(duration).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid ban duration in strict snapshot: {error}"),
-                )
-            })?;
-            Ok(BanEntry {
-                address,
-                mask,
-                name,
-                hash,
-                ban_certificate: true,
-                ban_ip: true,
-                reason,
-                start,
-                duration,
-            })
-        })
+        .map(
+            |(address, mask, name, hash, ban_certificate, ban_ip, reason, start, duration)| {
+                let address = address.parse().map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid ban address in strict snapshot: {error}"),
+                    )
+                })?;
+                let mask = u8::try_from(mask).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid ban mask in strict snapshot: {error}"),
+                    )
+                })?;
+                let duration = u64::try_from(duration).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid ban duration in strict snapshot: {error}"),
+                    )
+                })?;
+                Ok(BanEntry {
+                    address,
+                    mask,
+                    name,
+                    hash,
+                    ban_certificate,
+                    ban_ip,
+                    reason,
+                    start,
+                    duration,
+                })
+            },
+        )
         .collect()
 }
 
@@ -1405,32 +1622,59 @@ fn op_type_str(op: &BanOp) -> &'static str {
     }
 }
 
-/// Check whether a client IP matches a ban entry's CIDR range.
-fn ip_matches_cidr(ban_addr: IpAddr, mask: u8, client_addr: IpAddr) -> bool {
-    match (ban_addr, client_addr) {
-        (IpAddr::V4(ban), IpAddr::V4(client)) => {
-            if mask >= 32 {
-                ban == client
-            } else {
-                let shift = 32 - mask;
-                (u32::from(ban) >> shift) == (u32::from(client) >> shift)
-            }
-        }
-        (IpAddr::V6(ban), IpAddr::V6(client)) => {
-            if mask >= 128 {
-                ban == client
-            } else {
-                let shift = 128 - mask;
-                (u128::from(ban) >> shift) == (u128::from(client) >> shift)
-            }
-        }
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lookup_index_matches_ip_certificate_and_asn_bans() {
+        let now = 1_000;
+        let index = BanLookupIndex::from_entries(vec![
+            BanEntry {
+                address: "198.51.100.0".parse().unwrap(),
+                mask: 24,
+                name: None,
+                hash: None,
+                ban_certificate: false,
+                ban_ip: true,
+                reason: None,
+                start: now,
+                duration: 0,
+            },
+            BanEntry {
+                address: "192.0.2.1".parse().unwrap(),
+                mask: 32,
+                name: None,
+                hash: Some("AbCd".to_owned()),
+                ban_certificate: true,
+                ban_ip: false,
+                reason: None,
+                start: now,
+                duration: 0,
+            },
+            BanEntry {
+                address: "192.0.2.2".parse().unwrap(),
+                mask: 32,
+                name: None,
+                hash: Some("AS13335".to_owned()),
+                ban_certificate: true,
+                ban_ip: false,
+                reason: None,
+                start: now,
+                duration: 0,
+            },
+        ]);
+
+        assert!(index.is_ip_banned("198.51.100.42".parse().unwrap(), now));
+        assert!(!index.is_ip_banned("198.51.101.42".parse().unwrap(), now));
+        assert!(index.is_identity_banned(Some("aBcD"), None, now));
+        assert!(!index.is_identity_banned(Some("AS13335"), None, now));
+        assert!(index.has_active_asn_bans(now));
+        assert!(index.is_asn_banned(13335, now));
+        assert!(!index.is_asn_banned(15169, now));
+        assert_eq!(asn_from_ban_hash("AS13335"), Some(13335));
+        assert_eq!(asn_from_ban_hash("as13335"), None);
+    }
 
     #[test]
     fn ban_operation_msgpack_round_trips() {
@@ -1536,6 +1780,56 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].ban_certificate);
         assert!(!entries[0].ban_ip);
+    }
+
+    #[tokio::test]
+    async fn reloaded_lookup_index_preserves_disabled_ban_criteria() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let repo = BanRepository::open(1, temp.path()).await.unwrap();
+            repo.add_ban(BanEntry {
+                address: "198.51.100.42".parse().unwrap(),
+                mask: 32,
+                name: None,
+                hash: Some("not-a-ban".into()),
+                ban_certificate: false,
+                ban_ip: false,
+                reason: None,
+                start: chrono::Utc::now().timestamp(),
+                duration: 0,
+            })
+            .await
+            .unwrap();
+        }
+
+        let repo = BanRepository::open(1, temp.path()).await.unwrap();
+        assert!(!repo.is_banned("198.51.100.42".parse().unwrap()).await);
+        assert!(!repo.is_identity_banned(Some("not-a-ban"), None));
+    }
+
+    #[tokio::test]
+    async fn committed_ban_operations_refresh_the_lookup_index() {
+        let repo = BanRepository::new_in_memory(1);
+        let entry = BanEntry {
+            address: "198.51.100.0".parse().unwrap(),
+            mask: 24,
+            name: None,
+            hash: Some("AS13335".into()),
+            ban_certificate: true,
+            ban_ip: true,
+            reason: None,
+            start: chrono::Utc::now().timestamp(),
+            duration: 0,
+        };
+
+        repo.add_ban(entry.clone()).await.unwrap();
+        assert!(repo.is_banned("198.51.100.42".parse().unwrap()).await);
+        assert!(repo.has_active_asn_bans());
+        assert!(repo.is_asn_banned(13335));
+
+        repo.remove_ban(entry.address, entry.mask).await.unwrap();
+        assert!(!repo.is_banned("198.51.100.42".parse().unwrap()).await);
+        assert!(!repo.has_active_asn_bans());
     }
 
     #[tokio::test]
