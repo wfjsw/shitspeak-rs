@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
 use shitspeak_state::{BanEntry, BanOp};
@@ -9,6 +9,39 @@ use crate::{
     messages::{Message, encoder::BanList},
     server::Server,
 };
+
+const BANNED_ADDRESS_LENGTH: usize = 16;
+
+fn decode_ban_address(address: &[u8]) -> Result<IpAddr, MessageHandlerError> {
+    let address: [u8; BANNED_ADDRESS_LENGTH] = address.try_into().map_err(|_| {
+        MessageHandlerError::protocol_violation(
+            "ban list address must contain a 16-byte Mumble HostAddress",
+        )
+    })?;
+    let address = Ipv6Addr::from(address);
+
+    Ok(address
+        .to_ipv4_mapped()
+        .map(IpAddr::V4)
+        .unwrap_or(IpAddr::V6(address)))
+}
+
+fn encode_ban_address(address: IpAddr, ban_ip: bool) -> Vec<u8> {
+    if !ban_ip {
+        return vec![0; BANNED_ADDRESS_LENGTH];
+    }
+
+    match address {
+        IpAddr::V4(address) => {
+            let mut encoded = [0; BANNED_ADDRESS_LENGTH];
+            encoded[10] = 0xff;
+            encoded[11] = 0xff;
+            encoded[12..].copy_from_slice(&address.octets());
+            encoded.to_vec()
+        }
+        IpAddr::V6(address) => address.octets().to_vec(),
+    }
+}
 
 pub async fn handle_ban_list(
     server: &Arc<Box<Server>>,
@@ -45,8 +78,8 @@ pub async fn handle_ban_list(
         let bans: Vec<shitspeak_proto::mumble_proto::ban_list::BanEntry> = active
             .into_iter()
             .map(|b| shitspeak_proto::mumble_proto::ban_list::BanEntry {
-                address: b.address.to_string().into_bytes(),
-                mask: b.mask as u32,
+                address: encode_ban_address(b.address, b.ban_ip),
+                mask: if b.ban_ip { b.mask as u32 } else { 0 },
                 name: b.name.clone(),
                 hash: b.hash.clone(),
                 reason: b.reason.clone(),
@@ -64,14 +97,12 @@ pub async fn handle_ban_list(
         // Update mode: replace ban list with provided entries
         let mut entries: Vec<BanEntry> = Vec::with_capacity(msg.bans.len());
         for b in &msg.bans {
-            let addr_str = String::from_utf8_lossy(&b.address);
-            // Reject unparseable/empty addresses instead of silently turning
-            // them into 0.0.0.0 (which would ban every IPv4 client).
-            let address: IpAddr = addr_str.parse().map_err(|_| {
-                MessageHandlerError::protocol_violation("ban list contains an invalid address")
-            })?;
+            // Mumble represents every BanEntry address as a 16-byte HostAddress.
+            // IPv4 entries are IPv4-mapped IPv6 addresses, not UTF-8 text.
+            let address = decode_ban_address(&b.address)?;
+            let ban_ip = !address.is_unspecified();
             let max_mask: u32 = if address.is_ipv4() { 32 } else { 128 };
-            if b.mask > max_mask {
+            if ban_ip && b.mask > max_mask {
                 return Err(MessageHandlerError::protocol_violation(
                     "ban list contains an invalid mask for its address family",
                 ));
@@ -81,6 +112,8 @@ pub async fn handle_ban_list(
                 mask: b.mask as u8,
                 name: b.name.clone(),
                 hash: b.hash.clone(),
+                ban_certificate: b.hash.is_some(),
+                ban_ip,
                 reason: b.reason.clone(),
                 start: b
                     .start

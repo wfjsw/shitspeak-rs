@@ -448,7 +448,10 @@ async fn finish_handler_result(
     projection_registration: &mut Option<ClientProjectionRegistration>,
     result: Result<(), MessageHandlerError>,
 ) -> Result<(), HandleIncomingConnectionError> {
-    if matches!(result, Err(MessageHandlerError::AuthRejection(_))) {
+    if matches!(
+        result,
+        Err(MessageHandlerError::AuthRejection(_) | MessageHandlerError::BannedConnection)
+    ) {
         let _ = client.force_disconnect().await;
     }
     map_handler_result(client_session_id, result)?;
@@ -799,6 +802,8 @@ async fn append_client_origin_reset_messages(
             actor: None,
             reason: None,
             ban: Some(false),
+            ban_certificate: None,
+            ban_ip: None,
         }
         .into();
         out.extend(

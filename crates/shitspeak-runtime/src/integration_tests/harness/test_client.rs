@@ -831,6 +831,8 @@ impl TestClient {
             actor: None,
             reason: Some(reason.into()),
             ban: Some(false),
+            ban_certificate: None,
+            ban_ip: None,
         }
         .into();
         self.send(m).await;
@@ -842,6 +844,8 @@ impl TestClient {
             actor: None,
             reason: Some(reason.into()),
             ban: Some(true),
+            ban_certificate: None,
+            ban_ip: None,
         }
         .into();
         self.send(m).await;

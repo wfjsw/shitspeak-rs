@@ -495,6 +495,10 @@ async fn handle_message_inner(
             client.write_proto_message_direct(&msg).await?;
             Err(MessageHandlerError::AuthRejection(reject))
         }
+        Err(MessageHandlerError::BannedConnection) => {
+            tracing::info!(session, "closing connection because it is banned");
+            Err(MessageHandlerError::BannedConnection)
+        }
         Err(MessageHandlerError::PermissionDenied(mut deny)) => {
             if deny.reason.is_none() {
                 deny.reason = Some(crate::localization::permission_denied_reason(

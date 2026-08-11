@@ -13,6 +13,8 @@ use crate::{
 #[derive(Debug)]
 pub enum MessageHandlerError {
     AuthRejection(AuthRejection),
+    /// The connection matches an active ban and must be closed without a Reject.
+    BannedConnection,
     ProtocolViolation(Cow<'static, str>),
     WriteProtoMessageError(WriteProtoMessageError),
     ReadProtoMessageError(ReadProtoMessageError),
@@ -83,6 +85,9 @@ impl std::fmt::Display for MessageHandlerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MessageHandlerError::AuthRejection(e) => write!(f, "Authentication rejected: {}", e),
+            MessageHandlerError::BannedConnection => {
+                write!(f, "Connection matches an active ban")
+            }
             MessageHandlerError::ProtocolViolation(reason) => {
                 write!(f, "Protocol violation: {}", reason)
             }

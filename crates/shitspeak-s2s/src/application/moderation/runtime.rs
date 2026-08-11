@@ -363,6 +363,8 @@ mod tests {
         let patch = UserRemovePatch {
             reason: Some("spam".to_string()),
             ban: true,
+            ban_certificate: Some(true),
+            ban_ip: Some(true),
         };
         svc.dispatch_user_remove(None, actor, target, patch.clone())
             .await
@@ -392,6 +394,8 @@ mod tests {
             command: Some(ModerationCommand::UserRemove(UserRemovePatch {
                 reason: None,
                 ban: false,
+                ban_certificate: None,
+                ban_ip: None,
             })),
         };
         let bytes = proto::encode_moderation(&env).unwrap();

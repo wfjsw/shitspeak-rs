@@ -63,12 +63,22 @@ pub struct BanEntry {
     pub name: Option<String>,
     /// SHA-1 hex of the banned user's certificate hash.
     pub hash: Option<String>,
+    /// Whether the certificate hash is an active ban criterion.
+    #[serde(default = "default_true")]
+    pub ban_certificate: bool,
+    /// Whether the IP address is an active ban criterion.
+    #[serde(default = "default_true")]
+    pub ban_ip: bool,
     /// Reason for the ban.
     pub reason: Option<String>,
     /// Unix timestamp when the ban started.
     pub start: i64,
     /// Duration in seconds; 0 = permanent.
     pub duration: u64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 mod ip_addr_string {
@@ -233,6 +243,8 @@ impl BanRepository {
                 reason TEXT,
                 start INTEGER NOT NULL,
                 duration INTEGER NOT NULL,
+                ban_certificate INTEGER NOT NULL DEFAULT 1,
+                ban_ip INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (address, mask)
             );
 
@@ -272,6 +284,8 @@ impl BanRepository {
             "ALTER TABLE ban_operations ADD COLUMN strict_op_id_hi TEXT",
             "ALTER TABLE ban_operations ADD COLUMN strict_op_id_lo TEXT",
             "ALTER TABLE ban_operations ADD COLUMN strict_ts_final TEXT",
+            "ALTER TABLE bans ADD COLUMN ban_certificate INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE bans ADD COLUMN ban_ip INTEGER NOT NULL DEFAULT 1",
         ] {
             let _ = conn.execute(migration, []);
         }
@@ -478,7 +492,7 @@ impl BanRepository {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT address, mask, name, hash, reason, start, duration
+                "SELECT address, mask, name, hash, ban_certificate, ban_ip, reason, start, duration
                  FROM bans
                  WHERE duration = 0 OR (start + duration) > ?1",
             )
@@ -492,9 +506,11 @@ impl BanRepository {
                     mask: row.get(1)?,
                     name: row.get(2)?,
                     hash: row.get(3)?,
-                    reason: row.get(4)?,
-                    start: row.get(5)?,
-                    duration: sql_u64_from_i64(row.get::<_, i64>(6)?),
+                    ban_certificate: row.get::<_, i64>(4)? != 0,
+                    ban_ip: row.get::<_, i64>(5)? != 0,
+                    reason: row.get(6)?,
+                    start: row.get(7)?,
+                    duration: sql_u64_from_i64(row.get::<_, i64>(8)?),
                 })
             })
             .expect("query should succeed");
@@ -513,7 +529,7 @@ impl BanRepository {
         let mut stmt = conn
             .prepare(
                 "SELECT address, mask FROM bans
-                 WHERE duration = 0 OR (start + duration) > ?1",
+                 WHERE ban_ip != 0 AND (duration = 0 OR (start + duration) > ?1)",
             )
             .expect("query should be valid");
 
@@ -1219,6 +1235,8 @@ fn active_bans_from_connection(conn: &Connection, now: i64) -> Result<Vec<BanEnt
                 mask,
                 name,
                 hash,
+                ban_certificate: true,
+                ban_ip: true,
                 reason,
                 start,
                 duration,
@@ -1334,8 +1352,8 @@ fn apply_op_to_db(conn: &Connection, op: &BanOp) -> Result<(), rusqlite::Error> 
         BanOp::SetBans { entries } => {
             conn.execute("DELETE FROM bans", [])?;
             let mut stmt = conn.prepare(
-                "INSERT INTO bans (address, mask, name, hash, reason, start, duration)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO bans (address, mask, name, hash, ban_certificate, ban_ip, reason, start, duration)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for entry in entries {
                 stmt.execute(params![
@@ -1343,6 +1361,8 @@ fn apply_op_to_db(conn: &Connection, op: &BanOp) -> Result<(), rusqlite::Error> 
                     entry.mask,
                     entry.name,
                     entry.hash,
+                    entry.ban_certificate as i64,
+                    entry.ban_ip as i64,
                     entry.reason,
                     entry.start,
                     sql_i64_from_u64(entry.duration)?,
@@ -1351,13 +1371,15 @@ fn apply_op_to_db(conn: &Connection, op: &BanOp) -> Result<(), rusqlite::Error> 
         }
         BanOp::AddBan { entry } => {
             conn.execute(
-                "INSERT OR REPLACE INTO bans (address, mask, name, hash, reason, start, duration)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR REPLACE INTO bans (address, mask, name, hash, ban_certificate, ban_ip, reason, start, duration)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     entry.address.to_string(),
                     entry.mask,
                     entry.name,
                     entry.hash,
+                    entry.ban_certificate as i64,
+                    entry.ban_ip as i64,
                     entry.reason,
                     entry.start,
                     sql_i64_from_u64(entry.duration)?,
@@ -1422,6 +1444,8 @@ mod tests {
                     mask: 32,
                     name: Some("replicated-ban".into()),
                     hash: None,
+                    ban_certificate: true,
+                    ban_ip: true,
                     reason: Some("s2s integration test".into()),
                     start: 123,
                     duration: 0,
@@ -1458,6 +1482,8 @@ mod tests {
                     mask: 32,
                     name: Some("strict-ban".into()),
                     hash: None,
+                    ban_certificate: true,
+                    ban_ip: true,
                     reason: Some("metadata test".into()),
                     start: 123,
                     duration: 0,
@@ -1480,10 +1506,36 @@ mod tests {
             mask: 32,
             name: Some("strict-ban".into()),
             hash: None,
+            ban_certificate: true,
+            ban_ip: true,
             reason: Some(reason.into()),
             start: 123,
             duration: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn ban_identity_criteria_can_be_disabled_independently() {
+        let repo = BanRepository::new_in_memory(1);
+        repo.add_ban(BanEntry {
+            address: "203.0.113.19".parse().unwrap(),
+            mask: 32,
+            name: None,
+            hash: Some("certificate".into()),
+            ban_certificate: false,
+            ban_ip: false,
+            reason: None,
+            start: chrono::Utc::now().timestamp(),
+            duration: 0,
+        })
+        .await
+        .unwrap();
+
+        assert!(!repo.is_banned("203.0.113.19".parse().unwrap()).await);
+        let entries = repo.get_active_bans().await;
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].ban_certificate);
+        assert!(!entries[0].ban_ip);
     }
 
     #[tokio::test]

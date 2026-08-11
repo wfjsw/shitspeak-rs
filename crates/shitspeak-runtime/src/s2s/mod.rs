@@ -3273,7 +3273,13 @@ async fn apply_user_remove_patch(
                 let gs = target.read_global_state();
                 gs.get_display_name_opt().map(ToOwned::to_owned)
             },
-            hash: target.get_certificate_hash().map(hex::encode),
+            hash: patch
+                .ban_certificate
+                .unwrap_or(true)
+                .then(|| target.get_certificate_hash().map(hex::encode))
+                .flatten(),
+            ban_certificate: patch.ban_certificate.unwrap_or(true),
+            ban_ip: patch.ban_ip.unwrap_or(true),
             reason: if reason.is_empty() {
                 None
             } else {
@@ -3304,6 +3310,8 @@ async fn apply_user_remove_patch(
             actor: actor_for_target,
             reason: patch.reason.clone(),
             ban: Some(patch.ban),
+            ban_certificate: Some(patch.ban_certificate.unwrap_or(true)),
+            ban_ip: Some(patch.ban_ip.unwrap_or(true)),
         }
         .into();
     if let Err(e) = target.write_proto_message_direct(&remove_notice).await {
@@ -5006,6 +5014,8 @@ mod tests {
                     mask: 32,
                     name: Some("strict-snapshot".to_owned()),
                     hash: None,
+                    ban_certificate: true,
+                    ban_ip: true,
                     reason: Some("snapshot replay test".to_owned()),
                     start: 123,
                     duration: 0,
@@ -5286,6 +5296,8 @@ mod tests {
                 mask: 32,
                 name: Some("replacement".to_owned()),
                 hash: None,
+                ban_certificate: true,
+                ban_ip: true,
                 reason: None,
                 start: 124,
                 duration: 0,

@@ -133,6 +133,8 @@ mod tests {
             command: Some(ModerationCommand::UserRemove(UserRemovePatch {
                 reason: Some("test".to_string()),
                 ban: true,
+                ban_certificate: Some(true),
+                ban_ip: Some(true),
             })),
         };
         let bytes = encode_moderation(&env).unwrap();

@@ -5186,6 +5186,8 @@ async fn s2s_ban_replication_propagates() {
         mask: 32,
         name: Some("replicated-ban".into()),
         hash: None,
+        ban_certificate: true,
+        ban_ip: true,
         reason: Some("s2s integration test".into()),
         start: chrono::Utc::now().timestamp(),
         duration: 0,

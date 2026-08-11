@@ -2491,6 +2491,8 @@ fn hidden_user_remove(session: ClientSessionIdentifier) -> Message {
         actor: None,
         reason: None,
         ban: Some(false),
+        ban_certificate: None,
+        ban_ip: None,
     }
     .into()
 }

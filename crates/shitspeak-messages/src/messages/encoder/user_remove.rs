@@ -6,6 +6,8 @@ pub struct UserRemove {
     pub actor: Option<u32>,
     pub reason: Option<String>,
     pub ban: Option<bool>,
+    pub ban_certificate: Option<bool>,
+    pub ban_ip: Option<bool>,
 }
 
 impl From<shitspeak_proto::mumble_proto::UserRemove> for UserRemove {
@@ -15,6 +17,8 @@ impl From<shitspeak_proto::mumble_proto::UserRemove> for UserRemove {
             actor: proto.actor,
             reason: proto.reason,
             ban: proto.ban,
+            ban_certificate: proto.ban_certificate,
+            ban_ip: proto.ban_ip,
         }
     }
 }
@@ -26,6 +30,8 @@ impl From<UserRemove> for shitspeak_proto::mumble_proto::UserRemove {
             actor: user_remove.actor,
             reason: user_remove.reason,
             ban: user_remove.ban,
+            ban_certificate: user_remove.ban_certificate,
+            ban_ip: user_remove.ban_ip,
         }
     }
 }

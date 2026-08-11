@@ -537,6 +537,8 @@ impl ClientProjectionState {
                 actor: None,
                 reason: None,
                 ban: Some(false),
+                ban_certificate: None,
+                ban_ip: None,
             }
             .into();
             outbound.extend(

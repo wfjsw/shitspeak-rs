@@ -604,6 +604,8 @@ impl ClientStateLogEntry {
                     actor: actor.map(u32::from),
                     reason: reason.clone(),
                     ban: Some(*ban),
+                    ban_certificate: None,
+                    ban_ip: None,
                 }
                 .into(),
             ),

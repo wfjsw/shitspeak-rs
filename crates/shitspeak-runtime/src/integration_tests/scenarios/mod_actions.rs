@@ -12,6 +12,69 @@ use shitspeak_messages::messages::Message;
 use shitspeak_messages::messages::encoder::UserState;
 use shitspeak_state::ACLPermissions;
 
+/// A native Mumble client sends a BanList address as a 16-byte HostAddress,
+/// using an IPv4-mapped IPv6 value for an IPv4 ban. The server must accept it
+/// rather than treating the binary field as UTF-8 and disconnecting the client.
+#[tokio::test]
+async fn moderator_can_add_ipv4_ban_from_ban_list() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    alice.drain_now().await;
+
+    alice
+        .send(Message::BanList(shitspeak_proto::mumble_proto::BanList {
+            bans: vec![shitspeak_proto::mumble_proto::ban_list::BanEntry {
+                address: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 203, 0, 113, 42],
+                mask: 24,
+                name: None,
+                hash: None,
+                reason: Some("native-client regression".into()),
+                start: None,
+                duration: None,
+            }],
+            query: Some(false),
+        }))
+        .await;
+
+    assert!(
+        !alice.recv_closed(Duration::from_secs(2)).await,
+        "a native BanList update must not disconnect the moderator"
+    );
+
+    alice
+        .send(Message::BanList(shitspeak_proto::mumble_proto::BanList {
+            bans: vec![],
+            query: Some(true),
+        }))
+        .await;
+    let reply = alice
+        .recv_until(
+            |message| matches!(message, Message::BanList(list) if list.bans.len() == 1),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("server should return the updated ban list");
+    let Message::BanList(reply) = reply else {
+        unreachable!("predicate only admits BanList replies");
+    };
+    assert_eq!(
+        reply.bans[0].address,
+        vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 203, 0, 113, 42,]
+    );
+
+    let bans = server.server.get_bans().get_active_bans().await;
+    assert_eq!(bans.len(), 1);
+    assert_eq!(bans[0].address, "203.0.113.42".parse::<IpAddr>().unwrap());
+    assert_eq!(bans[0].mask, 24);
+    assert_eq!(bans[0].reason.as_deref(), Some("native-client regression"));
+}
+
 /// Checks that a moderator mute is applied to another user.
 /// Expected: Bob receives `UserState { mute: true }` for his session. Mumble
 /// implements admin mute/deaf updates in `D:\mumble\src\murmur\Messages.cpp::msgUserState`;

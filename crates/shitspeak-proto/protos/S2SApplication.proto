@@ -47,6 +47,8 @@ message UserStatePatch {
 message UserRemovePatch {
   optional string reason = 1;
   bool   ban             = 2;
+  optional bool ban_certificate = 3;
+  optional bool ban_ip          = 4;
 }
 
 // ── UserStats RPC ─────────────────────────────────────────────────────────

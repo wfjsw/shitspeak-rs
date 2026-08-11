@@ -36,6 +36,8 @@ pub async fn handle_user_remove(
         crate::client::client_session_identifier::ClientSessionIdentifier::from(target_raw);
     let server_id = sender.server_id();
     let is_ban = msg.ban.unwrap_or(false);
+    let ban_certificate = msg.ban_certificate.unwrap_or(true);
+    let ban_ip = msg.ban_ip.unwrap_or(true);
     let target = match server
         .get_clients()
         .get_client_in_server(&server_id, target_session)
@@ -79,6 +81,8 @@ pub async fn handle_user_remove(
         let patch = shitspeak_s2s::application::proto::UserRemovePatch {
             reason: msg.reason.clone().map(Into::into),
             ban: is_ban,
+            ban_certificate: Some(ban_certificate),
+            ban_ip: Some(ban_ip),
         };
         if !server
             .s2s_manager()
@@ -125,7 +129,11 @@ pub async fn handle_user_remove(
                 let gs = target.read_global_state();
                 gs.get_display_name_opt().map(|s| s.to_owned())
             },
-            hash: target.get_certificate_hash().map(|h| hex::encode(h)),
+            hash: ban_certificate
+                .then(|| target.get_certificate_hash().map(|h| hex::encode(h)))
+                .flatten(),
+            ban_certificate,
+            ban_ip,
             reason: if reason.is_empty() {
                 None
             } else {
@@ -166,6 +174,8 @@ pub async fn handle_user_remove(
         actor: actor_for_target,
         reason: msg.reason.clone(),
         ban: Some(is_ban),
+        ban_certificate: Some(ban_certificate),
+        ban_ip: Some(ban_ip),
     }
     .into();
     if let Err(e) = target.write_proto_message_direct(&remove_notice).await {

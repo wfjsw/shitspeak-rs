@@ -21,6 +21,11 @@ use shitspeak_auth::{
 
 const AUTH_FINALIZATION_YIELD_EVERY: usize = 64;
 
+fn ban_hash_matches(banned: &str, certificate_hash: Option<&str>, tls_ja4: Option<&str>) -> bool {
+    certificate_hash.is_some_and(|hash| banned.eq_ignore_ascii_case(hash))
+        || tls_ja4.is_some_and(|ja4| banned.eq_ignore_ascii_case(ja4))
+}
+
 struct StagedUserChannelCacheWrite {
     cache_key: String,
     current_channel_id: u32,
@@ -116,32 +121,30 @@ pub async fn handle_authenticate(
             session = u32::from(session),
             "connection from banned IP rejected at authenticate"
         );
-        return Err(AuthRejection::new_with_language(
-            RejectType::AuthenticatorFail,
-            sender.language(),
-        )
-        .into());
+        return Err(MessageHandlerError::BannedConnection);
     }
-    // Banned certificate hash.
-    if let Some(certificate_hash) = sender.get_certificate_hash() {
-        let hash_hex = hex::encode(certificate_hash);
-        let banned_hash = server
-            .get_bans()
-            .get_active_bans()
-            .await
-            .iter()
-            .any(|entry| entry.hash.as_deref() == Some(hash_hex.as_str()));
-        if banned_hash {
-            tracing::info!(
-                session = u32::from(session),
-                "connection from banned certificate rejected at authenticate"
-            );
-            return Err(AuthRejection::new_with_language(
-                RejectType::AuthenticatorFail,
-                sender.language(),
-            )
-            .into());
-        }
+    // Banned certificate hash or TLS JA4 fingerprint. Both are compared
+    // case-insensitively because hashes and fingerprints are hexadecimal/text
+    // identifiers, and ban-list clients may normalize their casing.
+    let certificate_hash = sender.get_certificate_hash().map(hex::encode);
+    let tls_ja4 = sender.tls_ja4().map(str::to_owned);
+    let banned_hash = server
+        .get_bans()
+        .get_active_bans()
+        .await
+        .iter()
+        .any(|entry| {
+            entry.ban_certificate
+                && entry.hash.as_deref().is_some_and(|banned| {
+                    ban_hash_matches(banned, certificate_hash.as_deref(), tls_ja4.as_deref())
+                })
+        });
+    if banned_hash {
+        tracing::info!(
+            session = u32::from(session),
+            "connection from banned certificate or TLS JA4 fingerprint rejected at authenticate"
+        );
+        return Err(MessageHandlerError::BannedConnection);
     }
 
     // ── Authentication context ────────────────────────────────────────────
@@ -927,7 +930,7 @@ async fn client_is_current(server: &Arc<Box<Server>>, client: &Arc<Box<Client>>)
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_comment_if_revision, apply_texture_if_revision};
+    use super::{apply_comment_if_revision, apply_texture_if_revision, ban_hash_matches};
     use crate::client::client_global_state::ClientGlobalState;
 
     #[test]
@@ -953,5 +956,12 @@ mod tests {
 
         assert!(state.get_texture_hash().is_none());
         assert!(state.get_comment_hash().is_none());
+    }
+
+    #[test]
+    fn ban_hash_matches_certificate_and_tls_ja4_case_insensitively() {
+        assert!(ban_hash_matches("AbCd", Some("aBcD"), None));
+        assert!(ban_hash_matches("AbCd", None, Some("aBcD")));
+        assert!(!ban_hash_matches("AbCd", Some("other"), Some("different")));
     }
 }
