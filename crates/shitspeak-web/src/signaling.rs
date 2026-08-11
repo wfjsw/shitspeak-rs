@@ -2192,6 +2192,8 @@ async fn send_web_client_origin_reset(
             actor: None,
             reason: None,
             ban: Some(false),
+            ban_certificate: None,
+            ban_ip: None,
         }
         .into();
         send_web_outbound_message_with_synthetic(
