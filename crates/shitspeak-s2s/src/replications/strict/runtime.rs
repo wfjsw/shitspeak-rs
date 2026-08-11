@@ -4630,6 +4630,34 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         witnesses.len() >= super::recovery_reducer::fast_quorum_size(denominator)
     }
 
+    /// A stale foreign terminal observation cannot overturn a currently
+    /// quorum-confirmed exact local representation. Unlike recovery target
+    /// witnesses, this deliberately excludes mismatching peer observations:
+    /// those can prove only the logical repository target, not this journal
+    /// identity and terminal position.
+    fn local_head_has_exact_witness_quorum(&self, identity: HeadEvidenceIdentity) -> bool {
+        let denominator = self.net.strict_participant_count().saturating_sub(1);
+        if denominator == 0 {
+            return false;
+        }
+        let evidence = self.head_evidence.lock();
+        let Some(evidence) = evidence.as_ref() else {
+            return false;
+        };
+        if evidence.identity != identity {
+            return false;
+        }
+        let witnesses = evidence
+            .acknowledged_by
+            .iter()
+            .filter(|peer| {
+                peer.node() != self.self_id
+                    && self.net.member_boot_epoch(peer.node()) == Some(peer.boot_epoch())
+            })
+            .count();
+        witnesses >= super::recovery_reducer::fast_quorum_size(denominator)
+    }
+
     #[cfg(test)]
     pub(super) async fn record_recovery_target_witness_for_test(
         &self,
@@ -6042,7 +6070,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             }
             return false;
         }
-        let (representation_order, same_lineage_position_divergence) = {
+        let (
+            representation_order,
+            same_lineage_position_divergence,
+            local_identity,
+            local_repository_base_version,
+        ) = {
             let head = self.repository_terminal_head.lock().await;
             if remote_cut.journal_id() == head.terminal_cut.journal_id()
                 && remote_cut.generation() != head.terminal_cut.generation()
@@ -6081,7 +6114,12 @@ impl<R: StrictReplicable> StrictRuntime<R> {
             let same_lineage_position_divergence = remote_cut.journal_id()
                 == head.terminal_cut.journal_id()
                 && remote_cut.generation() == head.terminal_cut.generation();
-            (representation_order, same_lineage_position_divergence)
+            (
+                representation_order,
+                same_lineage_position_divergence,
+                HeadEvidenceIdentity::from_head(head.history_metadata, &head.terminal_cut),
+                local_rank.terminal_repository_base_version,
+            )
         };
         // Foreign-lineage ownership must be identical for every ranked
         // observation, including clock ticks and admission/history probes.
@@ -6090,6 +6128,25 @@ impl<R: StrictReplicable> StrictRuntime<R> {
         // higher repository base supersedes a pre-checkpoint active suffix,
         // regardless of its raw generation. Equal bases retain generation
         // and then history rank as deterministic tie-breakers.
+        let same_logical_target = (remote_rank.version, remote_rank.freshness)
+            == (
+                local_identity.repository_version,
+                local_identity.history_freshness,
+            )
+            && remote_cut.terminal_set_digest() == &local_identity.terminal_set_digest
+            && remote_rank.terminal_repository_base_version == local_repository_base_version;
+        if same_logical_target && self.local_head_has_exact_witness_quorum(local_identity) {
+            let mut deferrals = self.foreign_lineage_recovery_deferrals.lock();
+            if expected_deferral
+                .is_none_or(|expected| deferrals.get(&trigger_peer.node()) == Some(&expected))
+            {
+                deferrals.remove(&trigger_peer.node());
+            }
+            metrics::record_strict_terminal_divergence_event(
+                StrictTerminalDivergenceEvent::ForeignLineageElectionDeduped,
+            );
+            return true;
+        }
         if !representation_order.is_gt() && !self.repository_base_required() {
             let mut deferrals = self.foreign_lineage_recovery_deferrals.lock();
             if expected_deferral
