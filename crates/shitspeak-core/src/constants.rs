@@ -7,7 +7,7 @@ pub const MTU: usize = 1600;
 pub const APP_PROTO_VER: ProtocolVersion = ProtocolVersion {
     major: 1,
     minor: 6,
-    patch: 0,
+    patch: 870,
 };
 
 pub const PROTOBUF_INTRODUCED_VERSION: ProtocolVersion = ProtocolVersion {

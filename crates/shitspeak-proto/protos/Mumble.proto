@@ -177,6 +177,10 @@ message UserRemove {
 	optional string reason = 3;
 	// True if the kick should result in a ban.
 	optional bool ban = 4;
+	// True if the ban should include the user's certificate.
+	optional bool ban_certificate = 5;
+	// True if the ban should include the user's IP address.
+	optional bool ban_ip = 6;
 }
 
 // Sent by the server when it communicates new and changed users to client.
