@@ -105,14 +105,19 @@ impl GeoIpResolver {
         }
 
         self.config
-            .maxmind_database_path()
+            .maxmind_city_database_path()
+            .as_deref()
             .and_then(|path| lookup_city_database(path, &ips))
     }
 
     async fn lookup_ip_metadata_uncached(&self, ip: IpAddr) -> Option<IpGeoMetadata> {
-        self.config
-            .maxmind_database_path()
-            .and_then(|path| lookup_ip_metadata_database(path, ip))
+        let city_database_path = self.config.maxmind_city_database_path();
+        let asn_database_path = self.config.maxmind_asn_database_path();
+        lookup_ip_metadata_database(
+            city_database_path.as_deref(),
+            asn_database_path.as_deref(),
+            ip,
+        )
     }
 
     fn cache_metadata(&self, ip: IpAddr, metadata: Option<IpGeoMetadata>) {
@@ -191,22 +196,49 @@ pub fn lookup_city_database(path: &Path, ips: &[IpAddr]) -> Option<NodeGeo> {
     None
 }
 
-pub fn lookup_ip_metadata_database(path: &Path, ip: IpAddr) -> Option<IpGeoMetadata> {
+pub fn lookup_ip_metadata_database(
+    city_database_path: Option<&Path>,
+    asn_database_path: Option<&Path>,
+    ip: IpAddr,
+) -> Option<IpGeoMetadata> {
+    let asn = asn_database_path.and_then(|path| lookup_asn_database(path, ip));
+    let country = city_database_path.and_then(|path| lookup_country_database(path, ip));
+
+    let source = match (city_database_path, asn_database_path) {
+        (Some(city), Some(asn)) => format!("maxmind:city={},asn={}", city.display(), asn.display()),
+        (Some(city), None) => format!("maxmind:city={}", city.display()),
+        (None, Some(asn)) => format!("maxmind:asn={}", asn.display()),
+        (None, None) => return None,
+    };
+    IpGeoMetadata::new(asn, country, None, source)
+}
+
+fn lookup_asn_database(path: &Path, ip: IpAddr) -> Option<u32> {
     let reader = match maxminddb::Reader::open_readfile(path) {
         Ok(reader) => reader,
         Err(error) => {
-            tracing::debug!(path = %path.display(), %error, "GeoIP database unavailable");
+            tracing::debug!(path = %path.display(), %error, "GeoIP ASN database unavailable");
             return None;
         }
     };
 
-    let asn = reader
+    reader
         .lookup(ip)
         .ok()
         .and_then(|result| result.decode::<maxminddb::geoip2::Asn>().ok().flatten())
-        .and_then(|record| record.autonomous_system_number);
+        .and_then(|record| record.autonomous_system_number)
+}
 
-    let country = reader
+fn lookup_country_database(path: &Path, ip: IpAddr) -> Option<String> {
+    let reader = match maxminddb::Reader::open_readfile(path) {
+        Ok(reader) => reader,
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "GeoIP City database unavailable");
+            return None;
+        }
+    };
+
+    reader
         .lookup(ip)
         .ok()
         .and_then(|result| result.decode::<maxminddb::geoip2::Country>().ok().flatten())
@@ -223,9 +255,7 @@ pub fn lookup_ip_metadata_database(path: &Path, ip: IpAddr) -> Option<IpGeoMetad
                 .ok()
                 .and_then(|result| result.decode::<maxminddb::geoip2::City>().ok().flatten())
                 .and_then(|record| record.country.iso_code.map(str::to_owned))
-        });
-
-    IpGeoMetadata::new(asn, country, None, format!("maxmind:{}", path.display()))
+        })
 }
 
 pub fn is_public_geoip_candidate(ip: &IpAddr) -> bool {

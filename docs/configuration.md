@@ -486,10 +486,16 @@ $env:SHITSPEAK_PRIVACY__CERTIFICATE_HASH_SECRET = "replace-with-a-long-random-cl
 ```toml
 [geoip]
 enabled = true
-maxmind_database_path = "GeoLite2-City.mmdb"
+maxmind_database_path = "."
 cache_ttl_secs = 86400
 cache_capacity = 4096
 ```
+
+`maxmind_database_path` is the directory containing both `GeoLite2-City.mmdb` and
+`GeoLite2-ASN.mmdb`. The City database supplies location/country data and the ASN
+database supplies autonomous-system data for ASN ACLs and bans. For compatibility,
+a `GeoLite2-City.mmdb` file path is also accepted; its containing directory is used
+to locate `GeoLite2-ASN.mmdb`.
 
 This is used for shared GeoIP resolution such as ACL IP masks. S2S topology observability can use manual `[s2s.geo]` coordinates or egress probing separately.
 

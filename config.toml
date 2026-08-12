@@ -178,7 +178,7 @@ protect_certificate_hashes = false
 # check-perf endpoint probes unless manual [s2s.geo] coordinates are set.
 [geoip]
 enabled = true
-maxmind_database_path = "GeoLite2-City.mmdb"
+maxmind_database_path = "."
 cache_ttl_secs = 86400
 cache_capacity = 4096
 

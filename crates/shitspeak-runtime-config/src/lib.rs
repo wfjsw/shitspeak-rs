@@ -1533,6 +1533,25 @@ impl GeoIpConfig {
             .flatten()
     }
 
+    pub fn maxmind_city_database_path(&self) -> Option<PathBuf> {
+        let path = self.maxmind_database_path()?;
+        Some(if is_maxmind_database_file(path) {
+            path.clone()
+        } else {
+            path.join("GeoLite2-City.mmdb")
+        })
+    }
+
+    pub fn maxmind_asn_database_path(&self) -> Option<PathBuf> {
+        let path = self.maxmind_database_path()?;
+        let directory = if is_maxmind_database_file(path) {
+            path.parent()?
+        } else {
+            path
+        };
+        Some(directory.join("GeoLite2-ASN.mmdb"))
+    }
+
     pub fn cache_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.cache_ttl_secs.max(1))
     }
@@ -1629,7 +1648,14 @@ fn default_true() -> bool {
 }
 
 fn default_geoip_maxmind_database_path() -> Option<PathBuf> {
-    Some(PathBuf::from("GeoLite2-City.mmdb"))
+    Some(PathBuf::from("."))
+}
+
+fn is_maxmind_database_file(path: &Path) -> bool {
+    path.is_file()
+        || path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mmdb"))
 }
 
 fn default_geoip_cache_ttl_secs() -> u64 {
@@ -2101,10 +2127,7 @@ mod tests {
         assert_eq!(cfg.root_channel_name, "Root");
         assert_eq!(cfg.authenticator.backend(), AuthenticatorBackend::Demo);
         assert!(cfg.geoip.enabled());
-        assert_eq!(
-            cfg.geoip.maxmind_database_path(),
-            Some(&PathBuf::from("GeoLite2-City.mmdb"))
-        );
+        assert_eq!(cfg.geoip.maxmind_database_path(), Some(&PathBuf::from(".")));
         assert!(!cfg.observability.metrics.enabled);
         assert_eq!(cfg.observability.metrics.path, "/metrics");
         assert!(!cfg.observability.metrics.remote_write.enabled);
@@ -2279,12 +2302,12 @@ mod tests {
     }
 
     #[test]
-    fn global_geoip_config_parses_for_acl_shared_resolver() {
+    fn global_geoip_config_resolves_database_directory_for_acl_shared_resolver() {
         let cfg: GeoIpConfig = ::config::Config::builder()
             .add_source(::config::File::from_str(
                 r#"
                 enabled = true
-                maxmind_database_path = "GeoLite2-Country.mmdb"
+                maxmind_database_path = "geoip"
                 cache_ttl_secs = 60
                 cache_capacity = 32
             "#,
@@ -2296,12 +2319,41 @@ mod tests {
             .expect("geoip config parses");
 
         assert!(cfg.enabled());
+        assert_eq!(cfg.maxmind_database_path(), Some(&PathBuf::from("geoip")));
         assert_eq!(
-            cfg.maxmind_database_path(),
-            Some(&PathBuf::from("GeoLite2-Country.mmdb"))
+            cfg.maxmind_city_database_path(),
+            Some(PathBuf::from("geoip/GeoLite2-City.mmdb"))
+        );
+        assert_eq!(
+            cfg.maxmind_asn_database_path(),
+            Some(PathBuf::from("geoip/GeoLite2-ASN.mmdb"))
         );
         assert_eq!(cfg.cache_ttl(), Duration::from_secs(60));
         assert_eq!(cfg.cache_capacity(), 32);
+    }
+
+    #[test]
+    fn global_geoip_file_path_probes_sibling_asn_database() {
+        let cfg: GeoIpConfig = ::config::Config::builder()
+            .add_source(::config::File::from_str(
+                r#"
+                maxmind_database_path = "geoip/GeoLite2-City.mmdb"
+            "#,
+                ::config::FileFormat::Toml,
+            ))
+            .build()
+            .expect("config builder")
+            .try_deserialize()
+            .expect("geoip config parses");
+
+        assert_eq!(
+            cfg.maxmind_city_database_path(),
+            Some(PathBuf::from("geoip/GeoLite2-City.mmdb"))
+        );
+        assert_eq!(
+            cfg.maxmind_asn_database_path(),
+            Some(PathBuf::from("geoip/GeoLite2-ASN.mmdb"))
+        );
     }
 
     #[test]
