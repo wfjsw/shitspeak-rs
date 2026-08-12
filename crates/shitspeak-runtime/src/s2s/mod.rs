@@ -75,6 +75,7 @@ const S2S_SESSION_BLOB_TOPIC: &str = "session_blobs";
 const STRICT_PROPOSAL_GATEWAY_SLACK_TICKS: u32 = 4;
 const VOICE_RECIPIENT_INDEX_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const S2S_CHANNEL_REPLICATION_SLOW_STAGE: Duration = Duration::from_secs(1);
+const S2S_BAN_REPLICATION_SLOW_STAGE: Duration = Duration::from_secs(1);
 const S2S_CLIENT_REPLICATION_SLOW_PROPOSE: Duration = Duration::from_secs(1);
 const S2S_CLIENT_REPLICATION_SLOW_QUEUE_WAIT: Duration = Duration::from_millis(250);
 const S2S_CLIENT_SNAPSHOT_DEFER_ERROR_AFTER: Duration = Duration::from_secs(20);
@@ -136,6 +137,8 @@ pub struct S2SManager {
 /// must not bypass its recovery and repository-image fences.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BanProposalOutcome {
+    /// A fast quorum has made a durable terminal commit decision. Local
+    /// delivery continues in the background.
     Admitted,
     StrictUnavailable,
     StrictFenced,
@@ -1288,6 +1291,7 @@ impl S2SManager {
     }
 
     async fn propose_ban_op_direct(&self, op: BanOp) -> BanProposalOutcome {
+        let started_at = Instant::now();
         let Some(handle) = self.state.read().ban_replication.clone() else {
             return if self.strict_ban_runtime_expected() {
                 BanProposalOutcome::StrictFenced
@@ -1304,8 +1308,15 @@ impl S2SManager {
             timestamp: chrono::Utc::now().timestamp(),
             op,
         };
-        match handle.propose(operation).await {
-            Ok(_) => BanProposalOutcome::Admitted,
+        match handle.propose_with_accepted(operation).await {
+            Ok(mut proposal) => {
+                let Some(accepted) = proposal.take_accepted_receiver() else {
+                    error!("s2s ban op proposal acceptance receiver was unavailable");
+                    return BanProposalOutcome::Failed;
+                };
+                observe_ban_proposal_delivery(proposal.delivered(), started_at);
+                ban_proposal_outcome_after_acceptance(accepted).await
+            }
             Err(e) => {
                 warn!(error = %e, "s2s ban op propose failed");
                 BanProposalOutcome::Failed
@@ -2229,6 +2240,51 @@ impl S2SManager {
     }
 }
 
+async fn ban_proposal_outcome_after_acceptance(
+    accepted: oneshot::Receiver<()>,
+) -> BanProposalOutcome {
+    match accepted.await {
+        Ok(()) => BanProposalOutcome::Admitted,
+        Err(_) => {
+            error!("s2s ban op proposal ended before strict acceptance");
+            BanProposalOutcome::Failed
+        }
+    }
+}
+
+fn observe_ban_proposal_delivery(
+    delivered: impl Future<Output = Result<u64, s2s_replications::ReplicationError>> + Send + 'static,
+    started_at: Instant,
+) {
+    tokio::spawn(async move {
+        match delivered.await {
+            Ok(version) => {
+                let elapsed = started_at.elapsed();
+                if elapsed >= S2S_BAN_REPLICATION_SLOW_STAGE {
+                    warn!(
+                        version,
+                        delivered_elapsed_ms = elapsed.as_millis(),
+                        "s2s ban op proposal delivered slowly"
+                    );
+                } else {
+                    debug!(
+                        version,
+                        delivered_elapsed_ms = elapsed.as_millis(),
+                        "s2s ban op proposal delivered"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "s2s ban op proposal failed after strict acceptance"
+                );
+            }
+        }
+    });
+}
+
 pub(crate) fn start_observability_geo_resolution(
     configured_geo: Option<NodeGeo>,
     shutdown: watch::Receiver<()>,
@@ -2469,7 +2525,11 @@ async fn run_s2s_control_gateway(
                 });
             }
             NativeToS2SCommand::ProposeBan { op, respond } => {
-                let _ = respond.send(manager.propose_ban_op_direct(op).await);
+                let manager = Arc::clone(&manager);
+                tokio::spawn(async move {
+                    let result = manager.propose_ban_op_direct(op).await;
+                    let _ = respond.send(result);
+                });
             }
             NativeToS2SCommand::DispatchModeration { owner, envelope } => {
                 if let Err(e) = application
@@ -4714,6 +4774,39 @@ mod tests {
         assert!(!BanProposalOutcome::Admitted.permits_direct_repository_fallback());
         assert!(!BanProposalOutcome::StrictFenced.permits_direct_repository_fallback());
         assert!(!BanProposalOutcome::Failed.permits_direct_repository_fallback());
+    }
+
+    #[tokio::test]
+    async fn ban_proposal_reports_strict_acceptance_before_local_delivery() {
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let delivery_started = Arc::new(tokio::sync::Notify::new());
+        let release_delivery = Arc::new(tokio::sync::Notify::new());
+        observe_ban_proposal_delivery(
+            {
+                let delivery_started = Arc::clone(&delivery_started);
+                let release_delivery = Arc::clone(&release_delivery);
+                async move {
+                    delivery_started.notify_one();
+                    release_delivery.notified().await;
+                    Ok(7)
+                }
+            },
+            Instant::now(),
+        );
+        delivery_started.notified().await;
+
+        let admitted = tokio::spawn(ban_proposal_outcome_after_acceptance(accepted_rx));
+        accepted_tx
+            .send(())
+            .expect("acceptance receiver remains live");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), admitted)
+                .await
+                .expect("acceptance must not wait for local delivery")
+                .expect("acceptance task must complete"),
+            BanProposalOutcome::Admitted
+        );
+        release_delivery.notify_one();
     }
 
     fn test_node_geo(latitude: f64) -> NodeGeo {
