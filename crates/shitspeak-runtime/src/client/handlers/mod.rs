@@ -314,7 +314,7 @@ async fn handle_message_inner(
                 bans = ban_list.bans.len(),
                 "handling BanList"
             );
-            handle_ban_list(server, client, ban_list.into()).await
+            handle_ban_list(server, client, ban_list).await
         }
         Message::TextMessage(text_message) => {
             tracing::debug!(

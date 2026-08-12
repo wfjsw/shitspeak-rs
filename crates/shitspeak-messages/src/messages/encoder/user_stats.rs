@@ -105,7 +105,10 @@ fn decode_ip_bytes(raw: &[u8]) -> Option<IpAddr> {
 
 fn encode_ip_bytes(ip: IpAddr) -> Vec<u8> {
     match ip {
-        IpAddr::V4(v4) => v4.octets().to_vec(),
+        // Mumble's HostAddress field always uses the 16-byte IPv6 wire format.
+        // Encode IPv4 addresses as IPv4-mapped IPv6 addresses so clients display
+        // the original IPv4 address rather than the unspecified IPv6 address.
+        IpAddr::V4(v4) => v4.to_ipv6_mapped().octets().to_vec(),
         IpAddr::V6(v6) => v6.octets().to_vec(),
     }
 }
@@ -113,5 +116,27 @@ fn encode_ip_bytes(ip: IpAddr) -> Vec<u8> {
 impl From<UserStats> for Message {
     fn from(user_stats: UserStats) -> Self {
         Message::UserStats(user_stats.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_ipv4_as_ipv4_mapped_ipv6() {
+        let encoded = encode_ip_bytes(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+
+        assert_eq!(
+            encoded,
+            Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped().octets()
+        );
+    }
+
+    #[test]
+    fn encodes_ipv6_as_native_ipv6() {
+        let address: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+        assert_eq!(encode_ip_bytes(IpAddr::V6(address)), address.octets());
     }
 }
