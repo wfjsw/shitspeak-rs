@@ -1587,7 +1587,7 @@ impl Server {
     async fn reauthenticate_expired_local_client(
         self: &Arc<Box<Self>>,
         client: Arc<Box<Client>>,
-        auth_session_id: Option<String>,
+        previous_auth_session_id: Option<String>,
     ) {
         if !self.client_instance_is_current(&client).await {
             return;
@@ -1602,7 +1602,8 @@ impl Server {
             return;
         };
 
-        let auxiliary_data = self.authentication_auxiliary_data(&client, auth_session_id);
+        let auxiliary_data =
+            self.authentication_auxiliary_data(&client, previous_auth_session_id.clone());
         let permit = self.auth_finalization_queue.acquire_silent().await;
         if !self.client_instance_is_current(&client).await {
             return;
@@ -1652,6 +1653,16 @@ impl Server {
         } = result;
         if user_id == Some(u32::MAX) {
             self.disconnect_local_client(&client, "reauthentication returned reserved user id")
+                .await;
+            return;
+        }
+        if auth_session_id != previous_auth_session_id {
+            self.disconnect_local_client(&client, "reauthentication changed auth session id")
+                .await;
+            return;
+        }
+        if client.is_registered() && user_id.is_none() {
+            self.disconnect_local_client(&client, "reauthentication removed registered user id")
                 .await;
             return;
         }

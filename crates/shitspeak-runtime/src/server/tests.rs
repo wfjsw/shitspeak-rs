@@ -1013,7 +1013,7 @@ async fn authentication_expiry_reauth_preserves_state_while_pending_and_applies_
     let next_deadline = deadline + chrono::Duration::hours(1);
     responses
         .send(Ok(AuthenticateResult {
-            auth_session_id: Some("next-auth-session".to_owned()),
+            auth_session_id: Some("previous-auth-session".to_owned()),
             authenticated_until: Some(next_deadline),
             authentication_expiry_action: AuthenticationExpiryAction::Kick,
             user_id: Some(42),
@@ -1035,7 +1035,7 @@ async fn authentication_expiry_reauth_preserves_state_while_pending_and_applies_
                 let local = client.read_local_state();
                 let local = local.as_ref().expect("local state");
                 !local.is_reauthentication_in_progress()
-                    && local.auth_session_id() == Some("next-auth-session")
+                    && local.auth_session_id() == Some("previous-auth-session")
             };
             if complete {
                 break;
@@ -1055,12 +1055,122 @@ async fn authentication_expiry_reauth_preserves_state_while_pending_and_applies_
     );
     let local = client.read_local_state();
     let local = local.as_ref().expect("local state");
-    assert_eq!(local.auth_session_id(), Some("next-auth-session"));
+    assert_eq!(local.auth_session_id(), Some("previous-auth-session"));
     assert_eq!(local.authenticated_until(), Some(next_deadline));
     assert_eq!(
         local.authentication_expiry_action(),
         AuthenticationExpiryAction::Kick
     );
+}
+
+#[tokio::test]
+async fn authentication_expiry_reauth_kicks_registered_client_when_user_id_is_removed() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let server = Server::new(test_config(Vec::new()), authenticator)
+        .await
+        .expect("server");
+    let client = authentication_expiry_test_client(&server).await;
+    let session_id = client.get_session_id();
+    {
+        let mut state = client.write_global_state(&server.clients);
+        state.set_fqdn(Some("original.auth.example".to_owned()));
+    }
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication started")
+        .expect("reauthentication call");
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("previous-auth-session".to_owned()),
+            authenticated_until: Some(deadline + chrono::Duration::hours(1)),
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
+            user_id: None,
+            fqdn: None,
+            display_name: Some("Anonymous Name".to_owned()),
+            groups: vec!["updated-group".to_owned()],
+            is_superuser: false,
+            virtual_server_id: None,
+            language: Language::default(),
+            max_bandwidth: None,
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send successful reauthentication without a user id");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server
+                .clients
+                .get_client_in_server(DEFAULT_SERVER_ID, session_id)
+                .await
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reauthentication that removes a registered user id disconnects the client");
+}
+
+#[tokio::test]
+async fn authentication_expiry_reauth_kicks_client_when_auth_session_id_changes_or_is_removed() {
+    for auth_session_id in [Some("different-auth-session".to_owned()), None] {
+        let (authenticator, mut calls, responses) = controlled_authenticator();
+        let server = Server::new(test_config(Vec::new()), authenticator)
+            .await
+            .expect("server");
+        let client = authentication_expiry_test_client(&server).await;
+        let session_id = client.get_session_id();
+        let deadline = chrono::Utc::now();
+        set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+        authentication_expiry_reaper(&server, deadline).await;
+        tokio::time::timeout(Duration::from_secs(1), calls.recv())
+            .await
+            .expect("reauthentication started")
+            .expect("reauthentication call");
+        responses
+            .send(Ok(AuthenticateResult {
+                auth_session_id,
+                authenticated_until: Some(deadline + chrono::Duration::hours(1)),
+                authentication_expiry_action: AuthenticationExpiryAction::Kick,
+                user_id: Some(7),
+                fqdn: None,
+                display_name: Some("Original Name".to_owned()),
+                groups: vec!["original-group".to_owned()],
+                is_superuser: false,
+                virtual_server_id: None,
+                language: Language::default(),
+                max_bandwidth: None,
+                texture_url: None,
+                comment_url: None,
+            }))
+            .expect("send reauthentication with changed auth session id");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if server
+                    .clients
+                    .get_client_in_server(DEFAULT_SERVER_ID, session_id)
+                    .await
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(
+            "reauthentication that changes or removes an auth session id disconnects the client",
+        );
+    }
 }
 
 #[tokio::test]
@@ -1123,7 +1233,7 @@ async fn authentication_expiry_reauth_moves_user_to_default_after_losing_travers
         .expect("reauthentication call");
     responses
         .send(Ok(AuthenticateResult {
-            auth_session_id: Some("next-auth-session".to_owned()),
+            auth_session_id: Some("previous-auth-session".to_owned()),
             authenticated_until: Some(deadline + chrono::Duration::hours(1)),
             authentication_expiry_action: AuthenticationExpiryAction::Kick,
             user_id: Some(42),
