@@ -35,6 +35,8 @@ const DEFAULT_LOKI_REQUEST_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_LOKI_RETRY_INITIAL_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_LOKI_RETRY_MAX_INTERVAL_MS: u64 = 30_000;
 const LOKI_PUSH_PATH: &str = "/loki/api/v1/push";
+const TARGET_LOKI_PUSH_BODY_BYTES: usize = 50_000_000;
+const MAX_LOKI_PUSH_BODY_BYTES: usize = 100_000_000;
 const MAX_LOKI_RESPONSE_BODY_LOG_CHARS: usize = 4_096;
 
 static LOKI_FLUSH_HANDLE: OnceLock<Mutex<Option<LokiFlushHandle>>> = OnceLock::new();
@@ -715,25 +717,37 @@ async fn flush_loki_batch(
         return;
     }
 
-    let entries = std::mem::take(pending);
-    match send_loki_entries(sender, &entries).await {
-        LokiPushResult::Delivered => {}
-        LokiPushResult::Retryable(error) => {
-            let entry_count = entries.len();
-            cache_loki_retry_batch(sender, retry_cache, entries, sender.retry_initial_interval);
+    for prepared_batch in prepare_loki_push_batches(&sender.labels, std::mem::take(pending)) {
+        let LokiPreparedPush::Ready { entries, body } = prepared_batch else {
+            let LokiPreparedPush::OversizedEntry { payload_bytes } = prepared_batch else {
+                unreachable!("all prepared Loki push variants are handled")
+            };
             eprintln!(
-                "loki logging: push failed; caching batch for retry \
-                 (batch_entries={entry_count}, retry_in_ms={}, cached_entries={}/{}): {error}",
-                sender.retry_initial_interval.as_millis(),
-                loki_cached_entry_count(retry_cache),
-                sender.retry_cache_capacity,
+                "loki logging: dropping log entry because its encoded payload exceeds the hard limit \
+                 (payload_bytes={payload_bytes}, max_payload_bytes={MAX_LOKI_PUSH_BODY_BYTES})"
             );
-        }
-        LokiPushResult::Permanent(error) => {
-            eprintln!(
-                "loki logging: dropping log batch (batch_entries={}): {error}",
-                entries.len()
-            );
+            continue;
+        };
+
+        match send_loki_body(sender, body, entries.len()).await {
+            LokiPushResult::Delivered => {}
+            LokiPushResult::Retryable(error) => {
+                let entry_count = entries.len();
+                cache_loki_retry_batch(sender, retry_cache, entries, sender.retry_initial_interval);
+                eprintln!(
+                    "loki logging: push failed; caching batch for retry \
+                     (batch_entries={entry_count}, retry_in_ms={}, cached_entries={}/{}): {error}",
+                    sender.retry_initial_interval.as_millis(),
+                    loki_cached_entry_count(retry_cache),
+                    sender.retry_cache_capacity,
+                );
+            }
+            LokiPushResult::Permanent(error) => {
+                eprintln!(
+                    "loki logging: dropping log batch (batch_entries={}): {error}",
+                    entries.len()
+                );
+            }
         }
     }
 }
@@ -749,34 +763,50 @@ async fn flush_loki_retry_cache(
 
     let now = tokio::time::Instant::now();
     let mut deferred = VecDeque::with_capacity(retry_cache.len());
-    while let Some(mut batch) = retry_cache.pop_front() {
+    while let Some(batch) = retry_cache.pop_front() {
         if !force && batch.next_retry_at > now {
             deferred.push_back(batch);
             continue;
         }
 
-        match send_loki_entries(sender, &batch.entries).await {
-            LokiPushResult::Delivered => {}
-            LokiPushResult::Retryable(error) => {
-                let next_delay = batch
-                    .retry_delay
-                    .saturating_mul(2)
-                    .min(sender.retry_max_interval);
-                let entry_count = batch.entries.len();
-                batch.retry_delay = next_delay;
-                batch.next_retry_at = tokio::time::Instant::now() + next_delay;
+        for prepared_batch in prepare_loki_push_batches(&sender.labels, batch.entries) {
+            let LokiPreparedPush::Ready { entries, body } = prepared_batch else {
+                let LokiPreparedPush::OversizedEntry { payload_bytes } = prepared_batch else {
+                    unreachable!("all prepared Loki push variants are handled")
+                };
                 eprintln!(
-                    "loki logging: retry failed; keeping batch cached \
-                     (batch_entries={entry_count}, next_retry_in_ms={}): {error}",
-                    next_delay.as_millis(),
+                    "loki logging: dropping cached log entry because its encoded payload exceeds the hard limit \
+                     (payload_bytes={payload_bytes}, max_payload_bytes={MAX_LOKI_PUSH_BODY_BYTES})"
                 );
-                deferred.push_back(batch);
-            }
-            LokiPushResult::Permanent(error) => {
-                eprintln!(
-                    "loki logging: dropping cached log batch (batch_entries={}): {error}",
-                    batch.entries.len()
-                );
+                continue;
+            };
+
+            match send_loki_body(sender, body, entries.len()).await {
+                LokiPushResult::Delivered => {}
+                LokiPushResult::Retryable(error) => {
+                    let next_delay = batch
+                        .retry_delay
+                        .saturating_mul(2)
+                        .min(sender.retry_max_interval);
+                    let entry_count = entries.len();
+                    let retry_batch = LokiBatch {
+                        entries,
+                        next_retry_at: tokio::time::Instant::now() + next_delay,
+                        retry_delay: next_delay,
+                    };
+                    eprintln!(
+                        "loki logging: retry failed; keeping batch cached \
+                         (batch_entries={entry_count}, next_retry_in_ms={}): {error}",
+                        next_delay.as_millis(),
+                    );
+                    deferred.push_back(retry_batch);
+                }
+                LokiPushResult::Permanent(error) => {
+                    eprintln!(
+                        "loki logging: dropping cached log batch (batch_entries={}): {error}",
+                        entries.len()
+                    );
+                }
             }
         }
     }
@@ -840,14 +870,110 @@ enum LokiPushResult {
     Permanent(String),
 }
 
-async fn send_loki_entries(sender: &LokiSender, entries: &[LokiEntry]) -> LokiPushResult {
-    let payload = build_push_request(&sender.labels, entries.iter().cloned());
+enum LokiPreparedPush {
+    Ready {
+        entries: Vec<LokiEntry>,
+        body: Vec<u8>,
+    },
+    OversizedEntry {
+        payload_bytes: usize,
+    },
+}
+
+fn prepare_loki_push_batches(
+    base_labels: &BTreeMap<String, String>,
+    entries: Vec<LokiEntry>,
+) -> Vec<LokiPreparedPush> {
+    prepare_loki_push_batches_with_limits(
+        base_labels,
+        entries,
+        TARGET_LOKI_PUSH_BODY_BYTES,
+        MAX_LOKI_PUSH_BODY_BYTES,
+    )
+}
+
+fn prepare_loki_push_batches_with_limits(
+    base_labels: &BTreeMap<String, String>,
+    entries: Vec<LokiEntry>,
+    target_body_bytes: usize,
+    max_body_bytes: usize,
+) -> Vec<LokiPreparedPush> {
+    let estimated_batches = split_loki_entries_by_estimated_size(entries, target_body_bytes);
+    let mut prepared = Vec::with_capacity(estimated_batches.len());
+    for batch in estimated_batches {
+        prepare_loki_push_batch(base_labels, batch, max_body_bytes, &mut prepared);
+    }
+    prepared
+}
+
+fn split_loki_entries_by_estimated_size(
+    entries: Vec<LokiEntry>,
+    target_body_bytes: usize,
+) -> Vec<Vec<LokiEntry>> {
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut estimated_bytes = 0usize;
+
+    for entry in entries {
+        let entry_bytes = estimated_loki_entry_size(&entry);
+        if !batch.is_empty() && estimated_bytes.saturating_add(entry_bytes) > target_body_bytes {
+            batches.push(std::mem::take(&mut batch));
+            estimated_bytes = 0;
+        }
+        estimated_bytes = estimated_bytes.saturating_add(entry_bytes);
+        batch.push(entry);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
+}
+
+fn estimated_loki_entry_size(entry: &LokiEntry) -> usize {
+    entry
+        .timestamp_ns
+        .len()
+        .saturating_add(entry.line.len())
+        .saturating_add(
+            entry
+                .metadata
+                .iter()
+                .map(|(key, value)| key.len().saturating_add(value.len()).saturating_add(8))
+                .sum::<usize>(),
+        )
+        .saturating_add(32)
+}
+
+fn prepare_loki_push_batch(
+    base_labels: &BTreeMap<String, String>,
+    entries: Vec<LokiEntry>,
+    max_body_bytes: usize,
+    prepared: &mut Vec<LokiPreparedPush>,
+) {
+    let payload = build_push_request(base_labels, entries.iter().cloned());
     let body = match serde_json::to_vec(&payload) {
         Ok(body) => body,
         Err(error) => {
-            return LokiPushResult::Permanent(format!("failed to encode log batch: {error}"));
+            eprintln!("loki logging: dropping log batch because it could not be encoded: {error}");
+            return;
         }
     };
+    if body.len() <= max_body_bytes {
+        prepared.push(LokiPreparedPush::Ready { entries, body });
+    } else if entries.len() == 1 {
+        prepared.push(LokiPreparedPush::OversizedEntry {
+            payload_bytes: body.len(),
+        });
+    } else {
+        let split_at = entries.len() / 2;
+        let mut latter = entries;
+        let former = latter.drain(..split_at).collect();
+        prepare_loki_push_batch(base_labels, former, max_body_bytes, prepared);
+        prepare_loki_push_batch(base_labels, latter, max_body_bytes, prepared);
+    }
+}
+
+async fn send_loki_body(sender: &LokiSender, body: Vec<u8>, entry_count: usize) -> LokiPushResult {
     let payload_bytes = body.len();
 
     let mut request = sender
@@ -892,7 +1018,7 @@ async fn send_loki_entries(sender: &LokiSender, entries: &[LokiEntry]) -> LokiPu
                 &sender.push_url,
                 status,
                 &retry_after,
-                entries.len(),
+                entry_count,
                 payload_bytes,
                 &text,
             );
@@ -904,7 +1030,7 @@ async fn send_loki_entries(sender: &LokiSender, entries: &[LokiEntry]) -> LokiPu
         }
         Err(error) => LokiPushResult::Retryable(format_loki_transport_error(
             &error,
-            entries.len(),
+            entry_count,
             payload_bytes,
         )),
     }
@@ -1490,7 +1616,11 @@ mod tests {
 
         let mut sender = test_loki_sender(1);
         sender.push_url = format!("http://{address}/loki/api/v1/push");
-        let result = send_loki_entries(&sender, &[test_loki_entry("1")]).await;
+        let prepared = prepare_loki_push_batches(&sender.labels, vec![test_loki_entry("1")]);
+        let [LokiPreparedPush::Ready { entries, body }] = prepared.as_slice() else {
+            panic!("small log entry produces one sendable request");
+        };
+        let result = send_loki_body(&sender, body.clone(), entries.len()).await;
 
         let LokiPushResult::Retryable(diagnostics) = result else {
             panic!("a refused connection must be retried");
@@ -1522,6 +1652,65 @@ mod tests {
         assert!(!diagnostics.contains("alice"));
         assert!(!diagnostics.contains("secret"));
         assert!(!diagnostics.contains("api_key"));
+    }
+
+    #[test]
+    fn loki_pushes_target_50_mb_and_never_exceed_the_100_mb_hard_cap() {
+        assert_eq!(TARGET_LOKI_PUSH_BODY_BYTES, 50_000_000);
+        assert_eq!(MAX_LOKI_PUSH_BODY_BYTES, 100_000_000);
+    }
+
+    #[test]
+    fn loki_push_batches_are_split_to_the_hard_encoded_size_limit() {
+        let labels = BTreeMap::new();
+        let entries = (1..=4)
+            .map(|timestamp| LokiEntry {
+                timestamp_ns: timestamp.to_string(),
+                level: "INFO".to_string(),
+                line: "x".repeat(100),
+                metadata: BTreeMap::new(),
+            })
+            .collect();
+
+        let batches = prepare_loki_push_batches_with_limits(&labels, entries, 10_000, 350);
+        let ready_batches = batches
+            .iter()
+            .filter_map(|batch| match batch {
+                LokiPreparedPush::Ready { entries, body } => Some((entries, body)),
+                LokiPreparedPush::OversizedEntry { .. } => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(ready_batches.len(), 2);
+        assert!(ready_batches.iter().all(|(_, body)| body.len() <= 350));
+        assert_eq!(
+            ready_batches
+                .iter()
+                .flat_map(|(entries, _)| entries.iter())
+                .map(|entry| entry.timestamp_ns.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1", "2", "3", "4"]
+        );
+    }
+
+    #[test]
+    fn loki_push_drops_a_single_entry_over_the_hard_encoded_size_limit() {
+        let batches = prepare_loki_push_batches_with_limits(
+            &BTreeMap::new(),
+            vec![LokiEntry {
+                timestamp_ns: "1".to_string(),
+                level: "INFO".to_string(),
+                line: "x".repeat(500),
+                metadata: BTreeMap::new(),
+            }],
+            50,
+            100,
+        );
+
+        assert!(matches!(
+            batches.as_slice(),
+            [LokiPreparedPush::OversizedEntry { payload_bytes }] if *payload_bytes > 100
+        ));
     }
 
     #[test]
