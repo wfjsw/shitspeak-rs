@@ -282,7 +282,10 @@ pub async fn handle_acl(
                 }
                 super::channel_state::AcceptedChannelOpCommit::Pending(proposal) => {
                     super::channel_state::spawn_channel_op_completion_log(
-                        proposal, "set_acls", channel_id,
+                        Arc::clone(sender),
+                        proposal,
+                        "set_acls",
+                        channel_id,
                     );
                 }
             }

@@ -16,6 +16,11 @@ use crate::{
 
 const CHANNEL_SETTINGS_PENDING_NOTICE_GRACE: std::time::Duration =
     std::time::Duration::from_millis(25);
+const CHANNEL_REPOSITORY_REQUEST_SUBMITTED: &str =
+    "Channel settings update submitted. Waiting for repository admission.";
+const CHANNEL_REPOSITORY_REQUEST_COMMITTED: &str = "Channel settings update committed.";
+const CHANNEL_REPOSITORY_REQUEST_UNABLE_TO_COMMIT: &str =
+    "Channel settings update was unable to commit.";
 
 pub async fn handle_channel_state(
     server: &Arc<Box<Server>>,
@@ -240,7 +245,12 @@ pub async fn handle_channel_state(
                                 proposal,
                             );
                         } else {
-                            spawn_channel_op_completion_log(proposal, "create_channel", new_id);
+                            spawn_channel_op_completion_log(
+                                Arc::clone(sender),
+                                proposal,
+                                "create_channel",
+                                new_id,
+                            );
                         }
                     }
                 }
@@ -463,7 +473,12 @@ pub async fn handle_channel_state(
                         }
                     }
                     AcceptedChannelOpCommit::Pending(proposal) => {
-                        spawn_channel_op_completion_log(proposal, "edit_channel", channel_id);
+                        spawn_channel_op_completion_log(
+                            Arc::clone(sender),
+                            proposal,
+                            "edit_channel",
+                            channel_id,
+                        );
                     }
                 }
             }
@@ -488,19 +503,31 @@ pub(super) async fn wait_accepted_channel_op_commit_grace(
     {
         ChannelOpCompletion::Completed(result) => Ok(AcceptedChannelOpCommit::Completed(result)),
         ChannelOpCompletion::Pending => {
-            send_channel_settings_pending_notice(sender).await?;
+            send_channel_repository_notice(sender, CHANNEL_REPOSITORY_REQUEST_SUBMITTED).await?;
             Ok(AcceptedChannelOpCommit::Pending(proposal))
         }
     }
 }
 
 pub(super) fn spawn_channel_op_completion_log(
+    sender: Arc<Box<Client>>,
     proposal: ChannelOpProposal,
     operation: &'static str,
     channel_id: u32,
 ) {
     tokio::spawn(async move {
         let result = proposal.completed_after_acceptance().await;
+        if let Err(error) =
+            send_channel_repository_notice(&sender, channel_repository_completion_notice(&result))
+                .await
+        {
+            tracing::warn!(
+                operation,
+                channel_id,
+                ?error,
+                "failed to send channel operation completion notice"
+            );
+        }
         if !result.is_proposed() {
             tracing::warn!(
                 operation,
@@ -520,6 +547,16 @@ fn spawn_temp_channel_creator_move_after_commit(
 ) {
     tokio::spawn(async move {
         let result = proposal.completed_after_acceptance().await;
+        if let Err(error) =
+            send_channel_repository_notice(&sender, channel_repository_completion_notice(&result))
+                .await
+        {
+            tracing::warn!(
+                channel_id,
+                ?error,
+                "failed to send temporary channel operation completion notice"
+            );
+        }
         if !result.is_proposed() {
             tracing::warn!(
                 channel_id,
@@ -567,8 +604,9 @@ async fn move_temp_channel_creator_after_commit(
     );
 }
 
-async fn send_channel_settings_pending_notice(
+async fn send_channel_repository_notice(
     sender: &Arc<Box<Client>>,
+    notice: &'static str,
 ) -> Result<(), MessageHandlerError> {
     let message = Message::TextMessage(
         TextMessage {
@@ -576,14 +614,20 @@ async fn send_channel_settings_pending_notice(
             session: vec![u32::from(sender.get_session_id())],
             channel_id: Vec::new(),
             tree_id: Vec::new(),
-            message:
-                "Channel settings accepted. Applying them across the cluster may take a moment."
-                    .to_owned(),
+            message: notice.to_owned(),
         }
         .into(),
     );
     sender.write_proto_message(&message).await?;
     Ok(())
+}
+
+fn channel_repository_completion_notice(result: &ChannelOpProposeResult) -> &'static str {
+    if result.is_proposed() {
+        CHANNEL_REPOSITORY_REQUEST_COMMITTED
+    } else {
+        CHANNEL_REPOSITORY_REQUEST_UNABLE_TO_COMMIT
+    }
 }
 
 async fn add_missing_creator_temp_channel_acls(
@@ -696,5 +740,42 @@ async fn description_blob_patch(
                 .map(|hash| Some(Some(hash)))
         }
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CHANNEL_REPOSITORY_REQUEST_COMMITTED, CHANNEL_REPOSITORY_REQUEST_SUBMITTED,
+        CHANNEL_REPOSITORY_REQUEST_UNABLE_TO_COMMIT, channel_repository_completion_notice,
+    };
+    use crate::s2s::ChannelOpProposeResult;
+
+    #[test]
+    fn pending_channel_update_uses_repository_admission_notice() {
+        assert_eq!(
+            CHANNEL_REPOSITORY_REQUEST_SUBMITTED,
+            "Channel settings update submitted. Waiting for repository admission."
+        );
+    }
+
+    #[test]
+    fn completed_channel_update_uses_terminal_repository_notices() {
+        assert_eq!(
+            CHANNEL_REPOSITORY_REQUEST_COMMITTED,
+            "Channel settings update committed."
+        );
+        assert_eq!(
+            CHANNEL_REPOSITORY_REQUEST_UNABLE_TO_COMMIT,
+            "Channel settings update was unable to commit."
+        );
+        assert_eq!(
+            channel_repository_completion_notice(&ChannelOpProposeResult::Proposed),
+            CHANNEL_REPOSITORY_REQUEST_COMMITTED
+        );
+        assert_eq!(
+            channel_repository_completion_notice(&ChannelOpProposeResult::failed("quorum lost")),
+            CHANNEL_REPOSITORY_REQUEST_UNABLE_TO_COMMIT
+        );
     }
 }
