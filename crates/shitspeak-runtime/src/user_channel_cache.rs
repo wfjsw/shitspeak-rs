@@ -768,15 +768,21 @@ impl UserChannelCacheEntry {
 pub fn user_channel_cache_key(
     fqdn: Option<&str>,
     user_id: Option<u32>,
+    certificate_hash: Option<&[u8]>,
     username: Option<&str>,
 ) -> Option<String> {
     match fqdn.filter(|fqdn| !fqdn.is_empty()) {
         Some(fqdn) => Some(fqdn.to_owned()),
         None => match user_id {
             Some(user_id) => Some(user_id.to_string()),
-            None => username
-                .filter(|username| !username.is_empty())
-                .map(ToOwned::to_owned),
+            None => certificate_hash
+                .filter(|certificate_hash| !certificate_hash.is_empty())
+                .map(|certificate_hash| format!("{}@cert.local", hex::encode(certificate_hash)))
+                .or_else(|| {
+                    username
+                        .filter(|username| !username.is_empty())
+                        .map(|username| format!("{username}@username.local"))
+                }),
         },
     }
 }
@@ -794,7 +800,10 @@ pub async fn cache_key_for_client(server: &Server, client: &Client) -> Option<St
 
     let fqdn = client.get_fqdn();
     let user_id = client.get_user_id();
-    if let Some(cache_key) = user_channel_cache_key(fqdn.as_deref(), user_id, None) {
+    let certificate_hash = client.get_certificate_hash();
+    if let Some(cache_key) =
+        user_channel_cache_key(fqdn.as_deref(), user_id, certificate_hash, None)
+    {
         return Some(cache_key);
     }
     if is_remote {
@@ -808,7 +817,7 @@ pub async fn cache_key_for_client(server: &Server, client: &Client) -> Option<St
             .as_ref()
             .map(|credential| credential.username.clone())
     };
-    user_channel_cache_key(None, None, username.as_deref())
+    user_channel_cache_key(None, None, certificate_hash, username.as_deref())
 }
 
 /// Listen to replicated client state after it has been materialized locally
@@ -1200,20 +1209,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_key_prefers_fqdn_then_user_id_then_username() {
+    fn cache_key_prefers_fqdn_then_user_id_then_certificate_then_username() {
         assert_eq!(
-            user_channel_cache_key(Some("alice.example.test"), Some(42), Some("alice")),
+            user_channel_cache_key(
+                Some("alice.example.test"),
+                Some(42),
+                Some(b"certificate"),
+                Some("alice"),
+            ),
             Some("alice.example.test".to_owned())
         );
         assert_eq!(
-            user_channel_cache_key(Some(""), Some(42), Some("alice")),
+            user_channel_cache_key(Some(""), Some(42), Some(b"certificate"), Some("alice")),
             Some("42".to_owned())
         );
         assert_eq!(
-            user_channel_cache_key(None, None, Some("alice")),
-            Some("alice".to_owned())
+            user_channel_cache_key(None, None, Some(b"certificate"), Some("alice")),
+            Some("6365727469666963617465@cert.local".to_owned())
         );
-        assert_eq!(user_channel_cache_key(None, None, None), None);
+        assert_eq!(
+            user_channel_cache_key(None, None, None, Some("alice")),
+            Some("alice@username.local".to_owned())
+        );
+        assert_eq!(user_channel_cache_key(None, None, None, None), None);
     }
 
     #[test]

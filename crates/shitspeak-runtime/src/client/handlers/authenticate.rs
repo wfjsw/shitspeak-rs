@@ -265,6 +265,7 @@ pub async fn handle_authenticate(
     let channel_cache_key = crate::user_channel_cache::user_channel_cache_key(
         result.fqdn.as_deref(),
         result.user_id,
+        auth_auxiliary.certificate_hash.as_deref(),
         Some(username.as_str()),
     );
     let legacy_channel_cache_key = result.user_id.map(|user_id| user_id.to_string());

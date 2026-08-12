@@ -277,6 +277,7 @@ async fn configure_authenticated_client_inner(
     let channel_cache_key = shitspeak_runtime::user_channel_cache::user_channel_cache_key(
         result.fqdn.as_deref(),
         result.user_id,
+        client.get_certificate_hash(),
         cache_username.as_deref(),
     );
     let legacy_channel_cache_key = result.user_id.map(|user_id| user_id.to_string());
