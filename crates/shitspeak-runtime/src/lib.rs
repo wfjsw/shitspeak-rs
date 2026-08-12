@@ -72,7 +72,7 @@ impl ServerBuilder {
             .install_default()
             .expect("Failed to install rustls crypto provider");
 
-        let logging_guard = logging::init("shitspeak-rs")?;
+        let logging_guard = logging::init("shitspeak-rs", &self.config_path)?;
 
         shitspeak_client_crypto::probe_aes_backend();
         shitspeak_client_crypto::probe_gf128_backend();

@@ -179,7 +179,7 @@ pub async fn run_forwarder(config_path: impl AsRef<Path>) -> Result<(), Box<dyn 
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    let _logging_guard = logging::init("s2s-forwarder")?;
+    let _logging_guard = logging::init("s2s-forwarder", config_path.as_ref())?;
 
     run(config_path).await
 }

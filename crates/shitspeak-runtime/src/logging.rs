@@ -220,13 +220,16 @@ impl Drop for LoggingGuard {
     }
 }
 
-pub fn init(service_name: &'static str) -> Result<LoggingGuard, Box<dyn Error>> {
+pub fn init(
+    service_name: &'static str,
+    config_path: impl AsRef<std::path::Path>,
+) -> Result<LoggingGuard, Box<dyn Error>> {
     let cli_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_line_number(true);
-    let root = load_logging_config()?;
+    let root = load_logging_config(config_path)?;
 
     if root.logging.loki.enabled() {
         let node_id = logging_node_id(&root.s2s);
@@ -263,9 +266,11 @@ pub fn flush() {
     }
 }
 
-fn load_logging_config() -> Result<LoggingRootConfig, config::ConfigError> {
+fn load_logging_config(
+    config_path: impl AsRef<std::path::Path>,
+) -> Result<LoggingRootConfig, config::ConfigError> {
     ConfigCrate::builder()
-        .add_source(File::with_name("config").required(false))
+        .add_source(File::from(config_path.as_ref().to_path_buf()).required(false))
         .add_source(Environment::with_prefix("SHITSPEAK").separator("_"))
         .add_source(
             Environment::with_prefix("SHITSPEAK")
@@ -1447,6 +1452,32 @@ fn panic_message(info: &panic::PanicHookInfo<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logging_config_uses_the_explicit_config_path() {
+        let directory = tempfile::tempdir().expect("create config directory");
+        let config_path = directory.path().join("node-1.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[logging.loki]
+enabled = true
+url = "https://loki.example"
+
+[s2s]
+node_id = 1
+"#,
+        )
+        .expect("write explicit config");
+
+        let config = load_logging_config(&config_path).expect("load explicit config");
+
+        assert!(config.logging.loki.enabled());
+        assert_eq!(
+            config.logging.loki.push_url().as_deref(),
+            Some("https://loki.example/loki/api/v1/push")
+        );
+    }
 
     #[test]
     fn loki_push_url_accepts_base_or_push_endpoint() {
