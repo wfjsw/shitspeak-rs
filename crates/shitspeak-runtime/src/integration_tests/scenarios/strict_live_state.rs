@@ -2871,3 +2871,54 @@ async fn strict_live_ban_state_resolves_jnb_dfw_staged_recovery() {
     let quiet = wait_for_quiet(&servers).await;
     assert_no_active_traffic(&quiet);
 }
+
+/// Replays the exact DFW Ban repository and strict terminal journal captured
+/// after the second production BanList update. The first committed SetBans
+/// (v7) contains one certificate-only ASN entry; the durable v8 commit
+/// replaces that list with two certificate-only `::/0` ASN entries. A schema
+/// keyed only by `(address, mask)` rejects v8 and leaves the terminal delivery
+/// retrying forever. The fixture is intentionally a single node: the commit
+/// decision and its terminal delivery are already durable, so neither clients
+/// nor network latency participate in this failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the DFW Ban repository and strict terminal journal copied live through SSH"]
+async fn strict_live_ban_terminal_delivery_replays_dfw_second_certificate_only_update() {
+    let _guard = s2s_network_test_guard().await;
+    let fixture_root = PathBuf::from(
+        std::env::var_os("SHITSPEAK_STRICT_LIVE_BAN_DELIVERY_ROOT")
+            .expect("SHITSPEAK_STRICT_LIVE_BAN_DELIVERY_ROOT is required"),
+    );
+    let state_directory = fixture_root.join("node-4-dfw");
+    let node_id = 8;
+    let pki = Arc::new(mint_pki(&[node_id]));
+    let address = loopback(pick_free_port().await);
+    let server = spawn_s2s_test_server_with_state(
+        TestServerOpts::default(),
+        pki,
+        node_id,
+        0,
+        production_s2s_config(address, &[address]),
+        TestStrictReplicationState::from_directory(state_directory),
+    )
+    .await;
+
+    let delivered = wait_until(CONVERGENCE_DEADLINE, || {
+        server.server.get_bans().current_version() == 8
+            && tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(server.server.get_bans().get_active_bans())
+                    .len()
+                    == 2
+            })
+    })
+    .await;
+    assert!(
+        delivered,
+        "the copied DFW v8 Ban terminal delivery did not apply both certificate-only entries; version={}, entries={:?}",
+        server.server.get_bans().current_version(),
+        server.server.get_bans().get_active_bans().await,
+    );
+    assert!(server.server.get_bans().is_asn_banned(45_090));
+    assert!(server.server.get_bans().is_asn_banned(45_102));
+    server.shutdown_gracefully().await;
+}
