@@ -378,16 +378,32 @@ impl InboundDispatch {
         let (depth, capacity) = sender_queue_depth(sender);
         if let Some(report) = record_queue_watermark(watermark, depth, capacity, is_full) {
             let status = report.status();
-            debug!(
-                ?class,
-                queue_capacity = status.capacity(),
-                queue_depth = status.depth(),
-                queue_high_watermark = status.high_depth(),
-                queue_samples = status.samples(),
-                queue_full_samples = status.full_samples(),
-                interval_secs = report.interval().as_secs(),
-                "s2s inbound queue watermark"
-            );
+            let utilization = status.high_depth() as f64 / status.capacity().max(1) as f64;
+            macro_rules! log_watermark {
+                ($level:ident) => {
+                    tracing::$level!(
+                        ?class,
+                        queue_capacity = status.capacity(),
+                        queue_depth = status.depth(),
+                        queue_high_watermark = status.high_depth(),
+                        queue_samples = status.samples(),
+                        queue_full_samples = status.full_samples(),
+                        interval_secs = report.interval().as_secs(),
+                        "s2s inbound queue watermark"
+                    );
+                };
+            }
+            if utilization < 0.5 {
+                log_watermark!(trace);
+            } else if utilization < 0.7 {
+                log_watermark!(debug);
+            } else if utilization < 0.85 {
+                log_watermark!(info);
+            } else if utilization <= 0.95 {
+                log_watermark!(warn);
+            } else {
+                log_watermark!(error);
+            }
         }
     }
 }
