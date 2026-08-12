@@ -114,6 +114,26 @@ impl BanEntry {
     }
 }
 
+/// Return the durable identity for a ban criterion.
+///
+/// It includes every active criterion. Certificate-only bans deliberately
+/// include their hash because Mumble serializes each of them with the same
+/// unspecified `::/0` address.
+fn ban_entry_key(entry: &BanEntry) -> String {
+    format!(
+        "ban-ip={};ban-certificate={};address={};mask={};hash={}",
+        entry.ban_ip as u8,
+        entry.ban_certificate as u8,
+        entry.address,
+        entry.mask,
+        entry
+            .hash
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    )
+}
+
 // ─── WAL types ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,7 +213,7 @@ const IPV6_PREFIX_COUNT: u8 = 128;
 /// of the number of configured bans.
 #[derive(Default)]
 struct BanLookupIndex {
-    entries: HashMap<(IpAddr, u8), BanEntry>,
+    entries: HashMap<String, BanEntry>,
     ipv4_prefixes: HashMap<(u8, u32), i64>,
     ipv6_prefixes: HashMap<(u8, u128), i64>,
     identity_hashes: HashMap<String, i64>,
@@ -213,12 +233,12 @@ impl BanLookupIndex {
         match op {
             BanOp::SetBans { entries } => self.replace_entries(entries.clone()),
             BanOp::AddBan { entry } => {
-                self.entries
-                    .insert((entry.address, entry.mask), entry.clone());
+                self.entries.insert(ban_entry_key(entry), entry.clone());
                 self.rebuild();
             }
             BanOp::RemoveBan { address, mask } => {
-                self.entries.remove(&(*address, *mask));
+                self.entries
+                    .retain(|_, entry| entry.address != *address || entry.mask != *mask);
                 self.rebuild();
             }
         }
@@ -227,7 +247,7 @@ impl BanLookupIndex {
     fn replace_entries(&mut self, entries: Vec<BanEntry>) {
         self.entries = entries
             .into_iter()
-            .map(|entry| ((entry.address, entry.mask), entry))
+            .map(|entry| (ban_entry_key(&entry), entry))
             .collect();
         self.rebuild();
     }
@@ -407,6 +427,50 @@ pub struct BanRepository {
     tx: broadcast::Sender<Arc<BanOperation>>,
 }
 
+fn migrate_bans_schema_if_needed(conn: &Connection) {
+    let has_entry_key = conn
+        .prepare("PRAGMA table_info(bans)")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map(|columns| columns.iter().any(|column| column == "entry_key"))
+        .unwrap_or(false);
+    if has_entry_key {
+        return;
+    }
+
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE bans_rebuilt (
+             entry_key TEXT NOT NULL PRIMARY KEY,
+             address TEXT NOT NULL,
+             mask INTEGER NOT NULL,
+             name TEXT,
+             hash TEXT,
+             reason TEXT,
+             start INTEGER NOT NULL,
+             duration INTEGER NOT NULL,
+             ban_certificate INTEGER NOT NULL DEFAULT 1,
+             ban_ip INTEGER NOT NULL DEFAULT 1
+         );
+         INSERT INTO bans_rebuilt
+             (entry_key, address, mask, name, hash, reason, start, duration, ban_certificate, ban_ip)
+         SELECT printf('ban-ip=%d;ban-certificate=%d;address=%s;mask=%d;hash=%s',
+                       ban_ip, ban_certificate, address, mask, lower(coalesce(hash, ''))),
+                address, mask, name, hash, reason, start, duration, ban_certificate, ban_ip
+         FROM bans;
+         DROP TABLE bans;
+         ALTER TABLE bans_rebuilt RENAME TO bans;
+         CREATE INDEX idx_bans_address ON bans(address);
+         INSERT OR IGNORE INTO ban_repository_migrations (name)
+         VALUES ('ban_identity_v1');
+         COMMIT;",
+    )
+    .expect("ban identity schema migration should succeed");
+}
+
 impl BanRepository {
     // ── Construction ──────────────────────────────────────────────────────
 
@@ -439,6 +503,7 @@ impl BanRepository {
     fn init_db(node_id: u16, conn: Connection, storage_dir: Option<PathBuf>) -> Self {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS bans (
+                entry_key TEXT NOT NULL PRIMARY KEY,
                 address TEXT NOT NULL,
                 mask INTEGER NOT NULL,
                 name TEXT,
@@ -447,8 +512,7 @@ impl BanRepository {
                 start INTEGER NOT NULL,
                 duration INTEGER NOT NULL,
                 ban_certificate INTEGER NOT NULL DEFAULT 1,
-                ban_ip INTEGER NOT NULL DEFAULT 1,
-                PRIMARY KEY (address, mask)
+                ban_ip INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS ban_operations (
@@ -492,6 +556,7 @@ impl BanRepository {
         ] {
             let _ = conn.execute(migration, []);
         }
+        migrate_bans_schema_if_needed(&conn);
         conn.execute_batch(
             "BEGIN IMMEDIATE;
              INSERT OR IGNORE INTO ban_strict_op_ids (op_id_hi, op_id_lo, ts_final)
@@ -1615,11 +1680,23 @@ fn apply_op_to_db(conn: &Connection, op: &BanOp) -> Result<(), rusqlite::Error> 
         BanOp::SetBans { entries } => {
             conn.execute("DELETE FROM bans", [])?;
             let mut stmt = conn.prepare(
-                "INSERT INTO bans (address, mask, name, hash, ban_certificate, ban_ip, reason, start, duration)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO bans
+                     (entry_key, address, mask, name, hash, ban_certificate, ban_ip, reason, start, duration)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(entry_key) DO UPDATE SET
+                     address = excluded.address,
+                     mask = excluded.mask,
+                     name = excluded.name,
+                     hash = excluded.hash,
+                     ban_certificate = excluded.ban_certificate,
+                     ban_ip = excluded.ban_ip,
+                     reason = excluded.reason,
+                     start = excluded.start,
+                     duration = excluded.duration",
             )?;
             for entry in entries {
                 stmt.execute(params![
+                    ban_entry_key(entry),
                     entry.address.to_string(),
                     entry.mask,
                     entry.name,
@@ -1634,9 +1711,21 @@ fn apply_op_to_db(conn: &Connection, op: &BanOp) -> Result<(), rusqlite::Error> 
         }
         BanOp::AddBan { entry } => {
             conn.execute(
-                "INSERT OR REPLACE INTO bans (address, mask, name, hash, ban_certificate, ban_ip, reason, start, duration)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO bans
+                     (entry_key, address, mask, name, hash, ban_certificate, ban_ip, reason, start, duration)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(entry_key) DO UPDATE SET
+                     address = excluded.address,
+                     mask = excluded.mask,
+                     name = excluded.name,
+                     hash = excluded.hash,
+                     ban_certificate = excluded.ban_certificate,
+                     ban_ip = excluded.ban_ip,
+                     reason = excluded.reason,
+                     start = excluded.start,
+                     duration = excluded.duration",
                 params![
+                    ban_entry_key(entry),
                     entry.address.to_string(),
                     entry.mask,
                     entry.name,
@@ -1826,6 +1915,172 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].ban_certificate);
         assert!(!entries[0].ban_ip);
+    }
+
+    #[tokio::test]
+    async fn certificate_only_bans_with_unspecified_address_are_preserved() {
+        let repo = BanRepository::new_in_memory(1);
+        let first = BanEntry {
+            address: "::".parse().unwrap(),
+            mask: 0,
+            name: Some("first certificate".into()),
+            hash: Some("first-certificate-hash".into()),
+            ban_certificate: true,
+            ban_ip: false,
+            reason: None,
+            start: chrono::Utc::now().timestamp(),
+            duration: 0,
+        };
+        let second = BanEntry {
+            name: Some("second certificate".into()),
+            hash: Some("second-certificate-hash".into()),
+            ..first.clone()
+        };
+
+        repo.set_bans(vec![first.clone()]).await.unwrap();
+        repo.set_bans(vec![first.clone(), second.clone()])
+            .await
+            .unwrap();
+
+        let active = repo.get_active_bans().await;
+        assert_eq!(active.len(), 2);
+        assert!(active.contains(&first));
+        assert!(active.contains(&second));
+        assert!(repo.is_identity_banned(Some("first-certificate-hash"), None));
+        assert!(repo.is_identity_banned(Some("second-certificate-hash"), None));
+    }
+
+    #[tokio::test]
+    async fn strict_set_bans_preserves_multiple_certificate_only_asn_bans() {
+        let repo = BanRepository::new_in_memory(1);
+        let first = BanEntry {
+            address: "::".parse().unwrap(),
+            mask: 0,
+            name: None,
+            hash: Some("AS45090".into()),
+            ban_certificate: true,
+            ban_ip: false,
+            reason: None,
+            start: 1,
+            duration: 0,
+        };
+        let second = BanEntry {
+            hash: Some("AS45102".into()),
+            ..first.clone()
+        };
+
+        for (version, entries, metadata) in [
+            (
+                1,
+                vec![first.clone()],
+                StrictReplicationMetadata::new(1, 1, 1),
+            ),
+            (
+                2,
+                vec![first.clone(), second.clone()],
+                StrictReplicationMetadata::new(1, 2, 2),
+            ),
+        ] {
+            assert_eq!(
+                repo.apply_strict_operation_once(
+                    Arc::new(BanOperation {
+                        version,
+                        node_id: 8,
+                        timestamp: version as i64,
+                        op: BanOp::SetBans { entries },
+                    }),
+                    metadata,
+                )
+                .await
+                .unwrap(),
+                StrictOperationApplyOutcome::Applied
+            );
+        }
+
+        let active = repo.get_active_bans().await;
+        assert_eq!(active.len(), 2);
+        assert!(active.contains(&first));
+        assert!(active.contains(&second));
+        assert!(repo.is_asn_banned(45_090));
+        assert!(repo.is_asn_banned(45_102));
+    }
+
+    #[tokio::test]
+    async fn opening_legacy_bans_schema_migrates_certificate_bans_for_strict_set_bans() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("bans.db");
+        {
+            let legacy = Connection::open(&database).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE bans (
+                         address TEXT NOT NULL,
+                         mask INTEGER NOT NULL,
+                         name TEXT,
+                         hash TEXT,
+                         reason TEXT,
+                         start INTEGER NOT NULL,
+                         duration INTEGER NOT NULL,
+                         ban_certificate INTEGER NOT NULL DEFAULT 1,
+                         ban_ip INTEGER NOT NULL DEFAULT 1,
+                         PRIMARY KEY (address, mask)
+                     );
+                     INSERT INTO bans
+                         (address, mask, hash, start, duration, ban_certificate, ban_ip)
+                     VALUES ('::', 0, 'AS45090', 1, 0, 1, 0);",
+                )
+                .unwrap();
+        }
+
+        let repo = BanRepository::open(8, temp.path()).await.unwrap();
+        let has_entry_key = repo
+            .conn
+            .lock()
+            .prepare("PRAGMA table_info(bans)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .any(|column| column == "entry_key");
+        assert!(has_entry_key);
+
+        let first = BanEntry {
+            address: "::".parse().unwrap(),
+            mask: 0,
+            name: None,
+            hash: Some("AS45090".into()),
+            ban_certificate: true,
+            ban_ip: false,
+            reason: None,
+            start: 1,
+            duration: 0,
+        };
+        let second = BanEntry {
+            hash: Some("AS45102".into()),
+            ..first.clone()
+        };
+        assert_eq!(
+            repo.apply_strict_operation_once(
+                Arc::new(BanOperation {
+                    version: 2,
+                    node_id: 8,
+                    timestamp: 2,
+                    op: BanOp::SetBans {
+                        entries: vec![first.clone(), second.clone()],
+                    },
+                }),
+                StrictReplicationMetadata::new(2_349_447_939_974_943, 2, 8_877),
+            )
+            .await
+            .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+        let active = repo.get_active_bans().await;
+        assert_eq!(active.len(), 2);
+        assert!(active.contains(&first));
+        assert!(active.contains(&second));
     }
 
     #[tokio::test]
