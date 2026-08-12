@@ -35,6 +35,7 @@ const DEFAULT_LOKI_REQUEST_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_LOKI_RETRY_INITIAL_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_LOKI_RETRY_MAX_INTERVAL_MS: u64 = 30_000;
 const LOKI_PUSH_PATH: &str = "/loki/api/v1/push";
+const MAX_LOKI_RESPONSE_BODY_LOG_CHARS: usize = 4_096;
 
 static LOKI_FLUSH_HANDLE: OnceLock<Mutex<Option<LokiFlushHandle>>> = OnceLock::new();
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
@@ -718,11 +719,21 @@ async fn flush_loki_batch(
     match send_loki_entries(sender, &entries).await {
         LokiPushResult::Delivered => {}
         LokiPushResult::Retryable(error) => {
-            eprintln!("loki logging: push failed; caching batch for retry: {error}");
+            let entry_count = entries.len();
             cache_loki_retry_batch(sender, retry_cache, entries, sender.retry_initial_interval);
+            eprintln!(
+                "loki logging: push failed; caching batch for retry \
+                 (batch_entries={entry_count}, retry_in_ms={}, cached_entries={}/{}): {error}",
+                sender.retry_initial_interval.as_millis(),
+                loki_cached_entry_count(retry_cache),
+                sender.retry_cache_capacity,
+            );
         }
         LokiPushResult::Permanent(error) => {
-            eprintln!("loki logging: dropping log batch: {error}");
+            eprintln!(
+                "loki logging: dropping log batch (batch_entries={}): {error}",
+                entries.len()
+            );
         }
     }
 }
@@ -751,19 +762,31 @@ async fn flush_loki_retry_cache(
                     .retry_delay
                     .saturating_mul(2)
                     .min(sender.retry_max_interval);
-                eprintln!("loki logging: retry failed; keeping batch cached: {error}");
+                let entry_count = batch.entries.len();
                 batch.retry_delay = next_delay;
                 batch.next_retry_at = tokio::time::Instant::now() + next_delay;
+                eprintln!(
+                    "loki logging: retry failed; keeping batch cached \
+                     (batch_entries={entry_count}, next_retry_in_ms={}): {error}",
+                    next_delay.as_millis(),
+                );
                 deferred.push_back(batch);
             }
             LokiPushResult::Permanent(error) => {
-                eprintln!("loki logging: dropping cached log batch: {error}");
+                eprintln!(
+                    "loki logging: dropping cached log batch (batch_entries={}): {error}",
+                    batch.entries.len()
+                );
             }
         }
     }
 
     *retry_cache = deferred;
     trim_loki_retry_cache(sender, retry_cache);
+}
+
+fn loki_cached_entry_count(retry_cache: &VecDeque<LokiBatch>) -> usize {
+    retry_cache.iter().map(|batch| batch.entries.len()).sum()
 }
 
 fn cache_loki_retry_batch(
@@ -825,6 +848,7 @@ async fn send_loki_entries(sender: &LokiSender, entries: &[LokiEntry]) -> LokiPu
             return LokiPushResult::Permanent(format!("failed to encode log batch: {error}"));
         }
     };
+    let payload_bytes = body.len();
 
     let mut request = sender
         .client
@@ -857,15 +881,99 @@ async fn send_loki_entries(sender: &LokiSender, entries: &[LokiEntry]) -> LokiPu
         Ok(response) if response.status().is_success() => LokiPushResult::Delivered,
         Ok(response) => {
             let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("not-provided")
+                .to_string();
             let text = response.text().await.unwrap_or_default();
-            let message = format!("HTTP {status}: {text}");
+            let message = format_loki_http_error(
+                &sender.push_url,
+                status,
+                &retry_after,
+                entries.len(),
+                payload_bytes,
+                &text,
+            );
             if status.is_server_error() || status.as_u16() == 429 {
                 LokiPushResult::Retryable(message)
             } else {
-                LokiPushResult::Permanent(format!("push failed with {message}"))
+                LokiPushResult::Permanent(message)
             }
         }
-        Err(error) => LokiPushResult::Retryable(error.to_string()),
+        Err(error) => LokiPushResult::Retryable(format_loki_transport_error(
+            &error,
+            entries.len(),
+            payload_bytes,
+        )),
+    }
+}
+
+fn format_loki_transport_error(
+    error: &reqwest::Error,
+    entry_count: usize,
+    payload_bytes: usize,
+) -> String {
+    let mut source_chain = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        source_chain.push(cause.to_string());
+        source = cause.source();
+    }
+
+    let source_chain = if source_chain.is_empty() {
+        "none".to_string()
+    } else {
+        source_chain.join(" -> ")
+    };
+    format!(
+        "transport error (batch_entries={entry_count}, payload_bytes={payload_bytes}, \
+         timeout={}, connect={}, request={}, body={}): {error}; source_chain={source_chain}",
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_request(),
+        error.is_body(),
+    )
+}
+
+fn format_loki_http_error(
+    push_url: &str,
+    status: reqwest::StatusCode,
+    retry_after: &str,
+    entry_count: usize,
+    payload_bytes: usize,
+    response_body: &str,
+) -> String {
+    let response_body = loki_response_body_for_log(response_body);
+    format!(
+        "HTTP push failed (endpoint={}, status={status}, retry_after={retry_after}, \
+         batch_entries={entry_count}, payload_bytes={payload_bytes}, response_body={response_body:?})",
+        loki_endpoint_for_log(push_url),
+    )
+}
+
+fn loki_endpoint_for_log(push_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(push_url) else {
+        return "invalid-configured-url".to_string();
+    };
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        return "invalid-configured-url".to_string();
+    }
+    format!("{origin}{}", url.path())
+}
+
+fn loki_response_body_for_log(response_body: &str) -> String {
+    let mut characters = response_body.chars();
+    let excerpt = characters
+        .by_ref()
+        .take(MAX_LOKI_RESPONSE_BODY_LOG_CHARS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        format!("{excerpt}… [truncated at {MAX_LOKI_RESPONSE_BODY_LOG_CHARS} characters]")
+    } else {
+        excerpt
     }
 }
 
@@ -1369,6 +1477,51 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(retained, vec!["3", "4", "5"]);
+    }
+
+    #[tokio::test]
+    async fn loki_connection_failure_includes_transport_diagnostics() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve a localhost port for a refused connection");
+        let address = listener
+            .local_addr()
+            .expect("reserved listener has a local address");
+        drop(listener);
+
+        let mut sender = test_loki_sender(1);
+        sender.push_url = format!("http://{address}/loki/api/v1/push");
+        let result = send_loki_entries(&sender, &[test_loki_entry("1")]).await;
+
+        let LokiPushResult::Retryable(diagnostics) = result else {
+            panic!("a refused connection must be retried");
+        };
+        assert!(diagnostics.contains("transport error (batch_entries=1, payload_bytes="));
+        assert!(diagnostics.contains("connect=true"));
+        assert!(diagnostics.contains("request=true"));
+        assert!(diagnostics.contains("source_chain="));
+        assert!(!diagnostics.ends_with("source_chain=none"));
+    }
+
+    #[test]
+    fn loki_http_failure_includes_actionable_safe_diagnostics() {
+        let diagnostics = format_loki_http_error(
+            "https://alice:secret@loki.example/loki/api/v1/push?api_key=top-secret",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "10",
+            2,
+            99,
+            "rate limit\ntry later",
+        );
+
+        assert!(diagnostics.contains("endpoint=https://loki.example/loki/api/v1/push"));
+        assert!(diagnostics.contains("status=429 Too Many Requests"));
+        assert!(diagnostics.contains("retry_after=10"));
+        assert!(diagnostics.contains("batch_entries=2"));
+        assert!(diagnostics.contains("payload_bytes=99"));
+        assert!(diagnostics.contains("response_body=\"rate limit\\ntry later\""));
+        assert!(!diagnostics.contains("alice"));
+        assert!(!diagnostics.contains("secret"));
+        assert!(!diagnostics.contains("api_key"));
     }
 
     #[test]
