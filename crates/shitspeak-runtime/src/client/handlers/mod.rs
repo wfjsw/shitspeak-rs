@@ -56,7 +56,7 @@ pub(super) const BAN_REPOSITORY_REQUEST_SUBMITTED: &str =
     "Ban list update submitted. Waiting for repository admission.";
 pub(super) const BAN_REPOSITORY_REQUEST_ADMITTED: &str = "Ban list update fully admitted.";
 pub(super) const BAN_REPOSITORY_REQUEST_REJECTED: &str =
-    "Ban list update was not admitted because strict repository recovery is unavailable.";
+    "Ban list update was not admitted by strict replication.";
 
 pub(super) async fn send_ban_repository_notice(
     sender: &Arc<Box<Client>>,
