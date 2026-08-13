@@ -605,21 +605,19 @@ pub async fn handle_authenticate(
                 "failed to stage user last channel cache"
             );
         }
-        if !staged.listening_channel_ids.is_empty() {
-            if let Err(error) = server
-                .get_user_channel_cache()
-                .remember_listening_channels(
-                    &staged.cache_key,
-                    staged.listening_channel_ids.iter().copied(),
-                )
-                .await
-            {
-                tracing::warn!(
-                    error = %error,
-                    cache_key = staged.cache_key,
-                    "failed to stage user listening channel cache"
-                );
-            }
+        if let Err(error) = server
+            .get_user_channel_cache()
+            .remember_listening_channels(
+                &staged.cache_key,
+                staged.listening_channel_ids.iter().copied(),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                cache_key = staged.cache_key,
+                "failed to stage user listening channel cache"
+            );
         }
     }
 

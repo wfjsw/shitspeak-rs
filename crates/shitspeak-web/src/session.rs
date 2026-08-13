@@ -416,21 +416,19 @@ async fn configure_authenticated_client_inner(
                 "failed to stage user last channel cache"
             );
         }
-        if !restored_channels.listening_channel_ids.is_empty() {
-            if let Err(error) = server
-                .get_user_channel_cache()
-                .remember_listening_channels(
-                    cache_key,
-                    restored_channels.listening_channel_ids.iter().copied(),
-                )
-                .await
-            {
-                tracing::warn!(
-                    error = %error,
-                    cache_key,
-                    "failed to stage user listening channel cache"
-                );
-            }
+        if let Err(error) = server
+            .get_user_channel_cache()
+            .remember_listening_channels(
+                cache_key,
+                restored_channels.listening_channel_ids.iter().copied(),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                cache_key,
+                "failed to stage user listening channel cache"
+            );
         }
     }
     client.complete_authentication(

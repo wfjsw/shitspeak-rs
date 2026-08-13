@@ -99,14 +99,17 @@ fn channel_root_config(config: &Config) -> ChannelRootConfig {
 }
 
 struct ClientRepositoryChannelObserver {
-    clients: Weak<ClientRepository>,
+    server: Weak<Box<Server>>,
 }
 
 #[async_trait::async_trait]
 impl ChannelRepositoryObserver for ClientRepositoryChannelObserver {
     async fn channel_version_advanced(&self, server_id: &str, channel_version: u64) {
-        if let Some(clients) = self.clients.upgrade() {
-            clients.drain_pending_ops(server_id, channel_version).await;
+        if let Some(server) = self.server.upgrade() {
+            server
+                .get_clients()
+                .drain_pending_ops(server_id, channel_version)
+                .await;
         }
     }
 
@@ -116,9 +119,10 @@ impl ChannelRepositoryObserver for ClientRepositoryChannelObserver {
         valid_channel_ids: &HashSet<u32>,
         channel_version: u64,
     ) -> usize {
-        let Some(clients) = self.clients.upgrade() else {
+        let Some(server) = self.server.upgrade() else {
             return 0;
         };
+        let clients = server.get_clients();
 
         let mut repaired = 0;
         for client in clients.get_local_clients_in_server(server_id).await {
@@ -132,16 +136,49 @@ impl ChannelRepositoryObserver for ClientRepositoryChannelObserver {
                 continue;
             }
 
-            let mut state = client.write_global_state_as(
-                &clients,
-                Some(client.get_session_id()),
-                Some(channel_version),
-            );
-            if missing_current {
-                state.set_current_channel_id(0);
-            }
-            for channel_id in missing_listeners {
-                state.unlisten_channel(channel_id);
+            let remaining_listener_ids = {
+                let mut state = client.write_global_state_as(
+                    &clients,
+                    Some(client.get_session_id()),
+                    Some(channel_version),
+                );
+                if missing_current {
+                    state.set_current_channel_id(0);
+                }
+                for channel_id in &missing_listeners {
+                    state.unlisten_channel(*channel_id);
+                }
+                (!missing_listeners.is_empty()).then(|| {
+                    state
+                        .get_listening_channel_id()
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+            };
+            if let Some(listener_ids) = remaining_listener_ids {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    let Some(cache_key) = crate::user_channel_cache::cache_key_for_client(
+                        server.as_ref(),
+                        client.as_ref(),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    if let Err(error) = server
+                        .get_user_channel_cache()
+                        .remember_listening_channels(&cache_key, listener_ids)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            cache_key,
+                            "failed to reconcile user listening channel cache after channel deletion"
+                        );
+                    }
+                });
             }
             repaired += 1;
         }
@@ -426,7 +463,7 @@ impl Server {
         server
             .channels
             .set_observer(Arc::new(ClientRepositoryChannelObserver {
-                clients: Arc::downgrade(&server.clients),
+                server: Arc::downgrade(&server),
             }));
 
         Ok(server)

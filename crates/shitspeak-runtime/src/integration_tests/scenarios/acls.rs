@@ -2856,6 +2856,67 @@ async fn cached_login_without_traverse_falls_back_to_default_channel() {
 }
 
 #[tokio::test]
+async fn cached_listener_without_listen_permission_is_not_restored() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let channels = server.server.get_channels();
+    channels
+        .create_channel(Channel::new(
+            79,
+            "Cached listener".to_owned(),
+            0,
+            0,
+            Some(0),
+        ))
+        .await
+        .unwrap();
+    channels
+        .set_acls(
+            79,
+            true,
+            vec![acl_for_group(
+                "all",
+                enumflags2::BitFlags::empty(),
+                ACLPermissions::Listen.into(),
+                false,
+            )],
+        )
+        .await
+        .unwrap();
+    server
+        .server
+        .get_user_channel_cache()
+        .remember_listening_channels("2", [79])
+        .await
+        .unwrap();
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let self_state = bob
+        .initial_user_states
+        .iter()
+        .find(|state| state.session == Some(bob.session_id))
+        .expect("Bob self state");
+    assert!(
+        !self_state.listening_channel_add.contains(&79),
+        "a cached listener without ACL Listen permission must not be restored"
+    );
+    assert!(
+        server
+            .server
+            .get_user_channel_cache()
+            .get("2")
+            .await
+            .is_none_or(|channels| channels.listening_channel_ids.is_empty()),
+        "the denied listener must be removed from the persisted cache"
+    );
+}
+
+#[tokio::test]
 async fn acl_cache_does_not_cross_reused_local_session_ids() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

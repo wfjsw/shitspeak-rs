@@ -831,6 +831,78 @@ async fn channel_delete_removes_listener_before_channel_once() {
 }
 
 #[tokio::test]
+async fn temporary_channel_delete_clears_listener_cache() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    let temp_channel_id = create_channel_and_wait(&alice, 0, "CachedTempListener", true).await;
+    wait_for_user_in_channel(&alice, alice.session_id, temp_channel_id).await;
+    alice.drain_now().await;
+    bob.send(
+        UserState {
+            session: Some(bob.server_session),
+            listening_channel_add: vec![temp_channel_id],
+            ..Default::default()
+        }
+        .into(),
+    )
+    .await;
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(bob.session_id)
+                        && state.listening_channel_add == vec![temp_channel_id])
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("alice sees bob listen to the temporary channel");
+
+    alice.move_to_channel(0).await;
+    alice
+        .recv_until(
+            |message| {
+                matches!(message, Message::ChannelRemove(remove)
+                    if remove.channel_id == temp_channel_id)
+            },
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("temporary channel is removed");
+
+    let cache = server.server.get_user_channel_cache();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if tokio::time::timeout(Duration::from_millis(100), cache.get("2"))
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|cached| cached.listening_channel_ids.is_empty())
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "deleting a temporary channel must remove it from the persisted listener cache"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
 async fn channel_dependency_gap_replays_missing_create_before_user_move() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
