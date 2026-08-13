@@ -2283,15 +2283,17 @@ impl Client {
         authenticated_until: Option<DateTime<Utc>>,
         authentication_expiry_action: AuthenticationExpiryAction,
     ) {
-        let mut local_state = self.local_state.write();
-        let state = local_state
-            .as_mut()
-            .expect("Accessing authentication expiry on remote user");
-        state.set_authentication_expiry(
-            auth_session_id,
-            authenticated_until,
-            authentication_expiry_action,
-        );
+        {
+            let mut local_state = self.local_state.write();
+            let state = local_state
+                .as_mut()
+                .expect("Accessing authentication expiry on remote user");
+            state.set_authentication_expiry(
+                auth_session_id,
+                authenticated_until,
+                authentication_expiry_action,
+            );
+        }
         self.record_tracing_span_authentication();
     }
 
@@ -2301,15 +2303,17 @@ impl Client {
         authenticated_until: Option<DateTime<Utc>>,
         authentication_expiry_action: AuthenticationExpiryAction,
     ) {
-        let mut local_state = self.local_state.write();
-        let state = local_state
-            .as_mut()
-            .expect("Completing authentication on remote user");
-        state.complete_authentication(
-            auth_session_id,
-            authenticated_until,
-            authentication_expiry_action,
-        );
+        {
+            let mut local_state = self.local_state.write();
+            let state = local_state
+                .as_mut()
+                .expect("Completing authentication on remote user");
+            state.complete_authentication(
+                auth_session_id,
+                authenticated_until,
+                authentication_expiry_action,
+            );
+        }
         self.record_tracing_span_authentication();
     }
 
@@ -2635,6 +2639,75 @@ fn transport_closed_error() -> std::io::Error {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::mpsc as std_mpsc;
+
+    fn local_test_client() -> Box<Client> {
+        let (outbound_tx, _outbound_rx) = mpsc::channel(1);
+        Client::new_web_gateway(
+            ClientSessionIdentifier::from(0x0002_0001),
+            Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            outbound_tx,
+        )
+    }
+
+    fn assert_authentication_update_completes(
+        update: impl FnOnce(&Client) + Send + 'static,
+    ) -> Box<Client> {
+        let client = local_test_client();
+        let (completed_tx, completed_rx) = std_mpsc::channel();
+        std::thread::spawn(move || {
+            update(&client);
+            completed_tx
+                .send(client)
+                .expect("test receiver should remain available");
+        });
+
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("authentication update must not deadlock on local state")
+    }
+
+    #[test]
+    fn authentication_state_updates_do_not_reacquire_local_state_lock() {
+        let renewed = assert_authentication_update_completes(|client| {
+            client.set_authentication_expiry(
+                Some("renewal-session".to_owned()),
+                Some(Utc::now()),
+                AuthenticationExpiryAction::Reauth,
+            );
+        });
+        let renewed_local_state = renewed.local_state.read();
+        let renewed_state = renewed_local_state.as_ref().expect("local client state");
+        assert!(!renewed_state.is_authenticated());
+        assert_eq!(renewed_state.auth_session_id(), Some("renewal-session"));
+        assert_eq!(
+            renewed_state.authentication_expiry_action(),
+            AuthenticationExpiryAction::Reauth
+        );
+
+        let authenticated = assert_authentication_update_completes(|client| {
+            client.complete_authentication(
+                Some("initial-session".to_owned()),
+                Some(Utc::now()),
+                AuthenticationExpiryAction::Kick,
+            );
+        });
+        let authenticated_local_state = authenticated.local_state.read();
+        let authenticated_state = authenticated_local_state
+            .as_ref()
+            .expect("local client state");
+        assert!(authenticated_state.is_authenticated());
+        assert_eq!(
+            authenticated_state.auth_session_id(),
+            Some("initial-session")
+        );
+        assert_eq!(
+            authenticated_state.authentication_expiry_action(),
+            AuthenticationExpiryAction::Kick
+        );
+    }
 
     #[test]
     fn real_ip_getter_unmaps_ipv4_mapped_ipv6_addresses() {
