@@ -243,7 +243,6 @@ pub fn init(
 
     if root.logging.loki.enabled() {
         let node_id = logging_node_id(&root.s2s);
-        let loki_metadata_filter = root.logging.loki.event_filter()?;
         let loki_event_filter = root.logging.loki.event_filter()?;
         let (loki_formatter, flush_handle) =
             LokiEventFormatter::spawn(root.logging.loki, service_name, node_id)?;
@@ -253,8 +252,8 @@ pub fn init(
             .fmt_fields(LokiFields::default())
             .event_format(loki_formatter);
         tracing_subscriber::registry()
+            .with(SpanFieldsLayer::default())
             .with(fmt_layer.with_filter(cli_filter))
-            .with(LokiMetadataLayer::default().with_filter(loki_metadata_filter))
             .with(loki_layer.with_filter(loki_event_filter))
             .init();
         set_global_loki_flush_handle(flush_handle.clone());
@@ -264,6 +263,7 @@ pub fn init(
         })
     } else {
         tracing_subscriber::registry()
+            .with(SpanFieldsLayer::default())
             .with(fmt_layer.with_filter(cli_filter))
             .init();
         Ok(LoggingGuard { flush_handle: None })
@@ -454,9 +454,9 @@ where
 }
 
 #[derive(Default)]
-struct LokiMetadataLayer;
+struct SpanFieldsLayer;
 
-impl<S> Layer<S> for LokiMetadataLayer
+impl<S> Layer<S> for SpanFieldsLayer
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
@@ -1662,7 +1662,7 @@ node_id = 1
                     .with_ansi(false),
             },
         };
-        let subscriber = tracing_subscriber::registry().with(LokiMetadataLayer).with(
+        let subscriber = tracing_subscriber::registry().with(SpanFieldsLayer).with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
                 .with_writer(NoopMakeWriter)
@@ -1769,7 +1769,7 @@ node_id = 1
                     .with_ansi(false),
             },
         };
-        let subscriber = tracing_subscriber::registry().with(LokiMetadataLayer).with(
+        let subscriber = tracing_subscriber::registry().with(SpanFieldsLayer).with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
                 .with_writer(NoopMakeWriter)
