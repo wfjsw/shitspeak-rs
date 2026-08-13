@@ -48,6 +48,7 @@ pub(super) fn c2s_cipher_suite_provides_pfs(suite: &rustls::SupportedCipherSuite
 pub(super) fn load_c2s_tls_config(
     config: &Config,
     extensions: &ServerExtensions,
+    bans: Arc<shitspeak_state::BanRepository>,
 ) -> Result<rustls::ServerConfig, Box<dyn std::error::Error>> {
     let certificate = CertificateDer::pem_file_iter(&config.cert_path)
         .map_err(|e| startup_file_error("cert_path", &config.cert_path, "read TLS certificate", e))?
@@ -58,7 +59,7 @@ pub(super) fn load_c2s_tls_config(
     let private_key = PrivateKeyDer::from_pem_file(&config.key_path)
         .map_err(|e| startup_file_error("key_path", &config.key_path, "read TLS private key", e))?;
 
-    let client_cert_verifier = Arc::new(ClientCertificateVerifier::new());
+    let client_cert_verifier = Arc::new(ClientCertificateVerifier::new(bans));
 
     let mut tls_config =
         rustls::ServerConfig::builder_with_provider(Arc::new(c2s_pfs_tls_provider()))
@@ -78,8 +79,9 @@ pub(super) fn load_c2s_tls_config(
 pub(super) fn load_c2s_tls_acceptor(
     config: &Config,
     extensions: &ServerExtensions,
+    bans: Arc<shitspeak_state::BanRepository>,
 ) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
-    let tls_config = load_c2s_tls_config(config, extensions)?;
+    let tls_config = load_c2s_tls_config(config, extensions, bans)?;
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }
 

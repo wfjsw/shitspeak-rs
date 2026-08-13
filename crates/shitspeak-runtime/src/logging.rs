@@ -13,10 +13,12 @@ use tokio::sync::mpsc;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber, span};
 use tracing_subscriber::Layer;
-use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::field::{MakeVisitor, RecordFields, VisitOutput};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::FmtContext;
-use tracing_subscriber::fmt::format::{DefaultFields, FormatEvent, FormatFields, Writer};
+use tracing_subscriber::fmt::format::{
+    DefaultFields, DefaultVisitor, FormatEvent, FormatFields, Writer,
+};
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
@@ -25,6 +27,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::http_client;
 use crate::types::NodeIdentifier;
 use shitspeak_runtime_config::S2sConfig;
+
+mod span_format;
+
+use span_format::ScopedSpanEventFormatter;
 
 const DEFAULT_LOKI_BATCH_SIZE: usize = 128;
 const DEFAULT_LOKI_FILTER_TARGET: &str = "shitspeak_rs";
@@ -228,7 +234,11 @@ pub fn init(
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
-        .with_line_number(true);
+        .with_line_number(true)
+        .fmt_fields(LokiFields::default())
+        .event_format(ScopedSpanEventFormatter {
+            inner: tracing_subscriber::fmt::format().with_line_number(true),
+        });
     let root = load_logging_config(config_path)?;
 
     if root.logging.loki.enabled() {
@@ -359,8 +369,9 @@ impl LokiCommand {
 
 struct LokiEventFormatter {
     tx: mpsc::Sender<LokiEntry>,
-    line_formatter:
+    line_formatter: ScopedSpanEventFormatter<
         tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full, ()>,
+    >,
 }
 
 impl LokiEventFormatter {
@@ -406,10 +417,12 @@ impl LokiEventFormatter {
         Ok((
             Self {
                 tx,
-                line_formatter: tracing_subscriber::fmt::format()
-                    .with_line_number(true)
-                    .without_time()
-                    .with_ansi(true),
+                line_formatter: ScopedSpanEventFormatter {
+                    inner: tracing_subscriber::fmt::format()
+                        .with_line_number(true)
+                        .without_time()
+                        .with_ansi(true),
+                },
             },
             LokiFlushHandle {
                 command_tx,
@@ -486,7 +499,81 @@ struct LokiFields {
 
 impl<'writer> FormatFields<'writer> for LokiFields {
     fn format_fields<R: RecordFields>(&self, writer: Writer<'writer>, fields: R) -> fmt::Result {
-        self.inner.format_fields(writer, fields)
+        let mut visitor = LokiFieldVisitor {
+            inner: self.inner.make_visitor(writer),
+        };
+        fields.record(&mut visitor);
+        visitor.inner.finish()
+    }
+}
+
+struct LokiFieldVisitor<'writer> {
+    inner: DefaultVisitor<'writer>,
+}
+
+impl LokiFieldVisitor<'_> {
+    fn display(field: &Field) -> bool {
+        !matches!(
+            field.name(),
+            "client_cert_hash"
+                | "client_tls_ja4"
+                | "client_connection_sni"
+                | "client_real_ip"
+                | "client_connection_remote_ip"
+                | "client_connection_remote_port"
+                | "client_connection_local_port"
+                | "client_node"
+                | "client_local_session_id"
+                | "client_auth_session_id"
+                | "client_user_id"
+                | "client_user_name"
+                | "client_fqdn"
+                | "virtual_server_id"
+        )
+    }
+}
+
+impl Visit for LokiFieldVisitor<'_> {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if Self::display(field) {
+            self.inner.record_bool(field, value);
+        }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        if Self::display(field) {
+            self.inner.record_i64(field, value);
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if Self::display(field) {
+            self.inner.record_u64(field, value);
+        }
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        if Self::display(field) {
+            self.inner.record_f64(field, value);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if Self::display(field) && !(field.name() == "fqdn" && value.is_empty()) {
+            self.inner.record_str(field, value);
+        }
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn Error + 'static)) {
+        if Self::display(field) {
+            self.inner.record_error(field, value);
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if Self::display(field) {
+            self.inner.record_debug(field, value);
+        }
     }
 }
 
@@ -549,8 +636,8 @@ where
     }
 }
 
-struct SpanFields {
-    fields: serde_json::Map<String, serde_json::Value>,
+pub(super) struct SpanFields {
+    pub(super) fields: serde_json::Map<String, serde_json::Value>,
 }
 
 struct EventVisitor {
@@ -1561,6 +1648,163 @@ node_id = 1
         assert_eq!(value[2]["client_ip"], "192.0.2.1");
         assert_eq!(value[2]["client_port"], "64738");
         assert_eq!(value[2]["session"], "42");
+    }
+
+    #[test]
+    fn loki_client_span_keeps_full_metadata_but_limits_displayed_identity() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let formatter = LokiEventFormatter {
+            tx,
+            line_formatter: ScopedSpanEventFormatter {
+                inner: tracing_subscriber::fmt::format()
+                    .with_line_number(true)
+                    .without_time()
+                    .with_ansi(false),
+            },
+        };
+        let subscriber = tracing_subscriber::registry().with(LokiMetadataLayer).with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(NoopMakeWriter)
+                .fmt_fields(LokiFields::default())
+                .event_format(formatter),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let server = tracing::info_span!("server", virtual_server_id = "provisional");
+            server.record("virtual_server_id", "tenant-alpha");
+            let _server_entered = server.enter();
+            let span = tracing::info_span!(
+                "client",
+                client_cert_hash = "certificate-hash",
+                client_tls_ja4 = "t13d1516h2_8daaf6152771_02713d6af862",
+                client_connection_sni = "voice.example.test",
+                client_real_ip = "203.0.113.8",
+                client_connection_remote_ip = "192.0.2.4",
+                client_connection_remote_port = 54_321_u16,
+                client_connection_local_port = 64_738_u16,
+                client_node = 7_u16,
+                client_local_session_id = 42_u32,
+                client_auth_session_id = tracing::field::Empty,
+                client_user_id = tracing::field::Empty,
+                client_user_name = tracing::field::Empty,
+                client_fqdn = tracing::field::Empty,
+            );
+            span.record("client_auth_session_id", "auth-session-123");
+            span.record("client_user_id", 99_u32);
+            span.record("client_user_name", "Alice");
+            span.record("client_fqdn", "alice@example.test");
+            let _entered = span.enter();
+            tracing::info!("client event");
+        });
+
+        let entry = rx.try_recv().expect("client event should be captured");
+        assert_eq!(
+            entry.metadata.get("virtual_server_id").map(String::as_str),
+            Some("tenant-alpha")
+        );
+        for (key, value) in [
+            ("client_cert_hash", "certificate-hash"),
+            ("client_tls_ja4", "t13d1516h2_8daaf6152771_02713d6af862"),
+            ("client_connection_sni", "voice.example.test"),
+            ("client_real_ip", "203.0.113.8"),
+            ("client_connection_remote_ip", "192.0.2.4"),
+            ("client_connection_remote_port", "54321"),
+            ("client_connection_local_port", "64738"),
+            ("client_node", "7"),
+            ("client_local_session_id", "42"),
+            ("client_auth_session_id", "auth-session-123"),
+            ("client_user_id", "99"),
+            ("client_user_name", "Alice"),
+            ("client_fqdn", "alice@example.test"),
+        ] {
+            assert_eq!(entry.metadata.get(key).map(String::as_str), Some(value));
+        }
+        for key in ["real_ip", "client_port", "node", "session", "fqdn", "id"] {
+            assert!(
+                !entry.metadata.contains_key(key),
+                "display field leaked into structured metadata: {key}"
+            );
+        }
+
+        assert!(
+            entry.line.contains(
+                "server{id=tenant-alpha} client{real_ip=203.0.113.8 client_port=54321 node=7 session=42 fqdn=alice@example.test}"
+            ),
+            "unexpected client scope: {}",
+            entry.line
+        );
+        for field in [
+            "client_cert_hash",
+            "client_tls_ja4",
+            "client_connection_sni",
+            "client_real_ip",
+            "client_connection_remote_ip",
+            "client_connection_remote_port",
+            "client_connection_local_port",
+            "client_node",
+            "client_local_session_id",
+            "client_auth_session_id",
+            "client_user_id",
+            "client_user_name",
+            "client_fqdn",
+        ] {
+            assert!(
+                !entry.line.contains(field),
+                "line unexpectedly includes {field}: {}",
+                entry.line
+            );
+        }
+    }
+
+    #[test]
+    fn loki_client_span_omits_an_unavailable_fqdn_from_the_line() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let formatter = LokiEventFormatter {
+            tx,
+            line_formatter: ScopedSpanEventFormatter {
+                inner: tracing_subscriber::fmt::format()
+                    .with_line_number(true)
+                    .without_time()
+                    .with_ansi(false),
+            },
+        };
+        let subscriber = tracing_subscriber::registry().with(LokiMetadataLayer).with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(NoopMakeWriter)
+                .fmt_fields(LokiFields::default())
+                .event_format(formatter),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "client",
+                client_real_ip = "203.0.113.8",
+                client_connection_remote_port = 54_321_u16,
+                client_connection_local_port = 64_738_u16,
+                client_node = 7_u16,
+                client_local_session_id = 42_u32,
+                client_fqdn = tracing::field::Empty,
+            );
+            span.record("client_fqdn", "");
+            let _entered = span.enter();
+            tracing::info!("client event");
+        });
+
+        let entry = rx.try_recv().expect("client event should be captured");
+        assert_eq!(
+            entry.metadata.get("client_fqdn").map(String::as_str),
+            Some("")
+        );
+        assert!(
+            entry
+                .line
+                .contains("client{real_ip=203.0.113.8 client_port=54321 node=7 session=42}"),
+            "{}",
+            entry.line
+        );
+        assert!(!entry.line.contains("fqdn"), "{}", entry.line);
     }
 
     #[test]

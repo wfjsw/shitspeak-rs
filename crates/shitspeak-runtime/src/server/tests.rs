@@ -608,8 +608,12 @@ fn c2s_tls_config_disables_session_resumption() {
     config.cert_path = cert_path;
     config.key_path = key_path;
 
-    let tls_config =
-        load_c2s_tls_config(&config, &ServerExtensions::default()).expect("C2S TLS config");
+    let tls_config = load_c2s_tls_config(
+        &config,
+        &ServerExtensions::default(),
+        shitspeak_state::BanRepository::new_in_memory(1),
+    )
+    .expect("C2S TLS config");
 
     assert!(!tls_config.session_storage.can_cache());
     assert_eq!(tls_config.send_tls13_tickets, 0);

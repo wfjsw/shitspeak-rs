@@ -5,7 +5,6 @@ pub struct ClientStats {
     udp_ping_avg: f32,
     udp_ping_var: f32,
     udp_packets: u32,
-    udp_total_packets: u64,
     udp_volume: u64,
     tcp_ping_avg: f32,
     tcp_ping_var: f32,
@@ -20,7 +19,6 @@ impl Default for ClientStats {
             udp_ping_avg: 0.0,
             udp_ping_var: 0.0,
             udp_packets: 0,
-            udp_total_packets: 0,
             udp_volume: 0,
             tcp_ping_avg: 0.0,
             tcp_ping_var: 0.0,
@@ -57,7 +55,6 @@ impl ClientStats {
         if bytes == 0 {
             return;
         }
-        self.udp_total_packets = self.udp_total_packets.saturating_add(1);
         self.udp_volume = self.udp_volume.saturating_add(bytes as u64);
     }
 
@@ -81,7 +78,6 @@ impl ClientStats {
     }
     pub fn udp_packets(&self) -> u32 {
         self.udp_packets
-            .max(self.udp_total_packets.min(u32::MAX as u64) as u32)
     }
     pub fn tcp_ping_avg(&self) -> f32 {
         self.tcp_ping_avg
@@ -91,5 +87,26 @@ impl ClientStats {
     }
     pub fn tcp_packets(&self) -> u32 {
         self.tcp_packets
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientStats;
+    use shitspeak_messages::messages::encoder::Ping;
+
+    #[test]
+    fn udp_ping_count_is_independent_of_server_observed_udp_traffic() {
+        let mut stats = ClientStats::default();
+        for _ in 0..8 {
+            stats.record_udp_packet(512);
+        }
+
+        stats.update_from_ping_message(&Ping {
+            udp_packets: Some(7),
+            ..Ping::default()
+        });
+
+        assert_eq!(stats.udp_packets(), 7);
     }
 }

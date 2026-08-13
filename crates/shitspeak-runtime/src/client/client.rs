@@ -407,15 +407,43 @@ pub(crate) enum RequestBlobQueueEnqueueError {
 
 fn client_tracing_span(
     session_id: ClientSessionIdentifier,
+    certificate_hash: Option<&str>,
+    tls_ja4: Option<&str>,
+    connection_sni: Option<&str>,
     real_ip_address: IpAddr,
     tcp_address: SocketAddr,
+    local_address: SocketAddr,
 ) -> tracing::Span {
-    tracing::info_span!(
+    let span = tracing::info_span!(
         "client",
-        client_ip = %real_ip_address,
-        client_port = tcp_address.port(),
-        session = u32::from(session_id),
-    )
+        client_cert_hash = tracing::field::Empty,
+        client_tls_ja4 = tracing::field::Empty,
+        client_connection_sni = tracing::field::Empty,
+        client_real_ip = %real_ip_address,
+        client_connection_remote_ip = %tcp_address.ip(),
+        client_connection_remote_port = tcp_address.port(),
+        client_connection_local_port = local_address.port(),
+        client_node = session_id.get_node_id(),
+        client_local_session_id = session_id.get_local_session_id(),
+        client_auth_session_id = tracing::field::Empty,
+        client_user_id = tracing::field::Empty,
+        client_user_name = tracing::field::Empty,
+        client_fqdn = tracing::field::Empty,
+    );
+    if let Some(certificate_hash) = certificate_hash {
+        span.record("client_cert_hash", certificate_hash);
+    }
+    if let Some(tls_ja4) = tls_ja4 {
+        span.record("client_tls_ja4", tls_ja4);
+    }
+    if let Some(connection_sni) = connection_sni {
+        span.record("client_connection_sni", connection_sni);
+    }
+    span
+}
+
+fn server_tracing_span(server_id: &str) -> tracing::Span {
+    tracing::info_span!("server", virtual_server_id = %server_id)
 }
 
 use crate::constants::PROTOBUF_INTRODUCED_VERSION;
@@ -445,6 +473,7 @@ pub struct Client {
     local_address: SocketAddr,
     tls_ja4: Option<String>,
     uses_proxy_protocol: bool,
+    server_tracing_span: tracing::Span,
     tracing_span: tracing::Span,
 
     transport: ClientTransport,
@@ -627,6 +656,7 @@ impl Client {
             let is_verified = !certificate_chain.is_empty();
             (certificate_hash, certificate_chain, is_verified)
         };
+        let connection_sni = connection.get_ref().1.server_name().map(ToOwned::to_owned);
 
         let now = Utc::now();
         let certificate_hash_hex = certificate_hash.as_deref().map(hex::encode);
@@ -643,18 +673,28 @@ impl Client {
         let (connection_rx, connection_tx) = tokio::io::split(connection);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
         let (removed_tx, removed_rx) = watch::channel(false);
+        let tracing_span = client_tracing_span(
+            session_id,
+            certificate_hash_hex.as_deref(),
+            tls_ja4.as_deref(),
+            connection_sni.as_deref(),
+            real_ip_address,
+            tcp_address,
+            local_address,
+        );
 
         Box::new(Client {
             session_id: ParkingRwLock::new(session_id),
             client_instance_id,
-            server_id: ParkingRwLock::new(server_id),
+            server_id: ParkingRwLock::new(server_id.clone()),
             real_ip_address,
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
             local_address,
             tls_ja4,
             uses_proxy_protocol,
-            tracing_span: client_tracing_span(session_id, real_ip_address, tcp_address),
+            server_tracing_span: server_tracing_span(&server_id),
+            tracing_span,
             transport: ClientTransport::NativeTls {
                 rx: AsyncMutex::new(connection_rx),
                 tx: AsyncMutex::new(connection_tx),
@@ -824,14 +864,23 @@ impl Client {
         Box::new(Client {
             session_id: ParkingRwLock::new(session_id),
             client_instance_id,
-            server_id: ParkingRwLock::new(server_id),
+            server_id: ParkingRwLock::new(server_id.clone()),
             real_ip_address,
             tcp_address,
             udp_address: ParkingRwLock::new(None),
             local_address,
             tls_ja4: None,
             uses_proxy_protocol: false,
-            tracing_span: client_tracing_span(session_id, real_ip_address, tcp_address),
+            server_tracing_span: server_tracing_span(&server_id),
+            tracing_span: client_tracing_span(
+                session_id,
+                None,
+                None,
+                None,
+                real_ip_address,
+                tcp_address,
+                local_address,
+            ),
             transport: ClientTransport::WebGateway { kind, outbound_tx },
             disconnect_tx,
             disconnect_rx,
@@ -917,14 +966,23 @@ impl Client {
         Box::new(Client {
             session_id: ParkingRwLock::new(session_id),
             client_instance_id,
-            server_id: ParkingRwLock::new(server_id),
+            server_id: ParkingRwLock::new(server_id.clone()),
             real_ip_address,
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
             local_address,
             tls_ja4: None,
             uses_proxy_protocol: false,
-            tracing_span: client_tracing_span(session_id, real_ip_address, tcp_address),
+            server_tracing_span: server_tracing_span(&server_id),
+            tracing_span: client_tracing_span(
+                session_id,
+                certificate_hash_hex.as_deref(),
+                None,
+                None,
+                real_ip_address,
+                tcp_address,
+                local_address,
+            ),
             transport: ClientTransport::Remote,
             disconnect_tx,
             disconnect_rx,
@@ -1203,11 +1261,15 @@ impl Client {
     }
 
     pub fn set_server_id(&self, server_id: String) {
+        self.server_tracing_span
+            .record("virtual_server_id", server_id.as_str());
         *self.server_id.write() = server_id;
         self.acl_permission_cache.clear_sync();
     }
 
     pub fn set_scoped_identity(&self, server_id: String, session_id: ClientSessionIdentifier) {
+        self.server_tracing_span
+            .record("virtual_server_id", server_id.as_str());
         *self.server_id.write() = server_id;
         *self.session_id.write() = session_id;
         self.acl_permission_cache.clear_sync();
@@ -1377,22 +1439,33 @@ impl Client {
         self.tracing_span.clone()
     }
 
+    pub(crate) fn server_tracing_span(&self) -> tracing::Span {
+        self.server_tracing_span.clone()
+    }
+
     pub async fn in_tracing_span<F, T>(&self, future: F) -> T
     where
         F: Future<Output = T>,
     {
         use tracing::Instrument as _;
 
-        future.instrument(self.tracing_span()).await
+        future
+            .instrument(self.tracing_span())
+            .instrument(self.server_tracing_span())
+            .await
     }
 
     pub fn in_tracing_scope<T>(&self, f: impl FnOnce() -> T) -> T {
-        self.tracing_span.in_scope(f)
+        self.server_tracing_span()
+            .in_scope(|| self.tracing_span.in_scope(f))
     }
 
     fn record_tracing_span_session(&self) {
+        let session_id = self.get_session_id();
         self.tracing_span
-            .record("session", u32::from(self.get_session_id()));
+            .record("client_node", session_id.get_node_id());
+        self.tracing_span
+            .record("client_local_session_id", session_id.get_local_session_id());
     }
 
     pub fn get_login_time(&self) -> DateTime<Utc> {
@@ -2219,6 +2292,7 @@ impl Client {
             authenticated_until,
             authentication_expiry_action,
         );
+        self.record_tracing_span_authentication();
     }
 
     pub fn complete_authentication(
@@ -2236,6 +2310,50 @@ impl Client {
             authenticated_until,
             authentication_expiry_action,
         );
+        self.record_tracing_span_authentication();
+    }
+
+    fn record_tracing_span_authentication(&self) {
+        let auth_session_id = self
+            .local_state
+            .read()
+            .as_ref()
+            .and_then(|state| state.auth_session_id())
+            .map(ToOwned::to_owned);
+        if let Some(auth_session_id) = auth_session_id {
+            self.tracing_span
+                .record("client_auth_session_id", auth_session_id.as_str());
+        } else {
+            self.tracing_span.record("client_auth_session_id", "");
+        }
+        self.record_tracing_span_identity();
+    }
+
+    pub(crate) fn record_tracing_span_identity(&self) {
+        let (user_id, user_name, fqdn) = {
+            let state = self.global_state.read();
+            (
+                state.get_user_id(),
+                state.get_display_name_opt().map(ToOwned::to_owned),
+                state.get_fqdn().map(ToOwned::to_owned),
+            )
+        };
+        if let Some(user_id) = user_id {
+            self.tracing_span.record("client_user_id", user_id);
+        } else {
+            self.tracing_span.record("client_user_id", "");
+        }
+        if let Some(user_name) = user_name {
+            self.tracing_span
+                .record("client_user_name", user_name.as_str());
+        } else {
+            self.tracing_span.record("client_user_name", "");
+        }
+        if let Some(fqdn) = fqdn {
+            self.tracing_span.record("client_fqdn", fqdn.as_str());
+        } else {
+            self.tracing_span.record("client_fqdn", "");
+        }
     }
 
     pub(crate) fn take_expired_authentication(

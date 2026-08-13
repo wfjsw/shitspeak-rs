@@ -108,48 +108,6 @@ pub async fn handle_authenticate(
         .into());
     }
 
-    // Banned IP (re-checked here: bans may have been added while this
-    // connection was in flight; the TCP path also rejects earlier).
-    if server.get_bans().is_banned(real_ip).await {
-        tracing::info!(
-            %real_ip,
-            session = u32::from(session),
-            "connection from banned IP rejected at authenticate"
-        );
-        return Err(MessageHandlerError::BannedConnection);
-    }
-    // Certificate hashes and TLS JA4 fingerprints use indexed,
-    // case-insensitive identity-ban lookup.
-    let certificate_hash = sender.get_certificate_hash().map(hex::encode);
-    let tls_ja4 = sender.tls_ja4().map(str::to_owned);
-    if server
-        .get_bans()
-        .is_identity_banned(certificate_hash.as_deref(), tls_ja4.as_deref())
-    {
-        tracing::info!(
-            session = u32::from(session),
-            "connection from banned certificate or TLS JA4 fingerprint rejected at authenticate"
-        );
-        return Err(MessageHandlerError::BannedConnection);
-    }
-    // An ASN is an explicit certificate-ban criterion only when the ban hash
-    // has the exact `AS<number>` form. Avoid GeoIP work for every other ban
-    // list, and deliberately ignore the ASN criterion when lookup fails.
-    if server.get_bans().has_active_asn_bans()
-        && server
-            .lookup_ip_geo_metadata(real_ip)
-            .await
-            .and_then(|metadata| metadata.asn())
-            .is_some_and(|asn| server.get_bans().is_asn_banned(asn))
-    {
-        tracing::info!(
-            %real_ip,
-            session = u32::from(session),
-            "connection from banned ASN rejected at authenticate"
-        );
-        return Err(MessageHandlerError::BannedConnection);
-    }
-
     // ── Authentication context ────────────────────────────────────────────
     let certificate_hash = sender.get_certificate_hash().map(Bytes::copy_from_slice);
     let mut session_id = sender.get_session_id();

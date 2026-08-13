@@ -2627,14 +2627,17 @@ pub(crate) async fn flush_voice_batch(
 /// are gone the weak upgrade fails, the loop exits, and the task cleans up.
 pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client>>) {
     let span = sender.tracing_span();
+    let server_span = sender.server_tracing_span();
     let mut rx = match sender.take_voice_routing_rx() {
         Some(rx) => rx,
         None => {
-            span.in_scope(|| {
-                tracing::error!(
-                    session = u32::from(sender.get_session_id()),
-                    "voice routing task already spawned"
-                );
+            server_span.in_scope(|| {
+                span.in_scope(|| {
+                    tracing::error!(
+                        session = u32::from(sender.get_session_id()),
+                        "voice routing task already spawned"
+                    );
+                });
             });
             return;
         }
@@ -2746,7 +2749,8 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
             }
             local_fanout_queue.close();
         }
-        .instrument(span),
+        .instrument(span)
+        .instrument(server_span),
     );
 }
 
@@ -2761,14 +2765,17 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
 /// client drop; on a failed upgrade or a write error, the task exits.
 pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
     let span = client.tracing_span();
+    let server_span = client.server_tracing_span();
     let mut rx = match client.take_voice_tcp_rx() {
         Some(rx) => rx,
         None => {
-            span.in_scope(|| {
-                tracing::warn!(
-                    session = u32::from(client.get_session_id()),
-                    "voice TCP send task already spawned"
-                );
+            server_span.in_scope(|| {
+                span.in_scope(|| {
+                    tracing::warn!(
+                        session = u32::from(client.get_session_id()),
+                        "voice TCP send task already spawned"
+                    );
+                });
             });
             return;
         }
@@ -2791,7 +2798,8 @@ pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
                 }
             }
         }
-        .instrument(span),
+        .instrument(span)
+        .instrument(server_span),
     );
 }
 

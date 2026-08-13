@@ -273,8 +273,6 @@ impl Server {
         validate_visibility_config(&config)?;
         validate_privacy_config(&config)?;
 
-        let tls_acceptor = load_c2s_tls_acceptor(&config, &extensions)?;
-
         let entrypoints = bind_entrypoints(&config).await?;
 
         // ── Channel repository & blob stores ─────────────────────────────
@@ -318,6 +316,8 @@ impl Server {
                 (ch_repo, ch_blobs, s_blobs, user_channel_cache, ban_repo)
             }
         };
+
+        let tls_acceptor = load_c2s_tls_acceptor(&config, &extensions, Arc::clone(&bans))?;
 
         let s2s_manager = Arc::new(S2SManager::initialize(&config));
         let geoip_config = config.geoip.clone();
@@ -521,7 +521,8 @@ impl Server {
         &self,
         new_config: &Config,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let tls_acceptor = load_c2s_tls_acceptor(new_config, &self.extensions)?;
+        let tls_acceptor =
+            load_c2s_tls_acceptor(new_config, &self.extensions, Arc::clone(&self.bans))?;
         self.replace_c2s_tls_acceptor(tls_acceptor);
         Ok(())
     }
@@ -1843,10 +1844,15 @@ impl Server {
             is_superuser,
         )
         .await;
-        let mut state = client.write_global_state(&self.clients);
-        state.set_user_id(None);
-        state.set_fqdn(None);
-        state.set_suppress(!current_permissions.contains(shitspeak_state::ACLPermissions::Speak));
+        {
+            let mut state = client.write_global_state(&self.clients);
+            state.set_user_id(None);
+            state.set_fqdn(None);
+            state.set_suppress(
+                !current_permissions.contains(shitspeak_state::ACLPermissions::Speak),
+            );
+        }
+        client.record_tracing_span_identity();
     }
 
     #[cfg(test)]
@@ -1973,7 +1979,8 @@ impl Server {
                 new_config.voice.dispatch().validate().map_err(|error| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
                 })?;
-                let next_tls_acceptor = load_c2s_tls_acceptor(&new_config, &self.extensions)?;
+                let next_tls_acceptor =
+                    load_c2s_tls_acceptor(&new_config, &self.extensions, Arc::clone(&self.bans))?;
                 let prepared_authenticator = self
                     .auth_finalization_queue
                     .prepare_authenticator_reload(&new_config)

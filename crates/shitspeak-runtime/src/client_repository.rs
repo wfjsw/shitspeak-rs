@@ -3235,6 +3235,7 @@ impl ClientRepository {
                         apply_delta_to_global_state(&mut gs, initial_state);
                         client.set_can_receive_voice(gs.can_receive_voice());
                     }
+                    client.record_tracing_span_identity();
                     let channel_id = client.get_current_channel_id();
                     let listener_channels = client.get_listening_channel_ids();
                     let added = register.clients.insert(scoped_id.clone(), client).is_none();
@@ -3303,9 +3304,12 @@ impl ClientRepository {
                                 register.listener_index_remove_channel(&scoped_id, ch);
                             }
                         }
-                        let mut gs = client.write_global_state_direct();
-                        apply_delta_to_global_state(&mut gs, delta);
-                        client.set_can_receive_voice(gs.can_receive_voice());
+                        {
+                            let mut gs = client.write_global_state_direct();
+                            apply_delta_to_global_state(&mut gs, delta);
+                            client.set_can_receive_voice(gs.can_receive_voice());
+                        }
+                        client.record_tracing_span_identity();
                     } else {
                         tracing::trace!(
                             remote_node,

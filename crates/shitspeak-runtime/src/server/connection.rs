@@ -664,14 +664,17 @@ fn spawn_native_client_writer_task(
     client: &Arc<Box<Client>>,
 ) -> Option<tokio::task::JoinHandle<Result<(), WriteProtoMessageError>>> {
     let span = client.tracing_span();
+    let server_span = client.server_tracing_span();
     let mut rx = match client.take_outbound_message_rx() {
         Some(rx) => rx,
         None => {
-            span.in_scope(|| {
-                tracing::warn!(
-                    session = u32::from(client.get_session_id()),
-                    "native client writer task already spawned"
-                );
+            server_span.in_scope(|| {
+                span.in_scope(|| {
+                    tracing::warn!(
+                        session = u32::from(client.get_session_id()),
+                        "native client writer task already spawned"
+                    );
+                });
             });
             return None;
         }
@@ -679,11 +682,13 @@ fn spawn_native_client_writer_task(
     let mut voice_rx = match client.take_voice_tcp_rx() {
         Some(rx) => rx,
         None => {
-            span.in_scope(|| {
-                tracing::warn!(
-                    session = u32::from(client.get_session_id()),
-                    "native client voice TCP queue already claimed"
-                );
+            server_span.in_scope(|| {
+                span.in_scope(|| {
+                    tracing::warn!(
+                        session = u32::from(client.get_session_id()),
+                        "native client voice TCP queue already claimed"
+                    );
+                });
             });
             return None;
         }
@@ -733,7 +738,8 @@ fn spawn_native_client_writer_task(
             }
             Ok(())
         }
-        .instrument(span),
+        .instrument(span)
+        .instrument(server_span),
     ))
 }
 
@@ -880,13 +886,28 @@ impl Server {
 
         // ── Banned IP check ───────────────────────────────────────────────
         // Reject banned sources before spending resources on a TLS handshake.
-        // (Re-checked after TLS in the Authenticate handler so bans added
-        // while a connection is in flight also take effect.)
         if self.get_bans().is_banned(real_ip).await {
             tracing::info!(
                 %remote_addr,
                 %real_ip,
                 "connection from banned IP closed before TLS handshake"
+            );
+            return Ok(());
+        }
+        // ASN bans are derived from the effective source IP, so enforce them
+        // alongside IP bans before consuming TLS-handshake resources. Avoid
+        // GeoIP work entirely unless an active ASN criterion exists.
+        if self.get_bans().has_active_asn_bans()
+            && self
+                .lookup_ip_geo_metadata(real_ip)
+                .await
+                .and_then(|metadata| metadata.asn())
+                .is_some_and(|asn| self.get_bans().is_asn_banned(asn))
+        {
+            tracing::info!(
+                %remote_addr,
+                %real_ip,
+                "connection from banned ASN closed before TLS handshake"
             );
             return Ok(());
         }
@@ -911,6 +932,19 @@ impl Server {
         .map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out")
         })??;
+        // Certificate hashes are rejected by the Rustls verifier during the
+        // handshake. The JA4 fingerprint is available once ClientHello
+        // capture completes, so reject that identity criterion before the
+        // stream is routed or a native client is allocated.
+        if self.get_bans().is_identity_banned(None, Some(&tls_ja4)) {
+            tracing::info!(
+                %remote_addr,
+                %real_ip,
+                tls_ja4,
+                "connection from banned TLS JA4 fingerprint closed after TLS handshake"
+            );
+            return Ok(());
+        }
         let server_id = self.resolve_tls_server_id(&provisional_server_id, local_addr, &tls_stream);
         tracing::info!(
             %remote_addr,
@@ -1035,6 +1069,7 @@ impl Server {
             .await;
 
         let client_span = client.tracing_span();
+        let server_span = client.server_tracing_span();
 
         // Projection ownership moves to one stable shard after authentication.
         // Keeping this handle connection-local makes unregister automatic on
@@ -1253,6 +1288,7 @@ impl Server {
             }
         }
         .instrument(client_span.clone())
+        .instrument(server_span.clone())
         .await;
 
         // Stop shard projection before repository removal. This also covers a
@@ -1284,6 +1320,7 @@ impl Server {
             .await;
         }
         .instrument(client_span.clone())
+        .instrument(server_span)
         .await;
         if let Err(error) = &result {
             client.in_tracing_scope(|| {

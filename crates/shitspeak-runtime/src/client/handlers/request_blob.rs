@@ -60,22 +60,27 @@ pub async fn spawn_request_blob_task(server: Arc<Box<Server>>, sender: Arc<Box<C
         .await;
     let limit = request_blob_queue_capacity(server.get_max_users(), channel_count);
     let span = sender.tracing_span();
+    let server_span = sender.server_tracing_span();
     if !sender.install_request_blob_queue(limit) {
-        span.in_scope(|| {
-            tracing::error!(
-                session = u32::from(sender.get_session_id()),
-                "RequestBlob queue already installed"
-            );
+        server_span.in_scope(|| {
+            span.in_scope(|| {
+                tracing::error!(
+                    session = u32::from(sender.get_session_id()),
+                    "RequestBlob queue already installed"
+                );
+            });
         });
         sender.request_disconnect();
         return;
     }
     let Some(changed) = sender.request_blob_queue_notifier() else {
-        span.in_scope(|| {
-            tracing::error!(
-                session = u32::from(sender.get_session_id()),
-                "RequestBlob queue notifier missing after installation"
-            );
+        server_span.in_scope(|| {
+            span.in_scope(|| {
+                tracing::error!(
+                    session = u32::from(sender.get_session_id()),
+                    "RequestBlob queue notifier missing after installation"
+                );
+            });
         });
         sender.request_disconnect();
         return;
@@ -128,7 +133,8 @@ pub async fn spawn_request_blob_task(server: Arc<Box<Server>>, sender: Arc<Box<C
                 }
             }
         }
-        .instrument(span),
+        .instrument(span)
+        .instrument(server_span),
     );
 }
 

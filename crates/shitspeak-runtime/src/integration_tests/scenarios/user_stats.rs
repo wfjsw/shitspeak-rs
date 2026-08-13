@@ -331,6 +331,7 @@ async fn user_stats_reports_udp_network_statistics() {
                 late: 2,
                 lost: 3,
                 resync: 4,
+                udp_packets: Some(0),
                 ..Ping::default()
             }
             .into(),
@@ -384,9 +385,10 @@ async fn user_stats_reports_udp_network_statistics() {
     assert_eq!(from_server.late, Some(2));
     assert_eq!(from_server.lost, Some(3));
     assert_eq!(from_server.resync, Some(4));
-    assert!(
-        stats.udp_packets.unwrap_or_default() >= 1,
-        "UserStats UDP packet count should include observed encrypted UDP traffic"
+    assert_eq!(
+        stats.udp_packets,
+        Some(0),
+        "UserStats UDP ping count should match the client's Ping counter, not encrypted UDP packet statistics"
     );
 }
 
