@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use shitspeak_core::ProtocolVersion;
+use shitspeak_core::{DEFAULT_SERVER_ID, ProtocolVersion};
 
 use crate::Language;
 
@@ -16,6 +16,18 @@ pub fn canonical_authenticator_ip(ip_address: IpAddr) -> IpAddr {
             .map(IpAddr::V4)
             .unwrap_or(IpAddr::V6(ipv6)),
     }
+}
+
+/// Preserve an absent virtual-server selection while ensuring an explicitly
+/// empty selection cannot create an invalid server scope.
+pub fn normalize_virtual_server_id(server_id: Option<String>) -> Option<String> {
+    server_id.map(|server_id| {
+        if server_id.trim().is_empty() {
+            DEFAULT_SERVER_ID.to_owned()
+        } else {
+            server_id
+        }
+    })
 }
 
 #[derive(Debug)]

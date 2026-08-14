@@ -766,12 +766,13 @@ impl UserChannelCacheEntry {
 }
 
 pub fn user_channel_cache_key(
+    server_id: &str,
     fqdn: Option<&str>,
     user_id: Option<u32>,
     certificate_hash: Option<&[u8]>,
     username: Option<&str>,
 ) -> Option<String> {
-    match fqdn.filter(|fqdn| !fqdn.is_empty()) {
+    let identity = match fqdn.filter(|fqdn| !fqdn.is_empty()) {
         Some(fqdn) => Some(fqdn.to_owned()),
         None => match user_id {
             Some(user_id) => Some(user_id.to_string()),
@@ -784,7 +785,12 @@ pub fn user_channel_cache_key(
                         .map(|username| format!("{username}@username.local"))
                 }),
         },
-    }
+    }?;
+
+    // Server IDs and identity values are both externally supplied strings.
+    // Prefix the server-id length to make this namespace unambiguous without
+    // restricting either value's contents.
+    Some(format!("v1:{}:{server_id}{identity}", server_id.len()))
 }
 
 pub async fn cache_key_for_client(server: &Server, client: &Client) -> Option<String> {
@@ -801,9 +807,13 @@ pub async fn cache_key_for_client(server: &Server, client: &Client) -> Option<St
     let fqdn = client.get_fqdn();
     let user_id = client.get_user_id();
     let certificate_hash = client.get_certificate_hash();
-    if let Some(cache_key) =
-        user_channel_cache_key(fqdn.as_deref(), user_id, certificate_hash, None)
-    {
+    if let Some(cache_key) = user_channel_cache_key(
+        &client.server_id(),
+        fqdn.as_deref(),
+        user_id,
+        certificate_hash,
+        None,
+    ) {
         return Some(cache_key);
     }
     if is_remote {
@@ -817,7 +827,13 @@ pub async fn cache_key_for_client(server: &Server, client: &Client) -> Option<St
             .as_ref()
             .map(|credential| credential.username.clone())
     };
-    user_channel_cache_key(None, None, certificate_hash, username.as_deref())
+    user_channel_cache_key(
+        &client.server_id(),
+        None,
+        None,
+        certificate_hash,
+        username.as_deref(),
+    )
 }
 
 /// Listen to replicated client state after it has been materialized locally
@@ -1210,28 +1226,87 @@ mod tests {
 
     #[test]
     fn cache_key_prefers_fqdn_then_user_id_then_certificate_then_username() {
+        let fqdn_key = user_channel_cache_key(
+            "default",
+            Some("alice.example.test"),
+            Some(42),
+            Some(b"certificate"),
+            Some("alice"),
+        );
         assert_eq!(
+            fqdn_key,
             user_channel_cache_key(
+                "default",
                 Some("alice.example.test"),
-                Some(42),
-                Some(b"certificate"),
-                Some("alice"),
-            ),
-            Some("alice.example.test".to_owned())
+                Some(99),
+                Some(b"different-certificate"),
+                Some("bob"),
+            )
+        );
+
+        let user_id_key = user_channel_cache_key(
+            "default",
+            Some(""),
+            Some(42),
+            Some(b"certificate"),
+            Some("alice"),
+        );
+        assert_ne!(fqdn_key, user_id_key);
+
+        let certificate_key =
+            user_channel_cache_key("default", None, None, Some(b"certificate"), Some("alice"));
+        assert_ne!(user_id_key, certificate_key);
+
+        let username_key = user_channel_cache_key("default", None, None, None, Some("alice"));
+        assert_ne!(certificate_key, username_key);
+        assert_eq!(
+            user_channel_cache_key("default", None, None, None, None),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_isolates_same_identity_and_overlapping_channel_ids_by_virtual_server() {
+        let cache = UserChannelCache::new_in_memory();
+        let identity = Some("alice.example.test");
+        let first_server_key = user_channel_cache_key("first", identity, None, None, None)
+            .expect("identity should produce a cache key");
+        let second_server_key = user_channel_cache_key("second", identity, None, None, None)
+            .expect("identity should produce a cache key");
+
+        assert_ne!(first_server_key, second_server_key);
+
+        cache
+            .remember_last_channel(&first_server_key, 5)
+            .await
+            .unwrap();
+        cache
+            .remember_listening_channels(&first_server_key, [3, 5])
+            .await
+            .unwrap();
+        cache
+            .remember_last_channel(&second_server_key, 5)
+            .await
+            .unwrap();
+        cache
+            .remember_listening_channels(&second_server_key, [5, 9])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache.get(&first_server_key).await,
+            Some(CachedUserChannels {
+                last_channel_id: Some(5),
+                listening_channel_ids: vec![3, 5],
+            })
         );
         assert_eq!(
-            user_channel_cache_key(Some(""), Some(42), Some(b"certificate"), Some("alice")),
-            Some("42".to_owned())
+            cache.get(&second_server_key).await,
+            Some(CachedUserChannels {
+                last_channel_id: Some(5),
+                listening_channel_ids: vec![5, 9],
+            })
         );
-        assert_eq!(
-            user_channel_cache_key(None, None, Some(b"certificate"), Some("alice")),
-            Some("6365727469666963617465@cert.local".to_owned())
-        );
-        assert_eq!(
-            user_channel_cache_key(None, None, None, Some("alice")),
-            Some("alice@username.local".to_owned())
-        );
-        assert_eq!(user_channel_cache_key(None, None, None, None), None);
     }
 
     #[test]

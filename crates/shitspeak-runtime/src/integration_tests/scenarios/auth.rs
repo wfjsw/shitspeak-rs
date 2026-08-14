@@ -1038,6 +1038,76 @@ async fn auth_selected_server_id_absent_from_config_scopes_client() {
 }
 
 #[tokio::test]
+async fn blank_auth_selected_server_id_defaults_to_default_server() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server.authenticator.register_user_in_server(
+        "alice",
+        None,
+        Some(1),
+        vec![],
+        Language::default(),
+        Some(""),
+    );
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+
+    assert_eq!(server.server.get_clients().local_len().await, 1);
+    assert_eq!(
+        server
+            .server
+            .get_clients()
+            .local_len_in_server(crate::types::DEFAULT_SERVER_ID)
+            .await,
+        1
+    );
+    assert!(
+        server
+            .server
+            .get_clients()
+            .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn whitespace_auth_selected_server_id_defaults_to_default_server() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server.authenticator.register_user_in_server(
+        "alice",
+        None,
+        Some(1),
+        vec![],
+        Language::default(),
+        Some(" \t\n "),
+    );
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+
+    assert_eq!(server.server.get_clients().local_len().await, 1);
+    assert_eq!(
+        server
+            .server
+            .get_clients()
+            .local_len_in_server(crate::types::DEFAULT_SERVER_ID)
+            .await,
+        1
+    );
+    assert!(
+        server
+            .server
+            .get_clients()
+            .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn context_action_modify_from_client_closes_connection() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server

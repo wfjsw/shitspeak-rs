@@ -1659,11 +1659,14 @@ impl Server {
         .await;
         drop(permit);
 
-        let Ok(Ok(result)) = result else {
+        let Ok(Ok(mut result)) = result else {
             self.disconnect_local_client(&client, "reauthentication rejected")
                 .await;
             return;
         };
+
+        result.virtual_server_id =
+            shitspeak_auth::normalize_virtual_server_id(result.virtual_server_id);
 
         if !self.client_instance_is_current(&client).await {
             return;

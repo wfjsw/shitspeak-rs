@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::types::DEFAULT_SERVER_ID;
 use crate::{
     channel_handler::{
         ChannelTreeShadow, SessionChannelShadow, build_visible_ordered_channel_snapshot_messages,
@@ -17,6 +18,7 @@ use crate::{
 };
 use shitspeak_auth::{
     AuthenticateAuxiliaryData, AuthenticationRejection, Authenticator, canonical_authenticator_ip,
+    normalize_virtual_server_id,
 };
 
 const AUTH_FINALIZATION_YIELD_EVERY: usize = 64;
@@ -184,7 +186,7 @@ pub async fn handle_authenticate(
         .authenticate(&username, password.as_deref(), &auth_auxiliary)
         .await;
 
-    let result = match auth_result {
+    let mut result = match auth_result {
         Ok(r) => r,
         Err(AuthenticationRejection::NoSuchUser) => {
             return Err(AuthRejection::new_with_language(
@@ -216,18 +218,12 @@ pub async fn handle_authenticate(
         .into());
     }
 
+    result.virtual_server_id = normalize_virtual_server_id(result.virtual_server_id);
+
     let auth_session_id = result.auth_session_id.clone();
     let authenticated_until = result.authenticated_until;
     let authentication_expiry_action = result.authentication_expiry_action;
     sender.set_language(result.language);
-    let channel_cache_key = crate::user_channel_cache::user_channel_cache_key(
-        result.fqdn.as_deref(),
-        result.user_id,
-        auth_auxiliary.certificate_hash.as_deref(),
-        Some(username.as_str()),
-    );
-    let legacy_channel_cache_key = result.user_id.map(|user_id| user_id.to_string());
-
     if let Some(auth_server_id) = result.virtual_server_id.clone() {
         if auth_server_id != provisional_server_id {
             let Some(new_session) = repo
@@ -245,6 +241,19 @@ pub async fn handle_authenticate(
         }
     }
     let server_id = sender.server_id();
+    let channel_cache_key = crate::user_channel_cache::user_channel_cache_key(
+        &server_id,
+        result.fqdn.as_deref(),
+        result.user_id,
+        auth_auxiliary.certificate_hash.as_deref(),
+        Some(username.as_str()),
+    );
+    // Older releases used an unscoped numeric user-id key. Only migrate that
+    // data into the default scope; assigning it to another tenant would
+    // reproduce the cross-tenant cache leak this namespace prevents.
+    let legacy_channel_cache_key = (server_id == DEFAULT_SERVER_ID)
+        .then(|| result.user_id.map(|user_id| user_id.to_string()))
+        .flatten();
 
     // Avoid identity/ACL finalization work when the selected server is
     // already full. The reservation CAS below remains the race-safe check.

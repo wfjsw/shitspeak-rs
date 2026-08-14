@@ -10,7 +10,7 @@ use crate::protocol::{
 };
 use shitspeak_auth::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
-    canonical_authenticator_ip,
+    canonical_authenticator_ip, normalize_virtual_server_id,
 };
 use shitspeak_runtime::channel_handler::{ChannelTreeShadow, SessionChannelShadow};
 use shitspeak_runtime::client::user_info::Credential;
@@ -19,6 +19,7 @@ use shitspeak_runtime::client::{AsyncMessageHandlerExt, Client};
 use shitspeak_runtime::messages::Message;
 use shitspeak_runtime::messages::encoder::{CodecVersion, ServerConfig, ServerSync};
 use shitspeak_runtime::server::Server;
+use shitspeak_runtime::types::DEFAULT_SERVER_ID;
 use shitspeak_runtime_config::{WebAuthMode, WebConfig};
 
 #[derive(Clone)]
@@ -132,11 +133,12 @@ impl WebSessionContext {
 
     pub async fn allocate_authenticated_client(
         &self,
-        result: AuthenticateResult,
+        mut result: AuthenticateResult,
         outbound_tx: mpsc::Sender<Message>,
         transport: WebSessionTransport,
         credential: Option<Credential>,
     ) -> Option<(Arc<Box<Server>>, Arc<Box<Client>>, u32, Option<String>)> {
+        result.virtual_server_id = normalize_virtual_server_id(result.virtual_server_id);
         let server = Arc::clone(self.server.as_ref()?);
         let client = match transport {
             WebSessionTransport::WebRtc => {
@@ -268,19 +270,13 @@ pub async fn configure_authenticated_client(
 async fn configure_authenticated_client_inner(
     server: &Arc<Box<Server>>,
     client: &Arc<Box<Client>>,
-    result: AuthenticateResult,
+    mut result: AuthenticateResult,
     credential: Option<Credential>,
 ) -> Result<(), ConfigureAuthenticatedClientError> {
     let cache_username = credential
         .as_ref()
         .map(|credential| credential.username.clone());
-    let channel_cache_key = shitspeak_runtime::user_channel_cache::user_channel_cache_key(
-        result.fqdn.as_deref(),
-        result.user_id,
-        client.get_certificate_hash(),
-        cache_username.as_deref(),
-    );
-    let legacy_channel_cache_key = result.user_id.map(|user_id| user_id.to_string());
+    result.virtual_server_id = normalize_virtual_server_id(result.virtual_server_id);
     let auth_session_id = result.auth_session_id.clone();
     let authenticated_until = result.authenticated_until;
     let authentication_expiry_action = result.authentication_expiry_action;
@@ -309,6 +305,16 @@ async fn configure_authenticated_client_inner(
         }
     }
     let server_id = client.server_id();
+    let channel_cache_key = shitspeak_runtime::user_channel_cache::user_channel_cache_key(
+        &server_id,
+        result.fqdn.as_deref(),
+        result.user_id,
+        client.get_certificate_hash(),
+        cache_username.as_deref(),
+    );
+    let legacy_channel_cache_key = (server_id == DEFAULT_SERVER_ID)
+        .then(|| result.user_id.map(|user_id| user_id.to_string()))
+        .flatten();
     if server
         .get_clients()
         .authenticated_client_count_in_server(&server_id)
