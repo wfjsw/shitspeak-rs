@@ -313,7 +313,14 @@ async fn configure_authenticated_client_inner(
         cache_username.as_deref(),
     );
     let legacy_channel_cache_key = (server_id == DEFAULT_SERVER_ID)
-        .then(|| result.user_id.map(|user_id| user_id.to_string()))
+        .then(|| {
+            shitspeak_runtime::user_channel_cache::legacy_user_channel_cache_key(
+                result.fqdn.as_deref(),
+                result.user_id,
+                client.get_certificate_hash(),
+                cache_username.as_deref(),
+            )
+        })
         .flatten();
     if server
         .get_clients()

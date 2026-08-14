@@ -772,7 +772,23 @@ pub fn user_channel_cache_key(
     certificate_hash: Option<&[u8]>,
     username: Option<&str>,
 ) -> Option<String> {
-    let identity = match fqdn.filter(|fqdn| !fqdn.is_empty()) {
+    let identity = legacy_user_channel_cache_key(fqdn, user_id, certificate_hash, username)?;
+
+    // Server IDs and identity values are both externally supplied strings.
+    // Prefix the server-id length to make this namespace unambiguous without
+    // restricting either value's contents.
+    Some(format!("v1:{}:{server_id}{identity}", server_id.len()))
+}
+
+/// Return the unscoped identity key used before virtual-server cache
+/// isolation. Use only to migrate records into the default server scope.
+pub fn legacy_user_channel_cache_key(
+    fqdn: Option<&str>,
+    user_id: Option<u32>,
+    certificate_hash: Option<&[u8]>,
+    username: Option<&str>,
+) -> Option<String> {
+    match fqdn.filter(|fqdn| !fqdn.is_empty()) {
         Some(fqdn) => Some(fqdn.to_owned()),
         None => match user_id {
             Some(user_id) => Some(user_id.to_string()),
@@ -785,12 +801,7 @@ pub fn user_channel_cache_key(
                         .map(|username| format!("{username}@username.local"))
                 }),
         },
-    }?;
-
-    // Server IDs and identity values are both externally supplied strings.
-    // Prefix the server-id length to make this namespace unambiguous without
-    // restricting either value's contents.
-    Some(format!("v1:{}:{server_id}{identity}", server_id.len()))
+    }
 }
 
 pub async fn cache_key_for_client(server: &Server, client: &Client) -> Option<String> {
@@ -1307,6 +1318,42 @@ mod tests {
                 listening_channel_ids: vec![5, 9],
             })
         );
+    }
+
+    #[tokio::test]
+    async fn default_scope_migrates_the_previous_unscoped_identity_key() {
+        let cache = UserChannelCache::new_in_memory();
+        let legacy_key = legacy_user_channel_cache_key(
+            Some("alice.example.test"),
+            Some(42),
+            Some(b"certificate"),
+            Some("alice"),
+        )
+        .expect("identity should produce a legacy cache key");
+        let default_key = user_channel_cache_key(
+            "default",
+            Some("alice.example.test"),
+            Some(42),
+            Some(b"certificate"),
+            Some("alice"),
+        )
+        .expect("identity should produce a scoped cache key");
+
+        cache.remember_last_channel(&legacy_key, 12).await.unwrap();
+        cache
+            .remember_listening_channels(&legacy_key, [7, 12])
+            .await
+            .unwrap();
+        cache.migrate_key(&legacy_key, &default_key).await.unwrap();
+
+        assert_eq!(
+            cache.get(&default_key).await,
+            Some(CachedUserChannels {
+                last_channel_id: Some(12),
+                listening_channel_ids: vec![7, 12],
+            })
+        );
+        assert_eq!(cache.get(&legacy_key).await, None);
     }
 
     #[test]

@@ -248,11 +248,18 @@ pub async fn handle_authenticate(
         auth_auxiliary.certificate_hash.as_deref(),
         Some(username.as_str()),
     );
-    // Older releases used an unscoped numeric user-id key. Only migrate that
-    // data into the default scope; assigning it to another tenant would
-    // reproduce the cross-tenant cache leak this namespace prevents.
+    // Older releases used an unscoped identity key. Only migrate that data
+    // into the default scope; assigning it to another tenant would reproduce
+    // the cross-tenant cache leak this namespace prevents.
     let legacy_channel_cache_key = (server_id == DEFAULT_SERVER_ID)
-        .then(|| result.user_id.map(|user_id| user_id.to_string()))
+        .then(|| {
+            crate::user_channel_cache::legacy_user_channel_cache_key(
+                result.fqdn.as_deref(),
+                result.user_id,
+                auth_auxiliary.certificate_hash.as_deref(),
+                Some(username.as_str()),
+            )
+        })
         .flatten();
 
     // Avoid identity/ACL finalization work when the selected server is
