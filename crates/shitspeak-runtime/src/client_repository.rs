@@ -882,6 +882,33 @@ impl ClientRepository {
         uses_proxy_protocol: bool,
     ) -> Arc<Box<Client>> {
         let server_id = server_id.into();
+        let server_tracing_span = tracing::info_span!("server", virtual_server_id = %server_id);
+        self.allocate_local_client_in_server_with_tracing_span(
+            server_id,
+            real_ip_address,
+            tcp_address,
+            udp_address,
+            local_address,
+            connection,
+            tls_ja4,
+            uses_proxy_protocol,
+            server_tracing_span,
+        )
+        .await
+    }
+
+    pub(crate) async fn allocate_local_client_in_server_with_tracing_span(
+        &self,
+        server_id: String,
+        real_ip_address: IpAddr,
+        tcp_address: SocketAddr,
+        udp_address: Option<SocketAddr>,
+        local_address: SocketAddr,
+        connection: TlsStream<TcpStream>,
+        tls_ja4: Option<String>,
+        uses_proxy_protocol: bool,
+        server_tracing_span: tracing::Span,
+    ) -> Arc<Box<Client>> {
         let mut register = self.register.write().await;
         let mut client_by_udp_address_guard = self.clients_by_udp_address.write();
         let mut client_by_host_guard = self.clients_by_host.write();
@@ -900,6 +927,7 @@ impl ClientRepository {
             connection,
             tls_ja4,
             uses_proxy_protocol,
+            server_tracing_span,
             client_instance_id,
         );
 

@@ -1703,6 +1703,10 @@ node_id = 1
             entry.metadata.get("virtual_server_id").map(String::as_str),
             Some("tenant-alpha")
         );
+        assert_eq!(
+            entry.metadata.get("spans").map(String::as_str),
+            Some("[server, client]")
+        );
         for (key, value) in [
             ("client_cert_hash", "certificate-hash"),
             ("client_tls_ja4", "t13d1516h2_8daaf6152771_02713d6af862"),

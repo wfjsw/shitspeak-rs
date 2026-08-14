@@ -852,9 +852,27 @@ fn should_skip_client_add_entry(
 impl Server {
     pub async fn handle_incoming_connection(
         self: &Arc<Box<Self>>,
+        tcp_stream: tokio::net::TcpStream,
+        remote_addr: std::net::SocketAddr,
+        provisional_server_id: String,
+    ) -> Result<(), HandleIncomingConnectionError> {
+        let server_span = tracing::info_span!("server", virtual_server_id = %provisional_server_id);
+        self.handle_incoming_connection_in_server_span(
+            tcp_stream,
+            remote_addr,
+            provisional_server_id,
+            server_span.clone(),
+        )
+        .instrument(server_span)
+        .await
+    }
+
+    async fn handle_incoming_connection_in_server_span(
+        self: &Arc<Box<Self>>,
         mut tcp_stream: tokio::net::TcpStream,
         remote_addr: std::net::SocketAddr,
         provisional_server_id: String,
+        server_span: tracing::Span,
     ) -> Result<(), HandleIncomingConnectionError> {
         tracing::info!(
             %remote_addr,
@@ -946,11 +964,11 @@ impl Server {
             return Ok(());
         }
         let server_id = self.resolve_tls_server_id(&provisional_server_id, local_addr, &tls_stream);
+        server_span.record("virtual_server_id", server_id.as_str());
         tracing::info!(
             %remote_addr,
             %client_addr,
             %local_addr,
-            server_id,
             alpn = ?tls_stream.get_ref().1.alpn_protocol().map(String::from_utf8_lossy),
             tls_ja4 = ?tls_ja4,
             "TLS handshake completed"
@@ -997,6 +1015,7 @@ impl Server {
             client_addr,
             local_addr,
             server_id,
+            server_span,
             Some(tls_ja4),
             uses_proxy_protocol,
         )
@@ -1036,6 +1055,7 @@ impl Server {
         remote_addr: std::net::SocketAddr,
         local_addr: std::net::SocketAddr,
         server_id: String,
+        server_span: tracing::Span,
         tls_ja4: Option<String>,
         uses_proxy_protocol: bool,
     ) -> Result<(), HandleIncomingConnectionError> {
@@ -1056,7 +1076,7 @@ impl Server {
 
         let client = self
             .clients
-            .allocate_local_client_in_server(
+            .allocate_local_client_in_server_with_tracing_span(
                 server_id,
                 real_ip,
                 remote_addr,
@@ -1065,6 +1085,7 @@ impl Server {
                 tls_stream,
                 tls_ja4,
                 uses_proxy_protocol,
+                server_span,
             )
             .await;
 

@@ -406,6 +406,7 @@ pub(crate) enum RequestBlobQueueEnqueueError {
 }
 
 fn client_tracing_span(
+    server_tracing_span: &tracing::Span,
     session_id: ClientSessionIdentifier,
     certificate_hash: Option<&str>,
     tls_ja4: Option<&str>,
@@ -414,7 +415,7 @@ fn client_tracing_span(
     tcp_address: SocketAddr,
     local_address: SocketAddr,
 ) -> tracing::Span {
-    let span = tracing::info_span!(
+    let span = tracing::info_span!(parent: server_tracing_span,
         "client",
         client_cert_hash = tracing::field::Empty,
         client_tls_ja4 = tracing::field::Empty,
@@ -612,6 +613,7 @@ impl Client {
         tls_ja4: Option<String>,
         uses_proxy_protocol: bool,
     ) -> Box<Self> {
+        let server_tracing_span = server_tracing_span(&server_id);
         Self::new_local_in_server_with_instance_id(
             server_id,
             session_id,
@@ -622,6 +624,7 @@ impl Client {
             connection,
             tls_ja4,
             uses_proxy_protocol,
+            server_tracing_span,
             next_client_instance_id(session_id.get_node_id()),
         )
     }
@@ -636,6 +639,7 @@ impl Client {
         connection: TlsStream<TcpStream>,
         tls_ja4: Option<String>,
         uses_proxy_protocol: bool,
+        server_tracing_span: tracing::Span,
         client_instance_id: ClientInstanceId,
     ) -> Box<Self> {
         let (certificate_hash, certificate_chain, is_verified) = {
@@ -674,6 +678,7 @@ impl Client {
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
         let (removed_tx, removed_rx) = watch::channel(false);
         let tracing_span = client_tracing_span(
+            &server_tracing_span,
             session_id,
             certificate_hash_hex.as_deref(),
             tls_ja4.as_deref(),
@@ -693,7 +698,7 @@ impl Client {
             local_address,
             tls_ja4,
             uses_proxy_protocol,
-            server_tracing_span: server_tracing_span(&server_id),
+            server_tracing_span,
             tracing_span,
             transport: ClientTransport::NativeTls {
                 rx: AsyncMutex::new(connection_rx),
@@ -860,6 +865,17 @@ impl Client {
             mpsc::channel::<ClientOutboundMessage>(OUTBOUND_MESSAGE_QUEUE_CAPACITY);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
         let (removed_tx, removed_rx) = watch::channel(false);
+        let server_tracing_span = server_tracing_span(&server_id);
+        let tracing_span = client_tracing_span(
+            &server_tracing_span,
+            session_id,
+            None,
+            None,
+            None,
+            real_ip_address,
+            tcp_address,
+            local_address,
+        );
 
         Box::new(Client {
             session_id: ParkingRwLock::new(session_id),
@@ -871,16 +887,8 @@ impl Client {
             local_address,
             tls_ja4: None,
             uses_proxy_protocol: false,
-            server_tracing_span: server_tracing_span(&server_id),
-            tracing_span: client_tracing_span(
-                session_id,
-                None,
-                None,
-                None,
-                real_ip_address,
-                tcp_address,
-                local_address,
-            ),
+            server_tracing_span,
+            tracing_span,
             transport: ClientTransport::WebGateway { kind, outbound_tx },
             disconnect_tx,
             disconnect_rx,
@@ -962,6 +970,17 @@ impl Client {
         let certificate_hash_hex = cert_hash.as_deref().map(hex::encode);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
         let (removed_tx, removed_rx) = watch::channel(false);
+        let server_tracing_span = server_tracing_span(&server_id);
+        let tracing_span = client_tracing_span(
+            &server_tracing_span,
+            session_id,
+            certificate_hash_hex.as_deref(),
+            None,
+            None,
+            real_ip_address,
+            tcp_address,
+            local_address,
+        );
 
         Box::new(Client {
             session_id: ParkingRwLock::new(session_id),
@@ -973,16 +992,8 @@ impl Client {
             local_address,
             tls_ja4: None,
             uses_proxy_protocol: false,
-            server_tracing_span: server_tracing_span(&server_id),
-            tracing_span: client_tracing_span(
-                session_id,
-                certificate_hash_hex.as_deref(),
-                None,
-                None,
-                real_ip_address,
-                tcp_address,
-                local_address,
-            ),
+            server_tracing_span,
+            tracing_span,
             transport: ClientTransport::Remote,
             disconnect_tx,
             disconnect_rx,
