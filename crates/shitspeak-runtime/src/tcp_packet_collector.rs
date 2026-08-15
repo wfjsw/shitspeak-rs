@@ -4,8 +4,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 const FLOW_CACHE_TTL: Duration = Duration::from_secs(10);
+const FLOW_METADATA_WAIT: Duration = Duration::from_secs(1);
 #[cfg(target_os = "linux")]
 const FLOW_CACHE_CAPACITY: usize = 16_384;
 
@@ -45,6 +47,7 @@ struct SynMetadata {
 
 pub(crate) struct TcpPacketCollector {
     flows: Arc<Mutex<HashMap<FlowKey, SynMetadata>>>,
+    flow_updates: Arc<Notify>,
     active_backend: Option<String>,
 }
 
@@ -65,6 +68,7 @@ impl TcpPacketCollector {
     fn start_once(_available_backends: &[String]) -> Arc<Self> {
         Arc::new(Self {
             flows: Arc::new(Mutex::new(HashMap::new())),
+            flow_updates: Arc::new(Notify::new()),
             active_backend: None,
         })
     }
@@ -114,6 +118,37 @@ impl TcpPacketCollector {
         });
         Some(TcpPacketMetadata { ja4t, ja4l })
     }
+
+    /// Wait for the packet receiver to publish the flow observed by the
+    /// completed TLS handshake. This closes the race between the asynchronous
+    /// AF_PACKET receiver and the one-time authentication snapshot. A timeout
+    /// still preserves best-effort behavior for dropped or unavailable
+    /// captures.
+    pub(crate) async fn lookup_after_capture(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> Option<TcpPacketMetadata> {
+        let deadline = tokio::time::Instant::now() + FLOW_METADATA_WAIT;
+        loop {
+            let notified = self.flow_updates.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let metadata = self.lookup(source, destination);
+            if metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.ja4l().is_some())
+            {
+                return metadata;
+            }
+            if tokio::time::timeout_at(deadline, &mut notified)
+                .await
+                .is_err()
+            {
+                return self.lookup(source, destination);
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -157,10 +192,12 @@ mod linux {
 
     pub(super) fn start(available_backends: &[String]) -> Arc<TcpPacketCollector> {
         let flows = Arc::new(Mutex::new(HashMap::new()));
+        let flow_updates = Arc::new(Notify::new());
         let Ok(packet_fd) = open_packet_socket() else {
             tracing::debug!("could not open AF_PACKET socket for TCP metadata capture");
             return Arc::new(TcpPacketCollector {
                 flows,
+                flow_updates,
                 active_backend: None,
             });
         };
@@ -187,22 +224,26 @@ mod linux {
         let Some(backend) = backend else {
             return Arc::new(TcpPacketCollector {
                 flows,
+                flow_updates,
                 active_backend: None,
             });
         };
         let flow_cache = Arc::clone(&flows);
+        let updates = Arc::clone(&flow_updates);
         let thread = std::thread::Builder::new()
             .name("shitspeak-tcp-packet-capture".to_owned())
-            .spawn(move || receive_packets(packet_fd, flow_cache));
+            .spawn(move || receive_packets(packet_fd, flow_cache, updates));
         if let Err(error) = thread {
             tracing::warn!(%error, "could not start TCP packet capture thread");
             return Arc::new(TcpPacketCollector {
                 flows,
+                flow_updates,
                 active_backend: None,
             });
         }
         Arc::new(TcpPacketCollector {
             flows,
+            flow_updates,
             active_backend: Some(backend),
         })
     }
@@ -387,7 +428,11 @@ mod linux {
         }
     }
 
-    fn receive_packets(packet_fd: OwnedFd, flows: Arc<Mutex<HashMap<FlowKey, SynMetadata>>>) {
+    fn receive_packets(
+        packet_fd: OwnedFd,
+        flows: Arc<Mutex<HashMap<FlowKey, SynMetadata>>>,
+        flow_updates: Arc<Notify>,
+    ) {
         let mut buffer = [0u8; 65_536];
         loop {
             let len = unsafe {
@@ -403,6 +448,7 @@ mod linux {
             }
             if let Some(packet) = parse_packet(&buffer[..len as usize]) {
                 update_flows(&flows, packet, Instant::now());
+                flow_updates.notify_waiters();
             }
         }
     }
@@ -662,6 +708,7 @@ mod linux {
 
             let collector = TcpPacketCollector {
                 flows: Arc::new(flows),
+                flow_updates: Arc::new(Notify::new()),
                 active_backend: Some("af_packet".to_owned()),
             };
             let mapped_source = SocketAddr::new(
@@ -681,6 +728,85 @@ mod linux {
             let metadata = collector
                 .lookup(mapped_source, mapped_destination)
                 .expect("flow must remain cached");
+            assert_eq!(metadata.ja4t(), "64240_2-1-3-4_1460_8");
+            assert_eq!(metadata.ja4l(), Some("125_57_150"));
+        }
+
+        #[tokio::test]
+        async fn waits_for_flow_publication_before_snapshotting_metadata() {
+            let flows = Arc::new(Mutex::new(HashMap::new()));
+            let flow_updates = Arc::new(Notify::new());
+            let collector = Arc::new(TcpPacketCollector {
+                flows: Arc::clone(&flows),
+                flow_updates: Arc::clone(&flow_updates),
+                active_backend: Some("ebpf".to_owned()),
+            });
+            let source: SocketAddr = "192.0.2.1:50000".parse().expect("source address");
+            let destination: SocketAddr = "198.51.100.2:443".parse().expect("destination address");
+
+            let lookup = tokio::spawn({
+                let collector = Arc::clone(&collector);
+                async move { collector.lookup_after_capture(source, destination).await }
+            });
+            tokio::task::yield_now().await;
+
+            let now = Instant::now();
+            update_flows(
+                &flows,
+                TcpPacket {
+                    source,
+                    destination,
+                    ttl: 57,
+                    syn: true,
+                    ack: false,
+                    payload_len: 0,
+                    window_size: 64240,
+                    options: "2-1-3-4".to_owned(),
+                    maximum_segment_size: Some(1460),
+                    window_scale: Some(8),
+                },
+                now,
+            );
+            flow_updates.notify_waiters();
+            update_flows(
+                &flows,
+                TcpPacket {
+                    source: destination,
+                    destination: source,
+                    ttl: 64,
+                    syn: true,
+                    ack: true,
+                    payload_len: 0,
+                    window_size: 0,
+                    options: String::new(),
+                    maximum_segment_size: None,
+                    window_scale: None,
+                },
+                now + Duration::from_micros(125),
+            );
+            flow_updates.notify_waiters();
+            update_flows(
+                &flows,
+                TcpPacket {
+                    source,
+                    destination,
+                    ttl: 57,
+                    syn: false,
+                    ack: true,
+                    payload_len: 1,
+                    window_size: 0,
+                    options: String::new(),
+                    maximum_segment_size: None,
+                    window_scale: None,
+                },
+                now + Duration::from_micros(275),
+            );
+            flow_updates.notify_waiters();
+
+            let metadata = lookup
+                .await
+                .expect("lookup task must complete")
+                .expect("published flow metadata");
             assert_eq!(metadata.ja4t(), "64240_2-1-3-4_1460_8");
             assert_eq!(metadata.ja4l(), Some("125_57_150"));
         }

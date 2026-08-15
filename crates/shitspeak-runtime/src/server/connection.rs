@@ -961,7 +961,7 @@ impl Server {
         // asserted by a PROXY-protocol header. Never attribute the proxy's
         // TCP traits to the logical proxied client.
         if !uses_proxy_protocol
-            && let Some(metadata) = self.tcp_packet_metadata(remote_addr, local_addr)
+            && let Some(metadata) = self.tcp_packet_metadata(remote_addr, local_addr).await
         {
             tls_fingerprints.ja4t = Some(metadata.ja4t().to_owned());
             tls_fingerprints.ja4l = metadata.ja4l().map(ToOwned::to_owned);

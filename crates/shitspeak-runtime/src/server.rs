@@ -2342,12 +2342,14 @@ impl Server {
         self.packet_capture_backend.as_deref()
     }
 
-    pub(crate) fn tcp_packet_metadata(
+    pub(crate) async fn tcp_packet_metadata(
         &self,
         source: std::net::SocketAddr,
         destination: std::net::SocketAddr,
     ) -> Option<crate::tcp_packet_collector::TcpPacketMetadata> {
-        self.tcp_packet_collector.lookup(source, destination)
+        self.tcp_packet_collector
+            .lookup_after_capture(source, destination)
+            .await
     }
 
     pub fn auth_ip_rate_limiter(
