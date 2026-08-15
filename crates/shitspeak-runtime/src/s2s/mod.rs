@@ -3335,6 +3335,26 @@ async fn apply_user_state_patch(
             }
         }
     }
+
+    info!(
+        server_id = %server_id,
+        actor = actor_session,
+        actor_client_instance_id = actor_client.client_instance_id(),
+        target_session_id = u32::from(target_id),
+        target_client_instance_id = target.client_instance_id(),
+        target_user_id = ?target.get_user_id(),
+        target_fqdn = ?target.get_fqdn(),
+        target_auth_session_id = ?target.get_auth_session_id(),
+        action = "user_state",
+        channel_id = ?patch.channel_id,
+        mute = ?patch.mute,
+        deaf = ?patch.deaf,
+        suppress = ?patch.suppress,
+        priority_speaker = ?patch.priority_speaker,
+        listening_channel_add = ?patch.listening_channel_add,
+        listening_channel_remove = ?patch.listening_channel_remove,
+        "moderator action executed"
+    );
 }
 
 async fn apply_user_remove_patch(
@@ -3460,6 +3480,23 @@ async fn apply_user_remove_patch(
         old_channel_id,
     )
     .await;
+
+    info!(
+        server_id = %server_id,
+        actor = actor_session,
+        actor_client_instance_id = actor_client.client_instance_id(),
+        target_session_id = u32::from(target_id),
+        target_client_instance_id = target.client_instance_id(),
+        target_user_id = ?target.get_user_id(),
+        target_fqdn = ?target.get_fqdn(),
+        target_auth_session_id = ?target.get_auth_session_id(),
+        action = "user_remove",
+        ban = patch.ban,
+        ban_certificate = ?patch.ban_certificate,
+        ban_ip = ?patch.ban_ip,
+        reason = ?patch.reason,
+        "moderator action executed"
+    );
 }
 
 pub fn install_channel_replication_resolver(

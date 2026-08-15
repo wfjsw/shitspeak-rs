@@ -409,6 +409,7 @@ pub(crate) enum RequestBlobQueueEnqueueError {
 fn client_tracing_span(
     server_tracing_span: &tracing::Span,
     session_id: ClientSessionIdentifier,
+    client_instance_id: ClientInstanceId,
     certificate_hash: Option<&str>,
     tls_fingerprints: &TlsFingerprints,
     real_ip_address: IpAddr,
@@ -430,6 +431,7 @@ fn client_tracing_span(
         client_connection_local_port = local_address.port(),
         client_node = session_id.get_node_id(),
         client_local_session_id = session_id.get_local_session_id(),
+        client_instance_id,
         client_auth_session_id = tracing::field::Empty,
         client_user_id = tracing::field::Empty,
         client_user_name = tracing::field::Empty,
@@ -706,6 +708,7 @@ impl Client {
         let tracing_span = client_tracing_span(
             &server_tracing_span,
             session_id,
+            client_instance_id,
             certificate_hash_hex.as_deref(),
             &tls_fingerprints,
             real_ip_address,
@@ -895,6 +898,7 @@ impl Client {
         let tracing_span = client_tracing_span(
             &server_tracing_span,
             session_id,
+            client_instance_id,
             None,
             &TlsFingerprints::default(),
             real_ip_address,
@@ -1000,6 +1004,7 @@ impl Client {
         let tracing_span = client_tracing_span(
             &server_tracing_span,
             session_id,
+            client_instance_id,
             certificate_hash_hex.as_deref(),
             &TlsFingerprints::default(),
             real_ip_address,
@@ -1372,6 +1377,14 @@ impl Client {
 
     pub fn get_fqdn(&self) -> Option<String> {
         self.global_state.read().get_fqdn().map(ToOwned::to_owned)
+    }
+
+    pub fn get_auth_session_id(&self) -> Option<String> {
+        self.local_state
+            .read()
+            .as_ref()
+            .and_then(|state| state.auth_session_id())
+            .map(ToOwned::to_owned)
     }
 
     pub fn get_acl_generation(&self) -> u64 {

@@ -496,6 +496,30 @@ pub async fn handle_user_state(
         None => None,
     };
 
+    if !is_self {
+        tracing::info!(
+            server_id = %server_id,
+            actor = u32::from(sender_id),
+            actor_client_instance_id = sender.client_instance_id(),
+            target_session_id = u32::from(target_id),
+            target_client_instance_id = target.client_instance_id(),
+            target_user_id = ?target.get_user_id(),
+            target_fqdn = ?target.get_fqdn(),
+            target_auth_session_id = ?target.get_auth_session_id(),
+            action = "user_state",
+            channel_id = ?requested_channel_change,
+            mute = ?msg.mute,
+            deaf = ?msg.deaf,
+            suppress = ?msg.suppress,
+            priority_speaker = ?msg.priority_speaker,
+            listening_channel_add = ?msg.listening_channel_add,
+            listening_channel_remove = ?msg.listening_channel_remove,
+            comment_cleared = ?msg.comment.as_deref().map(str::is_empty),
+            texture_cleared = ?msg.texture.as_ref().map(|texture| texture.is_empty()),
+            "moderator action issued"
+        );
+    }
+
     if let Some(target_session_id) = msg.session {
         if target_session_id != sender_id && target_session_id.get_node_id() != local_node_id {
             let patch = shitspeak_s2s::application::proto::UserStatePatch {
@@ -727,6 +751,30 @@ pub async fn handle_user_state(
             target_current_channel_id,
         )
         .await;
+    }
+
+    if !is_self {
+        tracing::info!(
+            server_id = %server_id,
+            actor = u32::from(sender_id),
+            actor_client_instance_id = sender.client_instance_id(),
+            target_session_id = u32::from(target_id),
+            target_client_instance_id = target.client_instance_id(),
+            target_user_id = ?target.get_user_id(),
+            target_fqdn = ?target.get_fqdn(),
+            target_auth_session_id = ?target.get_auth_session_id(),
+            action = "user_state",
+            channel_id = ?requested_channel_change,
+            mute = ?msg.mute,
+            deaf = ?msg.deaf,
+            suppress = ?msg.suppress,
+            priority_speaker = ?msg.priority_speaker,
+            listening_channel_add = ?msg.listening_channel_add,
+            listening_channel_remove = ?msg.listening_channel_remove,
+            comment_cleared = ?msg.comment.as_deref().map(str::is_empty),
+            texture_cleared = ?msg.texture.as_ref().map(|texture| texture.is_empty()),
+            "moderator action executed"
+        );
     }
 
     Ok(())

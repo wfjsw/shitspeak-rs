@@ -10,6 +10,7 @@ use super::SpanFields;
 
 pub(super) struct ScopedSpanEventFormatter {
     pub(super) display_timestamp: bool,
+    pub(super) display_level: bool,
     pub(super) use_ansi: bool,
 }
 
@@ -45,8 +46,10 @@ where
             writer.write_char(' ')?;
         }
 
-        write_level(&mut writer, event.metadata().level(), use_ansi)?;
-        writer.write_char(' ')?;
+        if self.display_level {
+            write_level(&mut writer, event.metadata().level(), use_ansi)?;
+            writer.write_char(' ')?;
+        }
         write_dimmed(&mut writer, use_ansi, |writer| {
             write!(writer, "{}:", event.metadata().target())
         })?;
@@ -178,6 +181,7 @@ impl fmt::Display for ClientSpanDisplay<'_> {
             ("client_connection_remote_port", "client_port"),
             ("client_node", "node"),
             ("client_local_session_id", "session"),
+            ("client_instance_id", "client_instance_id"),
         ]
         .into_iter()
         .enumerate()

@@ -75,6 +75,23 @@ pub async fn handle_user_remove(
         ));
     }
 
+    tracing::info!(
+        server_id = %server_id,
+        actor = u32::from(sender.get_session_id()),
+        actor_client_instance_id = sender.client_instance_id(),
+        target_session_id = target_raw,
+        target_client_instance_id = target.client_instance_id(),
+        target_user_id = ?target.get_user_id(),
+        target_fqdn = ?target.get_fqdn(),
+        target_auth_session_id = ?target.get_auth_session_id(),
+        action = "user_remove",
+        ban = is_ban,
+        ban_certificate,
+        ban_ip,
+        reason = ?msg.reason,
+        "moderator action issued"
+    );
+
     let local_node_id = server.get_clients().local_node_id();
 
     // Cross-owner kick/ban: dispatch the intent to the owner. Same
@@ -230,6 +247,23 @@ pub async fn handle_user_remove(
         old_channel_id,
     )
     .await;
+
+    tracing::info!(
+        server_id = %server_id,
+        actor = u32::from(sender.get_session_id()),
+        actor_client_instance_id = sender.client_instance_id(),
+        target_session_id = target_raw,
+        target_client_instance_id = target.client_instance_id(),
+        target_user_id = ?target.get_user_id(),
+        target_fqdn = ?target.get_fqdn(),
+        target_auth_session_id = ?target.get_auth_session_id(),
+        action = "user_remove",
+        ban = is_ban,
+        ban_certificate,
+        ban_ip,
+        reason = ?msg.reason,
+        "moderator action executed"
+    );
 
     Ok(())
 }

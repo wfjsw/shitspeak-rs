@@ -238,6 +238,7 @@ pub fn init(
         .fmt_fields(LokiFields::default())
         .event_format(ScopedSpanEventFormatter {
             display_timestamp: true,
+            display_level: true,
             use_ansi: false,
         });
     let root = load_logging_config(config_path)?;
@@ -418,6 +419,7 @@ impl LokiEventFormatter {
                 tx,
                 line_formatter: ScopedSpanEventFormatter {
                     display_timestamp: false,
+                    display_level: false,
                     use_ansi: true,
                 },
             },
@@ -1652,12 +1654,79 @@ node_id = 1
     }
 
     #[test]
+    fn loki_moderation_target_session_id_does_not_collide_with_event_target() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let formatter = LokiEventFormatter {
+            tx,
+            line_formatter: ScopedSpanEventFormatter {
+                display_timestamp: false,
+                display_level: false,
+                use_ansi: false,
+            },
+        };
+        let subscriber = tracing_subscriber::registry().with(SpanFieldsLayer).with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(NoopMakeWriter)
+                .fmt_fields(LokiFields::default())
+                .event_format(formatter),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target_session_id = 1_048_757_u32,
+                "moderator action executed"
+            );
+        });
+
+        let entry = rx.try_recv().expect("moderator event should be captured");
+        assert_eq!(
+            entry.metadata.get("target_session_id").map(String::as_str),
+            Some("1048757")
+        );
+    }
+
+    #[test]
+    fn loki_log_line_omits_level_already_stored_as_a_label() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let formatter = LokiEventFormatter {
+            tx,
+            line_formatter: ScopedSpanEventFormatter {
+                display_timestamp: false,
+                display_level: false,
+                use_ansi: false,
+            },
+        };
+        let subscriber = tracing_subscriber::registry().with(SpanFieldsLayer).with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(NoopMakeWriter)
+                .fmt_fields(LokiFields::default())
+                .event_format(formatter),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("logging initialized");
+        });
+
+        let entry = rx.try_recv().expect("Loki event should be captured");
+        assert_eq!(entry.level, "INFO");
+        assert!(
+            !entry.line.contains("INFO"),
+            "Loki line duplicates its level label: {}",
+            entry.line
+        );
+        assert!(entry.line.contains("logging initialized"), "{}", entry.line);
+    }
+
+    #[test]
     fn loki_client_span_keeps_full_metadata_but_limits_displayed_identity() {
         let (tx, mut rx) = mpsc::channel(1);
         let formatter = LokiEventFormatter {
             tx,
             line_formatter: ScopedSpanEventFormatter {
                 display_timestamp: false,
+                display_level: false,
                 use_ansi: true,
             },
         };
@@ -1688,6 +1757,7 @@ node_id = 1
                 client_connection_local_port = 64_738_u16,
                 client_node = 7_u16,
                 client_local_session_id = 42_u32,
+                client_instance_id = 123_u64,
                 client_auth_session_id = tracing::field::Empty,
                 client_user_id = tracing::field::Empty,
                 client_user_name = tracing::field::Empty,
@@ -1724,6 +1794,7 @@ node_id = 1
             ("client_connection_local_port", "64738"),
             ("client_node", "7"),
             ("client_local_session_id", "42"),
+            ("client_instance_id", "123"),
             ("client_auth_session_id", "auth-session-123"),
             ("client_user_id", "99"),
             ("client_user_name", "Alice"),
@@ -1741,7 +1812,7 @@ node_id = 1
         let rendered_line = strip_ansi_escape_codes(&entry.line);
         assert!(
             rendered_line.contains(
-                "server{id=tenant-alpha} client{real_ip=203.0.113.8 client_port=54321 node=7 session=42 fqdn=alice@example.test}"
+                "server{id=tenant-alpha} client{real_ip=203.0.113.8 client_port=54321 node=7 session=42 client_instance_id=123 fqdn=alice@example.test}"
             ),
             "unexpected client scope: {rendered_line}",
         );
@@ -1789,6 +1860,7 @@ node_id = 1
             tx,
             line_formatter: ScopedSpanEventFormatter {
                 display_timestamp: false,
+                display_level: false,
                 use_ansi: false,
             },
         };
@@ -1808,6 +1880,7 @@ node_id = 1
                 client_connection_local_port = 64_738_u16,
                 client_node = 7_u16,
                 client_local_session_id = 42_u32,
+                client_instance_id = 123_u64,
                 client_fqdn = tracing::field::Empty,
             );
             span.record("client_fqdn", "");
@@ -1823,7 +1896,7 @@ node_id = 1
         assert!(
             entry
                 .line
-                .contains("client{real_ip=203.0.113.8 client_port=54321 node=7 session=42}"),
+                .contains("client{real_ip=203.0.113.8 client_port=54321 node=7 session=42 client_instance_id=123}"),
             "{}",
             entry.line
         );
