@@ -3,19 +3,20 @@ use std::fmt;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::fmt::FmtContext;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
+use tracing_subscriber::fmt::time::{FormatTime, SystemTime};
 use tracing_subscriber::registry::LookupSpan;
 
 use super::SpanFields;
 
-pub(super) struct ScopedSpanEventFormatter<F> {
-    pub(super) inner: F,
+pub(super) struct ScopedSpanEventFormatter {
+    pub(super) display_timestamp: bool,
+    pub(super) use_ansi: bool,
 }
 
-impl<S, N, F> FormatEvent<S, N> for ScopedSpanEventFormatter<F>
+impl<S, N> FormatEvent<S, N> for ScopedSpanEventFormatter
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
     N: for<'writer> FormatFields<'writer> + 'static,
-    F: FormatEvent<S, N>,
 {
     fn format_event(
         &self,
@@ -23,6 +24,7 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
+        let use_ansi = self.use_ansi || writer.has_ansi_escapes();
         if let Some(scope) = ctx.event_scope() {
             for span in scope.from_root() {
                 let extensions = span.extensions();
@@ -30,11 +32,73 @@ where
                     continue;
                 };
                 if let Some(display) = format_scoped_span(span.name(), fields) {
-                    write!(writer, "{display} ")?;
+                    write_bold(&mut writer, &display, use_ansi)?;
+                    writer.write_char(' ')?;
                 }
             }
         }
-        self.inner.format_event(ctx, writer, event)
+
+        if self.display_timestamp {
+            write_dimmed(&mut writer, use_ansi, |writer| {
+                SystemTime.format_time(&mut writer.by_ref())
+            })?;
+            writer.write_char(' ')?;
+        }
+
+        write_level(&mut writer, event.metadata().level(), use_ansi)?;
+        writer.write_char(' ')?;
+        write_dimmed(&mut writer, use_ansi, |writer| {
+            write!(writer, "{}:", event.metadata().target())
+        })?;
+        if let Some(line) = event.metadata().line() {
+            write_dimmed(&mut writer, use_ansi, |writer| write!(writer, "{line}:"))?;
+        }
+        writer.write_char(' ')?;
+        ctx.format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
+fn write_bold(writer: &mut Writer<'_>, value: &str, use_ansi: bool) -> fmt::Result {
+    write_styled(writer, "\x1b[1m", value, use_ansi)
+}
+
+fn write_dimmed(
+    writer: &mut Writer<'_>,
+    use_ansi: bool,
+    write_value: impl FnOnce(&mut Writer<'_>) -> fmt::Result,
+) -> fmt::Result {
+    if use_ansi {
+        writer.write_str("\x1b[2m")?;
+        write_value(writer)?;
+        writer.write_str("\x1b[0m")
+    } else {
+        write_value(writer)
+    }
+}
+
+fn write_level(writer: &mut Writer<'_>, level: &tracing::Level, use_ansi: bool) -> fmt::Result {
+    let (color, value) = match *level {
+        tracing::Level::TRACE => ("35", "TRACE"),
+        tracing::Level::DEBUG => ("34", "DEBUG"),
+        tracing::Level::INFO => ("32", " INFO"),
+        tracing::Level::WARN => ("33", " WARN"),
+        tracing::Level::ERROR => ("31", "ERROR"),
+    };
+    if use_ansi {
+        write!(writer, "\x1b[{color}m{value}\x1b[0m")
+    } else {
+        writer.write_str(value)
+    }
+}
+
+fn write_styled(writer: &mut Writer<'_>, style: &str, value: &str, use_ansi: bool) -> fmt::Result {
+    if use_ansi {
+        writer.write_str(style)?;
+        writer.write_str(value)?;
+        writer.write_str("\x1b[0m")
+    } else {
+        writer.write_str(value)
     }
 }
 

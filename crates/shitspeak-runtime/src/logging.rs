@@ -237,7 +237,8 @@ pub fn init(
         .with_line_number(true)
         .fmt_fields(LokiFields::default())
         .event_format(ScopedSpanEventFormatter {
-            inner: tracing_subscriber::fmt::format().with_line_number(true),
+            display_timestamp: true,
+            use_ansi: false,
         });
     let root = load_logging_config(config_path)?;
 
@@ -369,9 +370,7 @@ impl LokiCommand {
 
 struct LokiEventFormatter {
     tx: mpsc::Sender<LokiEntry>,
-    line_formatter: ScopedSpanEventFormatter<
-        tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full, ()>,
-    >,
+    line_formatter: ScopedSpanEventFormatter,
 }
 
 impl LokiEventFormatter {
@@ -418,10 +417,8 @@ impl LokiEventFormatter {
             Self {
                 tx,
                 line_formatter: ScopedSpanEventFormatter {
-                    inner: tracing_subscriber::fmt::format()
-                        .with_line_number(true)
-                        .without_time()
-                        .with_ansi(true),
+                    display_timestamp: false,
+                    use_ansi: true,
                 },
             },
             LokiFlushHandle {
@@ -1660,10 +1657,8 @@ node_id = 1
         let formatter = LokiEventFormatter {
             tx,
             line_formatter: ScopedSpanEventFormatter {
-                inner: tracing_subscriber::fmt::format()
-                    .with_line_number(true)
-                    .without_time()
-                    .with_ansi(false),
+                display_timestamp: false,
+                use_ansi: true,
             },
         };
         let subscriber = tracing_subscriber::registry().with(SpanFieldsLayer).with(
@@ -1743,11 +1738,21 @@ node_id = 1
             );
         }
 
+        let rendered_line = strip_ansi_escape_codes(&entry.line);
         assert!(
-            entry.line.contains(
+            rendered_line.contains(
                 "server{id=tenant-alpha} client{real_ip=203.0.113.8 client_port=54321 node=7 session=42 fqdn=alice@example.test}"
             ),
-            "unexpected client scope: {}",
+            "unexpected client scope: {rendered_line}",
+        );
+        assert!(
+            entry.line.contains("\x1b[1mserver{id=tenant-alpha}\x1b[0m"),
+            "server scope lost its ANSI emphasis: {}",
+            entry.line
+        );
+        assert!(
+            !entry.line.contains("server:client:"),
+            "redundant default span prefix remained: {}",
             entry.line
         );
         for field in [
@@ -1783,10 +1788,8 @@ node_id = 1
         let formatter = LokiEventFormatter {
             tx,
             line_formatter: ScopedSpanEventFormatter {
-                inner: tracing_subscriber::fmt::format()
-                    .with_line_number(true)
-                    .without_time()
-                    .with_ansi(false),
+                display_timestamp: false,
+                use_ansi: false,
             },
         };
         let subscriber = tracing_subscriber::registry().with(SpanFieldsLayer).with(
