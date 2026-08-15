@@ -3116,6 +3116,18 @@ impl StrictState {
         self.retired_operations = retired;
     }
 
+    fn operation_is_retired(&self, op_id: OpId) -> bool {
+        let node = op_id.0 >> 48;
+        let lower = node << 48;
+        let upper = lower | 0x0000_FFFF_FFFF_FFFF;
+        self.retired_operations
+            .range(lower..=upper)
+            .next_back()
+            .is_some_and(|(origin, counter)| {
+                op_id.0 < *origin || (op_id.0 == *origin && op_id.1 <= *counter)
+            })
+    }
+
     pub fn can_start_history_election(&self) -> bool {
         self.can_bootstrap_catchup()
             && matches!(self.history_election_phase, HistoryElectionPhase::Idle)
@@ -9723,6 +9735,13 @@ impl<R: StrictReplicable> StrictRuntime<R> {
                 ts_local = ts_final;
                 local_clock_after = s.clock;
                 v2_pending_to_persist = None;
+            } else if s.applied_operations.contains_key(&op_id) || s.operation_is_retired(op_id) {
+                // Repository checkpoint installation deliberately compacts
+                // terminal decisions. A delayed proposal for an operation the
+                // checkpoint already represents must not resurrect a pending
+                // ordering fence after that compaction.
+                metrics::record_strict_fence_rejection();
+                return;
             } else {
                 if protocol_version == STRICT_PROTOCOL_VERSION_V2
                     && (s.history_election_blocks_steady_state() || s.repository_base_required())
@@ -19785,6 +19804,75 @@ mod tests {
         let state = rt.state.lock();
         assert_eq!(state.clock, 0);
         assert!(!state.pending_proposes.contains_key(&op_id));
+    }
+
+    #[tokio::test]
+    async fn checkpointed_applied_v2_propose_does_not_recreate_pending_fence() {
+        let net = MockNet::new(1, vec![1, 2]);
+        net.set_epoch(1, 1);
+        net.set_epoch(2, 1);
+        net.set_strict_replication_protocol_version(STRICT_PROTOCOL_VERSION_V8);
+        let rt = StrictRuntime::new(
+            CountingStrictRepo::new(),
+            1,
+            1,
+            "channels".to_owned(),
+            net,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        rt.finish_history_election_for_test();
+
+        let op_id = make_op_id(2, 1, 6);
+        let retired_op_id = make_op_id(2, 1, 7);
+        let op_msgpack = Bytes::from(rmp_serde::to_vec(&1234u64).unwrap());
+        {
+            let mut state = rt.state.lock();
+            state.replace_repository_checkpoint(
+                BTreeMap::from([(op_id, 42)]),
+                BTreeMap::from([(retired_op_id.0, retired_op_id.1)]),
+            );
+        }
+
+        rt.recv_propose_v1(
+            2,
+            StrictProposeV1 {
+                coord_node: 2,
+                op_id_hi: op_id.0,
+                op_id_lo: op_id.1,
+                ts_propose: 100,
+                op_msgpack,
+                src_clock: 100,
+                protocol_version: STRICT_PROTOCOL_VERSION_V2,
+                frozen_targets: v2_frozen_targets_wire(),
+            },
+        )
+        .await;
+        rt.recv_propose_v1(
+            2,
+            StrictProposeV1 {
+                coord_node: 2,
+                op_id_hi: retired_op_id.0,
+                op_id_lo: retired_op_id.1,
+                ts_propose: 101,
+                op_msgpack: Bytes::from(rmp_serde::to_vec(&1235u64).unwrap()),
+                src_clock: 101,
+                protocol_version: STRICT_PROTOCOL_VERSION_V2,
+                frozen_targets: v2_frozen_targets_wire(),
+            },
+        )
+        .await;
+
+        let state = rt.state.lock();
+        assert_eq!(state.applied_operations.get(&op_id), Some(&42));
+        assert!(
+            !state.pending_proposes.contains_key(&op_id),
+            "a proposal for an operation present in the repository checkpoint must not recreate a delivery fence"
+        );
+        assert!(
+            !state.pending_proposes.contains_key(&retired_op_id),
+            "a proposal for an operation retired by the repository checkpoint must not recreate a delivery fence"
+        );
     }
 
     #[tokio::test]
