@@ -874,6 +874,10 @@ impl Server {
         provisional_server_id: String,
         server_span: tracing::Span,
     ) -> Result<(), HandleIncomingConnectionError> {
+        // A dual-stack listener reports IPv4 clients as IPv4-mapped IPv6.
+        // Keep logs, authenticator data, and AF_PACKET flow keys in the same
+        // canonical endpoint form.
+        let remote_addr = shitspeak_auth::canonical_socket_addr(remote_addr);
         tracing::info!(
             %remote_addr,
             provisional_server_id,
@@ -899,7 +903,9 @@ impl Server {
         let proxy_server_address = uses_proxy_protocol.then_some(remote_addr);
         let client_addr = proxy_connection
             .and_then(|info| info.client_address())
-            .map(|addr| SocketAddr::new(addr.ip(), addr.port()))
+            .map(|addr| {
+                shitspeak_auth::canonical_socket_addr(SocketAddr::new(addr.ip(), addr.port()))
+            })
             .unwrap_or(remote_addr);
         let real_ip = client_addr.ip();
 
@@ -931,7 +937,7 @@ impl Server {
             return Ok(());
         }
 
-        let local_addr = tcp_stream.local_addr()?;
+        let local_addr = shitspeak_auth::canonical_socket_addr(tcp_stream.local_addr()?);
         tracing::info!(
             %remote_addr,
             %client_addr,

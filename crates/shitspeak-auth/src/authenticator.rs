@@ -19,6 +19,12 @@ pub fn canonical_authenticator_ip(ip_address: IpAddr) -> IpAddr {
     }
 }
 
+/// Normalize an IPv4-mapped IPv6 endpoint so a dual-stack listener reports
+/// the same endpoint representation as an IPv4 packet observer.
+pub fn canonical_socket_addr(address: SocketAddr) -> SocketAddr {
+    SocketAddr::new(canonical_authenticator_ip(address.ip()), address.port())
+}
+
 /// Preserve an absent virtual-server selection while ensuring an explicitly
 /// empty selection cannot create an invalid server scope.
 pub fn normalize_virtual_server_id(server_id: Option<String>) -> Option<String> {
@@ -203,9 +209,9 @@ pub trait Authenticator: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-    use super::canonical_authenticator_ip;
+    use super::{canonical_authenticator_ip, canonical_socket_addr};
 
     #[test]
     fn canonical_authenticator_ip_unmaps_ipv4_mapped_ipv6() {
@@ -222,5 +228,15 @@ mod tests {
         let native = IpAddr::V6(Ipv6Addr::LOCALHOST);
 
         assert_eq!(canonical_authenticator_ip(native), native);
+    }
+
+    #[test]
+    fn canonical_socket_addr_unmaps_ipv4_mapped_ipv6() {
+        let mapped: SocketAddr = "[::ffff:118.171.43.53]:60842".parse().unwrap();
+
+        assert_eq!(
+            canonical_socket_addr(mapped),
+            "118.171.43.53:60842".parse().unwrap()
+        );
     }
 }

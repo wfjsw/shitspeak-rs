@@ -78,6 +78,8 @@ impl TcpPacketCollector {
         source: SocketAddr,
         destination: SocketAddr,
     ) -> Option<TcpPacketMetadata> {
+        let source = shitspeak_auth::canonical_socket_addr(source);
+        let destination = shitspeak_auth::canonical_socket_addr(destination);
         let now = Instant::now();
         let metadata = self
             .flows
@@ -639,8 +641,22 @@ mod linux {
                 flows: Arc::new(flows),
                 active_backend: Some("af_packet".to_owned()),
             };
+            let mapped_source = SocketAddr::new(
+                IpAddr::V6(match source.ip() {
+                    IpAddr::V4(address) => address.to_ipv6_mapped(),
+                    IpAddr::V6(_) => unreachable!("fixture uses IPv4"),
+                }),
+                source.port(),
+            );
+            let mapped_destination = SocketAddr::new(
+                IpAddr::V6(match destination.ip() {
+                    IpAddr::V4(address) => address.to_ipv6_mapped(),
+                    IpAddr::V6(_) => unreachable!("fixture uses IPv4"),
+                }),
+                destination.port(),
+            );
             let metadata = collector
-                .lookup(source, destination)
+                .lookup(mapped_source, mapped_destination)
                 .expect("flow must remain cached");
             assert_eq!(metadata.ja4t(), "64240_2-1-3-4_1460_8");
             assert_eq!(metadata.ja4l(), Some("125_57_150"));
