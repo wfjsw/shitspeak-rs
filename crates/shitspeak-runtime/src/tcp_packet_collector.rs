@@ -128,6 +128,7 @@ mod linux {
     const BPF_LD_ABS_H: u8 = 0x28;
     const BPF_LD_ABS_B: u8 = 0x30;
     const BPF_ALU64_MOV_K: u8 = 0xb7;
+    const BPF_ALU64_MOV_X: u8 = 0xbf;
     const BPF_JMP_JEQ_K: u8 = 0x15;
     const BPF_JMP_EXIT: u8 = 0x95;
     const SO_ATTACH_BPF: libc::c_int = 50;
@@ -226,6 +227,7 @@ mod linux {
         // variable header length; the overwhelmingly common untagged path is
         // filtered before it reaches the receiver thread.
         let instructions = [
+            socket_filter_context_prologue(),
             BpfInsn {
                 code: BPF_LD_ABS_H,
                 dst_src: 0,
@@ -372,6 +374,17 @@ mod linux {
         (result == 0)
             .then_some(())
             .ok_or_else(std::io::Error::last_os_error)
+    }
+
+    fn socket_filter_context_prologue() -> BpfInsn {
+        // BPF_LD_ABS uses r6 as the saved socket-buffer context. The verifier
+        // rejects the packet loads unless it is initialized from r1 first.
+        BpfInsn {
+            code: BPF_ALU64_MOV_X,
+            dst_src: 0x16,
+            off: 0,
+            imm: 0,
+        }
     }
 
     fn receive_packets(packet_fd: OwnedFd, flows: Arc<Mutex<HashMap<FlowKey, SynMetadata>>>) {
@@ -569,6 +582,16 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn socket_filter_initializes_r6_with_the_socket_buffer_context() {
+            let instruction = socket_filter_context_prologue();
+
+            assert_eq!(instruction.code, BPF_ALU64_MOV_X);
+            assert_eq!(instruction.dst_src, 0x16, "destination r6, source r1");
+            assert_eq!(instruction.off, 0);
+            assert_eq!(instruction.imm, 0);
+        }
 
         #[test]
         fn parses_syn_options_and_produces_tcp_fingerprints() {

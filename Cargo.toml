@@ -108,6 +108,7 @@ clap = { workspace = true }
 shitspeak-runtime = { workspace = true }
 shitspeak-web = { workspace = true, optional = true }
 config = { workspace = true }
+libc = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
