@@ -37,7 +37,12 @@ pub struct TestAuthenticator {
 #[derive(Debug, Clone)]
 pub struct TestAuthenticateAuxiliaryData {
     ip_address: IpAddr,
+    tls_ja3: Option<String>,
     tls_ja4: Option<String>,
+    tls_ja4t: Option<String>,
+    tls_ja4x: Option<String>,
+    tls_ja4l: Option<String>,
+    tls_sni: Option<String>,
     uses_proxy_protocol: bool,
     version: Option<ProtocolVersion>,
     client_name: Option<String>,
@@ -52,6 +57,26 @@ impl TestAuthenticateAuxiliaryData {
 
     pub fn tls_ja4(&self) -> Option<&str> {
         self.tls_ja4.as_deref()
+    }
+
+    pub fn tls_ja3(&self) -> Option<&str> {
+        self.tls_ja3.as_deref()
+    }
+
+    pub fn tls_ja4x(&self) -> Option<&str> {
+        self.tls_ja4x.as_deref()
+    }
+
+    pub fn tls_ja4t(&self) -> Option<&str> {
+        self.tls_ja4t.as_deref()
+    }
+
+    pub fn tls_ja4l(&self) -> Option<&str> {
+        self.tls_ja4l.as_deref()
+    }
+
+    pub fn tls_sni(&self) -> Option<&str> {
+        self.tls_sni.as_deref()
     }
 
     pub fn uses_proxy_protocol(&self) -> bool {
@@ -227,7 +252,12 @@ impl Authenticator for AuthenticatorAdapter {
             .unwrap()
             .push(TestAuthenticateAuxiliaryData {
                 ip_address: auxiliary_data.ip_address,
+                tls_ja3: auxiliary_data.tls_ja3.clone(),
                 tls_ja4: auxiliary_data.tls_ja4.clone(),
+                tls_ja4t: auxiliary_data.tls_ja4t.clone(),
+                tls_ja4x: auxiliary_data.tls_ja4x.clone(),
+                tls_ja4l: auxiliary_data.tls_ja4l.clone(),
+                tls_sni: auxiliary_data.tls_sni.clone(),
                 uses_proxy_protocol: auxiliary_data.uses_proxy_protocol,
                 version: auxiliary_data.version,
                 client_name: auxiliary_data.client_name.clone(),

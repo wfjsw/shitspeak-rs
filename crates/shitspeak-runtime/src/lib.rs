@@ -24,6 +24,7 @@ pub mod rate_limits;
 pub mod register;
 pub mod s2s;
 pub mod server;
+pub(crate) mod tcp_packet_collector;
 pub mod tls_fingerprint;
 pub(crate) mod toggle_superuser_visibility;
 pub mod types;

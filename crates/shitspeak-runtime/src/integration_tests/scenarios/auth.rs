@@ -400,7 +400,7 @@ async fn collect_manual_messages(
 }
 
 #[tokio::test]
-async fn authenticator_receives_tls_ja4_and_proxy_protocol_flag() {
+async fn authenticator_receives_tls_fingerprints_sni_and_proxy_protocol_flag() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server
         .authenticator
@@ -421,6 +421,20 @@ async fn authenticator_receives_tls_ja4_and_proxy_protocol_flag() {
         tls_ja4.starts_with("t13x"),
         "SNI-redacted TLS 1.3 JA4: {tls_ja4}"
     );
+    let tls_ja3 = auxiliary
+        .tls_ja3()
+        .expect("native TLS connection should have a JA3 fingerprint");
+    assert!(
+        tls_ja3.contains(','),
+        "JA3 must expose its canonical fields"
+    );
+    assert!(
+        auxiliary.tls_ja4x().is_some(),
+        "test client presents a certificate, so the authenticator should receive JA4X"
+    );
+    assert_eq!(auxiliary.tls_sni(), Some("localhost"));
+    assert_eq!(auxiliary.tls_ja4t(), None);
+    assert_eq!(auxiliary.tls_ja4l(), None);
     assert!(
         !auxiliary.uses_proxy_protocol(),
         "direct test connection should not use PROXY protocol"

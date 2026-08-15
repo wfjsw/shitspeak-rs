@@ -1,16 +1,54 @@
+use std::fmt::Write as _;
 use std::io;
 use std::io::Cursor;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use x509_parser::prelude::parse_x509_certificate;
 
 const TLS_HANDSHAKE_RECORD: u8 = 22;
 const TLS_CLIENT_HELLO_HANDSHAKE: u8 = 1;
 const TLS_EXTENSION_SERVER_NAME: u16 = 0;
 const TLS_EXTENSION_ALPN: u16 = 16;
 const TLS_EXTENSION_SIGNATURE_ALGORITHMS: u16 = 13;
+const TLS_EXTENSION_SUPPORTED_GROUPS: u16 = 10;
+const TLS_EXTENSION_EC_POINT_FORMATS: u16 = 11;
 const TLS_EXTENSION_SUPPORTED_VERSIONS: u16 = 43;
 const MAX_HANDSHAKE_BYTES: usize = 128 * 1024;
+
+/// Capture backends the process can activate, ordered from most precise to
+/// least invasive. The probe runs once during server construction.
+pub(crate) fn available_packet_capture_backends() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let capabilities = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("CapEff:\t"))
+                    .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+            })
+            .unwrap_or_default();
+        let has = |bit| capabilities & (1u64 << bit) != 0u64;
+        let mut backends = Vec::new();
+        // The eBPF socket filter is attached to an AF_PACKET socket, so it
+        // needs CAP_NET_RAW as well as the capabilities needed to load and
+        // attach the BPF program. CAP_NET_RAW alone permits the AF_PACKET
+        // fallback.
+        if has(39) && has(38) && has(12) && has(13) {
+            backends.push("ebpf".to_owned());
+        }
+        if has(13) {
+            backends.push("af_packet".to_owned());
+        }
+        backends
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
 
 enum ClientHelloRecordParse {
     Complete(Vec<u8>),
@@ -19,13 +57,26 @@ enum ClientHelloRecordParse {
 }
 
 #[derive(Debug)]
-struct ClientHelloData {
+struct ClientHelloData<'a> {
     legacy_version: u16,
-    cipher_suites: Vec<u16>,
-    extensions: Vec<u16>,
-    supported_versions: Vec<u16>,
-    signature_algorithms: Vec<u16>,
-    alpn_protocols: Vec<Vec<u8>>,
+    cipher_suites: &'a [u8],
+    extensions: &'a [u8],
+    supported_versions: Option<&'a [u8]>,
+    signature_algorithms: Option<&'a [u8]>,
+    supported_groups: Option<&'a [u8]>,
+    ec_point_formats: Option<&'a [u8]>,
+    alpn_protocols: Option<&'a [u8]>,
+    sni: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TlsFingerprints {
+    pub(crate) ja3: Option<String>,
+    pub(crate) ja4: Option<String>,
+    pub(crate) ja4t: Option<String>,
+    pub(crate) ja4x: Option<String>,
+    pub(crate) ja4l: Option<String>,
+    pub(crate) sni: Option<String>,
 }
 
 struct Reader<'a> {
@@ -72,10 +123,10 @@ impl<'a> Reader<'a> {
 /// state is transferred to the normal rustls handshake. This avoids the
 /// timing-dependent `TcpStream::peek` capture that could miss a fragmented
 /// ClientHello.
-pub async fn accept_tls_with_ja4<IO>(
+pub(crate) async fn accept_tls_with_fingerprints<IO>(
     mut stream: IO,
     tls_acceptor: &TlsAcceptor,
-) -> io::Result<(TlsStream<IO>, String)>
+) -> io::Result<(TlsStream<IO>, TlsFingerprints)>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
@@ -102,15 +153,15 @@ where
             ));
         }
 
-        let mut record = Vec::with_capacity(record_header.len() + record_len);
-        record.extend_from_slice(&record_header);
-        record.resize(record_header.len() + record_len, 0);
+        let record_start = tls_records.len();
+        tls_records.extend_from_slice(&record_header);
+        tls_records.resize(record_end, 0);
         stream
-            .read_exact(&mut record[record_header.len()..])
+            .read_exact(&mut tls_records[record_start + record_header.len()..])
             .await?;
-        tls_records.extend_from_slice(&record);
 
-        let mut record_reader = Cursor::new(record.as_slice());
+        let record = &tls_records[record_start..];
+        let mut record_reader = Cursor::new(record);
         while (record_reader.position() as usize) < record.len() {
             let bytes_read = acceptor.read_tls(&mut record_reader)?;
             if bytes_read == 0 {
@@ -132,11 +183,18 @@ where
                 let client_hello = parse_client_hello(&handshake).ok_or_else(|| {
                     invalid_client_hello("could not parse the accepted TLS ClientHello")
                 })?;
-                let tls_ja4 = ja4_from_client_hello(&client_hello);
+                let fingerprints = TlsFingerprints {
+                    ja3: Some(ja3_from_client_hello(&client_hello)),
+                    ja4: Some(ja4_from_client_hello(&client_hello)),
+                    ja4t: None,
+                    ja4x: None,
+                    ja4l: None,
+                    sni: client_hello.sni.map(str::to_ascii_lowercase),
+                };
                 let tls_stream = tokio_rustls::server::StartHandshake::from_parts(accepted, stream)
                     .into_stream(tls_acceptor.config().clone())
                     .await?;
-                return Ok((tls_stream, tls_ja4));
+                return Ok((tls_stream, fingerprints));
             }
             Ok(None) => {}
             Err((error, _alert)) => {
@@ -154,7 +212,7 @@ fn invalid_client_hello(message: impl Into<String>) -> io::Error {
 
 fn parse_tls_client_hello_records(input: &[u8]) -> ClientHelloRecordParse {
     let mut offset = 0;
-    let mut handshake = Vec::new();
+    let mut handshake = Vec::with_capacity(input.len().min(MAX_HANDSHAKE_BYTES));
     let mut expected_handshake_len = None;
 
     loop {
@@ -194,7 +252,7 @@ fn parse_tls_client_hello_records(input: &[u8]) -> ClientHelloRecordParse {
     }
 }
 
-fn parse_client_hello(handshake: &[u8]) -> Option<ClientHelloData> {
+fn parse_client_hello(handshake: &[u8]) -> Option<ClientHelloData<'_>> {
     if handshake.len() < 4 || handshake[0] != TLS_CLIENT_HELLO_HANDSHAKE {
         return None;
     }
@@ -211,57 +269,28 @@ fn parse_client_hello(handshake: &[u8]) -> Option<ClientHelloData> {
     if cipher_suites_len % 2 != 0 {
         return None;
     }
-    let mut cipher_suites = Vec::with_capacity(cipher_suites_len / 2);
-    for _ in 0..cipher_suites_len / 2 {
-        cipher_suites.push(reader.read_u16()?);
-    }
+    let cipher_suites = reader.read_exact(cipher_suites_len)?;
 
     let compression_methods_len = reader.read_u8()? as usize;
     reader.skip(compression_methods_len)?;
-
-    let mut extensions = Vec::new();
-    let mut supported_versions = Vec::new();
-    let mut signature_algorithms = Vec::new();
-    let mut alpn_protocols = Vec::new();
 
     if reader.remaining() == 0 {
         return Some(ClientHelloData {
             legacy_version,
             cipher_suites,
-            extensions,
-            supported_versions,
-            signature_algorithms,
-            alpn_protocols,
+            extensions: &[],
+            supported_versions: None,
+            signature_algorithms: None,
+            supported_groups: None,
+            ec_point_formats: None,
+            alpn_protocols: None,
+            sni: None,
         });
     }
 
     let extensions_len = reader.read_u16()? as usize;
-    let extensions_end = reader.offset.checked_add(extensions_len)?;
-    if extensions_end > body.len() {
-        return None;
-    }
-
-    while reader.offset < extensions_end {
-        let extension_type = reader.read_u16()?;
-        let extension_len = reader.read_u16()? as usize;
-        let extension_data = reader.read_exact(extension_len)?;
-
-        extensions.push(extension_type);
-        match extension_type {
-            TLS_EXTENSION_SUPPORTED_VERSIONS => {
-                supported_versions = parse_supported_versions(extension_data);
-            }
-            TLS_EXTENSION_SIGNATURE_ALGORITHMS => {
-                signature_algorithms = parse_u16_vector(extension_data);
-            }
-            TLS_EXTENSION_ALPN => {
-                alpn_protocols = parse_alpn_protocols(extension_data);
-            }
-            _ => {}
-        }
-    }
-
-    if reader.offset != extensions_end {
+    let extensions = reader.read_exact(extensions_len)?;
+    if reader.remaining() != 0 || !valid_extensions(extensions) {
         return None;
     }
 
@@ -269,69 +298,97 @@ fn parse_client_hello(handshake: &[u8]) -> Option<ClientHelloData> {
         legacy_version,
         cipher_suites,
         extensions,
-        supported_versions,
-        signature_algorithms,
-        alpn_protocols,
+        supported_versions: extension_data(extensions, TLS_EXTENSION_SUPPORTED_VERSIONS),
+        signature_algorithms: extension_data(extensions, TLS_EXTENSION_SIGNATURE_ALGORITHMS),
+        supported_groups: extension_data(extensions, TLS_EXTENSION_SUPPORTED_GROUPS),
+        ec_point_formats: extension_data(extensions, TLS_EXTENSION_EC_POINT_FORMATS),
+        alpn_protocols: extension_data(extensions, TLS_EXTENSION_ALPN),
+        sni: extension_data(extensions, TLS_EXTENSION_SERVER_NAME).and_then(parse_sni),
     })
 }
 
-fn parse_supported_versions(data: &[u8]) -> Vec<u16> {
-    let Some((&len, versions)) = data.split_first() else {
-        return Vec::new();
-    };
-    parse_u16_list(versions.get(..len as usize).unwrap_or_default())
-}
-
-fn parse_u16_vector(data: &[u8]) -> Vec<u16> {
-    if data.len() < 2 {
-        return Vec::new();
-    }
-    let len = u16::from_be_bytes([data[0], data[1]]) as usize;
-    parse_u16_list(data.get(2..2 + len).unwrap_or_default())
-}
-
-fn parse_u16_list(data: &[u8]) -> Vec<u16> {
-    data.chunks_exact(2)
-        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
-        .collect()
-}
-
-fn parse_alpn_protocols(data: &[u8]) -> Vec<Vec<u8>> {
-    if data.len() < 2 {
-        return Vec::new();
-    }
-    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-    let Some(list) = data.get(2..2 + list_len) else {
-        return Vec::new();
-    };
-
-    let mut protocols = Vec::new();
-    let mut offset = 0;
-    while offset < list.len() {
-        let len = list[offset] as usize;
-        offset += 1;
-        let Some(protocol) = list.get(offset..offset + len) else {
-            return Vec::new();
+fn valid_extensions(data: &[u8]) -> bool {
+    let mut reader = Reader::new(data);
+    while reader.remaining() != 0 {
+        let Some(_) = reader.read_u16() else {
+            return false;
         };
-        offset += len;
-        protocols.push(protocol.to_vec());
+        let Some(len) = reader.read_u16() else {
+            return false;
+        };
+        if reader.skip(len as usize).is_none() {
+            return false;
+        }
     }
-    protocols
+    true
 }
 
-fn ja4_from_client_hello(hello: &ClientHelloData) -> String {
+fn extension_data(extensions: &[u8], wanted: u16) -> Option<&[u8]> {
+    let mut reader = Reader::new(extensions);
+    let mut result = None;
+    while reader.remaining() != 0 {
+        let extension_type = reader.read_u16()?;
+        let extension_len = reader.read_u16()? as usize;
+        let extension_data = reader.read_exact(extension_len)?;
+        if extension_type == wanted {
+            result = Some(extension_data);
+        }
+    }
+    result
+}
+
+fn extension_types(extensions: &[u8], exclude: Option<u16>) -> Vec<u16> {
+    let mut reader = Reader::new(extensions);
+    let mut types = Vec::with_capacity(extensions.len() / 4);
+    while reader.remaining() != 0 {
+        let extension_type = reader.read_u16().expect("validated extension type");
+        let extension_len = reader.read_u16().expect("validated extension length");
+        reader
+            .skip(extension_len as usize)
+            .expect("validated extension data");
+        if Some(extension_type) != exclude {
+            types.push(extension_type);
+        }
+    }
+    types
+}
+
+fn u16_vector(data: Option<&[u8]>) -> &[u8] {
+    let Some(data) = data else { return &[] };
+    let Some(length) = data.get(..2) else {
+        return &[];
+    };
+    let length = usize::from(u16::from_be_bytes([length[0], length[1]]));
+    data.get(2..2 + length)
+        .filter(|values| values.len() % 2 == 0)
+        .unwrap_or_default()
+}
+
+fn parse_sni(data: &[u8]) -> Option<&str> {
+    let list_len = usize::from(u16::from_be_bytes([*data.first()?, *data.get(1)?]));
+    let list = data.get(2..2 + list_len)?;
+    let mut reader = Reader::new(list);
+    while reader.remaining() > 0 {
+        let name_type = reader.read_u8()?;
+        let name_len = reader.read_u16()? as usize;
+        let name = reader.read_exact(name_len)?;
+        if name_type == 0 {
+            let name = std::str::from_utf8(name).ok()?;
+            return (!name.is_empty()).then_some(name);
+        }
+    }
+    None
+}
+
+fn ja4_from_client_hello(hello: &ClientHelloData<'_>) -> String {
     let version = ja4_tls_version(hello);
-    let cipher_suites = non_grease_sorted(&hello.cipher_suites);
-    let extensions = non_grease_sorted(
-        &hello
-            .extensions
-            .iter()
-            .filter(|extension| **extension != TLS_EXTENSION_SERVER_NAME)
-            .copied()
-            .collect::<Vec<_>>(),
-    );
-    let signature_algorithms = non_grease_sorted(&hello.signature_algorithms);
-    let alpn = ja4_alpn(&hello.alpn_protocols);
+    let cipher_suites = non_grease_sorted_bytes(hello.cipher_suites);
+    let extensions = non_grease_sorted(&extension_types(
+        hello.extensions,
+        Some(TLS_EXTENSION_SERVER_NAME),
+    ));
+    let signature_algorithms = non_grease_sorted_bytes(u16_vector(hello.signature_algorithms));
+    let alpn = ja4_alpn(hello.alpn_protocols);
 
     let cipher_hash = sha256_12_hex(&format_u16_list(&cipher_suites));
     let extension_hash_input = format!(
@@ -352,12 +409,25 @@ fn ja4_from_client_hello(hello: &ClientHelloData) -> String {
     )
 }
 
-fn ja4_tls_version(hello: &ClientHelloData) -> String {
-    let version = hello
-        .supported_versions
-        .iter()
-        .filter(|version| !is_grease(**version))
-        .copied()
+fn ja3_from_client_hello(hello: &ClientHelloData<'_>) -> String {
+    format!(
+        "{},{},{},{},{}",
+        hello.legacy_version,
+        format_u16_decimal_bytes(hello.cipher_suites),
+        format_u16_decimal_list(&non_grease_in_order(&extension_types(
+            hello.extensions,
+            Some(TLS_EXTENSION_SERVER_NAME),
+        ))),
+        format_u16_decimal_bytes(u16_vector(hello.supported_groups)),
+        format_u8_decimal_list(u8_vector(hello.ec_point_formats)),
+    )
+}
+
+fn ja4_tls_version(hello: &ClientHelloData<'_>) -> String {
+    let version = supported_versions(hello.supported_versions)
+        .chunks_exact(2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+        .filter(|version| !is_grease(*version))
         .max()
         .unwrap_or(hello.legacy_version);
 
@@ -370,22 +440,20 @@ fn ja4_tls_version(hello: &ClientHelloData) -> String {
     }
 }
 
-fn ja4_alpn(protocols: &[Vec<u8>]) -> String {
-    let Some(protocol) = protocols.first() else {
+fn ja4_alpn(data: Option<&[u8]>) -> String {
+    let Some(protocol) = first_alpn_protocol(data) else {
         return "00".to_owned();
     };
-    let alnum: Vec<char> = protocol
+    let mut alphanumeric = protocol
         .iter()
-        .filter(|byte| byte.is_ascii_alphanumeric())
         .copied()
-        .map(|byte| (byte as char).to_ascii_lowercase())
-        .collect();
-
-    match alnum.as_slice() {
-        [] => "00".to_owned(),
-        [single] => format!("{single}{single}"),
-        [first, .., last] => format!("{first}{last}"),
-    }
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|byte| byte.to_ascii_lowercase());
+    let Some(first) = alphanumeric.next() else {
+        return "00".to_owned();
+    };
+    let last = alphanumeric.last().unwrap_or(first);
+    String::from_utf8(vec![first, last]).expect("ASCII ALPN characters")
 }
 
 fn non_grease_sorted(values: &[u16]) -> Vec<u16> {
@@ -398,16 +466,101 @@ fn non_grease_sorted(values: &[u16]) -> Vec<u16> {
     values
 }
 
+fn non_grease_in_order(values: &[u16]) -> Vec<u16> {
+    values
+        .iter()
+        .filter(|value| !is_grease(**value))
+        .copied()
+        .collect()
+}
+
+fn non_grease_sorted_bytes(values: &[u8]) -> Vec<u16> {
+    let mut values = values
+        .chunks_exact(2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+        .filter(|value| !is_grease(*value))
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values
+}
+
 fn is_grease(value: u16) -> bool {
     (value & 0x0f0f) == 0x0a0a && (value >> 8) == (value & 0x00ff)
 }
 
 fn format_u16_list(values: &[u16]) -> String {
+    let mut output = String::with_capacity(values.len().saturating_mul(5));
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        write!(output, "{value:04x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+fn format_u16_decimal_list(values: &[u16]) -> String {
+    let mut output = String::new();
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            output.push('-');
+        }
+        write!(output, "{value}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+fn format_u16_decimal_bytes(values: &[u8]) -> String {
+    let mut output = String::new();
+    for value in values
+        .chunks_exact(2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+        .filter(|value| !is_grease(*value))
+    {
+        if !output.is_empty() {
+            output.push('-');
+        }
+        write!(output, "{value}").expect("writing to String cannot fail");
+    }
+    output
+}
+
+fn u8_vector(data: Option<&[u8]>) -> &[u8] {
+    let Some(data) = data else { return &[] };
+    let Some((&length, values)) = data.split_first() else {
+        return &[];
+    };
+    values.get(..usize::from(length)).unwrap_or_default()
+}
+
+fn supported_versions(data: Option<&[u8]>) -> &[u8] {
+    let Some(data) = data else { return &[] };
+    let Some((&length, values)) = data.split_first() else {
+        return &[];
+    };
     values
-        .iter()
-        .map(|value| format!("{value:04x}"))
-        .collect::<Vec<_>>()
-        .join(",")
+        .get(..usize::from(length))
+        .filter(|versions| versions.len() % 2 == 0)
+        .unwrap_or_default()
+}
+
+fn first_alpn_protocol(data: Option<&[u8]>) -> Option<&[u8]> {
+    let data = data?;
+    let length = usize::from(u16::from_be_bytes([*data.first()?, *data.get(1)?]));
+    let list = data.get(2..2 + length)?;
+    let (&protocol_length, protocol) = list.split_first()?;
+    protocol.get(..usize::from(protocol_length))
+}
+
+fn format_u8_decimal_list(values: &[u8]) -> String {
+    let mut output = String::new();
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            output.push('-');
+        }
+        write!(output, "{value}").expect("writing to String cannot fail");
+    }
+    output
 }
 
 fn sha256_12_hex(input: &str) -> String {
@@ -417,6 +570,63 @@ fn sha256_12_hex(input: &str) -> String {
 
 fn read_u24(bytes: &[u8]) -> usize {
     ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize
+}
+
+/// Return the JA4X construction fingerprint for one DER X.509 certificate.
+///
+/// JA4X deliberately excludes attribute and extension values; it fingerprints
+/// the ordered issuer RDN OIDs, subject RDN OIDs, and extension OIDs instead.
+pub(crate) fn ja4x_from_certificate(certificate_der: &[u8]) -> Option<String> {
+    let (_, certificate) = parse_x509_certificate(certificate_der).ok()?;
+    let issuer = certificate
+        .issuer()
+        .iter_attributes()
+        .map(|attribute| oid_content_hex(attribute.attr_type().to_id_string()))
+        .collect::<Option<Vec<_>>>()?;
+    let subject = certificate
+        .subject()
+        .iter_attributes()
+        .map(|attribute| oid_content_hex(attribute.attr_type().to_id_string()))
+        .collect::<Option<Vec<_>>>()?;
+    let extensions = certificate
+        .extensions()
+        .iter()
+        .map(|extension| oid_content_hex(extension.oid.to_id_string()))
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!(
+        "{}_{}_{}",
+        sha256_12_hex(&issuer.join(",")),
+        sha256_12_hex(&subject.join(",")),
+        sha256_12_hex(&extensions.join(","))
+    ))
+}
+
+fn oid_content_hex(oid: String) -> Option<String> {
+    let mut arcs = oid.split('.').map(str::parse::<u64>);
+    let first = arcs.next()?.ok()?;
+    let second = arcs.next()?.ok()?;
+    if first > 2 || (first < 2 && second > 39) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    encode_base128(first * 40 + second, &mut bytes);
+    for arc in arcs {
+        encode_base128(arc.ok()?, &mut bytes);
+    }
+    Some(hex::encode(bytes))
+}
+
+fn encode_base128(value: u64, output: &mut Vec<u8>) {
+    let mut bytes = [0u8; 10];
+    let mut start = bytes.len() - 1;
+    bytes[start] = (value & 0x7f) as u8;
+    let mut remaining = value >> 7;
+    while remaining != 0 {
+        start -= 1;
+        bytes[start] = ((remaining & 0x7f) as u8) | 0x80;
+        remaining >>= 7;
+    }
+    output.extend_from_slice(&bytes[start..]);
 }
 
 #[cfg(test)]
@@ -498,6 +708,37 @@ mod tests {
             ja4_from_client_hello(&without_sni),
             ja4_from_client_hello(&with_sni)
         );
+        assert_eq!(
+            ja3_from_client_hello(&without_sni),
+            ja3_from_client_hello(&with_sni)
+        );
+    }
+
+    #[test]
+    fn ja3_uses_ordered_non_grease_tls_parameters() {
+        let hello = test_client_hello(vec![
+            (TLS_EXTENSION_SUPPORTED_GROUPS, vec![0x00, 0x02, 0x00, 0x17]),
+            (TLS_EXTENSION_EC_POINT_FORMATS, vec![0x01, 0x00]),
+        ]);
+        let hello = parse_client_hello(&hello).expect("parse ClientHello");
+
+        assert_eq!(ja3_from_client_hello(&hello), "771,4865-4866,10-11,23,0");
+    }
+
+    #[test]
+    fn ja4x_ignores_certificate_attribute_values() {
+        let first = rcgen::generate_simple_self_signed(vec!["first.example".to_owned()])
+            .expect("generate first certificate");
+        let second = rcgen::generate_simple_self_signed(vec!["second.example".to_owned()])
+            .expect("generate second certificate");
+
+        let first = ja4x_from_certificate(first.cert.der()).expect("first JA4X");
+        let second = ja4x_from_certificate(second.cert.der()).expect("second JA4X");
+        assert_eq!(first, second);
+        assert!(
+            first.split('_').all(|part| part.len() == 12),
+            "JA4X must contain three 12-character SHA-256 prefixes: {first}"
+        );
     }
 
     #[tokio::test]
@@ -526,14 +767,15 @@ mod tests {
         let client_connector = TlsConnector::from(Arc::new(client_config));
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server_handshake = accept_tls_with_ja4(server_io, &server_acceptor);
+        let server_handshake = accept_tls_with_fingerprints(server_io, &server_acceptor);
         let client_handshake = client_connector.connect(
             ServerName::try_from("localhost").expect("static server name"),
             FragmentingIo::new(client_io, 1),
         );
         let (server_result, client_result) = tokio::join!(server_handshake, client_handshake);
 
-        let (_server_tls, tls_ja4) = server_result.expect("server TLS handshake");
+        let (_server_tls, fingerprints) = server_result.expect("server TLS handshake");
+        let tls_ja4 = fingerprints.ja4.expect("JA4");
         let _client_tls = client_result.expect("client TLS handshake");
         assert!(
             tls_ja4.starts_with("t13x"),

@@ -890,7 +890,11 @@ impl ClientRepository {
             udp_address,
             local_address,
             connection,
-            tls_ja4,
+            crate::tls_fingerprint::TlsFingerprints {
+                ja4: tls_ja4,
+                ..crate::tls_fingerprint::TlsFingerprints::default()
+            },
+            None,
             uses_proxy_protocol,
             server_tracing_span,
         )
@@ -905,7 +909,8 @@ impl ClientRepository {
         udp_address: Option<SocketAddr>,
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
-        tls_ja4: Option<String>,
+        tls_fingerprints: crate::tls_fingerprint::TlsFingerprints,
+        proxy_server_address: Option<SocketAddr>,
         uses_proxy_protocol: bool,
         server_tracing_span: tracing::Span,
     ) -> Arc<Box<Client>> {
@@ -925,7 +930,8 @@ impl ClientRepository {
             udp_address,
             local_address,
             connection,
-            tls_ja4,
+            tls_fingerprints,
+            proxy_server_address,
             uses_proxy_protocol,
             server_tracing_span,
             client_instance_id,

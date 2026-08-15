@@ -42,6 +42,7 @@ use crate::{
     errors::{ReadProtoMessageError, WriteProtoMessageError},
     messages::{Message, ReadMessageExt, WriteMessageExt, encoder as msg_encoder},
     protocol_version::ProtocolVersion,
+    tls_fingerprint::{TlsFingerprints, ja4x_from_certificate},
     types::{DEFAULT_SERVER_ID, ScopedSessionId},
     voice::VoiceRoutingPayload,
 };
@@ -409,8 +410,7 @@ fn client_tracing_span(
     server_tracing_span: &tracing::Span,
     session_id: ClientSessionIdentifier,
     certificate_hash: Option<&str>,
-    tls_ja4: Option<&str>,
-    connection_sni: Option<&str>,
+    tls_fingerprints: &TlsFingerprints,
     real_ip_address: IpAddr,
     tcp_address: SocketAddr,
     local_address: SocketAddr,
@@ -418,7 +418,11 @@ fn client_tracing_span(
     let span = tracing::info_span!(parent: server_tracing_span,
         "client",
         client_cert_hash = tracing::field::Empty,
+        client_tls_ja3 = tracing::field::Empty,
         client_tls_ja4 = tracing::field::Empty,
+        client_tls_ja4t = tracing::field::Empty,
+        client_tls_ja4x = tracing::field::Empty,
+        client_tls_ja4l = tracing::field::Empty,
         client_connection_sni = tracing::field::Empty,
         client_real_ip = %real_ip_address,
         client_connection_remote_ip = %tcp_address.ip(),
@@ -434,11 +438,23 @@ fn client_tracing_span(
     if let Some(certificate_hash) = certificate_hash {
         span.record("client_cert_hash", certificate_hash);
     }
-    if let Some(tls_ja4) = tls_ja4 {
+    if let Some(tls_ja3) = tls_fingerprints.ja3.as_deref() {
+        span.record("client_tls_ja3", tls_ja3);
+    }
+    if let Some(tls_ja4) = tls_fingerprints.ja4.as_deref() {
         span.record("client_tls_ja4", tls_ja4);
     }
-    if let Some(connection_sni) = connection_sni {
-        span.record("client_connection_sni", connection_sni);
+    if let Some(tls_ja4t) = tls_fingerprints.ja4t.as_deref() {
+        span.record("client_tls_ja4t", tls_ja4t);
+    }
+    if let Some(tls_ja4x) = tls_fingerprints.ja4x.as_deref() {
+        span.record("client_tls_ja4x", tls_ja4x);
+    }
+    if let Some(tls_ja4l) = tls_fingerprints.ja4l.as_deref() {
+        span.record("client_tls_ja4l", tls_ja4l);
+    }
+    if let Some(tls_sni) = tls_fingerprints.sni.as_deref() {
+        span.record("client_connection_sni", tls_sni);
     }
     span
 }
@@ -472,7 +488,8 @@ pub struct Client {
     /// bind/unbind paths write it only on rare events.
     udp_address: ParkingRwLock<Option<SocketAddr>>,
     local_address: SocketAddr,
-    tls_ja4: Option<String>,
+    tls_fingerprints: TlsFingerprints,
+    proxy_server_address: Option<SocketAddr>,
     uses_proxy_protocol: bool,
     server_tracing_span: tracing::Span,
     tracing_span: tracing::Span,
@@ -622,7 +639,11 @@ impl Client {
             udp_address,
             local_address,
             connection,
-            tls_ja4,
+            TlsFingerprints {
+                ja4: tls_ja4,
+                ..TlsFingerprints::default()
+            },
+            None,
             uses_proxy_protocol,
             server_tracing_span,
             next_client_instance_id(session_id.get_node_id()),
@@ -637,7 +658,8 @@ impl Client {
         udp_address: Option<SocketAddr>,
         local_address: SocketAddr,
         connection: TlsStream<TcpStream>,
-        tls_ja4: Option<String>,
+        mut tls_fingerprints: TlsFingerprints,
+        proxy_server_address: Option<SocketAddr>,
         uses_proxy_protocol: bool,
         server_tracing_span: tracing::Span,
         client_instance_id: ClientInstanceId,
@@ -661,6 +683,10 @@ impl Client {
             (certificate_hash, certificate_chain, is_verified)
         };
         let connection_sni = connection.get_ref().1.server_name().map(ToOwned::to_owned);
+        tls_fingerprints.sni = connection_sni.clone().or(tls_fingerprints.sni);
+        tls_fingerprints.ja4x = certificate_chain
+            .first()
+            .and_then(|certificate| ja4x_from_certificate(certificate.as_ref()));
 
         let now = Utc::now();
         let certificate_hash_hex = certificate_hash.as_deref().map(hex::encode);
@@ -681,8 +707,7 @@ impl Client {
             &server_tracing_span,
             session_id,
             certificate_hash_hex.as_deref(),
-            tls_ja4.as_deref(),
-            connection_sni.as_deref(),
+            &tls_fingerprints,
             real_ip_address,
             tcp_address,
             local_address,
@@ -696,7 +721,8 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
             local_address,
-            tls_ja4,
+            tls_fingerprints,
+            proxy_server_address,
             uses_proxy_protocol,
             server_tracing_span,
             tracing_span,
@@ -870,8 +896,7 @@ impl Client {
             &server_tracing_span,
             session_id,
             None,
-            None,
-            None,
+            &TlsFingerprints::default(),
             real_ip_address,
             tcp_address,
             local_address,
@@ -885,7 +910,8 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(None),
             local_address,
-            tls_ja4: None,
+            tls_fingerprints: TlsFingerprints::default(),
+            proxy_server_address: None,
             uses_proxy_protocol: false,
             server_tracing_span,
             tracing_span,
@@ -975,8 +1001,7 @@ impl Client {
             &server_tracing_span,
             session_id,
             certificate_hash_hex.as_deref(),
-            None,
-            None,
+            &TlsFingerprints::default(),
             real_ip_address,
             tcp_address,
             local_address,
@@ -990,7 +1015,8 @@ impl Client {
             tcp_address,
             udp_address: ParkingRwLock::new(udp_address),
             local_address,
-            tls_ja4: None,
+            tls_fingerprints: TlsFingerprints::default(),
+            proxy_server_address: None,
             uses_proxy_protocol: false,
             server_tracing_span,
             tracing_span,
@@ -1417,7 +1443,31 @@ impl Client {
     }
 
     pub fn tls_ja4(&self) -> Option<&str> {
-        self.tls_ja4.as_deref()
+        self.tls_fingerprints.ja4.as_deref()
+    }
+
+    pub fn tls_ja3(&self) -> Option<&str> {
+        self.tls_fingerprints.ja3.as_deref()
+    }
+
+    pub fn tls_ja4t(&self) -> Option<&str> {
+        self.tls_fingerprints.ja4t.as_deref()
+    }
+
+    pub fn tls_ja4x(&self) -> Option<&str> {
+        self.tls_fingerprints.ja4x.as_deref()
+    }
+
+    pub fn tls_ja4l(&self) -> Option<&str> {
+        self.tls_fingerprints.ja4l.as_deref()
+    }
+
+    pub fn tls_sni(&self) -> Option<&str> {
+        self.tls_fingerprints.sni.as_deref()
+    }
+
+    pub fn proxy_server_address(&self) -> Option<SocketAddr> {
+        self.proxy_server_address
     }
 
     pub fn uses_proxy_protocol(&self) -> bool {

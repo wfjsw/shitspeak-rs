@@ -896,6 +896,7 @@ impl Server {
             None
         };
         let uses_proxy_protocol = proxy_connection.is_some();
+        let proxy_server_address = uses_proxy_protocol.then_some(remote_addr);
         let client_addr = proxy_connection
             .and_then(|info| info.client_address())
             .map(|addr| SocketAddr::new(addr.ip(), addr.port()))
@@ -942,23 +943,43 @@ impl Server {
         // A slow/failed TLS handshake must not hold a connection slot (and a
         // task) indefinitely: cap ClientHello capture and the TLS handshake
         // together with one deadline.
-        let (tls_stream, tls_ja4) = tokio::time::timeout(
+        let (tls_stream, mut tls_fingerprints) = tokio::time::timeout(
             crate::rate_limits::TLS_HANDSHAKE_TIMEOUT,
-            crate::tls_fingerprint::accept_tls_with_ja4(tcp_stream, &tls_acceptor),
+            crate::tls_fingerprint::accept_tls_with_fingerprints(tcp_stream, &tls_acceptor),
         )
         .await
         .map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out")
         })??;
+        // Packet capture observes the physical TCP peer, not the address
+        // asserted by a PROXY-protocol header. Never attribute the proxy's
+        // TCP traits to the logical proxied client.
+        if !uses_proxy_protocol
+            && let Some(metadata) = self.tcp_packet_metadata(remote_addr, local_addr)
+        {
+            tls_fingerprints.ja4t = Some(metadata.ja4t().to_owned());
+            tls_fingerprints.ja4l = metadata.ja4l().map(ToOwned::to_owned);
+        }
+        tls_fingerprints.ja4x = tls_stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certificates| certificates.first())
+            .and_then(|certificate| {
+                crate::tls_fingerprint::ja4x_from_certificate(certificate.as_ref())
+            });
         // Certificate hashes are rejected by the Rustls verifier during the
         // handshake. The JA4 fingerprint is available once ClientHello
         // capture completes, so reject that identity criterion before the
         // stream is routed or a native client is allocated.
-        if self.get_bans().is_identity_banned(None, Some(&tls_ja4)) {
+        if self
+            .get_bans()
+            .is_identity_banned(None, tls_fingerprints.ja4.as_deref())
+        {
             tracing::info!(
                 %remote_addr,
                 %real_ip,
-                tls_ja4,
+                tls_ja4 = ?tls_fingerprints.ja4,
                 "connection from banned TLS JA4 fingerprint closed after TLS handshake"
             );
             return Ok(());
@@ -970,7 +991,12 @@ impl Server {
             %client_addr,
             %local_addr,
             alpn = ?tls_stream.get_ref().1.alpn_protocol().map(String::from_utf8_lossy),
-            tls_ja4 = ?tls_ja4,
+            tls_ja3 = ?tls_fingerprints.ja3,
+            tls_ja4 = ?tls_fingerprints.ja4,
+            tls_ja4t = ?tls_fingerprints.ja4t,
+            tls_ja4x = ?tls_fingerprints.ja4x,
+            tls_ja4l = ?tls_fingerprints.ja4l,
+            tls_sni = ?tls_fingerprints.sni,
             "TLS handshake completed"
         );
         let negotiated_alpn = tls_stream.get_ref().1.alpn_protocol().map(Vec::from);
@@ -983,7 +1009,7 @@ impl Server {
                     client_addr,
                     local_addr,
                     server_id,
-                    Some(tls_ja4),
+                    tls_fingerprints,
                     uses_proxy_protocol,
                 );
                 if let Some(handler) = self.extensions.handle_c2s_alpn_stream(
@@ -1016,7 +1042,8 @@ impl Server {
             local_addr,
             server_id,
             server_span,
-            Some(tls_ja4),
+            tls_fingerprints,
+            proxy_server_address,
             uses_proxy_protocol,
         )
         .await
@@ -1056,7 +1083,8 @@ impl Server {
         local_addr: std::net::SocketAddr,
         server_id: String,
         server_span: tracing::Span,
-        tls_ja4: Option<String>,
+        tls_fingerprints: crate::tls_fingerprint::TlsFingerprints,
+        proxy_server_address: Option<std::net::SocketAddr>,
         uses_proxy_protocol: bool,
     ) -> Result<(), HandleIncomingConnectionError> {
         let authenticate_timeout =
@@ -1083,7 +1111,8 @@ impl Server {
                 None,
                 local_addr,
                 tls_stream,
-                tls_ja4,
+                tls_fingerprints,
+                proxy_server_address,
                 uses_proxy_protocol,
                 server_span,
             )

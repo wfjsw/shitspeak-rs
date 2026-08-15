@@ -9,6 +9,7 @@ pub mod voice;
 
 use std::sync::Arc;
 
+use crate::session::WebTlsMetadata;
 use shitspeak_runtime::errors::HandleIncomingConnectionError;
 use shitspeak_runtime::server::{
     AlpnConnectionInfo, Server, ServerExtension, ServerExtensionFuture, ServerExtensions,
@@ -83,7 +84,14 @@ impl ServerExtension for WebServerExtension {
                     info.real_ip(),
                     info.client_addr(),
                     info.local_addr(),
-                    info.tls_ja4().map(ToOwned::to_owned),
+                    WebTlsMetadata::new(
+                        info.tls_ja3().map(ToOwned::to_owned),
+                        info.tls_ja4().map(ToOwned::to_owned),
+                        info.tls_ja4t().map(ToOwned::to_owned),
+                        info.tls_ja4x().map(ToOwned::to_owned),
+                        info.tls_ja4l().map(ToOwned::to_owned),
+                        info.tls_sni().map(ToOwned::to_owned),
+                    ),
                     info.uses_proxy_protocol(),
                 )
                 .await

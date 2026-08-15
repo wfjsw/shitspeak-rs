@@ -22,6 +22,55 @@ use shitspeak_runtime::server::Server;
 use shitspeak_runtime::types::DEFAULT_SERVER_ID;
 use shitspeak_runtime_config::{WebAuthMode, WebConfig};
 
+#[derive(Clone, Default)]
+pub struct WebTlsMetadata {
+    ja3: Option<String>,
+    ja4: Option<String>,
+    ja4t: Option<String>,
+    ja4x: Option<String>,
+    ja4l: Option<String>,
+    sni: Option<String>,
+}
+
+impl WebTlsMetadata {
+    pub fn new(
+        ja3: Option<String>,
+        ja4: Option<String>,
+        ja4t: Option<String>,
+        ja4x: Option<String>,
+        ja4l: Option<String>,
+        sni: Option<String>,
+    ) -> Self {
+        Self {
+            ja3,
+            ja4,
+            ja4t,
+            ja4x,
+            ja4l,
+            sni,
+        }
+    }
+
+    pub(crate) fn ja3(&self) -> Option<&str> {
+        self.ja3.as_deref()
+    }
+    pub(crate) fn ja4(&self) -> Option<&str> {
+        self.ja4.as_deref()
+    }
+    pub(crate) fn ja4t(&self) -> Option<&str> {
+        self.ja4t.as_deref()
+    }
+    pub(crate) fn ja4x(&self) -> Option<&str> {
+        self.ja4x.as_deref()
+    }
+    pub(crate) fn ja4l(&self) -> Option<&str> {
+        self.ja4l.as_deref()
+    }
+    pub(crate) fn sni(&self) -> Option<&str> {
+        self.sni.as_deref()
+    }
+}
+
 #[derive(Clone)]
 pub struct WebSessionContext {
     config: WebConfig,
@@ -31,7 +80,7 @@ pub struct WebSessionContext {
     real_ip: IpAddr,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
-    tls_ja4: Option<String>,
+    tls_metadata: WebTlsMetadata,
     uses_proxy_protocol: bool,
 }
 
@@ -44,7 +93,7 @@ impl WebSessionContext {
         real_ip: IpAddr,
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
-        tls_ja4: Option<String>,
+        tls_metadata: WebTlsMetadata,
         uses_proxy_protocol: bool,
     ) -> Self {
         Self {
@@ -56,7 +105,7 @@ impl WebSessionContext {
             real_ip,
             peer_addr,
             local_addr,
-            tls_ja4,
+            tls_metadata,
             uses_proxy_protocol,
         }
     }
@@ -87,7 +136,15 @@ impl WebSessionContext {
             certificate_hash: None,
             session_id,
             ip_address: canonical_authenticator_ip(self.real_ip),
-            tls_ja4: self.tls_ja4.clone(),
+            tls_ja3: self.tls_metadata.ja3.clone(),
+            tls_ja4: self.tls_metadata.ja4.clone(),
+            tls_ja4t: self.tls_metadata.ja4t.clone(),
+            tls_ja4x: self.tls_metadata.ja4x.clone(),
+            tls_ja4l: self.tls_metadata.ja4l.clone(),
+            tls_sni: self.tls_metadata.sni.clone(),
+            proxy_server_address: None,
+            packet_capture_backends: Vec::new(),
+            packet_capture_backend: None,
             uses_proxy_protocol: self.uses_proxy_protocol,
             version: None,
             client_name: Some("shitspeak-web".to_string()),
@@ -230,6 +287,43 @@ impl WebSessionContext {
             }
         };
         Some((server, client))
+    }
+}
+
+#[cfg(test)]
+mod tls_metadata_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn auxiliary_data_preserves_all_tls_fingerprints() {
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        let context = WebSessionContext::new(
+            WebConfig::default(),
+            None,
+            None,
+            None,
+            address.ip(),
+            address,
+            address,
+            WebTlsMetadata::new(
+                Some("ja3".to_owned()),
+                Some("ja4".to_owned()),
+                Some("ja4t".to_owned()),
+                Some("ja4x".to_owned()),
+                Some("ja4l".to_owned()),
+                Some("voice.example.test".to_owned()),
+            ),
+            false,
+        );
+
+        let auxiliary = context.auxiliary_data(7);
+        assert_eq!(auxiliary.tls_ja3.as_deref(), Some("ja3"));
+        assert_eq!(auxiliary.tls_ja4.as_deref(), Some("ja4"));
+        assert_eq!(auxiliary.tls_ja4t.as_deref(), Some("ja4t"));
+        assert_eq!(auxiliary.tls_ja4x.as_deref(), Some("ja4x"));
+        assert_eq!(auxiliary.tls_ja4l.as_deref(), Some("ja4l"));
+        assert_eq!(auxiliary.tls_sni.as_deref(), Some("voice.example.test"));
     }
 }
 

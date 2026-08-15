@@ -205,6 +205,9 @@ pub struct Server {
     voice_dispatch_plan: VoiceDispatchPlan,
 
     allowed_proxies: Vec<AnyIpCidr>,
+    packet_capture_backends: Vec<String>,
+    packet_capture_backend: Option<String>,
+    tcp_packet_collector: Arc<crate::tcp_packet_collector::TcpPacketCollector>,
 
     tls_acceptor: ParkingRwLock<TlsAcceptor>,
     extensions: ServerExtensions,
@@ -355,6 +358,15 @@ impl Server {
         };
 
         let tls_acceptor = load_c2s_tls_acceptor(&config, &extensions, Arc::clone(&bans))?;
+        let packet_capture_backends = crate::tls_fingerprint::available_packet_capture_backends();
+        let tcp_packet_collector =
+            crate::tcp_packet_collector::TcpPacketCollector::start(&packet_capture_backends);
+        let packet_capture_backend = tcp_packet_collector.active_backend().map(ToOwned::to_owned);
+        tracing::info!(
+            packet_capture_backends = ?packet_capture_backends,
+            packet_capture_backend = ?packet_capture_backend,
+            "packet capture capability probe completed"
+        );
 
         let s2s_manager = Arc::new(S2SManager::initialize(&config));
         let geoip_config = config.geoip.clone();
@@ -372,6 +384,9 @@ impl Server {
             node_identifier: node_id,
             voice_dispatch_plan,
             allowed_proxies,
+            packet_capture_backends,
+            packet_capture_backend,
+            tcp_packet_collector,
             tls_acceptor: ParkingRwLock::new(tls_acceptor),
             extensions,
             entrypoints: Arc::new(ParkingRwLock::new(entrypoints)),
@@ -1836,7 +1851,15 @@ impl Server {
             certificate_hash: client.get_certificate_hash().map(Bytes::copy_from_slice),
             session_id: client.get_session_id().into(),
             ip_address: shitspeak_auth::canonical_authenticator_ip(client.get_real_ip_address()),
+            tls_ja3: client.tls_ja3().map(ToOwned::to_owned),
             tls_ja4: client.tls_ja4().map(ToOwned::to_owned),
+            tls_ja4t: client.tls_ja4t().map(ToOwned::to_owned),
+            tls_ja4x: client.tls_ja4x().map(ToOwned::to_owned),
+            tls_ja4l: client.tls_ja4l().map(ToOwned::to_owned),
+            tls_sni: client.tls_sni().map(ToOwned::to_owned),
+            proxy_server_address: client.proxy_server_address(),
+            packet_capture_backends: self.packet_capture_backends.clone(),
+            packet_capture_backend: self.packet_capture_backend.clone(),
             uses_proxy_protocol: client.uses_proxy_protocol(),
             version: client.protocol_version(),
             client_name,
@@ -2309,6 +2332,22 @@ impl Server {
 
     pub fn get_bans(&self) -> &Arc<shitspeak_state::BanRepository> {
         &self.bans
+    }
+
+    pub(crate) fn packet_capture_backends(&self) -> &[String] {
+        &self.packet_capture_backends
+    }
+
+    pub(crate) fn packet_capture_backend(&self) -> Option<&str> {
+        self.packet_capture_backend.as_deref()
+    }
+
+    pub(crate) fn tcp_packet_metadata(
+        &self,
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+    ) -> Option<crate::tcp_packet_collector::TcpPacketMetadata> {
+        self.tcp_packet_collector.lookup(source, destination)
     }
 
     pub fn auth_ip_rate_limiter(

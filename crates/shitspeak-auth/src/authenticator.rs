@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::net::SocketAddr;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -81,7 +82,24 @@ pub struct AuthenticateAuxiliaryData {
     pub certificate_hash: Option<Bytes>,
     pub session_id: u32,
     pub ip_address: IpAddr,
+    pub tls_ja3: Option<String>,
     pub tls_ja4: Option<String>,
+    /// TCP SYN fingerprint. This is unavailable when the listener cannot
+    /// observe the client's SYN packet (for example behind a TCP proxy).
+    pub tls_ja4t: Option<String>,
+    /// X.509 construction fingerprint of the presented client certificate.
+    pub tls_ja4x: Option<String>,
+    /// TCP distance/location fingerprint. This requires TCP packet metadata.
+    pub tls_ja4l: Option<String>,
+    /// The SNI name presented by the TLS client, when present.
+    pub tls_sni: Option<String>,
+    /// Transport address of the trusted PROXY-protocol peer. Present only
+    /// when the connection supplied and passed PROXY-protocol validation.
+    pub proxy_server_address: Option<SocketAddr>,
+    /// Ranked packet capture backends available to this server process.
+    pub packet_capture_backends: Vec<String>,
+    /// Packet capture backend selected at server startup, if it was activated.
+    pub packet_capture_backend: Option<String>,
     pub uses_proxy_protocol: bool,
     pub version: Option<ProtocolVersion>,
     pub client_name: Option<String>,

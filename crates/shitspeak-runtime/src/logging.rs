@@ -516,7 +516,11 @@ impl LokiFieldVisitor<'_> {
         !matches!(
             field.name(),
             "client_cert_hash"
+                | "client_tls_ja3"
                 | "client_tls_ja4"
+                | "client_tls_ja4t"
+                | "client_tls_ja4x"
+                | "client_tls_ja4l"
                 | "client_connection_sni"
                 | "client_real_ip"
                 | "client_connection_remote_ip"
@@ -1677,7 +1681,11 @@ node_id = 1
             let span = tracing::info_span!(
                 "client",
                 client_cert_hash = "certificate-hash",
+                client_tls_ja3 = "771,4865-4866,10-11,23,0",
                 client_tls_ja4 = "t13d1516h2_8daaf6152771_02713d6af862",
+                client_tls_ja4t = "64240_2-1-3-4_1460_8",
+                client_tls_ja4x = "aabbccddeeff_112233445566_778899aabbcc",
+                client_tls_ja4l = "125_57_150",
                 client_connection_sni = "voice.example.test",
                 client_real_ip = "203.0.113.8",
                 client_connection_remote_ip = "192.0.2.4",
@@ -1709,7 +1717,11 @@ node_id = 1
         );
         for (key, value) in [
             ("client_cert_hash", "certificate-hash"),
+            ("client_tls_ja3", "771,4865-4866,10-11,23,0"),
             ("client_tls_ja4", "t13d1516h2_8daaf6152771_02713d6af862"),
+            ("client_tls_ja4t", "64240_2-1-3-4_1460_8"),
+            ("client_tls_ja4x", "aabbccddeeff_112233445566_778899aabbcc"),
+            ("client_tls_ja4l", "125_57_150"),
             ("client_connection_sni", "voice.example.test"),
             ("client_real_ip", "203.0.113.8"),
             ("client_connection_remote_ip", "192.0.2.4"),
@@ -1740,7 +1752,11 @@ node_id = 1
         );
         for field in [
             "client_cert_hash",
+            "client_tls_ja3",
             "client_tls_ja4",
+            "client_tls_ja4t",
+            "client_tls_ja4x",
+            "client_tls_ja4l",
             "client_connection_sni",
             "client_real_ip",
             "client_connection_remote_ip",

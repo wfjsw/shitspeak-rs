@@ -21,7 +21,12 @@ pub struct AlpnConnectionInfo {
     client_addr: std::net::SocketAddr,
     local_addr: std::net::SocketAddr,
     server_id: String,
+    tls_ja3: Option<String>,
     tls_ja4: Option<String>,
+    tls_ja4t: Option<String>,
+    tls_ja4x: Option<String>,
+    tls_ja4l: Option<String>,
+    tls_sni: Option<String>,
     uses_proxy_protocol: bool,
 }
 
@@ -31,7 +36,7 @@ impl AlpnConnectionInfo {
         client_addr: std::net::SocketAddr,
         local_addr: std::net::SocketAddr,
         server_id: String,
-        tls_ja4: Option<String>,
+        tls_fingerprints: crate::tls_fingerprint::TlsFingerprints,
         uses_proxy_protocol: bool,
     ) -> Self {
         Self {
@@ -39,7 +44,12 @@ impl AlpnConnectionInfo {
             client_addr,
             local_addr,
             server_id,
-            tls_ja4,
+            tls_ja3: tls_fingerprints.ja3,
+            tls_ja4: tls_fingerprints.ja4,
+            tls_ja4t: tls_fingerprints.ja4t,
+            tls_ja4x: tls_fingerprints.ja4x,
+            tls_ja4l: tls_fingerprints.ja4l,
+            tls_sni: tls_fingerprints.sni,
             uses_proxy_protocol,
         }
     }
@@ -62,6 +72,26 @@ impl AlpnConnectionInfo {
 
     pub fn tls_ja4(&self) -> Option<&str> {
         self.tls_ja4.as_deref()
+    }
+
+    pub fn tls_ja3(&self) -> Option<&str> {
+        self.tls_ja3.as_deref()
+    }
+
+    pub fn tls_ja4t(&self) -> Option<&str> {
+        self.tls_ja4t.as_deref()
+    }
+
+    pub fn tls_ja4x(&self) -> Option<&str> {
+        self.tls_ja4x.as_deref()
+    }
+
+    pub fn tls_ja4l(&self) -> Option<&str> {
+        self.tls_ja4l.as_deref()
+    }
+
+    pub fn tls_sni(&self) -> Option<&str> {
+        self.tls_sni.as_deref()
     }
 
     pub fn uses_proxy_protocol(&self) -> bool {

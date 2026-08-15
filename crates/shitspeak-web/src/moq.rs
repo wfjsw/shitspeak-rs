@@ -2289,7 +2289,7 @@ mod tests {
                 .await
                 .expect("routed terminator before timeout")
                 .expect("routed terminator"),
-            None,
+            crate::session::WebTlsMetadata::default(),
         )
         .expect("decode routed terminator");
         let AudioPayload::Opus(opus) = routed.audio_payload else {
@@ -2551,7 +2551,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64740),
-            None,
+            crate::session::WebTlsMetadata::default(),
             false,
         );
         context
@@ -2572,7 +2572,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64740),
-            None,
+            crate::session::WebTlsMetadata::default(),
             false,
         )
     }

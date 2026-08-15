@@ -13,6 +13,7 @@ use crate::protocol::{
     WebGatewayConfig, WebMoqGatewayConfig, WebPermissionDenied, WebServerConfig, WebServerSync,
     WebTransportKind, WebUserRemove, WebUserState, WebVolumeAdjustment, encode_server_event,
 };
+use crate::session::WebTlsMetadata;
 use crate::session::client_is_current;
 use crate::simd;
 use shitspeak_auth::{
@@ -103,7 +104,14 @@ impl SignalingServer {
                 let server = Arc::clone(&server);
                 tokio::spawn(async move {
                     if let Err(e) = server
-                        .handle_stream_with_peer(stream, peer.ip(), peer, listen, None, false)
+                        .handle_stream_with_peer(
+                            stream,
+                            peer.ip(),
+                            peer,
+                            listen,
+                            WebTlsMetadata::default(),
+                            false,
+                        )
                         .await
                     {
                         tracing::trace!(%peer, error = %e, "web signaling connection failed");
@@ -118,8 +126,15 @@ impl SignalingServer {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        self.handle_stream_with_peer(stream, peer.ip(), peer, peer, None, false)
-            .await
+        self.handle_stream_with_peer(
+            stream,
+            peer.ip(),
+            peer,
+            peer,
+            WebTlsMetadata::default(),
+            false,
+        )
+        .await
     }
 
     pub async fn handle_stream_with_peer<S>(
@@ -128,7 +143,7 @@ impl SignalingServer {
         real_ip: IpAddr,
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
-        tls_ja4: Option<String>,
+        tls_metadata: WebTlsMetadata,
         uses_proxy_protocol: bool,
     ) -> io::Result<()>
     where
@@ -223,7 +238,7 @@ impl SignalingServer {
                         real_ip,
                         peer_addr,
                         local_addr,
-                        tls_ja4.clone(),
+                        tls_metadata.clone(),
                         uses_proxy_protocol,
                     );
                     run_signaling_websocket(stream, websocket_initial_bytes, context).await?;
@@ -413,7 +428,7 @@ struct SignalingContext {
     real_ip: IpAddr,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
-    tls_ja4: Option<String>,
+    tls_metadata: WebTlsMetadata,
     uses_proxy_protocol: bool,
 }
 
@@ -426,7 +441,7 @@ impl SignalingContext {
         real_ip: IpAddr,
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
-        tls_ja4: Option<String>,
+        tls_metadata: WebTlsMetadata,
         uses_proxy_protocol: bool,
     ) -> Self {
         Self {
@@ -438,7 +453,7 @@ impl SignalingContext {
             real_ip,
             peer_addr,
             local_addr,
-            tls_ja4,
+            tls_metadata,
             uses_proxy_protocol,
         }
     }
@@ -450,7 +465,15 @@ impl SignalingContext {
             certificate_hash: None,
             session_id,
             ip_address: canonical_authenticator_ip(self.real_ip),
-            tls_ja4: self.tls_ja4.clone(),
+            tls_ja3: self.tls_metadata.ja3().map(ToOwned::to_owned),
+            tls_ja4: self.tls_metadata.ja4().map(ToOwned::to_owned),
+            tls_ja4t: self.tls_metadata.ja4t().map(ToOwned::to_owned),
+            tls_ja4x: self.tls_metadata.ja4x().map(ToOwned::to_owned),
+            tls_ja4l: self.tls_metadata.ja4l().map(ToOwned::to_owned),
+            tls_sni: self.tls_metadata.sni().map(ToOwned::to_owned),
+            proxy_server_address: None,
+            packet_capture_backends: Vec::new(),
+            packet_capture_backend: None,
             uses_proxy_protocol: self.uses_proxy_protocol,
             version: None,
             client_name: Some("shitspeak-web".to_string()),
