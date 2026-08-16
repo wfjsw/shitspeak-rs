@@ -62,7 +62,7 @@ impl VoiceUdpRecvBatch {
         self.received.push(VoiceUdpDatagramMeta {
             index,
             len: len.min(self.buffers[index].len()),
-            src_addr,
+            src_addr: shitspeak_auth::canonical_socket_addr(src_addr),
         });
     }
 
@@ -213,6 +213,7 @@ fn socket_addr_from_storage(addr: &SocketAddrStorage) -> io::Result<SocketAddr> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv6Addr, SocketAddrV6};
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -261,5 +262,48 @@ mod tests {
             received[1],
             (b"second".to_vec(), sender.local_addr().unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn batch_canonicalizes_ipv4_peers_on_dual_stack_socket() {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        socket.set_only_v6(false).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket
+            .bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into())
+            .unwrap();
+        let receiver = UdpSocket::from_std(socket.into()).unwrap();
+        let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+
+        sender
+            .send_to(
+                b"ping",
+                (
+                    std::net::Ipv4Addr::LOCALHOST,
+                    receiver.local_addr().unwrap().port(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let mut batch = VoiceUdpRecvBatch::new(VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS, 64);
+        timeout(
+            Duration::from_secs(1),
+            recv_voice_udp_batch(&receiver, &mut batch),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let received = batch.iter().next().unwrap();
+        assert_eq!(received.payload(), b"ping");
+        assert_eq!(received.src_addr(), sender.local_addr().unwrap());
     }
 }
