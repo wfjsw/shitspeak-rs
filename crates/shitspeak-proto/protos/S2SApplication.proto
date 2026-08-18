@@ -163,6 +163,14 @@ message VoiceRepairRequest {
   bool tail_ack          = 7;
 }
 
+// Aggregate receiver playout report, sent only to the immediate upstream
+// overlay peer once per reporting interval.
+message VoicePathFeedback {
+  uint32 received_frames = 1;
+  uint32 gap_buffered = 2;
+  uint32 deadline_flush = 3;
+}
+
 message VoiceIntent {
   oneof kind {
     VoiceIntentNormal normal = 1;

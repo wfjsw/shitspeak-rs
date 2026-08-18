@@ -36,6 +36,7 @@ use super::metrics::{
     TransportHealthExclusionSnapshot, VoiceTransportBindingEventReason,
     VoiceTransportBindingEventSnapshot, VoiceTransportBindingSnapshot,
     VoiceTransportChallengerOutcome, VoiceTransportChallengerSnapshot,
+    conversational_effective_delay_us, conversational_impairment,
 };
 use super::service_level::{
     DeliveryPath, MessageClass, PeerAddress, RoutingMetric, ServiceLevel, TransportKind,
@@ -1424,6 +1425,8 @@ pub(crate) struct PeerState {
     /// uses the effective-loss EWMA so sparse keepalive probes can still
     /// protect realtime traffic.
     conversational_transport_loss_suspect: Mutex<HashMap<TransportKind, bool>>,
+    conversational_transport_playout_suspect: Mutex<HashMap<TransportKind, bool>>,
+    conversational_feedback: Mutex<ConversationalFeedbackState>,
     /// KCP is kept out of BestEffort selection after failaway/no-progress
     /// until the native KCP sampler observes a newer ACK-derived RTT sample.
     kcp_best_effort_recovery_after_rtt_samples: Mutex<Option<u64>>,
@@ -1435,6 +1438,14 @@ pub(crate) struct PeerState {
     /// Set true while a connect attempt is in flight, to prevent duplicate
     /// dials racing inside the supervisor.
     connecting: AtomicBool,
+}
+
+#[derive(Default)]
+struct ConversationalFeedbackState {
+    suspect_reports: u8,
+    healthy_reports: u8,
+    suspect: bool,
+    last_report: Option<Instant>,
 }
 
 impl PeerState {
@@ -1470,6 +1481,8 @@ impl PeerState {
             transport_health_exclusions: Mutex::new(HashMap::new()),
             datagram_path_health: Mutex::new(HashMap::new()),
             conversational_transport_loss_suspect: Mutex::new(HashMap::new()),
+            conversational_transport_playout_suspect: Mutex::new(HashMap::new()),
+            conversational_feedback: Mutex::new(ConversationalFeedbackState::default()),
             kcp_best_effort_recovery_after_rtt_samples: Mutex::new(None),
             voice_transport_binding: Mutex::new(VoiceTransportBinding::default()),
             outbound_dispatch_notify: Notify::new(),
@@ -2269,6 +2282,82 @@ impl PeerState {
         };
         suspects.insert(transport, suspect);
         suspect
+    }
+
+    pub(crate) fn observe_conversational_transport_playout(
+        &self,
+        transport: TransportKind,
+        metrics: Option<&super::metrics::LinkMetrics>,
+    ) -> bool {
+        const DELAY_SUSPECT_US: u64 = 750_000;
+        const DELAY_RECOVER_US: u64 = 500_000;
+        const IMPAIRMENT_SUSPECT: f64 = 80.0;
+        const IMPAIRMENT_RECOVER: f64 = 55.0;
+        let mut suspects = self.conversational_transport_playout_suspect.lock();
+        let previous = suspects.get(&transport).copied().unwrap_or(false);
+        let suspect = match metrics {
+            Some(metrics) if metrics.rtt_us() > 0.0 => {
+                let delay =
+                    conversational_effective_delay_us(metrics.rtt_us(), metrics.jitter_us());
+                let impairment = conversational_impairment(
+                    metrics.rtt_us(),
+                    metrics.jitter_us(),
+                    metrics.estimated_throughput_bps(),
+                    metrics.effective_packet_loss_ppm(),
+                );
+                delay >= DELAY_SUSPECT_US
+                    || impairment >= IMPAIRMENT_SUSPECT
+                    || (previous && (delay >= DELAY_RECOVER_US || impairment >= IMPAIRMENT_RECOVER))
+            }
+            Some(_) | None => previous,
+        };
+        suspects.insert(transport, suspect);
+        suspect
+    }
+
+    pub(crate) fn record_conversational_feedback(
+        &self,
+        received_frames: u32,
+        gap_buffered: u32,
+        deadline_flush: u32,
+        now: Instant,
+    ) {
+        if received_frames < 100
+            || gap_buffered > received_frames
+            || deadline_flush > received_frames
+        {
+            return;
+        }
+        let mut feedback = self.conversational_feedback.lock();
+        let degraded = gap_buffered.saturating_mul(100) >= received_frames.saturating_mul(2)
+            || deadline_flush.saturating_mul(100) >= received_frames;
+        let healthy = gap_buffered.saturating_mul(200) < received_frames
+            && deadline_flush.saturating_mul(400) < received_frames;
+        if degraded {
+            feedback.suspect_reports = feedback.suspect_reports.saturating_add(1);
+            feedback.healthy_reports = 0;
+        } else if healthy {
+            feedback.healthy_reports = feedback.healthy_reports.saturating_add(1);
+            feedback.suspect_reports = 0;
+        } else {
+            feedback.suspect_reports = 0;
+            feedback.healthy_reports = 0;
+        }
+        if feedback.suspect_reports >= 3 {
+            feedback.suspect = true;
+        }
+        if feedback.healthy_reports >= 3 {
+            feedback.suspect = false;
+        }
+        feedback.last_report = Some(now);
+    }
+
+    pub(crate) fn conversational_feedback_suspect(&self, now: Instant) -> bool {
+        let feedback = self.conversational_feedback.lock();
+        feedback
+            .last_report
+            .is_some_and(|at| now.saturating_duration_since(at) <= Duration::from_secs(5))
+            && feedback.suspect
     }
 
     #[allow(clippy::too_many_arguments)]

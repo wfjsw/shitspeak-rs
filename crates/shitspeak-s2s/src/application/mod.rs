@@ -48,7 +48,8 @@ pub use moderation::ModerationService;
 pub use plugin_data::PluginDataService;
 pub use proto::{
     MODERATION_SERVICE_TAG, PLUGIN_DATA_SERVICE_TAG, TEXT_MESSAGE_SERVICE_TAG,
-    USER_STATS_SERVICE_TAG, VOICE_REPAIR_SERVICE_TAG, VOICE_SERVICE_TAG,
+    USER_STATS_SERVICE_TAG, VOICE_PATH_FEEDBACK_SERVICE_TAG, VOICE_REPAIR_SERVICE_TAG,
+    VOICE_SERVICE_TAG,
 };
 pub use text_message::TextMessageService;
 pub use user_stats::UserStatsService;
@@ -104,6 +105,10 @@ impl ApplicationLayer {
         overlay.register_service(USER_STATS_SERVICE_TAG, user_stats.inbound_handler());
         overlay.register_service(VOICE_SERVICE_TAG, voice.inbound_handler());
         overlay.register_service(VOICE_REPAIR_SERVICE_TAG, voice.repair_inbound_handler());
+        overlay.register_service(
+            VOICE_PATH_FEEDBACK_SERVICE_TAG,
+            voice.path_feedback_inbound_handler(),
+        );
 
         let inner = Arc::new(ApplicationInner {
             overlay,
@@ -156,5 +161,8 @@ impl ApplicationLayer {
         self.inner
             .overlay
             .unregister_service(VOICE_REPAIR_SERVICE_TAG);
+        self.inner
+            .overlay
+            .unregister_service(VOICE_PATH_FEEDBACK_SERVICE_TAG);
     }
 }

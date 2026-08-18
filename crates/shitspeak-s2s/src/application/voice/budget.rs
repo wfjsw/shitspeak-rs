@@ -20,11 +20,19 @@ use super::metrics::{
 const MIN_ADMISSION_BYTES: usize = 128;
 const PRIMARY_MIN_BYTES: usize = 256 * 1024;
 const PRIMARY_MAX_BYTES: usize = 4 * 1024 * 1024;
-const PROACTIVE_MIN_BYTES: usize = 32 * 1024;
-const PROACTIVE_MAX_BYTES: usize = 512 * 1024;
+const PROACTIVE_MIN_BYTES: usize = 256 * 1024;
+const PROACTIVE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const PROACTIVE_BURST_MIN_BYTES: usize = 16 * 1024;
 const PROACTIVE_BURST_MAX_BYTES: usize = 128 * 1024;
 const CREDIT_QUARTERS_PER_BYTE: usize = 4;
+const LINK_REFILL_QUARTERS_PER_ACCEPTED_BYTE: usize = 2;
+const LINK_CREDIT_MIN_BYTES: usize = 512 * 1024;
+const LINK_CREDIT_MAX_BASE_BYTES: usize = 8 * 1024 * 1024;
+const LINK_SPEAKER_HEADROOM_BYTES: usize = 128 * 1024;
+const LINK_SPEAKER_HEADROOM_MAX_BYTES: usize = 8 * 1024 * 1024;
+const LINK_SPEAKER_IDLE: Duration = Duration::from_secs(2);
+const LINK_SPEAKER_SAMPLE: Duration = Duration::from_secs(1);
+const LINK_SPEAKER_EMA_ALPHA: f64 = 0.2;
 const DESTINATION_PRIVATE_POOL_PCT: u8 = 25;
 const REACTIVE_DEMAND_HOLD: Duration = Duration::from_secs(1);
 const REACTIVE_SCHEDULER_QUANTUM_BYTES: usize = 1_200;
@@ -47,6 +55,9 @@ pub(crate) struct AdaptiveVoiceBudget {
     primary: Arc<ByteBudget>,
     proactive: Arc<ByteBudget>,
     repair_credit: Arc<RepairCreditBucket>,
+    link_credits: Arc<Mutex<HashMap<NodeIdentifier, Arc<RepairCreditBucket>>>>,
+    link_schedulers: Arc<Mutex<HashMap<NodeIdentifier, ReactiveCreditScheduler>>>,
+    #[allow(dead_code)]
     reactive_scheduler: Arc<OnceLock<ReactiveCreditScheduler>>,
     reactive_scheduler_shutdown: CancellationToken,
 }
@@ -71,13 +82,13 @@ impl AdaptiveVoiceBudget {
         Self {
             primary: Arc::new(ByteBudget::default()),
             proactive: Arc::new(ByteBudget::default()),
-            repair_credit: Arc::new(RepairCreditBucket {
-                max_users: max_users.clone(),
+            repair_credit: Arc::new(RepairCreditBucket::legacy(
+                max_users.clone(),
                 reactive_reserve_pct,
                 reactive_hard_reserve_pct,
-                state: Mutex::new(RepairCreditState::default()),
-                credit_available: Notify::new(),
-            }),
+            )),
+            link_credits: Arc::new(Mutex::new(HashMap::new())),
+            link_schedulers: Arc::new(Mutex::new(HashMap::new())),
             reactive_scheduler: Arc::new(OnceLock::new()),
             reactive_scheduler_shutdown: CancellationToken::new(),
             max_users,
@@ -102,8 +113,56 @@ impl AdaptiveVoiceBudget {
     /// Mint one quarter of a proactive byte credit for every accepted primary
     /// byte. Call this only after an original frame has entered the primary
     /// ingress lane successfully.
+    #[allow(dead_code)]
     pub(crate) fn mint_proactive_credit(&self, accepted_primary_bytes: usize) -> usize {
         self.repair_credit.mint(accepted_primary_bytes)
+    }
+
+    /// Mint repair credit only on the outgoing first hop that accepted the
+    /// original. Link buckets deliberately do not share credit.
+    pub(crate) fn mint_link_credit(
+        &self,
+        first_hop: NodeIdentifier,
+        sender_session: u32,
+        sender_epoch: u64,
+        accepted_primary_bytes: usize,
+    ) -> usize {
+        let bucket = self.link_bucket(first_hop);
+        bucket.observe_speaker(sender_session, sender_epoch, Instant::now());
+        bucket.mint(accepted_primary_bytes.saturating_mul(LINK_REFILL_QUARTERS_PER_ACCEPTED_BYTE))
+    }
+
+    pub(crate) fn reserve_link_proactive_credit_batch(
+        &self,
+        first_hop: NodeIdentifier,
+        frame_sequence: u64,
+        requests: &[ProactiveCreditRequest],
+    ) -> Vec<Option<ProactiveCreditPermit>> {
+        self.link_bucket(first_hop)
+            .reserve_proactive_batch(frame_sequence, requests)
+    }
+
+    pub(crate) async fn reserve_link_reactive_credit_scheduled(
+        &self,
+        first_hop: NodeIdentifier,
+        destination: u32,
+        bytes: usize,
+        deadline: Instant,
+        retry: bool,
+    ) -> Option<ProactiveCreditPermit> {
+        let scheduler = {
+            let mut schedulers = self.link_schedulers.lock();
+            schedulers
+                .entry(first_hop)
+                .or_insert_with(|| {
+                    ReactiveCreditScheduler::spawn(
+                        self.link_bucket(first_hop),
+                        self.reactive_scheduler_shutdown.clone(),
+                    )
+                })
+                .clone()
+        };
+        scheduler.reserve(destination, bytes, deadline, retry).await
     }
 
     /// Reserve proactive-byte credit before queueing alternate repair work.
@@ -148,6 +207,7 @@ impl AdaptiveVoiceBudget {
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn reserve_reactive_credit_scheduled(
         &self,
         destination: u32,
@@ -186,7 +246,7 @@ impl AdaptiveVoiceBudget {
 
     /// Current maximum accumulated proactive credit, in bytes.
     pub(crate) fn proactive_credit_burst_bytes(&self) -> usize {
-        proactive_credit_burst(self.current_users())
+        link_credit_base_capacity(self.current_users())
     }
 
     /// Byte charge currently held by primary queue entries.
@@ -201,7 +261,16 @@ impl AdaptiveVoiceBudget {
 
     /// Available proactive credit, rounded down to whole bytes.
     pub(crate) fn proactive_credit_balance_bytes(&self) -> usize {
-        self.repair_credit.balance_bytes()
+        let links = self.link_credits.lock();
+        let link_balance = links
+            .values()
+            .map(|bucket| bucket.balance_bytes())
+            .sum::<usize>();
+        if link_balance == 0 {
+            self.repair_credit.balance_bytes()
+        } else {
+            link_balance
+        }
     }
 
     /// Available proactive credit in quarter-byte units. This is mainly for
@@ -214,7 +283,21 @@ impl AdaptiveVoiceBudget {
     pub(crate) fn repair_allocator_state_bytes(
         &self,
     ) -> (usize, usize, usize, usize, usize, usize) {
-        self.repair_credit.state_bytes()
+        let links = self.link_credits.lock();
+        if links.is_empty() {
+            return self.repair_credit.state_bytes();
+        }
+        links.values().fold((0, 0, 0, 0, 0, 0), |total, bucket| {
+            let state = bucket.state_bytes();
+            (
+                total.0 + state.0,
+                total.1 + state.1,
+                total.2 + state.2,
+                total.3 + state.3,
+                total.4 + state.4,
+                total.5 + state.5,
+            )
+        })
     }
 
     #[cfg(test)]
@@ -224,6 +307,20 @@ impl AdaptiveVoiceBudget {
 
     fn current_users(&self) -> u64 {
         self.max_users.load(Ordering::Relaxed)
+    }
+
+    fn link_bucket(&self, first_hop: NodeIdentifier) -> Arc<RepairCreditBucket> {
+        let mut buckets = self.link_credits.lock();
+        buckets
+            .entry(first_hop)
+            .or_insert_with(|| {
+                Arc::new(RepairCreditBucket::link(
+                    self.max_users.clone(),
+                    self.repair_credit.reactive_reserve_pct,
+                    self.repair_credit.reactive_hard_reserve_pct,
+                ))
+            })
+            .clone()
     }
 }
 
@@ -835,11 +932,68 @@ struct RepairCreditBucket {
     max_users: Arc<AtomicU64>,
     reactive_reserve_pct: u8,
     reactive_hard_reserve_pct: u8,
+    speakers: Option<Mutex<LinkSpeakerState>>,
     state: Mutex<RepairCreditState>,
     credit_available: Notify,
 }
 
+#[derive(Debug, Default)]
+struct LinkSpeakerState {
+    speakers: HashMap<(u32, u64), Instant>,
+    ema: f64,
+    last_sample: Option<Instant>,
+}
+
 impl RepairCreditBucket {
+    fn legacy(
+        max_users: Arc<AtomicU64>,
+        reactive_reserve_pct: u8,
+        reactive_hard_reserve_pct: u8,
+    ) -> Self {
+        Self {
+            max_users,
+            reactive_reserve_pct,
+            reactive_hard_reserve_pct,
+            speakers: None,
+            state: Mutex::new(RepairCreditState::default()),
+            credit_available: Notify::new(),
+        }
+    }
+
+    fn link(
+        max_users: Arc<AtomicU64>,
+        reactive_reserve_pct: u8,
+        reactive_hard_reserve_pct: u8,
+    ) -> Self {
+        Self {
+            max_users,
+            reactive_reserve_pct,
+            reactive_hard_reserve_pct,
+            speakers: Some(Mutex::new(LinkSpeakerState::default())),
+            state: Mutex::new(RepairCreditState::default()),
+            credit_available: Notify::new(),
+        }
+    }
+
+    fn observe_speaker(&self, sender_session: u32, sender_epoch: u64, now: Instant) {
+        let Some(speakers) = &self.speakers else {
+            return;
+        };
+        let mut speakers = speakers.lock();
+        speakers
+            .speakers
+            .insert((sender_session, sender_epoch), now);
+        sample_link_speakers(&mut speakers, now);
+    }
+
+    fn link_speaker_headroom_bytes(&self) -> usize {
+        let Some(speakers) = &self.speakers else {
+            return 0;
+        };
+        let mut speakers = speakers.lock();
+        sample_link_speakers(&mut speakers, Instant::now());
+        link_speaker_headroom(speakers.ema)
+    }
     /// `accepted_primary_bytes` is itself measured in quarter credits: one
     /// accepted byte produces one quarter of a proactive byte credit.
     fn mint(&self, accepted_primary_bytes: usize) -> usize {
@@ -1362,8 +1516,13 @@ impl RepairCreditBucket {
     }
 
     fn capacity_quarters(&self) -> usize {
-        proactive_credit_burst(self.max_users.load(Ordering::Relaxed))
-            .saturating_mul(CREDIT_QUARTERS_PER_BYTE)
+        let base = if self.speakers.is_some() {
+            link_credit_base_capacity(self.max_users.load(Ordering::Relaxed))
+                .saturating_add(self.link_speaker_headroom_bytes())
+        } else {
+            proactive_credit_burst(self.max_users.load(Ordering::Relaxed))
+        };
+        base.saturating_mul(CREDIT_QUARTERS_PER_BYTE)
     }
 
     fn trim_to_capacity(&self, state: &mut RepairCreditState, cap: usize) {
@@ -1542,11 +1701,39 @@ fn primary_capacity(users: u64) -> usize {
 }
 
 fn proactive_capacity(users: u64) -> usize {
-    (primary_capacity(users) / 8).clamp(PROACTIVE_MIN_BYTES, PROACTIVE_MAX_BYTES)
+    primary_capacity(users).clamp(PROACTIVE_MIN_BYTES, PROACTIVE_MAX_BYTES)
 }
 
 fn proactive_credit_burst(users: u64) -> usize {
     (primary_capacity(users) / 32).clamp(PROACTIVE_BURST_MIN_BYTES, PROACTIVE_BURST_MAX_BYTES)
+}
+
+fn link_credit_base_capacity(users: u64) -> usize {
+    primary_capacity(users)
+        .saturating_mul(2)
+        .clamp(LINK_CREDIT_MIN_BYTES, LINK_CREDIT_MAX_BASE_BYTES)
+}
+
+fn link_speaker_headroom(ema: f64) -> usize {
+    (ema.round() as usize)
+        .saturating_mul(LINK_SPEAKER_HEADROOM_BYTES)
+        .min(LINK_SPEAKER_HEADROOM_MAX_BYTES)
+}
+
+fn sample_link_speakers(state: &mut LinkSpeakerState, now: Instant) {
+    state
+        .speakers
+        .retain(|_, last_seen| now.saturating_duration_since(*last_seen) <= LINK_SPEAKER_IDLE);
+    let Some(last_sample) = state.last_sample else {
+        state.last_sample = Some(now);
+        return;
+    };
+    if now.saturating_duration_since(last_sample) < LINK_SPEAKER_SAMPLE {
+        return;
+    }
+    state.ema = LINK_SPEAKER_EMA_ALPHA * state.speakers.len() as f64
+        + (1.0 - LINK_SPEAKER_EMA_ALPHA) * state.ema;
+    state.last_sample = Some(now);
 }
 
 #[cfg(test)]
@@ -1561,13 +1748,46 @@ mod tests {
 
     use super::{
         AdaptiveVoiceBudget, MIN_ADMISSION_BYTES, ProactiveCreditRequest, REACTIVE_RETRY_EPOCH,
-        ReactiveScheduleRequest, ReactiveScheduleState, compare_overflow_requests, percentage,
+        ReactiveScheduleRequest, ReactiveScheduleState, compare_overflow_requests,
+        link_credit_base_capacity, link_speaker_headroom, percentage,
     };
 
     fn budget(users: u64) -> (Arc<AtomicU64>, AdaptiveVoiceBudget) {
         let users = Arc::new(AtomicU64::new(users));
         let budget = AdaptiveVoiceBudget::new(users.clone());
         (users, budget)
+    }
+
+    #[test]
+    fn link_credit_cap_scales_from_half_to_sixteen_megabytes() {
+        assert_eq!(link_credit_base_capacity(1), 512 * 1024);
+        assert_eq!(link_credit_base_capacity(8_192), 8 * 1024 * 1024);
+        assert_eq!(link_speaker_headroom(0.49), 0);
+        assert_eq!(link_speaker_headroom(1.0), 128 * 1024);
+        assert_eq!(link_speaker_headroom(64.0), 8 * 1024 * 1024);
+        assert_eq!(
+            link_credit_base_capacity(8_192) + link_speaker_headroom(64.0),
+            16 * 1024 * 1024,
+        );
+    }
+
+    #[test]
+    fn link_credit_is_not_transferable_between_first_hops() {
+        let budget =
+            AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(100)), 0, 0);
+        budget.mint_link_credit(2, 7, 11, 100);
+        let granted = budget.reserve_link_proactive_credit_batch(
+            2,
+            1,
+            &[ProactiveCreditRequest::new(9, 50, 1, 0)],
+        );
+        assert!(granted[0].is_some());
+        let denied = budget.reserve_link_proactive_credit_batch(
+            3,
+            1,
+            &[ProactiveCreditRequest::new(9, 1, 1, 0)],
+        );
+        assert!(denied[0].is_none());
     }
 
     fn reactive_request(
@@ -1747,31 +1967,31 @@ mod tests {
     fn capacities_follow_live_max_users() {
         let (users, budget) = budget(100);
         assert_eq!(budget.primary_capacity_bytes(), 256 * 1024);
-        assert_eq!(budget.proactive_capacity_bytes(), 32 * 1024);
-        assert_eq!(budget.proactive_credit_burst_bytes(), 16 * 1024);
+        assert_eq!(budget.proactive_capacity_bytes(), 256 * 1024);
+        assert_eq!(budget.proactive_credit_burst_bytes(), 512 * 1024);
 
         users.store(5_000, Ordering::Relaxed);
         assert_eq!(budget.primary_capacity_bytes(), 2_560_000);
-        assert_eq!(budget.proactive_capacity_bytes(), 320_000);
-        assert_eq!(budget.proactive_credit_burst_bytes(), 80_000);
+        assert_eq!(budget.proactive_capacity_bytes(), 2_560_000);
+        assert_eq!(budget.proactive_credit_burst_bytes(), 5_120_000);
 
         users.store(100, Ordering::Relaxed);
         assert_eq!(budget.primary_capacity_bytes(), 256 * 1024);
-        assert_eq!(budget.proactive_capacity_bytes(), 32 * 1024);
-        assert_eq!(budget.proactive_credit_burst_bytes(), 16 * 1024);
+        assert_eq!(budget.proactive_capacity_bytes(), 256 * 1024);
+        assert_eq!(budget.proactive_credit_burst_bytes(), 512 * 1024);
     }
 
     #[test]
     fn capacity_formulas_cap_at_both_ends() {
         let (users, budget) = budget(0);
         assert_eq!(budget.primary_capacity_bytes(), 256 * 1024);
-        assert_eq!(budget.proactive_capacity_bytes(), 32 * 1024);
-        assert_eq!(budget.proactive_credit_burst_bytes(), 16 * 1024);
+        assert_eq!(budget.proactive_capacity_bytes(), 256 * 1024);
+        assert_eq!(budget.proactive_credit_burst_bytes(), 512 * 1024);
 
         users.store(u64::MAX, Ordering::Relaxed);
         assert_eq!(budget.primary_capacity_bytes(), 4 * 1024 * 1024);
-        assert_eq!(budget.proactive_capacity_bytes(), 512 * 1024);
-        assert_eq!(budget.proactive_credit_burst_bytes(), 128 * 1024);
+        assert_eq!(budget.proactive_capacity_bytes(), 4 * 1024 * 1024);
+        assert_eq!(budget.proactive_credit_burst_bytes(), 8 * 1024 * 1024);
     }
 
     #[test]
@@ -1890,7 +2110,7 @@ mod tests {
     fn tentative_credit_occupies_burst_capacity_during_mint_and_refund() {
         let allocator =
             AdaptiveVoiceBudget::with_repair_reservations(Arc::new(AtomicU64::new(100)), 0, 0);
-        let cap = allocator.proactive_credit_burst_bytes() * 4;
+        let cap = allocator.repair_credit.capacity_quarters();
         assert_eq!(allocator.mint_proactive_credit(usize::MAX), cap);
         let permit = allocator.try_reserve_proactive_credit(100).unwrap();
         let reserved = permit.reserved_quarters();

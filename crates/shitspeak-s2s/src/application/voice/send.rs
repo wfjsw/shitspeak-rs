@@ -10,7 +10,10 @@ use bytes::Bytes;
 use std::time::Duration;
 
 use crate::application::error::ApplicationError;
-use crate::application::proto::{self, VOICE_REPAIR_SERVICE_TAG, VOICE_SERVICE_TAG, VoiceIntent};
+use crate::application::proto::{
+    self, VOICE_PATH_FEEDBACK_SERVICE_TAG, VOICE_REPAIR_SERVICE_TAG, VOICE_SERVICE_TAG,
+    VoiceIntent, VoicePathFeedback,
+};
 use crate::overlay::{OverlayNetwork, OverlaySendOptions, RoutingMetric, VoiceRouteQuality};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
@@ -163,6 +166,16 @@ pub trait VoiceTransport: Send + Sync + 'static {
         body: Bytes,
         ttl: Duration,
     ) -> Result<(), ApplicationError>;
+
+    async fn send_path_feedback(
+        &self,
+        _dst: NodeIdentifier,
+        _feedback: VoicePathFeedback,
+    ) -> Result<(), ApplicationError> {
+        Err(ApplicationError::Unavailable)
+    }
+
+    fn record_path_feedback(&self, _from: NodeIdentifier, _feedback: VoicePathFeedback) {}
 
     async fn send_repair_frame(
         &self,
@@ -327,6 +340,30 @@ impl VoiceTransport for OverlayVoiceTransport {
             )
             .await?;
         Ok(())
+    }
+
+    async fn send_path_feedback(
+        &self,
+        dst: NodeIdentifier,
+        feedback: VoicePathFeedback,
+    ) -> Result<(), ApplicationError> {
+        let body = proto::encode_voice_path_feedback(&feedback)?;
+        self.overlay
+            .send_unicast_unordered_with_routing_metric_and_options(
+                dst,
+                VOICE_PATH_FEEDBACK_SERVICE_TAG,
+                VOICE_REPAIR_LEVEL,
+                VOICE_REPAIR_ROUTING_METRIC,
+                VOICE_REPAIR_CLASS,
+                body,
+                OverlaySendOptions::default().expire_after(Duration::from_secs(1)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn record_path_feedback(&self, from: NodeIdentifier, feedback: VoicePathFeedback) {
+        self.overlay.record_voice_path_feedback(from, feedback);
     }
 
     async fn send_repair_frame(

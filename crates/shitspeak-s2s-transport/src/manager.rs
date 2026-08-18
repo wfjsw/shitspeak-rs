@@ -1789,7 +1789,34 @@ impl ConnectionManager {
                 policy.conversational_path_effective_loss_recover_ppm(),
             ),
         ) * 2;
-        Some(queue_pressure.max(quality_pressure))
+        let playout_pressure = u8::from(peer.observe_conversational_transport_playout(
+            quality_transport,
+            snapshot.get(&quality_transport),
+        )) * 2;
+        let feedback_pressure = u8::from(peer.conversational_feedback_suspect(now)) * 2;
+        Some(
+            queue_pressure
+                .max(quality_pressure)
+                .max(playout_pressure)
+                .max(feedback_pressure),
+        )
+    }
+
+    pub fn record_conversational_path_feedback(
+        &self,
+        peer: NodeIdentifier,
+        received_frames: u32,
+        gap_buffered: u32,
+        deadline_flush: u32,
+    ) {
+        if let Some(peer) = self.inner.get_peer(peer) {
+            peer.record_conversational_feedback(
+                received_frames,
+                gap_buffered,
+                deadline_flush,
+                Instant::now(),
+            );
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -5481,6 +5508,27 @@ mod tests {
             Some(2),
             "ConversationalQuality alone must enable the quality penalty"
         );
+    }
+
+    #[tokio::test]
+    async fn receiver_playout_feedback_is_hysteretic_and_expires() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Udp]);
+        let peer = transport.inner.get_peer(2).expect("peer");
+        let now = Instant::now();
+        for _ in 0..3 {
+            peer.record_conversational_feedback(100, 2, 0, now);
+        }
+        assert!(peer.conversational_feedback_suspect(now));
+        for _ in 0..3 {
+            peer.record_conversational_feedback(100, 0, 0, now);
+        }
+        assert!(!peer.conversational_feedback_suspect(now));
+        for _ in 0..3 {
+            peer.record_conversational_feedback(100, 0, 1, now);
+        }
+        assert!(peer.conversational_feedback_suspect(now));
+        assert!(!peer.conversational_feedback_suspect(now + Duration::from_secs(6)));
     }
 
     #[tokio::test]

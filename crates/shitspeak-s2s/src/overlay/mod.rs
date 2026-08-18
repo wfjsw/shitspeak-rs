@@ -60,6 +60,8 @@ use shitspeak_s2s_transport::{
     TransportKind, encoded_data_frame_len,
 };
 
+use crate::application::proto::VoicePathFeedback;
+
 const DISTRIBUTION_HOP_TTL: Duration = Duration::from_millis(80);
 // A compressed data frame can carry the encoding, original length, and a
 // dictionary id in addition to the identity-frame fields used for sizing.
@@ -398,6 +400,14 @@ pub struct OverlayNetwork {
 }
 
 impl OverlayNetwork {
+    pub fn record_voice_path_feedback(&self, from: NodeIdentifier, feedback: VoicePathFeedback) {
+        self.inner.transport.record_conversational_path_feedback(
+            from,
+            feedback.received_frames,
+            feedback.gap_buffered,
+            feedback.deadline_flush,
+        );
+    }
     /// Bring up the overlay over an already-started transport. Spawns
     /// all long-running tasks (Hello protocol, LSA emitter, anti-entropy,
     /// routing recomputer, diff watcher, inbound dispatcher); runs

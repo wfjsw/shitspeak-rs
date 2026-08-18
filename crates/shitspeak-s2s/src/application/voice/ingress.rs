@@ -21,7 +21,8 @@ use tracing::trace;
 use crate::application::config::{DeliveryStrategy, VoiceConfig};
 use crate::application::error::ApplicationError;
 use crate::application::proto::{
-    self, VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal, VoiceRepairRequest,
+    self, VoiceFrame, VoiceIntent, VoiceIntentKind, VoiceIntentNormal, VoicePathFeedback,
+    VoiceRepairRequest,
 };
 use crate::application::voice::budget::{ProactiveCreditPermit, ProactiveCreditRequest};
 use crate::application::voice::metrics;
@@ -68,6 +69,7 @@ const TAIL_REPAIR_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const TAIL_REPAIR_INTERVAL: Duration = Duration::from_millis(100);
 const TAIL_REPAIR_FAILURE_BACKOFF_MAX: Duration = Duration::from_millis(800);
 const TAIL_REPAIR_SEND_TIMEOUT_MAX: Duration = Duration::from_millis(100);
+const PATH_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Decoded inbound voice frame along with the immediate sender (next-hop
 /// peer that delivered the overlay frame, not necessarily the originator).
@@ -409,10 +411,63 @@ struct ProactiveSendWork {
 
 struct ProactiveRepairCandidate {
     dst: NodeIdentifier,
+    repair_first_hop: NodeIdentifier,
     avoid_first_hop: Option<NodeIdentifier>,
     expires_at: Instant,
     marginal_utility_micros: u64,
     copy_index: usize,
+}
+
+#[derive(Default)]
+struct PathFeedbackAccumulator {
+    windows: parking_lot::Mutex<HashMap<NodeIdentifier, PathFeedbackWindow>>,
+}
+
+struct PathFeedbackWindow {
+    started_at: Instant,
+    received_frames: u32,
+    gap_buffered: u32,
+    deadline_flush: u32,
+}
+
+impl PathFeedbackAccumulator {
+    fn record(
+        &self,
+        from: NodeIdentifier,
+        result: VoiceReceiveResult,
+        count: usize,
+    ) -> Option<VoicePathFeedback> {
+        let now = Instant::now();
+        let mut windows = self.windows.lock();
+        let window = windows.entry(from).or_insert(PathFeedbackWindow {
+            started_at: now,
+            received_frames: 0,
+            gap_buffered: 0,
+            deadline_flush: 0,
+        });
+        window.received_frames = window.received_frames.saturating_add(count as u32);
+        if result == VoiceReceiveResult::GapBuffered {
+            window.gap_buffered = window.gap_buffered.saturating_add(count as u32);
+        }
+        if result == VoiceReceiveResult::DeadlineFlush {
+            window.deadline_flush = window.deadline_flush.saturating_add(count as u32);
+        }
+        if now.saturating_duration_since(window.started_at) < PATH_FEEDBACK_INTERVAL {
+            return None;
+        }
+        let feedback = VoicePathFeedback {
+            received_frames: window.received_frames,
+            gap_buffered: window.gap_buffered,
+            deadline_flush: window.deadline_flush,
+        };
+        *window = PathFeedbackWindow {
+            started_at: now,
+            received_frames: 0,
+            gap_buffered: 0,
+            deadline_flush: 0,
+        };
+        Some(feedback)
+    }
 }
 
 struct RepairFrameContext {
@@ -549,6 +604,7 @@ impl VoiceService {
         let audio_sink: AudioSinkSlot = Arc::new(RwLock::new(None));
         let reorderer = Reorderer::new_with_capacity_source(cfg.clone(), max_users);
         let repair_cache = Arc::new(RepairCache::new(Duration::from_millis(cfg.repair_cache_ms)));
+        let path_feedback = Arc::new(PathFeedbackAccumulator::default());
         let repair_request_ttl_ms =
             repair_deadline_transport_ttl_ms(&cfg, cfg.repair_request_ttl_ms);
         spawn_repair_request_worker(
@@ -577,6 +633,7 @@ impl VoiceService {
             cfg.clone(),
             voice_budget.clone(),
             repair_request_scheduler,
+            path_feedback.clone(),
         );
         spawn_proactive_worker(
             proactive_send_rx,
@@ -671,6 +728,12 @@ impl VoiceService {
         })
     }
 
+    pub fn path_feedback_inbound_handler(&self) -> Arc<dyn ServiceInbound> {
+        Arc::new(VoicePathFeedbackInbound {
+            transport: self.transport.clone(),
+        })
+    }
+
     pub fn config(&self) -> &VoiceConfig {
         &self.cfg
     }
@@ -759,7 +822,12 @@ impl VoiceService {
             self.cancel_terminal_repairs(sender_session, seq, &dsts);
         }
         result?;
-        self.admit_original_repair_credit(bytes.len());
+        self.admit_original_repair_credit(
+            sender_session,
+            &dsts,
+            repair_context.as_ref(),
+            bytes.len(),
+        );
         self.register_terminal_repairs(
             sender_session,
             seq,
@@ -864,7 +932,12 @@ impl VoiceService {
             self.cancel_terminal_repairs(sender_session, seq, dsts);
         }
         result?;
-        self.admit_original_repair_credit(bytes.len());
+        self.admit_original_repair_credit(
+            sender_session,
+            dsts,
+            repair_context.as_ref(),
+            bytes.len(),
+        );
         self.register_terminal_repairs(
             sender_session,
             seq,
@@ -1203,7 +1276,12 @@ impl VoiceService {
             self.cancel_terminal_repairs(sender_session, seq, &[dst]);
         }
         result?;
-        self.admit_original_repair_credit(bytes.len());
+        self.admit_original_repair_credit(
+            sender_session,
+            &[dst],
+            repair_context.as_ref(),
+            bytes.len(),
+        );
         self.register_terminal_repairs(
             sender_session,
             seq,
@@ -1270,11 +1348,32 @@ impl VoiceService {
         ));
     }
 
-    fn admit_original_repair_credit(&self, original_bytes: usize) {
+    fn admit_original_repair_credit(
+        &self,
+        sender_session: u32,
+        dsts: &[NodeIdentifier],
+        repair_context: Option<&RepairFrameContext>,
+        original_bytes: usize,
+    ) {
         if !self.cfg.repair_enabled {
             return;
         }
-        self.voice_budget.mint_proactive_credit(original_bytes);
+        let mut accepted_hops = HashSet::new();
+        for (index, &dst) in dsts.iter().enumerate() {
+            let first_hop = repair_context
+                .and_then(|context| context.route_qualities.get(index).copied().flatten())
+                .map(|quality| quality.next_hop())
+                .unwrap_or(dst);
+            accepted_hops.insert(first_hop);
+        }
+        for first_hop in accepted_hops {
+            self.voice_budget.mint_link_credit(
+                first_hop,
+                sender_session,
+                self.sender_epoch,
+                original_bytes,
+            );
+        }
         publish_proactive_budget(&self.voice_budget);
     }
 
@@ -1433,6 +1532,7 @@ impl VoiceService {
                 }
                 candidates.push(ProactiveRepairCandidate {
                     dst,
+                    repair_first_hop: quality.alternate_next_hop().unwrap_or(dst),
                     avoid_first_hop,
                     expires_at,
                     marginal_utility_micros,
@@ -1455,20 +1555,34 @@ impl VoiceService {
             }
         };
         let reserve_bytes = proactive_body.len();
-        let requests = candidates
-            .iter()
-            .map(|candidate| {
-                ProactiveCreditRequest::new(
-                    u32::from(candidate.dst),
-                    reserve_bytes,
-                    candidate.marginal_utility_micros,
-                    candidate.copy_index,
-                )
-            })
-            .collect::<Vec<_>>();
-        let credit_grants = self
-            .voice_budget
-            .reserve_proactive_credit_batch(s2s_seq, &requests);
+        let mut credit_grants = (0..candidates.len()).map(|_| None).collect::<Vec<_>>();
+        let mut by_first_hop = HashMap::<NodeIdentifier, Vec<usize>>::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            by_first_hop
+                .entry(candidate.repair_first_hop)
+                .or_default()
+                .push(index);
+        }
+        for (first_hop, indexes) in by_first_hop {
+            let requests = indexes
+                .iter()
+                .map(|&index| {
+                    let candidate = &candidates[index];
+                    ProactiveCreditRequest::new(
+                        u32::from(candidate.dst),
+                        reserve_bytes,
+                        candidate.marginal_utility_micros,
+                        candidate.copy_index,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (index, grant) in indexes.into_iter().zip(
+                self.voice_budget
+                    .reserve_link_proactive_credit_batch(first_hop, s2s_seq, &requests),
+            ) {
+                credit_grants[index] = grant;
+            }
+        }
         for (candidate, credit_permit) in candidates.into_iter().zip(credit_grants) {
             let Some(credit_permit) = credit_permit else {
                 metrics::record_proactive_outcome(
@@ -1745,6 +1859,19 @@ struct VoiceRepairInbound {
     response_ttl: Duration,
 }
 
+struct VoicePathFeedbackInbound {
+    transport: Arc<dyn VoiceTransport>,
+}
+
+impl ServiceInbound for VoicePathFeedbackInbound {
+    fn handle(&self, msg: OverlayInboundMessage) {
+        match proto::decode_voice_path_feedback(&msg.body) {
+            Ok(feedback) => self.transport.record_path_feedback(msg.from, feedback),
+            Err(error) => trace!(%error, from = %msg.from, "voice path feedback: decode failed"),
+        }
+    }
+}
+
 impl ServiceInbound for VoiceRepairInbound {
     fn handle(&self, msg: OverlayInboundMessage) {
         if !self.repair_enabled {
@@ -1800,6 +1927,7 @@ fn spawn_dispatch_task(
     cfg: VoiceConfig,
     voice_budget: AdaptiveVoiceBudget,
     repair_request_scheduler: RepairRequestScheduler,
+    path_feedback: Arc<PathFeedbackAccumulator>,
 ) {
     tokio::spawn(async move {
         let mut primary_open = true;
@@ -1905,6 +2033,14 @@ fn spawn_dispatch_task(
                         result.result(),
                         result.count(),
                     );
+                    if let Some(feedback) =
+                        path_feedback.record(from_immediate, result.result(), result.count())
+                    {
+                        let transport = transport.clone();
+                        tokio::spawn(async move {
+                            let _ = transport.send_path_feedback(from_immediate, feedback).await;
+                        });
+                    }
                 }
             }
             let emits = report.into_marked_emissions();
@@ -2420,7 +2556,13 @@ async fn send_tail_repair_frame(
         RepairDestinationStage::Requested,
         body.len(),
     );
-    let credit_reservation = voice_budget.reserve_reactive_credit_scheduled(
+    let quality = transport.voice_route_quality(key.destination);
+    let avoid_first_hop = quality.map(|quality| quality.next_hop());
+    let first_hop = quality
+        .and_then(|quality| quality.alternate_next_hop())
+        .unwrap_or(key.destination);
+    let credit_reservation = voice_budget.reserve_link_reactive_credit_scheduled(
+        first_hop,
         u32::from(key.destination),
         body.len(),
         repair_deadline,
@@ -2493,8 +2635,6 @@ async fn send_tail_repair_frame(
         }
         entry.attempts = entry.attempts.max(next_attempt);
     }
-    let quality = transport.voice_route_quality(key.destination);
-    let avoid_first_hop = quality.map(|quality| quality.next_hop());
     let ttl = adaptive_repair_transport_ttl(cfg, quality);
     let send_deadline = repair_deadline.min(Instant::now() + tail_repair_send_timeout(ttl));
     credit_permit.record_attempt();
@@ -3216,8 +3356,24 @@ async fn send_budgeted_repair_frame(
         RepairDestinationStage::Requested,
         body.len(),
     );
+    let first_hop = transport
+        .voice_route_quality(destination)
+        .map(|quality| {
+            if avoid_first_hop == Some(quality.next_hop()) {
+                quality.alternate_next_hop().unwrap_or(quality.next_hop())
+            } else {
+                quality.next_hop()
+            }
+        })
+        .unwrap_or(destination);
     let Some(credit_permit) = voice_budget
-        .reserve_reactive_credit_scheduled(u32::from(destination), body.len(), deadline, retry)
+        .reserve_link_reactive_credit_scheduled(
+            first_hop,
+            u32::from(destination),
+            body.len(),
+            deadline,
+            retry,
+        )
         .await
     else {
         metrics::record_repair_destination_bytes(
