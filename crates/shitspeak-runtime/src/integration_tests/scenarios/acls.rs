@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
+use crate::integration_tests::harness::{
+    TestClient, TestServerOpts, spawn_test_server, test_user_channel_cache_key,
+};
 use shitspeak_messages::messages::Message;
 use shitspeak_messages::messages::encoder::{
     Authenticate, CLIENT_PERMISSION_CACHE_BIT, ChanAcl, ClientType, PluginDataTransmission,
@@ -2825,7 +2827,7 @@ async fn cached_login_without_traverse_falls_back_to_default_channel() {
     server
         .server
         .get_user_channel_cache()
-        .remember_last_channel("2", 78)
+        .remember_last_channel(&test_user_channel_cache_key(2), 78)
         .await
         .unwrap();
 
@@ -2847,7 +2849,7 @@ async fn cached_login_without_traverse_falls_back_to_default_channel() {
         server
             .server
             .get_user_channel_cache()
-            .get("2")
+            .get(&test_user_channel_cache_key(2))
             .await
             .and_then(|channels| channels.last_channel_id),
         Some(0),
@@ -2889,7 +2891,7 @@ async fn cached_listener_without_listen_permission_is_not_restored() {
     server
         .server
         .get_user_channel_cache()
-        .remember_listening_channels("2", [79])
+        .remember_listening_channels(&test_user_channel_cache_key(2), [79])
         .await
         .unwrap();
 
@@ -2909,7 +2911,7 @@ async fn cached_listener_without_listen_permission_is_not_restored() {
         server
             .server
             .get_user_channel_cache()
-            .get("2")
+            .get(&test_user_channel_cache_key(2))
             .await
             .is_none_or(|channels| channels.listening_channel_ids.is_empty()),
         "the denied listener must be removed from the persisted cache"

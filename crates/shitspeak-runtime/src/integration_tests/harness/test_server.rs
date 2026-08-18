@@ -370,6 +370,21 @@ pub async fn spawn_test_server(opts: TestServerOpts) -> TestServer {
     .await
 }
 
+/// Scoped user-channel-cache key for a numeric user identity on the default
+/// test virtual server. The runtime reads and writes cache entries under this
+/// scoped key; the legacy unscoped key (the bare user id) is only consulted to
+/// migrate pre-scoping records.
+pub fn test_user_channel_cache_key(user_id: u32) -> String {
+    crate::user_channel_cache::user_channel_cache_key(
+        crate::types::DEFAULT_SERVER_ID,
+        None,
+        Some(user_id),
+        None,
+        None,
+    )
+    .expect("numeric user identities always produce a scoped cache key")
+}
+
 pub async fn spawn_s2s_test_server(
     opts: TestServerOpts,
     pki: Arc<Pki>,

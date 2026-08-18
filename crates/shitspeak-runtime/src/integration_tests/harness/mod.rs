@@ -9,5 +9,5 @@ pub use test_client::{ManualNativeClient, TestClient};
 pub use test_server::{
     TestS2sServerOpts, TestServer, TestServerOpts, TestStrictReplicationState,
     spawn_s2s_test_server, spawn_s2s_test_server_with_config, spawn_s2s_test_server_with_state,
-    spawn_test_server,
+    spawn_test_server, test_user_channel_cache_key,
 };

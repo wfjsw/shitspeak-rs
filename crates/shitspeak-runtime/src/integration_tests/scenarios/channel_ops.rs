@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use crate::channel_handler::{ChannelTreeShadow, SessionChannelShadow, replay_channel_log_gap};
 use crate::client::visibility::UserVisibilityState;
-use crate::integration_tests::harness::{TestClient, TestServerOpts, spawn_test_server};
+use crate::integration_tests::harness::{
+    TestClient, TestServerOpts, spawn_test_server, test_user_channel_cache_key,
+};
 use crate::server::client_projection::ClientProjectionState;
 use crate::server::sharded_subscriber::{LagAction, ShardedSubscriber};
 use crate::types::DEFAULT_SERVER_ID;
@@ -886,11 +888,14 @@ async fn temporary_channel_delete_clears_listener_cache() {
     let cache = server.server.get_user_channel_cache();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
-        if tokio::time::timeout(Duration::from_millis(100), cache.get("2"))
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|cached| cached.listening_channel_ids.is_empty())
+        if tokio::time::timeout(
+            Duration::from_millis(100),
+            cache.get(&test_user_channel_cache_key(2)),
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|cached| cached.listening_channel_ids.is_empty())
         {
             break;
         }

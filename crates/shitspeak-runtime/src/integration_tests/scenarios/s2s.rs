@@ -13,7 +13,7 @@ use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::ClientStateOperation;
 use crate::integration_tests::harness::{
     TestClient, TestS2sServerOpts, TestServer, TestServerOpts, spawn_s2s_test_server,
-    spawn_s2s_test_server_with_config, test_client::ConnectError,
+    spawn_s2s_test_server_with_config, test_client::ConnectError, test_user_channel_cache_key,
 };
 use crate::s2s::BanProposalOutcome;
 use crate::voice::codec::AudioPayload;
@@ -2129,7 +2129,11 @@ async fn s2s_remote_channel_entry_updates_receiver_user_channel_cache() {
     let cached = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(a.server.get_user_channel_cache().get("2"))
+                .block_on(
+                    a.server
+                        .get_user_channel_cache()
+                        .get(&test_user_channel_cache_key(2)),
+                )
                 .is_some_and(|channels| channels.last_channel_id == Some(42))
         })
     })
