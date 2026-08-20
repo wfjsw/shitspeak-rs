@@ -280,6 +280,20 @@ impl AdaptiveVoiceBudget {
         self.repair_credit.balance_quarters()
     }
 
+    /// Available credit in quarter-byte units on the per-first-hop link
+    /// bucket for `first_hop`. Tail, reactive-response, and proactive-copy
+    /// dispatch reserve from the link bucket the accepted original flowed
+    /// through, so tests that seed credit must assert against this bucket
+    /// rather than the shared repair bucket.
+    #[cfg(test)]
+    pub(crate) fn link_credit_balance_quarters(&self, first_hop: NodeIdentifier) -> usize {
+        self.link_credits
+            .lock()
+            .get(&first_hop)
+            .map(|bucket| bucket.balance_quarters())
+            .unwrap_or(0)
+    }
+
     pub(crate) fn repair_allocator_state_bytes(
         &self,
     ) -> (usize, usize, usize, usize, usize, usize) {

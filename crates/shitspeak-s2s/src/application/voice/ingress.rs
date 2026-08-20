@@ -4643,7 +4643,9 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.voice_budget.mint_proactive_credit(usize::MAX);
+        // The tail dispatch reserves from the per-first-hop link bucket for
+        // the destination carrying the terminal frame.
+        svc.voice_budget.mint_link_credit(2, 0xABC, 42, usize::MAX);
         let mut calls = transport.calls();
         for _ in 0..60 {
             if calls.len() >= 2 {
@@ -4726,9 +4728,11 @@ mod tests {
         key
     }
 
-    fn funded_repair_budget() -> AdaptiveVoiceBudget {
+    fn funded_repair_budget(first_hops: &[NodeIdentifier]) -> AdaptiveVoiceBudget {
         let budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
-        budget.mint_proactive_credit(usize::MAX);
+        for &first_hop in first_hops {
+            budget.mint_link_credit(first_hop, 0, 0, usize::MAX);
+        }
         budget
     }
 
@@ -4754,15 +4758,28 @@ mod tests {
             &pressure,
             now,
         );
+        let mut funded_link_balance = 0usize;
         let fund = async {
             tokio::time::sleep(Duration::from_millis(10)).await;
             assert!(transport.calls().is_empty());
-            voice_budget.mint_proactive_credit(marked_body.len() * 4);
+            // Tail dispatch reserves from the per-link bucket for the first
+            // hop that accepted the original. Fund it to capacity so the
+            // reactive reservation is admitted, then capture the funded
+            // balance to measure the frame charge below.
+            voice_budget.mint_link_credit(2, 0xABB, 42, usize::MAX);
+            funded_link_balance = voice_budget.link_credit_balance_quarters(2);
         };
         tokio::join!(dispatch, fund);
         assert_eq!(transport.calls().len(), 1);
         assert_eq!(voice_budget.proactive_reserved_bytes(), 0);
-        assert_eq!(voice_budget.proactive_credit_balance_quarters(), 0);
+        // A committed tail repair charges the full reactive credit for the
+        // marked frame body (one byte = four quarter credits) on the link
+        // bucket the original flowed through.
+        assert_eq!(
+            funded_link_balance.saturating_sub(voice_budget.link_credit_balance_quarters(2)),
+            marked_body.len() * 4,
+            "tail repair should charge full reactive credit on the per-link bucket"
+        );
         assert!(repairs.lock()[&key].attempts > 0);
     }
 
@@ -4809,8 +4826,8 @@ mod tests {
         cache_single_tail_frame(&repair_cache, 0xABC, 42);
         let now = Instant::now();
         let key = due_tail_key(&repairs, 2, 0xABC, 42, now);
-        let voice_budget = funded_repair_budget();
-        let starting_credit = voice_budget.proactive_credit_balance_quarters();
+        let voice_budget = funded_repair_budget(&[2]);
+        let starting_credit = voice_budget.link_credit_balance_quarters(2);
         let pressure = ProactivePressureState::default();
         let cfg = VoiceConfig::default();
         let dispatch = dispatch_due_tail_repairs(
@@ -4838,7 +4855,7 @@ mod tests {
         .await
         .expect("tail cancellation must wake the transport wait");
         assert_eq!(
-            voice_budget.proactive_credit_balance_quarters(),
+            voice_budget.link_credit_balance_quarters(2),
             starting_credit
         );
         assert_eq!(voice_budget.proactive_reserved_bytes(), 0);
@@ -4892,7 +4909,7 @@ mod tests {
             );
         }
         let cfg = VoiceConfig::default();
-        let voice_budget = funded_repair_budget();
+        let voice_budget = funded_repair_budget(&[2]);
         let pressure = ProactivePressureState::default();
 
         dispatch_due_tail_repairs(
@@ -4990,7 +5007,7 @@ mod tests {
             },
         );
         let cfg = VoiceConfig::default();
-        let voice_budget = funded_repair_budget();
+        let voice_budget = funded_repair_budget(&[2]);
         let pressure = ProactivePressureState::default();
 
         dispatch_due_tail_repairs(
@@ -5047,7 +5064,7 @@ mod tests {
             cache_single_tail_frame(&repair_cache, sender_session, 42);
             due_tail_key(&repairs, 2, sender_session, 42, now);
         }
-        let voice_budget = funded_repair_budget();
+        let voice_budget = funded_repair_budget(&[2]);
         let pressure = ProactivePressureState::default();
 
         dispatch_due_tail_repairs(
@@ -5071,7 +5088,7 @@ mod tests {
         let transport = ControlledUnicastTransport::new(false);
         let repairs: TailRepairState = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let repair_cache = Arc::new(RepairCache::new(Duration::from_secs(10)));
-        let voice_budget = funded_repair_budget();
+        let voice_budget = funded_repair_budget(&[2]);
         let pressure = Arc::new(ProactivePressureState::default());
         let sender_session = 0xAC0;
         let sender_epoch = 42;
@@ -5121,7 +5138,7 @@ mod tests {
         let transport = SelectivelyHungProactiveTransport::new();
         let repairs: TailRepairState = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let repair_cache = RepairCache::new(Duration::from_secs(10));
-        let voice_budget = funded_repair_budget();
+        let voice_budget = funded_repair_budget(&[2, 3]);
         let pressure = ProactivePressureState::default();
         let sender_epoch = 42;
         let now = Instant::now();
@@ -5619,8 +5636,9 @@ mod tests {
         );
         let svc = make_legacy_service(transport.clone());
         // This test covers marker/cache semantics, not the source-side rate
-        // budget. Seed credit so the first qualifying alternate is admitted.
-        svc.voice_budget.mint_proactive_credit(1_024);
+        // budget. Seed credit so the first qualifying alternate is admitted;
+        // the proactive copy rides the alternate first hop 3.
+        svc.voice_budget.mint_link_credit(3, 0xABC, 42, usize::MAX);
         svc.send_unicast(
             0xABC,
             shitspeak_core::default_server_id(),
@@ -7093,7 +7111,7 @@ mod tests {
             other => panic!("expected Unicast, got {other:?}"),
         };
         svc.voice_budget
-            .mint_proactive_credit(original.len().saturating_mul(3));
+            .mint_link_credit(2, 0xABC, 42, usize::MAX);
         let request = VoiceRepairRequest {
             sender_session: 0xABC,
             sender_epoch: 42,
@@ -7159,8 +7177,10 @@ mod tests {
         )
         .unwrap();
         cache.insert(RepairFrame::new(sender_session, 42, 7, body.clone()));
+        // The repair response reserves from the link bucket for the first hop
+        // the original took (destination 2; its alternate fails on purpose).
         let voice_budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
-        voice_budget.mint_proactive_credit(usize::MAX);
+        voice_budget.mint_link_credit(2, 0xABC, 42, usize::MAX);
 
         send_repair_response(
             RepairResponseRequest {
@@ -7214,7 +7234,11 @@ mod tests {
         let (tx, rx) = mpsc::channel(3);
         let shutdown = CancellationToken::new();
         let voice_budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
-        voice_budget.mint_proactive_credit(usize::MAX);
+        // One repair response per peer destination; each reserves from its
+        // own per-first-hop link bucket.
+        for peer in [2, 3, 4] {
+            voice_budget.mint_link_credit(peer, 0, 0, usize::MAX);
+        }
         spawn_repair_response_worker_with_concurrency(
             rx,
             transport.clone(),
@@ -7298,7 +7322,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         let shutdown = CancellationToken::new();
         let voice_budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
-        voice_budget.mint_proactive_credit(usize::MAX);
+        voice_budget.mint_link_credit(2, 0, 0, usize::MAX);
         spawn_repair_response_worker_with_concurrency(
             rx,
             transport.clone(),
@@ -7370,7 +7394,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let shutdown = CancellationToken::new();
         let voice_budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
-        voice_budget.mint_proactive_credit(usize::MAX);
+        voice_budget.mint_link_credit(2, 0, 0, usize::MAX);
         spawn_repair_response_worker_with_concurrency(
             rx,
             transport.clone(),
@@ -7486,7 +7510,7 @@ mod tests {
         assert_eq!(transport.inner.calls().len(), 1);
 
         svc.voice_budget
-            .mint_proactive_credit(original.len().saturating_mul(4));
+            .mint_link_credit(3, 0xABC, 42, usize::MAX);
         let calls = wait_for_call_count(&transport.inner, 2).await;
         match &calls[1] {
             FakeCall::RepairFrame {
@@ -7682,7 +7706,8 @@ mod tests {
             CancellationToken::new(),
             42,
         );
-        svc.voice_budget.mint_proactive_credit(1_024);
+        svc.voice_budget
+            .mint_link_credit(3, 0xABC, 42, usize::MAX);
         let send = tokio::spawn({
             let svc = svc.clone();
             async move {
@@ -7820,12 +7845,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let original_len = match &transport.calls()[0] {
-            FakeCall::Unicast { body, .. } => body.len(),
-            other => panic!("expected original unicast, got {other:?}"),
-        };
         svc.voice_budget
-            .mint_proactive_credit(original_len.saturating_mul(3));
+            .mint_link_credit(2, 0xABC, 42, usize::MAX);
         let request = VoiceRepairRequest {
             sender_session: 0xABC,
             sender_epoch: 42,
