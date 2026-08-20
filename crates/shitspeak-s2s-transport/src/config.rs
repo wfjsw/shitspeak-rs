@@ -1727,7 +1727,7 @@ fn default_voice_path_stickiness_enabled() -> bool {
     true
 }
 fn default_voice_path_min_hold_ms() -> u64 {
-    750
+    250
 }
 fn default_voice_path_challenger_confirm_ms() -> u64 {
     500
@@ -1939,7 +1939,7 @@ mod tests {
         assert_eq!(policy.transport_switch_improvement_pct(), 15);
         assert_eq!(policy.best_effort_kcp_cost_penalty_pct(), 25);
         assert!(policy.voice_path_stickiness_enabled());
-        assert_eq!(policy.voice_path_min_hold(), Duration::from_millis(750));
+        assert_eq!(policy.voice_path_min_hold(), Duration::from_millis(250));
         assert_eq!(
             policy.voice_path_challenger_confirm(),
             Duration::from_millis(500)

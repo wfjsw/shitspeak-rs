@@ -1265,6 +1265,31 @@ impl<'a> PrometheusWriter<'a> {
             "counter",
         );
         self.header(
+            "shitspeak_s2s_voice_overlap_reserved_bytes",
+            "Reserved overlap-copy bytes by first hop.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_overlap_capacity_bytes",
+            "Rate-scaled overlap-copy capacity by first hop.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_voice_overlap_copies_sent_total",
+            "Voice overlap copies accepted by first hop.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_overlap_copies_shed_total",
+            "Voice overlap copies shed before or during send.",
+            "counter",
+        );
+        self.header(
+            "shitspeak_s2s_voice_overlap_primary_fallback_sends_total",
+            "Primary voice sends recovered through the overlap path.",
+            "counter",
+        );
+        self.header(
             "shitspeak_s2s_queue_status",
             "Local S2S queue status by direction, peer, transport, and class.",
             "gauge",

@@ -1,6 +1,6 @@
 //! Versioned control-plane state for source-rooted multicast trees.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use std::time::Instant;
@@ -29,6 +29,10 @@ const EDGE_FAILURE_REPORT_DEDUP: Duration = Duration::from_secs(1);
 const FAILED_EDGE_EXCLUSION: Duration = Duration::from_secs(10);
 const METRIC_RESHAPE_HOLD: Duration = Duration::from_secs(5);
 const METRIC_RESHAPE_IMPROVEMENT_PERCENT: u64 = 10;
+const VOICE_OVERLAP_DURATION: Duration = Duration::from_secs(1);
+const VOICE_OVERLAP_RATE_WINDOW: Duration = Duration::from_secs(1);
+const VOICE_OVERLAP_MIN_CAPACITY_BYTES: usize = 1024 * 1024;
+const VOICE_OVERLAP_MAX_CAPACITY_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const DISTRIBUTION_CONTROL_SERVICE_TAG: u32 = 250;
 pub(crate) const VOICE_REALTIME_PROFILE_ID: u32 = 1;
 #[cfg(feature = "pre-release-workload")]
@@ -47,6 +51,13 @@ impl TreeEdgePath {
             Self::LegacyVia(_) => "legacy",
         }
     }
+
+    pub(crate) fn first_hop(self, child: NodeIdentifier) -> NodeIdentifier {
+        match self {
+            Self::DirectChild => child,
+            Self::LegacyVia(first_hop) => first_hop,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,11 +68,16 @@ pub(crate) struct TreeEdgeCandidate {
 }
 
 impl TreeEdgeCandidate {
+    #[cfg(test)]
     pub(crate) fn direct(pressure: u8) -> Self {
+        Self::direct_with_cost(pressure, 0)
+    }
+
+    pub(crate) fn direct_with_cost(pressure: u8, route_cost: u64) -> Self {
         Self {
             path: TreeEdgePath::DirectChild,
             pressure,
-            route_cost: 0,
+            route_cost,
         }
     }
 
@@ -140,6 +156,44 @@ struct TreeEdgeBinding {
     generation: u64,
     bound: bool,
     no_alternate_reported: bool,
+    overlap: Option<TreeEdgeOverlap>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TreeEdgeOverlap {
+    path: TreeEdgePath,
+    expires_at: Instant,
+}
+
+impl TreeEdgeOverlap {
+    pub(crate) fn path(self) -> TreeEdgePath {
+        self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remaining(self, now: Instant) -> Duration {
+        self.expires_at.saturating_duration_since(now)
+    }
+}
+
+#[derive(Default)]
+struct VoiceOverlapLink {
+    accepted_originals: VecDeque<(Instant, usize)>,
+    accepted_bytes: usize,
+    reserved_bytes: usize,
+    copies_sent: u64,
+    copies_shed: u64,
+    primary_fallback_sends: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VoiceOverlapLinkSnapshot {
+    pub(crate) reserved_bytes: usize,
+    pub(crate) capacity_bytes: usize,
+    pub(crate) copies_sent: u64,
+    pub(crate) copies_shed: u64,
+    pub(crate) primary_fallback_sends: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -164,6 +218,24 @@ impl TreeEdgeAttempt {
     pub(crate) fn chosen_pressure(self) -> Option<u8> {
         self.chosen_pressure
     }
+
+    pub(crate) fn for_overlap(path: TreeEdgePath) -> Self {
+        Self {
+            key: TreeEdgeBindingKey {
+                source: 0,
+                profile: 0,
+                group: 0,
+                group_version: 0,
+                parent: 0,
+                child: 0,
+            },
+            path,
+            generation: 0,
+            reason: "overlap",
+            incumbent_pressure: None,
+            chosen_pressure: None,
+        }
+    }
 }
 
 fn candidate_for(
@@ -174,15 +246,6 @@ fn candidate_for(
         .iter()
         .copied()
         .find(|candidate| candidate.path == path)
-}
-
-fn best_legacy_candidate(
-    candidates: &[TreeEdgeCandidate],
-    excluded: Option<TreeEdgePath>,
-) -> Option<TreeEdgeCandidate> {
-    candidates.iter().copied().find(|candidate| {
-        matches!(candidate.path, TreeEdgePath::LegacyVia(_)) && excluded != Some(candidate.path)
-    })
 }
 
 fn observe_tree_edge_challenger(
@@ -220,6 +283,45 @@ fn begin_tree_edge_transition(
     binding.pending = Some((path, reason));
     binding.no_alternate_reported = false;
     clear_tree_edge_challenger(binding);
+}
+
+fn candidate_is_better(challenger: TreeEdgeCandidate, incumbent: TreeEdgeCandidate) -> bool {
+    if challenger.pressure != incumbent.pressure {
+        return challenger.pressure < incumbent.pressure;
+    }
+    if challenger.route_cost.saturating_mul(100) <= incumbent.route_cost.saturating_mul(90) {
+        return true;
+    }
+    false
+}
+
+fn prune_voice_overlap_samples(link: &mut VoiceOverlapLink, now: Instant) {
+    while link
+        .accepted_originals
+        .front()
+        .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= VOICE_OVERLAP_RATE_WINDOW)
+    {
+        let (_, bytes) = link.accepted_originals.pop_front().expect("checked front");
+        link.accepted_bytes = link.accepted_bytes.saturating_sub(bytes);
+    }
+}
+
+fn voice_overlap_capacity(link: &VoiceOverlapLink) -> usize {
+    link.accepted_bytes.saturating_mul(2).clamp(
+        VOICE_OVERLAP_MIN_CAPACITY_BYTES,
+        VOICE_OVERLAP_MAX_CAPACITY_BYTES,
+    )
+}
+
+fn publish_voice_overlap_link(first_hop: NodeIdentifier, link: &VoiceOverlapLink) {
+    distribution_metrics::update_voice_overlap_link(
+        first_hop,
+        link.reserved_bytes,
+        voice_overlap_capacity(link),
+        link.copies_sent,
+        link.copies_shed,
+        link.primary_fallback_sends,
+    );
 }
 
 fn record_no_tree_edge_alternate(key: TreeEdgeBindingKey, binding: &mut TreeEdgeBinding) {
@@ -803,11 +905,106 @@ pub(crate) struct DistributionPlane {
     routing_generations: Mutex<HashMap<StableTreeScope, u64>>,
     scope_activity: Mutex<HashMap<TreeScope, Instant>>,
     tree_edge_bindings: Mutex<HashMap<TreeEdgeBindingKey, TreeEdgeBinding>>,
+    voice_overlap_links: Mutex<HashMap<NodeIdentifier, VoiceOverlapLink>>,
     #[cfg(test)]
     control_publishes: Mutex<u64>,
 }
 
 impl DistributionPlane {
+    pub(crate) fn record_voice_original_bytes(
+        &self,
+        first_hop: NodeIdentifier,
+        bytes: usize,
+        now: Instant,
+    ) {
+        let mut links = self.voice_overlap_links.lock();
+        let link = links.entry(first_hop).or_default();
+        prune_voice_overlap_samples(link, now);
+        let bytes = bytes.max(1);
+        link.accepted_originals.push_back((now, bytes));
+        link.accepted_bytes = link.accepted_bytes.saturating_add(bytes);
+        publish_voice_overlap_link(first_hop, link);
+    }
+
+    pub(crate) fn try_reserve_voice_overlap(
+        &self,
+        first_hop: NodeIdentifier,
+        bytes: usize,
+        now: Instant,
+    ) -> bool {
+        let mut links = self.voice_overlap_links.lock();
+        let link = links.entry(first_hop).or_default();
+        prune_voice_overlap_samples(link, now);
+        let bytes = bytes.max(1);
+        if link.reserved_bytes.saturating_add(bytes) > voice_overlap_capacity(link) {
+            link.copies_shed = link.copies_shed.saturating_add(1);
+            publish_voice_overlap_link(first_hop, link);
+            return false;
+        }
+        link.reserved_bytes = link.reserved_bytes.saturating_add(bytes);
+        publish_voice_overlap_link(first_hop, link);
+        true
+    }
+
+    pub(crate) fn release_voice_overlap(
+        &self,
+        first_hop: NodeIdentifier,
+        bytes: usize,
+        sent: bool,
+        primary_fallback: bool,
+        now: Instant,
+    ) {
+        let mut links = self.voice_overlap_links.lock();
+        let link = links.entry(first_hop).or_default();
+        prune_voice_overlap_samples(link, now);
+        link.reserved_bytes = link.reserved_bytes.saturating_sub(bytes.max(1));
+        if sent {
+            link.copies_sent = link.copies_sent.saturating_add(1);
+        } else {
+            link.copies_shed = link.copies_shed.saturating_add(1);
+        }
+        if primary_fallback && sent {
+            link.primary_fallback_sends = link.primary_fallback_sends.saturating_add(1);
+        }
+        publish_voice_overlap_link(first_hop, link);
+    }
+
+    #[cfg(test)]
+    fn voice_overlap_link_snapshot(
+        &self,
+        first_hop: NodeIdentifier,
+        now: Instant,
+    ) -> VoiceOverlapLinkSnapshot {
+        let mut links = self.voice_overlap_links.lock();
+        let link = links.entry(first_hop).or_default();
+        prune_voice_overlap_samples(link, now);
+        VoiceOverlapLinkSnapshot {
+            reserved_bytes: link.reserved_bytes,
+            capacity_bytes: voice_overlap_capacity(link),
+            copies_sent: link.copies_sent,
+            copies_shed: link.copies_shed,
+            primary_fallback_sends: link.primary_fallback_sends,
+        }
+    }
+
+    pub(crate) fn active_tree_edge_overlap(
+        &self,
+        tree_key: TreeKey,
+        parent: NodeIdentifier,
+        child: NodeIdentifier,
+        now: Instant,
+    ) -> Option<TreeEdgeOverlap> {
+        let mut bindings = self.tree_edge_bindings.lock();
+        let binding = bindings.get_mut(&TreeEdgeBindingKey::new(tree_key, parent, child))?;
+        if binding
+            .overlap
+            .is_some_and(|overlap| overlap.expires_at <= now)
+        {
+            binding.overlap = None;
+        }
+        binding.overlap
+    }
+    #[cfg(test)]
     pub(crate) fn current_tree_edge_path(
         &self,
         tree_key: TreeKey,
@@ -832,11 +1029,11 @@ impl DistributionPlane {
     ) -> TreeEdgeAttempt {
         let key = TreeEdgeBindingKey::new(tree_key, parent, child);
         candidates.sort_by_key(|candidate| {
-            let mode_order = match candidate.path {
-                TreeEdgePath::DirectChild => 0,
-                TreeEdgePath::LegacyVia(node) => u64::from(node).saturating_add(1),
-            };
-            (candidate.pressure, candidate.route_cost, mode_order)
+            (
+                candidate.pressure,
+                candidate.route_cost,
+                candidate.path.first_hop(child),
+            )
         });
 
         let mut bindings = self.tree_edge_bindings.lock();
@@ -854,18 +1051,19 @@ impl DistributionPlane {
             generation: 1,
             bound: false,
             no_alternate_reported: false,
+            overlap: None,
         });
 
-        let direct = candidate_for(&candidates, TreeEdgePath::DirectChild);
         let incumbent = candidate_for(&candidates, binding.path);
 
-        if !binding.bound
-            && binding.pending == Some((TreeEdgePath::DirectChild, "initial"))
-            && direct.is_none_or(|candidate| candidate.pressure >= 3)
-            && let Some(replacement) =
-                best_legacy_candidate(&candidates, None).filter(|candidate| candidate.pressure < 3)
-        {
-            binding.pending = Some((replacement.path, "transport_unavailable"));
+        if !binding.bound && binding.pending == Some((TreeEdgePath::DirectChild, "initial")) {
+            if let Some(replacement) = candidates
+                .iter()
+                .copied()
+                .find(|candidate| candidate.pressure < 3)
+            {
+                binding.pending = Some((replacement.path, "initial"));
+            }
         }
         if let Some((path, reason)) = binding.pending {
             return TreeEdgeAttempt {
@@ -880,15 +1078,11 @@ impl DistributionPlane {
         }
 
         // A missing, closed, or fully pressured incumbent is a hard failure.
-        // Direct is preferred when escaping a failed fallback; otherwise use
-        // the deterministically best usable alternate.
         if incumbent.is_none_or(|candidate| candidate.pressure >= 3) {
-            let replacement = match binding.path {
-                TreeEdgePath::LegacyVia(_) => direct
-                    .filter(|candidate| candidate.pressure < 3)
-                    .or_else(|| best_legacy_candidate(&candidates, Some(binding.path))),
-                TreeEdgePath::DirectChild => best_legacy_candidate(&candidates, None),
-            };
+            let replacement = candidates
+                .iter()
+                .copied()
+                .find(|candidate| candidate.path != binding.path && candidate.pressure < 3);
             if let Some(replacement) = replacement.filter(|candidate| candidate.pressure < 3) {
                 begin_tree_edge_transition(binding, replacement.path, "transport_unavailable", now);
             } else {
@@ -907,26 +1101,13 @@ impl DistributionPlane {
             };
         }
 
-        let challenger = match binding.path {
-            TreeEdgePath::DirectChild => {
-                if incumbent.is_some_and(|candidate| candidate.pressure >= 2) {
-                    best_legacy_candidate(&candidates, None).filter(|candidate| {
-                        incumbent.is_some_and(|current| candidate.pressure < current.pressure)
-                    })
-                } else {
-                    None
-                }
-            }
-            TreeEdgePath::LegacyVia(_) => {
-                if direct.is_some_and(|candidate| candidate.pressure <= 1) {
-                    direct
-                } else {
-                    best_legacy_candidate(&candidates, Some(binding.path)).filter(|candidate| {
-                        incumbent.is_some_and(|current| candidate.pressure < current.pressure)
-                    })
-                }
-            }
-        };
+        let challenger = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.path != binding.path && candidate.pressure < 3)
+            .find(|candidate| {
+                incumbent.is_some_and(|current| candidate_is_better(*candidate, current))
+            });
 
         if let Some(challenger) = challenger {
             observe_tree_edge_challenger(binding, challenger.path, now);
@@ -936,16 +1117,7 @@ impl DistributionPlane {
                     now.saturating_duration_since(since) >= policy.challenger_confirm
                 })
             {
-                begin_tree_edge_transition(
-                    binding,
-                    challenger.path,
-                    if challenger.path == TreeEdgePath::DirectChild {
-                        "recovered"
-                    } else {
-                        "confirmed_challenger"
-                    },
-                    now,
-                );
+                begin_tree_edge_transition(binding, challenger.path, "confirmed_challenger", now);
             }
         } else {
             clear_tree_edge_challenger(binding);
@@ -973,10 +1145,7 @@ impl DistributionPlane {
             (
                 candidate.pressure,
                 candidate.route_cost,
-                match candidate.path {
-                    TreeEdgePath::DirectChild => 0,
-                    TreeEdgePath::LegacyVia(node) => u64::from(node).saturating_add(1),
-                },
+                candidate.path.first_hop(attempt.key.child),
             )
         });
         let mut bindings = self.tree_edge_bindings.lock();
@@ -1001,13 +1170,10 @@ impl DistributionPlane {
             // fresh generation rather than completing the stale decision.
         }
         binding.pending = None;
-        let replacement = match attempt.path {
-            TreeEdgePath::LegacyVia(_) => candidate_for(&candidates, TreeEdgePath::DirectChild)
-                .filter(|candidate| candidate.pressure < 3)
-                .or_else(|| best_legacy_candidate(&candidates, Some(attempt.path))),
-            TreeEdgePath::DirectChild => best_legacy_candidate(&candidates, None),
-        }
-        .filter(|candidate| candidate.pressure < 3);
+        let replacement = candidates
+            .iter()
+            .copied()
+            .find(|candidate| candidate.path != attempt.path && candidate.pressure < 3);
         let Some(replacement) = replacement else {
             record_no_tree_edge_alternate(attempt.key, binding);
             return None;
@@ -1029,13 +1195,13 @@ impl DistributionPlane {
         attempt: TreeEdgeAttempt,
         success: bool,
         now: Instant,
-    ) {
+    ) -> Option<TreeEdgeOverlap> {
         let mut bindings = self.tree_edge_bindings.lock();
         let Some(binding) = bindings.get_mut(&attempt.key) else {
-            return;
+            return None;
         };
         if binding.generation != attempt.generation {
-            return;
+            return None;
         }
         if !success {
             if binding
@@ -1045,7 +1211,7 @@ impl DistributionPlane {
                 binding.pending = None;
                 binding.generation = binding.generation.wrapping_add(1).max(1);
             }
-            return;
+            return None;
         }
 
         let previous = binding.bound.then_some(binding.path);
@@ -1053,7 +1219,7 @@ impl DistributionPlane {
         if !changed {
             binding.last_used_at = now;
             binding.no_alternate_reported = false;
-            return;
+            return None;
         }
         let held_for = binding.pending_held;
         let confirmation_for = binding.pending_confirmation;
@@ -1065,6 +1231,16 @@ impl DistributionPlane {
         binding.pending = None;
         clear_tree_edge_challenger(binding);
         binding.generation = binding.generation.wrapping_add(1).max(1);
+        let overlap = if previous.is_some() && attempt.reason == "confirmed_challenger" {
+            let overlap = TreeEdgeOverlap {
+                path: previous.expect("checked previous"),
+                expires_at: now + VOICE_OVERLAP_DURATION,
+            };
+            binding.overlap = Some(overlap);
+            Some(overlap)
+        } else {
+            None
+        };
         if changed {
             distribution_metrics::update_tree_edge_binding(
                 attempt.key.parent,
@@ -1096,6 +1272,7 @@ impl DistributionPlane {
                 "voice tree edge binding changed"
             );
         }
+        overlap
     }
 
     pub(crate) fn configure_recovery(self: &Arc<Self>, sender: RecoverySender) {
@@ -2260,6 +2437,215 @@ mod tests {
         )
     }
 
+    fn fast_sticky_policy() -> TreeEdgeStickinessPolicy {
+        TreeEdgeStickinessPolicy::new(
+            Duration::from_millis(250),
+            Duration::from_millis(500),
+            Duration::from_secs(2),
+        )
+    }
+
+    #[test]
+    fn equal_pressure_lower_cost_relay_switches_after_confirmation_with_overlap() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(94, 1);
+        let start = Instant::now();
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 1, 3),
+            ]
+        };
+        let first = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            fast_sticky_policy(),
+            start + Duration::from_millis(250),
+        );
+        assert_eq!(first.path(), TreeEdgePath::DirectChild);
+        let confirmed = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            fast_sticky_policy(),
+            start + Duration::from_millis(750),
+        );
+        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
+        let overlap = plane
+            .complete_tree_edge_attempt(confirmed, true, start + Duration::from_millis(750))
+            .expect("confirmed switch keeps the replaced path for overlap");
+        assert_eq!(overlap.path(), TreeEdgePath::DirectChild);
+        assert_eq!(
+            overlap.remaining(start + Duration::from_millis(750)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            plane
+                .active_tree_edge_overlap(tree_key, 1, 2, start + Duration::from_millis(1_749))
+                .map(TreeEdgeOverlap::path),
+            Some(TreeEdgePath::DirectChild)
+        );
+        assert!(
+            plane
+                .active_tree_edge_overlap(tree_key, 1, 2, start + Duration::from_millis(1_750))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn equal_pressure_lower_id_path_does_not_bypass_cost_switch_threshold() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(96, 1);
+        let start = Instant::now();
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::legacy(4097, 0, 40)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::LegacyVia(4097))
+        );
+
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(0, 39),
+                TreeEdgeCandidate::legacy(4097, 0, 40),
+            ]
+        };
+        let first = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            fast_sticky_policy(),
+            start + Duration::from_millis(250),
+        );
+        assert_eq!(first.path(), TreeEdgePath::LegacyVia(4097));
+        let _ = plane.complete_tree_edge_attempt(first, true, start + Duration::from_millis(250));
+
+        let later = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            fast_sticky_policy(),
+            start + Duration::from_millis(750),
+        );
+        assert_eq!(later.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn second_soft_switch_replaces_instead_of_fanning_out_overlap_paths() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(95, 1);
+        let start = Instant::now();
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+        let to_first_relay = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(3, 1, 3),
+            ]
+        };
+        let _ = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            to_first_relay(),
+            fast_sticky_policy(),
+            start + Duration::from_millis(250),
+        );
+        let first_relay = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            to_first_relay(),
+            fast_sticky_policy(),
+            start + Duration::from_millis(750),
+        );
+        let _ =
+            plane.complete_tree_edge_attempt(first_relay, true, start + Duration::from_millis(750));
+
+        let to_second_relay = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(3, 1, 3),
+                TreeEdgeCandidate::legacy(4, 1, 1),
+            ]
+        };
+        let _ = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            to_second_relay(),
+            fast_sticky_policy(),
+            start + Duration::from_millis(1_001),
+        );
+        let second_relay = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            to_second_relay(),
+            fast_sticky_policy(),
+            start + Duration::from_millis(1_501),
+        );
+        assert_eq!(second_relay.path(), TreeEdgePath::LegacyVia(4));
+        let overlap = plane
+            .complete_tree_edge_attempt(second_relay, true, start + Duration::from_millis(1_501))
+            .expect("second switch replaces the overlap path");
+        assert_eq!(overlap.path(), TreeEdgePath::LegacyVia(3));
+    }
+
+    #[test]
+    fn overlap_capacity_scales_with_original_rate_without_repair_credit() {
+        let plane = DistributionPlane::default();
+        let now = Instant::now();
+        let floor = plane.voice_overlap_link_snapshot(3, now);
+        assert_eq!(floor.capacity_bytes, VOICE_OVERLAP_MIN_CAPACITY_BYTES);
+        plane.record_voice_original_bytes(3, 6 * 1024 * 1024, now);
+        let capped = plane.voice_overlap_link_snapshot(3, now);
+        assert_eq!(capped.capacity_bytes, VOICE_OVERLAP_MAX_CAPACITY_BYTES);
+        assert!(plane.try_reserve_voice_overlap(3, 1024, now));
+        plane.release_voice_overlap(3, 1024, true, false, now);
+        plane.release_voice_overlap(3, 1, true, true, now);
+        let snapshot = plane.voice_overlap_link_snapshot(3, now);
+        assert_eq!(snapshot.reserved_bytes, 0);
+        assert_eq!(snapshot.copies_sent, 2);
+        assert_eq!(snapshot.copies_shed, 0);
+        assert_eq!(snapshot.primary_fallback_sends, 1);
+        assert_eq!(
+            plane
+                .voice_overlap_link_snapshot(3, now + Duration::from_secs(1))
+                .capacity_bytes,
+            VOICE_OVERLAP_MIN_CAPACITY_BYTES
+        );
+    }
+
     #[test]
     fn tree_edge_soft_switch_requires_hold_and_stable_challenger() {
         let plane = DistributionPlane::default();
@@ -2274,7 +2660,7 @@ mod tests {
             start,
         );
         assert_eq!(initial.path(), TreeEdgePath::DirectChild);
-        plane.complete_tree_edge_attempt(initial, true, start);
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
 
         let candidates = || {
             vec![
@@ -2325,7 +2711,7 @@ mod tests {
             sticky_policy(),
             start,
         );
-        plane.complete_tree_edge_attempt(initial, true, start);
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
         let at = |ms| start + Duration::from_millis(ms);
         let _ = plane.choose_tree_edge(
             tree_key,
@@ -2389,8 +2775,8 @@ mod tests {
             sticky_policy(),
             start,
         );
-        plane.complete_tree_edge_attempt(stale, true, start);
-        plane.complete_tree_edge_attempt(stale, true, start + Duration::from_millis(10));
+        let _ = plane.complete_tree_edge_attempt(stale, true, start);
+        let _ = plane.complete_tree_edge_attempt(stale, true, start + Duration::from_millis(10));
         assert_eq!(
             plane.current_tree_edge_path(tree_key, 1, 2),
             Some(TreeEdgePath::DirectChild)
@@ -2426,7 +2812,7 @@ mod tests {
             start,
         );
         assert_eq!(direct.path(), TreeEdgePath::LegacyVia(3));
-        plane.complete_tree_edge_attempt(direct, true, start);
+        let _ = plane.complete_tree_edge_attempt(direct, true, start);
 
         let failed_fallback = plane.choose_tree_edge(
             tree_key,

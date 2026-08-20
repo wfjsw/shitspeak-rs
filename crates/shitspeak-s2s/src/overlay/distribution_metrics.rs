@@ -227,6 +227,15 @@ struct TreeEdgeBindingGaugeKey {
     mode: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct VoiceOverlapLinkGauge {
+    reserved_bytes: usize,
+    capacity_bytes: usize,
+    copies_sent: u64,
+    copies_shed: u64,
+    primary_fallback_sends: u64,
+}
+
 #[derive(Default)]
 struct DistributionMetrics {
     events: HashMap<EventKey, u64>,
@@ -234,6 +243,7 @@ struct DistributionMetrics {
     peer_clocks: HashMap<NodeIdentifier, PeerClockGauge>,
     tree_edge_bindings: HashMap<TreeEdgeBindingGaugeKey, u64>,
     tree_edge_binding_events: HashMap<TreeEdgeBindingEventKey, u64>,
+    voice_overlap_links: HashMap<NodeIdentifier, VoiceOverlapLinkGauge>,
 }
 
 #[cfg(feature = "pre-release-workload")]
@@ -526,6 +536,26 @@ pub(crate) fn record_tree_edge_binding_event(
         .or_default() += 1;
 }
 
+pub(crate) fn update_voice_overlap_link(
+    first_hop: NodeIdentifier,
+    reserved_bytes: usize,
+    capacity_bytes: usize,
+    copies_sent: u64,
+    copies_shed: u64,
+    primary_fallback_sends: u64,
+) {
+    METRICS.lock().unwrap().voice_overlap_links.insert(
+        first_hop,
+        VoiceOverlapLinkGauge {
+            reserved_bytes,
+            capacity_bytes,
+            copies_sent,
+            copies_shed,
+            primary_fallback_sends,
+        },
+    );
+}
+
 fn set_peer_clock_gauges(gauges: Vec<(NodeIdentifier, PeerClockGauge)>) {
     let mut metrics = METRICS.lock().unwrap();
     metrics.peer_clocks.clear();
@@ -633,6 +663,34 @@ pub(crate) fn prometheus_samples(local_node: NodeIdentifier) -> Vec<PrometheusSa
                 ("reason".to_owned(), key.reason.to_owned()),
             ],
             *count as f64,
+        ));
+    }
+    for (peer, gauge) in &metrics.voice_overlap_links {
+        let labels = vec![("peer".to_owned(), peer.to_string())];
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_overlap_reserved_bytes",
+            labels.clone(),
+            gauge.reserved_bytes as f64,
+        ));
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_overlap_capacity_bytes",
+            labels.clone(),
+            gauge.capacity_bytes as f64,
+        ));
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_overlap_copies_sent_total",
+            labels.clone(),
+            gauge.copies_sent as f64,
+        ));
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_overlap_copies_shed_total",
+            labels.clone(),
+            gauge.copies_shed as f64,
+        ));
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_overlap_primary_fallback_sends_total",
+            labels,
+            gauge.primary_fallback_sends as f64,
         ));
     }
 

@@ -2360,7 +2360,6 @@ fn tree_edge_candidates(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     distribution: &DistributionPlane,
-    tree_key: TreeKey,
     self_id: NodeIdentifier,
     child: NodeIdentifier,
     recipients: &[NodeIdentifier],
@@ -2370,27 +2369,24 @@ fn tree_edge_candidates(
     hop_ttl: Duration,
     force_alternates: bool,
 ) -> Vec<TreeEdgeCandidate> {
+    let _ = (distribution, force_alternates);
     let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
     let metric = route_metric_from_wire(data.route_metric, level)
         .unwrap_or_else(|| RoutingMetric::default_for_level(level));
     let options = transport_options_for_overlay_data(data, Some(hop_ttl));
     let mut candidates = Vec::new();
+    let tables = routing.load();
+    let visited = path_trace_set(path_trace);
     let direct_pressure =
         transport.best_conversational_path_pressure(child, level, metric, transport_class, options);
     if let Some(pressure) = direct_pressure {
-        candidates.push(TreeEdgeCandidate::direct(pressure));
+        let route_cost = tables
+            .lookup_via_first_hop_with_metric(self_id, child, level, metric, &visited, child)
+            .map(|route| route.cost)
+            .unwrap_or(u64::MAX);
+        candidates.push(TreeEdgeCandidate::direct_with_cost(pressure, route_cost));
     }
 
-    let current_path = distribution.current_tree_edge_path(tree_key, self_id, child);
-    if !force_alternates
-        && !matches!(current_path, Some(TreeEdgePath::LegacyVia(_)))
-        && direct_pressure.is_some_and(|pressure| pressure <= 1)
-    {
-        return candidates;
-    }
-
-    let tables = routing.load();
-    let visited = path_trace_set(path_trace);
     let legacy_hops = tables
         .first_hops_reaching_all_with_metric(self_id, recipients, level, metric, &visited)
         .into_iter()
@@ -2559,6 +2555,62 @@ async fn send_tree_edge_attempt(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn send_tree_edge_overlap_copy(
+    transport: &ConnectionManager,
+    routing: &RoutingHandle,
+    distribution: &DistributionPlane,
+    overlap: TreeEdgePath,
+    self_id: NodeIdentifier,
+    child: NodeIdentifier,
+    recipients: &[NodeIdentifier],
+    data: &pb::OverlayData,
+    path_trace: &[u32],
+    transport_class: MessageClass,
+    hop_ttl: Duration,
+    primary_fallback: bool,
+) -> bool {
+    let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
+    let metric = route_metric_from_wire(data.route_metric, level)
+        .unwrap_or_else(|| RoutingMetric::default_for_level(level));
+    let options = transport_options_for_overlay_data(data, Some(hop_ttl));
+    let first_hop = overlap.first_hop(child);
+    let bytes = data.payload.len().max(1);
+    let pressure = transport.best_conversational_path_pressure(
+        first_hop,
+        level,
+        metric,
+        transport_class,
+        options,
+    );
+    if pressure.is_none_or(|pressure| pressure >= 2)
+        || !distribution.try_reserve_voice_overlap(first_hop, bytes, Instant::now())
+    {
+        debug!(parent = %self_id, %child, %first_hop, "shed voice overlap copy");
+        return false;
+    }
+
+    let sent = matches!(
+        send_tree_edge_attempt(
+            transport,
+            routing,
+            TreeEdgeAttempt::for_overlap(overlap),
+            self_id,
+            child,
+            recipients,
+            data,
+            path_trace,
+            transport_class,
+            hop_ttl,
+            false,
+        )
+        .await,
+        TreeEdgeSendOutcome::Sent | TreeEdgeSendOutcome::FallbackSent { .. }
+    );
+    distribution.release_voice_overlap(first_hop, bytes, sent, primary_fallback, Instant::now());
+    sent
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn send_sticky_tree_edge(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
@@ -2578,7 +2630,6 @@ async fn send_sticky_tree_edge(
         transport,
         routing,
         distribution,
-        tree_key,
         self_id,
         child,
         &recipients,
@@ -2619,20 +2670,68 @@ async fn send_sticky_tree_edge(
         outcome,
         TreeEdgeSendOutcome::Sent | TreeEdgeSendOutcome::FallbackSent { .. }
     ) {
-        distribution.complete_tree_edge_attempt(attempt, true, Instant::now());
+        let now = Instant::now();
+        let overlap = distribution.complete_tree_edge_attempt(attempt, true, now);
+        distribution.record_voice_original_bytes(
+            attempt.path().first_hop(child),
+            data.payload.len(),
+            now,
+        );
+        if let Some(overlap) = overlap.or_else(|| {
+            distribution.active_tree_edge_overlap(tree_key, self_id, child, Instant::now())
+        }) {
+            let _ = send_tree_edge_overlap_copy(
+                transport,
+                routing,
+                distribution,
+                overlap.path(),
+                self_id,
+                child,
+                &recipients,
+                data,
+                &path_trace,
+                transport_class,
+                hop_ttl,
+                false,
+            )
+            .await;
+        }
         return outcome;
+    }
+
+    if let Some(overlap) =
+        distribution.active_tree_edge_overlap(tree_key, self_id, child, Instant::now())
+    {
+        if send_tree_edge_overlap_copy(
+            transport,
+            routing,
+            distribution,
+            overlap.path(),
+            self_id,
+            child,
+            &recipients,
+            data,
+            &path_trace,
+            transport_class,
+            hop_ttl,
+            true,
+        )
+        .await
+        {
+            let _ = distribution.complete_tree_edge_attempt(attempt, false, Instant::now());
+            return TreeEdgeSendOutcome::FallbackSent { direct_unavailable };
+        }
     }
 
     let remaining_ttl = attempt_deadline.saturating_duration_since(Instant::now());
     if remaining_ttl.is_zero() {
-        distribution.complete_tree_edge_attempt(attempt, false, Instant::now());
+        let _ = distribution.complete_tree_edge_attempt(attempt, false, Instant::now());
         return outcome;
     }
     candidates = tree_edge_candidates(
         transport,
         routing,
         distribution,
-        tree_key,
         self_id,
         child,
         &recipients,
@@ -2646,7 +2745,7 @@ async fn send_sticky_tree_edge(
     let Some(retry) =
         distribution.hard_escape_tree_edge(attempt, candidates.clone(), reason, Instant::now())
     else {
-        distribution.complete_tree_edge_attempt(attempt, false, Instant::now());
+        let _ = distribution.complete_tree_edge_attempt(attempt, false, Instant::now());
         debug!(parent = %self_id, %child, reason = "no_alternate", "voice tree edge hard escape failed");
         return outcome;
     };
@@ -2666,7 +2765,7 @@ async fn send_sticky_tree_edge(
         .is_none_or(|candidate| candidate.pressure() >= 3);
     let retry_ttl = attempt_deadline.saturating_duration_since(Instant::now());
     if retry_ttl.is_zero() {
-        distribution.complete_tree_edge_attempt(retry, false, Instant::now());
+        let _ = distribution.complete_tree_edge_attempt(retry, false, Instant::now());
         return outcome;
     }
     let retry_outcome = send_tree_edge_attempt(
@@ -2683,7 +2782,7 @@ async fn send_sticky_tree_edge(
         retry_direct_unavailable,
     )
     .await;
-    distribution.complete_tree_edge_attempt(
+    let _ = distribution.complete_tree_edge_attempt(
         retry,
         matches!(
             retry_outcome,
@@ -2736,6 +2835,7 @@ async fn forward_tree_data_v3(
     );
     let sticky_key = (routing_policy.voice_path_stickiness_enabled()
         && data.service_tag == VOICE_SERVICE_TAG
+        && !data.distribution_repair
         && level == ServiceLevel::BestEffort
         && route_metric_from_wire(data.route_metric, level)
             == Some(RoutingMetric::ConversationalQuality)
@@ -3269,16 +3369,6 @@ fn queue_pressure_alternate(
             send_options,
         )
         .unwrap_or(3);
-    let reroute_threshold = if routing_metric == RoutingMetric::ConversationalQuality {
-        2
-    } else if send_options.expires_at().is_some() {
-        2
-    } else {
-        3
-    };
-    if current_pressure < reroute_threshold {
-        return None;
-    }
     let alternate = tables.lookup_avoiding_first_hop_with_metric(
         self_id,
         dst,
@@ -3297,7 +3387,49 @@ fn queue_pressure_alternate(
         transport_class,
         send_options,
     )?;
-    (alternate_pressure < current_pressure).then_some(alternate.next_hop)
+    if alternate_pressure >= 3 {
+        return None;
+    }
+    if current_pressure >= 3
+        || alternate_pressure < current_pressure
+        || (alternate_pressure == current_pressure
+            && alternate.cost.saturating_mul(100)
+                <= entry_cost_for_first_hop(
+                    tables,
+                    self_id,
+                    dst,
+                    level,
+                    routing_metric,
+                    path_trace_set,
+                    current_next_hop,
+                )
+                .unwrap_or(u64::MAX)
+                .saturating_mul(90))
+    {
+        return Some(alternate.next_hop);
+    }
+    None
+}
+
+fn entry_cost_for_first_hop(
+    tables: &RoutingTables,
+    self_id: NodeIdentifier,
+    dst: NodeIdentifier,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    path_trace_set: &HashSet<NodeIdentifier>,
+    first_hop: NodeIdentifier,
+) -> Option<u64> {
+    tables
+        .lookup_via_first_hop_with_metric(
+            self_id,
+            dst,
+            level,
+            routing_metric,
+            path_trace_set,
+            first_hop,
+        )
+        .map(|route| route.cost)
 }
 
 #[cfg(test)]
