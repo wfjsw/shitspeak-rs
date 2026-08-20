@@ -20,7 +20,7 @@ use crate::overlay::attachments::{AttachmentCache, AttachmentKey, TREE_HINT_ATTA
 use crate::overlay::config::OverlayConfig;
 use crate::overlay::distribution::{
     DistributionPlane, PendingDistributionFrame, TreeEdgeAttempt, TreeEdgeCandidate, TreeEdgePath,
-    TreeEdgeStickinessPolicy, TreeKey, TreeState, UnknownTreeEnqueue,
+    TreeEdgeSplit, TreeEdgeStickinessPolicy, TreeKey, TreeState, UnknownTreeEnqueue,
 };
 use crate::overlay::neighbor::NeighborMonitor;
 use shitspeak_core::NodeIdentifier;
@@ -2554,12 +2554,41 @@ async fn send_tree_edge_attempt(
     }
 }
 
+/// Per-frame draw for the redundant-copy decision. Deterministic per
+/// (first hop, origin message id) so the sender sheds copies in a stable,
+/// reproducible pattern and tests can reason about a fixed draw.
+fn split_frame_draw(first_hop: NodeIdentifier, origin_message_id: u64) -> f64 {
+    let mut x = (u64::from(u32::from(first_hop)) << 32) ^ origin_message_id;
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+    x ^= x >> 33;
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Pure copy decision for the faded old route during a split: send the copy
+/// with probability `copy_weight` (i.e. when the per-frame draw falls below
+/// it). `copy_weight = 1 - share`, so a probe at `share = 0` duplicates every
+/// frame and a completed fade at `share = 1` sends none.
+fn decide_send_old_route_copy(copy_weight: f64, draw: f64) -> bool {
+    draw < copy_weight
+}
+
+/// Pure split-mode path decision for an interior hold: each frame rides exactly
+/// one path by weight — the adopted route with probability `share`, the old
+/// route otherwise — instead of duplicating. `true` means the frame takes the
+/// adopted (`to`) path.
+fn decide_split_mode_takes_to(share: f64, draw: f64) -> bool {
+    draw < share
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn send_tree_edge_overlap_copy(
+async fn send_tree_edge_split_copy(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
     distribution: &DistributionPlane,
-    overlap: TreeEdgePath,
+    split: TreeEdgeSplit,
     self_id: NodeIdentifier,
     child: NodeIdentifier,
     recipients: &[NodeIdentifier],
@@ -2573,7 +2602,7 @@ async fn send_tree_edge_overlap_copy(
     let metric = route_metric_from_wire(data.route_metric, level)
         .unwrap_or_else(|| RoutingMetric::default_for_level(level));
     let options = transport_options_for_overlay_data(data, Some(hop_ttl));
-    let first_hop = overlap.first_hop(child);
+    let first_hop = split.from().first_hop(child);
     let bytes = data.payload.len().max(1);
     let pressure = transport.best_conversational_path_pressure(
         first_hop,
@@ -2582,10 +2611,23 @@ async fn send_tree_edge_overlap_copy(
         transport_class,
         options,
     );
+    // Redundant copy during a fade: shed when the old route is pressured, the
+    // copy budget is full, or (for a normal copy, not a primary fallback) the
+    // split weight has already faded this route below the draw.
+    let copy_weight = 1.0 - split.share();
+    let draw = split_frame_draw(first_hop, data.origin_message_id);
     if pressure.is_none_or(|pressure| pressure >= 2)
+        || (!primary_fallback && !decide_send_old_route_copy(copy_weight, draw))
         || !distribution.try_reserve_voice_overlap(first_hop, bytes, Instant::now())
     {
-        debug!(parent = %self_id, %child, %first_hop, "shed voice overlap copy");
+        debug!(
+            parent = %self_id,
+            %child,
+            %first_hop,
+            share = split.share(),
+            primary_fallback,
+            "shed voice transition copy"
+        );
         return false;
     }
 
@@ -2593,7 +2635,7 @@ async fn send_tree_edge_overlap_copy(
         send_tree_edge_attempt(
             transport,
             routing,
-            TreeEdgeAttempt::for_overlap(overlap),
+            TreeEdgeAttempt::for_split_copy(split.from()),
             self_id,
             child,
             recipients,
@@ -2647,6 +2689,30 @@ async fn send_sticky_tree_edge(
         policy,
         Instant::now(),
     );
+    // Split mode (interior steady state): once the controller holds an interior
+    // split, each frame rides exactly one path by weight instead of duplicating
+    // — the "portion to each" load distribution. `split_primary` is `None`
+    // except when split mode is active and the draw picked the old route; then
+    // the frame is sent down `from` as the primary (no redundant copy).
+    let split_primary = distribution
+        .active_tree_edge_split(tree_key, self_id, child)
+        .filter(|split| split.interior_hold() && policy.split_mode())
+        .map(|split| {
+            let draw = split_frame_draw(
+                u16::from(split.to().first_hop(child)) ^ u16::from(split.from().first_hop(child)),
+                data.origin_message_id,
+            );
+            if decide_split_mode_takes_to(split.share(), draw) {
+                split.to()
+            } else {
+                split.from()
+            }
+        });
+    let send_attempt = match split_primary {
+        Some(path) if path != attempt.path() => TreeEdgeAttempt::for_split_copy(path),
+        _ => attempt,
+    };
+    let primary_hop = send_attempt.path().first_hop(child);
     let direct_unavailable = candidates
         .iter()
         .find(|candidate| candidate.path() == TreeEdgePath::DirectChild)
@@ -2655,7 +2721,7 @@ async fn send_sticky_tree_edge(
     let outcome = send_tree_edge_attempt(
         transport,
         routing,
-        attempt,
+        send_attempt,
         self_id,
         child,
         &recipients,
@@ -2671,42 +2737,72 @@ async fn send_sticky_tree_edge(
         TreeEdgeSendOutcome::Sent | TreeEdgeSendOutcome::FallbackSent { .. }
     ) {
         let now = Instant::now();
-        let overlap = distribution.complete_tree_edge_attempt(attempt, true, now);
-        distribution.record_voice_original_bytes(
-            attempt.path().first_hop(child),
-            data.payload.len(),
-            now,
-        );
-        if let Some(overlap) = overlap.or_else(|| {
-            distribution.active_tree_edge_overlap(tree_key, self_id, child, Instant::now())
-        }) {
-            let _ = send_tree_edge_overlap_copy(
-                transport,
-                routing,
-                distribution,
-                overlap.path(),
-                self_id,
-                child,
-                &recipients,
-                data,
-                &path_trace,
-                transport_class,
-                hop_ttl,
-                false,
-            )
-            .await;
+        distribution.record_voice_original_bytes(primary_hop, data.payload.len(), now);
+        if split_primary.is_none() {
+            // Redundant-copy fade: complete/advance the split and mirror-copy
+            // the frame onto the old route with probability `1 - share`.
+            let split = distribution
+                .complete_tree_edge_attempt(attempt, true, now)
+                .or_else(|| distribution.active_tree_edge_split(tree_key, self_id, child));
+            if let Some(split) = split {
+                let _ = send_tree_edge_split_copy(
+                    transport,
+                    routing,
+                    distribution,
+                    split,
+                    self_id,
+                    child,
+                    &recipients,
+                    data,
+                    &path_trace,
+                    transport_class,
+                    hop_ttl,
+                    false,
+                )
+                .await;
+            }
         }
         return outcome;
     }
 
-    if let Some(overlap) =
-        distribution.active_tree_edge_overlap(tree_key, self_id, child, Instant::now())
-    {
-        if send_tree_edge_overlap_copy(
+    if let Some(split) = distribution.active_tree_edge_split(tree_key, self_id, child) {
+        if split.interior_hold() && policy.split_mode() {
+            // Split mode: a lost frame on its assigned path is retried once on
+            // the other split path at full rate. The interior steady state is
+            // not rolled back by a single loss — the reorder buffer + repair
+            // absorb it, and the controller's own abort handles persistent
+            // degradation.
+            let fallback_path = match split_primary {
+                Some(path) if path == split.to() => split.from(),
+                _ => split.to(),
+            };
+            let fallback_ttl = attempt_deadline.saturating_duration_since(Instant::now());
+            if !fallback_ttl.is_zero()
+                && matches!(
+                    send_tree_edge_attempt(
+                        transport,
+                        routing,
+                        TreeEdgeAttempt::for_split_copy(fallback_path),
+                        self_id,
+                        child,
+                        &recipients,
+                        data,
+                        &path_trace,
+                        transport_class,
+                        fallback_ttl,
+                        direct_unavailable,
+                    )
+                    .await,
+                    TreeEdgeSendOutcome::Sent | TreeEdgeSendOutcome::FallbackSent { .. }
+                )
+            {
+                return TreeEdgeSendOutcome::FallbackSent { direct_unavailable };
+            }
+        } else if send_tree_edge_split_copy(
             transport,
             routing,
             distribution,
-            overlap.path(),
+            split,
             self_id,
             child,
             &recipients,
@@ -2718,6 +2814,9 @@ async fn send_sticky_tree_edge(
         )
         .await
         {
+            // A failed primary must not be treated as committed: fall back to
+            // the warm old route at full rate and roll the split back.
+            let _ = distribution.abort_tree_edge_split(tree_key, self_id, child, Instant::now());
             let _ = distribution.complete_tree_edge_attempt(attempt, false, Instant::now());
             return TreeEdgeSendOutcome::FallbackSent { direct_unavailable };
         }
@@ -2832,6 +2931,11 @@ async fn forward_tree_data_v3(
         routing_policy.voice_path_min_hold(),
         routing_policy.voice_path_challenger_confirm(),
         routing_policy.voice_path_idle_reset(),
+        routing_policy.voice_path_transition_fanout(),
+        routing_policy.voice_path_transition_fade(),
+        routing_policy.voice_path_split_mode(),
+        routing_policy.voice_path_split_target_beta(),
+        routing_policy.voice_path_split_target_learning_rate(),
     );
     let sticky_key = (routing_policy.voice_path_stickiness_enabled()
         && data.service_tag == VOICE_SERVICE_TAG
@@ -3445,6 +3549,63 @@ mod tests {
     use shitspeak_s2s_transport::{SendError, TransportKind};
     use tokio::sync::{broadcast, mpsc};
     use tokio::time::timeout;
+
+    #[test]
+    fn split_copy_decision_tracks_the_faded_weight() {
+        // Probe window (share 0): the old route keeps every copy.
+        assert!(decide_send_old_route_copy(1.0 - 0.0, 0.999_999));
+        // Completed fade (share 1): no copies ride the old route.
+        assert!(!decide_send_old_route_copy(1.0 - 1.0, 0.0));
+        // Half faded: a draw below the weight sends, at or above it sheds.
+        let weight = 1.0 - 0.4;
+        assert!(decide_send_old_route_copy(weight, weight - 0.01));
+        assert!(!decide_send_old_route_copy(weight, weight));
+        assert!(!decide_send_old_route_copy(weight, weight + 0.01));
+    }
+
+    #[test]
+    fn split_frame_draw_is_deterministic_per_link_and_frame() {
+        let a0 = split_frame_draw(1, 100);
+        let a0_again = split_frame_draw(1, 100);
+        let a1 = split_frame_draw(1, 101);
+        let b0 = split_frame_draw(2, 100);
+        assert_eq!(a0, a0_again, "same link and frame draws the same weight");
+        assert_ne!(a0, a1, "different frames vary the draw");
+        assert_ne!(a0, b0, "different first hops decorrelate the draw");
+        for id in 0..128u64 {
+            let draw = split_frame_draw(7, id);
+            assert!((0.0..1.0).contains(&draw), "draw in [0,1): {draw}");
+        }
+    }
+
+    #[test]
+    fn split_mode_allocates_each_frame_to_exactly_one_path_by_weight() {
+        // Interior share 0.6: the draw sits above 0.6 for most frames, so a
+        // majority ride the old route — each frame is single-path, never a copy.
+        let share = 0.4;
+        let mut to_allocated = 0u32;
+        for id in 0..10_000u64 {
+            let draw = split_frame_draw(0x1701, id);
+            if decide_split_mode_takes_to(share, draw) {
+                to_allocated += 1;
+            }
+        }
+        let observed = to_allocated as f64 / 10_000.0;
+        assert!(
+            (observed - share).abs() < 0.02,
+            "weighted single-path allocation tracks the share (observed {observed})"
+        );
+        // A probe at share 1 commits every frame to the adopted path; at share 0
+        // the adopted path is abandoned — the two corners still never duplicate.
+        assert!(decide_split_mode_takes_to(1.0, 0.999_999));
+        assert!(!decide_split_mode_takes_to(0.0, 0.0));
+        // Same link pair and frame deterministically pick the same path.
+        let draw = split_frame_draw(0x1701, 4242);
+        assert_eq!(
+            decide_split_mode_takes_to(share, draw),
+            decide_split_mode_takes_to(share, split_frame_draw(0x1701, 4242)),
+        );
+    }
 
     fn edge(cost: u64) -> EdgeCost {
         EdgeCost {

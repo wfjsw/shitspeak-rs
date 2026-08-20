@@ -169,6 +169,11 @@ message VoicePathFeedback {
   uint32 received_frames = 1;
   uint32 gap_buffered = 2;
   uint32 deadline_flush = 3;
+  // Longest chunk-hold delay (beyond the in-order skew tolerance) the
+  // receiver had to impose on this peer's frames in the interval, in
+  // microseconds. A route forcing the receiver to hold chunks raises the
+  // sender's pressure on the next report instead of a slow average.
+  uint32 max_held_delay_us = 4;
 }
 
 message VoiceIntent {

@@ -29,10 +29,25 @@ const EDGE_FAILURE_REPORT_DEDUP: Duration = Duration::from_secs(1);
 const FAILED_EDGE_EXCLUSION: Duration = Duration::from_secs(10);
 const METRIC_RESHAPE_HOLD: Duration = Duration::from_secs(5);
 const METRIC_RESHAPE_IMPROVEMENT_PERCENT: u64 = 10;
-const VOICE_OVERLAP_DURATION: Duration = Duration::from_secs(1);
 const VOICE_OVERLAP_RATE_WINDOW: Duration = Duration::from_secs(1);
 const VOICE_OVERLAP_MIN_CAPACITY_BYTES: usize = 1024 * 1024;
 const VOICE_OVERLAP_MAX_CAPACITY_BYTES: usize = 8 * 1024 * 1024;
+/// Control cadence for the voice-split state machine. The split weight is
+/// advanced at most once per interval, driven from `choose_tree_edge` (which
+/// already runs once per forwarded frame per edge).
+const TRANSITION_CONTROL_INTERVAL: Duration = Duration::from_millis(50);
+/// A challenger that reads at least this hard-failure pressure for this many
+/// consecutive frames *under load* aborts the transition and rolls back to the
+/// warm old route. Queue pressure reacts immediately; loss/playout catch up
+/// within a fraction of a second of real load.
+const TRANSITION_ABORT_PRESSURE: u8 = 3;
+const TRANSITION_ABORT_OBSERVATIONS: u32 = 2;
+/// A challenger at or above this marginal pressure pauses the ramp until the
+/// measurement catches up (it is loaded now, not idle).
+const TRANSITION_MARGINAL_PRESSURE: u8 = 2;
+/// How long the new route must hold full load at the end of a fade before the
+/// transition commits and the old route is dropped entirely.
+const TRANSITION_CONFIRM: Duration = Duration::from_millis(150);
 pub(crate) const DISTRIBUTION_CONTROL_SERVICE_TAG: u32 = 250;
 pub(crate) const VOICE_REALTIME_PROFILE_ID: u32 = 1;
 #[cfg(feature = "pre-release-workload")]
@@ -103,19 +118,52 @@ pub(crate) struct TreeEdgeStickinessPolicy {
     min_hold: Duration,
     challenger_confirm: Duration,
     idle_reset: Duration,
+    /// How long a confirmed switch first duplicates voice onto both routes
+    /// (the load-probe window). Long enough for the new route to accumulate
+    /// enough real traffic for its loaded loss/playout metrics to be truthful.
+    transition_fanout: Duration,
+    /// How long the old route's copy takes to fade to zero once the probe
+    /// window ends and the split weight starts ramping.
+    transition_fade: Duration,
+    /// Interior split mode: once the controller settles at an interior weight
+    /// (`HoldsInterior`), each frame rides exactly one path by weight instead of
+    /// a redundant copy. OFF by default — the redundant fade is the staged first
+    /// cut; enable once repair coverage is confirmed in Grafana.
+    split_mode: bool,
+    /// Softmax temperature over each leg's loaded cost. Larger = more decisive
+    /// toward the cheaper route.
+    split_target_beta: f64,
+    /// Exponential smoothing on the split target per control interval; damps
+    /// feedback flips so the split converges instead of whipping between paths.
+    split_target_learning_rate: f64,
 }
 
 impl TreeEdgeStickinessPolicy {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         min_hold: Duration,
         challenger_confirm: Duration,
         idle_reset: Duration,
+        transition_fanout: Duration,
+        transition_fade: Duration,
+        split_mode: bool,
+        split_target_beta: f64,
+        split_target_learning_rate: f64,
     ) -> Self {
         Self {
             min_hold,
             challenger_confirm,
             idle_reset,
+            transition_fanout,
+            transition_fade,
+            split_mode,
+            split_target_beta,
+            split_target_learning_rate,
         }
+    }
+
+    pub(crate) fn split_mode(&self) -> bool {
+        self.split_mode
     }
 }
 
@@ -156,23 +204,286 @@ struct TreeEdgeBinding {
     generation: u64,
     bound: bool,
     no_alternate_reported: bool,
-    overlap: Option<TreeEdgeOverlap>,
+    /// Active weighted-split transition, if any. While present the controller
+    /// owns the edge: `path` is the challenger being adopted and the split
+    /// fades `from` (the old route) out under the challenger's *loaded*
+    /// quality, aborting back to `from` if it degrades.
+    transition: Option<TreeEdgeSplitState>,
 }
 
+/// Snapshot of an in-flight voice split, handed to the sender each frame so it
+/// can choose where the frame (or its redundant copy) rides.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct TreeEdgeOverlap {
-    path: TreeEdgePath,
-    expires_at: Instant,
+pub(crate) struct TreeEdgeSplit {
+    from: TreeEdgePath,
+    to: TreeEdgePath,
+    share: f64,
+    /// True when the controller has converged on an interior split and is
+    /// holding it as the steady state. The sender may then switch from
+    /// redundant-copy to one-path-per-frame by weight (split mode).
+    interior_hold: bool,
 }
 
-impl TreeEdgeOverlap {
-    pub(crate) fn path(self) -> TreeEdgePath {
-        self.path
+impl TreeEdgeSplit {
+    pub(crate) fn from(self) -> TreeEdgePath {
+        self.from
     }
 
-    #[cfg(test)]
-    pub(crate) fn remaining(self, now: Instant) -> Duration {
-        self.expires_at.saturating_duration_since(now)
+    pub(crate) fn to(self) -> TreeEdgePath {
+        self.to
+    }
+
+    /// Weight of the adopted path (`binding.path`); the old route receives a
+    /// redundant copy with probability `1 - share`.
+    pub(crate) fn share(self) -> f64 {
+        self.share
+    }
+
+    /// Whether the controller is holding an interior split (a portion to each
+    /// path) rather than still moving toward a corner.
+    pub(crate) fn interior_hold(self) -> bool {
+        self.interior_hold
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SplitPhase {
+    /// Both routes carry voice at full rate (duplication). This is the
+    /// load-probe window: it gives the challenger real traffic so its
+    /// loaded loss/playout metrics become truthful before any commitment.
+    Fanout,
+    /// The split weight ramps toward its target; the old route mirror-fades.
+    Adjusting,
+    /// The controller has converged on an interior split (target < 1.0) and is
+    /// holding it as the steady state, re-evaluating on a slow cadence.
+    HoldsInterior,
+}
+
+/// Weighted-split state machine for a tree-edge voice transition.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TreeEdgeSplitState {
+    Splitting {
+        from: TreeEdgePath,
+        to: TreeEdgePath,
+        /// Weight on `to` in `[0, 1]`; the old route mirrors at `1 - share`.
+        share: f64,
+        /// The controller heading: the split weight ramps toward this.
+        target: f64,
+        phase: SplitPhase,
+        phase_started_at: Instant,
+        /// When the weight last ramped (or the ramp phase began), so the fade
+        /// advances on wall time regardless of the per-edge frame rate.
+        last_ramp_at: Instant,
+        degraded_observations: u32,
+    },
+}
+
+/// Effect of advancing the split controller one control interval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeEdgeTransitionStep {
+    Active,
+    Complete,
+    Abort,
+}
+
+/// Loaded quality of one split leg: the coarse pressure the abort/confirm
+/// logic keys on, plus a fine-grained loaded cost for the softmax target.
+#[derive(Clone, Copy, Debug)]
+struct LoadedRouteQuality {
+    pressure: u8,
+    loaded_cost: f64,
+}
+
+/// E-model route cost stressed by the loaded pressure signal (queue, loss,
+/// playout, held-delay feedback). A pressure-3 route costs 4x its idle cost, so
+/// an idle-looking challenger's low cost is discounted the moment load arrives
+/// on it. A route with no candidate (missing from `candidates`) is treated as
+/// broken: `u64::MAX` cost.
+fn loaded_route_cost(route_cost: Option<u64>, pressure: u8) -> f64 {
+    route_cost.unwrap_or(u64::MAX) as f64 * (1.0 + f64::from(pressure))
+}
+
+fn loaded_quality_for(candidate: Option<TreeEdgeCandidate>) -> LoadedRouteQuality {
+    candidate.map_or(
+        LoadedRouteQuality {
+            pressure: TRANSITION_ABORT_PRESSURE,
+            loaded_cost: loaded_route_cost(None, TRANSITION_ABORT_PRESSURE),
+        },
+        |candidate| LoadedRouteQuality {
+            pressure: candidate.pressure,
+            loaded_cost: loaded_route_cost(Some(candidate.route_cost), candidate.pressure),
+        },
+    )
+}
+
+fn logistic(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Softmax equilibrium target for the `to` leg. Corner snaps make a decisively
+/// cheaper route converge to a clean 100/0 (or 0/100) so the existing
+/// Complete/Abort conditions fire rather than stalling at 0.9999.
+fn softmax_share(beta: f64, to_loaded_cost: f64, from_loaded_cost: f64) -> f64 {
+    let p = logistic(beta * (from_loaded_cost - to_loaded_cost));
+    if p >= 0.999 {
+        1.0
+    } else if p <= 0.001 {
+        0.0
+    } else {
+        p
+    }
+}
+
+/// Move `share` toward `target` on wall time, one fade-fraction per control
+/// interval. Bidirectional so a target rollback ramps back down to the old
+/// route at the same speed the fade advanced.
+fn ramp_split_share(
+    share: &mut f64,
+    target: f64,
+    last_ramp_at: &mut Instant,
+    now: Instant,
+    fade: Duration,
+) {
+    let delta = target - *share;
+    if delta.abs() <= f64::EPSILON {
+        return;
+    }
+    let elapsed = now.saturating_duration_since(*last_ramp_at);
+    let intervals = elapsed.as_secs_f64() / TRANSITION_CONTROL_INTERVAL.as_secs_f64();
+    let step = TRANSITION_CONTROL_INTERVAL.as_secs_f64() / fade.as_secs_f64();
+    let next = *share + intervals * step * delta.signum();
+    *share = next.clamp(target.min(*share), target.max(*share));
+    *last_ramp_at = now;
+}
+
+impl TreeEdgeSplitState {
+    /// Advance the split one control interval under both legs' *loaded*
+    /// quality. Returns the effect for `choose_tree_edge` to apply.
+    fn reduce(
+        &mut self,
+        now: Instant,
+        to_quality: LoadedRouteQuality,
+        from_quality: LoadedRouteQuality,
+        policy: TreeEdgeStickinessPolicy,
+    ) -> TreeEdgeTransitionStep {
+        let Self::Splitting {
+            share,
+            target,
+            phase,
+            phase_started_at,
+            last_ramp_at,
+            degraded_observations,
+            ..
+        } = self;
+
+        let to_pressure = to_quality.pressure;
+        let from_pressure = from_quality.pressure;
+
+        // Abort fast path: the challenger degraded hard under load for enough
+        // consecutive frames. Roll back to the warm old route.
+        if to_pressure >= TRANSITION_ABORT_PRESSURE {
+            *degraded_observations = degraded_observations.saturating_add(1);
+            if *degraded_observations >= TRANSITION_ABORT_OBSERVATIONS {
+                return TreeEdgeTransitionStep::Abort;
+            }
+        } else {
+            *degraded_observations = 0;
+        }
+
+        // A failing old route must not stall the switch: escape it rather than
+        // keep fading into a route that is broken. (The sender's copy gate
+        // already sheds copies to any route reading pressure >= 2.)
+        let old_route_broken = from_pressure >= TRANSITION_ABORT_PRESSURE;
+
+        // Recompute the load-aware equilibrium target once the probe window has
+        // passed: the softmax over each leg's *loaded* cost. This is what lets
+        // the split settle at an interior weight (a portion to each) instead of
+        // always racing to 100/0, and what lets it roll back when the challenger
+        // is only cheap because it was idle. The learning rate damps feedback
+        // flips so the split converges instead of whipping between paths.
+        if *phase != SplitPhase::Fanout
+            || now.saturating_duration_since(*phase_started_at) >= policy.transition_fanout
+        {
+            let desired = softmax_share(
+                policy.split_target_beta,
+                to_quality.loaded_cost,
+                from_quality.loaded_cost,
+            );
+            *target += policy.split_target_learning_rate * (desired - *target);
+            // Snap the *smoothed* target, not the raw desired, so a small
+            // quality wiggle cannot drag a near-corner target back off 1.0 and
+            // stall an almost-finished switch in an interior hold. A 99%+
+            // preference IS a decisive corner.
+            if *target >= 0.99 {
+                *target = 1.0;
+            } else if *target <= 0.01 {
+                *target = 0.0;
+            }
+        }
+
+        match phase {
+            SplitPhase::Fanout => {
+                if old_route_broken
+                    || now.saturating_duration_since(*phase_started_at) >= policy.transition_fanout
+                {
+                    *phase = SplitPhase::Adjusting;
+                    *phase_started_at = now;
+                    *last_ramp_at = now;
+                }
+            }
+            SplitPhase::Adjusting => {
+                // Load-aware hold: pause an upward ramp while the challenger is
+                // marginal (`>= 2`) so its loaded metrics catch up — unless the
+                // old route itself is failing, in which case escaping wins. A
+                // downward ramp (rolling back to the old route) is never paused:
+                // a marginal challenger is exactly why we would roll back.
+                let ramping_toward_challenger = *target > *share;
+                let paused = ramping_toward_challenger
+                    && to_pressure >= TRANSITION_MARGINAL_PRESSURE
+                    && !old_route_broken;
+                let was_at_target = (*share - *target).abs() <= f64::EPSILON;
+                if !paused {
+                    ramp_split_share(share, *target, last_ramp_at, now, policy.transition_fade);
+                }
+                if !was_at_target && (*share - *target).abs() <= f64::EPSILON {
+                    // Start the confirm/hold window at the moment the share arrives.
+                    *phase_started_at = now;
+                }
+                if *share <= *target && *target <= 0.0 {
+                    // The controller converged fully back to the old route.
+                    return TreeEdgeTransitionStep::Abort;
+                }
+                if *share >= *target && *target < 1.0 {
+                    // Interior steady state reached; hold and keep re-evaluating.
+                    *phase = SplitPhase::HoldsInterior;
+                    *phase_started_at = now;
+                }
+            }
+            SplitPhase::HoldsInterior => {
+                // Steady interior split: keep ramping toward the (re-evaluated)
+                // equilibrium so quality drift is re-approached slowly instead of
+                // held rigidly.
+                let was_at_target = (*share - *target).abs() <= f64::EPSILON;
+                ramp_split_share(share, *target, last_ramp_at, now, policy.transition_fade);
+                if !was_at_target && (*share - *target).abs() <= f64::EPSILON {
+                    *phase_started_at = now;
+                }
+                if *share <= *target && *target <= 0.0 {
+                    // Loaded quality flipped decisively: return to the old route.
+                    return TreeEdgeTransitionStep::Abort;
+                }
+            }
+        }
+
+        if *share >= *target
+            && *target >= 1.0
+            && (old_route_broken
+                || (to_pressure < TRANSITION_MARGINAL_PRESSURE
+                    && now.saturating_duration_since(*phase_started_at) >= TRANSITION_CONFIRM))
+        {
+            return TreeEdgeTransitionStep::Complete;
+        }
+        TreeEdgeTransitionStep::Active
     }
 }
 
@@ -219,7 +530,7 @@ impl TreeEdgeAttempt {
         self.chosen_pressure
     }
 
-    pub(crate) fn for_overlap(path: TreeEdgePath) -> Self {
+    pub(crate) fn for_split_copy(path: TreeEdgePath) -> Self {
         Self {
             key: TreeEdgeBindingKey {
                 source: 0,
@@ -231,7 +542,7 @@ impl TreeEdgeAttempt {
             },
             path,
             generation: 0,
-            reason: "overlap",
+            reason: "split_copy",
             incumbent_pressure: None,
             chosen_pressure: None,
         }
@@ -282,10 +593,33 @@ fn begin_tree_edge_transition(
     binding.generation = binding.generation.wrapping_add(1).max(1);
     binding.pending = Some((path, reason));
     binding.no_alternate_reported = false;
+    // A pending decision replaces any in-flight split (e.g. a hard escape from
+    // a transition that lost both routes).
+    binding.transition = None;
     clear_tree_edge_challenger(binding);
 }
 
-fn candidate_is_better(challenger: TreeEdgeCandidate, incumbent: TreeEdgeCandidate) -> bool {
+/// Whether the challenger is genuinely a better route than the incumbent.
+///
+/// `challenger_is_idle` applies the idle-credibility discount: a challenger
+/// whose first hop has carried no recent voice traffic reports clean metrics
+/// precisely because it is unloaded — those are stale bets the moment it takes
+/// load. Against a *healthy* incumbent (pressure < 2) an idle challenger must
+/// win decisively (≥2 pressure points or ≥20% cheaper) before we start loading
+/// it. Hard-failure replacement (pressure >= 3) never reaches this gate; it is
+/// handled earlier so escaping a failing route is never blocked.
+fn candidate_is_better(
+    challenger: TreeEdgeCandidate,
+    incumbent: TreeEdgeCandidate,
+    challenger_is_idle: bool,
+) -> bool {
+    if challenger_is_idle && incumbent.pressure < 2 {
+        return challenger.pressure.saturating_add(2) <= incumbent.pressure
+            || challenger
+                .route_cost
+                .saturating_mul(100)
+                <= incumbent.route_cost.saturating_mul(80);
+    }
     if challenger.pressure != incumbent.pressure {
         return challenger.pressure < incumbent.pressure;
     }
@@ -906,6 +1240,13 @@ pub(crate) struct DistributionPlane {
     scope_activity: Mutex<HashMap<TreeScope, Instant>>,
     tree_edge_bindings: Mutex<HashMap<TreeEdgeBindingKey, TreeEdgeBinding>>,
     voice_overlap_links: Mutex<HashMap<NodeIdentifier, VoiceOverlapLink>>,
+    /// First hops recently rolled back by a split abort, keyed per tree edge
+    /// `(parent, child, first_hop)`. A route that looked good while idle but
+    /// degraded under load must not be re-tried (and re-aborted) for
+    /// [`FAILED_EDGE_EXCLUSION`]: its metrics are idle-credit until it has had
+    /// a chance to prove otherwise.
+    voice_route_cooldowns:
+        Mutex<HashMap<(NodeIdentifier, NodeIdentifier, NodeIdentifier), Instant>>,
     #[cfg(test)]
     control_publishes: Mutex<u64>,
 }
@@ -924,6 +1265,50 @@ impl DistributionPlane {
         link.accepted_originals.push_back((now, bytes));
         link.accepted_bytes = link.accepted_bytes.saturating_add(bytes);
         publish_voice_overlap_link(first_hop, link);
+    }
+
+    /// Whether a candidate first hop has carried no recent voice traffic
+    /// through this plane. A first hop with no record at all is idle too: it
+    /// has never been loaded, so its clean metrics are idle-credit, not proof.
+    fn voice_route_first_hop_idle(&self, first_hop: NodeIdentifier, now: Instant) -> bool {
+        let mut links = self.voice_overlap_links.lock();
+        let Some(link) = links.get_mut(&first_hop) else {
+            return true;
+        };
+        prune_voice_overlap_samples(link, now);
+        link.accepted_originals.is_empty()
+    }
+
+    /// Whether a first hop is cooling down after a split abort on this tree
+    /// edge, and must be kept out of contention. Expiry is checked here so the
+    /// map only ever holds live entries after a lookup.
+    fn voice_route_first_hop_cooling_down(
+        &self,
+        parent: NodeIdentifier,
+        child: NodeIdentifier,
+        first_hop: NodeIdentifier,
+        now: Instant,
+    ) -> bool {
+        let mut cooldowns = self.voice_route_cooldowns.lock();
+        cooldowns.retain(|_, at| now.saturating_duration_since(*at) < FAILED_EDGE_EXCLUSION);
+        cooldowns
+            .get(&(parent, child, first_hop))
+            .is_some_and(|at| now.saturating_duration_since(*at) < FAILED_EDGE_EXCLUSION)
+    }
+
+    /// Mark a split-abort's failed first hop so it stays out of contention for
+    /// [`FAILED_EDGE_EXCLUSION`]. Called from both abort paths (the controller's
+    /// rollback and the sender's fallback abort).
+    fn record_tree_edge_split_abort(
+        &self,
+        parent: NodeIdentifier,
+        child: NodeIdentifier,
+        failed_first_hop: NodeIdentifier,
+        now: Instant,
+    ) {
+        let mut cooldowns = self.voice_route_cooldowns.lock();
+        cooldowns.retain(|_, at| now.saturating_duration_since(*at) < FAILED_EDGE_EXCLUSION);
+        cooldowns.insert((parent, child, failed_first_hop), now);
     }
 
     pub(crate) fn try_reserve_voice_overlap(
@@ -987,22 +1372,73 @@ impl DistributionPlane {
         }
     }
 
-    pub(crate) fn active_tree_edge_overlap(
+    pub(crate) fn active_tree_edge_split(
+        &self,
+        tree_key: TreeKey,
+        parent: NodeIdentifier,
+        child: NodeIdentifier,
+    ) -> Option<TreeEdgeSplit> {
+        self.tree_edge_bindings
+            .lock()
+            .get(&TreeEdgeBindingKey::new(tree_key, parent, child))
+            .and_then(|binding| match binding.transition {
+                Some(TreeEdgeSplitState::Splitting {
+                    from,
+                    to,
+                    share,
+                    phase,
+                    ..
+                }) => Some(TreeEdgeSplit {
+                    from,
+                    to,
+                    share,
+                    interior_hold: matches!(phase, SplitPhase::HoldsInterior),
+                }),
+                None => None,
+            })
+    }
+
+    /// Roll an in-flight split back to the old route. Called by the sender when
+    /// the primary (adopted) path failed to send and the old route successfully
+    /// carried the frame as a fallback: the failed new path must not be treated
+    /// as committed.
+    pub(crate) fn abort_tree_edge_split(
         &self,
         tree_key: TreeKey,
         parent: NodeIdentifier,
         child: NodeIdentifier,
         now: Instant,
-    ) -> Option<TreeEdgeOverlap> {
+    ) -> bool {
         let mut bindings = self.tree_edge_bindings.lock();
-        let binding = bindings.get_mut(&TreeEdgeBindingKey::new(tree_key, parent, child))?;
-        if binding
-            .overlap
-            .is_some_and(|overlap| overlap.expires_at <= now)
-        {
-            binding.overlap = None;
-        }
-        binding.overlap
+        let Some(binding) = bindings.get_mut(&TreeEdgeBindingKey::new(tree_key, parent, child))
+        else {
+            return false;
+        };
+        let Some(TreeEdgeSplitState::Splitting { from, to, .. }) = binding.transition else {
+            return false;
+        };
+        binding.transition = None;
+        binding.path = from;
+        binding.entered_at = now;
+        // The adopted first hop failed to send; the sender fell back to the old
+        // route. Keep the failed first hop out of contention while it cools.
+        self.record_tree_edge_split_abort(parent, child, to.first_hop(child), now);
+        distribution_metrics::record_tree_edge_binding_event(
+            parent,
+            child,
+            to.mode_label(),
+            from.mode_label(),
+            "transition_abort",
+        );
+        distribution_metrics::update_tree_edge_binding(
+            parent,
+            child,
+            Some(to.mode_label()),
+            Some(from.mode_label()),
+        );
+        distribution_metrics::update_tree_edge_transition(parent, child, false);
+        distribution_metrics::update_tree_edge_split_share(parent, child, None);
+        true
     }
     #[cfg(test)]
     pub(crate) fn current_tree_edge_path(
@@ -1051,7 +1487,7 @@ impl DistributionPlane {
             generation: 1,
             bound: false,
             no_alternate_reported: false,
-            overlap: None,
+            transition: None,
         });
 
         let incumbent = candidate_for(&candidates, binding.path);
@@ -1073,6 +1509,78 @@ impl DistributionPlane {
                 reason,
                 incumbent_pressure: incumbent.map(|candidate| candidate.pressure),
                 chosen_pressure: candidate_for(&candidates, path)
+                    .map(|candidate| candidate.pressure),
+            };
+        }
+
+        // Drive an in-flight weighted split. The controller owns the edge until
+        // it commits or aborts: no new challenger may interrupt the fade.
+        if let Some(mut transition) = binding.transition {
+            // An active transition is the edge in use (the controller owns the
+            // edge every frame), so it must not be pruned as idle mid-fade or
+            // mid-hold — an interior hold is a long-lived steady state, not a
+            // brief switch, and would be torn down by idle pruning otherwise.
+            binding.last_used_at = now;
+            let TreeEdgeSplitState::Splitting { from, to, share, .. } = transition;
+            let to_quality = loaded_quality_for(candidate_for(&candidates, binding.path));
+            let from_quality = loaded_quality_for(candidate_for(&candidates, from));
+            match transition.reduce(now, to_quality, from_quality, policy) {
+                TreeEdgeTransitionStep::Complete => {
+                    binding.transition = None;
+                    distribution_metrics::update_tree_edge_split_share(parent, child, None);
+                    distribution_metrics::record_tree_edge_binding_event(
+                        parent,
+                        child,
+                        from.mode_label(),
+                        binding.path.mode_label(),
+                        "transition_complete",
+                    );
+                    distribution_metrics::update_tree_edge_transition(parent, child, false);
+                }
+                TreeEdgeTransitionStep::Abort => {
+                    let rollback = from;
+                    binding.transition = None;
+                    binding.path = rollback;
+                    binding.entered_at = now;
+                    // The challenger's first hop looked good while idle but
+                    // degraded under load: keep it out of contention until its
+                    // loaded metrics could be re-established.
+                    self.record_tree_edge_split_abort(
+                        parent,
+                        child,
+                        to.first_hop(child),
+                        now,
+                    );
+                    distribution_metrics::update_tree_edge_split_share(parent, child, None);
+                    distribution_metrics::record_tree_edge_binding_event(
+                        parent,
+                        child,
+                        to.mode_label(),
+                        rollback.mode_label(),
+                        "transition_abort",
+                    );
+                    distribution_metrics::update_tree_edge_binding(
+                        parent,
+                        child,
+                        Some(to.mode_label()),
+                        Some(rollback.mode_label()),
+                    );
+                    distribution_metrics::update_tree_edge_transition(parent, child, false);
+                }
+                TreeEdgeTransitionStep::Active => {
+                    // Persist the advanced weight for the sender this frame.
+                    binding.transition = Some(transition);
+                    distribution_metrics::update_tree_edge_split_share(parent, child, Some(share));
+                }
+            }
+            return TreeEdgeAttempt {
+                key,
+                path: binding.path,
+                generation: binding.generation,
+                reason: "transition",
+                incumbent_pressure: candidate_for(&candidates, to)
+                    .map(|candidate| candidate.pressure),
+                chosen_pressure: candidate_for(&candidates, binding.path)
                     .map(|candidate| candidate.pressure),
             };
         }
@@ -1104,9 +1612,24 @@ impl DistributionPlane {
         let challenger = candidates
             .iter()
             .copied()
-            .filter(|candidate| candidate.path != binding.path && candidate.pressure < 3)
+            .filter(|candidate| {
+                candidate.path != binding.path
+                    && candidate.pressure < 3
+                    && !self.voice_route_first_hop_cooling_down(
+                        parent,
+                        child,
+                        candidate.path.first_hop(child),
+                        now,
+                    )
+            })
             .find(|candidate| {
-                incumbent.is_some_and(|current| candidate_is_better(*candidate, current))
+                incumbent.is_some_and(|current| {
+                    candidate_is_better(
+                        *candidate,
+                        current,
+                        self.voice_route_first_hop_idle(candidate.path.first_hop(child), now),
+                    )
+                })
             });
 
         if let Some(challenger) = challenger {
@@ -1195,7 +1718,7 @@ impl DistributionPlane {
         attempt: TreeEdgeAttempt,
         success: bool,
         now: Instant,
-    ) -> Option<TreeEdgeOverlap> {
+    ) -> Option<TreeEdgeSplit> {
         let mut bindings = self.tree_edge_bindings.lock();
         let Some(binding) = bindings.get_mut(&attempt.key) else {
             return None;
@@ -1231,13 +1754,45 @@ impl DistributionPlane {
         binding.pending = None;
         clear_tree_edge_challenger(binding);
         binding.generation = binding.generation.wrapping_add(1).max(1);
-        let overlap = if previous.is_some() && attempt.reason == "confirmed_challenger" {
-            let overlap = TreeEdgeOverlap {
-                path: previous.expect("checked previous"),
-                expires_at: now + VOICE_OVERLAP_DURATION,
-            };
-            binding.overlap = Some(overlap);
-            Some(overlap)
+        // A confirmed challenger starts a weighted split instead of a flat
+        // overlap: the old route keeps its full load through the probe window
+        // (`share = 0.0`), then the sender fades it out under the challenger's
+        // loaded quality (see `TreeEdgeSplitState::reduce`).
+        let split = if previous.is_some() && attempt.reason == "confirmed_challenger" {
+            let previous = previous.expect("checked previous");
+            binding.transition = Some(TreeEdgeSplitState::Splitting {
+                from: previous,
+                to: attempt.path,
+                share: 0.0,
+                target: 1.0,
+                phase: SplitPhase::Fanout,
+                phase_started_at: now,
+                last_ramp_at: now,
+                degraded_observations: 0,
+            });
+            distribution_metrics::record_tree_edge_binding_event(
+                attempt.key.parent,
+                attempt.key.child,
+                previous.mode_label(),
+                attempt.path.mode_label(),
+                "transition_begin",
+            );
+            distribution_metrics::update_tree_edge_transition(
+                attempt.key.parent,
+                attempt.key.child,
+                true,
+            );
+            distribution_metrics::update_tree_edge_split_share(
+                attempt.key.parent,
+                attempt.key.child,
+                Some(0.0),
+            );
+            Some(TreeEdgeSplit {
+                from: previous,
+                to: attempt.path,
+                share: 0.0,
+                interior_hold: false,
+            })
         } else {
             None
         };
@@ -1272,7 +1827,7 @@ impl DistributionPlane {
                 "voice tree edge binding changed"
             );
         }
-        overlap
+        split
     }
 
     pub(crate) fn configure_recovery(self: &Arc<Self>, sender: RecoverySender) {
@@ -2434,6 +2989,11 @@ mod tests {
             Duration::from_millis(750),
             Duration::from_millis(500),
             Duration::from_secs(2),
+            Duration::from_millis(700),
+            Duration::from_millis(400),
+            false,
+            0.1,
+            0.3,
         )
     }
 
@@ -2442,14 +3002,20 @@ mod tests {
             Duration::from_millis(250),
             Duration::from_millis(500),
             Duration::from_secs(2),
+            Duration::from_millis(700),
+            Duration::from_millis(400),
+            false,
+            0.1,
+            0.3,
         )
     }
 
     #[test]
-    fn equal_pressure_lower_cost_relay_switches_after_confirmation_with_overlap() {
+    fn confirmed_switch_starts_split_and_completes_after_fade() {
         let plane = DistributionPlane::default();
         let tree_key = key(94, 1);
         let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
         let initial = plane.choose_tree_edge(
             tree_key,
             1,
@@ -2472,7 +3038,7 @@ mod tests {
             2,
             candidates(),
             fast_sticky_policy(),
-            start + Duration::from_millis(250),
+            at(250),
         );
         assert_eq!(first.path(), TreeEdgePath::DirectChild);
         let confirmed = plane.choose_tree_edge(
@@ -2481,27 +3047,243 @@ mod tests {
             2,
             candidates(),
             fast_sticky_policy(),
-            start + Duration::from_millis(750),
+            at(750),
         );
         assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
-        let overlap = plane
-            .complete_tree_edge_attempt(confirmed, true, start + Duration::from_millis(750))
-            .expect("confirmed switch keeps the replaced path for overlap");
-        assert_eq!(overlap.path(), TreeEdgePath::DirectChild);
-        assert_eq!(
-            overlap.remaining(start + Duration::from_millis(750)),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
+        let split = plane
+            .complete_tree_edge_attempt(confirmed, true, at(750))
+            .expect("confirmed switch starts a split");
+        assert_eq!(split.from(), TreeEdgePath::DirectChild);
+        assert_eq!(split.share(), 0.0, "probe window duplicates voice onto both routes");
+
+        // Through the fanout window the split stays active and the old route
+        // keeps its full load (share stays at the probe value).
+        for ms in (760..=1400).step_by(50) {
+            let attempt =
+                plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(ms));
+            assert_eq!(attempt.path(), TreeEdgePath::LegacyVia(4097));
+            let split = plane
+                .active_tree_edge_split(tree_key, 1, 2)
+                .expect("split stays active through fanout");
+            assert_eq!(split.from(), TreeEdgePath::DirectChild);
+            assert_eq!(split.share(), 0.0);
+        }
+
+        // After fanout + fade + confirm the transition commits on a healthy
+        // challenger, dropping the old route entirely.
+        let completion = (0..100u64).find_map(|i| {
+            let ms = 1450 + i * 50;
+            let attempt =
+                plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(ms));
             plane
-                .active_tree_edge_overlap(tree_key, 1, 2, start + Duration::from_millis(1_749))
-                .map(TreeEdgeOverlap::path),
-            Some(TreeEdgePath::DirectChild)
+                .active_tree_edge_split(tree_key, 1, 2)
+                .is_none()
+                .then_some((ms, attempt.path()))
+        });
+        let (done_at, path) = completion.expect("transition completes on a healthy challenger");
+        assert_eq!(path, TreeEdgePath::LegacyVia(4097));
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::LegacyVia(4097))
         );
         assert!(
+            done_at >= 750 + 700 + 400 + 150,
+            "completes only after fanout+fade+confirm (was {done_at})"
+        );
+    }
+
+    #[test]
+    fn challenger_degradation_under_load_aborts_and_rolls_back() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(97, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+
+        let healthy = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 1, 3),
+            ]
+        };
+        let _ = plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(250));
+        let confirmed =
+            plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(750));
+        let _ = plane.complete_tree_edge_attempt(confirmed, true, at(750));
+        assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_some());
+
+        // The challenger degrades to hard failure under load.
+        let degraded = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 3, 3),
+            ]
+        };
+        let first = plane.choose_tree_edge(tree_key, 1, 2, degraded(), fast_sticky_policy(), at(800));
+        assert_eq!(
+            first.path(),
+            TreeEdgePath::LegacyVia(4097),
+            "one bad loaded read is not yet an abort"
+        );
+        assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_some());
+
+        let second = plane.choose_tree_edge(tree_key, 1, 2, degraded(), fast_sticky_policy(), at(850));
+        assert_eq!(
+            second.path(),
+            TreeEdgePath::DirectChild,
+            "consecutive hard-failure aborts and rolls back to the old route"
+        );
+        assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_none());
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::DirectChild)
+        );
+    }
+
+    /// Like `fast_sticky_policy` but with a decisive softmax temperature (β=1.0)
+    /// so a modest loaded-cost gap snaps the controller to a clean corner.
+    fn decisive_sticky_policy() -> TreeEdgeStickinessPolicy {
+        TreeEdgeStickinessPolicy::new(
+            Duration::from_millis(250),
+            Duration::from_millis(500),
+            Duration::from_secs(2),
+            Duration::from_millis(700),
+            Duration::from_millis(400),
+            false,
+            1.0,
+            0.3,
+        )
+    }
+
+    #[test]
+    fn loaded_quality_can_hold_interior_split() {
+        // The challenger beats the incumbent on idle cost (30 < 40, ≥25% cheaper)
+        // and wins the switch. Under load the two routes are close — loaded
+        // costs 60 vs 80 — so the softmax target settles inside (0, 1) and the
+        // split holds a portion on each path instead of committing to a corner.
+        let plane = DistributionPlane::default();
+        let tree_key = key(95, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 1, 30),
+            ]
+        };
+        let _ = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(250));
+        let confirmed =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(750));
+        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
+        let _ = plane.complete_tree_edge_attempt(confirmed, true, at(750));
+
+        // Drive through fanout + fade. The controller converges to an interior
+        // weight (~σ(0.1×20) ≈ 0.88) and holds it: never Complete (target < 1.0)
+        // and never Abort.
+        for ms in (1450..=4000u64).step_by(50) {
+            let _ =
+                plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(ms));
+        }
+        let split = plane
+            .active_tree_edge_split(tree_key, 1, 2)
+            .expect("interior split is the steady state");
+        assert!(
+            split.interior_hold(),
+            "controller holds an interior split when loaded quality favors it"
+        );
+        assert!(
+            (0.5..0.99).contains(&split.share()),
+            "share settled around the softmax equilibrium (was {})",
+            split.share()
+        );
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::LegacyVia(4097)),
+            "the adopted challenger stays the primary path during the interior hold"
+        );
+    }
+
+    #[test]
+    fn loaded_cost_flip_rolls_back_target_before_hard_failure() {
+        // The challenger wins on idle cost (90 < 120, ≥25% cheaper), but once it
+        // carries load its loaded cost (270) is decisively worse than the old
+        // route's (240). With a decisive β the softmax target collapses to 0 and
+        // the controller rolls back — without ever reading pressure 3, so this
+        // is the target-driven rollback, not the abort fast path.
+        let plane = DistributionPlane::default();
+        let tree_key = key(96, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 120)],
+            decisive_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+
+        let idle = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 120),
+                TreeEdgeCandidate::legacy(4097, 1, 90),
+            ]
+        };
+        let _ = plane.choose_tree_edge(tree_key, 1, 2, idle(), decisive_sticky_policy(), at(250));
+        let confirmed =
+            plane.choose_tree_edge(tree_key, 1, 2, idle(), decisive_sticky_policy(), at(750));
+        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
+        let _ = plane.complete_tree_edge_attempt(confirmed, true, at(750));
+        assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_some());
+
+        // Under load the challenger is marginal (pressure 2) but not a hard
+        // failure; its loaded cost is what drives the rollback.
+        let loaded = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 120),
+                TreeEdgeCandidate::legacy(4097, 2, 90),
+            ]
+        };
+        let completion = (0..200u64).find_map(|i| {
+            let ms = 1450 + i * 50;
+            let _ = plane.choose_tree_edge(tree_key, 1, 2, loaded(), decisive_sticky_policy(), at(ms));
             plane
-                .active_tree_edge_overlap(tree_key, 1, 2, start + Duration::from_millis(1_750))
+                .active_tree_edge_split(tree_key, 1, 2)
                 .is_none()
+                .then_some(ms)
+        });
+        let done_at = completion.expect("target collapse rolls the split back");
+        assert!(
+            done_at >= 750 + 700,
+            "rollback happens only after the probe window (was {done_at})"
+        );
+        assert!(
+            plane.active_tree_edge_split(tree_key, 1, 2).is_none(),
+            "no split remains after the rollback"
+        );
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::DirectChild),
+            "rolls back to the old route, not the marginal challenger"
         );
     }
 
@@ -2553,10 +3335,214 @@ mod tests {
     }
 
     #[test]
-    fn second_soft_switch_replaces_instead_of_fanning_out_overlap_paths() {
+    fn idle_challenger_must_beat_healthy_incumbent_decisively() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(98, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+
+        // The relay has never carried voice through this plane (idle-credit)
+        // and reports clean metrics: pressure 0 vs the healthy incumbent's 1
+        // (only a 1-point edge) and cost 38 vs 40 (~5% cheaper). Neither clears
+        // the idle-credibility discount (≥2 pressure points or ≥20% cheaper),
+        // so the switch must not happen even past the confirmation window.
+        let idle_challenger = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 0, 38),
+            ]
+        };
+        let _ = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            idle_challenger(),
+            fast_sticky_policy(),
+            at(250),
+        );
+        let later = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            idle_challenger(),
+            fast_sticky_policy(),
+            at(750),
+        );
+        assert_eq!(
+            later.path(),
+            TreeEdgePath::DirectChild,
+            "an idle challenger's clean pressure is a stale bet once loaded"
+        );
+    }
+
+    #[test]
+    fn idle_challenger_wins_on_decisive_cost_improvement() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(99, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+
+        // Same idle challenger, but 30 vs 40 is ≥20% cheaper — decisive enough
+        // to justify loading an untested route.
+        let idle_challenger = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 0, 30),
+            ]
+        };
+        let _ = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            idle_challenger(),
+            fast_sticky_policy(),
+            at(250),
+        );
+        let confirmed = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            idle_challenger(),
+            fast_sticky_policy(),
+            at(750),
+        );
+        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn loaded_challenger_keeps_normal_margin() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(100, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+
+        // The relay has been carrying real voice through this plane: it is not
+        // idle, so a plain 1-point pressure edge wins as before.
+        plane.record_voice_original_bytes(4097, 1024, start);
+        let loaded_challenger = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 0, 38),
+            ]
+        };
+        let _ = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            loaded_challenger(),
+            fast_sticky_policy(),
+            at(250),
+        );
+        let confirmed = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            loaded_challenger(),
+            fast_sticky_policy(),
+            at(750),
+        );
+        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn aborted_split_keeps_failed_first_hop_out_of_contention_for_exclusion_window() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(101, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+
+        let healthy = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 1, 3),
+            ]
+        };
+        let _ = plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(250));
+        let confirmed =
+            plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(750));
+        let _ = plane.complete_tree_edge_attempt(confirmed, true, at(750));
+        assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_some());
+
+        // The challenger degrades to hard failure under load → abort, rollback.
+        let degraded = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 3, 3),
+            ]
+        };
+        let _ = plane.choose_tree_edge(tree_key, 1, 2, degraded(), fast_sticky_policy(), at(800));
+        let second = plane.choose_tree_edge(tree_key, 1, 2, degraded(), fast_sticky_policy(), at(850));
+        assert_eq!(second.path(), TreeEdgePath::DirectChild);
+        assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_none());
+
+        // Now the failed relay reports clean metrics again (idle-look) and the
+        // 20%-cheaper cost qualifies normally — but it stays out of contention
+        // for the whole exclusion window rather than being re-tried/re-aborted.
+        let _ = plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(1_100));
+        let later = plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(1_600));
+        assert_eq!(
+            later.path(),
+            TreeEdgePath::DirectChild,
+            "recently aborted first hop stays out of contention for the exclusion window"
+        );
+        assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_none());
+
+        // After the exclusion window, the first hop is eligible again.
+        let _ = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            healthy(),
+            fast_sticky_policy(),
+            at(11_150),
+        );
+        let reeligible =
+            plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(11_650));
+        assert_eq!(reeligible.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn challenger_deferred_until_inflight_transition_completes() {
         let plane = DistributionPlane::default();
         let tree_key = key(95, 1);
         let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
         let initial = plane.choose_tree_edge(
             tree_key,
             1,
@@ -2578,7 +3564,7 @@ mod tests {
             2,
             to_first_relay(),
             fast_sticky_policy(),
-            start + Duration::from_millis(250),
+            at(250),
         );
         let first_relay = plane.choose_tree_edge(
             tree_key,
@@ -2586,11 +3572,14 @@ mod tests {
             2,
             to_first_relay(),
             fast_sticky_policy(),
-            start + Duration::from_millis(750),
+            at(750),
         );
-        let _ =
-            plane.complete_tree_edge_attempt(first_relay, true, start + Duration::from_millis(750));
+        let _ = plane.complete_tree_edge_attempt(first_relay, true, at(750));
+        assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_some());
 
+        // A second, better challenger arrives while the first split is in
+        // flight; it is deferred — the controller owns the edge until it
+        // commits or aborts, so no second fade can replace the first.
         let to_second_relay = || {
             vec![
                 TreeEdgeCandidate::direct_with_cost(1, 40),
@@ -2598,13 +3587,58 @@ mod tests {
                 TreeEdgeCandidate::legacy(4, 1, 1),
             ]
         };
+        for ms in (1001..=1450).step_by(50) {
+            let attempt = plane.choose_tree_edge(
+                tree_key,
+                1,
+                2,
+                to_second_relay(),
+                fast_sticky_policy(),
+                at(ms),
+            );
+            assert_eq!(attempt.path(), TreeEdgePath::LegacyVia(3), "deferred at {ms}");
+        }
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::LegacyVia(3))
+        );
+
+        // Drive the first transition to completion (fanout + fade + confirm),
+        // then the deferred challenger wins via normal sticky selection.
+        for ms in (1500..=6000).step_by(50) {
+            let _ = plane.choose_tree_edge(
+                tree_key,
+                1,
+                2,
+                to_second_relay(),
+                fast_sticky_policy(),
+                at(ms),
+            );
+            if plane.active_tree_edge_split(tree_key, 1, 2).is_none() {
+                break;
+            }
+        }
+        assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_none());
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::LegacyVia(3))
+        );
+
         let _ = plane.choose_tree_edge(
             tree_key,
             1,
             2,
             to_second_relay(),
             fast_sticky_policy(),
-            start + Duration::from_millis(1_001),
+            at(2_050),
+        );
+        let _ = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            to_second_relay(),
+            fast_sticky_policy(),
+            at(2_100),
         );
         let second_relay = plane.choose_tree_edge(
             tree_key,
@@ -2612,13 +3646,9 @@ mod tests {
             2,
             to_second_relay(),
             fast_sticky_policy(),
-            start + Duration::from_millis(1_501),
+            at(2_550),
         );
         assert_eq!(second_relay.path(), TreeEdgePath::LegacyVia(4));
-        let overlap = plane
-            .complete_tree_edge_attempt(second_relay, true, start + Duration::from_millis(1_501))
-            .expect("second switch replaces the overlap path");
-        assert_eq!(overlap.path(), TreeEdgePath::LegacyVia(3));
     }
 
     #[test]

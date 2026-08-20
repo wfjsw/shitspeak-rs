@@ -118,12 +118,27 @@ impl ReorderResultCount {
     }
 }
 
+/// One peer's share of a deadline flush in a single drain pass.
+///
+/// When a chunk's chunk-hold budget exhausts, the whole buffered chunk emits
+/// at once. `count` is how many of those frames arrived via `from`, and
+/// `max_held_delay_us` is the longest any flushed chunk was held beyond the
+/// in-order skew tolerance. This is the receiver-side UX symptom (delayed
+/// playout) attributed to the immediate peer that carried the frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FlushByPeer {
+    pub from: NodeIdentifier,
+    pub count: usize,
+    pub max_held_delay_us: u64,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ReorderReport {
     emissions: Vec<ReorderEmission>,
     results: Vec<ReorderResultCount>,
     pending_total: usize,
     opened_gap: Option<GapReport>,
+    flushes_by_peer: Vec<FlushByPeer>,
 }
 
 impl ReorderReport {
@@ -138,7 +153,19 @@ impl ReorderReport {
             results,
             pending_total,
             opened_gap,
+            flushes_by_peer: Vec::new(),
         }
+    }
+
+    fn with_flushes(mut self, flushes_by_peer: Vec<FlushByPeer>) -> Self {
+        self.flushes_by_peer = flushes_by_peer;
+        self
+    }
+
+    /// Deadline flushes attributed per immediate peer, including the held
+    /// delay each chunk was forced to absorb before release.
+    pub(crate) fn flushes_by_peer(&self) -> &[FlushByPeer] {
+        &self.flushes_by_peer
     }
 
     pub(crate) fn result_counts(&self) -> &[ReorderResultCount] {
@@ -236,6 +263,12 @@ struct SenderState {
     next_seq: u64,
     pending: BTreeMap<u64, ReorderEmission>,
     deadline: Option<Instant>,
+    /// The instant the open gap's in-order skew tolerance expires. When the
+    /// deadline fires unfilled the chunk enters hold-first mode: it is held
+    /// (rather than flushed around the hole) until this instant plus
+    /// `chunk_hold_budget_ms`, and the whole chunk then emits at once.
+    /// `None` when no gap is open.
+    hold_started_at: Option<Instant>,
     adaptive_delay_ms: u64,
     in_order_run: u32,
     last_activity: Instant,
@@ -405,6 +438,9 @@ impl Reorderer {
         let deadline =
             now + Duration::from_millis(self.effective_route_delay_ms(entry, route_hint));
         entry.deadline = Some(deadline);
+        // The chunk enters hold-first mode when this skew deadline passes
+        // unfilled; it stays held until `hold_started_at + chunk_hold_budget_ms`.
+        entry.hold_started_at = Some(deadline);
         state.deadlines.push(Reverse((deadline, session)));
         self.deadline_notify.notify_one();
         let first_pending = entry
@@ -420,6 +456,37 @@ impl Reorderer {
             first_seq: entry.next_seq,
             last_seq: first_pending.saturating_sub(1),
         }
+    }
+
+    /// The absolute instant beyond which an open gap is permanently missed.
+    /// This is the chunk-hold deadline: the in-order skew tolerance plus the
+    /// hold budget. Zero hold budget collapses it to the skew deadline (the
+    /// legacy flush behavior).
+    fn gap_hold_deadline(&self, entry: &SenderState) -> Option<Instant> {
+        entry
+            .hold_started_at
+            .map(|start| start + Duration::from_millis(self.cfg.chunk_hold_budget_ms))
+    }
+
+    /// Whether the sender's open gap is still repairable. The gap stays live
+    /// through the in-order skew tolerance AND the chunk-hold window, so a
+    /// late repair can still close the hole and emit the whole chunk
+    /// contiguously (delayed) instead of clipping.
+    fn gap_is_live(&self, entry: &SenderState, now: Instant) -> bool {
+        if entry.pending.is_empty() {
+            return false;
+        }
+        matches!(self.gap_hold_deadline(entry), Some(deadline) if deadline > now)
+    }
+
+    /// Whether the chunk is currently being held beyond the in-order skew
+    /// tolerance (the skew deadline has passed and the hold budget has not).
+    fn chunk_in_hold(&self, entry: &SenderState, now: Instant) -> bool {
+        let Some(started) = entry.hold_started_at else {
+            return false;
+        };
+        started <= now
+            && matches!(self.gap_hold_deadline(entry), Some(deadline) if deadline > now)
     }
 
     fn grow_adaptive_delay(&self, entry: &mut SenderState) {
@@ -611,6 +678,7 @@ impl Reorderer {
                     next_seq: frame_seq,
                     pending: BTreeMap::new(),
                     deadline: None,
+                    hold_started_at: None,
                     adaptive_delay_ms: initial_adaptive_delay_ms,
                     in_order_run: 0,
                     last_activity: now,
@@ -645,6 +713,7 @@ impl Reorderer {
             entry.sender_epoch = sender_epoch;
             entry.next_seq = frame_seq;
             entry.deadline = None;
+            entry.hold_started_at = None;
             entry.adaptive_delay_ms = initial_adaptive_delay_ms;
             entry.in_order_run = 0;
         }
@@ -667,8 +736,7 @@ impl Reorderer {
         if frame_seq == entry.next_seq {
             // A reactive repair may only close a previously opened gap. It
             // cannot advance a healthy stream by itself.
-            let gap_open = matches!(entry.deadline, Some(deadline) if deadline > now)
-                && !entry.pending.is_empty();
+            let gap_open = self.gap_is_live(&entry, now);
             if copy_kind.is_reactive_repair() && !gap_open {
                 results.push(ReorderResultCount::new(
                     VoiceReceiveResult::DuplicateOrLate,
@@ -695,6 +763,7 @@ impl Reorderer {
             }
             if entry.pending.is_empty() {
                 entry.deadline = None;
+                entry.hold_started_at = None;
             }
             if drained_count > 0 {
                 results.push(ReorderResultCount::new(
@@ -709,8 +778,7 @@ impl Reorderer {
         } else {
             // A reactive repair cannot create a new gap. It can only join an
             // existing suffix opened by an original or proactive copy.
-            let gap_open = matches!(entry.deadline, Some(deadline) if deadline > now)
-                && !entry.pending.is_empty();
+            let gap_open = self.gap_is_live(&entry, now);
             if copy_kind.is_reactive_repair() && !gap_open {
                 results.push(ReorderResultCount::new(
                     VoiceReceiveResult::DuplicateOrLate,
@@ -829,6 +897,7 @@ impl Reorderer {
     pub(crate) fn drain_expired_report(&self) -> ReorderReport {
         let mut emit: Vec<ReorderEmission> = Vec::new();
         let mut results: Vec<ReorderResultCount> = Vec::new();
+        let mut flushes_by_peer: Vec<FlushByPeer> = Vec::new();
         let mut state = self.state.lock();
         let now = Instant::now();
         self.prune_idle(&mut state, now);
@@ -850,18 +919,63 @@ impl Reorderer {
                 continue;
             }
 
+            // Hold-first gap policy: when the in-order skew tolerance (the
+            // armed deadline) expires with the hole still open, the chunk is
+            // HELD rather than flushed around the hole. Only the chunk-hold
+            // budget is the point of no return; until then a late repair can
+            // still emit the whole chunk contiguously (delayed) rather than
+            // clip.
+            if let Some(hold_started) = entry.hold_started_at {
+                let hold_until = hold_started
+                    + Duration::from_millis(self.cfg.chunk_hold_budget_ms);
+                if now < hold_until {
+                    // Re-arm the deadline task for the hold-budget expiry and
+                    // keep the whole buffered chunk.
+                    let entry = state.per_sender.get_mut(&session).unwrap();
+                    entry.deadline = Some(hold_until);
+                    state.deadlines.push(Reverse((hold_until, session)));
+                    continue;
+                }
+            }
+
             // Drain in seq order, jump next_seq past the highest seq
-            // we drained.
+            // we drained. This is the whole buffered chunk at once: a
+            // contiguous, delayed emit rather than a per-frame skip.
             let drained: Vec<(u64, ReorderEmission)> = {
                 let entry = state.per_sender.get_mut(&session).unwrap();
+                // Sample the held delay BEFORE clearing `hold_started_at`:
+                // this is the exact UX cost the receiver just imposed (the
+                // chunk played out late, after the whole hold window).
+                let held_delay_us = entry
+                    .hold_started_at
+                    .map(|start| {
+                        u64::try_from(now.saturating_duration_since(start).as_micros())
+                            .unwrap_or(u64::MAX)
+                    })
+                    .unwrap_or(0);
                 let drained: Vec<(u64, ReorderEmission)> =
                     std::mem::take(&mut entry.pending).into_iter().collect();
                 entry.deadline = None;
+                entry.hold_started_at = None;
                 if !drained.is_empty() {
                     self.grow_adaptive_delay(entry);
                 }
                 if let Some((max_seq, _)) = drained.last() {
                     entry.next_seq = max_seq.saturating_add(1);
+                }
+                for (_, emission) in &drained {
+                    let from = emission.from();
+                    match flushes_by_peer.iter_mut().find(|flush| flush.from == from) {
+                        Some(flush) => {
+                            flush.count = flush.count.saturating_add(1);
+                            flush.max_held_delay_us = flush.max_held_delay_us.max(held_delay_us);
+                        }
+                        None => flushes_by_peer.push(FlushByPeer {
+                            from,
+                            count: 1,
+                            max_held_delay_us: held_delay_us,
+                        }),
+                    }
                 }
                 drained
             };
@@ -880,7 +994,7 @@ impl Reorderer {
         let pending_total = state.total_pending;
         drop(state);
         self.acknowledge_deadline_wake();
-        ReorderReport::new(emit, results, pending_total, None)
+        ReorderReport::new(emit, results, pending_total, None).with_flushes(flushes_by_peer)
     }
 
     fn acknowledge_deadline_wake(&self) {
@@ -917,8 +1031,7 @@ impl Reorderer {
         };
         entry.sender_epoch == gap.sender_epoch
             && entry.next_seq <= gap.last_seq
-            && !entry.pending.is_empty()
-            && matches!(entry.deadline, Some(deadline) if deadline > Instant::now())
+            && self.gap_is_live(entry, Instant::now())
     }
 
     /// Return the live missing range for an existing repair coordinator.
@@ -939,7 +1052,9 @@ impl Reorderer {
 
         let state = self.state.lock();
         let entry = state.per_sender.get(&sender_session)?;
-        let deadline = entry.deadline?;
+        // The repair coordinator should keep repairing until the chunk-hold
+        // deadline, not just the in-order skew tolerance.
+        let deadline = self.gap_hold_deadline(entry)?;
         if entry.sender_epoch != sender_epoch || deadline <= Instant::now() {
             return None;
         }
@@ -971,6 +1086,32 @@ impl Reorderer {
             .per_sender
             .get(&session)
             .map(|entry| entry.adaptive_delay_ms)
+    }
+
+    /// `(held_frames, max_held_delay_us)` sampled under one lock.
+    ///
+    /// A drain resets `hold_started_at` on the flushed sessions, so callers
+    /// that observe held state around a drain (metrics gauges, feedback) must
+    /// sample it with this method BEFORE draining, or the flushed chunks'
+    /// delay is lost.
+    pub(crate) fn held_state(&self) -> (usize, u64) {
+        let state = self.state.lock();
+        let now = Instant::now();
+        let mut held_frames: usize = 0;
+        let mut max_held_delay_us = 0u64;
+        for entry in state.per_sender.values() {
+            if !self.chunk_in_hold(entry, now) {
+                continue;
+            }
+            held_frames = held_frames.saturating_add(entry.pending.len());
+            if let Some(start) = entry.hold_started_at {
+                let delay_us =
+                    u64::try_from(now.saturating_duration_since(start).as_micros())
+                        .unwrap_or(u64::MAX);
+                max_held_delay_us = max_held_delay_us.max(delay_us);
+            }
+        }
+        (held_frames, max_held_delay_us)
     }
 }
 
@@ -1371,6 +1512,10 @@ mod tests {
         c.reorder_max_delay_ms = 5;
         c.adaptive_jitter_min_delay_ms = 5;
         c.adaptive_jitter_max_delay_ms = 5;
+        // Tiny hold budget: by the time the sleep elapses both the skew
+        // tolerance and the chunk-hold window have passed, so the gap is
+        // permanently missed.
+        c.chunk_hold_budget_ms = 2;
         let expired = Reorderer::new(c);
         expired.push(11, frame(session, 3, 0, false));
         let out_of_order = frame(session, 3, 2, false);
@@ -1384,30 +1529,113 @@ mod tests {
     }
 
     #[test]
-    fn deadline_fire_skips_gap() {
+    fn deadline_fire_holds_chunk_until_repair_or_budget() {
         let mut c = cfg();
         c.reorder_max_delay_ms = 40;
         c.adaptive_jitter_min_delay_ms = 40;
         c.adaptive_jitter_max_delay_ms = 40;
         let r = Reorderer::new(c);
-        // 0 emits, 2 buffers (gap at 1), wait, deadline drains 2 and
-        // jumps next_seq to 3.
+        // 0 emits, 2 buffers (gap at 1). The 40ms in-order skew tolerance
+        // expires but the chunk is HELD instead of flushed around the hole.
         r.push(11, frame(0xABC, 1, 0, false));
         r.push(11, frame(0xABC, 1, 2, false));
         std::thread::sleep(Duration::from_millis(60));
+        assert!(r.drain_expired().is_empty());
+        assert_eq!(r.held_state().0, 1);
+        assert!(r.held_state().1 > 0);
+        // A repair within the hold window still emits the whole chunk
+        // contiguously (delayed), never a hole mid-playback.
+        let repaired = r
+            .push_with_route_hint_report_with_repair(11, frame(0xABC, 1, 1, false), None, true)
+            .into_emissions();
+        let seqs: Vec<u64> = repaired.iter().map(|(_, f)| f.s2s_seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+        // The stream is back in order.
+        let on = r.push(11, frame(0xABC, 1, 3, false));
+        let seqs: Vec<u64> = on.iter().map(|(_, f)| f.s2s_seq).collect();
+        assert_eq!(seqs, vec![3]);
+        assert_eq!(r.held_state().0, 0);
+    }
+
+    #[test]
+    fn hold_budget_exhaustion_flushes_whole_chunk_at_once() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 40;
+        c.adaptive_jitter_min_delay_ms = 40;
+        c.adaptive_jitter_max_delay_ms = 40;
+        c.chunk_hold_budget_ms = 5;
+        let r = Reorderer::new(c);
+        // 0 emits; 2 and 4 buffer (holes at 1 and 3). Once the chunk-hold
+        // budget is exhausted the whole buffered chunk emits in one delayed
+        // contiguous flush and the stream advances past it.
+        r.push(11, frame(0xABC, 1, 0, false));
+        r.push(11, frame(0xABC, 1, 2, false));
+        r.push(11, frame(0xABC, 1, 4, false));
+        std::thread::sleep(Duration::from_millis(60));
         let drained = r.drain_expired();
         let seqs: Vec<u64> = drained.iter().map(|(_, f)| f.s2s_seq).collect();
-        assert_eq!(seqs, vec![2]);
-        // After the skip, a repair for the missed slot is no longer
-        // admissible and must not rebase the stream.
+        assert_eq!(seqs, vec![2, 4]);
+        // After the flush the holes are permanently missed: a late repair is
+        // no longer admissible.
         let late = r
             .push_with_route_hint_report_with_repair(11, frame(0xABC, 1, 1, false), None, true)
             .into_emissions();
         assert!(late.is_empty());
-        // Pushing 3 in order works.
-        let on = r.push(11, frame(0xABC, 1, 3, false));
-        let seqs: Vec<u64> = on.iter().map(|(_, f)| f.s2s_seq).collect();
-        assert_eq!(seqs, vec![3]);
+        assert_eq!(r.held_state().0, 0);
+    }
+
+    #[test]
+    fn held_flush_attributes_count_and_delay_per_peer() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 40;
+        c.adaptive_jitter_min_delay_ms = 40;
+        c.adaptive_jitter_max_delay_ms = 40;
+        c.chunk_hold_budget_ms = 5;
+        let r = Reorderer::new(c);
+        // Two immediate peers feed the same stream (a route switch in flight).
+        // The chunk is held past the skew deadline and flushes at
+        // hold-exhaustion; the flush must be attributed to the peer that
+        // actually carried the frames, together with the held delay.
+        r.push(11, frame(0xABC, 1, 0, false));
+        r.push(22, frame(0xABC, 1, 2, false));
+        std::thread::sleep(Duration::from_millis(60));
+        let report = r.drain_expired_report();
+        let flushes = report.flushes_by_peer();
+        assert_eq!(flushes.len(), 1, "only the buffering peer flushed");
+        assert_eq!(flushes[0].from, 22);
+        assert_eq!(flushes[0].count, 1);
+        assert!(
+            flushes[0].max_held_delay_us > 15_000,
+            "held beyond the 40ms skew tolerance by ~20ms, got {}us",
+            flushes[0].max_held_delay_us
+        );
+        let seqs: Vec<u64> = report
+            .into_marked_emissions()
+            .iter()
+            .map(|e| e.frame().s2s_seq)
+            .collect();
+        assert_eq!(seqs, vec![2]);
+        // The drain reset the hold state; the post-drain observation is 0.
+        assert_eq!(r.held_state(), (0, 0));
+    }
+
+    #[test]
+    fn chunk_hold_budget_zero_flushes_at_the_skew_deadline() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_min_delay_ms = 5;
+        c.adaptive_jitter_max_delay_ms = 5;
+        c.chunk_hold_budget_ms = 0;
+        let r = Reorderer::new(c);
+        // Zero hold budget is the legacy policy: the chunk flushes at the
+        // in-order skew deadline with no additional hold.
+        r.push(11, frame(0xABC, 1, 0, false));
+        r.push(11, frame(0xABC, 1, 2, false));
+        std::thread::sleep(Duration::from_millis(10));
+        let drained = r.drain_expired();
+        let seqs: Vec<u64> = drained.iter().map(|(_, f)| f.s2s_seq).collect();
+        assert_eq!(seqs, vec![2]);
+        assert_eq!(r.held_state().0, 0);
     }
 
     #[test]
@@ -1416,6 +1644,9 @@ mod tests {
         c.reorder_max_delay_ms = 5;
         c.adaptive_jitter_min_delay_ms = 5;
         c.adaptive_jitter_max_delay_ms = 5;
+        // Tiny hold budget: the whole chunk-hold window exhausts while the
+        // test sleeps, so the gap is permanently missed before the repair.
+        c.chunk_hold_budget_ms = 2;
         let r = Reorderer::new(c);
 
         r.push(11, frame(0xABC, 1, 0, false));
@@ -1560,6 +1791,9 @@ mod tests {
         c.reorder_max_delay_ms = 5;
         c.adaptive_jitter_min_delay_ms = 5;
         c.adaptive_jitter_max_delay_ms = 5;
+        // The first deadline (skew tolerance) still wakes dispatch; a tiny
+        // hold budget means the drain that happens later actually flushes.
+        c.chunk_hold_budget_ms = 5;
         let r = Reorderer::new(c);
         let shutdown = CancellationToken::new();
         let nudges = Arc::new(AtomicUsize::new(0));
@@ -1673,6 +1907,9 @@ mod tests {
         c.adaptive_jitter_min_delay_ms = 5;
         c.adaptive_jitter_max_delay_ms = 25;
         c.adaptive_jitter_growth_step_ms = 10;
+        // The flush that triggers adaptive growth is the chunk-hold
+        // exhaustion, so keep the hold window short.
+        c.chunk_hold_budget_ms = 5;
         let r = Reorderer::new(c);
 
         r.push(11, frame(0xABC, 1, 0, false));
@@ -1728,7 +1965,7 @@ mod tests {
     }
 
     #[test]
-    fn route_hint_extends_gap_deadline_beyond_adaptive_max() {
+    fn route_hint_extends_gap_deadline_and_chunk_is_held_for_repair() {
         let mut c = cfg();
         c.reorder_max_delay_ms = 5;
         c.adaptive_jitter_enabled = false;
@@ -1743,10 +1980,23 @@ mod tests {
                 .is_empty()
         );
 
+        // Past the adaptive max (120ms) but before the route-extended skew
+        // tolerance (≈257ms): nothing is drained yet.
         std::thread::sleep(Duration::from_millis(130));
         assert!(r.drain_expired().is_empty());
+        // Past the skew tolerance: the chunk is HELD, not flushed around the
+        // hole, so the gap stays actionable for a late repair.
         std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(r.drain_expired().len(), 1);
+        assert!(r.drain_expired().is_empty());
+        assert_eq!(r.held_state().0, 1);
+        let gap = r
+            .gap_for_frame(11, &frame(0xABC, 1, 2, false))
+            .expect("gap stays open during the hold");
+        assert!(r.gap_still_missing(gap));
+        // A late fill still emits the whole chunk contiguously (delayed).
+        let emits = r.push(11, frame(0xABC, 1, 1, false));
+        let seqs: Vec<u64> = emits.iter().map(|(_, f)| f.s2s_seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
     }
 
     #[test]
@@ -1796,6 +2046,9 @@ mod tests {
         c.adaptive_jitter_enabled = false;
         c.adaptive_jitter_min_delay_ms = 100;
         c.adaptive_jitter_max_delay_ms = 120;
+        // The fixed skew deadline (100ms) gates when the hold starts; a tiny
+        // hold budget makes the flush land right at the fixed deadline.
+        c.chunk_hold_budget_ms = 5;
         let r = Reorderer::new(c);
 
         r.push(11, frame(0xABC, 1, 0, false));

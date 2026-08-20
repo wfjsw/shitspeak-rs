@@ -420,6 +420,8 @@ struct VoiceAppMetrics {
     repairs: HashMap<RepairKey, u64>,
     reorder_pending: HashMap<NodeIdentifier, u64>,
     reorder_pending_buckets: HashMap<(NodeIdentifier, &'static str), u64>,
+    reorder_held_frames: u64,
+    reorder_max_held_delay_us: u64,
     ingress_admission_drops: HashMap<VoiceIngressClass, u64>,
     ingress_queue_budgets: HashMap<VoiceIngressClass, QueueBudget>,
     reorder_speaker_states: u64,
@@ -522,6 +524,14 @@ pub(crate) fn set_reorder_speaker_state(tracked: usize, cap: usize) {
     let mut metrics = METRICS.lock().unwrap();
     metrics.reorder_speaker_states = tracked as u64;
     metrics.reorder_speaker_cap = cap as u64;
+}
+
+/// Aggregate held-delay signal: how many frames are currently held beyond the
+/// in-order skew tolerance waiting for a repair, and the longest such hold.
+pub(crate) fn set_reorder_held(held_frames: usize, max_held_delay_us: u64) {
+    let mut metrics = METRICS.lock().unwrap();
+    metrics.reorder_held_frames = held_frames as u64;
+    metrics.reorder_max_held_delay_us = max_held_delay_us;
 }
 
 pub(crate) fn record_deadline_wake(result: VoiceDeadlineWakeResult) {
@@ -734,6 +744,16 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         "shitspeak_s2s_voice_reorder_speaker_states",
         Vec::new(),
         metrics.reorder_speaker_states as f64,
+    ));
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_reorder_held_frames",
+        Vec::new(),
+        metrics.reorder_held_frames as f64,
+    ));
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_reorder_max_held_delay_microseconds",
+        Vec::new(),
+        metrics.reorder_max_held_delay_us as f64,
     ));
     out.push(PrometheusSample::new(
         "shitspeak_s2s_voice_reorder_speaker_cap",

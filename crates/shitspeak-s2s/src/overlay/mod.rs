@@ -406,6 +406,7 @@ impl OverlayNetwork {
             feedback.received_frames,
             feedback.gap_buffered,
             feedback.deadline_flush,
+            u64::from(feedback.max_held_delay_us),
         );
     }
     /// Bring up the overlay over an already-started transport. Spawns

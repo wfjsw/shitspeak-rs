@@ -244,6 +244,13 @@ struct DistributionMetrics {
     tree_edge_bindings: HashMap<TreeEdgeBindingGaugeKey, u64>,
     tree_edge_binding_events: HashMap<TreeEdgeBindingEventKey, u64>,
     voice_overlap_links: HashMap<NodeIdentifier, VoiceOverlapLinkGauge>,
+    /// Count of edges currently in a weighted-split voice transition, keyed by
+    /// (source, peer) — the `shitspeak_s2s_voice_transition_active` gauge.
+    active_transitions: HashMap<(NodeIdentifier, NodeIdentifier), u64>,
+    /// Current split weight on the adopted path per (source, peer), milli-scaled
+    /// (0..=1000) — the `shitspeak_s2s_voice_split_share` gauge. An interior hold
+    /// shows up as a stable value in (0, 1000) instead of a corner.
+    voice_split_shares: HashMap<(NodeIdentifier, NodeIdentifier), u64>,
 }
 
 #[cfg(feature = "pre-release-workload")]
@@ -556,6 +563,46 @@ pub(crate) fn update_voice_overlap_link(
     );
 }
 
+/// Track whether a tree edge currently has an in-flight weighted-split voice
+/// transition (gauge `shitspeak_s2s_voice_transition_active`).
+pub(crate) fn update_tree_edge_transition(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    active: bool,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    if active {
+        *metrics.active_transitions.entry((source, peer)).or_default() += 1;
+    } else if let Some(count) = metrics.active_transitions.get_mut(&(source, peer)) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            metrics.active_transitions.remove(&(source, peer));
+        }
+    }
+}
+
+/// Track the current split weight on the adopted path for a tree edge
+/// (gauge `shitspeak_s2s_voice_split_share`). `None` clears the edge when the
+/// split commits or aborts.
+pub(crate) fn update_tree_edge_split_share(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    share: Option<f64>,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    match share {
+        Some(share) => {
+            metrics.voice_split_shares.insert(
+                (source, peer),
+                (share.clamp(0.0, 1.0) * 1000.0).round() as u64,
+            );
+        }
+        None => {
+            metrics.voice_split_shares.remove(&(source, peer));
+        }
+    }
+}
+
 fn set_peer_clock_gauges(gauges: Vec<(NodeIdentifier, PeerClockGauge)>) {
     let mut metrics = METRICS.lock().unwrap();
     metrics.peer_clocks.clear();
@@ -663,6 +710,26 @@ pub(crate) fn prometheus_samples(local_node: NodeIdentifier) -> Vec<PrometheusSa
                 ("reason".to_owned(), key.reason.to_owned()),
             ],
             *count as f64,
+        ));
+    }
+    for ((source, peer), count) in &metrics.active_transitions {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_transition_active",
+            vec![
+                ("source".to_owned(), source.to_string()),
+                ("peer".to_owned(), peer.to_string()),
+            ],
+            *count as f64,
+        ));
+    }
+    for ((source, peer), share) in &metrics.voice_split_shares {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_split_share",
+            vec![
+                ("source".to_owned(), source.to_string()),
+                ("peer".to_owned(), peer.to_string()),
+            ],
+            *share as f64 / 1000.0,
         ));
     }
     for (peer, gauge) in &metrics.voice_overlap_links {
@@ -869,5 +936,29 @@ mod tests {
                 )
             }));
         }
+    }
+
+    #[test]
+    fn split_share_gauge_tracks_interior_holds_and_clears_on_commit() {
+        update_tree_edge_split_share(7, 42, Some(0.88));
+        let gauge = sample(
+            "shitspeak_s2s_voice_split_share",
+            &[("source", "7"), ("peer", "42")],
+        )
+        .expect("split share gauge exported");
+        assert!((gauge.value() - 0.88).abs() < 1e-9, "share exported as fraction");
+        // A corner (committed switch) exports as 1.0, then clears on completion.
+        update_tree_edge_split_share(7, 42, Some(1.0));
+        assert!((sample("shitspeak_s2s_voice_split_share", &[("source", "7"), ("peer", "42")])
+            .unwrap()
+            .value()
+            - 1.0)
+            .abs()
+            < 1e-9);
+        update_tree_edge_split_share(7, 42, None);
+        assert!(
+            sample("shitspeak_s2s_voice_split_share", &[("source", "7"), ("peer", "42")]).is_none(),
+            "cleared when the split commits or aborts"
+        );
     }
 }

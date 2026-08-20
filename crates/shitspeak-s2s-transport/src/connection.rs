@@ -45,6 +45,18 @@ use super::service_level::{
 const MAX_OBSERVED_REMOTE_IPS: usize = 8;
 const BACKOFF_JITTER_DIVISOR: u64 = 5;
 
+/// Receiver-reported chunk-hold delay that flags a conversational path as
+/// degraded. A route forcing the receiver to hold chunks beyond this plays
+/// voice late, which is the first audible symptom before a clip. The default
+/// chunk-hold budget is 1600 ms, so 300 ms is well before the point of no
+/// return but already a bad experience.
+const CONVERSATIONAL_HELD_DELAY_SUSPECT_US: u64 = 300_000;
+/// Held-delay below which a healthy report also clears a suspect path.
+const CONVERSATIONAL_HELD_DELAY_RECOVER_US: u64 = 100_000;
+/// Minimum frames a 250 ms feedback window must carry before it is judged;
+/// below this the peer is not carrying enough voice to trust the ratios.
+const CONVERSATIONAL_FEEDBACK_MIN_FRAMES: u32 = 10;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct VoiceTransportCandidateScore {
     transport: TransportKind,
@@ -2320,19 +2332,25 @@ impl PeerState {
         received_frames: u32,
         gap_buffered: u32,
         deadline_flush: u32,
+        max_held_delay_us: u64,
         now: Instant,
     ) {
-        if received_frames < 100
+        if received_frames < CONVERSATIONAL_FEEDBACK_MIN_FRAMES
             || gap_buffered > received_frames
             || deadline_flush > received_frames
         {
             return;
         }
         let mut feedback = self.conversational_feedback.lock();
+        // Pillar D: a receiver forced to hold a chunk beyond the suspect
+        // threshold is the UX symptom of a degrading route — raise pressure
+        // immediately rather than wait for the loss EWMA.
         let degraded = gap_buffered.saturating_mul(100) >= received_frames.saturating_mul(2)
-            || deadline_flush.saturating_mul(100) >= received_frames;
+            || deadline_flush.saturating_mul(100) >= received_frames
+            || max_held_delay_us >= CONVERSATIONAL_HELD_DELAY_SUSPECT_US;
         let healthy = gap_buffered.saturating_mul(200) < received_frames
-            && deadline_flush.saturating_mul(400) < received_frames;
+            && deadline_flush.saturating_mul(400) < received_frames
+            && max_held_delay_us < CONVERSATIONAL_HELD_DELAY_RECOVER_US;
         if degraded {
             feedback.suspect_reports = feedback.suspect_reports.saturating_add(1);
             feedback.healthy_reports = 0;
@@ -2343,10 +2361,14 @@ impl PeerState {
             feedback.suspect_reports = 0;
             feedback.healthy_reports = 0;
         }
-        if feedback.suspect_reports >= 3 {
+        // The feedback cadence is 250 ms and the signal is soft: a single
+        // report trips the suspect flag so the router reacts within one
+        // interval, and one healthy report clears it so a recovered route is
+        // not held suspect. Hysteresis lives in the routing layer, not here.
+        if feedback.suspect_reports >= 1 {
             feedback.suspect = true;
         }
-        if feedback.healthy_reports >= 3 {
+        if feedback.healthy_reports >= 1 {
             feedback.suspect = false;
         }
         feedback.last_report = Some(now);

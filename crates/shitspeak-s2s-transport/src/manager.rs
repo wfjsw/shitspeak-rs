@@ -1808,12 +1808,14 @@ impl ConnectionManager {
         received_frames: u32,
         gap_buffered: u32,
         deadline_flush: u32,
+        max_held_delay_us: u64,
     ) {
         if let Some(peer) = self.inner.get_peer(peer) {
             peer.record_conversational_feedback(
                 received_frames,
                 gap_buffered,
                 deadline_flush,
+                max_held_delay_us,
                 Instant::now(),
             );
         }
@@ -5516,17 +5518,24 @@ mod tests {
             ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Udp]);
         let peer = transport.inner.get_peer(2).expect("peer");
         let now = Instant::now();
-        for _ in 0..3 {
-            peer.record_conversational_feedback(100, 2, 0, now);
-        }
+        // Soft 250 ms cadence: one degraded report trips the suspect flag.
+        peer.record_conversational_feedback(100, 2, 0, 0, now);
         assert!(peer.conversational_feedback_suspect(now));
-        for _ in 0..3 {
-            peer.record_conversational_feedback(100, 0, 0, now);
-        }
+        // One healthy report clears it.
+        peer.record_conversational_feedback(100, 0, 0, 0, now);
         assert!(!peer.conversational_feedback_suspect(now));
-        for _ in 0..3 {
-            peer.record_conversational_feedback(100, 0, 1, now);
-        }
+        // A single deadline-flush frame degrades the route.
+        peer.record_conversational_feedback(100, 0, 1, 0, now);
+        assert!(peer.conversational_feedback_suspect(now));
+        // A large held delay (Pillar D) is a UX symptom even with no flush:
+        // the receiver is holding chunks late, which precedes a clip.
+        peer.record_conversational_feedback(100, 0, 0, 500_000, now);
+        assert!(peer.conversational_feedback_suspect(now));
+        // A small held delay is healthy and clears the flag again.
+        peer.record_conversational_feedback(100, 0, 0, 20_000, now);
+        assert!(!peer.conversational_feedback_suspect(now));
+        // The suspect flag expires when reports stop.
+        peer.record_conversational_feedback(100, 0, 1, 0, now);
         assert!(peer.conversational_feedback_suspect(now));
         assert!(!peer.conversational_feedback_suspect(now + Duration::from_secs(6)));
     }

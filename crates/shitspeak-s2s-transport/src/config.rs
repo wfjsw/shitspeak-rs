@@ -968,6 +968,22 @@ pub struct TransportRoutingPolicy {
     voice_path_challenger_confirm_ms: u64,
     #[serde(default = "default_voice_path_idle_reset_ms")]
     voice_path_idle_reset_ms: u64,
+    #[serde(default = "default_voice_path_transition_fanout_ms")]
+    voice_path_transition_fanout_ms: u64,
+    #[serde(default = "default_voice_path_transition_fade_ms")]
+    voice_path_transition_fade_ms: u64,
+    #[serde(default = "default_voice_path_split_mode")]
+    voice_path_split_mode: bool,
+    /// Softmax temperature (×1000) over each split leg's loaded cost. Larger =
+    /// more decisive toward the cheaper route; smaller lets the split hold an
+    /// interior share for longer. Milli-scaled so the policy keeps deriving `Eq`.
+    #[serde(default = "default_voice_path_split_target_beta_milli")]
+    voice_path_split_target_beta_milli: u64,
+    /// Exponential-smoothing factor (×1000) applied to the split target each
+    /// control interval. Damps feedback flips so the split converges instead of
+    /// whipping between paths.
+    #[serde(default = "default_voice_path_split_target_learning_rate_milli")]
+    voice_path_split_target_learning_rate_milli: u64,
     #[serde(default = "default_conversational_path_effective_loss_suspect_ppm")]
     conversational_path_effective_loss_suspect_ppm: u32,
     #[serde(default = "default_conversational_path_effective_loss_recover_ppm")]
@@ -1015,6 +1031,12 @@ impl Default for TransportRoutingPolicy {
             voice_path_min_hold_ms: default_voice_path_min_hold_ms(),
             voice_path_challenger_confirm_ms: default_voice_path_challenger_confirm_ms(),
             voice_path_idle_reset_ms: default_voice_path_idle_reset_ms(),
+            voice_path_transition_fanout_ms: default_voice_path_transition_fanout_ms(),
+            voice_path_transition_fade_ms: default_voice_path_transition_fade_ms(),
+            voice_path_split_mode: default_voice_path_split_mode(),
+            voice_path_split_target_beta_milli: default_voice_path_split_target_beta_milli(),
+            voice_path_split_target_learning_rate_milli:
+                default_voice_path_split_target_learning_rate_milli(),
             conversational_path_effective_loss_suspect_ppm:
                 default_conversational_path_effective_loss_suspect_ppm(),
             conversational_path_effective_loss_recover_ppm:
@@ -1061,6 +1083,37 @@ impl TransportRoutingPolicy {
 
     pub fn voice_path_idle_reset(&self) -> Duration {
         Duration::from_millis(self.voice_path_idle_reset_ms)
+    }
+
+    /// How long a confirmed switch first duplicates voice onto both routes (the
+    /// load-probe window) before the old route starts fading.
+    pub fn voice_path_transition_fanout(&self) -> Duration {
+        Duration::from_millis(self.voice_path_transition_fanout_ms)
+    }
+
+    /// How long the old route's copy takes to fade to zero once the probe
+    /// window ends.
+    pub fn voice_path_transition_fade(&self) -> Duration {
+        Duration::from_millis(self.voice_path_transition_fade_ms)
+    }
+
+    /// Interior split mode: once the controller settles at an interior weight,
+    /// each frame rides exactly one path by weight instead of a redundant copy.
+    /// OFF by default — the redundant fade is the staged first cut; enable once
+    /// repair coverage is confirmed in Grafana.
+    pub fn voice_path_split_mode(&self) -> bool {
+        self.voice_path_split_mode
+    }
+
+    /// Softmax temperature over each split leg's loaded cost (×1000).
+    pub fn voice_path_split_target_beta(&self) -> f64 {
+        self.voice_path_split_target_beta_milli as f64 / 1000.0
+    }
+
+    /// Exponential-smoothing factor applied to the split target each control
+    /// interval (×1000).
+    pub fn voice_path_split_target_learning_rate(&self) -> f64 {
+        self.voice_path_split_target_learning_rate_milli as f64 / 1000.0
     }
 
     pub fn conversational_path_effective_loss_suspect_ppm(&self) -> u32 {
@@ -1247,6 +1300,35 @@ impl TransportRoutingPolicy {
         self
     }
 
+    pub fn with_voice_path_transition_fanout(mut self, duration: Duration) -> Self {
+        self.voice_path_transition_fanout_ms =
+            duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        self
+    }
+
+    pub fn with_voice_path_transition_fade(mut self, duration: Duration) -> Self {
+        self.voice_path_transition_fade_ms =
+            duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        self
+    }
+
+    pub fn with_voice_path_split_mode(mut self, enabled: bool) -> Self {
+        self.voice_path_split_mode = enabled;
+        self
+    }
+
+    pub fn with_voice_path_split_target_beta(mut self, beta: f64) -> Self {
+        self.voice_path_split_target_beta_milli =
+            (beta.clamp(0.0, 1000.0) * 1000.0).round() as u64;
+        self
+    }
+
+    pub fn with_voice_path_split_target_learning_rate(mut self, rate: f64) -> Self {
+        self.voice_path_split_target_learning_rate_milli =
+            (rate.clamp(0.0, 1.0) * 1000.0).round() as u64;
+        self
+    }
+
     pub fn with_conversational_path_effective_loss_suspect_ppm(mut self, ppm: u32) -> Self {
         self.conversational_path_effective_loss_suspect_ppm = ppm.min(1_000_000);
         self
@@ -1320,8 +1402,10 @@ impl TransportRoutingPolicy {
         if self.voice_path_min_hold_ms == 0
             || self.voice_path_challenger_confirm_ms == 0
             || self.voice_path_idle_reset_ms == 0
+            || self.voice_path_transition_fanout_ms == 0
+            || self.voice_path_transition_fade_ms == 0
         {
-            return Err("s2s.transport voice-path stickiness timings must be non-zero".into());
+            return Err("s2s.transport voice-path stickiness/transition timings must be non-zero".into());
         }
         if self.voice_path_idle_reset_ms
             < self
@@ -1330,6 +1414,18 @@ impl TransportRoutingPolicy {
         {
             return Err(
                 "s2s.transport.voice_path_idle_reset_ms must be at least the larger of voice_path_min_hold_ms and voice_path_challenger_confirm_ms"
+                    .into(),
+            );
+        }
+        if self.voice_path_split_target_beta_milli > 1_000_000 {
+            return Err(
+                "s2s.transport.voice_path_split_target_beta_milli must not exceed 1000000 (beta 1000)"
+                    .into(),
+            );
+        }
+        if self.voice_path_split_target_learning_rate_milli > 1_000 {
+            return Err(
+                "s2s.transport.voice_path_split_target_learning_rate_milli must not exceed 1000 (1.0)"
                     .into(),
             );
         }
@@ -1735,6 +1831,21 @@ fn default_voice_path_challenger_confirm_ms() -> u64 {
 fn default_voice_path_idle_reset_ms() -> u64 {
     2_000
 }
+fn default_voice_path_transition_fanout_ms() -> u64 {
+    700
+}
+fn default_voice_path_transition_fade_ms() -> u64 {
+    400
+}
+fn default_voice_path_split_mode() -> bool {
+    false
+}
+fn default_voice_path_split_target_beta_milli() -> u64 {
+    100
+}
+fn default_voice_path_split_target_learning_rate_milli() -> u64 {
+    300
+}
 
 #[cfg(test)]
 mod tests {
@@ -2076,6 +2187,9 @@ mod tests {
                     voice_path_min_hold_ms = 900
                     voice_path_challenger_confirm_ms = 650
                     voice_path_idle_reset_ms = 3000
+                    voice_path_split_mode = true
+                    voice_path_split_target_beta_milli = 500
+                    voice_path_split_target_learning_rate_milli = 700
                 "#,
                 ::config::FileFormat::Toml,
             ))
@@ -2133,10 +2247,35 @@ mod tests {
             Duration::from_millis(650)
         );
         assert_eq!(policy.voice_path_idle_reset(), Duration::from_millis(3_000));
+        assert!(policy.voice_path_split_mode());
+        assert_eq!(policy.voice_path_split_target_beta(), 0.5);
+        assert_eq!(policy.voice_path_split_target_learning_rate(), 0.7);
         assert_eq!(
             policy.transport_metric_stale_after(),
             Duration::from_millis(800)
         );
+    }
+
+    #[test]
+    fn routing_policy_split_mode_builders_round_trip_milli_scaling() {
+        let policy = TransportRoutingPolicy::default()
+            .with_voice_path_split_mode(true)
+            .with_voice_path_split_target_beta(1.5)
+            .with_voice_path_split_target_learning_rate(0.42);
+        assert!(policy.voice_path_split_mode());
+        assert_eq!(policy.voice_path_split_target_beta(), 1.5);
+        assert!((policy.voice_path_split_target_learning_rate() - 0.42).abs() < 1e-9);
+        // Out-of-range setters clamp instead of corrupting the milli scale.
+        let clamped = policy
+            .with_voice_path_split_target_beta(5000.0)
+            .with_voice_path_split_target_learning_rate(7.0);
+        assert_eq!(clamped.voice_path_split_target_beta(), 1000.0);
+        assert_eq!(clamped.voice_path_split_target_learning_rate(), 1.0);
+        // Defaults keep split mode off and the softmax gentle.
+        let default = TransportRoutingPolicy::default();
+        assert!(!default.voice_path_split_mode());
+        assert_eq!(default.voice_path_split_target_beta(), 0.1);
+        assert_eq!(default.voice_path_split_target_learning_rate(), 0.3);
     }
 
     #[test]
@@ -2147,6 +2286,8 @@ mod tests {
             "voice_path_idle_reset_ms = 0",
             "voice_path_min_hold_ms = 1000\nvoice_path_idle_reset_ms = 999",
             "voice_path_challenger_confirm_ms = 1000\nvoice_path_idle_reset_ms = 999",
+            "voice_path_split_target_beta_milli = 1000001",
+            "voice_path_split_target_learning_rate_milli = 1001",
         ] {
             let tuning: TransportTuning = ::config::Config::builder()
                 .add_source(::config::File::from_str(source, ::config::FileFormat::Toml))

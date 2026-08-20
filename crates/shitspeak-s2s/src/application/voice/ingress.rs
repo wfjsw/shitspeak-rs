@@ -32,7 +32,7 @@ use crate::application::voice::metrics::{
 };
 use crate::application::voice::proactive_utility::proactive_marginal_utility_micros;
 use crate::application::voice::reorder::{
-    self, GapReport, Reorderer, VoiceCopyKind, VoiceRouteHint,
+    self, FlushByPeer, GapReport, Reorderer, VoiceCopyKind, VoiceRouteHint,
 };
 use crate::application::voice::repair::{REPAIR_RESPONSE_PAGE_SEQUENCES, RepairCache, RepairFrame};
 use crate::application::voice::send::{
@@ -69,7 +69,10 @@ const TAIL_REPAIR_INITIAL_DELAY: Duration = Duration::from_millis(50);
 const TAIL_REPAIR_INTERVAL: Duration = Duration::from_millis(100);
 const TAIL_REPAIR_FAILURE_BACKOFF_MAX: Duration = Duration::from_millis(800);
 const TAIL_REPAIR_SEND_TIMEOUT_MAX: Duration = Duration::from_millis(100);
-const PATH_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
+// 250 ms so the sender reacts to a bad route within ~a quarter second rather
+// than a second: a held chunk is a UX symptom (delayed playout) the router
+// should fold in before it becomes a clip.
+const PATH_FEEDBACK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Decoded inbound voice frame along with the immediate sender (next-hop
 /// peer that delivered the overlay frame, not necessarily the originator).
@@ -423,11 +426,27 @@ struct PathFeedbackAccumulator {
     windows: parking_lot::Mutex<HashMap<NodeIdentifier, PathFeedbackWindow>>,
 }
 
+#[derive(Clone, Copy)]
 struct PathFeedbackWindow {
     started_at: Instant,
     received_frames: u32,
     gap_buffered: u32,
     deadline_flush: u32,
+    /// Longest chunk-hold delay (beyond the in-order skew tolerance) imposed
+    /// on this peer's frames within the window, in microseconds.
+    max_held_delay_us: u64,
+}
+
+impl PathFeedbackWindow {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            received_frames: 0,
+            gap_buffered: 0,
+            deadline_flush: 0,
+            max_held_delay_us: 0,
+        }
+    }
 }
 
 impl PathFeedbackAccumulator {
@@ -439,12 +458,7 @@ impl PathFeedbackAccumulator {
     ) -> Option<VoicePathFeedback> {
         let now = Instant::now();
         let mut windows = self.windows.lock();
-        let window = windows.entry(from).or_insert(PathFeedbackWindow {
-            started_at: now,
-            received_frames: 0,
-            gap_buffered: 0,
-            deadline_flush: 0,
-        });
+        let window = windows.entry(from).or_insert_with(|| PathFeedbackWindow::new(now));
         window.received_frames = window.received_frames.saturating_add(count as u32);
         if result == VoiceReceiveResult::GapBuffered {
             window.gap_buffered = window.gap_buffered.saturating_add(count as u32);
@@ -452,6 +466,31 @@ impl PathFeedbackAccumulator {
         if result == VoiceReceiveResult::DeadlineFlush {
             window.deadline_flush = window.deadline_flush.saturating_add(count as u32);
         }
+        Self::flush_if_due(&mut windows, from, now)
+    }
+
+    /// Record the longest hold a chunk of this peer's frames absorbed before
+    /// release. Separate from [`Self::record`] so a deadline flush can report
+    /// both its frame count and its held delay without the two racing on the
+    /// window boundary.
+    fn record_held_delay(
+        &self,
+        from: NodeIdentifier,
+        max_held_delay_us: u64,
+    ) -> Option<VoicePathFeedback> {
+        let now = Instant::now();
+        let mut windows = self.windows.lock();
+        let window = windows.entry(from).or_insert_with(|| PathFeedbackWindow::new(now));
+        window.max_held_delay_us = window.max_held_delay_us.max(max_held_delay_us);
+        Self::flush_if_due(&mut windows, from, now)
+    }
+
+    fn flush_if_due(
+        windows: &mut HashMap<NodeIdentifier, PathFeedbackWindow>,
+        from: NodeIdentifier,
+        now: Instant,
+    ) -> Option<VoicePathFeedback> {
+        let window = windows.get_mut(&from)?;
         if now.saturating_duration_since(window.started_at) < PATH_FEEDBACK_INTERVAL {
             return None;
         }
@@ -459,13 +498,9 @@ impl PathFeedbackAccumulator {
             received_frames: window.received_frames,
             gap_buffered: window.gap_buffered,
             deadline_flush: window.deadline_flush,
+            max_held_delay_us: u32::try_from(window.max_held_delay_us).unwrap_or(u32::MAX),
         };
-        *window = PathFeedbackWindow {
-            started_at: now,
-            received_frames: 0,
-            gap_buffered: 0,
-            deadline_flush: 0,
-        };
+        *window = PathFeedbackWindow::new(now);
         Some(feedback)
     }
 }
@@ -2017,7 +2052,17 @@ fn spawn_dispatch_task(
                     }
                     (report, Some((origin_node, from)), Some(_permit))
                 }
-                DispatchEvent::DeadlineFired => (reorderer.drain_expired_report(), None, None),
+                DispatchEvent::DeadlineFired => {
+                    // Sample the held-delay state BEFORE the drain: flushing a
+                    // held chunk resets its `hold_started_at`, so observing
+                    // after the drain loses exactly the delay the chunk just
+                    // absorbed (the signal the gauges and Pillar D feedback
+                    // exist to surface).
+                    let held = reorderer.held_state();
+                    let report = reorderer.drain_expired_report();
+                    metrics::set_reorder_held(held.0, held.1);
+                    (report, None, None)
+                }
             };
             metrics::set_reorder_pending(source, report.pending_total());
             metrics::set_reorder_speaker_state(
@@ -2043,6 +2088,14 @@ fn spawn_dispatch_task(
                     }
                 }
             }
+            // Captured before `into_marked_emissions` moves `report`: the
+            // per-peer flush attribution is needed to feed the path-feedback
+            // accumulator on the deadline path.
+            let deadline_flushes: Vec<FlushByPeer> = if inbound_labels.is_none() {
+                report.flushes_by_peer().to_vec()
+            } else {
+                Vec::new()
+            };
             let emits = report.into_marked_emissions();
             if inbound_labels.is_none() {
                 for emission in &emits {
@@ -2058,6 +2111,33 @@ fn spawn_dispatch_task(
                         VoiceReceiveResult::DeadlineFlush,
                         1,
                     );
+                }
+                // Path feedback on the deadline path. This is the previous
+                // dead path: deadline events never reached the accumulator
+                // (it was only fed from push events), so `deadline_flush`
+                // was always zero in the receiver's report. A flushed chunk
+                // is reported to the immediate peer that carried it, along
+                // with the held delay the chunk absorbed before release.
+                for flush in deadline_flushes {
+                    let from = flush.from;
+                    if let Some(feedback) = path_feedback.record(
+                        from,
+                        VoiceReceiveResult::DeadlineFlush,
+                        flush.count,
+                    ) {
+                        let transport = transport.clone();
+                        tokio::spawn(async move {
+                            let _ = transport.send_path_feedback(from, feedback).await;
+                        });
+                    }
+                    if let Some(feedback) =
+                        path_feedback.record_held_delay(from, flush.max_held_delay_us)
+                    {
+                        let transport = transport.clone();
+                        tokio::spawn(async move {
+                            let _ = transport.send_path_feedback(from, feedback).await;
+                        });
+                    }
                 }
             }
             if emits.is_empty() {
@@ -2997,7 +3077,13 @@ async fn send_repair_request_attempt(
     if remaining.is_zero() {
         return false;
     }
-    let request_ttl_ms = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+    // The request's actionable window cannot outlive the packet on the wire:
+    // cap the carried TTL at the transport bound even when the chunk-hold
+    // deadline (Pillar A) extends well past the in-order skew tolerance.
+    let request_ttl_ms = remaining
+        .as_millis()
+        .min(u128::from(transport_ttl_ms))
+        .clamp(1, u128::from(u32::MAX)) as u32;
     let request = VoiceRepairRequest {
         sender_session: gap.sender_session,
         sender_epoch: gap.sender_epoch,
@@ -4108,6 +4194,36 @@ mod tests {
         ) {
             self.repairs.lock().unwrap().push(is_repair);
         }
+    }
+
+    #[test]
+    fn path_feedback_accumulator_reports_held_delay_and_resets() {
+        let acc = PathFeedbackAccumulator::default();
+        // Push and deadline events accumulate per window; the held delay is a
+        // separate record that maxes into the window.
+        assert!(acc.record(22, VoiceReceiveResult::GapBuffered, 3).is_none());
+        assert!(acc.record(22, VoiceReceiveResult::DeadlineFlush, 2).is_none());
+        assert!(acc.record_held_delay(22, 123_456).is_none());
+        std::thread::sleep(PATH_FEEDBACK_INTERVAL + Duration::from_millis(20));
+        // The triggering event's counts join the window being flushed: 3 gap +
+        // 2 flush (pre-sleep) + 1 flush (the trigger itself).
+        let feedback = acc
+            .record(22, VoiceReceiveResult::DeadlineFlush, 1)
+            .expect("window elapsed; feedback flushed");
+        assert_eq!(feedback.received_frames, 6);
+        assert_eq!(feedback.gap_buffered, 3);
+        assert_eq!(feedback.deadline_flush, 3);
+        assert_eq!(feedback.max_held_delay_us, 123_456);
+        // The window reset: further records stay buffered until it elapses.
+        assert!(acc.record(22, VoiceReceiveResult::DeadlineFlush, 1).is_none());
+        // A second peer's window is independent.
+        assert!(acc.record_held_delay(33, 999).is_none());
+        std::thread::sleep(PATH_FEEDBACK_INTERVAL + Duration::from_millis(20));
+        let feedback = acc
+            .record_held_delay(33, 456_789)
+            .expect("other peer's window elapsed");
+        assert_eq!(feedback.received_frames, 0);
+        assert_eq!(feedback.max_held_delay_us, 456_789);
     }
 
     #[tokio::test]
@@ -6626,9 +6742,15 @@ mod tests {
             12,
             crate::overlay::VoiceRouteQuality::new(11, TransportKind::Tcp, 237_000, 0, 0),
         );
+        let mut cfg = VoiceConfig::default();
+        // Keep the chunk-hold window short: this test exercises the origin
+        // quality extension of the skew deadline, not the (default 1600 ms)
+        // hold-first budget. With the hint the skew deadline is ~257 ms; a
+        // 50 ms hold then flushes the whole buffered chunk at ~307 ms.
+        cfg.chunk_hold_budget_ms = 50;
         let svc = VoiceService::new_with_transport(
             transport,
-            VoiceConfig::default(),
+            cfg,
             CancellationToken::new(),
             42,
         );
@@ -6668,7 +6790,9 @@ mod tests {
             1,
             "relay RTT must not shorten the origin deadline"
         );
-        for _ in 0..100 {
+        // The chunk-hold window ends at ~307 ms, after which the whole
+        // buffered chunk [0, 2] flushes contiguously.
+        for _ in 0..300 {
             if sink.len() == 2 {
                 break;
             }
