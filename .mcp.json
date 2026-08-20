@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "shitspeak_grafana": {
+      "command": "uvx",
+      "args": [
+        "mcp-grafana",
+        "--disable-write",
+        "--enabled-tools",
+        "search,datasource,prometheus,loki,dashboard",
+        "--max-loki-log-limit",
+        "500"
+      ],
+      "env": {
+        "GRAFANA_URL": "https://grafana.cfwarp.com",
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE": "D:/shitspeak-rs/.codex/secrets/shitspeak-grafana-token"
+      },
+      "timeout": 90000
+    }
+  }
+}
