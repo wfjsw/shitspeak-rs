@@ -24,3 +24,5 @@ codex-target/
 /target-*/
 /tmp/
 .reasonix/
+.mcp.json
+.claude/
