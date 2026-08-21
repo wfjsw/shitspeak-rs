@@ -315,6 +315,8 @@ fn build_local_lsa_content(
                 native_loss_ppm: n.native_loss_ppm,
                 data_health_ppm: n.data_health_ppm,
                 loss_sample_count: n.loss_sample_count,
+                datagram_loss_ppm: n.datagram_loss_ppm,
+                datagram_loss_sample_count: n.datagram_loss_sample_count,
                 transport_metrics: n
                     .transport_metrics
                     .iter()
@@ -409,6 +411,7 @@ struct LinkGate {
     loss_confident: bool,
     excessive_loss: bool,
     voice_udp: VoiceUdpGate,
+    voice_datagram: VoiceDatagramGate,
 }
 
 impl LinkGate {
@@ -423,6 +426,8 @@ impl LinkGate {
             n.loss_ppm,
             n.loss_sample_count,
             voice_udp_gate_from_neighbor_metrics(&n.transport_metrics),
+            n.datagram_loss_ppm,
+            n.datagram_loss_sample_count,
             cfg,
         )
     }
@@ -438,6 +443,8 @@ impl LinkGate {
             link.loss_ppm,
             link.loss_sample_count,
             voice_udp_gate_from_link_metrics(&link.transport_metrics),
+            link.datagram_loss_ppm,
+            link.datagram_loss_sample_count,
             cfg,
         )
     }
@@ -452,6 +459,8 @@ impl LinkGate {
         loss_ppm: u32,
         loss_sample_count: u64,
         voice_udp: VoiceUdpGate,
+        datagram_loss_ppm: u32,
+        datagram_loss_sample_count: u64,
         cfg: &OverlayConfig,
     ) -> Self {
         let loss_ppm = round_up_u32(loss_ppm, LOSS_GATE_BUCKET_PPM).min(1_000_000);
@@ -471,6 +480,7 @@ impl LinkGate {
             loss_confident,
             excessive_loss: loss_confident && loss_ppm >= cfg.max_route_packet_loss_ppm(),
             voice_udp,
+            voice_datagram: voice_datagram_gate(datagram_loss_ppm, datagram_loss_sample_count),
         }
     }
 
@@ -514,6 +524,30 @@ fn voice_udp_gate(loss_ppm: u32, jitter_us: u64, loss_sample_count: u64) -> Voic
         repair_loss_active: loss_ppm >= VOICE_UDP_REPAIR_LOSS_START_PPM,
         full_dup_loss_active: loss_ppm >= VOICE_UDP_FULL_DUP_LOSS_PPM,
         repair_jitter_active: jitter_us >= VOICE_UDP_REPAIR_JITTER_START_US,
+    }
+}
+
+/// Urgent voice-lane gate over the *active datagram lane* signal
+/// (`LinkAdvert.datagram_loss_ppm`), independent of the UDP transport metric.
+/// Reuses the same loss thresholds as the UDP voice gate; the datagram lane is
+/// where voice actually rides, so its degradation must trigger prompt
+/// re-emission even when the min-over-transports UDP metric stays clean.
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
+struct VoiceDatagramGate {
+    loss_ppm: u32,
+    loss_confident: bool,
+    repair_loss_active: bool,
+    full_dup_loss_active: bool,
+}
+
+fn voice_datagram_gate(loss_ppm: u32, loss_sample_count: u64) -> VoiceDatagramGate {
+    let loss_ppm = round_up_u32(loss_ppm, VOICE_UDP_LOSS_GATE_BUCKET_PPM).min(1_000_000);
+    let loss_confident = loss_sample_count >= MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+    VoiceDatagramGate {
+        loss_ppm,
+        loss_confident,
+        repair_loss_active: loss_ppm >= VOICE_UDP_REPAIR_LOSS_START_PPM,
+        full_dup_loss_active: loss_ppm >= VOICE_UDP_FULL_DUP_LOSS_PPM,
     }
 }
 
@@ -886,7 +920,8 @@ impl PendingMetricChange {
     }
 }
 
-/// Has UDP voice quality shifted enough to cross its metric gate?
+/// Has voice quality shifted enough to cross its metric gate? Either the
+/// legacy UDP transport metric or the dedicated active-datagram-lane signal.
 pub fn voice_cost_changed_significantly(
     emitter: &LsaEmitter,
     snap: &[NeighborSnapshot],
@@ -904,6 +939,15 @@ pub fn voice_cost_changed_significantly(
                 previous = ?previous.voice_udp,
                 current = ?current.voice_udp,
                 "local lsa urgent voice metric gate crossed: udp quality"
+            );
+            return true;
+        }
+        if previous.voice_datagram != current.voice_datagram {
+            trace!(
+                peer = %n.node_id,
+                previous = ?previous.voice_datagram,
+                current = ?current.voice_datagram,
+                "local lsa urgent voice metric gate crossed: datagram lane quality"
             );
             return true;
         }
@@ -1456,6 +1500,8 @@ mod tests {
                 native_loss_ppm: 0,
                 data_health_ppm: 0,
                 loss_sample_count: 0,
+                datagram_loss_ppm: 0,
+                datagram_loss_sample_count: 0,
                 transport_metrics: Vec::new(),
             })
             .collect()
@@ -1818,6 +1864,26 @@ mod tests {
             MIN_ROUTE_LOSS_EXCLUSION_SAMPLES,
         )];
 
+        assert!(voice_cost_changed_significantly(&emitter, &changed, &cfg));
+        assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
+    }
+
+    #[test]
+    fn datagram_lane_loss_bucket_triggers_urgent_gate_only() {
+        let cfg = OverlayConfig::new(vec![]);
+        let emitter = test_emitter();
+        let mut base = one_neighbor();
+        base.datagram_loss_ppm = 0;
+        base.datagram_loss_sample_count = 0;
+        let base = vec![base];
+        record_published(&emitter, &base, &cfg);
+
+        let mut changed = base.clone();
+        changed[0].datagram_loss_ppm = 10_000;
+        changed[0].datagram_loss_sample_count = MIN_ROUTE_LOSS_EXCLUSION_SAMPLES;
+
+        // Datagram-lane degradation alone (transport metric unchanged) must
+        // re-emit voice LSAs so peers can reroute off the degrading lane.
         assert!(voice_cost_changed_significantly(&emitter, &changed, &cfg));
         assert!(!cost_changed_significantly(&emitter, &changed, &cfg));
     }

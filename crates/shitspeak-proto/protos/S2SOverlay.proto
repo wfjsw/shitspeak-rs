@@ -101,6 +101,15 @@ message LinkAdvert {
   uint64 observed_sent_bps = 12; // Passive payload bytes/sec sent by origin to neighbor.
   uint32 throughput_confidence_ppm = 13; // Confidence in observed throughput, parts per million.
   repeated LinkTransportMetric transport_metrics = 14; // Per-transport quality for service-specific routing.
+  // Effective loss on the *active best-effort datagram lane* — the lane voice
+  // actually rides (UdpDatagram when usable, else QuicDatagram). The legacy
+  // per-transport loss below is min-over-transports and can hide datagram
+  // loss behind reliable streams; this is the dedicated voice-lane signal.
+  // Both zero with `datagram_loss_sample_count == 0` means the advertiser
+  // predates the signal (or the lane was never observed); consumers fall back
+  // to the UDP transport metric.
+  uint32 datagram_loss_ppm = 15;
+  uint64 datagram_loss_sample_count = 16;
 }
 
 message LinkTransportMetric {

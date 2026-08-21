@@ -287,6 +287,12 @@ pub struct LinkAdvertised {
     pub native_loss_ppm: u32,
     pub data_health_ppm: u32,
     pub loss_sample_count: u64,
+    /// Effective loss on the active best-effort datagram lane — the lane voice
+    /// actually rides. `datagram_loss_sample_count == 0` means the advertiser
+    /// predates the signal or the lane was never observed; consumers fall back
+    /// to the UDP transport metric.
+    pub datagram_loss_ppm: u32,
+    pub datagram_loss_sample_count: u64,
     pub transport_metrics: Vec<LinkTransportAdvertised>,
 }
 
@@ -695,6 +701,8 @@ impl LsaEntry {
                     native_loss_ppm: l.native_loss_ppm,
                     data_health_ppm: l.data_health_ppm,
                     loss_sample_count: l.loss_sample_count,
+                    datagram_loss_ppm: l.datagram_loss_ppm,
+                    datagram_loss_sample_count: l.datagram_loss_sample_count,
                     transport_metrics: l
                         .transport_metrics
                         .iter()
@@ -766,6 +774,8 @@ impl LsaEntry {
                     native_loss_ppm: l.native_loss_ppm,
                     data_health_ppm: l.data_health_ppm,
                     loss_sample_count: l.loss_sample_count,
+                    datagram_loss_ppm: l.datagram_loss_ppm,
+                    datagram_loss_sample_count: l.datagram_loss_sample_count,
                     transport_metrics: l
                         .transport_metrics
                         .iter()
@@ -1409,6 +1419,8 @@ mod tests {
             native_loss_ppm: 0,
             data_health_ppm: 0,
             loss_sample_count: 0,
+            datagram_loss_ppm: 0,
+            datagram_loss_sample_count: 0,
             transport_metrics: Vec::new(),
         }
     }
@@ -1563,6 +1575,8 @@ mod tests {
             native_loss_ppm: 40_000,
             data_health_ppm: 5_000,
             loss_sample_count: 123,
+            datagram_loss_ppm: 8_000,
+            datagram_loss_sample_count: 77,
             transport_metrics: vec![LinkTransportAdvertised::new(
                 TransportKind::Udp,
                 1_250,
@@ -1584,6 +1598,8 @@ mod tests {
         assert_eq!(wire_link.native_loss_ppm, 40_000);
         assert_eq!(wire_link.data_health_ppm, 5_000);
         assert_eq!(wire_link.loss_sample_count, 123);
+        assert_eq!(wire_link.datagram_loss_ppm, 8_000);
+        assert_eq!(wire_link.datagram_loss_sample_count, 77);
         assert_eq!(wire_link.throughput_bps, 10_000);
         assert_eq!(wire_link.observed_recv_bps, 4_000);
         assert_eq!(wire_link.observed_sent_bps, 10_000);
@@ -1613,6 +1629,8 @@ mod tests {
         assert_eq!(link.native_loss_ppm, 40_000);
         assert_eq!(link.data_health_ppm, 5_000);
         assert_eq!(link.loss_sample_count, 123);
+        assert_eq!(link.datagram_loss_ppm, 8_000);
+        assert_eq!(link.datagram_loss_sample_count, 77);
         assert_eq!(link.throughput_bps, 10_000);
         assert_eq!(link.observed_recv_bps, 4_000);
         assert_eq!(link.observed_sent_bps, 10_000);

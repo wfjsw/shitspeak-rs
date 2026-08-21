@@ -337,20 +337,29 @@ fn edge_metric_inputs(
                 return edge_metric_inputs_from_transport(link, candidate);
             }
         }
-        RoutingMetric::BestEffortCost => {
+        RoutingMetric::BestEffortCost | RoutingMetric::ConversationalQuality => {
             if level == ServiceLevel::BestEffort {
+                // Best-effort traffic (including voice) rides the *datagram
+                // lane*, so prefer the advertised active-lane loss when the
+                // advertiser emits it. This is authoritative where it exists:
+                // the legacy per-transport loss is a minimum over transports
+                // and can hide datagram loss behind reliable streams. Fall back
+                // to the UDP transport metric for legacy advertisers.
+                if link.datagram_loss_sample_count > 0 || link.datagram_loss_ppm > 0 {
+                    return EdgeMetricInputs {
+                        rtt_us: link.rtt_us,
+                        jitter_us: link.jitter_us,
+                        loss_ppm: link.datagram_loss_ppm,
+                        loss_sample_count: link.datagram_loss_sample_count,
+                    };
+                }
                 if let Some(udp) = transport_metric(link, TransportKind::Udp) {
                     return edge_metric_inputs_from_transport(link, udp);
                 }
-            }
-        }
-        RoutingMetric::ConversationalQuality => {
-            if level == ServiceLevel::BestEffort {
-                if let Some(udp) = transport_metric(link, TransportKind::Udp) {
-                    return edge_metric_inputs_from_transport(link, udp);
+            } else if metric == RoutingMetric::ConversationalQuality {
+                if let Some(candidate) = best_viable_reliable_udp_metric(link, metric, cfg) {
+                    return edge_metric_inputs_from_transport(link, candidate);
                 }
-            } else if let Some(candidate) = best_viable_reliable_udp_metric(link, metric, cfg) {
-                return edge_metric_inputs_from_transport(link, candidate);
             }
         }
     }
@@ -596,6 +605,8 @@ mod tests {
                     native_loss_ppm: 0,
                     data_health_ppm: 0,
                     loss_sample_count,
+                    datagram_loss_ppm: 0,
+                    datagram_loss_sample_count: 0,
                     transport_metrics: Vec::new(),
                 })
                 .collect(),
@@ -651,6 +662,8 @@ mod tests {
                         native_loss_ppm,
                         data_health_ppm,
                         loss_sample_count,
+                        datagram_loss_ppm: 0,
+                        datagram_loss_sample_count: 0,
                         transport_metrics: Vec::new(),
                     },
                 )
@@ -703,6 +716,8 @@ mod tests {
                         native_loss_ppm: 0,
                         data_health_ppm: 0,
                         loss_sample_count: MIN_ROUTE_LOSS_EXCLUSION_SAMPLES,
+                        datagram_loss_ppm: 0,
+                        datagram_loss_sample_count: 0,
                         transport_metrics: udp
                             .map(|(udp_rtt, udp_jitter, udp_loss, samples)| {
                                 vec![LinkTransportAdvertised::new(
@@ -714,6 +729,63 @@ mod tests {
                                 )]
                             })
                             .unwrap_or_default(),
+                    },
+                )
+                .collect(),
+            max_users: 0,
+            transit_disabled: false,
+            replication_services: ReplicationServices::ALL,
+            application_services: ApplicationServices::ALL,
+            strict_replication_protocol_version: 0,
+            strict_replication_transit_protocol_version: 0,
+            upper_layer_capabilities: None,
+        }
+    }
+
+    /// Entry builder that advertises a clean UDP transport metric alongside an
+    /// independent datagram-lane loss signal. Reproduces the real case where
+    /// voice rides the datagram lane but the min-over-transports UDP metric
+    /// stays clean.
+    fn entry_with_datagram_lane(
+        origin: NodeIdentifier,
+        links: Vec<(NodeIdentifier, u64, u32, u32, u64)>,
+    ) -> LsaEntry {
+        LsaEntry {
+            origin,
+            boot_epoch: 100,
+            seq: 1,
+            ts_local_received: std::time::Instant::now(),
+            tombstone: false,
+            addresses: vec![],
+            links: links
+                .into_iter()
+                .map(
+                    |(neighbor, rtt_us, aggregate_loss_ppm, datagram_loss_ppm, datagram_samples)| {
+                        LinkAdvertised {
+                            neighbor,
+                            rtt_us,
+                            jitter_us: 0,
+                            throughput_bps: 1_000_000,
+                            observed_recv_bps: 1_000_000,
+                            observed_sent_bps: 1_000_000,
+                            throughput_confidence_ppm: 1_000_000,
+                            transports_mask: transport_bit(TransportKind::Tcp)
+                                | transport_bit(TransportKind::Udp),
+                            loss_ppm: aggregate_loss_ppm,
+                            probe_loss_ppm: aggregate_loss_ppm,
+                            native_loss_ppm: 0,
+                            data_health_ppm: 0,
+                            loss_sample_count: MIN_ROUTE_LOSS_EXCLUSION_SAMPLES,
+                            datagram_loss_ppm,
+                            datagram_loss_sample_count: datagram_samples,
+                            transport_metrics: vec![LinkTransportAdvertised::new(
+                                TransportKind::Udp,
+                                rtt_us,
+                                0,
+                                0,
+                                MIN_ROUTE_LOSS_EXCLUSION_SAMPLES,
+                            )],
+                        }
                     },
                 )
                 .collect(),
@@ -756,6 +828,8 @@ mod tests {
                             native_loss_ppm: 0,
                             data_health_ppm: 0,
                             loss_sample_count: MIN_ROUTE_LOSS_EXCLUSION_SAMPLES,
+                            datagram_loss_ppm: 0,
+                            datagram_loss_sample_count: 0,
                             transport_metrics,
                         }
                     },
@@ -934,6 +1008,85 @@ mod tests {
             &cfg(),
         );
         assert_eq!(reliable[&2].next_hop, 2);
+
+        let conversational = compute_with_metric(
+            &db,
+            1,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            &cfg(),
+        );
+        assert_eq!(conversational[&2].next_hop, 3);
+    }
+
+    #[test]
+    fn conversational_cost_uses_datagram_lane_loss_over_clean_udp_transport() {
+        // Direct 1-2 has a clean UDP transport metric but a 40% datagram lane
+        // (the lane voice actually rides). Relay 1-3-2 is clean end to end.
+        // Best-effort cost must route voice off the degrading direct lane.
+        let db = build_db(vec![
+            entry_with_datagram_lane(
+                1,
+                vec![(2, 5_000, 0, 400_000, 256), (3, 4_000, 0, 0, 0)],
+            ),
+            entry_with_datagram_lane(
+                2,
+                vec![(1, 5_000, 0, 400_000, 256), (3, 1_000, 0, 0, 0)],
+            ),
+            entry_with_datagram_lane(
+                3,
+                vec![(1, 4_000, 0, 0, 0), (2, 1_000, 0, 0, 0)],
+            ),
+        ]);
+
+        let best_effort = compute_with_metric(
+            &db,
+            1,
+            ServiceLevel::BestEffort,
+            RoutingMetric::BestEffortCost,
+            &cfg(),
+        );
+        assert_eq!(best_effort[&2].next_hop, 3);
+
+        let conversational = compute_with_metric(
+            &db,
+            1,
+            ServiceLevel::BestEffort,
+            RoutingMetric::ConversationalQuality,
+            &cfg(),
+        );
+        assert_eq!(conversational[&2].next_hop, 3);
+    }
+
+    #[test]
+    fn conversational_cost_falls_back_to_udp_transport_when_datagram_signal_absent() {
+        // Legacy advertisers send no datagram fields (0/0 = absent). The direct
+        // 1-2 UDP transport metric is lossy; if the code wrongly treated the
+        // absent datagram signal as "clean" it would pick the direct path. The
+        // fallback must read the UDP transport metric and route via 3.
+        let db = build_db(vec![
+            entry_with_udp_metrics(
+                1,
+                vec![
+                    (2, 5_000, 0, Some((5_000, 0, 300_000, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
+                    (3, 4_000, 0, Some((4_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
+                ],
+            ),
+            entry_with_udp_metrics(
+                2,
+                vec![
+                    (1, 5_000, 0, Some((5_000, 0, 300_000, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
+                    (3, 1_000, 0, Some((1_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
+                ],
+            ),
+            entry_with_udp_metrics(
+                3,
+                vec![
+                    (1, 4_000, 0, Some((4_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
+                    (2, 1_000, 0, Some((1_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
+                ],
+            ),
+        ]);
 
         let conversational = compute_with_metric(
             &db,

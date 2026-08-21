@@ -9,10 +9,16 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Once, OnceLock};
+use std::time::Duration;
 
 use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, KeyPair};
 use tempfile::TempDir;
 use tokio::sync::{Mutex, OwnedMutexGuard};
+
+use shitspeak_core::NodeIdentifier;
+
+use crate::metrics::{DatagramPathHealthReason, DatagramPathHealthSnapshot, DatagramPathHealthState};
+use crate::service_level::DeliveryPath;
 
 /// Install rustls' aws-lc-rs default crypto provider exactly once across all
 /// tests in the process.
@@ -114,4 +120,44 @@ fn s2s_network_test_lock() -> Arc<Mutex<()>> {
 /// short convergence deadlines flaky.
 pub async fn s2s_network_test_guard() -> OwnedMutexGuard<()> {
     s2s_network_test_lock().lock_owned().await
+}
+
+/// Build a [`DatagramPathHealthSnapshot`] for tests without driving a real
+/// transport path. Unset fields take neutral defaults (zero counters, fresh
+/// observations, full confidence).
+pub fn datagram_path_health_snapshot(
+    peer: NodeIdentifier,
+    path: DeliveryPath,
+    state: DatagramPathHealthState,
+    effective_loss_ppm: Option<u32>,
+    loss_samples: u64,
+) -> DatagramPathHealthSnapshot {
+    DatagramPathHealthSnapshot::new(
+        peer,
+        path,
+        state,
+        DatagramPathHealthReason::WithinThreshold,
+        effective_loss_ppm,
+        None,
+        loss_samples,
+        0,
+        Duration::ZERO,
+        Duration::ZERO,
+        None,
+        None,
+        None,
+        1_000_000,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        Duration::ZERO,
+        false,
+    )
 }

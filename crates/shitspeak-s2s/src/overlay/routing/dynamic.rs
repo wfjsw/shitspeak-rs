@@ -402,6 +402,8 @@ mod tests {
             native_loss_ppm: 0,
             data_health_ppm: 0,
             loss_sample_count: 0,
+            datagram_loss_ppm: 0,
+            datagram_loss_sample_count: 0,
             transport_metrics: Vec::new(),
         }
     }

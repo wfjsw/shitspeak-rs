@@ -2380,10 +2380,31 @@ fn tree_edge_candidates(
     let direct_pressure =
         transport.best_conversational_path_pressure(child, level, metric, transport_class, options);
     if let Some(pressure) = direct_pressure {
-        let route_cost = tables
-            .lookup_via_first_hop_with_metric(self_id, child, level, metric, &visited, child)
-            .map(|route| route.cost)
-            .unwrap_or(u64::MAX);
+        // The direct candidate's route cost must be comparable to a relay's:
+        // both are the aggregate conversational cost of reaching *every*
+        // recipient through the chosen first hop. Previously this was just the
+        // cost to the child node itself, which structurally under-stated the
+        // direct path once the subtree had more than one member and made the
+        // relay candidates look worse than they are in `candidate_is_better`.
+        let route_cost = if recipients.is_empty() {
+            u64::MAX
+        } else {
+            recipients
+                .iter()
+                .try_fold(0u64, |acc, recipient| {
+                    tables
+                        .lookup_via_first_hop_with_metric(
+                            self_id,
+                            *recipient,
+                            level,
+                            metric,
+                            &visited,
+                            child,
+                        )
+                        .map(|route| acc.saturating_add(route.cost))
+                })
+                .unwrap_or(u64::MAX)
+        };
         candidates.push(TreeEdgeCandidate::direct_with_cost(pressure, route_cost));
     }
 

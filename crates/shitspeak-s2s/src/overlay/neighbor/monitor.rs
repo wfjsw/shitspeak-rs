@@ -22,7 +22,10 @@ use tokio::sync::{Notify, broadcast};
 use tracing::debug;
 
 use shitspeak_core::NodeIdentifier;
-use shitspeak_s2s_transport::{ConnectionManager, TransportKind};
+use shitspeak_s2s_transport::{
+    ConnectionManager, DatagramPathHealthSnapshot, DatagramPathHealthState, DeliveryPath,
+    TransportKind,
+};
 
 use super::super::config::OverlayConfig;
 use super::super::config::kind_to_idx;
@@ -50,6 +53,12 @@ pub struct NeighborSnapshot {
     pub native_loss_ppm: u32,
     pub data_health_ppm: u32,
     pub loss_sample_count: u64,
+    /// Effective loss on the active best-effort datagram lane — the lane voice
+    /// actually rides (UdpDatagram when usable, else QuicDatagram). Zero with
+    /// `datagram_loss_sample_count == 0` means no datagram lane has been
+    /// observed yet; consumers fall back to the UDP transport metric.
+    pub datagram_loss_ppm: u32,
+    pub datagram_loss_sample_count: u64,
     pub transport_metrics: Vec<NeighborTransportMetric>,
 }
 
@@ -396,6 +405,40 @@ impl NeighborMonitor {
         self.link_up_events.subscribe()
     }
 
+    /// Resolve the effective loss of the *active* best-effort datagram lane for
+    /// `peer` from the per-path datagram health snapshots.
+    ///
+    /// Voice rides the best-effort datagram lane, so this is the signal the
+    /// E-model route cost must see — the legacy per-transport loss is a minimum
+    /// over transports and can hide datagram loss behind reliable streams. The
+    /// active lane follows the transport's own preference: UDP datagram when it
+    /// is usable, else QUIC datagram. Blocked lanes are excluded so a failed
+    /// lane cannot mask the loss the fallback lane actually carries.
+    ///
+    /// Returns `(0, 0)` when no datagram lane has been observed; the consumer
+    /// falls back to the UDP transport metric in that case.
+    fn datagram_lane_loss(
+        health: &[DatagramPathHealthSnapshot],
+        peer: NodeIdentifier,
+    ) -> (u32, u64) {
+        let mut udp = None;
+        let mut quic = None;
+        for snapshot in health {
+            if snapshot.peer() != peer || snapshot.state() == DatagramPathHealthState::Blocked {
+                continue;
+            }
+            match snapshot.path() {
+                DeliveryPath::UdpDatagram => udp = Some(snapshot),
+                DeliveryPath::QuicDatagram => quic = Some(snapshot),
+                _ => {}
+            }
+        }
+        let Some(active) = udp.or(quic) else {
+            return (0, 0);
+        };
+        (active.effective_loss_ppm().unwrap_or(0), active.loss_samples())
+    }
+
     /// Build a snapshot of every currently-up neighbor with live cost
     /// metrics drawn from `metrics_snapshot()`.
     pub fn snapshot(&self) -> Vec<NeighborSnapshot> {
@@ -410,6 +453,8 @@ impl NeighborMonitor {
             }
             let (hello_loss_ppm, hello_loss_samples, _) =
                 packet_loss_snapshot(st, now, loss_window);
+            let (datagram_loss_ppm, datagram_loss_sample_count) =
+                Self::datagram_lane_loss(metrics.datagram_path_health(), *nid);
             let mut probe_loss_ppm = hello_loss_ppm;
             let mut native_loss_ppm = 0;
             let mut data_health_ppm = 0;
@@ -503,6 +548,8 @@ impl NeighborMonitor {
                 native_loss_ppm,
                 data_health_ppm,
                 loss_sample_count,
+                datagram_loss_ppm,
+                datagram_loss_sample_count,
                 transport_metrics,
             });
         }
@@ -990,5 +1037,91 @@ mod tests {
         state.reset_quality_samples();
         assert!(!has_mutual_fresh_clock_offset(&state, now));
         assert!(!state.remote_clock_ready);
+    }
+
+    #[test]
+    fn datagram_lane_loss_prefers_udp_and_falls_back_to_quic_when_udp_blocked() {
+        use shitspeak_s2s_transport::testing::datagram_path_health_snapshot;
+
+        let peer = NodeIdentifier::from(12u16);
+        let other = NodeIdentifier::from(15u16);
+
+        // UDP datagram Suspect still wins over a Healthy QUIC datagram: the
+        // active lane is the UDP lane, so its loss is the one that matters.
+        let health = [
+            datagram_path_health_snapshot(
+                peer,
+                DeliveryPath::UdpDatagram,
+                DatagramPathHealthState::Suspect,
+                Some(400_000),
+                128,
+            ),
+            datagram_path_health_snapshot(
+                peer,
+                DeliveryPath::QuicDatagram,
+                DatagramPathHealthState::Healthy,
+                Some(5_000),
+                64,
+            ),
+            datagram_path_health_snapshot(
+                peer,
+                DeliveryPath::UdpDatagram,
+                DatagramPathHealthState::Healthy,
+                Some(2_000),
+                32,
+            ),
+            // Different peer must be ignored.
+            datagram_path_health_snapshot(
+                other,
+                DeliveryPath::UdpDatagram,
+                DatagramPathHealthState::Healthy,
+                Some(999_999),
+                999,
+            ),
+        ];
+        // The last-seen UDP snapshot wins (the loop overwrites per lane), and
+        // it beats any QUIC datagram value even when Suspect.
+        assert_eq!(NeighborMonitor::datagram_lane_loss(&health, peer), (2_000, 32));
+
+        // Blocked UDP falls back to the QUIC datagram lane.
+        let health = [
+            datagram_path_health_snapshot(
+                peer,
+                DeliveryPath::UdpDatagram,
+                DatagramPathHealthState::Blocked,
+                Some(900_000),
+                256,
+            ),
+            datagram_path_health_snapshot(
+                peer,
+                DeliveryPath::QuicDatagram,
+                DatagramPathHealthState::Healthy,
+                Some(12_000),
+                40,
+            ),
+        ];
+        assert_eq!(NeighborMonitor::datagram_lane_loss(&health, peer), (12_000, 40));
+
+        // Only blocked lanes => no usable datagram lane => (0, 0) sentinel.
+        let health = [
+            datagram_path_health_snapshot(
+                peer,
+                DeliveryPath::UdpDatagram,
+                DatagramPathHealthState::Blocked,
+                Some(900_000),
+                256,
+            ),
+            datagram_path_health_snapshot(
+                peer,
+                DeliveryPath::QuicDatagram,
+                DatagramPathHealthState::Blocked,
+                Some(500_000),
+                128,
+            ),
+        ];
+        assert_eq!(NeighborMonitor::datagram_lane_loss(&health, peer), (0, 0));
+
+        // No datagram lane snapshots at all => (0, 0) sentinel.
+        assert_eq!(NeighborMonitor::datagram_lane_loss(&[], peer), (0, 0));
     }
 }

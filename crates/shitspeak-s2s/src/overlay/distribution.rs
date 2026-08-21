@@ -601,32 +601,38 @@ fn begin_tree_edge_transition(
 
 /// Whether the challenger is genuinely a better route than the incumbent.
 ///
+/// The decision is driven by the continuous whole-path conversational cost
+/// (`route_cost`, an E-model impairment score), not the saturated bang-bang
+/// pressure: once a voice lane crosses the low suspect threshold its pressure
+/// saturates and can no longer discriminate between two degrading paths, so
+/// cost is the primary axis and min_hold/challenger_confirm remain the only
+/// time hysteresis.
+///
 /// `challenger_is_idle` applies the idle-credibility discount: a challenger
 /// whose first hop has carried no recent voice traffic reports clean metrics
 /// precisely because it is unloaded — those are stale bets the moment it takes
 /// load. Against a *healthy* incumbent (pressure < 2) an idle challenger must
-/// win decisively (≥2 pressure points or ≥20% cheaper) before we start loading
-/// it. Hard-failure replacement (pressure >= 3) never reaches this gate; it is
-/// handled earlier so escaping a failing route is never blocked.
+/// be ≥20% cheaper before we start loading it; non-idle challengers only clear
+/// the normal ≥10% margin. A challenger whose first hop is live-degraded
+/// relative to the incumbent cannot win on advertised cost alone — its cost
+/// has not yet caught up with the live signal. Hard-failure replacement
+/// (pressure >= 3) never reaches this gate; it is handled earlier so escaping
+/// a failing route is never blocked.
 fn candidate_is_better(
     challenger: TreeEdgeCandidate,
     incumbent: TreeEdgeCandidate,
     challenger_is_idle: bool,
 ) -> bool {
+    if challenger.pressure > incumbent.pressure.saturating_add(1) {
+        return false;
+    }
     if challenger_is_idle && incumbent.pressure < 2 {
-        return challenger.pressure.saturating_add(2) <= incumbent.pressure
-            || challenger
-                .route_cost
-                .saturating_mul(100)
-                <= incumbent.route_cost.saturating_mul(80);
+        return challenger
+            .route_cost
+            .saturating_mul(100)
+            <= incumbent.route_cost.saturating_mul(80);
     }
-    if challenger.pressure != incumbent.pressure {
-        return challenger.pressure < incumbent.pressure;
-    }
-    if challenger.route_cost.saturating_mul(100) <= incumbent.route_cost.saturating_mul(90) {
-        return true;
-    }
-    false
+    challenger.route_cost.saturating_mul(100) <= incumbent.route_cost.saturating_mul(90)
 }
 
 fn prune_voice_overlap_samples(link: &mut VoiceOverlapLink, now: Instant) {
@@ -1464,10 +1470,13 @@ impl DistributionPlane {
         now: Instant,
     ) -> TreeEdgeAttempt {
         let key = TreeEdgeBindingKey::new(tree_key, parent, child);
+        // Cost-primary so the cheapest whole-path route wins the initial pick
+        // and the deterministic ordering mirrors the cost-primary decision in
+        // `candidate_is_better`.
         candidates.sort_by_key(|candidate| {
             (
-                candidate.pressure,
                 candidate.route_cost,
+                candidate.pressure,
                 candidate.path.first_hop(child),
             )
         });
@@ -3444,12 +3453,13 @@ mod tests {
         let _ = plane.complete_tree_edge_attempt(initial, true, start);
 
         // The relay has been carrying real voice through this plane: it is not
-        // idle, so a plain 1-point pressure edge wins as before.
+        // idle, so it only clears the normal ≥10% cost margin (35 vs 40 is
+        // 12.5% cheaper), not the stricter ≥20% idle bar.
         plane.record_voice_original_bytes(4097, 1024, start);
         let loaded_challenger = || {
             vec![
                 TreeEdgeCandidate::direct_with_cost(1, 40),
-                TreeEdgeCandidate::legacy(4097, 0, 38),
+                TreeEdgeCandidate::legacy(4097, 0, 35),
             ]
         };
         let _ = plane.choose_tree_edge(
@@ -3685,7 +3695,7 @@ mod tests {
             tree_key,
             1,
             2,
-            vec![TreeEdgeCandidate::direct(1)],
+            vec![TreeEdgeCandidate::direct_with_cost(1, 100)],
             sticky_policy(),
             start,
         );
@@ -3694,7 +3704,7 @@ mod tests {
 
         let candidates = || {
             vec![
-                TreeEdgeCandidate::direct(2),
+                TreeEdgeCandidate::direct_with_cost(2, 100),
                 TreeEdgeCandidate::legacy(3, 1, 10),
             ]
         };
@@ -3737,7 +3747,7 @@ mod tests {
             tree_key,
             1,
             2,
-            vec![TreeEdgeCandidate::direct(1)],
+            vec![TreeEdgeCandidate::direct_with_cost(1, 100)],
             sticky_policy(),
             start,
         );
@@ -3748,7 +3758,7 @@ mod tests {
             1,
             2,
             vec![
-                TreeEdgeCandidate::direct(2),
+                TreeEdgeCandidate::direct_with_cost(2, 100),
                 TreeEdgeCandidate::legacy(3, 1, 1),
             ],
             sticky_policy(),
@@ -3759,7 +3769,7 @@ mod tests {
             1,
             2,
             vec![
-                TreeEdgeCandidate::direct(2),
+                TreeEdgeCandidate::direct_with_cost(2, 100),
                 TreeEdgeCandidate::legacy(4, 1, 1),
             ],
             sticky_policy(),
@@ -3771,7 +3781,7 @@ mod tests {
             1,
             2,
             vec![
-                TreeEdgeCandidate::direct(2),
+                TreeEdgeCandidate::direct_with_cost(2, 100),
                 TreeEdgeCandidate::legacy(4, 1, 1),
             ],
             sticky_policy(),
@@ -3783,7 +3793,7 @@ mod tests {
             1,
             2,
             vec![
-                TreeEdgeCandidate::direct(2),
+                TreeEdgeCandidate::direct_with_cost(2, 100),
                 TreeEdgeCandidate::legacy(4, 1, 1),
             ],
             sticky_policy(),
