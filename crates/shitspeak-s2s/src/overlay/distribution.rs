@@ -96,6 +96,13 @@ pub(crate) struct TreeEdgeCandidate {
     /// losing hard, so a cost-better challenger qualifies on a single
     /// observation instead of the full confirm (C2b).
     hard_loss: bool,
+    /// Whether the destination (sink) is reporting degraded reorder quality on
+    /// the voice sent it — the receiver-side gap signal
+    /// (`ConnectionManager::best_effort_sink_feedback`). The sink hears the
+    /// loss the sender cannot, so a reported gap shortens the challenger
+    /// confirm the same way hard datagram loss does (C2c). Seeded alternates
+    /// and test fixtures leave it false (unknown).
+    sink_gap: bool,
 }
 
 impl TreeEdgeCandidate {
@@ -112,6 +119,7 @@ impl TreeEdgeCandidate {
             verified: true,
             lane_blocked: false,
             hard_loss: false,
+            sink_gap: false,
         }
     }
 
@@ -123,6 +131,7 @@ impl TreeEdgeCandidate {
             verified: true,
             lane_blocked: false,
             hard_loss: false,
+            sink_gap: false,
         }
     }
 
@@ -139,6 +148,7 @@ impl TreeEdgeCandidate {
             verified: false,
             lane_blocked: false,
             hard_loss: false,
+            sink_gap: false,
         }
     }
 
@@ -158,12 +168,24 @@ impl TreeEdgeCandidate {
         self.hard_loss
     }
 
+    pub(crate) fn sink_gap(self) -> bool {
+        self.sink_gap
+    }
+
     /// Attach the live datagram-lane health measured for this first hop
     /// (`ConnectionManager::best_effort_datagram_lane_health`). Seeded
     /// alternates and test fixtures leave both false (unknown lane).
     pub(crate) fn with_datagram_lane(mut self, lane_blocked: bool, hard_loss: bool) -> Self {
         self.lane_blocked = lane_blocked;
         self.hard_loss = hard_loss;
+        self
+    }
+
+    /// Attach the sink-reported reorder-gap signal for this first hop
+    /// (`ConnectionManager::best_effort_sink_feedback`). Seeded alternates and
+    /// test fixtures leave it false (unknown).
+    pub(crate) fn with_sink_gap(mut self, sink_gap: bool) -> Self {
+        self.sink_gap = sink_gap;
         self
     }
 }
@@ -1791,19 +1813,22 @@ impl DistributionPlane {
 
         if let Some(challenger) = challenger {
             observe_tree_edge_challenger(binding, challenger.path, now);
-            // C2b: when the incumbent is losing at/above the full-dup threshold
-            // (>= 3%, not the suspect floor that saturates), a cost-better
-            // challenger qualifies on a single observation and skips the confirm
-            // wait — the incumbent is already harming voice, so the extra
+            // C2b + C2c: when the incumbent is losing at/above the full-dup
+            // threshold (>= 3%, not the suspect floor that saturates) OR the
+            // destination (sink) reports degraded reorder quality on the voice
+            // sent it, a cost-better challenger qualifies on a single
+            // observation and skips the confirm wait — the lane is losing hard,
+            // or the receiver is hearing gaps the sender cannot, so the extra
             // confirmation window only prolongs the damage. min_hold still
             // guards the fresh-binding flap case.
-            let incumbent_hard_loss = incumbent.is_some_and(|candidate| candidate.hard_loss);
-            let confirm_window_met = incumbent_hard_loss
+            let incumbent_hard_signal = incumbent
+                .is_some_and(|candidate| candidate.hard_loss || candidate.sink_gap);
+            let confirm_window_met = incumbent_hard_signal
                 || binding.challenger_since.is_some_and(|since| {
                     now.saturating_duration_since(since) >= policy.challenger_confirm
                 });
             if now.saturating_duration_since(binding.entered_at) >= policy.min_hold
-                && binding.challenger_observations >= if incumbent_hard_loss { 1 } else { 2 }
+                && binding.challenger_observations >= if incumbent_hard_signal { 1 } else { 2 }
                 && confirm_window_met
             {
                 begin_tree_edge_transition(binding, challenger.path, "confirmed_challenger", now);
@@ -4299,6 +4324,63 @@ mod tests {
         };
         // First observation at 800 (min_hold met): without hard_loss the
         // challenger must be seen twice across the 500ms confirm window.
+        let first = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(800));
+        assert_eq!(first.path(), TreeEdgePath::DirectChild);
+        let second = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(850));
+        assert_eq!(second.path(), TreeEdgePath::DirectChild);
+        let confirmed = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(1_350));
+        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn c2c_sink_gap_confirms_cost_better_challenger_on_first_observation() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(111, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        // The destination (sink) is reporting degraded reorder quality on the
+        // voice sent it — the receiver hears gaps the sender's lane signal
+        // cannot. Like C2b hard loss, a cost-better challenger must confirm on
+        // a single observation with no confirm wait; min_hold (fast = 250ms)
+        // is met. Note the incumbent's datagram lane itself is clean.
+        let attempt = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40)
+                    .with_datagram_lane(false, false)
+                    .with_sink_gap(true),
+                TreeEdgeCandidate::legacy(4097, 1, 3).with_datagram_lane(false, false),
+            ],
+            fast_sticky_policy(),
+            at(800),
+        );
+        assert_eq!(attempt.reason, "confirmed_challenger");
+        assert_eq!(attempt.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn c2c_sink_gap_on_challenger_does_not_shorten_confirm() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(112, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        let candidates = || {
+            vec![
+                // The signal is about the incumbent's route: a gap the
+                // challenger's own sink reports does not waive the incumbent's
+                // confirm — the incumbent's quality is what is being replaced.
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_datagram_lane(false, false),
+                TreeEdgeCandidate::legacy(4097, 1, 3)
+                    .with_datagram_lane(false, false)
+                    .with_sink_gap(true),
+            ]
+        };
+        // First observation at 800 (min_hold met): without a hard signal on the
+        // incumbent the challenger must be seen twice across the 500ms confirm.
         let first = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(800));
         assert_eq!(first.path(), TreeEdgePath::DirectChild);
         let second = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(850));

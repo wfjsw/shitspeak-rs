@@ -2375,21 +2375,34 @@ fn datagram_lane_signal(
     )
 }
 
-/// Expose a frame's datagram-lane C2 signal to the telemetry layer so the
-/// dashboards can see, per edge, how often each signal is actually present
-/// (`shitspeak_s2s_voice_datagram_lane_signal_total`). `lane_blocked` feeds the
-/// C2a immediate-escape path, `hard_loss` the C2b shortened confirm.
+/// The live receiver-gap signal for a first hop (C2c): whether the destination
+/// (sink) is reporting degraded reorder quality on the voice this node sent it.
+/// The sink hears loss the sender's own lane signal cannot, so a reported gap
+/// shortens the challenger confirm the same way hard datagram loss does.
+fn sink_gap_signal(transport: &ConnectionManager, first_hop: NodeIdentifier) -> bool {
+    transport.best_effort_sink_feedback(first_hop).suspect
+}
+
+/// Expose a frame's datagram-lane and receiver-gap C2 signals to the telemetry
+/// layer so the dashboards can see, per edge, how often each signal is actually
+/// present (`shitspeak_s2s_voice_datagram_lane_signal_total`). `lane_blocked`
+/// feeds the C2a immediate-escape path, `hard_loss` the C2b shortened confirm,
+/// `sink_gap` the C2c receiver-gap shortened confirm.
 fn record_datagram_lane_signals(
     source: NodeIdentifier,
     peer: NodeIdentifier,
     lane_blocked: bool,
     hard_loss: bool,
+    sink_gap: bool,
 ) {
     if lane_blocked {
         crate::overlay::distribution_metrics::record_datagram_lane_signal(source, peer, "lane_blocked");
     }
     if hard_loss {
         crate::overlay::distribution_metrics::record_datagram_lane_signal(source, peer, "hard_loss");
+    }
+    if sink_gap {
+        crate::overlay::distribution_metrics::record_datagram_lane_signal(source, peer, "sink_gap");
     }
 }
 
@@ -2445,10 +2458,12 @@ fn tree_edge_candidates(
                 .unwrap_or(u64::MAX)
         };
         let (lane_blocked, hard_loss) = datagram_lane_signal(transport, child);
-        record_datagram_lane_signals(self_id, child, lane_blocked, hard_loss);
+        let sink_gap = sink_gap_signal(transport, child);
+        record_datagram_lane_signals(self_id, child, lane_blocked, hard_loss, sink_gap);
         candidates.push(
             TreeEdgeCandidate::direct_with_cost(pressure, route_cost)
-                .with_datagram_lane(lane_blocked, hard_loss),
+                .with_datagram_lane(lane_blocked, hard_loss)
+                .with_sink_gap(sink_gap),
         );
     }
 
@@ -2469,10 +2484,12 @@ fn tree_edge_candidates(
             options,
         ) {
             let (lane_blocked, hard_loss) = datagram_lane_signal(transport, first_hop);
-            record_datagram_lane_signals(self_id, first_hop, lane_blocked, hard_loss);
+            let sink_gap = sink_gap_signal(transport, first_hop);
+            record_datagram_lane_signals(self_id, first_hop, lane_blocked, hard_loss, sink_gap);
             candidates.push(
                 TreeEdgeCandidate::legacy(first_hop, pressure, route_cost)
-                    .with_datagram_lane(lane_blocked, hard_loss),
+                    .with_datagram_lane(lane_blocked, hard_loss)
+                    .with_sink_gap(sink_gap),
             );
         }
     }

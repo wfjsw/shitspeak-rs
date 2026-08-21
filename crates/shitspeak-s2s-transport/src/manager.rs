@@ -631,6 +631,20 @@ pub struct BestEffortDatagramLaneHealth {
     pub loss_samples: u64,
 }
 
+/// Whether a peer (the destination the distribution plane sends voice to) is
+/// reporting degraded reorder quality on the voice this node sent it — the
+/// receiver-side gap signal. The sink's reorder buffer reports `opened_gap`,
+/// deadline flushes, and held delay back to its immediate upstream peer every
+/// 250 ms (`VoicePathFeedback`), and the transport folds those reports into a
+/// suspect flag with a 5 s staleness window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BestEffortSinkFeedback {
+    /// The sink reported degraded quality (sustained gap buffering, deadline
+    /// flushes, or over-budget held delay) within the staleness window.
+    /// `false` with no live feedback: absence of a report is not a suspicion.
+    pub suspect: bool,
+}
+
 /// Public handle.
 #[derive(Clone)]
 pub struct ConnectionManager {
@@ -1838,6 +1852,22 @@ impl ConnectionManager {
         };
         let snapshots = peer.datagram_path_health_status(stale_after);
         active_best_effort_datagram_lane_health(&snapshots)
+    }
+
+    /// Whether `node` is reporting degraded reorder quality on the voice this
+    /// node sent it — the receiver-side gap signal (C2c). This is the same
+    /// suspect flag folded into the soft `feedback_pressure` inside
+    /// [`Self::best_conversational_path_pressure`], but surfaced as a distinct
+    /// boolean so the distribution plane can shorten the challenger confirm on
+    /// a leaf-reported gap the same way it does on hard datagram loss (C2b) —
+    /// the sink, not the sender, is the one hearing the loss.
+    pub fn best_effort_sink_feedback(&self, node: NodeIdentifier) -> BestEffortSinkFeedback {
+        let Some(peer) = self.inner.get_peer(node) else {
+            return BestEffortSinkFeedback::default();
+        };
+        BestEffortSinkFeedback {
+            suspect: peer.conversational_feedback_suspect(Instant::now()),
+        }
     }
 
     pub fn record_conversational_path_feedback(
@@ -5654,6 +5684,22 @@ mod tests {
         peer.record_conversational_feedback(100, 0, 1, 0, now);
         assert!(peer.conversational_feedback_suspect(now));
         assert!(!peer.conversational_feedback_suspect(now + Duration::from_secs(6)));
+    }
+
+    #[tokio::test]
+    async fn best_effort_sink_feedback_exposes_reported_gap_and_clears() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Udp]);
+        // No live feedback -> not suspect (absence of a report is not one).
+        assert!(!transport.best_effort_sink_feedback(2).suspect);
+        // A degraded report (gap-buffered >= 2% of received) trips the flag.
+        transport.record_conversational_path_feedback(2, 100, 2, 0, 0);
+        assert!(transport.best_effort_sink_feedback(2).suspect);
+        // One healthy report clears it.
+        transport.record_conversational_path_feedback(2, 100, 0, 0, 0);
+        assert!(!transport.best_effort_sink_feedback(2).suspect);
+        // Unknown peer -> default (not suspect).
+        assert!(!transport.best_effort_sink_feedback(99).suspect);
     }
 
     #[tokio::test]

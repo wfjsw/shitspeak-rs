@@ -673,13 +673,15 @@ pub(crate) fn record_tree_edge_decision(
         .or_default() += 1;
 }
 
-/// Record one tree-edge send to a first hop whose live datagram lane carried a
-/// C2 signal (counter `shitspeak_s2s_voice_datagram_lane_signal_total`).
+/// Record one tree-edge send to a first hop whose live signal carried a C2
+/// trigger (counter `shitspeak_s2s_voice_datagram_lane_signal_total`).
 /// `signal` is `lane_blocked` (all observed datagram paths hard-Blocked, the
-/// C2a immediate-escape trigger) or `hard_loss` (active-lane effective loss
-/// at/above the full-dup threshold, the C2b shortened-confirm trigger). One
-/// record per signal per send, so the per-edge rate is the exposure denominator
-/// against which the `shitspeak_s2s_voice_tree_edge_decision_total` escape and
+/// C2a immediate-escape trigger), `hard_loss` (active-lane effective loss
+/// at/above the full-dup threshold, the C2b shortened-confirm trigger), or
+/// `sink_gap` (the destination reporting degraded reorder quality, the C2c
+/// receiver-gap shortened-confirm trigger). One record per signal per send, so
+/// the per-edge rate is the exposure denominator against which the
+/// `shitspeak_s2s_voice_tree_edge_decision_total` escape and
 /// `confirmed_challenger` rates are judged.
 pub(crate) fn record_datagram_lane_signal(
     source: NodeIdentifier,
@@ -1204,6 +1206,7 @@ mod tests {
         record_datagram_lane_signal(7, 42, "lane_blocked");
         record_datagram_lane_signal(7, 42, "hard_loss");
         record_datagram_lane_signal(7, 42, "hard_loss");
+        record_datagram_lane_signal(7, 42, "sink_gap");
         record_datagram_lane_signal(8, 42, "lane_blocked");
 
         assert_eq!(
@@ -1223,6 +1226,15 @@ mod tests {
             .expect("hard_loss signal exported")
             .value(),
             2.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_signal_total",
+                &[("source", "7"), ("peer", "42"), ("signal", "sink_gap")],
+            )
+            .expect("sink_gap signal exported")
+            .value(),
+            1.0
         );
         assert!(
             sample(
