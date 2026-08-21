@@ -7554,7 +7554,7 @@
           "color": { "mode": "palette-classic" },
           "mappings": [],
           "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] },
-          "unit": "pps"
+          "unit": "ops"
         },
         "overrides": []
       },
@@ -7565,6 +7565,7 @@
         "y": 247
       },
       "id": 78,
+      "description": "v2 wall-clock distribution deadlines (deadline_translation/deadline_expiry/clock_offset_fallback) are retired under v3 hop-local TTL expiry: every tree is installed with hop_ttl=80ms so those events are never emitted (dead code, kept only for unit coverage). Ref A is a v2 canary that only fires if hop_ttl is ever configured to 0; refs B/C are the live v3 expiry/deadline signals: send-deadline expiries per peer and reorder deadline wakes per result.",
       "options": {
         "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
         "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
@@ -7575,12 +7576,28 @@
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
           "expr": "sum by (event, result) (rate(shitspeak_s2s_distribution_events_total{job=~\"$job\",event=~\"deadline_translation|deadline_expiry|clock_offset_fallback\"}[$__rate_interval]))",
-          "legendFormat": "{{event}} {{result}}",
+          "legendFormat": "v2 {{event}} {{result}}",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (peer) (rate(shitspeak_s2s_expired_outbound_frames_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "expired →{{peer}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (result) (rate(shitspeak_s2s_voice_deadline_wakes_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "deadline {{result}}",
+          "range": true,
+          "refId": "C"
         }
       ],
-      "title": "Distribution Deadline and Clock Outcomes",
+      "title": "Distribution Expiry and Deadline Outcomes",
       "type": "timeseries"
     },
     {
@@ -8453,10 +8470,62 @@
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": {
-        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 100 } ] }, "unit": "short" },
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] }, "unit": "ops" },
         "overrides": []
       },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 341 },
+      "id": 109,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source, first_hop, outcome) (rate(shitspeak_s2s_voice_fec_sends_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "fec {{source}}→{{first_hop}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Voice FEC Sends/s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] }, "unit": "Bps" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 341 },
+      "id": 110,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source, outcome) (rate(shitspeak_s2s_voice_fec_send_bytes_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "fec bytes {{source}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Voice FEC Send Bytes/s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 100 } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 349 },
       "id": 107,
       "options": {
         "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -8482,7 +8551,7 @@
         "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 100000 } ] }, "unit": "µs" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 341 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 349 },
       "id": 108,
       "options": {
         "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
