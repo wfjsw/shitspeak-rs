@@ -171,6 +171,9 @@ mod tests {
                 })),
             }),
             proactive_copy: false,
+            fec_parity: true,
+            fec_member_seqs: vec![1, 2, 3, 4],
+            fec_terminator_mask: 2,
         };
         let bytes = encode_voice(&frame).unwrap();
         let decoded = decode_voice(&bytes).unwrap();

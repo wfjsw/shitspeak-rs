@@ -14,6 +14,7 @@ use crate::application::proto::{
     self, VOICE_PATH_FEEDBACK_SERVICE_TAG, VOICE_REPAIR_SERVICE_TAG, VOICE_SERVICE_TAG,
     VoiceIntent, VoicePathFeedback,
 };
+use crate::application::voice::fec::FecSendOutcome;
 use crate::overlay::{OverlayNetwork, OverlaySendOptions, RoutingMetric, VoiceRouteQuality};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
@@ -195,6 +196,26 @@ pub trait VoiceTransport: Send + Sync + 'static {
         avoid_first_hop: Option<NodeIdentifier>,
         ttl: Duration,
     ) -> Result<(), ApplicationError>;
+
+    /// Emit one FEC parity frame toward every receiver in `dsts`, all of
+    /// which share `first_hop`. The production transport rate-limits per
+    /// `first_hop` against the overlay's lane-headroom budget and reports
+    /// whether the frame was admitted (`Sent`) or shed (`Shed`) before
+    /// leaving. The default keeps test transports on the plain multicast
+    /// path.
+    async fn send_fec_frame(
+        &self,
+        dsts: &[NodeIdentifier],
+        first_hop: Option<NodeIdentifier>,
+        body: Bytes,
+        ttl: Duration,
+    ) -> FecSendOutcome {
+        let _ = first_hop;
+        match self.send_multicast(dsts, body, ttl).await {
+            Ok(()) => FecSendOutcome::Sent,
+            Err(_) => FecSendOutcome::Shed,
+        }
+    }
 
     fn alive_members(&self) -> Vec<NodeIdentifier>;
 
@@ -418,6 +439,48 @@ impl VoiceTransport for OverlayVoiceTransport {
         Ok(())
     }
 
+    async fn send_fec_frame(
+        &self,
+        dsts: &[NodeIdentifier],
+        first_hop: Option<NodeIdentifier>,
+        body: Bytes,
+        ttl: Duration,
+    ) -> FecSendOutcome {
+        if dsts.is_empty() {
+            return FecSendOutcome::Shed;
+        }
+        // Without a known first hop there is no lane budget to hold the
+        // parity against; fall back to the plain multicast path.
+        let Some(first_hop) = first_hop else {
+            return match self.send_multicast(dsts, body, ttl).await {
+                Ok(()) => FecSendOutcome::Sent,
+                Err(_) => FecSendOutcome::Shed,
+            };
+        };
+        let bytes = body.len();
+        if !self.overlay.try_reserve_fec_headroom(first_hop, bytes) {
+            return FecSendOutcome::Shed;
+        }
+        let options = OverlaySendOptions::default().expire_after(ttl);
+        let result = self
+            .overlay
+            .send_multicast_unordered_with_routing_metric_and_options(
+                dsts,
+                VOICE_SERVICE_TAG,
+                VOICE_LEVEL,
+                VOICE_ROUTING_METRIC,
+                VOICE_CLASS,
+                body,
+                options,
+            )
+            .await;
+        self.overlay.release_fec_headroom(first_hop, bytes, result.is_ok());
+        match result {
+            Ok(()) => FecSendOutcome::Sent,
+            Err(_) => FecSendOutcome::Shed,
+        }
+    }
+
     fn alive_members(&self) -> Vec<NodeIdentifier> {
         self.overlay.alive_members()
     }
@@ -490,6 +553,9 @@ impl PreparedVoiceEnvelope {
             payload,
             intent: Some(intent),
             proactive_copy: false,
+            fec_parity: false,
+            fec_member_seqs: Vec::new(),
+            fec_terminator_mask: 0,
         })
     }
 
@@ -497,6 +563,12 @@ impl PreparedVoiceEnvelope {
     /// cache insertion.
     pub fn original_body(&self) -> Bytes {
         self.original_body.clone()
+    }
+
+    /// Cheap clone of the raw audio payload. Used by the FEC sender to build
+    /// parity without re-decoding the encoded body.
+    pub fn payload(&self) -> Bytes {
+        self.frame.payload.clone()
     }
 
     /// Lazily encode and cache the one marked proactive alternate body.
@@ -1010,6 +1082,9 @@ mod tests {
                 })),
             }),
             proactive_copy: true,
+            fec_parity: false,
+            fec_member_seqs: Vec::new(),
+            fec_terminator_mask: 0,
         })
         .unwrap();
 

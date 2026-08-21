@@ -84,6 +84,9 @@ fn repair_frame(
         payload,
         intent: Some(normal_voice_intent(0)),
         proactive_copy: false,
+        fec_parity: false,
+        fec_member_seqs: Vec::new(),
+        fec_terminator_mask: 0,
     }
 }
 

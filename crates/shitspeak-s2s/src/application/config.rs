@@ -99,6 +99,30 @@ pub struct VoiceConfig {
 
     /// Percentage of the repair mint that proactive work may never borrow.
     pub repair_reactive_hard_reserve_pct: u8,
+
+    /// Change-set C3: enable best-effort block FEC over the datagram voice
+    /// lane. The sender XORs the last `voice_fec_block_size` equal-length
+    /// payloads of a speaker into one parity frame, sent unicast to each
+    /// first hop that carried the block. Parity frames are rate-limited by
+    /// the per-first-hop `voice_overlap` lane-headroom budget (capacity ∝
+    /// accepted original bytes) and only emitted when the first hop's live
+    /// loss reaches `voice_fec_loss_gate_ppm`, so healthy lanes pay nothing.
+    pub voice_fec_enabled: bool,
+
+    /// Number of consecutive equal-length payloads covered by one parity
+    /// frame. A block whose members are not all the same length is dropped
+    /// (no redundancy) rather than sent with length ambiguity.
+    pub voice_fec_block_size: usize,
+
+    /// How many recent payloads per `(sender_session, sender_epoch, from)`
+    /// the receiver caches to XOR against a parity block, and how many
+    /// received parity blocks it retains.
+    pub voice_fec_receiver_window: usize,
+
+    /// Emit FEC parity for a first hop only when its live lane loss reaches
+    /// this many ppm (derived from the datagram-lane loss metric). Defaults
+    /// to `repair_loss_start_ppm` semantics.
+    pub voice_fec_loss_gate_ppm: u32,
 }
 
 impl Default for VoiceConfig {
@@ -128,6 +152,10 @@ impl Default for VoiceConfig {
             repair_max_extra_copies_per_frame: default_repair_max_extra_copies_per_frame(),
             repair_reactive_reserve_pct: default_repair_reactive_reserve_pct(),
             repair_reactive_hard_reserve_pct: default_repair_reactive_hard_reserve_pct(),
+            voice_fec_enabled: default_voice_fec_enabled(),
+            voice_fec_block_size: default_voice_fec_block_size(),
+            voice_fec_receiver_window: default_voice_fec_receiver_window(),
+            voice_fec_loss_gate_ppm: default_voice_fec_loss_gate_ppm(),
         }
     }
 }
@@ -196,6 +224,14 @@ struct VoiceConfigWire {
     repair_reactive_reserve_pct: u8,
     #[serde(default = "default_repair_reactive_hard_reserve_pct")]
     repair_reactive_hard_reserve_pct: u8,
+    #[serde(default = "default_voice_fec_enabled")]
+    voice_fec_enabled: bool,
+    #[serde(default = "default_voice_fec_block_size")]
+    voice_fec_block_size: usize,
+    #[serde(default = "default_voice_fec_receiver_window")]
+    voice_fec_receiver_window: usize,
+    #[serde(default = "default_voice_fec_loss_gate_ppm")]
+    voice_fec_loss_gate_ppm: u32,
 }
 
 impl<'de> Deserialize<'de> for VoiceConfig {
@@ -217,6 +253,11 @@ impl<'de> Deserialize<'de> for VoiceConfig {
         if raw.repair_reactive_hard_reserve_pct > raw.repair_reactive_reserve_pct {
             return Err(D::Error::custom(
                 "repair_reactive_hard_reserve_pct must not exceed repair_reactive_reserve_pct",
+            ));
+        }
+        if raw.voice_fec_block_size < 2 || raw.voice_fec_block_size > 32 {
+            return Err(D::Error::custom(
+                "voice_fec_block_size must be between 2 and 32",
             ));
         }
         let _ = (
@@ -254,6 +295,10 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             repair_max_extra_copies_per_frame: raw.repair_max_extra_copies_per_frame,
             repair_reactive_reserve_pct: raw.repair_reactive_reserve_pct,
             repair_reactive_hard_reserve_pct: raw.repair_reactive_hard_reserve_pct,
+            voice_fec_enabled: raw.voice_fec_enabled,
+            voice_fec_block_size: raw.voice_fec_block_size,
+            voice_fec_receiver_window: raw.voice_fec_receiver_window,
+            voice_fec_loss_gate_ppm: raw.voice_fec_loss_gate_ppm,
         })
     }
 }
@@ -353,6 +398,18 @@ fn default_repair_reactive_reserve_pct() -> u8 {
 }
 fn default_repair_reactive_hard_reserve_pct() -> u8 {
     10
+}
+fn default_voice_fec_enabled() -> bool {
+    false
+}
+fn default_voice_fec_block_size() -> usize {
+    4
+}
+fn default_voice_fec_receiver_window() -> usize {
+    8
+}
+fn default_voice_fec_loss_gate_ppm() -> u32 {
+    10_000
 }
 
 #[cfg(test)]

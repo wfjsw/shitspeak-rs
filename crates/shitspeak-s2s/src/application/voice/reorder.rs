@@ -54,6 +54,10 @@ pub type Emission = (NodeIdentifier, VoiceFrame);
 pub(crate) enum VoiceCopyKind {
     ReactiveRepair,
     Proactive,
+    /// A frame XOR-reconstructed from a FEC parity block. Ranks above a
+    /// proactive copy (it is byte-identical to the original and requires no
+    /// extra wire credit) but below a true original, which always wins.
+    Fec,
     Original,
 }
 
@@ -193,6 +197,33 @@ impl ReorderReport {
 
     pub(crate) fn into_marked_emissions(self) -> Vec<ReorderEmission> {
         self.emissions
+    }
+
+    /// An empty report, used as the accumulator when FEC reconstruction
+    /// pushes several recovered frames in one dispatch step.
+    pub(crate) fn empty() -> Self {
+        Self {
+            emissions: Vec::new(),
+            results: Vec::new(),
+            pending_total: 0,
+            opened_gap: None,
+            flushes_by_peer: Vec::new(),
+        }
+    }
+
+    /// Fold a second report into this one. `opened_gap` keeps the first
+    /// non-None: the same sequence gap cannot open twice in one dispatch
+    /// step, and the data push that armed it must win over any reconstructed
+    /// pushes that follow.
+    pub(crate) fn merge(mut self, other: ReorderReport) -> Self {
+        self.emissions.extend(other.emissions);
+        self.results.extend(other.results);
+        self.pending_total = other.pending_total;
+        if self.opened_gap.is_none() {
+            self.opened_gap = other.opened_gap;
+        }
+        self.flushes_by_peer.extend(other.flushes_by_peer);
+        self
     }
 }
 
@@ -775,6 +806,7 @@ impl Reorderer {
                 let resolution = match copy_kind {
                     VoiceCopyKind::Proactive => GapResolution::Proactive,
                     VoiceCopyKind::ReactiveRepair => GapResolution::Reactive,
+                    VoiceCopyKind::Fec => GapResolution::Fec,
                     VoiceCopyKind::Original => GapResolution::Duplicate,
                 };
                 metrics::record_gap_resolution(resolution);
@@ -1092,6 +1124,31 @@ impl Reorderer {
             deadline,
         })
     }
+
+    /// The currently live missing seq range `(first, last)` for a sender, if
+    /// a gap is actually open (something is buffered past `next_seq`). FEC
+    /// reconstruction uses this to restrict recovered frames to the range the
+    /// reorder is actually waiting on; `None` means "recover anything".
+    pub(crate) fn live_missing_range(
+        &self,
+        sender_session: u32,
+        sender_epoch: u64,
+    ) -> Option<(u64, u64)> {
+        if self.cfg.reorder_disabled {
+            return None;
+        }
+        let state = self.state.lock();
+        let entry = state.per_sender.get(&sender_session)?;
+        if entry.sender_epoch != sender_epoch {
+            return None;
+        }
+        let first_pending = entry.pending.keys().next().copied()?;
+        if entry.next_seq >= first_pending {
+            return None;
+        }
+        Some((entry.next_seq, first_pending.saturating_sub(1)))
+    }
+
     #[cfg(test)]
     pub fn pending_total(&self) -> usize {
         self.state.lock().total_pending
@@ -1207,6 +1264,9 @@ mod tests {
                 })),
             }),
             proactive_copy: false,
+            fec_parity: false,
+            fec_member_seqs: Vec::new(),
+            fec_terminator_mask: 0,
         }
     }
 
