@@ -30,7 +30,9 @@ use tracing::trace;
 
 use crate::application::config::VoiceConfig;
 use crate::application::proto::VoiceFrame;
-use crate::application::voice::metrics::{self, VoiceDeadlineWakeResult, VoiceReceiveResult};
+use crate::application::voice::metrics::{
+    self, GapResolution, VoiceDeadlineWakeResult, VoiceReceiveResult,
+};
 use shitspeak_core::NodeIdentifier;
 
 const ADAPTIVE_JITTER_IN_ORDER_DECAY_RUN: u32 = 16;
@@ -765,6 +767,18 @@ impl Reorderer {
                 entry.deadline = None;
                 entry.hold_started_at = None;
             }
+            // A live armed gap was just closed by whichever copy kind delivered
+            // the missing first frame. `duplicate` conflates a delayed primary
+            // with the split's redundant copy (both arrive as `Original`); the
+            // split-mode decision reads how often the hole is filled at all.
+            if gap_open {
+                let resolution = match copy_kind {
+                    VoiceCopyKind::Proactive => GapResolution::Proactive,
+                    VoiceCopyKind::ReactiveRepair => GapResolution::Reactive,
+                    VoiceCopyKind::Original => GapResolution::Duplicate,
+                };
+                metrics::record_gap_resolution(resolution);
+            }
             if drained_count > 0 {
                 results.push(ReorderResultCount::new(
                     VoiceReceiveResult::GapFilled,
@@ -981,6 +995,10 @@ impl Reorderer {
             };
             state.total_pending = state.total_pending.saturating_sub(drained.len());
             if !drained.is_empty() {
+                // An armed gap reached its point of no return and was flushed
+                // with the hole still open: the missing frame(s) were never
+                // covered by any copy.
+                metrics::record_gap_resolution(GapResolution::Timeout);
                 results.push(ReorderResultCount::new(
                     VoiceReceiveResult::DeadlineFlush,
                     drained.len(),

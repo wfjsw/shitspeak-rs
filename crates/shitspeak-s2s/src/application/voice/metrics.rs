@@ -135,6 +135,34 @@ impl VoiceReceiveResult {
     }
 }
 
+/// How an armed reorder gap was ultimately resolved.
+///
+/// This is the split-mode decision metric: it measures what fraction of loss
+/// events the *duplicate* path (or another repair mechanism) actually covers.
+/// `duplicate` covers both a delayed/reordered primary frame and the split's
+/// redundant copy — the reorder layer cannot tell them apart, both arrive as
+/// `VoiceCopyKind::Original`. `fec` is reserved for change-set C3.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum GapResolution {
+    Duplicate,
+    Proactive,
+    Reactive,
+    Fec,
+    Timeout,
+}
+
+impl GapResolution {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Duplicate => "duplicate",
+            Self::Proactive => "proactive",
+            Self::Reactive => "reactive",
+            Self::Fec => "fec",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
 /// The delivery lane that admitted an inbound voice frame.
 ///
 /// This is intentionally a small fixed label set: queue pressure must remain
@@ -427,6 +455,7 @@ struct VoiceAppMetrics {
     reorder_speaker_states: u64,
     reorder_speaker_cap: u64,
     deadline_wakes: HashMap<VoiceDeadlineWakeResult, u64>,
+    gap_resolutions: HashMap<GapResolution, u64>,
     proactive_budget: ProactiveBudget,
     proactive_outcomes: HashMap<(VoiceProactiveKind, VoiceProactiveResult), u64>,
     repair_cache: RepairCacheTelemetry,
@@ -537,6 +566,13 @@ pub(crate) fn set_reorder_held(held_frames: usize, max_held_delay_us: u64) {
 pub(crate) fn record_deadline_wake(result: VoiceDeadlineWakeResult) {
     let mut metrics = METRICS.lock().unwrap();
     *metrics.deadline_wakes.entry(result).or_default() += 1;
+}
+
+/// Record how an armed reorder gap was resolved (or lost). See
+/// [`GapResolution`].
+pub(crate) fn record_gap_resolution(resolution: GapResolution) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics.gap_resolutions.entry(resolution).or_default() += 1;
 }
 
 pub(crate) fn set_proactive_queue_budget(capacity_bytes: usize, used_bytes: usize) {
@@ -764,6 +800,13 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         out.push(PrometheusSample::new(
             "shitspeak_s2s_voice_deadline_wakes_total",
             vec![("result".to_owned(), result.label().to_owned())],
+            *count as f64,
+        ));
+    }
+    for (resolution, count) in &metrics.gap_resolutions {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_reorder_gap_resolution_total",
+            vec![("resolution".to_owned(), resolution.label().to_owned())],
             *count as f64,
         ));
     }
@@ -1009,6 +1052,40 @@ mod tests {
         .expect("pending bucket");
         assert!(pending_bucket.value() >= 1.0);
         assert_no_unbounded_voice_labels(&pending_bucket);
+    }
+
+    #[test]
+    fn gap_resolution_metric_is_bounded_and_counts_each_kind() {
+        // The reorder path records these same labels through the production
+        // hooks, so other tests share the static counter. Assert the delta this
+        // test produced rather than an absolute total.
+        let count_before = |resolution: GapResolution| {
+            find_sample(
+                "shitspeak_s2s_voice_reorder_gap_resolution_total",
+                &[("resolution", resolution.label())],
+            )
+            .map(|sample| sample.value())
+            .unwrap_or(0.0)
+        };
+
+        for (resolution, count) in [
+            (GapResolution::Duplicate, 3),
+            (GapResolution::Proactive, 2),
+            (GapResolution::Reactive, 1),
+            (GapResolution::Timeout, 4),
+        ] {
+            let before = count_before(resolution);
+            for _ in 0..count {
+                record_gap_resolution(resolution);
+            }
+            let sample = find_sample(
+                "shitspeak_s2s_voice_reorder_gap_resolution_total",
+                &[("resolution", resolution.label())],
+            )
+            .expect("gap resolution sample");
+            assert_eq!(sample.value(), before + count as f64);
+            assert_no_unbounded_voice_labels(&sample);
+        }
     }
 
     #[test]

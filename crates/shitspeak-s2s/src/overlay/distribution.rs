@@ -259,6 +259,18 @@ pub(crate) enum SplitPhase {
     HoldsInterior,
 }
 
+impl SplitPhase {
+    /// Stable Prometheus label for the phase. `&'static` so the metric's label
+    /// set is bounded across restarts.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SplitPhase::Fanout => "fanout",
+            SplitPhase::Adjusting => "adjusting",
+            SplitPhase::HoldsInterior => "holds_interior",
+        }
+    }
+}
+
 /// Weighted-split state machine for a tree-edge voice transition.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TreeEdgeSplitState {
@@ -283,7 +295,10 @@ pub(crate) enum TreeEdgeSplitState {
 enum TreeEdgeTransitionStep {
     Active,
     Complete,
-    Abort,
+    /// The split rolled back to the old route. `reason` is one of the
+    /// `&'static` strings surfaced in `shitspeak_s2s_voice_split_abort_total`
+    /// (`challenger_degraded` or `rollback`).
+    Abort { reason: &'static str },
 }
 
 /// Loaded quality of one split leg: the coarse pressure the abort/confirm
@@ -384,7 +399,9 @@ impl TreeEdgeSplitState {
         if to_pressure >= TRANSITION_ABORT_PRESSURE {
             *degraded_observations = degraded_observations.saturating_add(1);
             if *degraded_observations >= TRANSITION_ABORT_OBSERVATIONS {
-                return TreeEdgeTransitionStep::Abort;
+                return TreeEdgeTransitionStep::Abort {
+                    reason: "challenger_degraded",
+                };
             }
         } else {
             *degraded_observations = 0;
@@ -451,7 +468,9 @@ impl TreeEdgeSplitState {
                 }
                 if *share <= *target && *target <= 0.0 {
                     // The controller converged fully back to the old route.
-                    return TreeEdgeTransitionStep::Abort;
+                    return TreeEdgeTransitionStep::Abort {
+                        reason: "rollback",
+                    };
                 }
                 if *share >= *target && *target < 1.0 {
                     // Interior steady state reached; hold and keep re-evaluating.
@@ -470,7 +489,9 @@ impl TreeEdgeSplitState {
                 }
                 if *share <= *target && *target <= 0.0 {
                     // Loaded quality flipped decisively: return to the old route.
-                    return TreeEdgeTransitionStep::Abort;
+                    return TreeEdgeTransitionStep::Abort {
+                        reason: "rollback",
+                    };
                 }
             }
         }
@@ -1429,6 +1450,7 @@ impl DistributionPlane {
         // The adopted first hop failed to send; the sender fell back to the old
         // route. Keep the failed first hop out of contention while it cools.
         self.record_tree_edge_split_abort(parent, child, to.first_hop(child), now);
+        distribution_metrics::record_split_abort(parent, child, "primary_failed");
         distribution_metrics::record_tree_edge_binding_event(
             parent,
             child,
@@ -1530,7 +1552,8 @@ impl DistributionPlane {
             // mid-hold — an interior hold is a long-lived steady state, not a
             // brief switch, and would be torn down by idle pruning otherwise.
             binding.last_used_at = now;
-            let TreeEdgeSplitState::Splitting { from, to, share, .. } = transition;
+            let TreeEdgeSplitState::Splitting { from, to, share, phase, .. } = transition;
+            let phase_before = phase;
             let to_quality = loaded_quality_for(candidate_for(&candidates, binding.path));
             let from_quality = loaded_quality_for(candidate_for(&candidates, from));
             match transition.reduce(now, to_quality, from_quality, policy) {
@@ -1546,7 +1569,7 @@ impl DistributionPlane {
                     );
                     distribution_metrics::update_tree_edge_transition(parent, child, false);
                 }
-                TreeEdgeTransitionStep::Abort => {
+                TreeEdgeTransitionStep::Abort { reason } => {
                     let rollback = from;
                     binding.transition = None;
                     binding.path = rollback;
@@ -1560,6 +1583,7 @@ impl DistributionPlane {
                         to.first_hop(child),
                         now,
                     );
+                    distribution_metrics::record_split_abort(parent, child, reason);
                     distribution_metrics::update_tree_edge_split_share(parent, child, None);
                     distribution_metrics::record_tree_edge_binding_event(
                         parent,
@@ -1578,6 +1602,19 @@ impl DistributionPlane {
                 }
                 TreeEdgeTransitionStep::Active => {
                     // Persist the advanced weight for the sender this frame.
+                    // Record an entry into the phase the controller advanced to,
+                    // so the fanout→adjusting→holds_interior progression (and a
+                    // premature abort) is visible per edge in the dashboards.
+                    let TreeEdgeSplitState::Splitting {
+                        phase: phase_after, ..
+                    } = transition;
+                    if phase_after != phase_before {
+                        distribution_metrics::record_split_phase(
+                            parent,
+                            child,
+                            phase_after.label(),
+                        );
+                    }
                     binding.transition = Some(transition);
                     distribution_metrics::update_tree_edge_split_share(parent, child, Some(share));
                 }
@@ -1790,6 +1827,11 @@ impl DistributionPlane {
                 attempt.key.parent,
                 attempt.key.child,
                 true,
+            );
+            distribution_metrics::record_split_phase(
+                attempt.key.parent,
+                attempt.key.child,
+                SplitPhase::Fanout.label(),
             );
             distribution_metrics::update_tree_edge_split_share(
                 attempt.key.parent,

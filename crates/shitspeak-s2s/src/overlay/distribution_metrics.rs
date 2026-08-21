@@ -251,6 +251,13 @@ struct DistributionMetrics {
     /// (0..=1000) — the `shitspeak_s2s_voice_split_share` gauge. An interior hold
     /// shows up as a stable value in (0, 1000) instead of a corner.
     voice_split_shares: HashMap<(NodeIdentifier, NodeIdentifier), u64>,
+    /// Entries into each split state-machine phase per (source, peer) —
+    /// `shitspeak_s2s_voice_split_phase_total`. Phase labels are the `&'static`
+    /// `SplitPhase` variant names, so the label set is bounded.
+    split_phases: HashMap<(NodeIdentifier, NodeIdentifier, &'static str), u64>,
+    /// Weighted-split aborts per (source, peer) with the trigger that ended the
+    /// transition — `shitspeak_s2s_voice_split_abort_total`.
+    split_aborts: HashMap<(NodeIdentifier, NodeIdentifier, &'static str), u64>,
 }
 
 #[cfg(feature = "pre-release-workload")]
@@ -603,6 +610,30 @@ pub(crate) fn update_tree_edge_split_share(
     }
 }
 
+/// Record an entry into a weighted-split state-machine phase for a tree edge
+/// (counter `shitspeak_s2s_voice_split_phase_total`). `phase` is a `&'static`
+/// `SplitPhase` variant name so the label set is bounded and stable across
+/// restarts.
+pub(crate) fn record_split_phase(source: NodeIdentifier, peer: NodeIdentifier, phase: &'static str) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics
+        .split_phases
+        .entry((source, peer, phase))
+        .or_default() += 1;
+}
+
+/// Record a weighted-split abort for a tree edge with the trigger that ended
+/// the transition (counter `shitspeak_s2s_voice_split_abort_total`). `reason`
+/// is one of the `&'static` strings produced by the split state machine
+/// (`challenger_degraded`, `rollback`, `primary_failed`, or `timed_out`).
+pub(crate) fn record_split_abort(source: NodeIdentifier, peer: NodeIdentifier, reason: &'static str) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics
+        .split_aborts
+        .entry((source, peer, reason))
+        .or_default() += 1;
+}
+
 fn set_peer_clock_gauges(gauges: Vec<(NodeIdentifier, PeerClockGauge)>) {
     let mut metrics = METRICS.lock().unwrap();
     metrics.peer_clocks.clear();
@@ -730,6 +761,28 @@ pub(crate) fn prometheus_samples(local_node: NodeIdentifier) -> Vec<PrometheusSa
                 ("peer".to_owned(), peer.to_string()),
             ],
             *share as f64 / 1000.0,
+        ));
+    }
+    for ((source, peer, phase), count) in &metrics.split_phases {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_split_phase_total",
+            vec![
+                ("source".to_owned(), source.to_string()),
+                ("peer".to_owned(), peer.to_string()),
+                ("phase".to_owned(), (*phase).to_owned()),
+            ],
+            *count as f64,
+        ));
+    }
+    for ((source, peer, reason), count) in &metrics.split_aborts {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_split_abort_total",
+            vec![
+                ("source".to_owned(), source.to_string()),
+                ("peer".to_owned(), peer.to_string()),
+                ("reason".to_owned(), (*reason).to_owned()),
+            ],
+            *count as f64,
         ));
     }
     for (peer, gauge) in &metrics.voice_overlap_links {
@@ -959,6 +1012,65 @@ mod tests {
         assert!(
             sample("shitspeak_s2s_voice_split_share", &[("source", "7"), ("peer", "42")]).is_none(),
             "cleared when the split commits or aborts"
+        );
+    }
+
+    #[test]
+    fn split_phase_and_abort_counters_accumulate_per_edge() {
+        record_split_phase(7, 42, "fanout");
+        record_split_phase(7, 42, "adjusting");
+        record_split_phase(7, 42, "adjusting");
+        record_split_abort(7, 42, "challenger_degraded");
+        record_split_abort(7, 42, "rollback");
+
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_split_phase_total",
+                &[("source", "7"), ("peer", "42"), ("phase", "fanout")],
+            )
+            .expect("fanout entry exported")
+            .value(),
+            1.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_split_phase_total",
+                &[("source", "7"), ("peer", "42"), ("phase", "adjusting")],
+            )
+            .expect("adjusting entries exported")
+            .value(),
+            2.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_split_abort_total",
+                &[
+                    ("source", "7"),
+                    ("peer", "42"),
+                    ("reason", "challenger_degraded")
+                ],
+            )
+            .expect("challenger-degraded abort exported")
+            .value(),
+            1.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_split_abort_total",
+                &[("source", "7"), ("peer", "42"), ("reason", "rollback")],
+            )
+            .expect("rollback abort exported")
+            .value(),
+            1.0
+        );
+        // Distinct edges are distinct keys; a phase never recorded there is absent.
+        assert!(
+            sample(
+                "shitspeak_s2s_voice_split_phase_total",
+                &[("source", "8"), ("peer", "42"), ("phase", "holds_interior")],
+            )
+            .is_none(),
+            "no phase entry on a different edge"
         );
     }
 }
