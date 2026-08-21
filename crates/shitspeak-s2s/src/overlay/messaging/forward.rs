@@ -2356,6 +2356,7 @@ async fn send_direct_tree_edge_with_routing(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tree_edge_candidates(
     transport: &ConnectionManager,
     routing: &RoutingHandle,
@@ -2368,8 +2369,9 @@ fn tree_edge_candidates(
     transport_class: MessageClass,
     hop_ttl: Duration,
     force_alternates: bool,
+    avoid_first_hop: Option<NodeIdentifier>,
 ) -> Vec<TreeEdgeCandidate> {
-    let _ = (distribution, force_alternates);
+    let _ = distribution;
     let level = level_from_wire(data.service_level).unwrap_or(ServiceLevel::Reliable);
     let metric = route_metric_from_wire(data.route_metric, level)
         .unwrap_or_else(|| RoutingMetric::default_for_level(level));
@@ -2426,6 +2428,28 @@ fn tree_edge_candidates(
         ) {
             candidates.push(TreeEdgeCandidate::legacy(first_hop, pressure, route_cost));
         }
+    }
+    // Always-ready alternate (C1): the escape must know its #2 before the
+    // primary fails, and have a deterministic target even when every live relay
+    // is unusable. Seed the cheapest whole-path route to all recipients that
+    // avoids the failed first hop — even when that lane has no live transport
+    // today. `hard_escape_tree_edge` treats the seeded candidate as a last-
+    // resort escape target, so a failed primary becomes a best-effort try on
+    // the routing-table alternate instead of a guaranteed drop.
+    if force_alternates
+        && let Some(alternate) = tables
+            .first_hops_reaching_all_with_metric(self_id, recipients, level, metric, &visited)
+            .into_iter()
+            .find(|route| {
+                Some(route.next_hop) != avoid_first_hop
+                    && route.next_hop != child
+                    && !visited.contains(&route.next_hop)
+            })
+        && !candidates
+            .iter()
+            .any(|candidate| candidate.path().first_hop(child) == alternate.next_hop)
+    {
+        candidates.push(TreeEdgeCandidate::alternate(alternate.next_hop, alternate.cost));
     }
     candidates
 }
@@ -2701,6 +2725,7 @@ async fn send_sticky_tree_edge(
         transport_class,
         hop_ttl,
         false,
+        None,
     );
     let attempt = distribution.choose_tree_edge(
         tree_key,
@@ -2860,6 +2885,7 @@ async fn send_sticky_tree_edge(
         transport_class,
         remaining_ttl,
         true,
+        Some(attempt.path().first_hop(child)),
     );
     let reason = hard_escape_reason(&outcome);
     let Some(retry) =

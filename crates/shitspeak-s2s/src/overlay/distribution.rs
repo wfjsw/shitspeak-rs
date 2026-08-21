@@ -80,6 +80,11 @@ pub(crate) struct TreeEdgeCandidate {
     path: TreeEdgePath,
     pressure: u8,
     route_cost: u64,
+    /// Whether `pressure` is a live transport measurement. The escape path seeds
+    /// a routing-table alternate whose lane has no live transport today
+    /// (`verified = false`); it is a last-resort escape target so a failed
+    /// primary becomes a best-effort try rather than a guaranteed drop.
+    verified: bool,
 }
 
 impl TreeEdgeCandidate {
@@ -93,6 +98,7 @@ impl TreeEdgeCandidate {
             path: TreeEdgePath::DirectChild,
             pressure,
             route_cost,
+            verified: true,
         }
     }
 
@@ -101,6 +107,21 @@ impl TreeEdgeCandidate {
             path: TreeEdgePath::LegacyVia(first_hop),
             pressure,
             route_cost,
+            verified: true,
+        }
+    }
+
+    /// The always-ready alternate: the cheapest whole-path route to every
+    /// recipient whose first hop avoids the incumbent, seeded by the escape
+    /// path (`tree_edge_candidates` with `force_alternates`) even when its lane
+    /// has no live transport measurement. Its pressure is unknown, so it only
+    /// qualifies as a last-resort escape target.
+    pub(crate) fn alternate(first_hop: NodeIdentifier, route_cost: u64) -> Self {
+        Self {
+            path: TreeEdgePath::LegacyVia(first_hop),
+            pressure: 0,
+            route_cost,
+            verified: false,
         }
     }
 
@@ -1710,10 +1731,15 @@ impl DistributionPlane {
         reason: &'static str,
         now: Instant,
     ) -> Option<TreeEdgeAttempt> {
+        // Cost-primary, mirroring the soft path (`choose_tree_edge`): among
+        // live alternates the cheapest whole-path route wins, not the first
+        // sub-3-pressure relay. Unverified (seeded) alternates sort last so the
+        // verified pick is always preferred when one exists.
         candidates.sort_by_key(|candidate| {
             (
-                candidate.pressure,
                 candidate.route_cost,
+                candidate.pressure,
+                !candidate.verified,
                 candidate.path.first_hop(attempt.key.child),
             )
         });
@@ -1739,10 +1765,28 @@ impl DistributionPlane {
             // fresh generation rather than completing the stale decision.
         }
         binding.pending = None;
-        let replacement = candidates
-            .iter()
-            .copied()
-            .find(|candidate| candidate.path != attempt.path && candidate.pressure < 3);
+        // Warm-gate preference: a verified alternate whose first hop has
+        // actually carried voice traffic through this plane is the reliable
+        // escape target. Escaping onto an idle lane is what re-arms the
+        // "looked good while idle, degraded under load" abort loop, so a warm
+        // alternate beats a cheaper cold one. Fall back to the cheapest verified
+        // alternate, then to the seeded (unverified) routing-table alternate as
+        // a last resort — trying it beats dropping the frame outright.
+        let verified = || {
+            candidates.iter().copied().filter(|candidate| {
+                candidate.path != attempt.path && candidate.verified && candidate.pressure < 3
+            })
+        };
+        let replacement = verified()
+            .find(|candidate| {
+                !self.voice_route_first_hop_idle(candidate.path.first_hop(attempt.key.child), now)
+            })
+            .or_else(|| verified().next())
+            .or_else(|| {
+                candidates.iter().copied().find(|candidate| {
+                    candidate.path != attempt.path && !candidate.verified
+                })
+            });
         let Some(replacement) = replacement else {
             record_no_tree_edge_alternate(attempt.key, binding);
             return None;
@@ -3908,6 +3952,124 @@ mod tests {
             start + Duration::from_millis(1),
         );
         assert_eq!(failed_fallback.path(), TreeEdgePath::DirectChild);
+    }
+
+    /// Commit a direct-child binding and return a fresh attempt at the current
+    /// generation, so `hard_escape_tree_edge` sees `binding.generation ==
+    /// attempt.generation` and takes the escape path.
+    fn committed_direct_binding(
+        plane: &DistributionPlane,
+        tree_key: TreeKey,
+        now: Instant,
+    ) -> TreeEdgeAttempt {
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            now,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, now);
+        plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            now,
+        )
+    }
+
+    #[test]
+    fn hard_escape_is_cost_primary_among_warm_alternates() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(101, 1);
+        let start = Instant::now();
+        let incumbent = committed_direct_binding(&plane, tree_key, start);
+        assert_eq!(incumbent.path(), TreeEdgePath::DirectChild);
+        // Both relays have carried voice; the escape must take the cheaper one.
+        plane.record_voice_original_bytes(4097, 128, start);
+        plane.record_voice_original_bytes(5, 128, start);
+        let escape = plane
+            .hard_escape_tree_edge(
+                incumbent,
+                vec![
+                    TreeEdgeCandidate::direct(3),
+                    TreeEdgeCandidate::legacy(4097, 1, 20),
+                    TreeEdgeCandidate::legacy(5, 1, 10),
+                ],
+                "test",
+                start,
+            )
+            .expect("escape target");
+        assert_eq!(escape.path(), TreeEdgePath::LegacyVia(5));
+    }
+
+    #[test]
+    fn hard_escape_prefers_warm_alternate_over_cheaper_idle_one() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(102, 1);
+        let start = Instant::now();
+        let incumbent = committed_direct_binding(&plane, tree_key, start);
+        // Only 4097 has carried voice; 5 is cheaper but idle (the lane that
+        // never carried traffic — the exact cause of the abort churn).
+        plane.record_voice_original_bytes(4097, 128, start);
+        let escape = plane
+            .hard_escape_tree_edge(
+                incumbent,
+                vec![
+                    TreeEdgeCandidate::direct(3),
+                    TreeEdgeCandidate::legacy(4097, 1, 20),
+                    TreeEdgeCandidate::legacy(5, 1, 10),
+                ],
+                "test",
+                start,
+            )
+            .expect("escape target");
+        assert_eq!(escape.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn hard_escape_falls_back_to_seeded_alternate_when_no_verified_relay() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(103, 1);
+        let start = Instant::now();
+        let incumbent = committed_direct_binding(&plane, tree_key, start);
+        // No live relay: the direct path failed and only the seeded
+        // routing-table alternate (no live transport) is available. The escape
+        // must try it rather than drop the frame.
+        let escape = plane
+            .hard_escape_tree_edge(
+                incumbent,
+                vec![
+                    TreeEdgeCandidate::direct(3),
+                    TreeEdgeCandidate::alternate(5, 10),
+                ],
+                "test",
+                start,
+            )
+            .expect("seeded alternate escape target");
+        assert_eq!(escape.path(), TreeEdgePath::LegacyVia(5));
+    }
+
+    #[test]
+    fn hard_escape_returns_none_without_any_alternate() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(104, 1);
+        let start = Instant::now();
+        let incumbent = committed_direct_binding(&plane, tree_key, start);
+        assert!(
+            plane
+                .hard_escape_tree_edge(
+                    incumbent,
+                    vec![TreeEdgeCandidate::direct(3)],
+                    "test",
+                    start,
+                )
+                .is_none(),
+            "no alternate leaves the escape to fail like today"
+        );
     }
 
     fn frame(message_id: u64) -> PendingDistributionFrame {
