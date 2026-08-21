@@ -49,10 +49,10 @@ use super::identity::{
     NodeIdentity, OriginAuthenticationError, OriginSignature, OriginSignatureMetadata,
 };
 use super::metrics::{
-    DatagramPathEvidenceEvent, DatagramPathHealthState, ExpiredOutboundDropStage,
-    InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot, MetricsTuning, QueueWatermark,
-    QueueWatermarkReport, TransportHealthExclusionReason, VoiceTransportBindingEventReason,
-    assemble_snapshot, record_delivery_path_selection,
+    DatagramPathEvidenceEvent, DatagramPathHealthSnapshot, DatagramPathHealthState,
+    ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot,
+    MetricsTuning, QueueWatermark, QueueWatermarkReport, TransportHealthExclusionReason,
+    VoiceTransportBindingEventReason, assemble_snapshot, record_delivery_path_selection,
 };
 use super::service_level::{
     DeliveryPath, MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel,
@@ -610,6 +610,25 @@ impl ManagerInner {
             }
         }
     }
+}
+
+/// Live health of the best-effort datagram lane for a peer — the lane voice
+/// rides. Mirrors the overlay's active-lane preference (`NeighborMonitor`:
+/// UDP datagram when usable, else QUIC datagram) and reports whether the lane
+/// is hard-Blocked plus the active lane's effective loss, so the distribution
+/// plane can escape immediately on a Blocked incumbent and shorten the
+/// challenger confirm on hard loss without waiting out the soft window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BestEffortDatagramLaneHealth {
+    /// Whether every observed best-effort datagram lane is Blocked — no usable
+    /// datagram path remains for voice. `false` while no datagram lane has been
+    /// observed: absence of an observation is not a Blocked lane.
+    pub blocked: bool,
+    /// Effective loss ppm of the active (non-Blocked) datagram lane, `None`
+    /// when no lane is usable (or still insufficiently sampled).
+    pub loss_ppm: Option<u32>,
+    /// Loss sample count of the active lane; confidence for `loss_ppm`.
+    pub loss_samples: u64,
 }
 
 /// Public handle.
@@ -1802,6 +1821,25 @@ impl ConnectionManager {
         )
     }
 
+    /// Health of the best-effort datagram lane for `node` — the lane voice
+    /// rides. Composite conversational pressure cannot express a hard-Blocked
+    /// lane (the reliable fallback can look clean while voice has no datagram
+    /// path), so the distribution plane uses this to (C2a) escape immediately
+    /// when the incumbent lane is Blocked and (C2b) shorten the challenger
+    /// confirm when the incumbent lane is losing at/above the full-dup
+    /// threshold.
+    pub fn best_effort_datagram_lane_health(
+        &self,
+        node: NodeIdentifier,
+    ) -> BestEffortDatagramLaneHealth {
+        let stale_after = self.inner.cfg().routing_policy().transport_metric_stale_after();
+        let Some(peer) = self.inner.get_peer(node) else {
+            return BestEffortDatagramLaneHealth::default();
+        };
+        let snapshots = peer.datagram_path_health_status(stale_after);
+        active_best_effort_datagram_lane_health(&snapshots)
+    }
+
     pub fn record_conversational_path_feedback(
         &self,
         peer: NodeIdentifier,
@@ -2419,6 +2457,42 @@ fn preferred_conversational_datagram_path(
         }
     }
     None
+}
+
+/// Resolve the best-effort datagram lane health for a peer from its per-path
+/// datagram health snapshots. Mirrors the overlay's active-lane preference
+/// (`NeighborMonitor::datagram_lane_loss`): UDP datagram when usable, else
+/// QUIC datagram. `blocked` is true only when at least one datagram lane was
+/// observed AND every observed lane is Blocked — a missing lane is not a
+/// Blocked lane (fresh link, still probing).
+fn active_best_effort_datagram_lane_health(
+    snapshots: &[DatagramPathHealthSnapshot],
+) -> BestEffortDatagramLaneHealth {
+    let mut udp = None;
+    let mut quic = None;
+    let mut observed = 0u8;
+    let mut blocked = 0u8;
+    for snapshot in snapshots {
+        match snapshot.path() {
+            DeliveryPath::UdpDatagram | DeliveryPath::QuicDatagram => {
+                observed += 1;
+                if snapshot.state() == DatagramPathHealthState::Blocked {
+                    blocked += 1;
+                } else if snapshot.path() == DeliveryPath::UdpDatagram {
+                    udp = Some(snapshot);
+                } else {
+                    quic = Some(snapshot);
+                }
+            }
+            _ => {}
+        }
+    }
+    let active = udp.or(quic);
+    BestEffortDatagramLaneHealth {
+        blocked: observed > 0 && observed == blocked,
+        loss_ppm: active.and_then(|snapshot| snapshot.effective_loss_ppm()),
+        loss_samples: active.map_or(0, |snapshot| snapshot.loss_samples()),
+    }
 }
 
 fn is_conversational_best_effort(
@@ -4395,6 +4469,48 @@ mod tests {
                 bytes: 1199,
             })
         ));
+    }
+
+    #[test]
+    fn active_best_effort_datagram_lane_health_prefers_udp_and_detects_full_block() {
+        use crate::testing::datagram_path_health_snapshot;
+
+        let snapshot = |path, state, loss| {
+            datagram_path_health_snapshot(2, path, state, loss, if loss.is_some() { 40 } else { 0 })
+        };
+        // Healthy UDP beats a lossy QUIC fallback (UDP is the preferred lane).
+        let health = active_best_effort_datagram_lane_health(&[
+            snapshot(DeliveryPath::QuicDatagram, DatagramPathHealthState::Suspect, Some(80_000)),
+            snapshot(DeliveryPath::UdpDatagram, DatagramPathHealthState::Healthy, Some(5_000)),
+        ]);
+        assert!(!health.blocked, "healthy UDP lane is not blocked");
+        assert_eq!(health.loss_ppm, Some(5_000), "active lane is UDP");
+        assert_eq!(health.loss_samples, 40);
+        // A blocked UDP falls back to the QUIC datagram lane's loss.
+        let health = active_best_effort_datagram_lane_health(&[
+            snapshot(DeliveryPath::UdpDatagram, DatagramPathHealthState::Blocked, Some(200_000)),
+            snapshot(DeliveryPath::QuicDatagram, DatagramPathHealthState::Suspect, Some(9_000)),
+        ]);
+        assert!(!health.blocked, "QUIC datagram fallback is usable");
+        assert_eq!(health.loss_ppm, Some(9_000), "active lane falls back to QUIC");
+        // All observed datagram lanes blocked -> hard Blocked signal.
+        let health = active_best_effort_datagram_lane_health(&[
+            snapshot(DeliveryPath::UdpDatagram, DatagramPathHealthState::Blocked, Some(200_000)),
+            snapshot(DeliveryPath::QuicDatagram, DatagramPathHealthState::Blocked, Some(250_000)),
+        ]);
+        assert!(health.blocked, "every datagram lane Blocked");
+        assert_eq!(health.loss_ppm, None, "no usable lane to read loss from");
+        // The only observed datagram lane is blocked and there is no observed
+        // fallback (QUIC datagram not established) — voice has no datagram path.
+        let health = active_best_effort_datagram_lane_health(&[
+            snapshot(DeliveryPath::UdpDatagram, DatagramPathHealthState::Blocked, Some(200_000)),
+        ]);
+        assert!(health.blocked, "only observed lane blocked and no fallback observed");
+        assert_eq!(health.loss_ppm, None, "no fallback lane");
+        // Absence of any datagram observation is not a Blocked lane.
+        let health = active_best_effort_datagram_lane_health(&[]);
+        assert!(!health.blocked, "no observation is not Blocked");
+        assert_eq!(health.loss_ppm, None);
     }
     use std::net::SocketAddr;
     use std::time::Duration;

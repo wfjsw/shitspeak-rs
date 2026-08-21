@@ -22,6 +22,7 @@ use crate::overlay::distribution::{
     DistributionPlane, PendingDistributionFrame, TreeEdgeAttempt, TreeEdgeCandidate, TreeEdgePath,
     TreeEdgeSplit, TreeEdgeStickinessPolicy, TreeKey, TreeState, UnknownTreeEnqueue,
 };
+use crate::overlay::lsdb::advert::VOICE_UDP_FULL_DUP_LOSS_PPM;
 use crate::overlay::neighbor::NeighborMonitor;
 use shitspeak_core::NodeIdentifier;
 use shitspeak_proto::s2s_overlay_proto as pb;
@@ -2356,6 +2357,42 @@ async fn send_direct_tree_edge_with_routing(
     }
 }
 
+/// The live datagram-lane decision signal for a first hop (C2): whether the
+/// active best-effort datagram lane is hard-Blocked (immediate escape) and
+/// whether its effective loss is at/above the full-dup threshold (shortened
+/// challenger confirm). Both `false` when the lane is unknown (e.g. a seeded
+/// routing-table alternate with no live transport).
+fn datagram_lane_signal(
+    transport: &ConnectionManager,
+    first_hop: NodeIdentifier,
+) -> (bool, bool) {
+    let lane = transport.best_effort_datagram_lane_health(first_hop);
+    (
+        lane.blocked,
+        lane
+            .loss_ppm
+            .is_some_and(|ppm| ppm >= VOICE_UDP_FULL_DUP_LOSS_PPM),
+    )
+}
+
+/// Expose a frame's datagram-lane C2 signal to the telemetry layer so the
+/// dashboards can see, per edge, how often each signal is actually present
+/// (`shitspeak_s2s_voice_datagram_lane_signal_total`). `lane_blocked` feeds the
+/// C2a immediate-escape path, `hard_loss` the C2b shortened confirm.
+fn record_datagram_lane_signals(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    lane_blocked: bool,
+    hard_loss: bool,
+) {
+    if lane_blocked {
+        crate::overlay::distribution_metrics::record_datagram_lane_signal(source, peer, "lane_blocked");
+    }
+    if hard_loss {
+        crate::overlay::distribution_metrics::record_datagram_lane_signal(source, peer, "hard_loss");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn tree_edge_candidates(
     transport: &ConnectionManager,
@@ -2407,7 +2444,12 @@ fn tree_edge_candidates(
                 })
                 .unwrap_or(u64::MAX)
         };
-        candidates.push(TreeEdgeCandidate::direct_with_cost(pressure, route_cost));
+        let (lane_blocked, hard_loss) = datagram_lane_signal(transport, child);
+        record_datagram_lane_signals(self_id, child, lane_blocked, hard_loss);
+        candidates.push(
+            TreeEdgeCandidate::direct_with_cost(pressure, route_cost)
+                .with_datagram_lane(lane_blocked, hard_loss),
+        );
     }
 
     let legacy_hops = tables
@@ -2426,7 +2468,12 @@ fn tree_edge_candidates(
             transport_class,
             options,
         ) {
-            candidates.push(TreeEdgeCandidate::legacy(first_hop, pressure, route_cost));
+            let (lane_blocked, hard_loss) = datagram_lane_signal(transport, first_hop);
+            record_datagram_lane_signals(self_id, first_hop, lane_blocked, hard_loss);
+            candidates.push(
+                TreeEdgeCandidate::legacy(first_hop, pressure, route_cost)
+                    .with_datagram_lane(lane_blocked, hard_loss),
+            );
         }
     }
     // Always-ready alternate (C1): the escape must know its #2 before the

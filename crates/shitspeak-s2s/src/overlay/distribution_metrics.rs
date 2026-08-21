@@ -258,6 +258,24 @@ struct DistributionMetrics {
     /// Weighted-split aborts per (source, peer) with the trigger that ended the
     /// transition — `shitspeak_s2s_voice_split_abort_total`.
     split_aborts: HashMap<(NodeIdentifier, NodeIdentifier, &'static str), u64>,
+    /// Tree-edge decision outcomes per (source, peer, reason) —
+    /// `shitspeak_s2s_voice_tree_edge_decision_total`. Every `choose_tree_edge`
+    /// / `hard_escape_tree_edge` call records the outcome reason it returned,
+    /// so the dashboards can see how often each decision path fires per edge
+    /// (`incumbent`, `confirmed_challenger`, `transport_unavailable`,
+    /// `lane_blocked`, `no_alternate`, `transition`, `initial`, or a
+    /// hard-escape reason) and how the mix shifts across the A/B/C change sets.
+    tree_edge_decisions: HashMap<(NodeIdentifier, NodeIdentifier, &'static str), u64>,
+    /// Counts of tree-edge sends whose live best-effort datagram lane to the
+    /// first hop carried a C2 signal — `shitspeak_s2s_voice_datagram_lane_signal_total`.
+    /// `signal` is `lane_blocked` (every observed datagram path hard-Blocked →
+    /// C2a immediate escape) or `hard_loss` (active-lane effective loss at/above
+    /// the full-dup threshold → C2b shortened challenger confirm). One record per
+    /// signal per send, so the rate is the exposure denominator against which the
+    /// per-edge escape/confirm rates (`shitspeak_s2s_voice_tree_edge_decision_total`)
+    /// can be judged: distinguishes "no escapes because the lane is fine" from
+    /// "no escapes despite a broken mechanism".
+    datagram_lane_signals: HashMap<(NodeIdentifier, NodeIdentifier, &'static str), u64>,
 }
 
 #[cfg(feature = "pre-release-workload")]
@@ -625,12 +643,53 @@ pub(crate) fn record_split_phase(source: NodeIdentifier, peer: NodeIdentifier, p
 /// Record a weighted-split abort for a tree edge with the trigger that ended
 /// the transition (counter `shitspeak_s2s_voice_split_abort_total`). `reason`
 /// is one of the `&'static` strings produced by the split state machine
-/// (`challenger_degraded`, `rollback`, `primary_failed`, or `timed_out`).
+/// (`challenger_degraded`, `lane_blocked`, `rollback`, `primary_failed`, or
+/// `timed_out`).
 pub(crate) fn record_split_abort(source: NodeIdentifier, peer: NodeIdentifier, reason: &'static str) {
     let mut metrics = METRICS.lock().unwrap();
     *metrics
         .split_aborts
         .entry((source, peer, reason))
+        .or_default() += 1;
+}
+
+/// Record one tree-edge decision outcome (counter
+/// `shitspeak_s2s_voice_tree_edge_decision_total`). `reason` is the `&'static`
+/// `TreeEdgeAttempt` reason the decision returned: `incumbent` (steady state,
+/// every frame), `transition` (an in-flight split owns the edge), or one of
+/// the transition-starting reasons (`confirmed_challenger`,
+/// `transport_unavailable`, `lane_blocked`, `no_alternate`, `initial`, or a
+/// hard-escape reason). The per-edge mix — and how it shifts across the A/B/C
+/// change sets — is the escape/reroute performance signal.
+pub(crate) fn record_tree_edge_decision(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    reason: &'static str,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics
+        .tree_edge_decisions
+        .entry((source, peer, reason))
+        .or_default() += 1;
+}
+
+/// Record one tree-edge send to a first hop whose live datagram lane carried a
+/// C2 signal (counter `shitspeak_s2s_voice_datagram_lane_signal_total`).
+/// `signal` is `lane_blocked` (all observed datagram paths hard-Blocked, the
+/// C2a immediate-escape trigger) or `hard_loss` (active-lane effective loss
+/// at/above the full-dup threshold, the C2b shortened-confirm trigger). One
+/// record per signal per send, so the per-edge rate is the exposure denominator
+/// against which the `shitspeak_s2s_voice_tree_edge_decision_total` escape and
+/// `confirmed_challenger` rates are judged.
+pub(crate) fn record_datagram_lane_signal(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    signal: &'static str,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics
+        .datagram_lane_signals
+        .entry((source, peer, signal))
         .or_default() += 1;
 }
 
@@ -781,6 +840,28 @@ pub(crate) fn prometheus_samples(local_node: NodeIdentifier) -> Vec<PrometheusSa
                 ("source".to_owned(), source.to_string()),
                 ("peer".to_owned(), peer.to_string()),
                 ("reason".to_owned(), (*reason).to_owned()),
+            ],
+            *count as f64,
+        ));
+    }
+    for ((source, peer, reason), count) in &metrics.tree_edge_decisions {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_tree_edge_decision_total",
+            vec![
+                ("source".to_owned(), source.to_string()),
+                ("peer".to_owned(), peer.to_string()),
+                ("reason".to_owned(), (*reason).to_owned()),
+            ],
+            *count as f64,
+        ));
+    }
+    for ((source, peer, signal), count) in &metrics.datagram_lane_signals {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_datagram_lane_signal_total",
+            vec![
+                ("source".to_owned(), source.to_string()),
+                ("peer".to_owned(), peer.to_string()),
+                ("signal".to_owned(), (*signal).to_owned()),
             ],
             *count as f64,
         ));
@@ -1071,6 +1152,85 @@ mod tests {
             )
             .is_none(),
             "no phase entry on a different edge"
+        );
+    }
+
+    #[test]
+    fn tree_edge_decision_counter_accumulates_per_edge_and_reason() {
+        record_tree_edge_decision(7, 42, "confirmed_challenger");
+        record_tree_edge_decision(7, 42, "incumbent");
+        record_tree_edge_decision(7, 42, "incumbent");
+        record_tree_edge_decision(8, 42, "lane_blocked");
+
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_tree_edge_decision_total",
+                &[("source", "7"), ("peer", "42"), ("reason", "confirmed_challenger")],
+            )
+            .expect("confirmed challenger decision exported")
+            .value(),
+            1.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_tree_edge_decision_total",
+                &[("source", "7"), ("peer", "42"), ("reason", "incumbent")],
+            )
+            .expect("incumbent decisions exported")
+            .value(),
+            2.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_tree_edge_decision_total",
+                &[("source", "8"), ("peer", "42"), ("reason", "lane_blocked")],
+            )
+            .expect("lane_blocked escape exported")
+            .value(),
+            1.0
+        );
+        assert!(
+            sample(
+                "shitspeak_s2s_voice_tree_edge_decision_total",
+                &[("source", "7"), ("peer", "42"), ("reason", "transition")],
+            )
+            .is_none(),
+            "a reason never recorded on an edge is absent"
+        );
+    }
+
+    #[test]
+    fn datagram_lane_signal_counter_accumulates_per_edge_and_signal() {
+        record_datagram_lane_signal(7, 42, "lane_blocked");
+        record_datagram_lane_signal(7, 42, "hard_loss");
+        record_datagram_lane_signal(7, 42, "hard_loss");
+        record_datagram_lane_signal(8, 42, "lane_blocked");
+
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_signal_total",
+                &[("source", "7"), ("peer", "42"), ("signal", "lane_blocked")],
+            )
+            .expect("lane_blocked signal exported")
+            .value(),
+            1.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_signal_total",
+                &[("source", "7"), ("peer", "42"), ("signal", "hard_loss")],
+            )
+            .expect("hard_loss signal exported")
+            .value(),
+            2.0
+        );
+        assert!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_signal_total",
+                &[("source", "8"), ("peer", "42"), ("signal", "hard_loss")],
+            )
+            .is_none(),
+            "a signal never recorded on an edge is absent"
         );
     }
 }

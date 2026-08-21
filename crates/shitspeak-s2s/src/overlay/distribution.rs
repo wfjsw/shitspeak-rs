@@ -85,6 +85,17 @@ pub(crate) struct TreeEdgeCandidate {
     /// (`verified = false`); it is a last-resort escape target so a failed
     /// primary becomes a best-effort try rather than a guaranteed drop.
     verified: bool,
+    /// Whether the active best-effort datagram lane for this first hop is
+    /// hard-Blocked — voice has no usable datagram path to ride. A Blocked
+    /// lane is a hard failure even when composite pressure is below the soft
+    /// bar (the reliable fallback can look clean while voice is dead), so the
+    /// incumbent cannot wait out the hold/confirm window (C2a).
+    lane_blocked: bool,
+    /// Whether the active datagram lane's effective loss is at/above the
+    /// full-dup threshold (`VOICE_UDP_FULL_DUP_LOSS_PPM`, 3%). The incumbent is
+    /// losing hard, so a cost-better challenger qualifies on a single
+    /// observation instead of the full confirm (C2b).
+    hard_loss: bool,
 }
 
 impl TreeEdgeCandidate {
@@ -99,6 +110,8 @@ impl TreeEdgeCandidate {
             pressure,
             route_cost,
             verified: true,
+            lane_blocked: false,
+            hard_loss: false,
         }
     }
 
@@ -108,6 +121,8 @@ impl TreeEdgeCandidate {
             pressure,
             route_cost,
             verified: true,
+            lane_blocked: false,
+            hard_loss: false,
         }
     }
 
@@ -122,6 +137,8 @@ impl TreeEdgeCandidate {
             pressure: 0,
             route_cost,
             verified: false,
+            lane_blocked: false,
+            hard_loss: false,
         }
     }
 
@@ -131,6 +148,23 @@ impl TreeEdgeCandidate {
 
     pub(crate) fn pressure(self) -> u8 {
         self.pressure
+    }
+
+    pub(crate) fn lane_blocked(self) -> bool {
+        self.lane_blocked
+    }
+
+    pub(crate) fn hard_loss(self) -> bool {
+        self.hard_loss
+    }
+
+    /// Attach the live datagram-lane health measured for this first hop
+    /// (`ConnectionManager::best_effort_datagram_lane_health`). Seeded
+    /// alternates and test fixtures leave both false (unknown lane).
+    pub(crate) fn with_datagram_lane(mut self, lane_blocked: bool, hard_loss: bool) -> Self {
+        self.lane_blocked = lane_blocked;
+        self.hard_loss = hard_loss;
+        self
     }
 }
 
@@ -328,6 +362,12 @@ enum TreeEdgeTransitionStep {
 struct LoadedRouteQuality {
     pressure: u8,
     loaded_cost: f64,
+    /// Whether the leg's best-effort datagram lane is hard-Blocked (C2a). A
+    /// Blocked challenger aborts the split immediately (reason `lane_blocked`),
+    /// distinct from a gradual pressure rise; a Blocked old route marks
+    /// `old_route_broken` so the switch completes instead of stalling into a
+    /// lane voice cannot ride.
+    lane_blocked: bool,
 }
 
 /// E-model route cost stressed by the loaded pressure signal (queue, loss,
@@ -344,10 +384,21 @@ fn loaded_quality_for(candidate: Option<TreeEdgeCandidate>) -> LoadedRouteQualit
         LoadedRouteQuality {
             pressure: TRANSITION_ABORT_PRESSURE,
             loaded_cost: loaded_route_cost(None, TRANSITION_ABORT_PRESSURE),
+            lane_blocked: false,
         },
-        |candidate| LoadedRouteQuality {
-            pressure: candidate.pressure,
-            loaded_cost: loaded_route_cost(Some(candidate.route_cost), candidate.pressure),
+        |candidate| {
+            // A hard-Blocked lane is a hard failure for the split regardless of
+            // the composite pressure the reliable fallback reports.
+            let pressure = if candidate.lane_blocked {
+                TRANSITION_ABORT_PRESSURE
+            } else {
+                candidate.pressure
+            };
+            LoadedRouteQuality {
+                pressure,
+                loaded_cost: loaded_route_cost(Some(candidate.route_cost), pressure),
+                lane_blocked: candidate.lane_blocked,
+            }
         },
     )
 }
@@ -415,6 +466,15 @@ impl TreeEdgeSplitState {
         let to_pressure = to_quality.pressure;
         let from_pressure = from_quality.pressure;
 
+        // A challenger whose datagram lane is hard-Blocked is decisively dead —
+        // voice has no usable datagram path — so it aborts immediately, without
+        // the consecutive-observation count a gradual pressure rise needs.
+        if to_quality.lane_blocked {
+            return TreeEdgeTransitionStep::Abort {
+                reason: "lane_blocked",
+            };
+        }
+
         // Abort fast path: the challenger degraded hard under load for enough
         // consecutive frames. Roll back to the warm old route.
         if to_pressure >= TRANSITION_ABORT_PRESSURE {
@@ -430,8 +490,11 @@ impl TreeEdgeSplitState {
 
         // A failing old route must not stall the switch: escape it rather than
         // keep fading into a route that is broken. (The sender's copy gate
-        // already sheds copies to any route reading pressure >= 2.)
-        let old_route_broken = from_pressure >= TRANSITION_ABORT_PRESSURE;
+        // already sheds copies to any route reading pressure >= 2.) A Blocked
+        // old-route lane counts as broken even if its reliable fallback keeps
+        // composite pressure below the bar.
+        let old_route_broken =
+            from_pressure >= TRANSITION_ABORT_PRESSURE || from_quality.lane_blocked;
 
         // Recompute the load-aware equilibrium target once the probe window has
         // passed: the softmax over each leg's *loaded* cost. This is what lets
@@ -599,6 +662,17 @@ fn candidate_for(
         .iter()
         .copied()
         .find(|candidate| candidate.path == path)
+}
+
+/// Record the outcome reason of a tree-edge decision once per
+/// `choose_tree_edge` / `hard_escape_tree_edge` return, so the dashboards can
+/// count how often each decision path fires per edge.
+fn record_tree_edge_decision(attempt: &TreeEdgeAttempt) {
+    distribution_metrics::record_tree_edge_decision(
+        attempt.key.parent,
+        attempt.key.child,
+        attempt.reason,
+    );
 }
 
 fn observe_tree_edge_challenger(
@@ -1545,16 +1619,14 @@ impl DistributionPlane {
         let incumbent = candidate_for(&candidates, binding.path);
 
         if !binding.bound && binding.pending == Some((TreeEdgePath::DirectChild, "initial")) {
-            if let Some(replacement) = candidates
-                .iter()
-                .copied()
-                .find(|candidate| candidate.pressure < 3)
-            {
+            if let Some(replacement) = candidates.iter().copied().find(|candidate| {
+                candidate.pressure < 3 && !candidate.lane_blocked
+            }) {
                 binding.pending = Some((replacement.path, "initial"));
             }
         }
         if let Some((path, reason)) = binding.pending {
-            return TreeEdgeAttempt {
+            let attempt = TreeEdgeAttempt {
                 key,
                 path,
                 generation: binding.generation,
@@ -1563,6 +1635,8 @@ impl DistributionPlane {
                 chosen_pressure: candidate_for(&candidates, path)
                     .map(|candidate| candidate.pressure),
             };
+            record_tree_edge_decision(&attempt);
+            return attempt;
         }
 
         // Drive an in-flight weighted split. The controller owns the edge until
@@ -1640,7 +1714,7 @@ impl DistributionPlane {
                     distribution_metrics::update_tree_edge_split_share(parent, child, Some(share));
                 }
             }
-            return TreeEdgeAttempt {
+            let attempt = TreeEdgeAttempt {
                 key,
                 path: binding.path,
                 generation: binding.generation,
@@ -1650,22 +1724,36 @@ impl DistributionPlane {
                 chosen_pressure: candidate_for(&candidates, binding.path)
                     .map(|candidate| candidate.pressure),
             };
+            record_tree_edge_decision(&attempt);
+            return attempt;
         }
 
-        // A missing, closed, or fully pressured incumbent is a hard failure.
-        if incumbent.is_none_or(|candidate| candidate.pressure >= 3) {
-            let replacement = candidates
-                .iter()
-                .copied()
-                .find(|candidate| candidate.path != binding.path && candidate.pressure < 3);
-            if let Some(replacement) = replacement.filter(|candidate| candidate.pressure < 3) {
-                begin_tree_edge_transition(binding, replacement.path, "transport_unavailable", now);
+        // A missing, closed, or fully pressured incumbent is a hard failure —
+        // and so is an incumbent whose best-effort datagram lane is
+        // hard-Blocked (C2a): voice has no datagram path to ride, so the soft
+        // hold/confirm window must not delay the escape to the precomputed
+        // alternate. The escape target must itself have a usable lane; a
+        // Blocked replacement would just transfer the failure.
+        let incumbent_lane_blocked = incumbent.is_some_and(|candidate| candidate.lane_blocked);
+        if incumbent.is_none_or(|candidate| candidate.pressure >= 3 || candidate.lane_blocked) {
+            let reason = if incumbent_lane_blocked {
+                "lane_blocked"
+            } else {
+                "transport_unavailable"
+            };
+            let replacement = candidates.iter().copied().find(|candidate| {
+                candidate.path != binding.path
+                    && candidate.pressure < 3
+                    && !candidate.lane_blocked
+            });
+            if let Some(replacement) = replacement {
+                begin_tree_edge_transition(binding, replacement.path, reason, now);
             } else {
                 clear_tree_edge_challenger(binding);
                 record_no_tree_edge_alternate(key, binding);
             }
             let (path, reason) = binding.pending.unwrap_or((binding.path, "no_alternate"));
-            return TreeEdgeAttempt {
+            let attempt = TreeEdgeAttempt {
                 key,
                 path,
                 generation: binding.generation,
@@ -1674,6 +1762,8 @@ impl DistributionPlane {
                 chosen_pressure: candidate_for(&candidates, path)
                     .map(|candidate| candidate.pressure),
             };
+            record_tree_edge_decision(&attempt);
+            return attempt;
         }
 
         let challenger = candidates
@@ -1701,11 +1791,20 @@ impl DistributionPlane {
 
         if let Some(challenger) = challenger {
             observe_tree_edge_challenger(binding, challenger.path, now);
-            if now.saturating_duration_since(binding.entered_at) >= policy.min_hold
-                && binding.challenger_observations >= 2
-                && binding.challenger_since.is_some_and(|since| {
+            // C2b: when the incumbent is losing at/above the full-dup threshold
+            // (>= 3%, not the suspect floor that saturates), a cost-better
+            // challenger qualifies on a single observation and skips the confirm
+            // wait — the incumbent is already harming voice, so the extra
+            // confirmation window only prolongs the damage. min_hold still
+            // guards the fresh-binding flap case.
+            let incumbent_hard_loss = incumbent.is_some_and(|candidate| candidate.hard_loss);
+            let confirm_window_met = incumbent_hard_loss
+                || binding.challenger_since.is_some_and(|since| {
                     now.saturating_duration_since(since) >= policy.challenger_confirm
-                })
+                });
+            if now.saturating_duration_since(binding.entered_at) >= policy.min_hold
+                && binding.challenger_observations >= if incumbent_hard_loss { 1 } else { 2 }
+                && confirm_window_met
             {
                 begin_tree_edge_transition(binding, challenger.path, "confirmed_challenger", now);
             }
@@ -1714,14 +1813,16 @@ impl DistributionPlane {
         }
 
         let (path, reason) = binding.pending.unwrap_or((binding.path, "incumbent"));
-        TreeEdgeAttempt {
+        let attempt = TreeEdgeAttempt {
             key,
             path,
             generation: binding.generation,
             reason,
             incumbent_pressure: incumbent.map(|candidate| candidate.pressure),
             chosen_pressure: candidate_for(&candidates, path).map(|candidate| candidate.pressure),
-        }
+        };
+        record_tree_edge_decision(&attempt);
+        attempt
     }
 
     pub(crate) fn hard_escape_tree_edge(
@@ -1750,7 +1851,7 @@ impl DistributionPlane {
                 && let Some(current) = candidate_for(&candidates, binding.path)
                     .filter(|candidate| candidate.pressure < 3)
             {
-                return Some(TreeEdgeAttempt {
+                let retry = TreeEdgeAttempt {
                     key: attempt.key,
                     path: current.path,
                     generation: binding.generation,
@@ -1758,7 +1859,9 @@ impl DistributionPlane {
                     incumbent_pressure: candidate_for(&candidates, attempt.path)
                         .map(|candidate| candidate.pressure),
                     chosen_pressure: Some(current.pressure),
-                });
+                };
+                record_tree_edge_decision(&retry);
+                return Some(retry);
             }
             // A sibling completion may have committed the same pending path.
             // Its rejection still needs one escape retry, but it must create a
@@ -1774,7 +1877,10 @@ impl DistributionPlane {
         // a last resort — trying it beats dropping the frame outright.
         let verified = || {
             candidates.iter().copied().filter(|candidate| {
-                candidate.path != attempt.path && candidate.verified && candidate.pressure < 3
+                candidate.path != attempt.path
+                    && candidate.verified
+                    && candidate.pressure < 3
+                    && !candidate.lane_blocked
             })
         };
         let replacement = verified()
@@ -1792,7 +1898,7 @@ impl DistributionPlane {
             return None;
         };
         begin_tree_edge_transition(binding, replacement.path, reason, now);
-        Some(TreeEdgeAttempt {
+        let escape = TreeEdgeAttempt {
             key: attempt.key,
             path: replacement.path,
             generation: binding.generation,
@@ -1800,7 +1906,9 @@ impl DistributionPlane {
             incumbent_pressure: candidate_for(&candidates, attempt.path)
                 .map(|candidate| candidate.pressure),
             chosen_pressure: Some(replacement.pressure),
-        })
+        };
+        record_tree_edge_decision(&escape);
+        Some(escape)
     }
 
     pub(crate) fn complete_tree_edge_attempt(
@@ -4070,6 +4178,187 @@ mod tests {
                 .is_none(),
             "no alternate leaves the escape to fail like today"
         );
+    }
+
+    #[test]
+    fn c2a_blocked_lane_escapes_immediately_with_distinct_reason() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(105, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        // The incumbent's datagram lane flips hard-Blocked but its composite
+        // pressure stays low (the reliable fallback looks clean). The soft
+        // challenger path would still be inside min_hold here — a Blocked lane
+        // must escape immediately regardless, to the precomputed alternate.
+        let attempt = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_datagram_lane(true, false),
+                TreeEdgeCandidate::legacy(4097, 1, 3).with_datagram_lane(false, false),
+            ],
+            sticky_policy(),
+            at(10),
+        );
+        assert_eq!(attempt.reason, "lane_blocked");
+        assert_eq!(attempt.path(), TreeEdgePath::LegacyVia(4097));
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::DirectChild),
+            "pending escape has not committed yet"
+        );
+    }
+
+    #[test]
+    fn c2a_blocked_lane_escapes_when_pressure_still_below_hard_bar() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(106, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        // Pressure is 1 (well below the soft bar) but the lane is Blocked.
+        let attempt = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_datagram_lane(true, false),
+                TreeEdgeCandidate::legacy(4097, 1, 3).with_datagram_lane(false, false),
+            ],
+            sticky_policy(),
+            at(20),
+        );
+        assert_eq!(attempt.reason, "lane_blocked");
+        assert_eq!(attempt.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn c2a_blocked_lane_is_not_an_escape_target() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(107, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        // Both the direct incumbent and the only relay are lane-Blocked: there
+        // is no usable datagram path anywhere, so the escape has no target.
+        let attempt = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_datagram_lane(true, false),
+                TreeEdgeCandidate::legacy(4097, 1, 3).with_datagram_lane(true, false),
+            ],
+            sticky_policy(),
+            at(30),
+        );
+        assert_eq!(attempt.reason, "no_alternate");
+        assert_eq!(attempt.path(), TreeEdgePath::DirectChild);
+    }
+
+    #[test]
+    fn c2b_hard_loss_confirms_cost_better_challenger_on_first_observation() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(108, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        // The incumbent's datagram lane crosses the 3% full-dup loss threshold
+        // (pressure stays low — the suspect floor that saturates is not the
+        // keyed signal). A cost-better challenger must confirm on a single
+        // observation with no confirm wait; min_hold (fast = 250ms) is met.
+        let attempt = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_datagram_lane(false, true),
+                TreeEdgeCandidate::legacy(4097, 1, 3).with_datagram_lane(false, false),
+            ],
+            fast_sticky_policy(),
+            at(800),
+        );
+        assert_eq!(attempt.reason, "confirmed_challenger");
+        assert_eq!(attempt.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn c2b_without_hard_loss_challenger_still_needs_full_confirm() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(109, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_datagram_lane(false, false),
+                TreeEdgeCandidate::legacy(4097, 1, 3).with_datagram_lane(false, false),
+            ]
+        };
+        // First observation at 800 (min_hold met): without hard_loss the
+        // challenger must be seen twice across the 500ms confirm window.
+        let first = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(800));
+        assert_eq!(first.path(), TreeEdgePath::DirectChild);
+        let second = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(850));
+        assert_eq!(second.path(), TreeEdgePath::DirectChild);
+        let confirmed = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(1_350));
+        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn c2a_split_aborts_with_lane_blocked_when_challenger_lane_flips() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(110, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 1, 3),
+            ]
+        };
+        let _ = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(250));
+        let confirmed = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(750));
+        let split = plane
+            .complete_tree_edge_attempt(confirmed, true, at(750))
+            .expect("confirmed switch starts a split");
+        assert_eq!(split.to(), TreeEdgePath::LegacyVia(4097));
+        // The challenger's datagram lane flips Blocked mid-fanout: the split
+        // must abort immediately (no consecutive-observation wait) with the
+        // distinct lane_blocked reason and roll back to the direct child.
+        let blocked = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 1, 3).with_datagram_lane(true, false),
+            ]
+        };
+        let attempt = plane.choose_tree_edge(tree_key, 1, 2, blocked(), fast_sticky_policy(), at(760));
+        assert_eq!(attempt.path(), TreeEdgePath::DirectChild, "rolled back");
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::DirectChild)
+        );
+        let abort = distribution_metrics::prometheus_samples(1)
+            .into_iter()
+            .find(|sample| {
+                sample.name() == "shitspeak_s2s_voice_split_abort_total"
+                    && sample.labels().iter().any(|(k, v)| k == "source" && v == "1")
+                    && sample.labels().iter().any(|(k, v)| k == "peer" && v == "2")
+                    && sample.labels().iter().any(|(k, v)| k == "reason" && v == "lane_blocked")
+            })
+            .expect("lane_blocked split abort recorded");
+        assert!(abort.value() >= 1.0);
     }
 
     fn frame(message_id: u64) -> PendingDistributionFrame {
