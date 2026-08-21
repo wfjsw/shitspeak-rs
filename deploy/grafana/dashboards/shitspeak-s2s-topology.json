@@ -2703,12 +2703,121 @@
       "type": "table"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "footer": {
+              "reducers": []
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "commit_hash"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 260
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "build_date"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 190
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
+      "id": 33,
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": false,
+            "displayName": "node"
+          }
+        ]
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max by (job, instance, node, app_name, version, commit_hash, commit_date, build_date) (shitspeak_build_info{job=~\"$job\"})",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Build Versions",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true
+            },
+            "renameByName": {
+              "app_name": "app",
+              "commit_hash": "commit"
+            }
+          }
+        }
+      ],
+      "type": "table"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 69
+        "y": 75
       },
       "id": 20,
       "panels": [],
@@ -2744,7 +2853,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 70
+        "y": 76
       },
       "id": 21,
       "options": {
@@ -2811,7 +2920,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 70
+        "y": 76
       },
       "id": 22,
       "options": {
@@ -2878,7 +2987,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 70
+        "y": 76
       },
       "id": 23,
       "options": {
@@ -2945,7 +3054,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 70
+        "y": 76
       },
       "id": 24,
       "options": {
@@ -3049,7 +3158,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 74
+        "y": 80
       },
       "id": 25,
       "options": {
@@ -3161,7 +3270,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 74
+        "y": 80
       },
       "id": 26,
       "options": {
@@ -3262,7 +3371,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 82
+        "y": 88
       },
       "id": 27,
       "options": {
@@ -3363,7 +3472,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 82
+        "y": 88
       },
       "id": 28,
       "options": {
@@ -3497,7 +3606,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 90
+        "y": 96
       },
       "id": 29,
       "options": {
@@ -3631,7 +3740,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 90
+        "y": 96
       },
       "id": 30,
       "options": {
@@ -3765,7 +3874,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 98
+        "y": 104
       },
       "id": 31,
       "options": {
@@ -3877,7 +3986,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 98
+        "y": 104
       },
       "id": 32,
       "options": {
@@ -3924,121 +4033,12 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": {
-              "type": "auto"
-            },
-            "footer": {
-              "reducers": []
-            },
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "commit_hash"
-            },
-            "properties": [
-              {
-                "id": "custom.width",
-                "value": 260
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "build_date"
-            },
-            "properties": [
-              {
-                "id": "custom.width",
-                "value": 190
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 6,
-        "w": 24,
-        "x": 0,
-        "y": 106
-      },
-      "id": 33,
-      "options": {
-        "cellHeight": "sm",
-        "showHeader": true,
-        "sortBy": [
-          {
-            "desc": false,
-            "displayName": "node"
-          }
-        ]
-      },
-      "pluginVersion": "12.4.4",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "max by (job, instance, node, app_name, version, commit_hash, commit_date, build_date) (shitspeak_build_info{job=~\"$job\"})",
-          "format": "table",
-          "instant": true,
-          "range": false,
-          "refId": "A"
-        }
-      ],
-      "title": "Build Versions",
-      "transformations": [
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "Time": true,
-              "Value": true
-            },
-            "renameByName": {
-              "app_name": "app",
-              "commit_hash": "commit"
-            }
-          }
-        }
-      ],
-      "type": "table"
-    },
-    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 112
+        "y": 118
       },
       "id": 34,
       "panels": [],
@@ -4074,7 +4074,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 113
+        "y": 119
       },
       "id": 35,
       "options": {
@@ -4140,7 +4140,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 113
+        "y": 119
       },
       "id": 36,
       "options": {
@@ -4206,7 +4206,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 113
+        "y": 119
       },
       "id": 37,
       "options": {
@@ -4272,7 +4272,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 113
+        "y": 119
       },
       "id": 38,
       "options": {
@@ -4375,7 +4375,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 117
+        "y": 123
       },
       "id": 39,
       "options": {
@@ -4476,7 +4476,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 117
+        "y": 123
       },
       "id": 40,
       "options": {
@@ -4577,7 +4577,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 125
+        "y": 131
       },
       "id": 41,
       "options": {
@@ -4678,7 +4678,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 125
+        "y": 131
       },
       "id": 42,
       "options": {
@@ -4801,7 +4801,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 133
+        "y": 139
       },
       "id": 43,
       "options": {
@@ -4874,7 +4874,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 133
+        "y": 139
       },
       "id": 44,
       "options": {
@@ -4993,7 +4993,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 141
+        "y": 147
       },
       "id": 45,
       "options": {
@@ -5086,7 +5086,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 141
+        "y": 147
       },
       "id": 46,
       "options": {
@@ -5225,7 +5225,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 149
+        "y": 155
       },
       "id": 47,
       "panels": [],
@@ -5261,7 +5261,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 150
+        "y": 156
       },
       "id": 48,
       "options": {
@@ -5327,7 +5327,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 150
+        "y": 156
       },
       "id": 49,
       "options": {
@@ -5393,7 +5393,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 150
+        "y": 156
       },
       "id": 50,
       "options": {
@@ -5459,7 +5459,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 150
+        "y": 156
       },
       "id": 51,
       "options": {
@@ -5562,7 +5562,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 154
+        "y": 160
       },
       "id": 52,
       "options": {
@@ -5685,7 +5685,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 154
+        "y": 160
       },
       "id": 53,
       "options": {
@@ -5786,7 +5786,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 162
+        "y": 168
       },
       "id": 54,
       "options": {
@@ -5887,7 +5887,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 162
+        "y": 168
       },
       "id": 55,
       "options": {
@@ -5988,7 +5988,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 170
+        "y": 176
       },
       "id": 56,
       "options": {
@@ -6040,7 +6040,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 178
+        "y": 184
       },
       "id": 57,
       "panels": [],
@@ -6113,7 +6113,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 179
+        "y": 185
       },
       "id": 58,
       "options": {
@@ -6225,7 +6225,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 179
+        "y": 185
       },
       "id": 59,
       "options": {
@@ -6288,7 +6288,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 187
+        "y": 193
       },
       "id": 60,
       "panels": [],
@@ -6361,7 +6361,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 188
+        "y": 194
       },
       "id": 61,
       "options": {
@@ -6479,7 +6479,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 188
+        "y": 194
       },
       "id": 62,
       "options": {
@@ -6591,7 +6591,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 196
+        "y": 202
       },
       "id": 63,
       "options": {
@@ -6692,7 +6692,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 196
+        "y": 202
       },
       "id": 64,
       "options": {
@@ -6793,7 +6793,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 204
+        "y": 210
       },
       "id": 65,
       "options": {
@@ -6916,7 +6916,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 204
+        "y": 210
       },
       "id": 66,
       "options": {
@@ -7050,7 +7050,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 212
+        "y": 218
       },
       "id": 67,
       "options": {
@@ -7151,7 +7151,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 212
+        "y": 218
       },
       "id": 68,
       "options": {
@@ -7192,7 +7192,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 220
+        "y": 226
       },
       "id": 70,
       "panels": [],
@@ -7222,7 +7222,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 221
+        "y": 227
       },
       "id": 71,
       "options": {
@@ -7277,7 +7277,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 221
+        "y": 227
       },
       "id": 72,
       "options": {
@@ -7332,7 +7332,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 221
+        "y": 227
       },
       "id": 73,
       "options": {
@@ -7387,7 +7387,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 221
+        "y": 227
       },
       "id": 74,
       "options": {
@@ -7437,7 +7437,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 225
+        "y": 231
       },
       "id": 75,
       "options": {
@@ -7476,7 +7476,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 225
+        "y": 231
       },
       "id": 76,
       "options": {
@@ -7515,7 +7515,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 233
+        "y": 239
       },
       "id": 77,
       "options": {
@@ -7562,7 +7562,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 241
+        "y": 247
       },
       "id": 78,
       "options": {
@@ -7601,7 +7601,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 241
+        "y": 247
       },
       "id": 79,
       "options": {
@@ -7648,7 +7648,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 257
+        "y": 263
       },
       "id": 82,
       "options": {
@@ -7695,7 +7695,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 257
+        "y": 263
       },
       "id": 83,
       "options": {
@@ -7734,7 +7734,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 265
+        "y": 271
       },
       "id": 84,
       "options": {
@@ -7773,7 +7773,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 265
+        "y": 271
       },
       "id": 85,
       "options": {
@@ -7811,7 +7811,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 273
+        "y": 279
       },
       "id": 86,
       "options": {
@@ -7849,7 +7849,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 277
+        "y": 283
       },
       "id": 87,
       "panels": [],
@@ -7877,7 +7877,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 278
+        "y": 284
       },
       "id": 88,
       "options": {
@@ -7916,7 +7916,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 278
+        "y": 284
       },
       "id": 89,
       "options": {
@@ -7963,7 +7963,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 286
+        "y": 292
       },
       "id": 90,
       "options": {
@@ -8010,7 +8010,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 286
+        "y": 292
       },
       "id": 91,
       "options": {
@@ -8056,7 +8056,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 286
+        "y": 292
       },
       "id": 92,
       "options": {
@@ -8102,7 +8102,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 294
+        "y": 300
       },
       "id": 93,
       "options": {
@@ -8144,7 +8144,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 294
+        "y": 300
       },
       "id": 94,
       "options": {
@@ -8167,7 +8167,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 302 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 308 },
       "id": 95,
       "panels": [],
       "title": "Soft Voice-Path Stickiness",
@@ -8184,7 +8184,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 303 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 309 },
       "id": 96,
       "options": {
         "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -8218,7 +8218,7 @@
         "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 1 } ] }, "unit": "ops" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 303 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 309 },
       "id": 97,
       "options": {
         "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -8260,7 +8260,7 @@
         "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 100000 } ] }, "unit": "µs" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 311 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 317 },
       "id": 101,
       "options": {
         "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -8294,7 +8294,7 @@
         "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 1 } ] }, "unit": "ops" },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 311 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 317 },
       "id": 102,
       "options": {
         "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -8320,6 +8320,186 @@
         }
       ],
       "title": "Fallback and Sticky Tree-Edge State",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 10 } ] }, "unit": "none" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 325 },
+      "id": 103,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source, peer) (shitspeak_s2s_voice_transition_active{job=~\"$job\"})",
+          "legendFormat": "transition {{source}}→{{peer}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Active Voice Transitions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] }, "unit": "percentunit" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 325 },
+      "id": 104,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source, peer) (shitspeak_s2s_voice_split_share{job=~\"$job\"})",
+          "legendFormat": "split share {{source}}→{{peer}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Voice Split Share",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] }, "unit": "bytes" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 333 },
+      "id": 105,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (peer) (shitspeak_s2s_voice_overlap_reserved_bytes{job=~\"$job\"})",
+          "legendFormat": "reserved →{{peer}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (peer) (shitspeak_s2s_voice_overlap_capacity_bytes{job=~\"$job\"})",
+          "legendFormat": "capacity →{{peer}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Voice Overlap Link Reservation",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] }, "unit": "ops" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 333 },
+      "id": 106,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (peer) (rate(shitspeak_s2s_voice_overlap_copies_sent_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "copies sent →{{peer}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (peer) (rate(shitspeak_s2s_voice_overlap_copies_shed_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "copies shed →{{peer}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (peer) (rate(shitspeak_s2s_voice_overlap_primary_fallback_sends_total{job=~\"$job\"}[$__rate_interval]))",
+          "legendFormat": "primary fallback →{{peer}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Voice Overlap Copy Activity/s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 100 } ] }, "unit": "short" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 341 },
+      "id": 107,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum(shitspeak_s2s_voice_reorder_held_frames{job=~\"$job\"})",
+          "legendFormat": "held frames",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Reorder Held Frames",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 }, { "color": "red", "value": 100000 } ] }, "unit": "µs" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 341 },
+      "id": 108,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "max(shitspeak_s2s_voice_reorder_max_held_delay_microseconds{job=~\"$job\"})",
+          "legendFormat": "max held delay",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Reorder Max Held Delay",
       "type": "timeseries"
     }
   ],
