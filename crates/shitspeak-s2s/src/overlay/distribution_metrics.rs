@@ -869,7 +869,12 @@ pub(crate) fn prometheus_samples(local_node: NodeIdentifier) -> Vec<PrometheusSa
         ));
     }
     for (peer, gauge) in &metrics.voice_overlap_links {
-        let labels = vec![("peer".to_owned(), peer.to_string())];
+        // `source` is a node-config collector label on this deployment, so the
+        // overlap metrics carry the emitting node as `source_node_id` instead.
+        let labels = vec![
+            ("source_node_id".to_owned(), local_node.clone()),
+            ("peer".to_owned(), peer.to_string()),
+        ];
         out.push(PrometheusSample::new(
             "shitspeak_s2s_voice_overlap_reserved_bytes",
             labels.clone(),
