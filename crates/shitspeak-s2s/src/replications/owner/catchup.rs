@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use rand::seq::SliceRandom;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::super::metrics::{self, CatchupMode, ReplicationPipelineKind, ReplicationPipelineStage};
 use super::super::proto::{CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupResp, OwnerOp};
@@ -88,6 +88,14 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
             // Relays may only advertise fully materialized state at the
             // LSDB-current epoch. An empty response lets the requester fall
             // back to the origin without exposing pending/runtime progress.
+            debug!(
+                origin=%origin,
+                from=%from,
+                req_epoch=req.known_epoch,
+                authoritative_epoch=?authoritative_epoch,
+                materialized=?materialized,
+                "owner catchup response: no materialized state at current epoch; responding empty"
+            );
             let response = OwnerCatchupResp {
                 origin_node: origin as u32,
                 origin_epoch: authoritative_epoch.unwrap_or(0),
@@ -298,6 +306,22 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
         ReplicationPipelineStage::CatchupBuild,
         build_started_at.elapsed(),
     );
+    debug!(
+        origin=%origin,
+        from=%from,
+        req_since=request_since,
+        origin_epoch=origin_epoch,
+        origin_version=origin_version,
+        snapshot=selected_snapshot,
+        snapshot_version=snapshot_version,
+        ops=catchup_ops.len(),
+        total_available=total,
+        has_more=has_more,
+        too_old=too_old_use_snapshot,
+        payload_limited=payload_limited,
+        encode_failed=encode_failed,
+        "owner catchup response built"
+    );
 
     let resp = OwnerCatchupResp {
         origin_node: origin as u32,
@@ -374,10 +398,17 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
     if previous.is_none() && from != origin && !has_materialized_payload {
         // An empty relay response is not proof that the current owner is at
         // version zero. Ask the origin before establishing the incarnation.
+        debug!(
+            origin=%origin,
+            from=%from,
+            epoch=resp_epoch,
+            outcome="rearm_empty_relay_no_known",
+            "owner catchup response: empty relay before incarnation; asking origin"
+        );
         rt.rearm_catchup_retry(origin, resp_epoch);
         if rt.net.alive_members().contains(&origin) {
             let _ = rt
-                .send_catchup_req_to(origin, origin, resp_epoch, 0, 0)
+                .send_catchup_req_to(origin, origin, resp_epoch, 0, 0, "apply_empty_relay_ask_origin")
                 .await;
         }
         return;
@@ -386,6 +417,14 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
     // `TooOld` without bytes is an explicit snapshot-unavailable response.
     // Applying its tail would create an unproven prefix, so retry directly.
     if resp.too_old_use_snapshot && resp.snapshot_msgpack.is_empty() {
+        debug!(
+            origin=%origin,
+            from=%from,
+            epoch=resp_epoch,
+            known=?previous,
+            outcome="rearm_too_old_empty",
+            "owner catchup response: too_old with no snapshot bytes; retrying"
+        );
         rt.rearm_catchup_retry(origin, resp_epoch);
         if from != origin && rt.net.alive_members().contains(&origin) {
             let since = if rt.origin_is_inactive(origin) {
@@ -399,7 +438,7 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
                     .unwrap_or(0)
             };
             let _ = rt
-                .send_catchup_req_to(origin, origin, resp_epoch, since, 0)
+                .send_catchup_req_to(origin, origin, resp_epoch, since, 0, "apply_too_old_empty_ask_origin")
                 .await;
         }
         return;
@@ -414,6 +453,13 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
             known_epoch == resp_epoch && known_version > 0
         });
         if same_epoch_nonempty && !rt.origin_is_inactive(origin) {
+            debug!(
+                origin=%origin,
+                from=%from,
+                epoch=resp_epoch,
+                outcome="converged",
+                "owner catchup response: authoritative empty confirms an active origin is caught up"
+            );
             metrics::record_pipeline_stage(
                 ReplicationPipelineKind::Owner,
                 ReplicationPipelineStage::CatchupApply,
@@ -425,6 +471,13 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
             // Offline handling deliberately retains a same-epoch high-water
             // floor. A delayed empty response from that incarnation cannot
             // erase the floor or make old operations admissible again.
+            debug!(
+                origin=%origin,
+                from=%from,
+                epoch=resp_epoch,
+                outcome="rearm_same_epoch_inactive",
+                "owner catchup response: empty from active epoch but origin inactive; retaining floor"
+            );
             rt.rearm_catchup_retry(origin, resp_epoch);
             return;
         }
@@ -449,7 +502,16 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
             drop(state);
             rt.mark_origin_active(origin);
         }
-        if rt.record_empty_origin_confirmation(origin, resp_epoch) < 2 {
+        let confirmations = rt.record_empty_origin_confirmation(origin, resp_epoch);
+        debug!(
+            origin=%origin,
+            from=%from,
+            epoch=resp_epoch,
+            confirmations,
+            outcome="establish_v0",
+            "owner catchup response: authoritative origin proves version zero"
+        );
+        if confirmations < 2 {
             rt.schedule_origin_stabilization(origin, resp_epoch);
             rt.rearm_catchup_retry(origin, resp_epoch);
             return;
@@ -460,6 +522,15 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
         if previous.is_some_and(|(known_epoch, known_version)| {
             known_epoch == resp_epoch && resp.snapshot_version < known_version
         }) {
+            debug!(
+                origin=%origin,
+                from=%from,
+                epoch=resp_epoch,
+                snapshot_version=resp.snapshot_version,
+                known=?previous,
+                outcome="rearm_snapshot_stale",
+                "owner catchup response: snapshot older than known state; retrying"
+            );
             rt.rearm_catchup_retry(origin, resp_epoch);
             return;
         }
@@ -497,20 +568,44 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
                 rt.mark_origin_active(origin);
                 if resp.snapshot_version > 0 {
                     rt.clear_empty_origin_confirmation(origin);
+                    debug!(
+                        origin=%origin,
+                        from=%from,
+                        epoch=resp_epoch,
+                        snapshot_version=resp.snapshot_version,
+                        outcome="snapshot_installed",
+                        "owner catchup response: snapshot installed"
+                    );
                 } else if from == origin
                     && rt.record_empty_origin_confirmation(origin, resp_epoch) < 2
                 {
+                    debug!(
+                        origin=%origin,
+                        from=%from,
+                        epoch=resp_epoch,
+                        snapshot_version=0,
+                        outcome="rearm_snapshot_empty_confirm",
+                        "owner catchup response: snapshot installed but origin at version zero; confirming"
+                    );
                     rt.schedule_origin_stabilization(origin, resp_epoch);
                     rt.rearm_catchup_retry(origin, resp_epoch);
                     return;
                 }
             }
             Ok(OwnerSnapshotInstallOutcome::Deferred) => {
+                debug!(
+                    origin=%origin,
+                    from=%from,
+                    epoch=resp_epoch,
+                    snapshot_version=resp.snapshot_version,
+                    outcome="rearm_snapshot_deferred",
+                    "owner catchup response: snapshot install deferred; retrying"
+                );
                 rt.rearm_catchup_retry(origin, resp_epoch);
                 return;
             }
             Err(error) => {
-                warn!(origin=%origin, epoch=resp_epoch, error=%error, "owner snapshot install failed");
+                warn!(origin=%origin, epoch=resp_epoch, error=%error, outcome="rearm_snapshot_error", "owner snapshot install failed");
                 rt.rearm_catchup_retry(origin, resp_epoch);
                 return;
             }
@@ -520,10 +615,17 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
     if rt.origin_is_inactive(origin) {
         // A removed transient shard may only become visible again through an
         // atomic snapshot (or a direct proof that the owner is version zero).
+        debug!(
+            origin=%origin,
+            from=%from,
+            epoch=resp_epoch,
+            outcome="rearm_inactive_ask_origin",
+            "owner catchup response: origin inactive; needs snapshot or v0 proof"
+        );
         rt.rearm_catchup_retry(origin, resp_epoch);
         if from != origin && rt.net.alive_members().contains(&origin) {
             let _ = rt
-                .send_catchup_req_to(origin, origin, resp_epoch, 0, 0)
+                .send_catchup_req_to(origin, origin, resp_epoch, 0, 0, "apply_inactive_ask_origin")
                 .await;
         }
         return;
@@ -549,9 +651,26 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
 
     if resp.has_more {
         if resp.next_chunk_token <= previous_chunk_token {
+            debug!(
+                origin=%origin,
+                from=%from,
+                epoch=resp_epoch,
+                chunk_token=resp.next_chunk_token,
+                previous_chunk_token=previous_chunk_token,
+                outcome="rearm_chunk_token_regressed",
+                "owner catchup response: continuation token did not advance; retrying"
+            );
             rt.rearm_catchup_retry(origin, resp_epoch);
             return;
         }
+        debug!(
+            origin=%origin,
+            from=%from,
+            epoch=resp_epoch,
+            chunk_token=resp.next_chunk_token,
+            outcome="continuation",
+            "owner catchup response: more chunks available; continuing"
+        );
         let alive = rt.net.alive_members();
         let mut peers: Vec<NodeIdentifier> = alive
             .into_iter()
@@ -605,9 +724,18 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
     if from != origin && origin != rt.self_id && rt.net.alive_members().contains(&origin) {
         let known_epoch = rt.net.member_boot_epoch(origin).unwrap_or(resp_epoch);
         let _ = rt
-            .send_catchup_req_to(origin, origin, known_epoch, version_after, 0)
+            .send_catchup_req_to(origin, origin, known_epoch, version_after, 0, "apply_relay_followup")
             .await;
     }
+    debug!(
+        origin=%origin,
+        from=%from,
+        epoch=resp_epoch,
+        version_after=version_after,
+        served_by_relay=(from != origin),
+        outcome="converged_apply",
+        "owner catchup response: ops applied; caught up"
+    );
     metrics::record_pipeline_stage(
         ReplicationPipelineKind::Owner,
         ReplicationPipelineStage::CatchupApply,

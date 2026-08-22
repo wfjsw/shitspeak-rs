@@ -18,7 +18,7 @@ use prost::Message as _;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use super::super::config::ReplicationConfig;
 use super::super::error::ReplicationError;
@@ -766,6 +766,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                     attempt.epoch,
                     attempt.since_version,
                     attempt.chunk_token,
+                    "retry_timeout",
                 )
                 .await
                 .is_ok()
@@ -843,7 +844,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                         return;
                     }
                     let since = runtime.origin_is_inactive(origin).then_some(0);
-                    runtime.request_catchup(origin, epoch, since).await;
+                    runtime.request_catchup(origin, epoch, since, "stabilization").await;
                 }
             });
         }
@@ -879,7 +880,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             }
             let known_epoch = self.known_epoch_for_origin(origin);
             let since = self.origin_is_inactive(origin).then_some(0);
-            self.request_catchup(origin, known_epoch, since).await;
+            self.request_catchup(origin, known_epoch, since, "bootstrap").await;
         }
     }
 
@@ -901,6 +902,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         origin: NodeIdentifier,
         known_epoch: u64,
         since_version: Option<u64>,
+        cause: &'static str,
     ) -> bool {
         if origin == self.self_id {
             return true;
@@ -911,13 +913,27 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         };
         if should_send {
             let sent = self
-                .send_catchup_req_since(origin, known_epoch, since_version)
+                .send_catchup_req_since(origin, known_epoch, since_version, cause)
                 .await;
             if !sent {
                 self.state.lock().catchup_in_flight.remove(&origin);
+                debug!(
+                    origin=%origin,
+                    epoch=known_epoch,
+                    since=?since_version,
+                    cause,
+                    "owner catchup request could not reach any destination"
+                );
             }
             sent
         } else {
+            debug!(
+                origin=%origin,
+                epoch=known_epoch,
+                since=?since_version,
+                cause,
+                "owner catchup request suppressed by throttle"
+            );
             true
         }
     }
@@ -1003,7 +1019,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         if !self.epoch_is_current(origin, new_epoch) {
             return;
         }
-        self.request_catchup(origin, new_epoch, Some(since)).await;
+        self.request_catchup(origin, new_epoch, Some(since), "restart").await;
         self.schedule_origin_stabilization(origin, new_epoch);
     }
 
@@ -1011,7 +1027,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         let _guard = self.lock_origin(origin).await;
         let known_epoch = self.known_epoch_for_origin(origin);
         let since = self.origin_is_inactive(origin).then_some(0);
-        self.request_catchup(origin, known_epoch, since).await;
+        self.request_catchup(origin, known_epoch, since, "join").await;
         self.schedule_origin_stabilization(origin, known_epoch);
     }
 
@@ -1129,7 +1145,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                 was_empty
             };
             if should_request {
-                self.send_catchup_req_since(origin, op.origin_epoch, Some(0))
+                self.send_catchup_req_since(origin, op.origin_epoch, Some(0), "gap_catchup")
                     .await;
             }
             return;
@@ -1173,7 +1189,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                             was_empty
                         };
                         if arm {
-                            self.send_catchup_req(origin, new_epoch).await;
+                            self.send_catchup_req(origin, new_epoch, "gap_catchup").await;
                         }
                     }
                     other => {
@@ -1202,7 +1218,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                     (arm, known_epoch)
                 };
                 if arm {
-                    self.send_catchup_req(origin, known_epoch).await;
+                    self.send_catchup_req(origin, known_epoch, "gap_catchup").await;
                 }
             }
             Classification::Apply => self.apply_op(origin, op).await,
@@ -1341,14 +1357,20 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                 }
                 if runtime.epoch_is_current(origin, epoch) {
                     let since = runtime.origin_is_inactive(origin).then_some(0);
-                    runtime.request_catchup(origin, epoch, since).await;
+                    runtime.request_catchup(origin, epoch, since, "rearm").await;
                 }
             });
         }
     }
 
-    async fn send_catchup_req(&self, origin: NodeIdentifier, known_epoch: u64) -> bool {
-        self.send_catchup_req_since(origin, known_epoch, None).await
+    async fn send_catchup_req(
+        &self,
+        origin: NodeIdentifier,
+        known_epoch: u64,
+        cause: &'static str,
+    ) -> bool {
+        self.send_catchup_req_since(origin, known_epoch, None, cause)
+            .await
     }
 
     async fn send_catchup_req_since(
@@ -1356,6 +1378,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         origin: NodeIdentifier,
         known_epoch: u64,
         since_version: Option<u64>,
+        cause: &'static str,
     ) -> bool {
         let alive = self.net.alive_members();
         let since = since_version.unwrap_or_else(|| {
@@ -1390,7 +1413,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         }
         for dst in destinations {
             if self
-                .send_catchup_req_to(dst, origin, known_epoch, since, 0)
+                .send_catchup_req_to(dst, origin, known_epoch, since, 0, cause)
                 .await
                 .is_ok()
             {
@@ -1407,6 +1430,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         known_epoch: u64,
         since_version: u64,
         chunk_token: u64,
+        cause: &'static str,
     ) -> Result<(), ReplicationError> {
         let req = OwnerCatchupReq {
             origin_node: origin as u32,
@@ -1420,6 +1444,15 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             .send_unicast(dst, &self.topic, OwnerBody::CatchupReq(req))
             .await?;
         self.track_catchup_attempt(origin, known_epoch, since_version, chunk_token, dst);
+        debug!(
+            origin=%origin,
+            dst=%dst,
+            epoch=known_epoch,
+            since=since_version,
+            chunk_token=chunk_token,
+            cause,
+            "owner catchup request sent"
+        );
         Ok(())
     }
 
@@ -1443,6 +1476,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                 known_epoch,
                 since_version,
                 chunk_token,
+                "continuation",
             )
             .await
             .is_ok()
@@ -1469,7 +1503,14 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
 
         for dst in alternatives {
             if self
-                .send_catchup_req_to(dst, origin, known_epoch, since_version, chunk_token)
+                .send_catchup_req_to(
+                    dst,
+                    origin,
+                    known_epoch,
+                    since_version,
+                    chunk_token,
+                    "continuation",
+                )
                 .await
                 .is_ok()
             {
