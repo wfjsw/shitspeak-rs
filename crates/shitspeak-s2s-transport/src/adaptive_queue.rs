@@ -314,6 +314,29 @@ fn auto_budget_bytes() -> usize {
         .min(usize::MAX as u64) as usize
 }
 
+/// Divisor applied to the memory-derived global budget to size a single
+/// real-time datagram lane. Sized so that latest-wins eviction is a
+/// pathological fallback rather than a normal condition: the lane holds well
+/// beyond any burst a peer can offer before the wire drains it, while the
+/// per-lane ceiling keeps the aggregate across peers bounded.
+const DATAGRAM_LANE_BUDGET_DIVISOR: u64 = 16;
+const DATAGRAM_LANE_BUDGET_MIN_BYTES: u64 = 1024 * 1024;
+const DATAGRAM_LANE_BUDGET_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Memory-derived capacity for a real-time (best-effort) datagram lane used by
+/// both the UDP data path and the QUIC DATAGRAM path. The caller-supplied floor
+/// (e.g. a configured buffer size) is honored when it is larger; otherwise the
+/// derived budget applies. The capacity, not the drain rate, is what adapts.
+pub(crate) fn adaptive_datagram_lane_bytes(configured_floor: usize) -> usize {
+    configured_floor.max(derived_datagram_lane_bytes())
+}
+
+fn derived_datagram_lane_bytes() -> usize {
+    let auto = auto_budget_bytes() as u64;
+    (auto / DATAGRAM_LANE_BUDGET_DIVISOR)
+        .clamp(DATAGRAM_LANE_BUDGET_MIN_BYTES, DATAGRAM_LANE_BUDGET_MAX_BYTES) as usize
+}
+
 #[cfg(windows)]
 fn available_memory_bytes() -> Option<u64> {
     use std::mem::size_of;

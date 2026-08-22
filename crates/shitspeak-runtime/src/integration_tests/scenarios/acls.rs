@@ -2907,13 +2907,27 @@ async fn cached_listener_without_listen_permission_is_not_restored() {
         !self_state.listening_channel_add.contains(&79),
         "a cached listener without ACL Listen permission must not be restored"
     );
+    // The denied listener is pruned from the persisted cache asynchronously,
+    // *after* the server sends the login burst (see authenticate.rs
+    // staged_channel_cache_write). ServerSync arrives with the burst, so
+    // connect_and_authenticate can return before the prune lands. Poll until
+    // it does instead of racing the single write.
+    let pruned = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cached = server
+                .server
+                .get_user_channel_cache()
+                .get(&test_user_channel_cache_key(2))
+                .await;
+            if cached.is_none_or(|channels| channels.listening_channel_ids.is_empty()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
     assert!(
-        server
-            .server
-            .get_user_channel_cache()
-            .get(&test_user_channel_cache_key(2))
-            .await
-            .is_none_or(|channels| channels.listening_channel_ids.is_empty()),
+        pruned.is_ok(),
         "the denied listener must be removed from the persisted cache"
     );
 }

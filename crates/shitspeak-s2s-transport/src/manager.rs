@@ -3917,18 +3917,23 @@ fn try_dispatch_envelope_with_policy(
                     );
                 }
                 if outcome.evicted_items() > 0 {
-                    for _ in 0..outcome.evicted_items() {
-                        sender.record_quic_datagram_drop();
-                        super::metrics::record_quic_datagram_drop(
-                            super::metrics::QuicDatagramDropReason::AppQueueEvicted,
-                        );
-                        if quic_v2_datagram {
+                    if quic_v2_datagram {
+                        for _ in 0..outcome.evicted_items() {
+                            sender.record_quic_datagram_drop();
+                            super::metrics::record_quic_datagram_drop(
+                                super::metrics::QuicDatagramDropReason::AppQueueEvicted,
+                            );
                             record_quic_datagram_evidence(
                                 peer,
                                 &sender,
                                 DatagramPathEvidenceEvent::Pressure,
                             );
                         }
+                    } else if path == DeliveryPath::UdpDatagram {
+                        // UDP evicts the oldest datagram to admit the newest.
+                        // Record the generic queue-full watermark rather than
+                        // the QUIC-named drop counter.
+                        record_outbound_stream_queue_sample(peer, path, class, &sender, level, true);
                     }
                 }
                 for sidecar in variant.sidecars().iter().filter(|_| !quic_v2_datagram) {
@@ -3937,11 +3942,8 @@ fn try_dispatch_envelope_with_policy(
                         OutboundFrame::with_options(level, class, sidecar.clone(), options),
                     );
                     if let Ok(outcome) = sidecar_outcome {
-                        for _ in 0..outcome.evicted_items() {
-                            sender.record_quic_datagram_drop();
-                            super::metrics::record_quic_datagram_drop(
-                                super::metrics::QuicDatagramDropReason::AppQueueEvicted,
-                            );
+                        if outcome.evicted_items() > 0 && path == DeliveryPath::UdpDatagram {
+                            record_outbound_stream_queue_sample(peer, path, class, &sender, level, true);
                         }
                     }
                 }

@@ -53,11 +53,10 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use crate::types::NodeIdentifier;
 use shitspeak_proto::s2s_transport_proto as pb;
 
-use super::super::adaptive_queue::{
-    AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender,
-};
+use super::super::adaptive_queue::{AdaptiveQueueBudget, adaptive_datagram_lane_bytes};
 use super::super::compression::{maybe_compress_frame_payload, validate_and_decode_payload};
 use super::super::connection::{ActiveStream, OutboundFrame, PeerState};
+use super::super::latest_wins_queue::{LatestWinsReceiver, TryRecvLatestWinsError, latest_wins_queue};
 use super::super::frame::{FrameType, build_frame};
 use super::super::identity::{NodeIdentity, parse_peer_cn};
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
@@ -2929,15 +2928,20 @@ fn spawn_udp_write_pump(
     peer_addr: SocketAddr,
     is_dialer: bool,
 ) -> ActiveStream {
-    let budget = AdaptiveQueueBudget::auto();
     let lane_bytes = super::super::stream_io::stream_handoff_lane_bytes(
-        budget.max_bytes(),
+        AdaptiveQueueBudget::auto().max_bytes(),
         inner.cfg().max_frame_bytes(),
     );
-    let (tx, rx) = AdaptiveQueueSender::new(budget.split(lane_bytes));
+    let (tx, rx) = latest_wins_queue(adaptive_datagram_lane_bytes(lane_bytes));
     let closed = inner.shutdown().child_token();
     tokio::spawn(run_write(state, session, peer, inner, rx, closed.clone()));
-    ActiveStream::new(TransportKind::Udp, Some(peer_addr), tx, closed, is_dialer)
+    ActiveStream::new_latest_wins(
+        TransportKind::Udp,
+        Some(peer_addr),
+        tx,
+        closed,
+        is_dialer,
+    )
 }
 
 fn stabilized_ping_interval(active: Duration, idle: Duration) -> Duration {
@@ -2949,7 +2953,7 @@ async fn run_write(
     session: Arc<UdpCryptoSession>,
     peer: Arc<PeerState>,
     inner: Arc<ManagerInner>,
-    mut rx: AdaptiveQueueReceiver<OutboundFrame>,
+    mut rx: LatestWinsReceiver<OutboundFrame>,
     closed: CancellationToken,
 ) {
     let level = TransportKind::Udp.service_level();
@@ -3264,7 +3268,7 @@ async fn send_udp_data_batch(
     session: &UdpCryptoSession,
     peer: &PeerState,
     inner: &ManagerInner,
-    rx: &mut AdaptiveQueueReceiver<OutboundFrame>,
+    rx: &mut LatestWinsReceiver<OutboundFrame>,
     pending_udp_data: &mut VecDeque<PreparedUdpData>,
     first: PreparedUdpData,
     level: ServiceLevel,
@@ -3279,8 +3283,8 @@ async fn send_udp_data_batch(
         } else {
             let out = match rx.try_recv() {
                 Ok(out) => out,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                Err(TryRecvLatestWinsError::Empty) => break,
+                Err(TryRecvLatestWinsError::Closed) => break,
             };
             let mut prepared = prepare_udp_data_frames(out, session, peer, inner, level)?;
             let Some(first) = prepared.pop_front() else {

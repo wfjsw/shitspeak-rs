@@ -2,12 +2,14 @@
 //! stream transports. The bound `quinn::Endpoint` is built once at endpoint
 //! construction time and shared between accept and dial.
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
 use prost::Message as _;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
@@ -19,7 +21,8 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use super::super::adaptive_queue::AdaptiveQueueBudget;
+use super::super::adaptive_queue::{AdaptiveQueueBudget, adaptive_datagram_lane_bytes};
+use super::super::latest_wins_queue::{LatestWinsReceiver, TryRecvLatestWinsError};
 use super::super::compression::{maybe_compress_frame_payload, validate_and_decode_payload};
 use super::super::connection::{ActiveStream, OutboundFrame, PeerState, QuicV2SessionSender};
 use super::super::frame::{FrameType, build_frame, encode_frame_to_bytes};
@@ -790,7 +793,7 @@ async fn install_quic_v2_session(
     let lane_bytes = stream_handoff_lane_bytes(budget.max_bytes(), inner.cfg().max_frame_bytes());
     let (sender, receivers) = QuicV2SessionSender::new(
         lane_bytes,
-        inner.cfg().quic_datagram_send_buffer_bytes(),
+        adaptive_datagram_lane_bytes(inner.cfg().quic_datagram_send_buffer_bytes()),
         inner.cfg().quic_datagram_receive_buffer_bytes(),
         max_datagram_size,
     );
@@ -907,171 +910,246 @@ async fn install_quic_v2_session(
     Ok(())
 }
 
+/// Upper bound on how many datagrams are prepared from the app queue before
+/// the pump yields back to the runtime, mirroring the UDP/stream dispatchers.
+const QUIC_DATAGRAM_BATCH_MAX: usize = 32;
+
+/// One fully validated, encoded best-effort frame ready to hand to quinn.
+struct PreparedQuicDatagram {
+    encoded: Bytes,
+    original_payload_len: usize,
+}
+
 async fn run_quic_datagram_sender(
     conn: quinn::Connection,
     session_sender: QuicV2SessionSender,
-    mut rx: super::super::latest_wins_queue::LatestWinsReceiver<OutboundFrame>,
+    mut rx: LatestWinsReceiver<OutboundFrame>,
     inner: Arc<ManagerInner>,
     peer: Arc<PeerState>,
     closed: CancellationToken,
 ) {
+    let mut pending: VecDeque<PreparedQuicDatagram> = VecDeque::new();
     loop {
-        let out = tokio::select! {
-            _ = closed.cancelled() => return,
-            out = rx.recv() => match out {
-                Some(out) => out,
-                None => return,
-            },
-        };
-        if out.options().is_expired() {
-            record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Expired);
-            continue;
-        }
-        let original_payload_len = out.payload().len();
-        let mut frame = build_frame(
-            inner.self_id(),
-            peer.node_id(),
-            ServiceLevel::BestEffort,
-            FrameType::Data,
-            out.class(),
-            quic_now_us(),
-            out.payload().clone(),
-        );
-        if frame.encoded_len() > inner.cfg().max_frame_bytes() {
-            record_session_datagram_evidence(
-                &peer,
-                &session_sender,
-                DatagramPathEvidenceEvent::TooLarge,
-            );
-            record_session_datagram_drop(&session_sender, QuicDatagramDropReason::TooLarge);
-            continue;
-        }
-        if maybe_compress_frame_payload(
-            &mut frame,
-            out.options(),
-            inner.cfg().compression_config(),
-            inner.cfg().max_frame_bytes(),
-        )
-        .is_err()
-        {
-            record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Validation);
-            continue;
-        }
-        let encoded = match encode_frame_to_bytes(&frame) {
-            Ok(encoded) => encoded,
-            Err(_) => {
-                record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Validation);
+        // Block until the first frame is available.
+        if pending.is_empty() {
+            let out = tokio::select! {
+                _ = closed.cancelled() => return,
+                out = rx.recv() => match out {
+                    Some(out) => out,
+                    None => return,
+                },
+            };
+            let Some(prepared) =
+                prepare_quic_datagram(out, &conn, &session_sender, &peer, &inner)
+            else {
                 continue;
+            };
+            pending.push_back(prepared);
+        }
+
+        // Batch-fill up to the send cap without blocking.
+        while pending.len() < QUIC_DATAGRAM_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(out) => {
+                    if let Some(prepared) =
+                        prepare_quic_datagram(out, &conn, &session_sender, &peer, &inner)
+                    {
+                        pending.push_back(prepared);
+                    }
+                }
+                Err(TryRecvLatestWinsError::Empty) => break,
+                Err(TryRecvLatestWinsError::Closed) => return,
             }
-        };
-        if out.options().is_expired() {
-            record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Expired);
-            continue;
         }
-        if encoded.len() > inner.cfg().max_frame_bytes() {
+
+        // Send the batch as fast as quinn accepts it. `send_datagram_wait`
+        // backpressures on quinn's datagram buffer when the wire is the
+        // bottleneck instead of silently discarding the oldest queued datagram
+        // (RFC 9221 drop-on-full); during the wait the app-side latest-wins
+        // queue keeps evicting the oldest frames, which is the intended
+        // real-time fallback under sustained overload.
+        while let Some(prepared) = pending.pop_front() {
+            if !send_quic_datagram(&conn, &session_sender, &peer, prepared, &closed).await {
+                return;
+            }
+        }
+
+        // Quinn schedules queued DATAGRAMs ahead of stream data. Yield between
+        // batches so reliable lane pumps make progress under sustained
+        // best-effort load (replaces the fixed 1ms per-frame sleep).
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Builds, compresses, encodes, and validates one best-effort frame for the
+/// QUIC DATAGRAM path. Returns `None` when the frame was dropped; a drop
+/// reason and any path evidence have already been recorded.
+fn prepare_quic_datagram(
+    out: OutboundFrame,
+    conn: &quinn::Connection,
+    session_sender: &QuicV2SessionSender,
+    peer: &PeerState,
+    inner: &ManagerInner,
+) -> Option<PreparedQuicDatagram> {
+    if out.options().is_expired() {
+        record_session_datagram_drop(session_sender, QuicDatagramDropReason::Expired);
+        return None;
+    }
+    let original_payload_len = out.payload().len();
+    let mut frame = build_frame(
+        inner.self_id(),
+        peer.node_id(),
+        ServiceLevel::BestEffort,
+        FrameType::Data,
+        out.class(),
+        quic_now_us(),
+        out.payload().clone(),
+    );
+    if frame.encoded_len() > inner.cfg().max_frame_bytes() {
+        record_session_datagram_evidence(
+            peer,
+            session_sender,
+            DatagramPathEvidenceEvent::TooLarge,
+        );
+        record_session_datagram_drop(session_sender, QuicDatagramDropReason::TooLarge);
+        return None;
+    }
+    if maybe_compress_frame_payload(
+        &mut frame,
+        out.options(),
+        inner.cfg().compression_config(),
+        inner.cfg().max_frame_bytes(),
+    )
+    .is_err()
+    {
+        record_session_datagram_drop(session_sender, QuicDatagramDropReason::Validation);
+        return None;
+    }
+    let encoded = match encode_frame_to_bytes(&frame) {
+        Ok(encoded) => encoded,
+        Err(_) => {
+            record_session_datagram_drop(session_sender, QuicDatagramDropReason::Validation);
+            return None;
+        }
+    };
+    if out.options().is_expired() {
+        record_session_datagram_drop(session_sender, QuicDatagramDropReason::Expired);
+        return None;
+    }
+    if encoded.len() > inner.cfg().max_frame_bytes() {
+        record_session_datagram_evidence(
+            peer,
+            session_sender,
+            DatagramPathEvidenceEvent::TooLarge,
+        );
+        record_session_datagram_drop(session_sender, QuicDatagramDropReason::TooLarge);
+        return None;
+    }
+    let max_datagram_size = conn.max_datagram_size().unwrap_or(0);
+    session_sender.set_max_datagram_size(max_datagram_size);
+    if encoded.len() > max_datagram_size {
+        record_session_datagram_evidence(
+            peer,
+            session_sender,
+            DatagramPathEvidenceEvent::TooLarge,
+        );
+        record_session_datagram_drop(session_sender, QuicDatagramDropReason::TooLarge);
+        return None;
+    }
+    Some(PreparedQuicDatagram {
+        encoded,
+        original_payload_len,
+    })
+}
+
+/// Sends one prepared datagram. When quinn's datagram buffer lacks room the
+/// send waits for space (backpressure) rather than evicting the oldest queued
+/// datagram. Returns `false` when the connection is no longer usable and the
+/// pump must exit.
+async fn send_quic_datagram(
+    conn: &quinn::Connection,
+    session_sender: &QuicV2SessionSender,
+    peer: &PeerState,
+    prepared: PreparedQuicDatagram,
+    closed: &CancellationToken,
+) -> bool {
+    let PreparedQuicDatagram {
+        encoded,
+        original_payload_len,
+    } = prepared;
+    if conn.datagram_send_buffer_space() < encoded.len() {
+        record_session_datagram_evidence(
+            peer,
+            session_sender,
+            DatagramPathEvidenceEvent::Pressure,
+        );
+    }
+    match conn.send_datagram_wait(encoded.clone()).await {
+        Ok(()) => {
             record_session_datagram_evidence(
-                &peer,
-                &session_sender,
+                peer,
+                session_sender,
+                DatagramPathEvidenceEvent::OutcomeSuccess,
+            );
+            session_sender.record_datagram_queued();
+            peer.metrics()
+                .record_payload_sent(TransportKind::Quic, original_payload_len);
+            peer.metrics()
+                .record_sent(TransportKind::Quic, encoded.len());
+            record_quic_lane_delivery(
+                peer.node_id(),
+                TransportIoDirection::Egress,
+                QuicDeliveryLane::Datagram,
+                1,
+                encoded.len(),
+            );
+            true
+        }
+        Err(quinn::SendDatagramError::TooLarge) => {
+            record_session_datagram_evidence(
+                peer,
+                session_sender,
                 DatagramPathEvidenceEvent::TooLarge,
             );
-            record_session_datagram_drop(&session_sender, QuicDatagramDropReason::TooLarge);
-            continue;
+            record_session_datagram_drop(session_sender, QuicDatagramDropReason::TooLarge);
+            true
         }
-        let max_datagram_size = conn.max_datagram_size().unwrap_or(0);
-        session_sender.set_max_datagram_size(max_datagram_size);
-        if encoded.len() > max_datagram_size {
+        Err(quinn::SendDatagramError::UnsupportedByPeer) => {
             record_session_datagram_evidence(
-                &peer,
-                &session_sender,
-                DatagramPathEvidenceEvent::TooLarge,
+                peer,
+                session_sender,
+                DatagramPathEvidenceEvent::OutcomeFailure,
             );
-            record_session_datagram_drop(&session_sender, QuicDatagramDropReason::TooLarge);
-            continue;
+            record_session_datagram_drop(session_sender, QuicDatagramDropReason::Unsupported);
+            peer.metrics()
+                .record_data_health_failure(TransportKind::Quic);
+            closed.cancel();
+            false
         }
-        if conn.datagram_send_buffer_space() < encoded.len() {
+        Err(quinn::SendDatagramError::Disabled) => {
             record_session_datagram_evidence(
-                &peer,
-                &session_sender,
-                DatagramPathEvidenceEvent::Pressure,
+                peer,
+                session_sender,
+                DatagramPathEvidenceEvent::OutcomeFailure,
+            );
+            record_session_datagram_drop(session_sender, QuicDatagramDropReason::Disabled);
+            peer.metrics()
+                .record_data_health_failure(TransportKind::Quic);
+            closed.cancel();
+            false
+        }
+        Err(quinn::SendDatagramError::ConnectionLost(_)) => {
+            record_session_datagram_evidence(
+                peer,
+                session_sender,
+                DatagramPathEvidenceEvent::OutcomeFailure,
             );
             record_session_datagram_drop(
-                &session_sender,
-                QuicDatagramDropReason::QuinnBufferPressure,
+                session_sender,
+                QuicDatagramDropReason::ConnectionLost,
             );
-        }
-        if out.options().is_expired() {
-            record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Expired);
-            continue;
-        }
-        match conn.send_datagram(encoded.clone()) {
-            Ok(()) => {
-                record_session_datagram_evidence(
-                    &peer,
-                    &session_sender,
-                    DatagramPathEvidenceEvent::OutcomeSuccess,
-                );
-                session_sender.record_datagram_queued();
-                peer.metrics()
-                    .record_payload_sent(TransportKind::Quic, original_payload_len);
-                peer.metrics()
-                    .record_sent(TransportKind::Quic, encoded.len());
-                record_quic_lane_delivery(
-                    peer.node_id(),
-                    TransportIoDirection::Egress,
-                    QuicDeliveryLane::Datagram,
-                    1,
-                    encoded.len(),
-                );
-                // Quinn schedules queued DATAGRAMs ahead of stream data.
-                // Yield between submissions so reliable lane pumps can make
-                // progress under sustained best-effort load.
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            Err(quinn::SendDatagramError::TooLarge) => {
-                record_session_datagram_evidence(
-                    &peer,
-                    &session_sender,
-                    DatagramPathEvidenceEvent::TooLarge,
-                );
-                record_session_datagram_drop(&session_sender, QuicDatagramDropReason::TooLarge);
-            }
-            Err(quinn::SendDatagramError::UnsupportedByPeer) => {
-                record_session_datagram_evidence(
-                    &peer,
-                    &session_sender,
-                    DatagramPathEvidenceEvent::OutcomeFailure,
-                );
-                record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Unsupported);
-                peer.metrics()
-                    .record_data_health_failure(TransportKind::Quic);
-                closed.cancel();
-                return;
-            }
-            Err(quinn::SendDatagramError::Disabled) => {
-                record_session_datagram_evidence(
-                    &peer,
-                    &session_sender,
-                    DatagramPathEvidenceEvent::OutcomeFailure,
-                );
-                record_session_datagram_drop(&session_sender, QuicDatagramDropReason::Disabled);
-                peer.metrics()
-                    .record_data_health_failure(TransportKind::Quic);
-                closed.cancel();
-                return;
-            }
-            Err(quinn::SendDatagramError::ConnectionLost(_)) => {
-                record_session_datagram_evidence(
-                    &peer,
-                    &session_sender,
-                    DatagramPathEvidenceEvent::OutcomeFailure,
-                );
-                record_session_datagram_drop(
-                    &session_sender,
-                    QuicDatagramDropReason::ConnectionLost,
-                );
-                closed.cancel();
-                return;
-            }
+            closed.cancel();
+            false
         }
     }
 }

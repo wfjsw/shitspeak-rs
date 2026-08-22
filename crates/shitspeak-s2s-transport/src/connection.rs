@@ -759,6 +759,24 @@ impl ActiveStream {
         }
     }
 
+    /// Constructor for the UDP packet endpoint's evict-oldest data lane.
+    pub(crate) fn new_latest_wins(
+        transport: TransportKind,
+        remote_addr: Option<SocketAddr>,
+        sender: LatestWinsSender<OutboundFrame>,
+        closed: CancellationToken,
+        is_dialer: bool,
+    ) -> Self {
+        Self {
+            transport,
+            remote_addr,
+            sender: SessionSender::LatestWins(sender),
+            closed,
+            is_dialer,
+            installed_at: Instant::now(),
+        }
+    }
+
     pub fn transport(&self) -> TransportKind {
         self.transport
     }
@@ -802,7 +820,7 @@ impl ActiveStream {
             datagrams_received,
             datagrams_dropped,
         ) = match &self.sender {
-            SessionSender::Legacy(_) => (
+            SessionSender::Legacy(_) | SessionSender::LatestWins(_) => (
                 QuicSessionProtocol::S2s1,
                 false,
                 None,
@@ -845,6 +863,10 @@ impl ActiveStream {
 #[derive(Clone)]
 pub(crate) enum SessionSender {
     Legacy(AdaptiveQueueSender<OutboundFrame>),
+    /// Latest-wins (evict-oldest) data lane used by the UDP endpoint so
+    /// real-time frames favor freshness under sustained overload. Admission is
+    /// bounded by an adaptive capacity, so eviction is pathological only.
+    LatestWins(LatestWinsSender<OutboundFrame>),
     QuicV2(QuicV2SessionSender),
 }
 
@@ -1114,7 +1136,7 @@ impl SessionSender {
     pub(crate) fn quic_v2_datagram_evidence_session(&self) -> Option<u64> {
         match self {
             Self::QuicV2(sender) => Some(sender.datagram_evidence_session()),
-            Self::Legacy(_) => None,
+            Self::Legacy(_) | Self::LatestWins(_) => None,
         }
     }
 
@@ -1129,6 +1151,16 @@ impl SessionSender {
                 .map_err(|error| match error {
                     TryAdaptiveSendError::Full(_) => SessionTrySendError::Full,
                     TryAdaptiveSendError::Closed(_) => SessionTrySendError::Closed,
+                }),
+            Self::LatestWins(sender) => sender
+                .try_send(frame)
+                .map(|result| SessionSendOutcome {
+                    evicted_items: result.evicted_items(),
+                    dropped_expired: false,
+                })
+                .map_err(|error| match error {
+                    LatestWinsSendError::Closed(_) => SessionTrySendError::Closed,
+                    LatestWinsSendError::TooLarge { .. } => SessionTrySendError::TooLarge,
                 }),
             Self::QuicV2(sender) => sender.try_send(frame),
         }
@@ -1157,6 +1189,7 @@ impl SessionSender {
     ) -> (usize, usize) {
         match self {
             Self::Legacy(sender) => (sender.depth_bytes(), sender.capacity_bytes()),
+            Self::LatestWins(sender) => (sender.depth_bytes(), sender.capacity_bytes()),
             Self::QuicV2(sender) => sender.depth_capacity(level, class),
         }
     }
@@ -1184,6 +1217,7 @@ impl SessionSender {
     fn aggregate_depth_capacity(&self) -> (usize, usize) {
         match self {
             Self::Legacy(sender) => (sender.depth_bytes(), sender.capacity_bytes()),
+            Self::LatestWins(sender) => (sender.depth_bytes(), sender.capacity_bytes()),
             Self::QuicV2(sender) => sender.aggregate_depth_capacity(),
         }
     }
@@ -1191,6 +1225,7 @@ impl SessionSender {
     pub(crate) fn is_closed(&self) -> bool {
         match self {
             Self::Legacy(sender) => sender.is_closed(),
+            Self::LatestWins(sender) => sender.is_closed(),
             Self::QuicV2(sender) => sender.is_closed(),
         }
     }
@@ -1198,7 +1233,7 @@ impl SessionSender {
     pub(crate) fn quic_v2_max_datagram_size(&self) -> Option<usize> {
         match self {
             Self::QuicV2(sender) => Some(sender.max_datagram_size()),
-            Self::Legacy(_) => None,
+            Self::Legacy(_) | Self::LatestWins(_) => None,
         }
     }
 

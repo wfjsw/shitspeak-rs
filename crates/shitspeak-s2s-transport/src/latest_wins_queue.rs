@@ -88,6 +88,13 @@ pub(crate) enum LatestWinsSendError<T> {
     },
 }
 
+/// Error returned by [`LatestWinsReceiver::try_recv`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TryRecvLatestWinsError {
+    Empty,
+    Closed,
+}
+
 impl<T> LatestWinsSendError<T> {
     pub(crate) fn into_item(self) -> T {
         match self {
@@ -265,6 +272,23 @@ impl<T> LatestWinsReceiver<T> {
     pub(crate) fn depth_bytes(&self) -> usize {
         self.inner.state.lock().depth_bytes
     }
+
+    /// Non-blocking receive of the next buffered item, if one is ready.
+    pub(crate) fn try_recv(&mut self) -> Result<T, TryRecvLatestWinsError> {
+        let mut state = self.inner.state.lock();
+        if state.cancelled {
+            return Err(TryRecvLatestWinsError::Closed);
+        }
+        if let Some(entry) = state.items.pop_front() {
+            state.depth_bytes = state.depth_bytes.saturating_sub(entry.bytes);
+            return Ok(entry.item);
+        }
+        if state.closed {
+            Err(TryRecvLatestWinsError::Closed)
+        } else {
+            Err(TryRecvLatestWinsError::Empty)
+        }
+    }
 }
 
 impl<T> Drop for LatestWinsReceiver<T> {
@@ -422,6 +446,18 @@ mod tests {
 
         let err = tx.try_send(Item::new(1, 4)).expect_err("receiver is gone");
         assert_eq!(err.into_item(), Item::new(1, 4));
+    }
+
+    #[test]
+    fn try_recv_returns_items_without_blocking() {
+        let (tx, mut rx) = latest_wins_queue::<Item>(10);
+        assert_eq!(rx.try_recv(), Err(TryRecvLatestWinsError::Empty));
+        tx.try_send(Item::new(1, 4)).expect("first item");
+        assert_eq!(rx.try_recv(), Ok(Item::new(1, 4)));
+        assert_eq!(rx.try_recv(), Err(TryRecvLatestWinsError::Empty));
+
+        tx.close();
+        assert_eq!(rx.try_recv(), Err(TryRecvLatestWinsError::Closed));
     }
 
     #[tokio::test]
