@@ -147,16 +147,22 @@ message VoiceFrame {
   bool proactive_copy   = 9;
 
   // Change-set C3 best-effort block FEC. When set, this frame is NOT part of
-  // the data sequence: `payload` is the XOR of the member payloads named by
+  // the data sequence: `payload` is a parity frame for the block named by
   // `fec_member_seqs` (all members have equal length, so reconstruction is
   // unambiguous), and receivers route it to the FEC window, never the
   // reorder. `s2s_seq` is the seq of the frame that completed the block
-  // (correlation/debug only). Absent/false for peers predating this field.
+  // (correlation/debug only). `fec_parity_index` selects which parity equation
+  // the payload carries: 0 is the plain XOR sum (recovers one missing member),
+  // 1 is the GF(2^8) weighted sum with Vandermonde coefficient 2^index
+  // (together with index 0, recovers two missing members). A peer that only
+  // sends index 0 interoperates with receivers expecting either. Absent/false
+  // for peers predating this field.
   bool fec_parity           = 10;
   repeated uint64 fec_member_seqs = 11;
   // Bit `i` set when member `i` of the block was an utterance terminator, so
   // a reconstruction can restore the flag.
   uint32 fec_terminator_mask = 12;
+  uint32 fec_parity_index    = 13;
 }
 
 // Best-effort request for the origin node to replay recently-sent voice

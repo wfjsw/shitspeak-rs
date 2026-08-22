@@ -1723,6 +1723,25 @@ impl ConnectionManager {
             .map(|link| (selected, link))
     }
 
+    /// Worst effective packet loss among the live datagram transports (UDP,
+    /// KCP) for `node`, or `None` when no datagram transport is live.
+    ///
+    /// The FEC gate keys on this rather than the routing-selected best
+    /// transport: best-effort voice may ride any live transport, and the
+    /// send-time deadline-queue penalty can push it off a low-loss QUIC
+    /// stream onto the lossy datagram lane, so the selected transport's loss
+    /// understates what the datagram lane actually delivers.
+    pub fn datagram_lane_effective_loss_ppm(&self, node: NodeIdentifier) -> Option<u32> {
+        let peer = self.inner.get_peer(node)?;
+        let snapshot = peer.metrics().snapshot_per_transport();
+        peer.live_kinds()
+            .into_iter()
+            .filter(|kind| matches!(kind, TransportKind::Udp | TransportKind::Kcp))
+            .filter_map(|kind| snapshot.get(&kind))
+            .map(|link| link.effective_packet_loss_ppm())
+            .max()
+    }
+
     /// Best queue-pressure penalty the sender would see for this peer now.
     /// Lower is better; this combines the peer dispatcher backlog with the
     /// selected stream. Expiring sends include estimated drain time while

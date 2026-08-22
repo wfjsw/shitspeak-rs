@@ -1267,6 +1267,7 @@ mod tests {
             fec_parity: false,
             fec_member_seqs: Vec::new(),
             fec_terminator_mask: 0,
+            fec_parity_index: 0,
         }
     }
 

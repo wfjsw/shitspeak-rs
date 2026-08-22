@@ -184,6 +184,11 @@ pub struct VoiceRouteQuality {
     loss_ppm: u32,
     jitter_us: u64,
     alternate: Option<VoiceRouteAlternative>,
+    /// Effective loss of the datagram lane (worst of live UDP/KCP) to the
+    /// next hop. `None` when no datagram transport is live. The FEC gate keys
+    /// on this — the lane FEC parity actually protects — which can be lossier
+    /// than the routing-selected transport.
+    datagram_loss_ppm: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -210,7 +215,14 @@ impl VoiceRouteQuality {
             loss_ppm,
             jitter_us,
             alternate: None,
+            datagram_loss_ppm: None,
         }
+    }
+
+    /// Attach the effective loss of the datagram lane to this first hop.
+    pub fn with_datagram_loss_ppm(mut self, loss_ppm: Option<u32>) -> Self {
+        self.datagram_loss_ppm = loss_ppm;
+        self
     }
 
     /// Attach a loop-free route whose first hop differs from the selected
@@ -268,6 +280,10 @@ impl VoiceRouteQuality {
 
     pub fn loss_ppm(self) -> u32 {
         self.loss_ppm
+    }
+
+    pub fn datagram_loss_ppm(self) -> Option<u32> {
+        self.datagram_loss_ppm
     }
 
     pub fn jitter_us(self) -> u64 {
@@ -2201,6 +2217,7 @@ impl OverlayNetwork {
             })
             .collect::<Vec<_>>();
         let mut next_hop_metrics = HashMap::new();
+        let mut next_hop_datagram_loss = HashMap::new();
 
         routes
             .into_iter()
@@ -2210,13 +2227,17 @@ impl OverlayNetwork {
                     self.selected_voice_transport_metrics(primary.next_hop, level, routing_metric)
                 });
                 let (transport, link) = selected.as_ref()?;
+                let datagram_loss = next_hop_datagram_loss
+                    .entry(primary.next_hop)
+                    .or_insert_with(|| self.datagram_lane_loss_ppm(primary.next_hop));
                 let mut quality = VoiceRouteQuality::new(
                     primary.next_hop,
                     *transport,
                     primary.latency_us,
                     link.effective_packet_loss_ppm(),
                     link.jitter_us().max(0.0) as u64,
-                );
+                )
+                .with_datagram_loss_ppm(*datagram_loss);
 
                 if let Some(alternate) = alternate {
                     let alternate_selected = next_hop_metrics
@@ -2270,6 +2291,16 @@ impl OverlayNetwork {
             false,
             std::time::Instant::now(),
         );
+    }
+
+    /// Effective packet loss of the datagram lane to `next_hop` (worst among
+    /// live UDP/KCP transports), or `None` when no datagram transport is
+    /// live. The FEC gate keys on this — the lane FEC parity actually protects
+    /// — rather than the routing-selected best transport.
+    pub fn datagram_lane_loss_ppm(&self, next_hop: NodeIdentifier) -> Option<u32> {
+        self.inner
+            .transport
+            .datagram_lane_effective_loss_ppm(next_hop)
     }
 
     fn selected_voice_transport_metrics(

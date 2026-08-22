@@ -114,6 +114,13 @@ pub struct VoiceConfig {
     /// (no redundancy) rather than sent with length ambiguity.
     pub voice_fec_block_size: usize,
 
+    /// How many parity frames each completed block emits. 1 = plain XOR sum
+    /// (recovers one missing member per block). 2 = adds a GF(2^8) weighted
+    /// sum that, together with the plain sum, recovers two missing members.
+    /// Clamped to at most `voice_fec_block_size - 1` (never more parity than
+    /// data), and never above 2.
+    pub voice_fec_parity_blocks: usize,
+
     /// How many recent payloads per `(sender_session, sender_epoch, from)`
     /// the receiver caches to XOR against a parity block, and how many
     /// received parity blocks it retains.
@@ -154,6 +161,7 @@ impl Default for VoiceConfig {
             repair_reactive_hard_reserve_pct: default_repair_reactive_hard_reserve_pct(),
             voice_fec_enabled: default_voice_fec_enabled(),
             voice_fec_block_size: default_voice_fec_block_size(),
+            voice_fec_parity_blocks: default_voice_fec_parity_blocks(),
             voice_fec_receiver_window: default_voice_fec_receiver_window(),
             voice_fec_loss_gate_ppm: default_voice_fec_loss_gate_ppm(),
         }
@@ -228,6 +236,8 @@ struct VoiceConfigWire {
     voice_fec_enabled: bool,
     #[serde(default = "default_voice_fec_block_size")]
     voice_fec_block_size: usize,
+    #[serde(default = "default_voice_fec_parity_blocks")]
+    voice_fec_parity_blocks: usize,
     #[serde(default = "default_voice_fec_receiver_window")]
     voice_fec_receiver_window: usize,
     #[serde(default = "default_voice_fec_loss_gate_ppm")]
@@ -258,6 +268,11 @@ impl<'de> Deserialize<'de> for VoiceConfig {
         if raw.voice_fec_block_size < 2 || raw.voice_fec_block_size > 32 {
             return Err(D::Error::custom(
                 "voice_fec_block_size must be between 2 and 32",
+            ));
+        }
+        if raw.voice_fec_parity_blocks < 1 || raw.voice_fec_parity_blocks > 2 {
+            return Err(D::Error::custom(
+                "voice_fec_parity_blocks must be between 1 and 2",
             ));
         }
         let _ = (
@@ -297,6 +312,7 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             repair_reactive_hard_reserve_pct: raw.repair_reactive_hard_reserve_pct,
             voice_fec_enabled: raw.voice_fec_enabled,
             voice_fec_block_size: raw.voice_fec_block_size,
+            voice_fec_parity_blocks: raw.voice_fec_parity_blocks,
             voice_fec_receiver_window: raw.voice_fec_receiver_window,
             voice_fec_loss_gate_ppm: raw.voice_fec_loss_gate_ppm,
         })
@@ -404,6 +420,9 @@ fn default_voice_fec_enabled() -> bool {
 }
 fn default_voice_fec_block_size() -> usize {
     4
+}
+fn default_voice_fec_parity_blocks() -> usize {
+    1
 }
 fn default_voice_fec_receiver_window() -> usize {
     8
