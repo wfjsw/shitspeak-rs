@@ -189,6 +189,11 @@ pub struct VoiceRouteQuality {
     /// on this — the lane FEC parity actually protects — which can be lossier
     /// than the routing-selected transport.
     datagram_loss_ppm: Option<u32>,
+    /// Whether the datagram lane to the next hop is currently evicting
+    /// (best-effort frames shed at the send path within the recent window).
+    /// The FEC gate skips parity while true: parity sent over an evicting lane
+    /// is shed before the wire, so emitting it only adds load.
+    datagram_lane_shedding: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -216,12 +221,20 @@ impl VoiceRouteQuality {
             jitter_us,
             alternate: None,
             datagram_loss_ppm: None,
+            datagram_lane_shedding: false,
         }
     }
 
     /// Attach the effective loss of the datagram lane to this first hop.
     pub fn with_datagram_loss_ppm(mut self, loss_ppm: Option<u32>) -> Self {
         self.datagram_loss_ppm = loss_ppm;
+        self
+    }
+
+    /// Attach whether the datagram lane to this first hop is currently evicting
+    /// at the send path. The FEC gate skips parity while it is true.
+    pub fn with_datagram_lane_shedding(mut self, shedding: bool) -> Self {
+        self.datagram_lane_shedding = shedding;
         self
     }
 
@@ -284,6 +297,10 @@ impl VoiceRouteQuality {
 
     pub fn datagram_loss_ppm(self) -> Option<u32> {
         self.datagram_loss_ppm
+    }
+
+    pub fn datagram_lane_shedding(self) -> bool {
+        self.datagram_lane_shedding
     }
 
     pub fn jitter_us(self) -> u64 {
@@ -2218,6 +2235,7 @@ impl OverlayNetwork {
             .collect::<Vec<_>>();
         let mut next_hop_metrics = HashMap::new();
         let mut next_hop_datagram_loss = HashMap::new();
+        let mut next_hop_shedding = HashMap::new();
 
         routes
             .into_iter()
@@ -2230,6 +2248,9 @@ impl OverlayNetwork {
                 let datagram_loss = next_hop_datagram_loss
                     .entry(primary.next_hop)
                     .or_insert_with(|| self.datagram_lane_loss_ppm(primary.next_hop));
+                let shedding = next_hop_shedding
+                    .entry(primary.next_hop)
+                    .or_insert_with(|| self.datagram_lane_shedding(primary.next_hop));
                 let mut quality = VoiceRouteQuality::new(
                     primary.next_hop,
                     *transport,
@@ -2237,7 +2258,8 @@ impl OverlayNetwork {
                     link.effective_packet_loss_ppm(),
                     link.jitter_us().max(0.0) as u64,
                 )
-                .with_datagram_loss_ppm(*datagram_loss);
+                .with_datagram_loss_ppm(*datagram_loss)
+                .with_datagram_lane_shedding(*shedding);
 
                 if let Some(alternate) = alternate {
                     let alternate_selected = next_hop_metrics
@@ -2301,6 +2323,13 @@ impl OverlayNetwork {
         self.inner
             .transport
             .datagram_lane_effective_loss_ppm(next_hop)
+    }
+
+    /// Whether the datagram lane to `next_hop` is currently evicting at the
+    /// send path. The FEC gate skips parity while true: parity sent over an
+    /// evicting lane is shed before the wire, so emitting it only adds load.
+    pub fn datagram_lane_shedding(&self, next_hop: NodeIdentifier) -> bool {
+        self.inner.transport.datagram_lane_shedding(next_hop)
     }
 
     fn selected_voice_transport_metrics(

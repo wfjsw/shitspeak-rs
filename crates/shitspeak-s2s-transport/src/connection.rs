@@ -4,7 +4,7 @@
 //! the dial address book, the set of currently-active streams, reconnect
 //! backoff, and aggregated metrics.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -26,7 +26,7 @@ use super::adaptive_queue::{
 };
 use super::latest_wins_queue::{
     LatestWinsQueueItem, LatestWinsReceiver, LatestWinsSendError, LatestWinsSender,
-    latest_wins_queue,
+    latest_wins_queue_unbounded,
 };
 use super::metrics::{
     DatagramPathEvidenceSnapshot, DatagramPathHealthReason, DatagramPathHealthSnapshot,
@@ -863,9 +863,9 @@ impl ActiveStream {
 #[derive(Clone)]
 pub(crate) enum SessionSender {
     Legacy(AdaptiveQueueSender<OutboundFrame>),
-    /// Latest-wins (evict-oldest) data lane used by the UDP endpoint so
-    /// real-time frames favor freshness under sustained overload. Admission is
-    /// bounded by an adaptive capacity, so eviction is pathological only.
+    /// Unbounded real-time data lane used by the UDP endpoint. A best-effort
+    /// UDP send never fails or backpressures, so the lane sheds frames only by
+    /// their deadline at dequeue time — never on an arbitrary byte budget.
     LatestWins(LatestWinsSender<OutboundFrame>),
     QuicV2(QuicV2SessionSender),
 }
@@ -949,7 +949,13 @@ impl QuicV2SessionSender {
             AdaptiveQueueSender::new(high_budget.split(stream_lane_bytes));
         let (regular, regular_rx) =
             AdaptiveQueueSender::new(regular_budget.split(stream_lane_bytes));
-        let (datagram, datagram_rx) = latest_wins_queue(datagram_bytes);
+        // The DATAGRAM lane is unbounded: `send_datagram_wait` already
+        // backpressures on quinn's datagram buffer when the wire is the
+        // bottleneck, so an arbitrary app-side byte budget on top of that only
+        // sheds still-viable frames. Real-time freshness is shed by frame
+        // deadline at dequeue time, which bounds the queue by offered rate ×
+        // deadline. `datagram_bytes` remains the reported send-buffer size.
+        let (datagram, datagram_rx) = latest_wins_queue_unbounded();
         (
             Self {
                 control,
@@ -1437,6 +1443,14 @@ fn jittered_delay(base: Duration, cap: Duration) -> Duration {
     Duration::from_nanos(rand::rng().random_range(low..=high))
 }
 
+/// Window over which best-effort datagram-lane sheds are counted for the FEC
+/// send-path pressure gate (`PeerState::datagram_lane_shedding`).
+pub(crate) const DATAGRAM_LANE_SHED_WINDOW: Duration = Duration::from_secs(1);
+/// Sheds within the window that indicate sustained offered > drain on the
+/// datagram lane — a single occasional expired frame is noise, but repeated
+/// sheds mean redundancy sent over the lane would be shed before the wire.
+pub(crate) const DATAGRAM_LANE_SHED_THRESHOLD: usize = 2;
+
 /// Aggregate state for one peer. The supervisor mutates this through `Mutex`
 /// guards held briefly across non-blocking work.
 pub(crate) struct PeerState {
@@ -1465,6 +1479,11 @@ pub(crate) struct PeerState {
     udp_datagram_mtu_ceiling: AtomicUsize,
     udp_datagram_mtu_last_probe: Mutex<Option<Instant>>,
     expired_outbound_drops: ExpiredOutboundDropCounters,
+    /// Recent timestamps of best-effort datagram frames shed at the write path
+    /// (expired before the wire). Sustained shedding means offered > drain on
+    /// the datagram lane, so redundancy sent over it is shed too — the FEC gate
+    /// keys on this to skip parity while the lane is evicting.
+    datagram_lane_sheds: Mutex<VecDeque<Instant>>,
     transport_health_exclusions:
         Mutex<HashMap<(TransportKind, TransportHealthExclusionReason), u64>>,
     datagram_path_health: Mutex<HashMap<DeliveryPath, DatagramPathHealthObservation>>,
@@ -1525,6 +1544,7 @@ impl PeerState {
             udp_datagram_mtu_ceiling: AtomicUsize::new(1200),
             udp_datagram_mtu_last_probe: Mutex::new(None),
             expired_outbound_drops: ExpiredOutboundDropCounters::default(),
+            datagram_lane_sheds: Mutex::new(VecDeque::new()),
             transport_health_exclusions: Mutex::new(HashMap::new()),
             datagram_path_health: Mutex::new(HashMap::new()),
             conversational_transport_loss_suspect: Mutex::new(HashMap::new()),
@@ -2295,6 +2315,47 @@ impl PeerState {
         class: MessageClass,
     ) {
         self.expired_outbound_drops.record(stage, transport, class);
+        if stage == ExpiredOutboundDropStage::TransportWrite
+            && transport == Some(TransportKind::Udp)
+        {
+            // A best-effort UDP frame expired before the wire: the datagram
+            // lane cannot drain what was offered. QUIC datagram sheds are
+            // recorded directly at the prepare site (quic.rs) because that path
+            // uses a separate drop counter.
+            self.record_datagram_lane_shed();
+        }
+    }
+
+    /// Record one best-effort datagram frame shed at the send path (expired
+    /// before the wire). Fed by the UDP write pump and the QUIC datagram
+    /// prepare path.
+    pub(crate) fn record_datagram_lane_shed(&self) {
+        let now = Instant::now();
+        let mut sheds = self.datagram_lane_sheds.lock();
+        sheds.push_back(now);
+        // Prune on every record so the deque stays bounded to the window even
+        // under a shed storm.
+        while sheds
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= DATAGRAM_LANE_SHED_WINDOW)
+        {
+            sheds.pop_front();
+        }
+    }
+
+    /// Whether the datagram lane to this peer is currently evicting: at least
+    /// [`DATAGRAM_LANE_SHED_THRESHOLD`] frames shed within the recent window.
+    /// The FEC sender skips parity while this is true — the parity would be
+    /// shed before the wire too.
+    pub(crate) fn datagram_lane_shedding(&self, now: Instant) -> bool {
+        let mut sheds = self.datagram_lane_sheds.lock();
+        while sheds
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= DATAGRAM_LANE_SHED_WINDOW)
+        {
+            sheds.pop_front();
+        }
+        sheds.len() >= DATAGRAM_LANE_SHED_THRESHOLD
     }
 
     pub(crate) fn expired_outbound_drop_status(&self) -> Vec<ExpiredOutboundDropSnapshot> {
@@ -3605,6 +3666,39 @@ mod tests {
             MetricsTuning::default(),
             1024 * 1024,
         )
+    }
+
+    #[test]
+    fn datagram_lane_shedding_signals_sustained_send_path_eviction() {
+        let peer = peer_for_address_tests();
+        let now = Instant::now();
+        assert!(
+            !peer.datagram_lane_shedding(now),
+            "a clean lane is not evicting"
+        );
+
+        // A single occasional shed is below the threshold.
+        peer.record_datagram_lane_shed();
+        assert!(
+            !peer.datagram_lane_shedding(now),
+            "one shed within the window is noise, not eviction"
+        );
+
+        // Repeated sheds within the window indicate offered > drain.
+        peer.record_datagram_lane_shed();
+        assert!(
+            peer.datagram_lane_shedding(now),
+            "repeated sheds within the window flag the lane as evicting"
+        );
+
+        // Once the window elapses without further sheds the lane recovers. The
+        // query time must be strictly more than the window past the *recorded*
+        // shed instants (recorded at or after `now`).
+        assert!(
+            !peer
+                .datagram_lane_shedding(now + DATAGRAM_LANE_SHED_WINDOW + Duration::from_secs(1)),
+            "no recent sheds means the lane has recovered"
+        );
     }
 
     fn observe_quic_test_window(

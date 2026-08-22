@@ -42,11 +42,10 @@ const TRANSITION_CONTROL_INTERVAL: Duration = Duration::from_millis(50);
 /// within a fraction of a second of real load.
 const TRANSITION_ABORT_PRESSURE: u8 = 3;
 const TRANSITION_ABORT_OBSERVATIONS: u32 = 2;
-/// A challenger at or above this marginal pressure pauses the ramp until the
-/// measurement catches up (it is loaded now, not idle).
-const TRANSITION_MARGINAL_PRESSURE: u8 = 2;
 /// How long the new route must hold full load at the end of a fade before the
-/// transition commits and the old route is dropped entirely.
+/// transition commits and the old route is dropped entirely. A challenger that
+/// degrades hard (pressure >= 3) during the confirm is caught by the abort
+/// fast-path instead.
 const TRANSITION_CONFIRM: Duration = Duration::from_millis(150);
 pub(crate) const DISTRIBUTION_CONTROL_SERVICE_TAG: u32 = 250;
 pub(crate) const VOICE_REALTIME_PROFILE_ID: u32 = 1;
@@ -555,19 +554,14 @@ impl TreeEdgeSplitState {
                 }
             }
             SplitPhase::Adjusting => {
-                // Load-aware hold: pause an upward ramp while the challenger is
-                // marginal (`>= 2`) so its loaded metrics catch up — unless the
-                // old route itself is failing, in which case escaping wins. A
-                // downward ramp (rolling back to the old route) is never paused:
-                // a marginal challenger is exactly why we would roll back.
-                let ramping_toward_challenger = *target > *share;
-                let paused = ramping_toward_challenger
-                    && to_pressure >= TRANSITION_MARGINAL_PRESSURE
-                    && !old_route_broken;
+                // Ramp toward the (loaded-cost) target continuously. No pause on
+                // marginal challengers: the Fanout window already probed the
+                // challenger under load, the softmax target is built from loaded
+                // costs, and a challenger that degrades hard during the ramp is
+                // caught by the abort fast-path above. A downward ramp (rolling
+                // back to the old route) is never paused either.
                 let was_at_target = (*share - *target).abs() <= f64::EPSILON;
-                if !paused {
-                    ramp_split_share(share, *target, last_ramp_at, now, policy.transition_fade);
-                }
+                ramp_split_share(share, *target, last_ramp_at, now, policy.transition_fade);
                 if !was_at_target && (*share - *target).abs() <= f64::EPSILON {
                     // Start the confirm/hold window at the moment the share arrives.
                     *phase_started_at = now;
@@ -602,11 +596,16 @@ impl TreeEdgeSplitState {
             }
         }
 
+        // Complete onto the challenger once the loaded-cost softmax decisively
+        // prefers it (`target == 1.0`) and the share has fully arrived. The
+        // confirm window guards against a flapping verdict; a challenger that
+        // degrades hard (pressure >= 3) trips the abort fast-path above first.
+        // An old route that is itself failing completes immediately so the lane
+        // is never stalled into a route voice cannot ride.
         if *share >= *target
             && *target >= 1.0
             && (old_route_broken
-                || (to_pressure < TRANSITION_MARGINAL_PRESSURE
-                    && now.saturating_duration_since(*phase_started_at) >= TRANSITION_CONFIRM))
+                || now.saturating_duration_since(*phase_started_at) >= TRANSITION_CONFIRM)
         {
             return TreeEdgeTransitionStep::Complete;
         }
@@ -746,16 +745,25 @@ fn begin_tree_edge_transition(
 /// cost is the primary axis and min_hold/challenger_confirm remain the only
 /// time hysteresis.
 ///
-/// `challenger_is_idle` applies the idle-credibility discount: a challenger
-/// whose first hop has carried no recent voice traffic reports clean metrics
-/// precisely because it is unloaded — those are stale bets the moment it takes
-/// load. Against a *healthy* incumbent (pressure < 2) an idle challenger must
-/// be ≥20% cheaper before we start loading it; non-idle challengers only clear
-/// the normal ≥10% margin. A challenger whose first hop is live-degraded
-/// relative to the incumbent cannot win on advertised cost alone — its cost
-/// has not yet caught up with the live signal. Hard-failure replacement
-/// (pressure >= 3) never reaches this gate; it is handled earlier so escaping
-/// a failing route is never blocked.
+/// Loaded challengers are compared on their *loaded* cost
+/// (`route_cost × (1+pressure)`) — the same figure the split softmax keys on —
+/// so the gate agrees with the softmax instead of starting a Fanout the
+/// controller immediately rolls back. A challenger's own load inflates its
+/// loaded cost (a saturated relay is not cheap), while the incumbent's load
+/// inflates its (a congested incumbent is replaceable even at equal raw cost).
+///
+/// `challenger_is_idle` applies the idle-credibility discount to a fully-clean
+/// challenger (pressure 0) whose first hop has carried no recent voice traffic:
+/// it reports clean metrics precisely because it is unloaded — those are stale
+/// bets the moment it takes load, and its ×1 loaded factor would clear the
+/// loaded bar merely because the incumbent carries load. Against a *healthy*
+/// incumbent (pressure < 2) such a challenger must clear the stricter ≥20%
+/// *raw* margin before we start loading it; non-idle (or live-degraded)
+/// challengers only need the normal ≥10% loaded margin. A challenger whose
+/// first hop is live-degraded relative to the incumbent cannot win on
+/// advertised cost alone — its cost has not yet caught up with the live signal.
+/// Hard-failure replacement (pressure >= 3) never reaches this gate; it is
+/// handled earlier so escaping a failing route is never blocked.
 fn candidate_is_better(
     challenger: TreeEdgeCandidate,
     incumbent: TreeEdgeCandidate,
@@ -764,13 +772,25 @@ fn candidate_is_better(
     if challenger.pressure > incumbent.pressure.saturating_add(1) {
         return false;
     }
-    if challenger_is_idle && incumbent.pressure < 2 {
-        return challenger
-            .route_cost
-            .saturating_mul(100)
-            <= incumbent.route_cost.saturating_mul(80);
+    let challenger_loaded = loaded_route_cost(Some(challenger.route_cost), challenger.pressure);
+    let incumbent_loaded = loaded_route_cost(Some(incumbent.route_cost), incumbent.pressure);
+    if challenger_is_idle && challenger.pressure == 0 && incumbent.pressure < 2 {
+        // Idle-credibility discount, measured on raw cost: a fully-clean
+        // challenger's advertised cost is a stale bet the moment it takes load,
+        // and on loaded cost its ×1 factor would clear the bar merely because
+        // the incumbent carries load (an idle 38-vs-40 route reads as 52%
+        // cheaper on loaded cost, when the raw edge is 5% and untested).
+        // Against a healthy incumbent, require a decisive ≥20% raw cost
+        // improvement before loading an untested route.
+        return challenger.route_cost * 100 <= incumbent.route_cost * 80;
     }
-    challenger.route_cost.saturating_mul(100) <= incumbent.route_cost.saturating_mul(90)
+    // Loaded comparison (Gap B): the same figure the split softmax keys on, so
+    // the gate agrees with the controller. A challenger's own load inflates its
+    // loaded cost (a saturated relay is not cheap), while the incumbent's load
+    // inflates its (a congested incumbent is replaceable even at equal raw
+    // cost). This keeps a saturated-cheap relay from winning the gate and then
+    // losing the softmax — the wasted Fanout Gap B removes.
+    challenger_loaded * 100.0 <= incumbent_loaded * 90.0
 }
 
 fn prune_voice_overlap_samples(link: &mut VoiceOverlapLink, now: Instant) {
@@ -3317,6 +3337,137 @@ mod tests {
         assert!(
             done_at >= 750 + 700 + 400 + 150,
             "completes only after fanout+fade+confirm (was {done_at})"
+        );
+    }
+
+    #[test]
+    fn marginal_challenger_with_decisive_loaded_cost_completes_transition() {
+        // Gap A regression: a challenger already under marginal load (pressure
+        // 2) is still the better *loaded* route (cost 3 → loaded 9 vs the
+        // incumbent's loaded 80), so the softmax snaps the target to 1.0 and the
+        // transition completes onto it. The old marginal-pressure gate paused
+        // the ramp and required to_pressure < 2 to Complete, which made any
+        // switch onto a loaded challenger structurally impossible under
+        // sustained mesh congestion.
+        let plane = DistributionPlane::default();
+        let tree_key = key(120, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 40)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+
+        // The challenger reports marginal pressure 2 from the start — it is
+        // carrying load, not idle — yet its loaded cost is decisively cheaper.
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 2, 3),
+            ]
+        };
+        let first = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            fast_sticky_policy(),
+            at(250),
+        );
+        assert_eq!(first.path(), TreeEdgePath::DirectChild);
+        let confirmed = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            fast_sticky_policy(),
+            at(750),
+        );
+        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
+        let _ = plane.complete_tree_edge_attempt(confirmed, true, at(750));
+        assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_some());
+
+        // Drive through fanout + fade + confirm; the transition commits onto the
+        // loaded challenger instead of stalling in Adjusting forever.
+        let completion = (0..100u64).find_map(|i| {
+            let ms = 1450 + i * 50;
+            let _ = plane.choose_tree_edge(
+                tree_key,
+                1,
+                2,
+                candidates(),
+                fast_sticky_policy(),
+                at(ms),
+            );
+            plane
+                .active_tree_edge_split(tree_key, 1, 2)
+                .is_none()
+                .then_some(ms)
+        });
+        let done_at =
+            completion.expect("transition completes onto a loaded-but-cheaper challenger");
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::LegacyVia(4097))
+        );
+        assert!(
+            done_at >= 750 + 700 + 400 + 150,
+            "completes only after fanout+fade+confirm (was {done_at})"
+        );
+    }
+
+    #[test]
+    fn saturated_relay_loses_gate_to_healthy_incumbent_on_loaded_cost() {
+        // Gap B regression: a relay already carrying load (pressure 2) has its
+        // loaded cost inflated to parity with the incumbent (10×3 == 15×2 == 30).
+        // On raw cost it looks 33% cheaper and would win the old gate, then lose
+        // the loaded-cost softmax — a wasted Fanout. The loaded gate rejects it
+        // outright, so the incumbent stays primary.
+        let plane = DistributionPlane::default();
+        let tree_key = key(121, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![TreeEdgeCandidate::direct_with_cost(1, 15)],
+            fast_sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 15),
+                TreeEdgeCandidate::legacy(4097, 2, 10),
+            ]
+        };
+        // Drive like production: each frame chooses, then completes the attempt
+        // (which refreshes the binding's liveness so it is never idle-pruned —
+        // the un-gated initial-pick re-selection would otherwise kick in past
+        // idle_reset). Even after min_hold + a full confirm window, the
+        // saturated relay is never picked: the incumbent stays primary and no
+        // split ever starts.
+        for ms in (250..=2000u64).step_by(50) {
+            let attempt =
+                plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(ms));
+            assert_eq!(
+                attempt.path(),
+                TreeEdgePath::DirectChild,
+                "saturated relay must not be adopted (t={ms})"
+            );
+            assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_none());
+            let _ = plane.complete_tree_edge_attempt(attempt, true, at(ms));
+        }
+        assert_eq!(
+            plane.current_tree_edge_path(tree_key, 1, 2),
+            Some(TreeEdgePath::DirectChild)
         );
     }
 

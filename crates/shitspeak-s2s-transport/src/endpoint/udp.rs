@@ -53,10 +53,11 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use crate::types::NodeIdentifier;
 use shitspeak_proto::s2s_transport_proto as pb;
 
-use super::super::adaptive_queue::{AdaptiveQueueBudget, adaptive_datagram_lane_bytes};
 use super::super::compression::{maybe_compress_frame_payload, validate_and_decode_payload};
 use super::super::connection::{ActiveStream, OutboundFrame, PeerState};
-use super::super::latest_wins_queue::{LatestWinsReceiver, TryRecvLatestWinsError, latest_wins_queue};
+use super::super::latest_wins_queue::{
+    LatestWinsReceiver, TryRecvLatestWinsError, latest_wins_queue_unbounded,
+};
 use super::super::frame::{FrameType, build_frame};
 use super::super::identity::{NodeIdentity, parse_peer_cn};
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
@@ -2928,11 +2929,11 @@ fn spawn_udp_write_pump(
     peer_addr: SocketAddr,
     is_dialer: bool,
 ) -> ActiveStream {
-    let lane_bytes = super::super::stream_io::stream_handoff_lane_bytes(
-        AdaptiveQueueBudget::auto().max_bytes(),
-        inner.cfg().max_frame_bytes(),
-    );
-    let (tx, rx) = latest_wins_queue(adaptive_datagram_lane_bytes(lane_bytes));
+    // The UDP data lane is unbounded: a best-effort UDP send to the kernel
+    // never fails or backpressures, so the app queue must not shed frames on an
+    // arbitrary byte budget. Real-time freshness is shed by frame deadline at
+    // dequeue time, which keeps the queue bounded by offered rate × deadline.
+    let (tx, rx) = latest_wins_queue_unbounded();
     let closed = inner.shutdown().child_token();
     tokio::spawn(run_write(state, session, peer, inner, rx, closed.clone()));
     ActiveStream::new_latest_wins(

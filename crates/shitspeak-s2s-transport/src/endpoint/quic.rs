@@ -21,7 +21,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use super::super::adaptive_queue::{AdaptiveQueueBudget, adaptive_datagram_lane_bytes};
+use super::super::adaptive_queue::AdaptiveQueueBudget;
 use super::super::latest_wins_queue::{LatestWinsReceiver, TryRecvLatestWinsError};
 use super::super::compression::{maybe_compress_frame_payload, validate_and_decode_payload};
 use super::super::connection::{ActiveStream, OutboundFrame, PeerState, QuicV2SessionSender};
@@ -793,7 +793,7 @@ async fn install_quic_v2_session(
     let lane_bytes = stream_handoff_lane_bytes(budget.max_bytes(), inner.cfg().max_frame_bytes());
     let (sender, receivers) = QuicV2SessionSender::new(
         lane_bytes,
-        adaptive_datagram_lane_bytes(inner.cfg().quic_datagram_send_buffer_bytes()),
+        inner.cfg().quic_datagram_send_buffer_bytes(),
         inner.cfg().quic_datagram_receive_buffer_bytes(),
         max_datagram_size,
     );
@@ -965,9 +965,9 @@ async fn run_quic_datagram_sender(
         // Send the batch as fast as quinn accepts it. `send_datagram_wait`
         // backpressures on quinn's datagram buffer when the wire is the
         // bottleneck instead of silently discarding the oldest queued datagram
-        // (RFC 9221 drop-on-full); during the wait the app-side latest-wins
-        // queue keeps evicting the oldest frames, which is the intended
-        // real-time fallback under sustained overload.
+        // (RFC 9221 drop-on-full); during the wait the app-side queue is
+        // unbounded, so frames stall there and are shed by their own deadline
+        // at dequeue time — the real-time fallback under sustained overload.
         while let Some(prepared) = pending.pop_front() {
             if !send_quic_datagram(&conn, &session_sender, &peer, prepared, &closed).await {
                 return;
@@ -992,6 +992,10 @@ fn prepare_quic_datagram(
     inner: &ManagerInner,
 ) -> Option<PreparedQuicDatagram> {
     if out.options().is_expired() {
+        // The frame expired before the wire because the datagram lane could not
+        // drain what was offered — feed the send-path shedding signal the FEC
+        // gate keys on (parity sent now would be shed too).
+        peer.record_datagram_lane_shed();
         record_session_datagram_drop(session_sender, QuicDatagramDropReason::Expired);
         return None;
     }
@@ -1033,6 +1037,10 @@ fn prepare_quic_datagram(
         }
     };
     if out.options().is_expired() {
+        // The frame expired before the wire because the datagram lane could not
+        // drain what was offered — feed the send-path shedding signal the FEC
+        // gate keys on (parity sent now would be shed too).
+        peer.record_datagram_lane_shed();
         record_session_datagram_drop(session_sender, QuicDatagramDropReason::Expired);
         return None;
     }

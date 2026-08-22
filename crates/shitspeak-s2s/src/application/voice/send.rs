@@ -235,6 +235,15 @@ pub trait VoiceTransport: Send + Sync + 'static {
             .map(|&dst| self.voice_route_quality(dst))
             .collect()
     }
+
+    /// Whether the best-effort datagram lane to `first_hop` is currently
+    /// evicting at the send path. The FEC sender skips parity while true — the
+    /// parity would be shed before the wire too. Test transports default to
+    /// `false`.
+    fn datagram_lane_shedding(&self, first_hop: NodeIdentifier) -> bool {
+        let _ = first_hop;
+        false
+    }
 }
 
 /// Production `VoiceTransport` impl backed by the overlay network.
@@ -499,6 +508,10 @@ impl VoiceTransport for OverlayVoiceTransport {
 
     fn voice_route_qualities(&self, dsts: &[NodeIdentifier]) -> Vec<Option<VoiceRouteQuality>> {
         self.overlay.voice_route_qualities(dsts)
+    }
+
+    fn datagram_lane_shedding(&self, first_hop: NodeIdentifier) -> bool {
+        self.overlay.datagram_lane_shedding(first_hop)
     }
 }
 

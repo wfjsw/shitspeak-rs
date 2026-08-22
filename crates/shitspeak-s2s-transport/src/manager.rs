@@ -1745,6 +1745,18 @@ impl ConnectionManager {
             .max()
     }
 
+    /// Whether the datagram lane to `node` is currently evicting: at least
+    /// `DATAGRAM_LANE_SHED_THRESHOLD` best-effort frames shed at the write path
+    /// within the recent window. The FEC sender skips parity while a first hop
+    /// is evicting, because parity sent over the lane would be shed before the
+    /// wire too.
+    pub fn datagram_lane_shedding(&self, node: NodeIdentifier) -> bool {
+        let Some(peer) = self.inner.get_peer(node) else {
+            return false;
+        };
+        peer.datagram_lane_shedding(Instant::now())
+    }
+
     /// Best queue-pressure penalty the sender would see for this peer now.
     /// Lower is better; this combines the peer dispatcher backlog with the
     /// selected stream. Expiring sends include estimated drain time while

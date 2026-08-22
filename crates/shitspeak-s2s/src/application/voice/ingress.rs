@@ -1417,7 +1417,11 @@ impl VoiceService {
     /// recovered ~nothing). KCP is never a voice lane. Parity copies are
     /// bounded by the per-first-hop `voice_overlap` lane-headroom budget
     /// inside the transport, so a healthy lane pays nothing and a lossy lane
-    /// gets bounded redundancy.
+    /// gets bounded redundancy. A second, send-path pressure gate skips a
+    /// first hop while its datagram lane is evicting at the write path
+    /// (`VoiceRouteQuality::datagram_lane_shedding`): under sustained
+    /// offered > drain the parity would be shed before the wire, so emitting
+    /// it only adds load to the lane already failing to drain.
     async fn emit_fec_if_due(
         &self,
         sender_session: u32,
@@ -1442,7 +1446,7 @@ impl VoiceService {
         // Group destinations by first hop. The parity copy uses the same
         // first hop its block's data frames used, so the receiver's FEC
         // mirror keys `(sender_session, sender_epoch, from)` align.
-        let mut hops: HashMap<NodeIdentifier, (Vec<NodeIdentifier>, u32)> = HashMap::new();
+        let mut hops: HashMap<NodeIdentifier, (Vec<NodeIdentifier>, u32, bool)> = HashMap::new();
         let qualities = repair_context
             .map(|context| context.route_qualities.as_slice())
             .unwrap_or(&[]);
@@ -1453,9 +1457,17 @@ impl VoiceService {
             let entry = hops.entry(quality.next_hop()).or_default();
             entry.0.push(dst);
             entry.1 = entry.1.max(Self::fec_gate_loss_ppm(quality));
+            entry.2 |= quality.datagram_lane_shedding();
         }
         let ttl = self.cfg.transport_ttl();
-        for (&first_hop, (hop_dsts, gate_loss_ppm)) in &hops {
+        for (&first_hop, (hop_dsts, gate_loss_ppm, shedding)) in &hops {
+            // Send-path pressure gate: while the first-hop datagram lane is
+            // evicting (frames shed before the wire), parity sent over it would
+            // be shed too — emitting it only adds offered load to the lane
+            // already failing to drain. Skip until the lane recovers.
+            if *shedding {
+                continue;
+            }
             if u64::from(*gate_loss_ppm) < u64::from(self.cfg.voice_fec_loss_gate_ppm) {
                 continue;
             }
@@ -7460,6 +7472,40 @@ mod tests {
         assert_eq!(parity.fec_member_seqs, vec![12, 13, 14, 15]);
         assert_eq!(parity.payload.len(), 4);
         assert_eq!(parity.s2s_seq, 15);
+
+        // Send-path pressure gate (Gap C): selected transport loss above the
+        // gate (5% >= 1%) BUT the first-hop datagram lane is evicting — frames
+        // shed at the write path before the wire. Parity sent now would be
+        // shed too, so FEC must skip even though the loss gate is clear.
+        for &dst in &[1u16, 2, 3] {
+            transport.set_voice_route_quality(
+                dst,
+                VoiceRouteQuality::new(dst, TransportKind::Quic, 1_000, 50_000, 100)
+                    .with_datagram_lane_shedding(true),
+            );
+        }
+        let calls_before = transport.calls().len();
+        for _ in 0..4 {
+            svc.send_broadcast(
+                0xABC,
+                shitspeak_core::default_server_id(),
+                0,
+                false,
+                Bytes::from_static(b"abcd"),
+                normal_intent(5),
+            )
+            .await
+            .unwrap();
+        }
+        for call in &transport.calls()[calls_before..] {
+            if let FakeCall::Multicast { body, .. } = call {
+                let frame = proto::decode_voice(body).unwrap();
+                assert!(
+                    !frame.fec_parity,
+                    "parity emitted while the datagram lane is evicting at the send path"
+                );
+            }
+        }
     }
 
     #[tokio::test]

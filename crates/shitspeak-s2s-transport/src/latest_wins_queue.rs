@@ -1,8 +1,16 @@
-//! Byte-bounded queue that favors the newest items under pressure.
+//! Single-receiver queue used for real-time best-effort lanes.
 //!
-//! Unlike a regular bounded channel, sending never waits for capacity. A new
-//! item evicts as many of the oldest queued items as necessary to fit. Items
-//! larger than the entire queue are rejected without changing the queue.
+//! Two flavors share one implementation:
+//!
+//! - **Bounded** (`latest_wins_queue`): sending never waits for capacity; a new
+//!   item evicts as many of the oldest queued items as necessary to fit, and
+//!   items larger than the whole queue are rejected. This is the fallback for
+//!   lanes that must not grow past a byte budget.
+//! - **Unbounded** (`latest_wins_queue_unbounded`): sending never evicts and
+//!   never rejects. Stale frames are shed by their own deadline at dequeue
+//!   time, so the lane's footprint stays bounded by offered rate × deadline
+//!   rather than an arbitrary byte ceiling. Because the lane is never full, it
+//!   reports a "no ceiling" capacity.
 
 #![allow(dead_code)]
 
@@ -32,7 +40,10 @@ struct State<T> {
 
 struct Inner<T> {
     state: Mutex<State<T>>,
-    capacity_bytes: usize,
+    /// Byte budget for the bounded mode. `None` marks an unbounded lane that
+    /// never evicts or rejects; stale frames are shed by their own deadline at
+    /// dequeue time, so the footprint stays bounded by offered rate × deadline.
+    capacity_bytes: Option<usize>,
     sender_count: AtomicUsize,
     receiver_alive: AtomicUsize,
     notify: Notify,
@@ -133,7 +144,37 @@ pub(crate) fn latest_wins_queue<T>(
         }),
         // A zero-byte queue cannot make progress. Keeping the normalization
         // here also makes zero-size item accounting deterministic.
-        capacity_bytes: capacity_bytes.max(1),
+        capacity_bytes: Some(capacity_bytes.max(1)),
+        sender_count: AtomicUsize::new(1),
+        receiver_alive: AtomicUsize::new(1),
+        notify: Notify::new(),
+    });
+    (
+        LatestWinsSender {
+            inner: Arc::clone(&inner),
+        },
+        LatestWinsReceiver { inner },
+    )
+}
+
+/// Creates an unbounded, single-receiver latest-wins queue.
+///
+/// There is no byte budget: sending never evicts and never rejects on size.
+/// Real-time freshness is shed by the item deadline at dequeue time (callers
+/// check [`LatestWinsQueueItem`]-carried expiry before sending), so the lane
+/// cannot grow without bound — queued frames expire and are dropped. Because
+/// the lane is never full, `capacity_bytes()` reports a sentinel that every
+/// consumer treats as "no ceiling" (queue-fill penalties return 0 and the QUIC
+/// datagram size is bounded by the transport, not the lane).
+pub(crate) fn latest_wins_queue_unbounded<T>() -> (LatestWinsSender<T>, LatestWinsReceiver<T>) {
+    let inner = Arc::new(Inner {
+        state: Mutex::new(State {
+            items: VecDeque::new(),
+            depth_bytes: 0,
+            closed: false,
+            cancelled: false,
+        }),
+        capacity_bytes: None,
         sender_count: AtomicUsize::new(1),
         receiver_alive: AtomicUsize::new(1),
         notify: Notify::new(),
@@ -160,13 +201,40 @@ where
     T: LatestWinsQueueItem,
 {
     /// Adds an item, evicting the oldest buffered items when necessary.
+    ///
+    /// An unbounded lane accepts every item without eviction; stale frames are
+    /// dropped later at dequeue by their own deadline.
     pub(crate) fn try_send(&self, item: T) -> Result<LatestWinsSendResult, LatestWinsSendError<T>> {
         let item_bytes = item.estimated_queue_bytes().max(1);
-        if item_bytes > self.inner.capacity_bytes {
+        let Some(capacity_bytes) = self.inner.capacity_bytes else {
+            let result = {
+                let mut state = self.inner.state.lock();
+                if state.closed
+                    || state.cancelled
+                    || self.inner.receiver_alive.load(Ordering::Acquire) == 0
+                {
+                    return Err(LatestWinsSendError::Closed(item));
+                }
+                state.depth_bytes = state.depth_bytes.saturating_add(item_bytes);
+                state.items.push_back(Entry {
+                    item,
+                    bytes: item_bytes,
+                });
+                LatestWinsSendResult {
+                    evicted_items: 0,
+                    evicted_bytes: 0,
+                    depth_items: state.items.len(),
+                    depth_bytes: state.depth_bytes,
+                }
+            };
+            self.inner.notify.notify_one();
+            return Ok(result);
+        };
+        if item_bytes > capacity_bytes {
             return Err(LatestWinsSendError::TooLarge {
                 item,
                 item_bytes,
-                capacity_bytes: self.inner.capacity_bytes,
+                capacity_bytes,
             });
         }
 
@@ -181,7 +249,7 @@ where
 
             let mut evicted_items = 0usize;
             let mut evicted_bytes = 0usize;
-            while state.depth_bytes.saturating_add(item_bytes) > self.inner.capacity_bytes {
+            while state.depth_bytes.saturating_add(item_bytes) > capacity_bytes {
                 let Some(evicted) = state.items.pop_front() else {
                     break;
                 };
@@ -221,8 +289,14 @@ where
         state.closed || state.cancelled
     }
 
+    /// Byte budget of the lane, or a "no ceiling" sentinel for unbounded lanes.
+    ///
+    /// Consumers use this to derive fill pressure and to cap the QUIC datagram
+    /// size. An unbounded lane reports `usize::MAX` so queue-fill penalties are
+    /// zero (the lane is never full) and the datagram size is bounded by the
+    /// transport, not the lane.
     pub(crate) fn capacity_bytes(&self) -> usize {
-        self.inner.capacity_bytes
+        self.inner.capacity_bytes.unwrap_or(usize::MAX)
     }
 
     pub(crate) fn depth_bytes(&self) -> usize {
@@ -468,5 +542,31 @@ mod tests {
         assert_eq!(result.evicted_items(), 1);
         assert_eq!(result.evicted_bytes(), 1);
         assert_eq!(rx.recv().await, Some(Item::new(2, 0)));
+    }
+
+    #[tokio::test]
+    async fn unbounded_queue_never_evicts_or_rejects() {
+        let (tx, mut rx) = latest_wins_queue_unbounded::<Item>();
+        assert_eq!(tx.capacity_bytes(), usize::MAX);
+        for id in 1..=100 {
+            let result = tx
+                .try_send(Item::new(id, 4))
+                .unwrap_or_else(|_| panic!("unbounded lane must never reject item {id}"));
+            assert_eq!(result.evicted_items(), 0, "item {id} must not evict");
+            assert_eq!(result.evicted_bytes(), 0, "item {id} must not evict bytes");
+        }
+        assert_eq!(tx.depth_bytes(), 400);
+        for id in 1..=100 {
+            assert_eq!(rx.recv().await, Some(Item::new(id, 4)), "FIFO order for {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unbounded_queue_accepts_oversized_items() {
+        let (tx, mut rx) = latest_wins_queue_unbounded::<Item>();
+        tx.try_send(Item::new(1, usize::MAX)).expect("oversized item accepted");
+        assert_eq!(tx.depth_bytes(), usize::MAX);
+        assert_eq!(rx.recv().await, Some(Item::new(1, usize::MAX)));
+        assert_eq!(tx.depth_bytes(), 0);
     }
 }
