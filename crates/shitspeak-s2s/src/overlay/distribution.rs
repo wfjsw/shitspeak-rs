@@ -613,6 +613,28 @@ impl TreeEdgeSplitState {
     }
 }
 
+/// The outcome of one redundant-copy decision in `send_tree_edge_split_copy`,
+/// stored per (child, first_hop) to debounce the `shed voice transition copy`
+/// debug log: a line is emitted only when this value changes for an edge, so a
+/// sustained shed (e.g. a suspect old route held at pressure ≥ 2) logs once
+/// instead of once per voice frame. Every shed is still counted, debounce or
+/// not, in `shitspeak_s2s_voice_transition_copy_shed_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VoiceTransitionCopyDecision {
+    /// The copy was not shed this frame (it was sent, or the send was
+    /// attempted). Recording it resets the debounce so the next shed — even an
+    /// identical one — is a fresh episode and gets logged.
+    Sent,
+    /// The copy was shed, with the reason and the metric values that drove the
+    /// decision. `share_tenths` is the split weight rounded to 0.1 so an active
+    /// fade re-logs only as it crosses milestones, not every control tick.
+    Shed {
+        reason: &'static str,
+        pressure: Option<u8>,
+        share_tenths: u8,
+    },
+}
+
 #[derive(Default)]
 struct VoiceOverlapLink {
     accepted_originals: VecDeque<(Instant, usize)>,
@@ -1404,6 +1426,10 @@ pub(crate) struct DistributionPlane {
     scope_activity: Mutex<HashMap<TreeScope, Instant>>,
     tree_edge_bindings: Mutex<HashMap<TreeEdgeBindingKey, TreeEdgeBinding>>,
     voice_overlap_links: Mutex<HashMap<NodeIdentifier, VoiceOverlapLink>>,
+    /// Last redundant-copy outcome per (child, first_hop), used to debounce the
+    /// `shed voice transition copy` debug log in `send_tree_edge_split_copy`
+    /// (see [`VoiceTransitionCopyDecision`]).
+    shed_log_states: Mutex<HashMap<(NodeIdentifier, NodeIdentifier), VoiceTransitionCopyDecision>>,
     /// First hops recently rolled back by a split abort, keyed per tree edge
     /// `(parent, child, first_hop)`. A route that looked good while idle but
     /// degraded under load must not be re-tried (and re-aborted) for
@@ -1473,6 +1499,26 @@ impl DistributionPlane {
         let mut cooldowns = self.voice_route_cooldowns.lock();
         cooldowns.retain(|_, at| now.saturating_duration_since(*at) < FAILED_EDGE_EXCLUSION);
         cooldowns.insert((parent, child, failed_first_hop), now);
+    }
+
+    /// Debounced gate for the `shed voice transition copy` debug log. Returns
+    /// `true` (emit the line) only when `decision` differs from the last one
+    /// recorded for this (child, first_hop) edge, and stores `decision` so the
+    /// next call can compare. Call it on shed frames with
+    /// [`VoiceTransitionCopyDecision::Shed`] and on non-shed copy outcomes with
+    /// [`VoiceTransitionCopyDecision::Sent`], so a sustained shed logs once and
+    /// a shed that resumes after a recovery (or changes reason / pressure /
+    /// fade milestone) logs again. It has no effect on the shed itself — the
+    /// metric counter is recorded separately on every shed.
+    pub(crate) fn should_log_shed_copy(
+        &self,
+        child: NodeIdentifier,
+        first_hop: NodeIdentifier,
+        decision: VoiceTransitionCopyDecision,
+    ) -> bool {
+        let mut states = self.shed_log_states.lock();
+        let previous = states.insert((child, first_hop), decision);
+        previous != Some(decision)
     }
 
     pub(crate) fn try_reserve_voice_overlap(
@@ -4054,6 +4100,36 @@ mod tests {
                 .capacity_bytes,
             VOICE_OVERLAP_MIN_CAPACITY_BYTES
         );
+    }
+
+    #[test]
+    fn shed_copy_log_debounces_on_state_change_and_resumes_after_send() {
+        let plane = DistributionPlane::default();
+        let shed = |pressure: Option<u8>, share: f64| VoiceTransitionCopyDecision::Shed {
+            reason: "pressure",
+            pressure,
+            share_tenths: (share * 10.0).round() as u8,
+        };
+        // First shed for the edge logs.
+        assert!(plane.should_log_shed_copy(4, 4097, shed(Some(2), 0.0)));
+        // An identical sustained shed (the repetitive case) is suppressed.
+        assert!(!plane.should_log_shed_copy(4, 4097, shed(Some(2), 0.0)));
+        // An escalated pressure value is a new state and logs again.
+        assert!(plane.should_log_shed_copy(4, 4097, shed(Some(3), 0.0)));
+        // A non-shed copy resets the debounce...
+        assert!(plane.should_log_shed_copy(4, 4097, VoiceTransitionCopyDecision::Sent));
+        // ...so the identical shed after a recovery is a fresh episode.
+        assert!(plane.should_log_shed_copy(4, 4097, shed(Some(2), 0.0)));
+        // A draw shed logs at a new fade milestone, then stays quiet at it.
+        let draw = VoiceTransitionCopyDecision::Shed {
+            reason: "draw",
+            pressure: None,
+            share_tenths: 5,
+        };
+        assert!(plane.should_log_shed_copy(4, 4097, draw));
+        assert!(!plane.should_log_shed_copy(4, 4097, draw));
+        // The debounce state is per (child, first_hop): a new edge logs.
+        assert!(plane.should_log_shed_copy(5, 4097, shed(Some(2), 0.0)));
     }
 
     #[test]

@@ -8473,6 +8473,48 @@
         "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] }, "unit": "ops" },
         "overrides": []
       },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 341 },
+      "id": 111,
+      "options": {
+        "legend": { "calcs": [ "lastNotNull" ], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "hideZeros": false, "mode": "multi", "sort": "desc" }
+      },
+      "pluginVersion": "12.4.4",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source_node_id, peer) (rate(shitspeak_s2s_voice_transition_copy_shed_total{job=~\"$job\", reason=\"pressure\"}[$__rate_interval]))",
+          "legendFormat": "pressure {{source_node_id}}→{{peer}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source_node_id, peer) (rate(shitspeak_s2s_voice_transition_copy_shed_total{job=~\"$job\", reason=\"budget\"}[$__rate_interval]))",
+          "legendFormat": "budget {{source_node_id}}→{{peer}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "sum by (source_node_id, peer) (rate(shitspeak_s2s_voice_transition_copy_shed_total{job=~\"$job\", reason=\"draw\"}[$__rate_interval]))",
+          "legendFormat": "draw {{source_node_id}}→{{peer}}",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Voice Transition Copy Sheds/s by reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "mappings": [], "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": 0 } ] }, "unit": "ops" },
+        "overrides": []
+      },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 341 },
       "id": 109,
       "options": {

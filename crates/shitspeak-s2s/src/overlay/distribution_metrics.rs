@@ -276,6 +276,17 @@ struct DistributionMetrics {
     /// can be judged: distinguishes "no escapes because the lane is fine" from
     /// "no escapes despite a broken mechanism".
     datagram_lane_signals: HashMap<(NodeIdentifier, NodeIdentifier, &'static str), u64>,
+    /// Redundant split-copy sheds per (first hop, trigger) — counter
+    /// `shitspeak_s2s_voice_transition_copy_shed_total`. Every frame whose
+    /// old-route copy is dropped in `send_tree_edge_split_copy` records one
+    /// entry with the reason that dropped it: `pressure` (route soft-failure
+    /// ≥ 2, or the first hop is no longer a peer), `draw` (the split-weight
+    /// fade picked the adopted route for this frame), or `budget` (voice
+    /// overlap copy capacity exhausted). This is the metric counterpart of the
+    /// `shed voice transition copy` debug log — which is debounced — so the
+    /// log lines can be matched 1:1 against the counter, and sheds that never
+    /// make it to a log line (suppressed repeats) are still fully counted.
+    voice_transition_copy_sheds: HashMap<(NodeIdentifier, &'static str), u64>,
 }
 
 #[cfg(feature = "pre-release-workload")]
@@ -695,6 +706,24 @@ pub(crate) fn record_datagram_lane_signal(
         .or_default() += 1;
 }
 
+/// Record one dropped redundant split copy (counter
+/// `shitspeak_s2s_voice_transition_copy_shed_total`). `reason` is the `&'static`
+/// trigger that shed it in `send_tree_edge_split_copy`: `pressure` (route
+/// soft-failure ≥ 2 or peer gone), `draw` (the fade picked the adopted route),
+/// or `budget` (voice overlap copy capacity exhausted). This is the metric
+/// counterpart of the `shed voice transition copy` debug log; the log is
+/// debounced, so the counter is the complete, authoritative shed count.
+pub(crate) fn record_voice_transition_copy_shed(
+    first_hop: NodeIdentifier,
+    reason: &'static str,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics
+        .voice_transition_copy_sheds
+        .entry((first_hop, reason))
+        .or_default() += 1;
+}
+
 fn set_peer_clock_gauges(gauges: Vec<(NodeIdentifier, PeerClockGauge)>) {
     let mut metrics = METRICS.lock().unwrap();
     metrics.peer_clocks.clear();
@@ -899,6 +928,20 @@ pub(crate) fn prometheus_samples(local_node: NodeIdentifier) -> Vec<PrometheusSa
             "shitspeak_s2s_voice_overlap_primary_fallback_sends_total",
             labels,
             gauge.primary_fallback_sends as f64,
+        ));
+    }
+    for ((peer, reason), count) in &metrics.voice_transition_copy_sheds {
+        // Same label convention as the overlap gauges above: `source` is a
+        // node-config collector label on this deployment, so the shedding node
+        // is carried as `source_node_id` and the exit hop as `peer`.
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_transition_copy_shed_total",
+            vec![
+                ("source_node_id".to_owned(), local_node.clone()),
+                ("peer".to_owned(), peer.to_string()),
+                ("reason".to_owned(), (*reason).to_owned()),
+            ],
+            *count as f64,
         ));
     }
 
@@ -1248,6 +1291,66 @@ mod tests {
             )
             .is_none(),
             "a signal never recorded on an edge is absent"
+        );
+    }
+
+    #[test]
+    fn voice_transition_copy_shed_counter_accumulates_per_hop_and_reason() {
+        record_voice_transition_copy_shed(4097, "pressure");
+        record_voice_transition_copy_shed(4097, "pressure");
+        record_voice_transition_copy_shed(4097, "budget");
+        record_voice_transition_copy_shed(4098, "draw");
+
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_transition_copy_shed_total",
+                &[
+                    ("source_node_id", "1"),
+                    ("peer", "4097"),
+                    ("reason", "pressure"),
+                ],
+            )
+            .expect("pressure sheds exported")
+            .value(),
+            2.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_transition_copy_shed_total",
+                &[
+                    ("source_node_id", "1"),
+                    ("peer", "4097"),
+                    ("reason", "budget"),
+                ],
+            )
+            .expect("budget sheds exported")
+            .value(),
+            1.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_transition_copy_shed_total",
+                &[
+                    ("source_node_id", "1"),
+                    ("peer", "4098"),
+                    ("reason", "draw"),
+                ],
+            )
+            .expect("draw sheds exported")
+            .value(),
+            1.0
+        );
+        assert!(
+            sample(
+                "shitspeak_s2s_voice_transition_copy_shed_total",
+                &[
+                    ("source_node_id", "1"),
+                    ("peer", "4097"),
+                    ("reason", "unknown"),
+                ],
+            )
+            .is_none(),
+            "a reason never recorded is absent"
         );
     }
 }

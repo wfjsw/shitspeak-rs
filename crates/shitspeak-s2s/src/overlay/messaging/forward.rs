@@ -21,6 +21,7 @@ use crate::overlay::config::OverlayConfig;
 use crate::overlay::distribution::{
     DistributionPlane, PendingDistributionFrame, TreeEdgeAttempt, TreeEdgeCandidate, TreeEdgePath,
     TreeEdgeSplit, TreeEdgeStickinessPolicy, TreeKey, TreeState, UnknownTreeEnqueue,
+    VoiceTransitionCopyDecision,
 };
 use crate::overlay::lsdb::advert::VOICE_UDP_FULL_DUP_LOSS_PPM;
 use crate::overlay::neighbor::NeighborMonitor;
@@ -2722,21 +2723,42 @@ async fn send_tree_edge_split_copy(
     );
     // Redundant copy during a fade: shed when the old route is pressured, the
     // copy budget is full, or (for a normal copy, not a primary fallback) the
-    // split weight has already faded this route below the draw.
+    // split weight has already faded this route below the draw. The three
+    // triggers are checked in that order and resolved to a single `reason`, so
+    // the shed counter (`shitspeak_s2s_voice_transition_copy_shed_total`) and
+    // the debug log always agree on what shed the copy.
     let copy_weight = 1.0 - split.share();
     let draw = split_frame_draw(first_hop, data.origin_message_id);
-    if pressure.is_none_or(|pressure| pressure >= 2)
-        || (!primary_fallback && !decide_send_old_route_copy(copy_weight, draw))
-        || !distribution.try_reserve_voice_overlap(first_hop, bytes, Instant::now())
-    {
-        debug!(
-            parent = %self_id,
-            %child,
-            %first_hop,
-            share = split.share(),
-            primary_fallback,
-            "shed voice transition copy"
-        );
+    let shed_reason = if pressure.is_none_or(|pressure| pressure >= 2) {
+        Some("pressure")
+    } else if !primary_fallback && !decide_send_old_route_copy(copy_weight, draw) {
+        Some("draw")
+    } else if !distribution.try_reserve_voice_overlap(first_hop, bytes, Instant::now()) {
+        Some("budget")
+    } else {
+        None
+    };
+    if let Some(reason) = shed_reason {
+        crate::overlay::distribution_metrics::record_voice_transition_copy_shed(first_hop, reason);
+        // Debounced: log only when the shed state changes for this edge, so a
+        // sustained shed (the usual repeat) logs once instead of per frame.
+        let shed = VoiceTransitionCopyDecision::Shed {
+            reason,
+            pressure,
+            share_tenths: (split.share() * 10.0).round() as u8,
+        };
+        if distribution.should_log_shed_copy(child, first_hop, shed) {
+            debug!(
+                parent = %self_id,
+                %child,
+                %first_hop,
+                share = split.share(),
+                primary_fallback,
+                reason,
+                ?pressure,
+                "shed voice transition copy"
+            );
+        }
         return false;
     }
 
@@ -2758,6 +2780,9 @@ async fn send_tree_edge_split_copy(
         TreeEdgeSendOutcome::Sent | TreeEdgeSendOutcome::FallbackSent { .. }
     );
     distribution.release_voice_overlap(first_hop, bytes, sent, primary_fallback, Instant::now());
+    // Any frame that reached here was not shed, so the next shed (even an
+    // identical one) is a fresh episode for the debounced debug log.
+    distribution.should_log_shed_copy(child, first_hop, VoiceTransitionCopyDecision::Sent);
     sent
 }
 
