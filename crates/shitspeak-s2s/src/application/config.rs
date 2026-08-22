@@ -368,7 +368,14 @@ fn default_reorder_idle_reset_ms() -> u64 {
     2_000
 }
 fn default_chunk_hold_budget_ms() -> u64 {
-    1_600
+    // Cap a held gap at roughly one reactive-repair round trip plus a FEC
+    // block window (~300ms), instead of 1600ms. The hold exists to wait for a
+    // repair (FEC parity ~1 block, reactive resend ~2*RTT), so a budget much
+    // longer than that converts every modest gap into a long silence for
+    // nothing. At the old 1600ms a single dropped voice datagram stalled the
+    // chunk ~1.6-3.2s ("long cutoff", "silence longer than sounds"); at this
+    // budget it costs ~300ms and then clips instead of stalling.
+    300
 }
 fn default_adaptive_jitter_enabled() -> bool {
     true
@@ -448,7 +455,7 @@ mod tests {
         assert_eq!(cfg.voice.reorder_max_buffered_frames, 48);
         assert_eq!(cfg.voice.reorder_max_total_buffer, 4_096);
         assert_eq!(cfg.voice.reorder_idle_reset_ms, 2_000);
-        assert_eq!(cfg.voice.chunk_hold_budget_ms, 1_600);
+        assert_eq!(cfg.voice.chunk_hold_budget_ms, 300);
         assert_eq!(cfg.voice.adaptive_jitter_min_delay_ms, 40);
         assert_eq!(cfg.voice.adaptive_jitter_max_delay_ms, 120);
         assert_eq!(cfg.voice.adaptive_jitter_growth_step_ms, 20);

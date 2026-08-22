@@ -1723,20 +1723,23 @@ impl ConnectionManager {
             .map(|link| (selected, link))
     }
 
-    /// Worst effective packet loss among the live datagram transports (UDP,
-    /// KCP) for `node`, or `None` when no datagram transport is live.
+    /// Effective packet loss of the UDP datagram lane for `node`, or `None`
+    /// when no UDP transport is live.
     ///
-    /// The FEC gate keys on this rather than the routing-selected best
-    /// transport: best-effort voice may ride any live transport, and the
-    /// send-time deadline-queue penalty can push it off a low-loss QUIC
-    /// stream onto the lossy datagram lane, so the selected transport's loss
-    /// understates what the datagram lane actually delivers.
+    /// Feeds `VoiceRouteQuality::datagram_loss_ppm`. This was the FEC gate
+    /// input during the Phase 1 gate fix; that was reverted — the datagram
+    /// lane degrades independently of the lane voice actually rides, so
+    /// keying FEC on it fired parity at times the voice lane had no loss to
+    /// recover (4->8: UDP-degradation windows did not align with listener
+    /// reorder gaps). The field remains populated as a metric signal but is
+    /// not currently read by production gate logic. KCP is excluded — voice
+    /// is never routed onto it, so its loss does not reflect the voice lane.
     pub fn datagram_lane_effective_loss_ppm(&self, node: NodeIdentifier) -> Option<u32> {
         let peer = self.inner.get_peer(node)?;
         let snapshot = peer.metrics().snapshot_per_transport();
         peer.live_kinds()
             .into_iter()
-            .filter(|kind| matches!(kind, TransportKind::Udp | TransportKind::Kcp))
+            .filter(|kind| matches!(kind, TransportKind::Udp))
             .filter_map(|kind| snapshot.get(&kind))
             .map(|link| link.effective_packet_loss_ppm())
             .max()

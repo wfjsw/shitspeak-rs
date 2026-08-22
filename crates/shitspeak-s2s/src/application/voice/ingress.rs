@@ -1405,16 +1405,19 @@ impl VoiceService {
     }
 
     /// Feed the just-sent frame into the sender FEC window and, when a block
-    /// completes, emit one parity copy per first hop whose live datagram loss
-    /// clears the `voice_fec_loss_gate_ppm` gate. The gate fires on the worse
-    /// of the routing-selected transport and the datagram lane (UDP/KCP) —
-    /// best-effort voice may ride any live transport, and the send-time
-    /// deadline-queue penalty can push it off a low-loss QUIC stream onto the
-    /// lossy datagram lane, so the selected transport's loss understates what
-    /// the datagram lane actually delivers. Parity copies are bounded by the
-    /// per-first-hop `voice_overlap` lane-headroom budget inside the
-    /// transport, so a healthy lane pays nothing and a lossy lane gets
-    /// bounded redundancy.
+    /// completes, emit one parity copy per first hop whose live voice-lane
+    /// loss clears the `voice_fec_loss_gate_ppm` gate. The gate fires on the
+    /// effective loss of the routing-selected transport
+    /// (`VoiceRouteQuality::loss_ppm`) — the lane that actually carries the
+    /// best-effort voice and its parity copies. Keying FEC on a separate
+    /// "datagram lane" (UDP) instead is wrong: that lane degrades
+    /// independently of the voice transport, so it fires FEC at times the
+    /// voice lane has no loss to recover (production 4->8: the UDP-degradation
+    /// windows did not align with the listener's reorder gaps, and FEC
+    /// recovered ~nothing). KCP is never a voice lane. Parity copies are
+    /// bounded by the per-first-hop `voice_overlap` lane-headroom budget
+    /// inside the transport, so a healthy lane pays nothing and a lossy lane
+    /// gets bounded redundancy.
     async fn emit_fec_if_due(
         &self,
         sender_session: u32,
@@ -1516,15 +1519,23 @@ impl VoiceService {
         Some(Bytes::from(proto::encode_voice(&frame).ok()?))
     }
 
-    /// Effective loss the FEC gate should fire on for a first hop: the worse
-    /// of the routing-selected transport and the datagram lane that actually
-    /// carries best-effort voice (UDP/KCP). The selected transport's loss
-    /// understates the lane when the send-time deadline-queue penalty pushes
-    /// voice off a low-loss stream onto the datagram lane.
+    /// Effective loss the FEC gate should fire on for a first hop: the
+    /// routing-selected transport's effective loss — the lane that best-effort
+    /// voice and its parity copies actually ride (`voice_transport_binding`).
+    /// On QUIC that lane is the transport's unreliable *datagram* sub-lane
+    /// (RFC 9221; voice is never retransmitted), and `loss_ppm()` reflects it:
+    /// the QUIC native-loss sampler reads quinn path stats, which count
+    /// datagram-bearing packets lost on the path. The send never leaves that
+    /// lane: `deadline_queue_penalty` is hard zero for BestEffort on a QUIC
+    /// v2 datagram lane, so queue pressure does not redirect voice off the
+    /// routing-selected transport. So the gate keys on the real voice lane on
+    /// every transport kind — a QUIC voice lane that starts dropping crosses
+    /// the gate and gets parity. A degraded UDP datagram lane is not a signal
+    /// the voice lane is degrading: it moves independently (4->8:
+    /// UDP-degradation windows did not align with the listener's reorder
+    /// gaps, and FEC recovered ~nothing), and KCP is never a voice lane.
     fn fec_gate_loss_ppm(quality: VoiceRouteQuality) -> u32 {
-        quality
-            .loss_ppm()
-            .max(quality.datagram_loss_ppm().unwrap_or(0))
+        quality.loss_ppm()
     }
 
     fn remote_voice_members(&self) -> Vec<NodeIdentifier> {
@@ -7377,16 +7388,51 @@ mod tests {
         assert_eq!(parity.payload.len(), 4);
         assert_eq!(parity.s2s_seq, 7);
 
-        // Selected transport loss below the gate (0.005% < 1%) but the
-        // datagram lane that actually carries best-effort voice is above it
-        // (5% >= 1%): the gate must key on the datagram lane, not the
-        // routing-selected best transport. This is the 4->8 case — QUIC is
-        // near-lossless while UDP/KCP carry the voice at ~2-3% effective loss.
+        // Selected transport loss below the gate (0.005% < 1%) even though the
+        // UDP datagram lane is degraded (5% >= 1%): NO parity. Voice rides the
+        // routing-selected transport (QUIC on 4->8, binding stable), so the
+        // datagram lane's loss is not a signal the voice lane has loss to
+        // recover. This was the Phase 1 regression: gating on the datagram
+        // lane fired FEC at times the listener had no recoverable gaps, and
+        // the 2-parity flood rode a lossless QUIC stream doing ~nothing.
         for &dst in &[1u16, 2, 3] {
             transport.set_voice_route_quality(
                 dst,
                 VoiceRouteQuality::new(dst, TransportKind::Quic, 1_000, 50, 100)
                     .with_datagram_loss_ppm(Some(50_000)),
+            );
+        }
+        let calls_before = transport.calls().len();
+        for _ in 0..4 {
+            svc.send_broadcast(
+                0xABC,
+                shitspeak_core::default_server_id(),
+                0,
+                false,
+                Bytes::from_static(b"abcd"),
+                normal_intent(5),
+            )
+            .await
+            .unwrap();
+        }
+        for call in &transport.calls()[calls_before..] {
+            if let FakeCall::Multicast { body, .. } = call {
+                let frame = proto::decode_voice(body).unwrap();
+                assert!(
+                    !frame.fec_parity,
+                    "parity emitted when only the datagram lane is degraded"
+                );
+            }
+        }
+
+        // Selected transport loss above the gate (5% >= 1%) on a QUIC-bound
+        // lane: parity still emits. The gate keys on the lane voice actually
+        // rides, not on the transport kind — a genuinely lossy voice lane gets
+        // redundancy regardless of whether it is QUIC or UDP.
+        for &dst in &[1u16, 2, 3] {
+            transport.set_voice_route_quality(
+                dst,
+                VoiceRouteQuality::new(dst, TransportKind::Quic, 1_000, 50_000, 100),
             );
         }
         let calls_before = transport.calls().len();
@@ -7409,13 +7455,11 @@ mod tests {
             }
             None
         });
-        let parity = parity.expect(
-            "parity frame should be emitted when the datagram lane clears the gate even though \
-             the selected transport does not",
-        );
-        assert_eq!(parity.fec_member_seqs, vec![8, 9, 10, 11]);
+        let parity =
+            parity.expect("parity frame should be emitted when the selected transport clears the gate");
+        assert_eq!(parity.fec_member_seqs, vec![12, 13, 14, 15]);
         assert_eq!(parity.payload.len(), 4);
-        assert_eq!(parity.s2s_seq, 11);
+        assert_eq!(parity.s2s_seq, 15);
     }
 
     #[tokio::test]
