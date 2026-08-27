@@ -760,7 +760,13 @@ mod tests {
             links: links
                 .into_iter()
                 .map(
-                    |(neighbor, rtt_us, aggregate_loss_ppm, datagram_loss_ppm, datagram_samples)| {
+                    |(
+                        neighbor,
+                        rtt_us,
+                        aggregate_loss_ppm,
+                        datagram_loss_ppm,
+                        datagram_samples,
+                    )| {
                         LinkAdvertised {
                             neighbor,
                             rtt_us,
@@ -1025,18 +1031,9 @@ mod tests {
         // (the lane voice actually rides). Relay 1-3-2 is clean end to end.
         // Best-effort cost must route voice off the degrading direct lane.
         let db = build_db(vec![
-            entry_with_datagram_lane(
-                1,
-                vec![(2, 5_000, 0, 400_000, 256), (3, 4_000, 0, 0, 0)],
-            ),
-            entry_with_datagram_lane(
-                2,
-                vec![(1, 5_000, 0, 400_000, 256), (3, 1_000, 0, 0, 0)],
-            ),
-            entry_with_datagram_lane(
-                3,
-                vec![(1, 4_000, 0, 0, 0), (2, 1_000, 0, 0, 0)],
-            ),
+            entry_with_datagram_lane(1, vec![(2, 5_000, 0, 400_000, 256), (3, 4_000, 0, 0, 0)]),
+            entry_with_datagram_lane(2, vec![(1, 5_000, 0, 400_000, 256), (3, 1_000, 0, 0, 0)]),
+            entry_with_datagram_lane(3, vec![(1, 4_000, 0, 0, 0), (2, 1_000, 0, 0, 0)]),
         ]);
 
         let best_effort = compute_with_metric(
@@ -1068,22 +1065,52 @@ mod tests {
             entry_with_udp_metrics(
                 1,
                 vec![
-                    (2, 5_000, 0, Some((5_000, 0, 300_000, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
-                    (3, 4_000, 0, Some((4_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
+                    (
+                        2,
+                        5_000,
+                        0,
+                        Some((5_000, 0, 300_000, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
+                    (
+                        3,
+                        4_000,
+                        0,
+                        Some((4_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
                 ],
             ),
             entry_with_udp_metrics(
                 2,
                 vec![
-                    (1, 5_000, 0, Some((5_000, 0, 300_000, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
-                    (3, 1_000, 0, Some((1_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
+                    (
+                        1,
+                        5_000,
+                        0,
+                        Some((5_000, 0, 300_000, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
+                    (
+                        3,
+                        1_000,
+                        0,
+                        Some((1_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
                 ],
             ),
             entry_with_udp_metrics(
                 3,
                 vec![
-                    (1, 4_000, 0, Some((4_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
-                    (2, 1_000, 0, Some((1_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES))),
+                    (
+                        1,
+                        4_000,
+                        0,
+                        Some((4_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
+                    (
+                        2,
+                        1_000,
+                        0,
+                        Some((1_000, 0, 0, MIN_ROUTE_LOSS_EXCLUSION_SAMPLES)),
+                    ),
                 ],
             ),
         ]);

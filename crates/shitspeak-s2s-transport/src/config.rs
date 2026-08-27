@@ -1307,8 +1307,7 @@ impl TransportRoutingPolicy {
     }
 
     pub fn with_voice_path_transition_fade(mut self, duration: Duration) -> Self {
-        self.voice_path_transition_fade_ms =
-            duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.voice_path_transition_fade_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
         self
     }
 
@@ -1318,8 +1317,7 @@ impl TransportRoutingPolicy {
     }
 
     pub fn with_voice_path_split_target_beta(mut self, beta: f64) -> Self {
-        self.voice_path_split_target_beta_milli =
-            (beta.clamp(0.0, 1000.0) * 1000.0).round() as u64;
+        self.voice_path_split_target_beta_milli = (beta.clamp(0.0, 1000.0) * 1000.0).round() as u64;
         self
     }
 
@@ -1405,7 +1403,9 @@ impl TransportRoutingPolicy {
             || self.voice_path_transition_fanout_ms == 0
             || self.voice_path_transition_fade_ms == 0
         {
-            return Err("s2s.transport voice-path stickiness/transition timings must be non-zero".into());
+            return Err(
+                "s2s.transport voice-path stickiness/transition timings must be non-zero".into(),
+            );
         }
         if self.voice_path_idle_reset_ms
             < self

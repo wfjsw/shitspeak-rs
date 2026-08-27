@@ -459,7 +459,9 @@ impl PathFeedbackAccumulator {
     ) -> Option<VoicePathFeedback> {
         let now = Instant::now();
         let mut windows = self.windows.lock();
-        let window = windows.entry(from).or_insert_with(|| PathFeedbackWindow::new(now));
+        let window = windows
+            .entry(from)
+            .or_insert_with(|| PathFeedbackWindow::new(now));
         window.received_frames = window.received_frames.saturating_add(count as u32);
         if result == VoiceReceiveResult::GapBuffered {
             window.gap_buffered = window.gap_buffered.saturating_add(count as u32);
@@ -481,7 +483,9 @@ impl PathFeedbackAccumulator {
     ) -> Option<VoicePathFeedback> {
         let now = Instant::now();
         let mut windows = self.windows.lock();
-        let window = windows.entry(from).or_insert_with(|| PathFeedbackWindow::new(now));
+        let window = windows
+            .entry(from)
+            .or_insert_with(|| PathFeedbackWindow::new(now));
         window.max_held_delay_us = window.max_held_delay_us.max(max_held_delay_us);
         Self::flush_if_due(&mut windows, from, now)
     }
@@ -2038,10 +2042,7 @@ impl ServiceInbound for VoiceInbound {
                 } else {
                     VoiceCopyKind::Original
                 };
-                let class = if matches!(
-                    copy_kind,
-                    VoiceCopyKind::Proactive | VoiceCopyKind::Fec
-                ) {
+                let class = if matches!(copy_kind, VoiceCopyKind::Proactive | VoiceCopyKind::Fec) {
                     VoiceIngressClass::Proactive
                 } else {
                     VoiceIngressClass::Primary
@@ -2242,15 +2243,16 @@ fn spawn_dispatch_task(
                         );
                         let mut report = reorder::ReorderReport::empty();
                         let gap = reorderer.live_missing_range(sender_session, sender_epoch);
-                        for recovered in fec_state.try_reconstruct(from, sender_session, sender_epoch, gap) {
-                            report = report.merge(
-                                reorderer.push_with_route_hint_report_with_copy_kind(
+                        for recovered in
+                            fec_state.try_reconstruct(from, sender_session, sender_epoch, gap)
+                        {
+                            report =
+                                report.merge(reorderer.push_with_route_hint_report_with_copy_kind(
                                     from,
                                     recovered,
                                     None,
                                     VoiceCopyKind::Fec,
-                                ),
-                            );
+                                ));
                         }
                         report
                     } else if !fec_enabled && is_parity {
@@ -2269,25 +2271,20 @@ fn spawn_dispatch_task(
                                     .map(route_hint_from_quality)
                             })
                             .flatten();
-                        let mut report =
-                            reorderer.push_with_route_hint_report_with_copy_kind(
-                                from,
-                                delivery.frame,
-                                route_hint,
-                                delivery.copy_kind,
-                            );
+                        let mut report = reorderer.push_with_route_hint_report_with_copy_kind(
+                            from,
+                            delivery.frame,
+                            route_hint,
+                            delivery.copy_kind,
+                        );
                         // A data push just opened a gap: the parity block for
                         // it may already be in the mirror. Reconstruct the
                         // live range now.
                         if fec_enabled && report.opened_gap().is_some() {
-                            let gap =
-                                reorderer.live_missing_range(sender_session, sender_epoch);
-                            for recovered in fec_state.try_reconstruct(
-                                from,
-                                sender_session,
-                                sender_epoch,
-                                gap,
-                            ) {
+                            let gap = reorderer.live_missing_range(sender_session, sender_epoch);
+                            for recovered in
+                                fec_state.try_reconstruct(from, sender_session, sender_epoch, gap)
+                            {
                                 report = report.merge(
                                     reorderer.push_with_route_hint_report_with_copy_kind(
                                         from,
@@ -2381,11 +2378,9 @@ fn spawn_dispatch_task(
                 // with the held delay the chunk absorbed before release.
                 for flush in deadline_flushes {
                     let from = flush.from;
-                    if let Some(feedback) = path_feedback.record(
-                        from,
-                        VoiceReceiveResult::DeadlineFlush,
-                        flush.count,
-                    ) {
+                    if let Some(feedback) =
+                        path_feedback.record(from, VoiceReceiveResult::DeadlineFlush, flush.count)
+                    {
                         let transport = transport.clone();
                         tokio::spawn(async move {
                             let _ = transport.send_path_feedback(from, feedback).await;
@@ -4463,7 +4458,10 @@ mod tests {
         // Push and deadline events accumulate per window; the held delay is a
         // separate record that maxes into the window.
         assert!(acc.record(22, VoiceReceiveResult::GapBuffered, 3).is_none());
-        assert!(acc.record(22, VoiceReceiveResult::DeadlineFlush, 2).is_none());
+        assert!(
+            acc.record(22, VoiceReceiveResult::DeadlineFlush, 2)
+                .is_none()
+        );
         assert!(acc.record_held_delay(22, 123_456).is_none());
         std::thread::sleep(PATH_FEEDBACK_INTERVAL + Duration::from_millis(20));
         // The triggering event's counts join the window being flushed: 3 gap +
@@ -4476,7 +4474,10 @@ mod tests {
         assert_eq!(feedback.deadline_flush, 3);
         assert_eq!(feedback.max_held_delay_us, 123_456);
         // The window reset: further records stay buffered until it elapses.
-        assert!(acc.record(22, VoiceReceiveResult::DeadlineFlush, 1).is_none());
+        assert!(
+            acc.record(22, VoiceReceiveResult::DeadlineFlush, 1)
+                .is_none()
+        );
         // A second peer's window is independent.
         assert!(acc.record_held_delay(33, 999).is_none());
         std::thread::sleep(PATH_FEEDBACK_INTERVAL + Duration::from_millis(20));
@@ -7031,12 +7032,7 @@ mod tests {
         // hold-first budget. With the hint the skew deadline is ~257 ms; a
         // 50 ms hold then flushes the whole buffered chunk at ~307 ms.
         cfg.chunk_hold_budget_ms = 50;
-        let svc = VoiceService::new_with_transport(
-            transport,
-            cfg,
-            CancellationToken::new(),
-            42,
-        );
+        let svc = VoiceService::new_with_transport(transport, cfg, CancellationToken::new(), 42);
         let sink = RecordingSink::new();
         svc.set_audio_sink(sink.clone());
         let sender_session = shitspeak_core::ClientSessionIdentifier::new(12, 0xABC)
@@ -7233,7 +7229,10 @@ mod tests {
     #[async_trait::async_trait]
     impl AudioSink for FecProbeSink {
         async fn deliver(&self, _from: NodeIdentifier, frame: VoiceFrame, _is_repair: bool) {
-            self.frames.lock().unwrap().push((frame.s2s_seq, frame.payload));
+            self.frames
+                .lock()
+                .unwrap()
+                .push((frame.s2s_seq, frame.payload));
         }
     }
 
@@ -7343,12 +7342,8 @@ mod tests {
         cfg.voice_fec_block_size = 4;
         cfg.voice_fec_loss_gate_ppm = 10_000;
         cfg.tree_delivery_enabled = false;
-        let svc = VoiceService::new_with_transport(
-            transport.clone(),
-            cfg,
-            CancellationToken::new(),
-            42,
-        );
+        let svc =
+            VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
         for _ in 0..4 {
             svc.send_broadcast(
                 0xABC,
@@ -7467,8 +7462,8 @@ mod tests {
             }
             None
         });
-        let parity =
-            parity.expect("parity frame should be emitted when the selected transport clears the gate");
+        let parity = parity
+            .expect("parity frame should be emitted when the selected transport clears the gate");
         assert_eq!(parity.fec_member_seqs, vec![12, 13, 14, 15]);
         assert_eq!(parity.payload.len(), 4);
         assert_eq!(parity.s2s_seq, 15);
@@ -7514,12 +7509,7 @@ mod tests {
         let mut cfg = VoiceConfig::default();
         cfg.voice_fec_enabled = true;
         cfg.voice_fec_receiver_window = 8;
-        let svc = VoiceService::new_with_transport(
-            transport,
-            cfg,
-            CancellationToken::new(),
-            42,
-        );
+        let svc = VoiceService::new_with_transport(transport, cfg, CancellationToken::new(), 42);
         let sink = Arc::new(FecProbeSink::default());
         svc.set_audio_sink(sink.clone());
 
@@ -7531,7 +7521,11 @@ mod tests {
 
         // Parity block {1,2,3,4}: recovered 4 = parity ^ a ^ b ^ c = d.
         let parity = fec_xor(&[b"aaaa", b"bbbb", b"cccc", b"dddd"]);
-        inject_voice_inbound(&svc, 11, fec_parity_frame(0xABC, 42, vec![1, 2, 3, 4], &parity, 0, 0));
+        inject_voice_inbound(
+            &svc,
+            11,
+            fec_parity_frame(0xABC, 42, vec![1, 2, 3, 4], &parity, 0, 0),
+        );
 
         let frames = wait_for_fec_sink(&sink, 4).await;
         assert_eq!(frames[3].0, 4);
@@ -7556,7 +7550,11 @@ mod tests {
         inject_voice_inbound(&svc, 11, fec_data_frame(3, b"cccc"));
         wait_for_fec_sink(&sink, 3).await;
         let parity = fec_xor(&[b"aaaa", b"bbbb", b"cccc", b"dddd"]);
-        inject_voice_inbound(&svc, 11, fec_parity_frame(0xABC, 42, vec![1, 2, 3, 4], &parity, 0, 0));
+        inject_voice_inbound(
+            &svc,
+            11,
+            fec_parity_frame(0xABC, 42, vec![1, 2, 3, 4], &parity, 0, 0),
+        );
         // Let the parity arrival settle into the mirror before the gap opens.
         tokio::time::sleep(Duration::from_millis(10)).await;
         inject_voice_inbound(&svc, 11, fec_data_frame(5, b"eeee"));
@@ -7761,8 +7759,7 @@ mod tests {
             FakeCall::Unicast { body, .. } => body.clone(),
             other => panic!("expected Unicast, got {other:?}"),
         };
-        svc.voice_budget
-            .mint_link_credit(2, 0xABC, 42, usize::MAX);
+        svc.voice_budget.mint_link_credit(2, 0xABC, 42, usize::MAX);
         let request = VoiceRepairRequest {
             sender_session: 0xABC,
             sender_epoch: 42,
@@ -8160,8 +8157,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(transport.inner.calls().len(), 1);
 
-        svc.voice_budget
-            .mint_link_credit(3, 0xABC, 42, usize::MAX);
+        svc.voice_budget.mint_link_credit(3, 0xABC, 42, usize::MAX);
         let calls = wait_for_call_count(&transport.inner, 2).await;
         match &calls[1] {
             FakeCall::RepairFrame {
@@ -8357,8 +8353,7 @@ mod tests {
             CancellationToken::new(),
             42,
         );
-        svc.voice_budget
-            .mint_link_credit(3, 0xABC, 42, usize::MAX);
+        svc.voice_budget.mint_link_credit(3, 0xABC, 42, usize::MAX);
         let send = tokio::spawn({
             let svc = svc.clone();
             async move {
@@ -8496,8 +8491,7 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.voice_budget
-            .mint_link_credit(2, 0xABC, 42, usize::MAX);
+        svc.voice_budget.mint_link_credit(2, 0xABC, 42, usize::MAX);
         let request = VoiceRepairRequest {
             sender_session: 0xABC,
             sender_epoch: 42,

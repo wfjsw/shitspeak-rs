@@ -2296,9 +2296,11 @@ impl OverlayNetwork {
     /// redundancy is bounded by the lane's own measured capacity and can
     /// never push a healthy lane past headroom.
     pub fn try_reserve_fec_headroom(&self, first_hop: NodeIdentifier, bytes: usize) -> bool {
-        self.inner
-            .distribution
-            .try_reserve_voice_overlap(first_hop, bytes, std::time::Instant::now())
+        self.inner.distribution.try_reserve_voice_overlap(
+            first_hop,
+            bytes,
+            std::time::Instant::now(),
+        )
     }
 
     /// Release a FEC parity send reservation on `first_hop`. `sent` records

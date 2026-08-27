@@ -436,7 +436,10 @@ impl NeighborMonitor {
         let Some(active) = udp.or(quic) else {
             return (0, 0);
         };
-        (active.effective_loss_ppm().unwrap_or(0), active.loss_samples())
+        (
+            active.effective_loss_ppm().unwrap_or(0),
+            active.loss_samples(),
+        )
     }
 
     /// Build a snapshot of every currently-up neighbor with live cost
@@ -1081,7 +1084,10 @@ mod tests {
         ];
         // The last-seen UDP snapshot wins (the loop overwrites per lane), and
         // it beats any QUIC datagram value even when Suspect.
-        assert_eq!(NeighborMonitor::datagram_lane_loss(&health, peer), (2_000, 32));
+        assert_eq!(
+            NeighborMonitor::datagram_lane_loss(&health, peer),
+            (2_000, 32)
+        );
 
         // Blocked UDP falls back to the QUIC datagram lane.
         let health = [
@@ -1100,7 +1106,10 @@ mod tests {
                 40,
             ),
         ];
-        assert_eq!(NeighborMonitor::datagram_lane_loss(&health, peer), (12_000, 40));
+        assert_eq!(
+            NeighborMonitor::datagram_lane_loss(&health, peer),
+            (12_000, 40)
+        );
 
         // Only blocked lanes => no usable datagram lane => (0, 0) sentinel.
         let health = [

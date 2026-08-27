@@ -483,7 +483,8 @@ impl VoiceTransport for OverlayVoiceTransport {
                 options,
             )
             .await;
-        self.overlay.release_fec_headroom(first_hop, bytes, result.is_ok());
+        self.overlay
+            .release_fec_headroom(first_hop, bytes, result.is_ok());
         match result {
             Ok(()) => FecSendOutcome::Sent,
             Err(_) => FecSendOutcome::Shed,

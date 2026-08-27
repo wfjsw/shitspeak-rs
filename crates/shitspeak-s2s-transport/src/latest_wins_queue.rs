@@ -557,14 +557,19 @@ mod tests {
         }
         assert_eq!(tx.depth_bytes(), 400);
         for id in 1..=100 {
-            assert_eq!(rx.recv().await, Some(Item::new(id, 4)), "FIFO order for {id}");
+            assert_eq!(
+                rx.recv().await,
+                Some(Item::new(id, 4)),
+                "FIFO order for {id}"
+            );
         }
     }
 
     #[tokio::test]
     async fn unbounded_queue_accepts_oversized_items() {
         let (tx, mut rx) = latest_wins_queue_unbounded::<Item>();
-        tx.try_send(Item::new(1, usize::MAX)).expect("oversized item accepted");
+        tx.try_send(Item::new(1, usize::MAX))
+            .expect("oversized item accepted");
         assert_eq!(tx.depth_bytes(), usize::MAX);
         assert_eq!(rx.recv().await, Some(Item::new(1, usize::MAX)));
         assert_eq!(tx.depth_bytes(), 0);

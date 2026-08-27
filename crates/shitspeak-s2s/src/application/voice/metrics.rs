@@ -540,12 +540,13 @@ pub(crate) fn record_fec_send(
     outcome: FecSendOutcome,
 ) {
     let mut metrics = METRICS.lock().unwrap();
-    let key = FecSendKey { source, first_hop, outcome };
+    let key = FecSendKey {
+        source,
+        first_hop,
+        outcome,
+    };
     *metrics.fec_sends.entry(key).or_default() += 1;
-    *metrics
-        .fec_send_bytes
-        .entry((source, outcome))
-        .or_default() += bytes as u64;
+    *metrics.fec_send_bytes.entry((source, outcome)).or_default() += bytes as u64;
 }
 
 pub(crate) fn set_reorder_pending(source: NodeIdentifier, pending: usize) {

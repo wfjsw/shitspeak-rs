@@ -17,7 +17,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use shitspeak_core::NodeIdentifier;
 
-use crate::metrics::{DatagramPathHealthReason, DatagramPathHealthSnapshot, DatagramPathHealthState};
+use crate::metrics::{
+    DatagramPathHealthReason, DatagramPathHealthSnapshot, DatagramPathHealthState,
+};
 use crate::service_level::DeliveryPath;
 
 /// Install rustls' aws-lc-rs default crypto provider exactly once across all

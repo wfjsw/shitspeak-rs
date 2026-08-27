@@ -844,7 +844,9 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                         return;
                     }
                     let since = runtime.origin_is_inactive(origin).then_some(0);
-                    runtime.request_catchup(origin, epoch, since, "stabilization").await;
+                    runtime
+                        .request_catchup(origin, epoch, since, "stabilization")
+                        .await;
                 }
             });
         }
@@ -880,7 +882,8 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             }
             let known_epoch = self.known_epoch_for_origin(origin);
             let since = self.origin_is_inactive(origin).then_some(0);
-            self.request_catchup(origin, known_epoch, since, "bootstrap").await;
+            self.request_catchup(origin, known_epoch, since, "bootstrap")
+                .await;
         }
     }
 
@@ -1019,7 +1022,8 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         if !self.epoch_is_current(origin, new_epoch) {
             return;
         }
-        self.request_catchup(origin, new_epoch, Some(since), "restart").await;
+        self.request_catchup(origin, new_epoch, Some(since), "restart")
+            .await;
         self.schedule_origin_stabilization(origin, new_epoch);
     }
 
@@ -1027,7 +1031,8 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         let _guard = self.lock_origin(origin).await;
         let known_epoch = self.known_epoch_for_origin(origin);
         let since = self.origin_is_inactive(origin).then_some(0);
-        self.request_catchup(origin, known_epoch, since, "join").await;
+        self.request_catchup(origin, known_epoch, since, "join")
+            .await;
         self.schedule_origin_stabilization(origin, known_epoch);
     }
 
@@ -1189,7 +1194,8 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                             was_empty
                         };
                         if arm {
-                            self.send_catchup_req(origin, new_epoch, "gap_catchup").await;
+                            self.send_catchup_req(origin, new_epoch, "gap_catchup")
+                                .await;
                         }
                     }
                     other => {
@@ -1218,7 +1224,8 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                     (arm, known_epoch)
                 };
                 if arm {
-                    self.send_catchup_req(origin, known_epoch, "gap_catchup").await;
+                    self.send_catchup_req(origin, known_epoch, "gap_catchup")
+                        .await;
                 }
             }
             Classification::Apply => self.apply_op(origin, op).await,

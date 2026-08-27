@@ -1880,7 +1880,11 @@ impl ConnectionManager {
         &self,
         node: NodeIdentifier,
     ) -> BestEffortDatagramLaneHealth {
-        let stale_after = self.inner.cfg().routing_policy().transport_metric_stale_after();
+        let stale_after = self
+            .inner
+            .cfg()
+            .routing_policy()
+            .transport_metric_stale_after();
         let Some(peer) = self.inner.get_peer(node) else {
             return BestEffortDatagramLaneHealth::default();
         };
@@ -3945,7 +3949,9 @@ fn try_dispatch_envelope_with_policy(
                         // UDP evicts the oldest datagram to admit the newest.
                         // Record the generic queue-full watermark rather than
                         // the QUIC-named drop counter.
-                        record_outbound_stream_queue_sample(peer, path, class, &sender, level, true);
+                        record_outbound_stream_queue_sample(
+                            peer, path, class, &sender, level, true,
+                        );
                     }
                 }
                 for sidecar in variant.sidecars().iter().filter(|_| !quic_v2_datagram) {
@@ -3955,7 +3961,9 @@ fn try_dispatch_envelope_with_policy(
                     );
                     if let Ok(outcome) = sidecar_outcome {
                         if outcome.evicted_items() > 0 && path == DeliveryPath::UdpDatagram {
-                            record_outbound_stream_queue_sample(peer, path, class, &sender, level, true);
+                            record_outbound_stream_queue_sample(
+                                peer, path, class, &sender, level, true,
+                            );
                         }
                     }
                 }
@@ -4546,32 +4554,65 @@ mod tests {
         };
         // Healthy UDP beats a lossy QUIC fallback (UDP is the preferred lane).
         let health = active_best_effort_datagram_lane_health(&[
-            snapshot(DeliveryPath::QuicDatagram, DatagramPathHealthState::Suspect, Some(80_000)),
-            snapshot(DeliveryPath::UdpDatagram, DatagramPathHealthState::Healthy, Some(5_000)),
+            snapshot(
+                DeliveryPath::QuicDatagram,
+                DatagramPathHealthState::Suspect,
+                Some(80_000),
+            ),
+            snapshot(
+                DeliveryPath::UdpDatagram,
+                DatagramPathHealthState::Healthy,
+                Some(5_000),
+            ),
         ]);
         assert!(!health.blocked, "healthy UDP lane is not blocked");
         assert_eq!(health.loss_ppm, Some(5_000), "active lane is UDP");
         assert_eq!(health.loss_samples, 40);
         // A blocked UDP falls back to the QUIC datagram lane's loss.
         let health = active_best_effort_datagram_lane_health(&[
-            snapshot(DeliveryPath::UdpDatagram, DatagramPathHealthState::Blocked, Some(200_000)),
-            snapshot(DeliveryPath::QuicDatagram, DatagramPathHealthState::Suspect, Some(9_000)),
+            snapshot(
+                DeliveryPath::UdpDatagram,
+                DatagramPathHealthState::Blocked,
+                Some(200_000),
+            ),
+            snapshot(
+                DeliveryPath::QuicDatagram,
+                DatagramPathHealthState::Suspect,
+                Some(9_000),
+            ),
         ]);
         assert!(!health.blocked, "QUIC datagram fallback is usable");
-        assert_eq!(health.loss_ppm, Some(9_000), "active lane falls back to QUIC");
+        assert_eq!(
+            health.loss_ppm,
+            Some(9_000),
+            "active lane falls back to QUIC"
+        );
         // All observed datagram lanes blocked -> hard Blocked signal.
         let health = active_best_effort_datagram_lane_health(&[
-            snapshot(DeliveryPath::UdpDatagram, DatagramPathHealthState::Blocked, Some(200_000)),
-            snapshot(DeliveryPath::QuicDatagram, DatagramPathHealthState::Blocked, Some(250_000)),
+            snapshot(
+                DeliveryPath::UdpDatagram,
+                DatagramPathHealthState::Blocked,
+                Some(200_000),
+            ),
+            snapshot(
+                DeliveryPath::QuicDatagram,
+                DatagramPathHealthState::Blocked,
+                Some(250_000),
+            ),
         ]);
         assert!(health.blocked, "every datagram lane Blocked");
         assert_eq!(health.loss_ppm, None, "no usable lane to read loss from");
         // The only observed datagram lane is blocked and there is no observed
         // fallback (QUIC datagram not established) — voice has no datagram path.
-        let health = active_best_effort_datagram_lane_health(&[
-            snapshot(DeliveryPath::UdpDatagram, DatagramPathHealthState::Blocked, Some(200_000)),
-        ]);
-        assert!(health.blocked, "only observed lane blocked and no fallback observed");
+        let health = active_best_effort_datagram_lane_health(&[snapshot(
+            DeliveryPath::UdpDatagram,
+            DatagramPathHealthState::Blocked,
+            Some(200_000),
+        )]);
+        assert!(
+            health.blocked,
+            "only observed lane blocked and no fallback observed"
+        );
         assert_eq!(health.loss_ppm, None, "no fallback lane");
         // Absence of any datagram observation is not a Blocked lane.
         let health = active_best_effort_datagram_lane_health(&[]);

@@ -374,7 +374,9 @@ enum TreeEdgeTransitionStep {
     /// The split rolled back to the old route. `reason` is one of the
     /// `&'static` strings surfaced in `shitspeak_s2s_voice_split_abort_total`
     /// (`challenger_degraded` or `rollback`).
-    Abort { reason: &'static str },
+    Abort {
+        reason: &'static str,
+    },
 }
 
 /// Loaded quality of one split leg: the coarse pressure the abort/confirm
@@ -568,9 +570,7 @@ impl TreeEdgeSplitState {
                 }
                 if *share <= *target && *target <= 0.0 {
                     // The controller converged fully back to the old route.
-                    return TreeEdgeTransitionStep::Abort {
-                        reason: "rollback",
-                    };
+                    return TreeEdgeTransitionStep::Abort { reason: "rollback" };
                 }
                 if *share >= *target && *target < 1.0 {
                     // Interior steady state reached; hold and keep re-evaluating.
@@ -589,9 +589,7 @@ impl TreeEdgeSplitState {
                 }
                 if *share <= *target && *target <= 0.0 {
                     // Loaded quality flipped decisively: return to the old route.
-                    return TreeEdgeTransitionStep::Abort {
-                        reason: "rollback",
-                    };
+                    return TreeEdgeTransitionStep::Abort { reason: "rollback" };
                 }
             }
         }
@@ -1707,9 +1705,11 @@ impl DistributionPlane {
         let incumbent = candidate_for(&candidates, binding.path);
 
         if !binding.bound && binding.pending == Some((TreeEdgePath::DirectChild, "initial")) {
-            if let Some(replacement) = candidates.iter().copied().find(|candidate| {
-                candidate.pressure < 3 && !candidate.lane_blocked
-            }) {
+            if let Some(replacement) = candidates
+                .iter()
+                .copied()
+                .find(|candidate| candidate.pressure < 3 && !candidate.lane_blocked)
+            {
                 binding.pending = Some((replacement.path, "initial"));
             }
         }
@@ -1735,7 +1735,13 @@ impl DistributionPlane {
             // mid-hold — an interior hold is a long-lived steady state, not a
             // brief switch, and would be torn down by idle pruning otherwise.
             binding.last_used_at = now;
-            let TreeEdgeSplitState::Splitting { from, to, share, phase, .. } = transition;
+            let TreeEdgeSplitState::Splitting {
+                from,
+                to,
+                share,
+                phase,
+                ..
+            } = transition;
             let phase_before = phase;
             let to_quality = loaded_quality_for(candidate_for(&candidates, binding.path));
             let from_quality = loaded_quality_for(candidate_for(&candidates, from));
@@ -1760,12 +1766,7 @@ impl DistributionPlane {
                     // The challenger's first hop looked good while idle but
                     // degraded under load: keep it out of contention until its
                     // loaded metrics could be re-established.
-                    self.record_tree_edge_split_abort(
-                        parent,
-                        child,
-                        to.first_hop(child),
-                        now,
-                    );
+                    self.record_tree_edge_split_abort(parent, child, to.first_hop(child), now);
                     distribution_metrics::record_split_abort(parent, child, reason);
                     distribution_metrics::update_tree_edge_split_share(parent, child, None);
                     distribution_metrics::record_tree_edge_binding_event(
@@ -1830,9 +1831,7 @@ impl DistributionPlane {
                 "transport_unavailable"
             };
             let replacement = candidates.iter().copied().find(|candidate| {
-                candidate.path != binding.path
-                    && candidate.pressure < 3
-                    && !candidate.lane_blocked
+                candidate.path != binding.path && candidate.pressure < 3 && !candidate.lane_blocked
             });
             if let Some(replacement) = replacement {
                 begin_tree_edge_transition(binding, replacement.path, reason, now);
@@ -1887,8 +1886,8 @@ impl DistributionPlane {
             // or the receiver is hearing gaps the sender cannot, so the extra
             // confirmation window only prolongs the damage. min_hold still
             // guards the fresh-binding flap case.
-            let incumbent_hard_signal = incumbent
-                .is_some_and(|candidate| candidate.hard_loss || candidate.sink_gap);
+            let incumbent_hard_signal =
+                incumbent.is_some_and(|candidate| candidate.hard_loss || candidate.sink_gap);
             let confirm_window_met = incumbent_hard_signal
                 || binding.challenger_since.is_some_and(|since| {
                     now.saturating_duration_since(since) >= policy.challenger_confirm
@@ -1980,9 +1979,10 @@ impl DistributionPlane {
             })
             .or_else(|| verified().next())
             .or_else(|| {
-                candidates.iter().copied().find(|candidate| {
-                    candidate.path != attempt.path && !candidate.verified
-                })
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|candidate| candidate.path != attempt.path && !candidate.verified)
             });
         let Some(replacement) = replacement else {
             record_no_tree_edge_alternate(attempt.key, binding);
@@ -3326,29 +3326,21 @@ mod tests {
                 TreeEdgeCandidate::legacy(4097, 1, 3),
             ]
         };
-        let first = plane.choose_tree_edge(
-            tree_key,
-            1,
-            2,
-            candidates(),
-            fast_sticky_policy(),
-            at(250),
-        );
+        let first =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(250));
         assert_eq!(first.path(), TreeEdgePath::DirectChild);
-        let confirmed = plane.choose_tree_edge(
-            tree_key,
-            1,
-            2,
-            candidates(),
-            fast_sticky_policy(),
-            at(750),
-        );
+        let confirmed =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(750));
         assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
         let split = plane
             .complete_tree_edge_attempt(confirmed, true, at(750))
             .expect("confirmed switch starts a split");
         assert_eq!(split.from(), TreeEdgePath::DirectChild);
-        assert_eq!(split.share(), 0.0, "probe window duplicates voice onto both routes");
+        assert_eq!(
+            split.share(),
+            0.0,
+            "probe window duplicates voice onto both routes"
+        );
 
         // Through the fanout window the split stays active and the old route
         // keeps its full load (share stays at the probe value).
@@ -3417,23 +3409,11 @@ mod tests {
                 TreeEdgeCandidate::legacy(4097, 2, 3),
             ]
         };
-        let first = plane.choose_tree_edge(
-            tree_key,
-            1,
-            2,
-            candidates(),
-            fast_sticky_policy(),
-            at(250),
-        );
+        let first =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(250));
         assert_eq!(first.path(), TreeEdgePath::DirectChild);
-        let confirmed = plane.choose_tree_edge(
-            tree_key,
-            1,
-            2,
-            candidates(),
-            fast_sticky_policy(),
-            at(750),
-        );
+        let confirmed =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(750));
         assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
         let _ = plane.complete_tree_edge_attempt(confirmed, true, at(750));
         assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_some());
@@ -3442,14 +3422,8 @@ mod tests {
         // loaded challenger instead of stalling in Adjusting forever.
         let completion = (0..100u64).find_map(|i| {
             let ms = 1450 + i * 50;
-            let _ = plane.choose_tree_edge(
-                tree_key,
-                1,
-                2,
-                candidates(),
-                fast_sticky_policy(),
-                at(ms),
-            );
+            let _ =
+                plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(ms));
             plane
                 .active_tree_edge_split(tree_key, 1, 2)
                 .is_none()
@@ -3552,7 +3526,8 @@ mod tests {
                 TreeEdgeCandidate::legacy(4097, 3, 3),
             ]
         };
-        let first = plane.choose_tree_edge(tree_key, 1, 2, degraded(), fast_sticky_policy(), at(800));
+        let first =
+            plane.choose_tree_edge(tree_key, 1, 2, degraded(), fast_sticky_policy(), at(800));
         assert_eq!(
             first.path(),
             TreeEdgePath::LegacyVia(4097),
@@ -3560,7 +3535,8 @@ mod tests {
         );
         assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_some());
 
-        let second = plane.choose_tree_edge(tree_key, 1, 2, degraded(), fast_sticky_policy(), at(850));
+        let second =
+            plane.choose_tree_edge(tree_key, 1, 2, degraded(), fast_sticky_policy(), at(850));
         assert_eq!(
             second.path(),
             TreeEdgePath::DirectChild,
@@ -3690,7 +3666,8 @@ mod tests {
         };
         let completion = (0..200u64).find_map(|i| {
             let ms = 1450 + i * 50;
-            let _ = plane.choose_tree_edge(tree_key, 1, 2, loaded(), decisive_sticky_policy(), at(ms));
+            let _ =
+                plane.choose_tree_edge(tree_key, 1, 2, loaded(), decisive_sticky_policy(), at(ms));
             plane
                 .active_tree_edge_split(tree_key, 1, 2)
                 .is_none()
@@ -3933,7 +3910,8 @@ mod tests {
             ]
         };
         let _ = plane.choose_tree_edge(tree_key, 1, 2, degraded(), fast_sticky_policy(), at(800));
-        let second = plane.choose_tree_edge(tree_key, 1, 2, degraded(), fast_sticky_policy(), at(850));
+        let second =
+            plane.choose_tree_edge(tree_key, 1, 2, degraded(), fast_sticky_policy(), at(850));
         assert_eq!(second.path(), TreeEdgePath::DirectChild);
         assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_none());
 
@@ -3941,7 +3919,8 @@ mod tests {
         // 20%-cheaper cost qualifies normally — but it stays out of contention
         // for the whole exclusion window rather than being re-tried/re-aborted.
         let _ = plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(1_100));
-        let later = plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(1_600));
+        let later =
+            plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(1_600));
         assert_eq!(
             later.path(),
             TreeEdgePath::DirectChild,
@@ -3950,14 +3929,7 @@ mod tests {
         assert!(plane.active_tree_edge_split(tree_key, 1, 2).is_none());
 
         // After the exclusion window, the first hop is eligible again.
-        let _ = plane.choose_tree_edge(
-            tree_key,
-            1,
-            2,
-            healthy(),
-            fast_sticky_policy(),
-            at(11_150),
-        );
+        let _ = plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(11_150));
         let reeligible =
             plane.choose_tree_edge(tree_key, 1, 2, healthy(), fast_sticky_policy(), at(11_650));
         assert_eq!(reeligible.path(), TreeEdgePath::LegacyVia(4097));
@@ -4022,7 +3994,11 @@ mod tests {
                 fast_sticky_policy(),
                 at(ms),
             );
-            assert_eq!(attempt.path(), TreeEdgePath::LegacyVia(3), "deferred at {ms}");
+            assert_eq!(
+                attempt.path(),
+                TreeEdgePath::LegacyVia(3),
+                "deferred at {ms}"
+            );
         }
         assert_eq!(
             plane.current_tree_edge_path(tree_key, 1, 2),
@@ -4551,11 +4527,20 @@ mod tests {
         };
         // First observation at 800 (min_hold met): without hard_loss the
         // challenger must be seen twice across the 500ms confirm window.
-        let first = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(800));
+        let first =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(800));
         assert_eq!(first.path(), TreeEdgePath::DirectChild);
-        let second = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(850));
+        let second =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(850));
         assert_eq!(second.path(), TreeEdgePath::DirectChild);
-        let confirmed = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(1_350));
+        let confirmed = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            fast_sticky_policy(),
+            at(1_350),
+        );
         assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
     }
 
@@ -4608,11 +4593,20 @@ mod tests {
         };
         // First observation at 800 (min_hold met): without a hard signal on the
         // incumbent the challenger must be seen twice across the 500ms confirm.
-        let first = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(800));
+        let first =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(800));
         assert_eq!(first.path(), TreeEdgePath::DirectChild);
-        let second = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(850));
+        let second =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(850));
         assert_eq!(second.path(), TreeEdgePath::DirectChild);
-        let confirmed = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(1_350));
+        let confirmed = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            fast_sticky_policy(),
+            at(1_350),
+        );
         assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
     }
 
@@ -4638,7 +4632,8 @@ mod tests {
             ]
         };
         let _ = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(250));
-        let confirmed = plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(750));
+        let confirmed =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(750));
         let split = plane
             .complete_tree_edge_attempt(confirmed, true, at(750))
             .expect("confirmed switch starts a split");
@@ -4652,7 +4647,8 @@ mod tests {
                 TreeEdgeCandidate::legacy(4097, 1, 3).with_datagram_lane(true, false),
             ]
         };
-        let attempt = plane.choose_tree_edge(tree_key, 1, 2, blocked(), fast_sticky_policy(), at(760));
+        let attempt =
+            plane.choose_tree_edge(tree_key, 1, 2, blocked(), fast_sticky_policy(), at(760));
         assert_eq!(attempt.path(), TreeEdgePath::DirectChild, "rolled back");
         assert_eq!(
             plane.current_tree_edge_path(tree_key, 1, 2),
@@ -4662,9 +4658,15 @@ mod tests {
             .into_iter()
             .find(|sample| {
                 sample.name() == "shitspeak_s2s_voice_split_abort_total"
-                    && sample.labels().iter().any(|(k, v)| k == "source" && v == "1")
+                    && sample
+                        .labels()
+                        .iter()
+                        .any(|(k, v)| k == "source" && v == "1")
                     && sample.labels().iter().any(|(k, v)| k == "peer" && v == "2")
-                    && sample.labels().iter().any(|(k, v)| k == "reason" && v == "lane_blocked")
+                    && sample
+                        .labels()
+                        .iter()
+                        .any(|(k, v)| k == "reason" && v == "lane_blocked")
             })
             .expect("lane_blocked split abort recorded");
         assert!(abort.value() >= 1.0);

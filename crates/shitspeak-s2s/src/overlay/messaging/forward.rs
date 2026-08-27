@@ -2363,15 +2363,11 @@ async fn send_direct_tree_edge_with_routing(
 /// whether its effective loss is at/above the full-dup threshold (shortened
 /// challenger confirm). Both `false` when the lane is unknown (e.g. a seeded
 /// routing-table alternate with no live transport).
-fn datagram_lane_signal(
-    transport: &ConnectionManager,
-    first_hop: NodeIdentifier,
-) -> (bool, bool) {
+fn datagram_lane_signal(transport: &ConnectionManager, first_hop: NodeIdentifier) -> (bool, bool) {
     let lane = transport.best_effort_datagram_lane_health(first_hop);
     (
         lane.blocked,
-        lane
-            .loss_ppm
+        lane.loss_ppm
             .is_some_and(|ppm| ppm >= VOICE_UDP_FULL_DUP_LOSS_PPM),
     )
 }
@@ -2392,19 +2388,19 @@ fn sink_gap_signal(transport: &ConnectionManager, first_hop: NodeIdentifier) -> 
 fn record_datagram_lane_signals(
     source: NodeIdentifier,
     peer: NodeIdentifier,
+    frame_bytes: usize,
     lane_blocked: bool,
     hard_loss: bool,
     sink_gap: bool,
 ) {
-    if lane_blocked {
-        crate::overlay::distribution_metrics::record_datagram_lane_signal(source, peer, "lane_blocked");
-    }
-    if hard_loss {
-        crate::overlay::distribution_metrics::record_datagram_lane_signal(source, peer, "hard_loss");
-    }
-    if sink_gap {
-        crate::overlay::distribution_metrics::record_datagram_lane_signal(source, peer, "sink_gap");
-    }
+    crate::overlay::distribution_metrics::record_datagram_lane_observation(
+        source,
+        peer,
+        frame_bytes,
+        lane_blocked,
+        hard_loss,
+        sink_gap,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2427,6 +2423,7 @@ fn tree_edge_candidates(
     let metric = route_metric_from_wire(data.route_metric, level)
         .unwrap_or_else(|| RoutingMetric::default_for_level(level));
     let options = transport_options_for_overlay_data(data, Some(hop_ttl));
+    let frame_bytes = data.encoded_len();
     let mut candidates = Vec::new();
     let tables = routing.load();
     let visited = path_trace_set(path_trace);
@@ -2447,12 +2444,7 @@ fn tree_edge_candidates(
                 .try_fold(0u64, |acc, recipient| {
                     tables
                         .lookup_via_first_hop_with_metric(
-                            self_id,
-                            *recipient,
-                            level,
-                            metric,
-                            &visited,
-                            child,
+                            self_id, *recipient, level, metric, &visited, child,
                         )
                         .map(|route| acc.saturating_add(route.cost))
                 })
@@ -2460,7 +2452,14 @@ fn tree_edge_candidates(
         };
         let (lane_blocked, hard_loss) = datagram_lane_signal(transport, child);
         let sink_gap = sink_gap_signal(transport, child);
-        record_datagram_lane_signals(self_id, child, lane_blocked, hard_loss, sink_gap);
+        record_datagram_lane_signals(
+            self_id,
+            child,
+            frame_bytes,
+            lane_blocked,
+            hard_loss,
+            sink_gap,
+        );
         candidates.push(
             TreeEdgeCandidate::direct_with_cost(pressure, route_cost)
                 .with_datagram_lane(lane_blocked, hard_loss)
@@ -2486,7 +2485,14 @@ fn tree_edge_candidates(
         ) {
             let (lane_blocked, hard_loss) = datagram_lane_signal(transport, first_hop);
             let sink_gap = sink_gap_signal(transport, first_hop);
-            record_datagram_lane_signals(self_id, first_hop, lane_blocked, hard_loss, sink_gap);
+            record_datagram_lane_signals(
+                self_id,
+                first_hop,
+                frame_bytes,
+                lane_blocked,
+                hard_loss,
+                sink_gap,
+            );
             candidates.push(
                 TreeEdgeCandidate::legacy(first_hop, pressure, route_cost)
                     .with_datagram_lane(lane_blocked, hard_loss)
@@ -2514,7 +2520,10 @@ fn tree_edge_candidates(
             .iter()
             .any(|candidate| candidate.path().first_hop(child) == alternate.next_hop)
     {
-        candidates.push(TreeEdgeCandidate::alternate(alternate.next_hop, alternate.cost));
+        candidates.push(TreeEdgeCandidate::alternate(
+            alternate.next_hop,
+            alternate.cost,
+        ));
     }
     candidates
 }

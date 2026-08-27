@@ -518,8 +518,7 @@ impl Reorderer {
         let Some(started) = entry.hold_started_at else {
             return false;
         };
-        started <= now
-            && matches!(self.gap_hold_deadline(entry), Some(deadline) if deadline > now)
+        started <= now && matches!(self.gap_hold_deadline(entry), Some(deadline) if deadline > now)
     }
 
     fn grow_adaptive_delay(&self, entry: &mut SenderState) {
@@ -972,8 +971,8 @@ impl Reorderer {
             // still emit the whole chunk contiguously (delayed) rather than
             // clip.
             if let Some(hold_started) = entry.hold_started_at {
-                let hold_until = hold_started
-                    + Duration::from_millis(self.cfg.chunk_hold_budget_ms);
+                let hold_until =
+                    hold_started + Duration::from_millis(self.cfg.chunk_hold_budget_ms);
                 if now < hold_until {
                     // Re-arm the deadline task for the hold-budget expiry and
                     // keep the whole buffered chunk.
@@ -1180,9 +1179,8 @@ impl Reorderer {
             }
             held_frames = held_frames.saturating_add(entry.pending.len());
             if let Some(start) = entry.hold_started_at {
-                let delay_us =
-                    u64::try_from(now.saturating_duration_since(start).as_micros())
-                        .unwrap_or(u64::MAX);
+                let delay_us = u64::try_from(now.saturating_duration_since(start).as_micros())
+                    .unwrap_or(u64::MAX);
                 max_held_delay_us = max_held_delay_us.max(delay_us);
             }
         }

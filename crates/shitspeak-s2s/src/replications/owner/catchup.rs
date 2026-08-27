@@ -408,7 +408,14 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
         rt.rearm_catchup_retry(origin, resp_epoch);
         if rt.net.alive_members().contains(&origin) {
             let _ = rt
-                .send_catchup_req_to(origin, origin, resp_epoch, 0, 0, "apply_empty_relay_ask_origin")
+                .send_catchup_req_to(
+                    origin,
+                    origin,
+                    resp_epoch,
+                    0,
+                    0,
+                    "apply_empty_relay_ask_origin",
+                )
                 .await;
         }
         return;
@@ -438,7 +445,14 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
                     .unwrap_or(0)
             };
             let _ = rt
-                .send_catchup_req_to(origin, origin, resp_epoch, since, 0, "apply_too_old_empty_ask_origin")
+                .send_catchup_req_to(
+                    origin,
+                    origin,
+                    resp_epoch,
+                    since,
+                    0,
+                    "apply_too_old_empty_ask_origin",
+                )
                 .await;
         }
         return;
@@ -625,7 +639,14 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
         rt.rearm_catchup_retry(origin, resp_epoch);
         if from != origin && rt.net.alive_members().contains(&origin) {
             let _ = rt
-                .send_catchup_req_to(origin, origin, resp_epoch, 0, 0, "apply_inactive_ask_origin")
+                .send_catchup_req_to(
+                    origin,
+                    origin,
+                    resp_epoch,
+                    0,
+                    0,
+                    "apply_inactive_ask_origin",
+                )
                 .await;
         }
         return;
@@ -724,7 +745,14 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
     if from != origin && origin != rt.self_id && rt.net.alive_members().contains(&origin) {
         let known_epoch = rt.net.member_boot_epoch(origin).unwrap_or(resp_epoch);
         let _ = rt
-            .send_catchup_req_to(origin, origin, known_epoch, version_after, 0, "apply_relay_followup")
+            .send_catchup_req_to(
+                origin,
+                origin,
+                known_epoch,
+                version_after,
+                0,
+                "apply_relay_followup",
+            )
             .await;
     }
     debug!(

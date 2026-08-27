@@ -55,11 +55,11 @@ use shitspeak_proto::s2s_transport_proto as pb;
 
 use super::super::compression::{maybe_compress_frame_payload, validate_and_decode_payload};
 use super::super::connection::{ActiveStream, OutboundFrame, PeerState};
+use super::super::frame::{FrameType, build_frame};
+use super::super::identity::{NodeIdentity, parse_peer_cn};
 use super::super::latest_wins_queue::{
     LatestWinsReceiver, TryRecvLatestWinsError, latest_wins_queue_unbounded,
 };
-use super::super::frame::{FrameType, build_frame};
-use super::super::identity::{NodeIdentity, parse_peer_cn};
 use super::super::manager::{InboundDispatch, InboundMessage, ManagerInner};
 use super::super::metrics::{
     ExpiredOutboundDropStage, TransportIoDirection, TransportIoPressureResult,
@@ -2936,13 +2936,7 @@ fn spawn_udp_write_pump(
     let (tx, rx) = latest_wins_queue_unbounded();
     let closed = inner.shutdown().child_token();
     tokio::spawn(run_write(state, session, peer, inner, rx, closed.clone()));
-    ActiveStream::new_latest_wins(
-        TransportKind::Udp,
-        Some(peer_addr),
-        tx,
-        closed,
-        is_dialer,
-    )
+    ActiveStream::new_latest_wins(TransportKind::Udp, Some(peer_addr), tx, closed, is_dialer)
 }
 
 fn stabilized_ping_interval(active: Duration, idle: Duration) -> Duration {

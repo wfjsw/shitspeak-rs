@@ -58,7 +58,11 @@ pub(crate) struct FecBlockToSend {
 /// Blocks are built only from equal-length members, so in practice this is a
 /// plain XOR of length == the common member length.
 pub(crate) fn xor_payloads(payloads: &[&[u8]]) -> Vec<u8> {
-    let max_len = payloads.iter().map(|payload| payload.len()).max().unwrap_or(0);
+    let max_len = payloads
+        .iter()
+        .map(|payload| payload.len())
+        .max()
+        .unwrap_or(0);
     let mut acc = vec![0u8; max_len];
     for payload in payloads {
         for (index, byte) in payload.iter().copied().enumerate() {
@@ -171,7 +175,11 @@ impl SenderFecWindow {
             // Length changed mid-block: the new frame starts a fresh block.
             self.pending.clear();
         }
-        self.pending.push(PendingMember { seq, payload, terminator });
+        self.pending.push(PendingMember {
+            seq,
+            payload,
+            terminator,
+        });
         if self.pending.len() < self.block_size {
             return None;
         }
@@ -182,8 +190,11 @@ impl SenderFecWindow {
                 terminator_mask |= 1 << index;
             }
         }
-        let payloads: Vec<&[u8]> =
-            self.pending.iter().map(|member| member.payload.as_ref()).collect();
+        let payloads: Vec<&[u8]> = self
+            .pending
+            .iter()
+            .map(|member| member.payload.as_ref())
+            .collect();
         let parity = Bytes::from(xor_payloads(&payloads));
         // Second parity (index 1): GF(2^8) weighted XOR with Vandermonde
         // coefficient 2^member_index, same member length as the XOR sum.
@@ -198,7 +209,12 @@ impl SenderFecWindow {
             Bytes::from(acc)
         });
         self.pending.clear();
-        Some(FecBlockToSend { member_seqs, parity, parity2, terminator_mask })
+        Some(FecBlockToSend {
+            member_seqs,
+            parity,
+            parity2,
+            terminator_mask,
+        })
     }
 }
 
@@ -215,7 +231,10 @@ struct FecBlock {
 
 impl FecBlock {
     fn parity(&self, index: usize) -> Option<&[u8]> {
-        self.parities.get(index).and_then(Option::as_ref).map(Bytes::as_ref)
+        self.parities
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(Bytes::as_ref)
     }
 }
 
@@ -235,7 +254,11 @@ struct ReceivedMember {
 
 impl ReceiverFecWindow {
     fn new(window: usize) -> Self {
-        Self { window: window.max(1), received: VecDeque::new(), blocks: Vec::new() }
+        Self {
+            window: window.max(1),
+            received: VecDeque::new(),
+            blocks: Vec::new(),
+        }
     }
 
     /// Record an inbound data frame (any copy kind). Keeps the most recent
@@ -261,7 +284,11 @@ impl ReceiverFecWindow {
         }
         // Merge into an existing block when the same member set already has a
         // parity (the two parity frames of one block arrive separately).
-        if let Some(block) = self.blocks.iter_mut().find(|block| block.member_seqs == member_seqs) {
+        if let Some(block) = self
+            .blocks
+            .iter_mut()
+            .find(|block| block.member_seqs == member_seqs)
+        {
             while block.parities.len() <= parity_index {
                 block.parities.push(None);
             }
@@ -269,7 +296,11 @@ impl ReceiverFecWindow {
         } else {
             let mut parities = vec![None; parity_index + 1];
             parities[parity_index] = Some(parity);
-            self.blocks.push(FecBlock { member_seqs, parities, terminator_mask });
+            self.blocks.push(FecBlock {
+                member_seqs,
+                parities,
+                terminator_mask,
+            });
         }
         while self.blocks.len() > self.window {
             self.blocks.remove(0);
@@ -307,7 +338,9 @@ impl ReceiverFecWindow {
             // S0 = XOR of the present members; S1 = GF(2^8)-weighted XOR of
             // the present members with weight 2^member_index. Both share the
             // present members' common payload length.
-            let Some(first_present) = present.first() else { continue };
+            let Some(first_present) = present.first() else {
+                continue;
+            };
             let member_len = first_present.frame.payload.len();
             let mut s0 = vec![0u8; member_len];
             let mut s1 = vec![0u8; member_len];
@@ -326,7 +359,9 @@ impl ReceiverFecWindow {
             match missing.as_slice() {
                 [target] => {
                     // Single recovery: missing = XOR parity ^ all present.
-                    let Some(parity0) = block.parity(0) else { continue };
+                    let Some(parity0) = block.parity(0) else {
+                        continue;
+                    };
                     let mut acc = xor_into(parity0, &[]);
                     for member in &present {
                         acc = xor_into(&acc, &member.frame.payload);
@@ -394,7 +429,9 @@ fn recovered_frame(
     target: u64,
     payload: Bytes,
 ) -> Option<VoiceFrame> {
-    let template = present.iter().min_by_key(|member| member.seq.abs_diff(target))?;
+    let template = present
+        .iter()
+        .min_by_key(|member| member.seq.abs_diff(target))?;
     let member_index = block
         .member_seqs
         .iter()
@@ -525,7 +562,11 @@ impl ReceiverFecState {
         parity_index: usize,
         terminator_mask: u32,
     ) {
-        let key = MirrorKey { sender_session, sender_epoch, from };
+        let key = MirrorKey {
+            sender_session,
+            sender_epoch,
+            from,
+        };
         let mut inner = self.inner.lock().unwrap();
         let mirror = Self::mirror_mut(&mut inner, key);
         mirror.record_parity(member_seqs, parity, parity_index, terminator_mask);
@@ -542,7 +583,11 @@ impl ReceiverFecState {
         sender_epoch: u64,
         gap: Option<(u64, u64)>,
     ) -> Vec<VoiceFrame> {
-        let key = MirrorKey { sender_session, sender_epoch, from };
+        let key = MirrorKey {
+            sender_session,
+            sender_epoch,
+            from,
+        };
         let mut inner = self.inner.lock().unwrap();
         let mirror = Self::mirror_mut(&mut inner, key);
         let recovered = mirror.try_reconstruct(gap);
@@ -552,10 +597,7 @@ impl ReceiverFecState {
         recovered
     }
 
-    fn mirror_mut(
-        inner: &mut ReceiverFecStateInner,
-        key: MirrorKey,
-    ) -> &mut ReceiverFecWindow {
+    fn mirror_mut(inner: &mut ReceiverFecStateInner, key: MirrorKey) -> &mut ReceiverFecWindow {
         // Index-based so the hit and miss paths never hold two mutable
         // borrows of `inner.mirrors` at once.
         let existing = inner
@@ -578,8 +620,13 @@ impl ReceiverFecState {
                 inner.mirrors.swap_remove(index);
             }
         }
-        let tracked = InstantTrackedKey { key, last_seen: std::time::Instant::now() };
-        inner.mirrors.push((tracked, ReceiverFecWindow::new(inner.window)));
+        let tracked = InstantTrackedKey {
+            key,
+            last_seen: std::time::Instant::now(),
+        };
+        inner
+            .mirrors
+            .push((tracked, ReceiverFecWindow::new(inner.window)));
         let (_, mirror) = inner.mirrors.last_mut().expect("just pushed");
         mirror
     }
@@ -612,7 +659,11 @@ mod tests {
         let mut window = SenderFecWindow::new(4, 1);
         // Frames 1-3 buffered, no parity yet.
         for seq in 1..=3 {
-            assert!(window.push(seq, Bytes::from_static(b"abcd"), false).is_none());
+            assert!(
+                window
+                    .push(seq, Bytes::from_static(b"abcd"), false)
+                    .is_none()
+            );
         }
         // Frame 4 completes the block.
         let block = window.push(4, Bytes::from_static(b"abcd"), false).unwrap();
@@ -683,7 +734,11 @@ mod tests {
     fn sender_emits_two_parities_when_configured() {
         let mut window = SenderFecWindow::new(4, 2);
         for seq in 1..=3 {
-            assert!(window.push(seq, Bytes::from(vec![seq as u8; 3]), false).is_none());
+            assert!(
+                window
+                    .push(seq, Bytes::from(vec![seq as u8; 3]), false)
+                    .is_none()
+            );
         }
         let block = window
             .push(4, Bytes::from(vec![4u8; 3]), false)
@@ -724,8 +779,10 @@ mod tests {
         mirror.record_parity(vec![1, 2, 3, 4], Bytes::from(parity1), 1, 0);
         let recovered = mirror.try_reconstruct(None);
         assert_eq!(recovered.len(), 2);
-        let by_seq: HashMap<u64, Vec<u8>> =
-            recovered.iter().map(|f| (f.s2s_seq, f.payload.to_vec())).collect();
+        let by_seq: HashMap<u64, Vec<u8>> = recovered
+            .iter()
+            .map(|f| (f.s2s_seq, f.payload.to_vec()))
+            .collect();
         assert_eq!(by_seq.get(&3).map(Vec::as_slice), Some(b"ijkl".as_slice()));
         assert_eq!(by_seq.get(&4).map(Vec::as_slice), Some(b"mnop".as_slice()));
     }
@@ -747,7 +804,12 @@ mod tests {
         mirror.record_frame(frame(2, b"efgh", false));
         // Weighted parity arrives first, then the XOR sum for the same block.
         mirror.record_parity(vec![1, 2, 3, 4], Bytes::from_static(b"Q\x00\x00\x00"), 1, 0);
-        mirror.record_parity(vec![1, 2, 3, 4], Bytes::from_static(b"\x00\x00\x00\x00"), 0, 0);
+        mirror.record_parity(
+            vec![1, 2, 3, 4],
+            Bytes::from_static(b"\x00\x00\x00\x00"),
+            0,
+            0,
+        );
         let recovered = mirror.try_reconstruct(None);
         assert_eq!(recovered.len(), 2);
     }

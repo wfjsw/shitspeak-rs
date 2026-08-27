@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use shitspeak_core::NodeIdentifier;
 
@@ -236,6 +237,13 @@ struct VoiceOverlapLinkGauge {
     primary_fallback_sends: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct DatagramLaneSignalState {
+    active: bool,
+    active_since: Option<Instant>,
+    active_duration: Duration,
+}
+
 #[derive(Default)]
 struct DistributionMetrics {
     events: HashMap<EventKey, u64>,
@@ -276,6 +284,17 @@ struct DistributionMetrics {
     /// can be judged: distinguishes "no escapes because the lane is fine" from
     /// "no escapes despite a broken mechanism".
     datagram_lane_signals: HashMap<(NodeIdentifier, NodeIdentifier, &'static str), u64>,
+    /// Current C2 signal state, accumulated active time, and state changes.
+    /// Unlike `datagram_lane_signals`, these are updated from boolean state
+    /// observations rather than incremented once for every affected send.
+    datagram_lane_signal_states:
+        HashMap<(NodeIdentifier, NodeIdentifier, &'static str), DatagramLaneSignalState>,
+    datagram_lane_signal_transitions:
+        HashMap<(NodeIdentifier, NodeIdentifier, &'static str, &'static str), u64>,
+    datagram_lane_affected_frames: HashMap<(NodeIdentifier, NodeIdentifier, &'static str), u64>,
+    datagram_lane_affected_bytes: HashMap<(NodeIdentifier, NodeIdentifier, &'static str), u64>,
+    datagram_lane_observed_frames: HashMap<(NodeIdentifier, NodeIdentifier), u64>,
+    datagram_lane_observed_bytes: HashMap<(NodeIdentifier, NodeIdentifier), u64>,
     /// Redundant split-copy sheds per (first hop, trigger) — counter
     /// `shitspeak_s2s_voice_transition_copy_shed_total`. Every frame whose
     /// old-route copy is dropped in `send_tree_edge_split_copy` records one
@@ -608,7 +627,10 @@ pub(crate) fn update_tree_edge_transition(
 ) {
     let mut metrics = METRICS.lock().unwrap();
     if active {
-        *metrics.active_transitions.entry((source, peer)).or_default() += 1;
+        *metrics
+            .active_transitions
+            .entry((source, peer))
+            .or_default() += 1;
     } else if let Some(count) = metrics.active_transitions.get_mut(&(source, peer)) {
         *count = count.saturating_sub(1);
         if *count == 0 {
@@ -643,7 +665,11 @@ pub(crate) fn update_tree_edge_split_share(
 /// (counter `shitspeak_s2s_voice_split_phase_total`). `phase` is a `&'static`
 /// `SplitPhase` variant name so the label set is bounded and stable across
 /// restarts.
-pub(crate) fn record_split_phase(source: NodeIdentifier, peer: NodeIdentifier, phase: &'static str) {
+pub(crate) fn record_split_phase(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    phase: &'static str,
+) {
     let mut metrics = METRICS.lock().unwrap();
     *metrics
         .split_phases
@@ -656,7 +682,11 @@ pub(crate) fn record_split_phase(source: NodeIdentifier, peer: NodeIdentifier, p
 /// is one of the `&'static` strings produced by the split state machine
 /// (`challenger_degraded`, `lane_blocked`, `rollback`, `primary_failed`, or
 /// `timed_out`).
-pub(crate) fn record_split_abort(source: NodeIdentifier, peer: NodeIdentifier, reason: &'static str) {
+pub(crate) fn record_split_abort(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    reason: &'static str,
+) {
     let mut metrics = METRICS.lock().unwrap();
     *metrics
         .split_aborts
@@ -694,6 +724,7 @@ pub(crate) fn record_tree_edge_decision(
 /// the per-edge rate is the exposure denominator against which the
 /// `shitspeak_s2s_voice_tree_edge_decision_total` escape and
 /// `confirmed_challenger` rates are judged.
+#[cfg(test)]
 pub(crate) fn record_datagram_lane_signal(
     source: NodeIdentifier,
     peer: NodeIdentifier,
@@ -706,6 +737,86 @@ pub(crate) fn record_datagram_lane_signal(
         .or_default() += 1;
 }
 
+/// Record one candidate-edge observation and maintain event-oriented C2
+/// telemetry. The observed frame/byte counters are the denominators for the
+/// affected counters. State transitions and active duration avoid interpreting
+/// the legacy per-send signal counter as a count of independent failures.
+pub(crate) fn record_datagram_lane_observation(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    frame_bytes: usize,
+    lane_blocked: bool,
+    hard_loss: bool,
+    sink_gap: bool,
+) {
+    record_datagram_lane_observation_at(
+        source,
+        peer,
+        frame_bytes,
+        lane_blocked,
+        hard_loss,
+        sink_gap,
+        Instant::now(),
+    );
+}
+
+fn record_datagram_lane_observation_at(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    frame_bytes: usize,
+    lane_blocked: bool,
+    hard_loss: bool,
+    sink_gap: bool,
+    now: Instant,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    let edge = (source, peer);
+    *metrics
+        .datagram_lane_observed_frames
+        .entry(edge)
+        .or_default() += 1;
+    *metrics
+        .datagram_lane_observed_bytes
+        .entry(edge)
+        .or_default() += frame_bytes as u64;
+
+    for (signal, active) in [
+        ("lane_blocked", lane_blocked),
+        ("hard_loss", hard_loss),
+        ("sink_gap", sink_gap),
+    ] {
+        let key = (source, peer, signal);
+        if active {
+            *metrics.datagram_lane_signals.entry(key).or_default() += 1;
+            *metrics
+                .datagram_lane_affected_frames
+                .entry(key)
+                .or_default() += 1;
+            *metrics.datagram_lane_affected_bytes.entry(key).or_default() += frame_bytes as u64;
+        }
+
+        let state = metrics.datagram_lane_signal_states.entry(key).or_default();
+        if active == state.active {
+            continue;
+        }
+
+        let transition = if active { "active" } else { "inactive" };
+        if active {
+            state.active = true;
+            state.active_since = Some(now);
+        } else {
+            if let Some(started) = state.active_since.take() {
+                state.active_duration += now.saturating_duration_since(started);
+            }
+            state.active = false;
+        }
+        *metrics
+            .datagram_lane_signal_transitions
+            .entry((source, peer, signal, transition))
+            .or_default() += 1;
+    }
+}
+
 /// Record one dropped redundant split copy (counter
 /// `shitspeak_s2s_voice_transition_copy_shed_total`). `reason` is the `&'static`
 /// trigger that shed it in `send_tree_edge_split_copy`: `pressure` (route
@@ -713,10 +824,7 @@ pub(crate) fn record_datagram_lane_signal(
 /// or `budget` (voice overlap copy capacity exhausted). This is the metric
 /// counterpart of the `shed voice transition copy` debug log; the log is
 /// debounced, so the counter is the complete, authoritative shed count.
-pub(crate) fn record_voice_transition_copy_shed(
-    first_hop: NodeIdentifier,
-    reason: &'static str,
-) {
+pub(crate) fn record_voice_transition_copy_shed(first_hop: NodeIdentifier, reason: &'static str) {
     let mut metrics = METRICS.lock().unwrap();
     *metrics
         .voice_transition_copy_sheds
@@ -731,6 +839,7 @@ fn set_peer_clock_gauges(gauges: Vec<(NodeIdentifier, PeerClockGauge)>) {
 }
 
 pub(crate) fn prometheus_samples(local_node: NodeIdentifier) -> Vec<PrometheusSample> {
+    let now = Instant::now();
     let metrics = METRICS.lock().unwrap();
     let mut out = Vec::new();
     let local_node = local_node.to_string();
@@ -895,6 +1004,80 @@ pub(crate) fn prometheus_samples(local_node: NodeIdentifier) -> Vec<PrometheusSa
                 ("signal".to_owned(), (*signal).to_owned()),
             ],
             *count as f64,
+        ));
+    }
+    for ((source, peer, signal), state) in &metrics.datagram_lane_signal_states {
+        let labels = vec![
+            ("source".to_owned(), source.to_string()),
+            ("peer".to_owned(), peer.to_string()),
+            ("signal".to_owned(), (*signal).to_owned()),
+        ];
+        let active_duration = state.active_since.map_or(state.active_duration, |started| {
+            state.active_duration + now.saturating_duration_since(started)
+        });
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_datagram_lane_state",
+            labels.clone(),
+            if state.active { 1.0 } else { 0.0 },
+        ));
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_datagram_lane_state_duration_seconds_total",
+            labels,
+            active_duration.as_secs_f64(),
+        ));
+    }
+    for ((source, peer, signal, state), count) in &metrics.datagram_lane_signal_transitions {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_datagram_lane_state_transition_total",
+            vec![
+                ("source".to_owned(), source.to_string()),
+                ("peer".to_owned(), peer.to_string()),
+                ("signal".to_owned(), (*signal).to_owned()),
+                ("state".to_owned(), (*state).to_owned()),
+            ],
+            *count as f64,
+        ));
+    }
+    for ((source, peer, signal), count) in &metrics.datagram_lane_affected_frames {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_datagram_lane_affected_frames_total",
+            vec![
+                ("source".to_owned(), source.to_string()),
+                ("peer".to_owned(), peer.to_string()),
+                ("signal".to_owned(), (*signal).to_owned()),
+            ],
+            *count as f64,
+        ));
+    }
+    for ((source, peer, signal), count) in &metrics.datagram_lane_affected_bytes {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_datagram_lane_affected_bytes_total",
+            vec![
+                ("source".to_owned(), source.to_string()),
+                ("peer".to_owned(), peer.to_string()),
+                ("signal".to_owned(), (*signal).to_owned()),
+            ],
+            *count as f64,
+        ));
+    }
+    for ((source, peer), count) in &metrics.datagram_lane_observed_frames {
+        let labels = vec![
+            ("source".to_owned(), source.to_string()),
+            ("peer".to_owned(), peer.to_string()),
+        ];
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_datagram_lane_observed_frames_total",
+            labels.clone(),
+            *count as f64,
+        ));
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_datagram_lane_observed_bytes_total",
+            labels,
+            metrics
+                .datagram_lane_observed_bytes
+                .get(&(*source, *peer))
+                .copied()
+                .unwrap_or_default() as f64,
         ));
     }
     for (peer, gauge) in &metrics.voice_overlap_links {
@@ -1130,18 +1313,30 @@ mod tests {
             &[("source", "7"), ("peer", "42")],
         )
         .expect("split share gauge exported");
-        assert!((gauge.value() - 0.88).abs() < 1e-9, "share exported as fraction");
+        assert!(
+            (gauge.value() - 0.88).abs() < 1e-9,
+            "share exported as fraction"
+        );
         // A corner (committed switch) exports as 1.0, then clears on completion.
         update_tree_edge_split_share(7, 42, Some(1.0));
-        assert!((sample("shitspeak_s2s_voice_split_share", &[("source", "7"), ("peer", "42")])
+        assert!(
+            (sample(
+                "shitspeak_s2s_voice_split_share",
+                &[("source", "7"), ("peer", "42")]
+            )
             .unwrap()
             .value()
-            - 1.0)
-            .abs()
-            < 1e-9);
+                - 1.0)
+                .abs()
+                < 1e-9
+        );
         update_tree_edge_split_share(7, 42, None);
         assert!(
-            sample("shitspeak_s2s_voice_split_share", &[("source", "7"), ("peer", "42")]).is_none(),
+            sample(
+                "shitspeak_s2s_voice_split_share",
+                &[("source", "7"), ("peer", "42")]
+            )
+            .is_none(),
             "cleared when the split commits or aborts"
         );
     }
@@ -1215,7 +1410,11 @@ mod tests {
         assert_eq!(
             sample(
                 "shitspeak_s2s_voice_tree_edge_decision_total",
-                &[("source", "7"), ("peer", "42"), ("reason", "confirmed_challenger")],
+                &[
+                    ("source", "7"),
+                    ("peer", "42"),
+                    ("reason", "confirmed_challenger")
+                ],
             )
             .expect("confirmed challenger decision exported")
             .value(),
@@ -1291,6 +1490,113 @@ mod tests {
             )
             .is_none(),
             "a signal never recorded on an edge is absent"
+        );
+    }
+
+    #[test]
+    fn datagram_lane_signal_state_metrics_separate_transitions_duration_and_exposure() {
+        let started = Instant::now();
+        record_datagram_lane_observation_at(91, 92, 120, true, false, false, started);
+        record_datagram_lane_observation_at(
+            91,
+            92,
+            180,
+            true,
+            false,
+            false,
+            started + Duration::from_secs(2),
+        );
+        record_datagram_lane_observation_at(
+            91,
+            92,
+            240,
+            false,
+            false,
+            false,
+            started + Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_state_transition_total",
+                &[
+                    ("source", "91"),
+                    ("peer", "92"),
+                    ("signal", "lane_blocked"),
+                    ("state", "active"),
+                ],
+            )
+            .expect("one entry transition exported")
+            .value(),
+            1.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_state_transition_total",
+                &[
+                    ("source", "91"),
+                    ("peer", "92"),
+                    ("signal", "lane_blocked"),
+                    ("state", "inactive"),
+                ],
+            )
+            .expect("one exit transition exported")
+            .value(),
+            1.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_state_duration_seconds_total",
+                &[("source", "91"), ("peer", "92"), ("signal", "lane_blocked")],
+            )
+            .expect("completed active duration exported")
+            .value(),
+            5.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_affected_frames_total",
+                &[("source", "91"), ("peer", "92"), ("signal", "lane_blocked")],
+            )
+            .expect("affected frames exported")
+            .value(),
+            2.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_affected_bytes_total",
+                &[("source", "91"), ("peer", "92"), ("signal", "lane_blocked")],
+            )
+            .expect("affected bytes exported")
+            .value(),
+            300.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_observed_frames_total",
+                &[("source", "91"), ("peer", "92")],
+            )
+            .expect("observed frame denominator exported")
+            .value(),
+            3.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_observed_bytes_total",
+                &[("source", "91"), ("peer", "92")],
+            )
+            .expect("observed byte denominator exported")
+            .value(),
+            540.0
+        );
+        assert_eq!(
+            sample(
+                "shitspeak_s2s_voice_datagram_lane_state",
+                &[("source", "91"), ("peer", "92"), ("signal", "lane_blocked")],
+            )
+            .expect("inactive state exported")
+            .value(),
+            0.0
         );
     }
 

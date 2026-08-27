@@ -22,11 +22,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::super::adaptive_queue::AdaptiveQueueBudget;
-use super::super::latest_wins_queue::{LatestWinsReceiver, TryRecvLatestWinsError};
 use super::super::compression::{maybe_compress_frame_payload, validate_and_decode_payload};
 use super::super::connection::{ActiveStream, OutboundFrame, PeerState, QuicV2SessionSender};
 use super::super::frame::{FrameType, build_frame, encode_frame_to_bytes};
 use super::super::identity::parse_peer_cn;
+use super::super::latest_wins_queue::{LatestWinsReceiver, TryRecvLatestWinsError};
 use super::super::manager::ManagerInner;
 use super::super::metrics::{
     DatagramPathEvidenceEvent, QuicDatagramDropReason, QuicDeliveryLane, QuicProtocolErrorReason,
@@ -939,8 +939,7 @@ async fn run_quic_datagram_sender(
                     None => return,
                 },
             };
-            let Some(prepared) =
-                prepare_quic_datagram(out, &conn, &session_sender, &peer, &inner)
+            let Some(prepared) = prepare_quic_datagram(out, &conn, &session_sender, &peer, &inner)
             else {
                 continue;
             };
@@ -1010,11 +1009,7 @@ fn prepare_quic_datagram(
         out.payload().clone(),
     );
     if frame.encoded_len() > inner.cfg().max_frame_bytes() {
-        record_session_datagram_evidence(
-            peer,
-            session_sender,
-            DatagramPathEvidenceEvent::TooLarge,
-        );
+        record_session_datagram_evidence(peer, session_sender, DatagramPathEvidenceEvent::TooLarge);
         record_session_datagram_drop(session_sender, QuicDatagramDropReason::TooLarge);
         return None;
     }
@@ -1045,22 +1040,14 @@ fn prepare_quic_datagram(
         return None;
     }
     if encoded.len() > inner.cfg().max_frame_bytes() {
-        record_session_datagram_evidence(
-            peer,
-            session_sender,
-            DatagramPathEvidenceEvent::TooLarge,
-        );
+        record_session_datagram_evidence(peer, session_sender, DatagramPathEvidenceEvent::TooLarge);
         record_session_datagram_drop(session_sender, QuicDatagramDropReason::TooLarge);
         return None;
     }
     let max_datagram_size = conn.max_datagram_size().unwrap_or(0);
     session_sender.set_max_datagram_size(max_datagram_size);
     if encoded.len() > max_datagram_size {
-        record_session_datagram_evidence(
-            peer,
-            session_sender,
-            DatagramPathEvidenceEvent::TooLarge,
-        );
+        record_session_datagram_evidence(peer, session_sender, DatagramPathEvidenceEvent::TooLarge);
         record_session_datagram_drop(session_sender, QuicDatagramDropReason::TooLarge);
         return None;
     }
@@ -1086,11 +1073,7 @@ async fn send_quic_datagram(
         original_payload_len,
     } = prepared;
     if conn.datagram_send_buffer_space() < encoded.len() {
-        record_session_datagram_evidence(
-            peer,
-            session_sender,
-            DatagramPathEvidenceEvent::Pressure,
-        );
+        record_session_datagram_evidence(peer, session_sender, DatagramPathEvidenceEvent::Pressure);
     }
     match conn.send_datagram_wait(encoded.clone()).await {
         Ok(()) => {
@@ -1152,10 +1135,7 @@ async fn send_quic_datagram(
                 session_sender,
                 DatagramPathEvidenceEvent::OutcomeFailure,
             );
-            record_session_datagram_drop(
-                session_sender,
-                QuicDatagramDropReason::ConnectionLost,
-            );
+            record_session_datagram_drop(session_sender, QuicDatagramDropReason::ConnectionLost);
             closed.cancel();
             false
         }

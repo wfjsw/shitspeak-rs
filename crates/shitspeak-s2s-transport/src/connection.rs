@@ -3695,8 +3695,7 @@ mod tests {
         // query time must be strictly more than the window past the *recorded*
         // shed instants (recorded at or after `now`).
         assert!(
-            !peer
-                .datagram_lane_shedding(now + DATAGRAM_LANE_SHED_WINDOW + Duration::from_secs(1)),
+            !peer.datagram_lane_shedding(now + DATAGRAM_LANE_SHED_WINDOW + Duration::from_secs(1)),
             "no recent sheds means the lane has recovered"
         );
     }
