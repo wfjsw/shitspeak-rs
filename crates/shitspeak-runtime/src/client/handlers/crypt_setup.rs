@@ -5,15 +5,12 @@ use bytes::Bytes;
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    messages::{
-        Message,
-        encoder::{CryptSetup, RejectType},
-    },
+    messages::{Message, encoder::CryptSetup},
     server::Server,
 };
 
 pub async fn handle_crypt_setup(
-    server: &Arc<Box<Server>>,
+    _server: &Arc<Box<Server>>,
     sender: &Arc<Box<Client>>,
     msg: CryptSetup,
 ) -> Result<(), MessageHandlerError> {
@@ -25,51 +22,33 @@ pub async fn handle_crypt_setup(
         "CryptSetup handler"
     );
 
-    // A CryptSetup message from the client has two meanings:
-    //
-    //  1. client_nonce present  → client is requesting a decrypt IV resync
-    //     (e.g. after a packet loss burst).  Adopt the client's nonce as the
-    //     new decrypt IV.
-    //
-    //  2. client_nonce absent   → client wants a full key re-exchange.
-    //     Regenerate the whole crypt state and send the new key back.
-
     if msg.is_client_request_resync() {
-        // Full re-key
-        server
-            .create_client_crypt_state(sender, "OCB2-AES128")
-            .await
-            .map_err(|_| RejectType::AuthenticatorFail)?;
-
+        // An empty request asks for the server's current outbound nonce. Keep
+        // the existing key and client nonce.
         let reply: Message = {
             let crypt = sender.crypt_state();
-            let state = crypt.as_ref().expect("crypt state just created");
-            CryptSetup::new(
-                state.key().map(Bytes::copy_from_slice),
-                Some(Bytes::copy_from_slice(state.decrypt_iv())),
-                Some(Bytes::copy_from_slice(state.encrypt_iv())),
-            )
-            .into()
+            let server_nonce = crypt
+                .as_ref()
+                .map(|state| Bytes::copy_from_slice(state.encrypt_iv()));
+            CryptSetup::new(None, None, server_nonce).into()
         };
 
         sender.write_proto_message(&reply).await?;
     } else if let Some(client_nonce) = msg.client_nonce().map(|n| n.to_vec()) {
-        // Decrypt IV resync — adopt the client's nonce
-        let reply: Message = {
-            let mut crypt = sender.crypt_state();
-            if let Some(state) = crypt.as_mut() {
+        // A supplied client nonce replaces the server's inbound nonce. Murmur
+        // does not send an acknowledgement for this form.
+        let mut crypt = sender.crypt_state();
+        if let Some(state) = crypt.as_mut() {
+            if client_nonce.len() == state.decrypt_iv().len() {
                 state.set_decrypt_iv(&client_nonce);
+            } else {
+                tracing::warn!(
+                    session = u32::from(session),
+                    nonce_len = client_nonce.len(),
+                    "ignoring invalid client crypto nonce"
+                );
             }
-
-            // Acknowledge: send our current encrypt IV as server_nonce
-            let encrypt_iv = crypt
-                .as_ref()
-                .map(|s| s.encrypt_iv().to_vec())
-                .unwrap_or_default();
-            CryptSetup::new(None, None, Some(Bytes::from(encrypt_iv))).into()
-        };
-        // Drop the crypt lock before the async write
-        sender.write_proto_message(&reply).await?;
+        }
     }
 
     Ok(())

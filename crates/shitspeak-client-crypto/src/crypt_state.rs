@@ -13,6 +13,7 @@ pub struct CryptState {
     decrypt_iv: [u8; Ocb2::NONCE_SIZE],
 
     last_good_time: DateTime<Utc>,
+    last_resync_request_time: DateTime<Utc>,
 
     good: u32,
     late: u32,
@@ -43,10 +44,12 @@ impl CryptState {
         rng.fill(&mut encrypt_iv)?;
         rng.fill(&mut decrypt_iv)?;
 
+        let now = Utc::now();
         Ok(CryptState {
             encrypt_iv,
             decrypt_iv,
-            last_good_time: Utc::now(),
+            last_good_time: now,
+            last_resync_request_time: now,
             good: 0,
             late: 0,
             lost: 0,
@@ -80,10 +83,12 @@ impl CryptState {
             .try_into()
             .map_err(|_| CryptError::InvalidNonceSize)?;
 
+        let now = Utc::now();
         Ok(CryptState {
             encrypt_iv,
             decrypt_iv,
-            last_good_time: Utc::now(),
+            last_good_time: now,
+            last_resync_request_time: now,
             good: 0,
             late: 0,
             lost: 0,
@@ -118,6 +123,19 @@ impl CryptState {
         }
         self.decrypt_iv.copy_from_slice(iv);
         self.resync = self.resync.wrapping_add(1);
+    }
+
+    pub fn should_request_resync(&mut self, interval: std::time::Duration) -> bool {
+        let now = Utc::now();
+        let since_last_good = (now - self.last_good_time).to_std().unwrap_or_default();
+        let since_last_request = (now - self.last_resync_request_time)
+            .to_std()
+            .unwrap_or_default();
+        if since_last_good < interval || since_last_request < interval {
+            return false;
+        }
+        self.last_resync_request_time = now;
+        true
     }
 
     /// Return the key (if available from the crypto mode).

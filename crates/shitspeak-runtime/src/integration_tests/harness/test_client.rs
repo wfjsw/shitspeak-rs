@@ -938,6 +938,12 @@ impl TestClient {
         Ok(())
     }
 
+    pub async fn send_raw_udp(&self, packet: &[u8]) -> std::io::Result<()> {
+        let socket = self.udp.as_ref().expect("open_udp first");
+        socket.send_to(packet, self.udp_server_addr).await?;
+        Ok(())
+    }
+
     /// Send an encrypted legacy ping over UDP. The server decrypts it (via
     /// the IP-fallback path), which has the side effect of binding our UDP
     /// address to our session. Unlike a voice packet, a ping is *not* echoed

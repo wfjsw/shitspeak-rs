@@ -154,38 +154,6 @@ pub async fn handle_authenticate(
         );
     }
 
-    // Send CryptSetup before auth finalization can queue. Native clients start
-    // probing encrypted UDP as soon as they have keys; if this waits behind the
-    // login queue they can falsely latch onto TCP voice for several seconds.
-    let crypt_setup_msg: Message = {
-        let needs_crypt_state = sender.crypt_state().is_none();
-        if needs_crypt_state {
-            if let Err(e) = server
-                .create_client_crypt_state(sender, "OCB2-AES128")
-                .await
-            {
-                tracing::error!(
-                    session = u32::from(session),
-                    error = %e,
-                    "Failed to create crypt state"
-                );
-                return Err(AuthRejection::new(RejectType::None)
-                    .because(text(sender.language(), TextKey::CryptSetupFailed))
-                    .into());
-            }
-        }
-
-        let crypt = sender.crypt_state();
-        let state = crypt.as_ref().expect("crypt state just created");
-        shitspeak_messages::messages::encoder::CryptSetup::new(
-            state.key().map(Bytes::copy_from_slice),
-            Some(Bytes::copy_from_slice(state.decrypt_iv())),
-            Some(Bytes::copy_from_slice(state.encrypt_iv())),
-        )
-        .into()
-    };
-    sender.write_proto_message(&crypt_setup_msg).await?;
-
     let auth_permit = server.acquire_auth_finalization_permit(sender).await?;
 
     // ── Authenticate ──────────────────────────────────────────────────────
@@ -355,6 +323,41 @@ pub async fn handle_authenticate(
                 .into());
         }
     }
+
+    // Match Murmur's authentication sequence: establish UDP crypto only
+    // after every authentication and admission check has succeeded, while
+    // still sending CryptSetup before the channel/user snapshot and
+    // ServerSync.
+    if let Err(e) = server
+        .create_client_crypt_state(sender, "OCB2-AES128")
+        .await
+    {
+        tracing::error!(
+            session = u32::from(session),
+            error = %e,
+            "Failed to create crypt state"
+        );
+        repo.release_authenticated_client_reservation_in_server(
+            &server_id,
+            sender.get_session_id(),
+        )
+        .await;
+        return Err(AuthRejection::new(RejectType::None)
+            .because(text(sender.language(), TextKey::CryptSetupFailed))
+            .into());
+    }
+    let crypt_setup_msg: Message = {
+        let crypt = sender.crypt_state();
+        let state = crypt.as_ref().expect("crypt state just created");
+        shitspeak_messages::messages::encoder::CryptSetup::new(
+            state.key().map(Bytes::copy_from_slice),
+            Some(Bytes::copy_from_slice(state.decrypt_iv())),
+            Some(Bytes::copy_from_slice(state.encrypt_iv())),
+        )
+        .into()
+    };
+    sender.write_proto_message(&crypt_setup_msg).await?;
+
     sender.stage_session_blob_resolution(result.user_id, result.texture_url, result.comment_url);
     sender.complete_authentication(
         auth_session_id,
@@ -423,8 +426,7 @@ pub async fn handle_authenticate(
 
     // ── Build the full burst of messages to send to the new client ────────
     //
-    // CryptSetup was sent before auth finalization so clients waiting in the
-    // login queue can prove UDP reachability immediately. The remaining
+    // CryptSetup was sent after authentication succeeded. The remaining
     // messages are sent to the joining client in a single batch to avoid
     // per-message syscall overhead:
     //

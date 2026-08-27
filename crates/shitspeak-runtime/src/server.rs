@@ -74,6 +74,30 @@ const UDP_PROCESSING_BURST_MULTIPLIER: usize = 5;
 const UDP_PROCESSING_MIN_HARD_CAPACITY: usize =
     UDP_PROCESSING_MIN_BASELINE_CAPACITY * UDP_PROCESSING_BURST_MULTIPLIER;
 const UDP_PROCESSING_PACKETS_PER_USER_HARD_CAP: usize = 128;
+const CLIENT_CRYPT_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn request_client_crypt_resync_after_failure(client: &Client) {
+    let should_request = {
+        let mut crypt = client.crypt_state();
+        crypt
+            .as_mut()
+            .is_some_and(|state| state.should_request_resync(CLIENT_CRYPT_RESYNC_INTERVAL))
+    };
+    if !should_request {
+        return;
+    }
+
+    let request = shitspeak_messages::messages::Message::CryptSetup(
+        shitspeak_proto::mumble_proto::CryptSetup::default(),
+    );
+    if let Err(error) = client.write_proto_message(&request).await {
+        tracing::debug!(
+            session = u32::from(client.get_session_id()),
+            %error,
+            "failed to request client crypto nonce resync"
+        );
+    }
+}
 
 fn validate_visibility_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if config.hide_channels_without_traverse && !config.hide_users_without_traverse {
@@ -1043,6 +1067,7 @@ impl Server {
                                 server
                                     .clients
                                     .unbind_client_udp_endpoint(local_addr, src_addr);
+                                request_client_crypt_resync_after_failure(&c).await;
                             }
                             None => {
                                 crate::voice::metrics::record_udp_decrypt(
@@ -1126,6 +1151,9 @@ impl Server {
                                     }
                                 }
                             };
+                            if decrypted.is_none() {
+                                request_client_crypt_resync_after_failure(c).await;
+                            }
                             if let Some(decrypted) = decrypted {
                                 matched = Some(c.clone());
                                 decrypted_from_match = Some(decrypted);

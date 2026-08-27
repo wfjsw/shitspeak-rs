@@ -12,7 +12,7 @@ use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 use shitspeak_client_crypto::CryptState;
 use shitspeak_messages::messages::encoder::{
-    Authenticate, ClientType, ContextActionModify, Ping, RejectType,
+    Authenticate, ClientType, ContextActionModify, CryptSetup, Ping, RejectType,
 };
 use shitspeak_messages::messages::{Message, ReadMessageExt, WriteMessageExt};
 use shitspeak_state::{ACL, ACLPermissions};
@@ -182,15 +182,6 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
     ];
     bob.send_batch(&handshake).await;
 
-    let crypt_setup = bob
-        .recv(Duration::from_secs(2))
-        .await
-        .expect("bob should receive CryptSetup before queue notice");
-    let Message::CryptSetup(crypt_setup) = crypt_setup else {
-        panic!("expected pre-sync CryptSetup, got {crypt_setup:?}");
-    };
-    let mut bob_udp_crypt = crypt_state_from_setup(crypt_setup);
-
     let queue_notice = bob
         .recv(Duration::from_secs(2))
         .await
@@ -223,15 +214,14 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
         ),
         "queued client should still receive TCP Ping replies before ServerSync"
     );
-
-    let udp_ping = send_encrypted_udp_ping(&server, &mut bob_udp_crypt, 77).await;
-    assert_eq!(
-        udp_ping.timestamp, 77,
-        "queued client should receive encrypted UDP ping replies before ServerSync"
+    assert!(
+        bob.recv(Duration::from_millis(100)).await.is_none(),
+        "queued client must not receive CryptSetup before authentication starts"
     );
 
     gate.release();
 
+    let mut saw_crypt_setup = false;
     let mut saw_server_sync = false;
     let mut saw_queue_notice_after_sync = false;
     for _ in 0..32 {
@@ -239,6 +229,7 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
             break;
         };
         match message {
+            Message::CryptSetup(_) => saw_crypt_setup = true,
             Message::ServerSync(_) => {
                 saw_server_sync = true;
                 break;
@@ -249,6 +240,10 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
             _ => {}
         }
     }
+    assert!(
+        saw_crypt_setup,
+        "bob should receive CryptSetup after authentication succeeds"
+    );
     assert!(
         saw_server_sync,
         "bob should complete ServerSync after permit release"
@@ -268,6 +263,145 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
             )
         }),
         "queue notices must not be cached and replayed after ServerSync"
+    );
+}
+
+#[tokio::test]
+async fn crypt_setup_resync_matches_murmur() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+
+    let client = ManualNativeClient::connect(&server)
+        .await
+        .expect("manual connection");
+    assert!(matches!(
+        client.recv(Duration::from_secs(2)).await,
+        Some(Message::Version(_))
+    ));
+    client
+        .send_batch(&[
+            shitspeak_messages::messages::encoder::Version {
+                version: Some(crate::protocol_version::ProtocolVersion::new(1, 5, 0)),
+                release: Some("test-client".into()),
+                os: Some("test".into()),
+                os_version: Some("test".into()),
+            }
+            .into(),
+            Authenticate {
+                username: Some("alice".into()),
+                password: None,
+                tokens: Vec::new(),
+                celt_versions: Vec::new(),
+                opus: Some(true),
+                client_type: ClientType::Regular,
+            }
+            .into(),
+        ])
+        .await;
+
+    let mut initial_setup = None;
+    let mut saw_server_sync = false;
+    for _ in 0..64 {
+        let Some(message) = client.recv(Duration::from_secs(2)).await else {
+            break;
+        };
+        match message {
+            Message::CryptSetup(setup) => initial_setup = Some(setup),
+            Message::ServerSync(_) => {
+                saw_server_sync = true;
+                break;
+            }
+            Message::Reject(reject) => panic!("unexpected auth reject: {reject:?}"),
+            _ => {}
+        }
+    }
+    assert!(saw_server_sync, "client should authenticate");
+    let initial_setup = initial_setup.expect("authentication should include CryptSetup");
+    let key = initial_setup.key.clone().expect("CryptSetup includes key");
+    let original_server_nonce = initial_setup
+        .server_nonce
+        .clone()
+        .expect("CryptSetup includes server_nonce");
+    collect_manual_messages(&client, Duration::from_millis(50)).await;
+
+    client.send(CryptSetup::default().into()).await;
+    let response = client
+        .recv(Duration::from_secs(2))
+        .await
+        .expect("empty CryptSetup should receive a nonce response");
+    let Message::CryptSetup(response) = response else {
+        panic!("expected CryptSetup nonce response, got {response:?}");
+    };
+    assert!(
+        response.key.is_none(),
+        "nonce resync must not replace the key"
+    );
+    assert!(
+        response.client_nonce.is_none(),
+        "nonce resync must not replace the client nonce"
+    );
+    assert_eq!(response.server_nonce, Some(original_server_nonce.clone()));
+
+    let replacement_client_nonce = vec![0x5a; 16];
+    client
+        .send(CryptSetup::new(None, Some(replacement_client_nonce.clone().into()), None).into())
+        .await;
+    assert!(
+        client.recv(Duration::from_millis(100)).await.is_none(),
+        "client nonce update must not receive a CryptSetup acknowledgement"
+    );
+
+    let mut client_crypt = CryptState::from_key(
+        "OCB2-AES128",
+        &key,
+        &replacement_client_nonce,
+        &original_server_nonce,
+    )
+    .expect("replacement client crypt state");
+    let udp_ping = send_encrypted_udp_ping(&server, &mut client_crypt, 77).await;
+    assert_eq!(udp_ping.timestamp, 77);
+}
+
+#[tokio::test]
+async fn persistent_udp_decrypt_failure_requests_client_nonce_resync() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    let mut client = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+    client.open_udp().await.expect("open UDP socket");
+
+    tokio::time::sleep(Duration::from_millis(5_100)).await;
+    client
+        .send_raw_udp(&[0xa5; 16])
+        .await
+        .expect("send invalid encrypted UDP packet");
+
+    let request = client
+        .recv_until(
+            |message| matches!(message, Message::CryptSetup(_)),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("server should request nonce resync after persistent decrypt failure");
+    let Message::CryptSetup(request) = request else {
+        unreachable!();
+    };
+    assert!(request.key.is_none());
+    assert!(request.client_nonce.is_none());
+    assert!(request.server_nonce.is_none());
+
+    client
+        .send_raw_udp(&[0xa5; 16])
+        .await
+        .expect("send another invalid encrypted UDP packet");
+    assert!(
+        client.recv(Duration::from_millis(100)).await.is_none(),
+        "server must throttle repeated nonce resync requests"
     );
 }
 
@@ -339,18 +473,6 @@ async fn auth_pre_sync_udp_tunnel_messages_are_dropped_instead_of_queued() {
         saw_server_sync,
         "pre-sync UDPTunnel messages should be dropped without disconnecting the client"
     );
-}
-
-fn crypt_state_from_setup(crypt_setup: shitspeak_proto::mumble_proto::CryptSetup) -> CryptState {
-    let key = crypt_setup.key.expect("CryptSetup includes key");
-    let client_nonce = crypt_setup
-        .client_nonce
-        .expect("CryptSetup includes client_nonce");
-    let server_nonce = crypt_setup
-        .server_nonce
-        .expect("CryptSetup includes server_nonce");
-    CryptState::from_key("OCB2-AES128", &key, &client_nonce, &server_nonce)
-        .expect("crypt state from CryptSetup")
 }
 
 async fn send_encrypted_udp_ping(
