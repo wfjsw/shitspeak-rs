@@ -8526,7 +8526,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum by (source, first_hop, outcome) (rate(shitspeak_s2s_voice_fec_sends_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum by (source, first_hop, outcome) (rate(shitspeak_s2s_voice_fec_sends_total{job=~\"$job\"}[$__rate_interval])) or on() vector(0)",
           "legendFormat": "fec {{source}}→{{first_hop}} {{outcome}}",
           "range": true,
           "refId": "A"
@@ -8552,7 +8552,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum by (source, outcome) (rate(shitspeak_s2s_voice_fec_send_bytes_total{job=~\"$job\"}[$__rate_interval]))",
+          "expr": "sum by (source, outcome) (rate(shitspeak_s2s_voice_fec_send_bytes_total{job=~\"$job\"}[$__rate_interval])) or on() vector(0)",
           "legendFormat": "fec bytes {{source}} {{outcome}}",
           "range": true,
           "refId": "A"
