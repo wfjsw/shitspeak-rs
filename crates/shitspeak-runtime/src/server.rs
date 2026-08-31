@@ -346,7 +346,12 @@ impl Server {
         let session_blob_cache_budget_bytes = config.session_blob_cache_budget_bytes;
         let auth_task_executor =
             BackgroundTaskExecutor::new("auth", auth_finalization_concurrency)?;
-        let acl_bulk_task_executor = BackgroundTaskExecutor::new("acl-bulk", 1)?;
+        let acl_bulk_workers = crate::runtime_workers::runtime_worker_allocation().acl_bulk();
+        let acl_bulk_task_executor = BackgroundTaskExecutor::new_with_worker_threads(
+            "acl-bulk",
+            acl_bulk_workers,
+            acl_bulk_workers,
+        )?;
         let channel_repo_tuning = channel_repo_tuning(&config);
         let channel_root_config = channel_root_config(&config);
         let (channels, channel_blobs, session_blobs, user_channel_cache, bans) = match &config

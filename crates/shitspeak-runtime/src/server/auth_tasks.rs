@@ -35,15 +35,23 @@ impl BackgroundTaskExecutor {
         configured_concurrency: usize,
     ) -> std::io::Result<Self> {
         let worker_threads = background_worker_threads(configured_concurrency);
+        Self::new_with_worker_threads(workload, configured_concurrency, worker_threads)
+    }
+
+    pub(super) fn new_with_worker_threads(
+        workload: &'static str,
+        configured_concurrency: usize,
+        worker_threads: usize,
+    ) -> std::io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
+            .worker_threads(worker_threads.max(1))
             .thread_name(format!("{workload}-runtime-worker"))
             .on_thread_start(lower_current_thread_priority)
             .enable_all()
             .build()?;
         let handle = runtime.handle().clone();
         tracing::info!(
-            worker_threads,
+            worker_threads = worker_threads.max(1),
             configured_concurrency,
             workload,
             "started isolated low-priority background runtime"

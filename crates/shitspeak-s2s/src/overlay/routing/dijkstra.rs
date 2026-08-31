@@ -39,7 +39,7 @@ pub struct RouteEntry {
     pub latency_us: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutingGraph {
     active: HashSet<NodeIdentifier>,
     transit_disabled: HashSet<NodeIdentifier>,
@@ -55,18 +55,11 @@ impl RoutingGraph {
         lsdb.with_entries(|entries| Self::from_entries(entries.values()))
     }
 
-    pub(crate) fn from_lsdb_filtered<F>(lsdb: &LinkStateDb, include_node: F) -> Self
-    where
-        F: Fn(NodeIdentifier) -> bool,
-    {
-        lsdb.with_entries(|entries| Self::from_entries_filtered(entries.values(), include_node))
-    }
-
     fn from_entries<'a>(entries: impl IntoIterator<Item = &'a LsaEntry>) -> Self {
         Self::from_entries_filtered(entries, |_| true)
     }
 
-    fn from_entries_filtered<'a, F>(
+    pub(crate) fn from_entries_filtered<'a, F>(
         entries: impl IntoIterator<Item = &'a LsaEntry>,
         include_node: F,
     ) -> Self
@@ -125,6 +118,19 @@ impl RoutingGraph {
 
     pub(crate) fn transit_disabled(&self, node: NodeIdentifier) -> bool {
         self.transit_disabled.contains(&node)
+    }
+
+    pub(crate) fn changed_origins(&self, next: &Self) -> HashSet<NodeIdentifier> {
+        self.active
+            .union(&next.active)
+            .copied()
+            .filter(|origin| {
+                self.active.contains(origin) != next.active.contains(origin)
+                    || self.transit_disabled.contains(origin)
+                        != next.transit_disabled.contains(origin)
+                    || self.links.get(origin) != next.links.get(origin)
+            })
+            .collect()
     }
 }
 

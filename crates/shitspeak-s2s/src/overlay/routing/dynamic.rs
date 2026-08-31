@@ -11,6 +11,7 @@ use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::ServiceLevel;
 
 use super::super::config::OverlayConfig;
+#[cfg(test)]
 use super::super::lsdb::LinkStateDb;
 use super::dijkstra::{self, EdgeCost, PathCost, RouteEntry, RoutingGraph, ShortestPathTree};
 use super::{RoutingMetric, RoutingTableKey, RoutingTables};
@@ -31,22 +32,6 @@ impl DynamicSpf {
         cfg: &OverlayConfig,
     ) -> Self {
         Self::from_graph(RoutingGraph::from_lsdb(lsdb), self_id, cfg)
-    }
-
-    pub(crate) fn rebuild_filtered<F>(
-        lsdb: &LinkStateDb,
-        self_id: NodeIdentifier,
-        cfg: &OverlayConfig,
-        include_node: F,
-    ) -> Self
-    where
-        F: Fn(NodeIdentifier) -> bool,
-    {
-        Self::from_graph(
-            RoutingGraph::from_lsdb_filtered(lsdb, include_node),
-            self_id,
-            cfg,
-        )
     }
 
     #[cfg(test)]
@@ -73,21 +58,16 @@ impl DynamicSpf {
         self.routing_tables(cfg)
     }
 
-    pub(crate) fn update_filtered<F>(
+    pub(crate) fn update_graph(
         &mut self,
-        lsdb: &LinkStateDb,
-        dirty_origins: HashSet<NodeIdentifier>,
+        next_graph: RoutingGraph,
         cfg: &OverlayConfig,
-        include_node: F,
-    ) -> RoutingTables
-    where
-        F: Fn(NodeIdentifier) -> bool,
-    {
+    ) -> RoutingTables {
+        let dirty_origins = self.graph.changed_origins(&next_graph);
         if dirty_origins.is_empty() {
             return self.routing_tables(cfg);
         }
 
-        let next_graph = RoutingGraph::from_lsdb_filtered(lsdb, include_node);
         if dirty_origins.len() > DYNAMIC_DIRTY_FALLBACK_ORIGINS {
             *self = Self::from_graph(next_graph, self.self_id, cfg);
             return self.routing_tables(cfg);
@@ -118,7 +98,11 @@ impl DynamicSpf {
         out
     }
 
-    fn from_graph(graph: RoutingGraph, self_id: NodeIdentifier, cfg: &OverlayConfig) -> Self {
+    pub(crate) fn from_graph(
+        graph: RoutingGraph,
+        self_id: NodeIdentifier,
+        cfg: &OverlayConfig,
+    ) -> Self {
         let mut tables = HashMap::new();
         for metric in RoutingMetric::ALL {
             for level in ServiceLevel::ALL {

@@ -1,7 +1,20 @@
 use clap::Parser;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let worker_threads = shitspeak_runtime::runtime_workers::runtime_worker_allocation().main();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_name("main-runtime-worker")
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("error: failed to build main runtime: {error}");
+            std::process::exit(1);
+        });
+    runtime.block_on(run());
+}
+
+async fn run() {
     let args = shitspeak_rs::cli::Args::parse();
 
     #[cfg(feature = "web")]

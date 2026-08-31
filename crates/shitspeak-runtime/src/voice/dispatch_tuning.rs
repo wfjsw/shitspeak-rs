@@ -23,6 +23,7 @@ use crate::{
 
 const PAYLOAD_CLASS_BOUNDARY_BYTES: usize = 512;
 const CONSERVATIVE_FANOUT_THRESHOLD: usize = 512;
+const MIN_MODELED_FANOUT: usize = CONSERVATIVE_FANOUT_THRESHOLD / 2;
 const CONSERVATIVE_RAYON_MIN_LEN: usize = 256;
 const CALIBRATION_KEY: [u8; 16] = [0x42; 16];
 const CALIBRATION_IV_E: [u8; 16] = [0x01; 16];
@@ -459,6 +460,9 @@ enum RayonCostModel {
         per_chunk_ns: f64,
         per_merged_recipient_ns: f64,
         critical_chunk_recipient_ns: f64,
+        // Captures the way partitioning overhead changes with the critical
+        // chunk length instead of forcing both effects into independent terms.
+        chunk_critical_path_interaction_ns: f64,
     },
 }
 
@@ -471,11 +475,14 @@ impl RayonCostModel {
                 per_chunk_ns,
                 per_merged_recipient_ns,
                 critical_chunk_recipient_ns,
+                chunk_critical_path_interaction_ns,
             } => {
                 dispatch_ns
                     + per_chunk_ns * chunk_plan.chunk_count() as f64
                     + per_merged_recipient_ns * chunk_plan.fanout as f64
                     + critical_chunk_recipient_ns * chunk_plan.chunk_len() as f64
+                    + chunk_critical_path_interaction_ns * chunk_plan.chunk_count() as f64
+                        / chunk_plan.chunk_len() as f64
             }
         }
     }
@@ -513,13 +520,14 @@ struct ModeledScheduleSegment {
 async fn calibrate_voice_dispatch_plan(rayon_workers: usize) -> Result<VoiceDispatchPlan, String> {
     let small_payload = make_calibration_encoded(170)?;
     let large_payload = make_calibration_encoded(768)?;
-    let small_profile = calibrate_payload_profile(&small_payload, rayon_workers).await?;
-    let large_profile = calibrate_payload_profile(&large_payload, rayon_workers).await?;
+    let small_profile = calibrate_payload_profile("small", &small_payload, rayon_workers).await?;
+    let large_profile = calibrate_payload_profile("large", &large_payload, rayon_workers).await?;
 
     Ok(VoiceDispatchPlan::calibrated(small_profile, large_profile))
 }
 
 async fn calibrate_payload_profile(
+    payload_class: &'static str,
     encoded: &CalibrationEncoded,
     rayon_workers: usize,
 ) -> Result<VoiceDispatchProfile, String> {
@@ -541,14 +549,35 @@ async fn calibrate_payload_profile(
         });
     }
 
-    let Some(sequential_model) = fit_sequential_model(&measurements) else {
-        tracing::info!("voice dispatch model fit was not usable; selecting sequential dispatch");
-        return Ok(VoiceDispatchProfile::sequential_only());
+    let sequential_model = match fit_sequential_model(&measurements) {
+        Ok(model) => model,
+        Err(reason) => {
+            tracing::info!(
+                payload_class,
+                reason,
+                "voice dispatch sequential model rejected; selecting sequential dispatch"
+            );
+            return Ok(VoiceDispatchProfile::sequential_only());
+        }
     };
-    let Some(rayon_model) = fit_rayon_model(&measurements, rayon_workers) else {
-        tracing::info!("voice dispatch model fit was not usable; selecting sequential dispatch");
-        return Ok(VoiceDispatchProfile::sequential_only());
+    let rayon_model = match fit_rayon_model(&measurements, rayon_workers) {
+        Ok(model) => model,
+        Err(reason) => {
+            tracing::info!(
+                payload_class,
+                reason,
+                sequential_model = ?sequential_model,
+                "voice dispatch Rayon model rejected; selecting sequential dispatch"
+            );
+            return Ok(VoiceDispatchProfile::sequential_only());
+        }
     };
+    tracing::info!(
+        payload_class,
+        sequential_model = ?sequential_model,
+        rayon_model = ?rayon_model,
+        "voice dispatch calibration models fitted"
+    );
 
     let holdout_probe = model_holdout_probe(rayon_workers);
     let holdout_plan = holdout_probe.chunk_plan(rayon_workers);
@@ -562,23 +591,44 @@ async fn calibrate_payload_profile(
     .await?;
     if !model_matches_holdout(sequential_model, rayon_model, holdout_plan, holdout) {
         tracing::info!(
-            "voice dispatch model did not match its holdout probe; selecting sequential dispatch"
+            payload_class,
+            reason = "holdout_prediction_mismatch",
+            sequential_model = ?sequential_model,
+            rayon_model = ?rayon_model,
+            holdout_fanout = holdout_probe.fanout,
+            holdout_sequential_ns = holdout.sequential.as_nanos() as u64,
+            predicted_sequential_ns = sequential_model.predict(holdout_probe.fanout),
+            holdout_rayon_ns = holdout.rayon.as_nanos() as u64,
+            predicted_rayon_ns = rayon_model.predict(holdout_plan),
+            "voice dispatch model rejected; selecting sequential dispatch"
         );
         return Ok(VoiceDispatchProfile::sequential_only());
     }
 
     let Some(candidate) = select_modeled_profile(sequential_model, rayon_model, rayon_workers)
     else {
+        tracing::info!(
+            payload_class,
+            reason = "no_sustained_modeled_rayon_win",
+            sequential_model = ?sequential_model,
+            rayon_model = ?rayon_model,
+            "voice dispatch model found no sustained Rayon crossover; selecting sequential dispatch"
+        );
         return Ok(VoiceDispatchProfile::sequential_only());
     };
 
-    if confirm_modeled_profile(encoded, candidate, rayon_workers).await? {
-        Ok(candidate.profile)
-    } else {
-        tracing::info!(
-            "voice dispatch model crossover confirmation failed; selecting sequential dispatch"
-        );
-        Ok(VoiceDispatchProfile::sequential_only())
+    match confirm_modeled_profile(encoded, candidate, rayon_workers).await {
+        Ok(()) => Ok(candidate.profile),
+        Err(reason) => {
+            tracing::info!(
+                payload_class,
+                reason,
+                sequential_model = ?sequential_model,
+                rayon_model = ?rayon_model,
+                "voice dispatch model confirmation rejected; selecting sequential dispatch"
+            );
+            Ok(VoiceDispatchProfile::sequential_only())
+        }
     }
 }
 
@@ -804,32 +854,61 @@ fn median_duration(samples: &mut [Duration]) -> Duration {
     samples[samples.len() / 2]
 }
 
-fn fit_sequential_model(measurements: &[ModelMeasurement]) -> Option<LinearCostModel> {
-    let points = measurements
-        .iter()
-        .map(|measurement| {
-            (
-                measurement.fanout as f64,
-                duration_ns(measurement.timing.sequential),
-            )
+fn fit_sequential_model(measurements: &[ModelMeasurement]) -> Result<LinearCostModel, String> {
+    let mut samples_by_fanout = HashMap::<usize, Vec<f64>>::new();
+    for measurement in measurements {
+        samples_by_fanout
+            .entry(measurement.fanout)
+            .or_default()
+            .push(duration_ns(measurement.timing.sequential));
+    }
+    let mut points = samples_by_fanout
+        .into_iter()
+        .map(|(fanout, mut samples)| {
+            samples.sort_by(f64::total_cmp);
+            (fanout as f64, samples[samples.len() / 2])
         })
         .collect::<Vec<_>>();
-    let model = fit_linear_model(&points)?;
-    measurements
-        .iter()
-        .all(|measurement| {
-            prediction_matches(
-                model.predict(measurement.fanout),
-                duration_ns(measurement.timing.sequential),
-            )
+    points.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let model = fit_linear_model(&points)
+        .or_else(|| {
+            // Scheduler noise can invert the least-squares slope even when the
+            // fanout medians are monotonically increasing. In that case retain
+            // the observed monotonic trend and fit a conservative origin model.
+            let increasing = points
+                .first()
+                .zip(points.last())
+                .is_some_and(|(first, last)| last.1 > first.1);
+            increasing.then(|| {
+                let slope = points
+                    .iter()
+                    .map(|(fanout, duration)| fanout * duration)
+                    .sum::<f64>()
+                    / points
+                        .iter()
+                        .map(|(fanout, _)| fanout * fanout)
+                        .sum::<f64>();
+                LinearCostModel {
+                    fixed_ns: 0.0,
+                    per_recipient_ns: slope,
+                }
+            })
         })
-        .then_some(model)
+        .ok_or_else(|| "invalid sequential linear fit".to_owned())?;
+    if points
+        .iter()
+        .all(|(fanout, observed)| prediction_matches(model.predict(*fanout as usize), *observed))
+    {
+        Ok(model)
+    } else {
+        Err("sequential training prediction exceeded 25% error".to_owned())
+    }
 }
 
 fn fit_rayon_model(
     measurements: &[ModelMeasurement],
     rayon_workers: usize,
-) -> Option<RayonCostModel> {
+) -> Result<RayonCostModel, String> {
     if rayon_workers == 2 {
         let points = measurements
             .iter()
@@ -841,8 +920,11 @@ fn fit_rayon_model(
                 )
             })
             .collect::<Vec<_>>();
-        let model = RayonCostModel::TwoWorkers(fit_linear_model(&points)?);
-        return measurements
+        let model = RayonCostModel::TwoWorkers(
+            fit_linear_model(&points)
+                .ok_or_else(|| "invalid two-worker Rayon linear fit".to_owned())?,
+        );
+        if measurements
             .iter()
             .filter(|measurement| measurement.chunk_plan.chunk_count() == 2)
             .all(|measurement| {
@@ -851,23 +933,36 @@ fn fit_rayon_model(
                     duration_ns(measurement.timing.rayon),
                 )
             })
-            .then_some(model);
+        {
+            return Ok(model);
+        }
+        return Err("two-worker Rayon training prediction exceeded 25% error".to_owned());
     }
 
-    let mut system = [[0.0; 5]; 4];
+    // Normalize the columns before solving the normal equations. Fanout and
+    // chunk length are several orders of magnitude larger than the dispatch
+    // constant, so scaling keeps the interaction fit numerically stable.
+    let scales = (0..5)
+        .map(|column| {
+            measurements
+                .iter()
+                .map(|measurement| rayon_model_features(measurement)[column].abs())
+                .fold(0.0, f64::max)
+                .max(1.0)
+        })
+        .collect::<Vec<_>>();
+    let mut system = [[0.0; 6]; 5];
     for measurement in measurements {
-        let features = [
-            1.0,
-            measurement.chunk_plan.chunk_count() as f64,
-            measurement.fanout as f64,
-            measurement.chunk_plan.chunk_len() as f64,
-        ];
+        let mut features = rayon_model_features(measurement);
+        for (feature, scale) in features.iter_mut().zip(&scales) {
+            *feature /= scale;
+        }
         let observed = duration_ns(measurement.timing.rayon);
-        for row in 0..4 {
-            for column in 0..4 {
+        for row in 0..5 {
+            for column in 0..5 {
                 system[row][column] += features[row] * features[column];
             }
-            system[row][4] += features[row] * observed;
+            system[row][5] += features[row] * observed;
         }
     }
     let [
@@ -875,19 +970,35 @@ fn fit_rayon_model(
         per_chunk_ns,
         per_merged_recipient_ns,
         critical_chunk_recipient_ns,
-    ] = solve_4x4(system)?;
+        chunk_critical_path_interaction_ns,
+    ] = solve_5x5(system).ok_or_else(|| "singular Rayon interaction model".to_owned())?;
+    let [
+        dispatch_ns,
+        per_chunk_ns,
+        per_merged_recipient_ns,
+        critical_chunk_recipient_ns,
+        chunk_critical_path_interaction_ns,
+    ] = [
+        dispatch_ns / scales[0],
+        per_chunk_ns / scales[1],
+        per_merged_recipient_ns / scales[2],
+        critical_chunk_recipient_ns / scales[3],
+        chunk_critical_path_interaction_ns / scales[4],
+    ];
     let coefficients = [
         dispatch_ns,
         per_chunk_ns,
         per_merged_recipient_ns,
         critical_chunk_recipient_ns,
+        chunk_critical_path_interaction_ns,
     ];
     if !coefficients
         .iter()
-        .all(|coefficient| coefficient.is_finite() && *coefficient >= 0.0)
-        || critical_chunk_recipient_ns == 0.0
+        .all(|coefficient| coefficient.is_finite())
     {
-        return None;
+        return Err(format!(
+            "Rayon interaction model has invalid coefficients: dispatch_ns={dispatch_ns} per_chunk_ns={per_chunk_ns} per_merged_recipient_ns={per_merged_recipient_ns} critical_chunk_recipient_ns={critical_chunk_recipient_ns} chunk_critical_path_interaction_ns={chunk_critical_path_interaction_ns}"
+        ));
     }
 
     let model = RayonCostModel::General {
@@ -895,16 +1006,28 @@ fn fit_rayon_model(
         per_chunk_ns,
         per_merged_recipient_ns,
         critical_chunk_recipient_ns,
+        chunk_critical_path_interaction_ns,
     };
-    measurements
+    if measurements
         .iter()
-        .all(|measurement| {
-            prediction_matches(
-                model.predict(measurement.chunk_plan),
-                duration_ns(measurement.timing.rayon),
-            )
-        })
-        .then_some(model)
+        .any(|measurement| model.predict(measurement.chunk_plan) <= 0.0)
+    {
+        return Err("Rayon interaction model produced a non-positive prediction".to_owned());
+    }
+    Ok(model)
+}
+
+fn rayon_model_features(measurement: &ModelMeasurement) -> [f64; 5] {
+    let chunk_count = measurement.chunk_plan.chunk_count() as f64;
+    let chunk_len = measurement.chunk_plan.chunk_len() as f64;
+    [
+        1.0,
+        chunk_count,
+        measurement.fanout as f64,
+        chunk_len,
+        // Partition density is the chunk-count/critical-path interaction.
+        chunk_count / chunk_len,
+    ]
 }
 
 fn fit_linear_model(points: &[(f64, f64)]) -> Option<LinearCostModel> {
@@ -934,9 +1057,9 @@ fn fit_linear_model(points: &[(f64, f64)]) -> Option<LinearCostModel> {
         })
 }
 
-fn solve_4x4(mut system: [[f64; 5]; 4]) -> Option<[f64; 4]> {
-    for column in 0..4 {
-        let pivot = (column..4).max_by(|&left, &right| {
+fn solve_5x5(mut system: [[f64; 6]; 5]) -> Option<[f64; 5]> {
+    for column in 0..5 {
+        let pivot = (column..5).max_by(|&left, &right| {
             system[left][column]
                 .abs()
                 .total_cmp(&system[right][column].abs())
@@ -950,18 +1073,18 @@ fn solve_4x4(mut system: [[f64; 5]; 4]) -> Option<[f64; 4]> {
         for value in &mut system[column][column..] {
             *value /= divisor;
         }
-        for row in 0..4 {
+        for row in 0..5 {
             if row == column {
                 continue;
             }
             let factor = system[row][column];
-            for entry in column..5 {
+            for entry in column..6 {
                 system[row][entry] -= factor * system[column][entry];
             }
         }
     }
 
-    let solution = std::array::from_fn(|row| system[row][4]);
+    let solution = std::array::from_fn(|row| system[row][5]);
     solution
         .iter()
         .all(|value| value.is_finite())
@@ -974,10 +1097,14 @@ fn model_matches_holdout(
     chunk_plan: RayonChunkPlan,
     timing: CalibrationTiming,
 ) -> bool {
-    prediction_matches(
-        sequential_model.predict(chunk_plan.fanout),
-        duration_ns(timing.sequential),
-    ) && prediction_matches(rayon_model.predict(chunk_plan), duration_ns(timing.rayon))
+    let predicted_sequential = sequential_model.predict(chunk_plan.fanout);
+    let predicted_rayon = rayon_model.predict(chunk_plan);
+    prediction_matches(predicted_sequential, duration_ns(timing.sequential))
+        && rayon_wins(timing)
+            == rayon_wins(CalibrationTiming {
+                sequential: Duration::from_nanos(predicted_sequential.max(0.0) as u64),
+                rayon: Duration::from_nanos(predicted_rayon.max(0.0) as u64),
+            })
 }
 
 fn select_modeled_profile(
@@ -986,7 +1113,7 @@ fn select_modeled_profile(
     rayon_workers: usize,
 ) -> Option<ModeledProfileCandidate> {
     let tiers = modeled_dispatch_tiers(rayon_workers);
-    let choices = (2..=CALIBRATION_MAX_FANOUT)
+    let choices = (MIN_MODELED_FANOUT..=CALIBRATION_MAX_FANOUT)
         .map(|fanout| {
             modeled_tier_for_range(
                 &tiers,
@@ -1010,7 +1137,7 @@ fn select_modeled_profile(
 
     let mut segments: Vec<ModeledScheduleSegment> = Vec::new();
     for (index, choice) in choices.iter().enumerate().skip(start_index) {
-        let fanout = index + 2;
+        let fanout = MIN_MODELED_FANOUT + index;
         let (tier, score) = choice.expect("the sustained suffix has a modeled Rayon winner");
         if segments.last().is_some_and(|segment| segment.tier == tier) {
             let segment = segments
@@ -1161,7 +1288,7 @@ async fn confirm_modeled_profile(
     encoded: &CalibrationEncoded,
     candidate: ModeledProfileCandidate,
     rayon_workers: usize,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     for fanout in confirmation_fanouts(candidate.profile) {
         let chunk_plan = candidate.profile.rayon_chunk_plan(fanout, rayon_workers);
         let timing = measure_median_pair(
@@ -1173,10 +1300,14 @@ async fn confirm_modeled_profile(
         )
         .await?;
         if !rayon_wins(timing) {
-            return Ok(false);
+            return Err(format!(
+                "confirmation fanout {fanout} did not meet 5% Rayon win: sequential_ns={} rayon_ns={}",
+                timing.sequential.as_nanos(),
+                timing.rayon.as_nanos()
+            ));
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 fn confirmation_fanouts(profile: VoiceDispatchProfile) -> Vec<usize> {
@@ -1252,6 +1383,7 @@ mod tests {
             per_chunk_ns: 300.0,
             per_merged_recipient_ns: 5.0,
             critical_chunk_recipient_ns: 60.0,
+            chunk_critical_path_interaction_ns: 40.0,
         };
         let measurements = model_training_probes(4)
             .into_iter()
@@ -1361,6 +1493,71 @@ mod tests {
     }
 
     #[test]
+    fn tolerates_timer_noise_that_pushes_the_linear_intercept_below_zero() {
+        let measurements = [
+            model_measurement(64, 2, 8, 390_000, 2_000_000),
+            model_measurement(64, 2, 8, 400_000, 2_000_000),
+            model_measurement(512, 2, 8, 3_200_000, 2_000_000),
+            model_measurement(512, 2, 8, 3_210_000, 2_000_000),
+        ];
+        let model =
+            fit_sequential_model(&measurements).expect("positive sequential slope remains usable");
+        assert_eq!(model.fixed_ns, 0.0);
+        assert!(model.per_recipient_ns > 0.0);
+    }
+
+    #[test]
+    fn sequential_fit_uses_one_robust_point_per_fanout() {
+        let measurements = [
+            (64, 1_000_000, 2_000_000),
+            (64, 1_100_000, 2_000_000),
+            (512, 5_600_000, 2_000_000),
+            (512, 5_700_000, 2_000_000),
+            (2_048, 21_000_000, 2_000_000),
+            (2_048, 21_100_000, 2_000_000),
+        ]
+        .into_iter()
+        .map(|(fanout, sequential_ns, rayon_ns)| {
+            model_measurement(fanout, 2, 8, sequential_ns, rayon_ns)
+        })
+        .collect::<Vec<_>>();
+
+        let model = fit_sequential_model(&measurements).expect("sequential model fits");
+        assert!(prediction_matches(model.predict(1_024), 10_650_000.0));
+    }
+
+    #[test]
+    fn interaction_model_accepts_chunk_scaling_without_negative_coefficients() {
+        let sequential = LinearCostModel {
+            fixed_ns: 1_000.0,
+            per_recipient_ns: 100.0,
+        };
+        let rayon = RayonCostModel::General {
+            dispatch_ns: 2_000.0,
+            per_chunk_ns: 300.0,
+            per_merged_recipient_ns: 5.0,
+            critical_chunk_recipient_ns: 60.0,
+            chunk_critical_path_interaction_ns: 20_000.0,
+        };
+        let measurements = model_training_probes(8)
+            .into_iter()
+            .map(|probe| {
+                let plan = probe.chunk_plan(8);
+                model_measurement(
+                    probe.fanout,
+                    probe.requested_chunks,
+                    8,
+                    sequential.predict(probe.fanout) as u64,
+                    rayon.predict(plan) as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let fitted = fit_rayon_model(&measurements, 8).expect("interaction model fits");
+        assert!(matches!(fitted, RayonCostModel::General { .. }));
+    }
+
+    #[test]
     fn selects_only_sustained_modeled_rayon_wins() {
         let sequential = LinearCostModel {
             fixed_ns: 10_000.0,
@@ -1371,6 +1568,7 @@ mod tests {
             per_chunk_ns: 500.0,
             per_merged_recipient_ns: 5.0,
             critical_chunk_recipient_ns: 30.0,
+            chunk_critical_path_interaction_ns: 40.0,
         };
         let candidate = select_modeled_profile(sequential, rayon, 8)
             .expect("model predicts a sustained Rayon crossover");
@@ -1401,6 +1599,7 @@ mod tests {
                     per_chunk_ns: 500.0,
                     per_merged_recipient_ns: 5.0,
                     critical_chunk_recipient_ns: 30.0,
+                    chunk_critical_path_interaction_ns: 40.0,
                 },
                 8,
             )
@@ -1419,11 +1618,12 @@ mod tests {
             per_chunk_ns: 500.0,
             per_merged_recipient_ns: 5.0,
             critical_chunk_recipient_ns: 30.0,
+            chunk_critical_path_interaction_ns: 40.0,
         };
         let candidate = select_modeled_profile(sequential, rayon, 32)
             .expect("the modeled crossover is sustained");
 
-        assert_eq!(candidate.profile.fanout_threshold(), 150);
+        assert_eq!(candidate.profile.fanout_threshold(), MIN_MODELED_FANOUT);
         assert!(
             candidate.profile.breakpoints().len() <= MAX_RAYON_DISPATCH_BREAKPOINTS,
             "the bounded schedule coalesces ceiling-division oscillations"

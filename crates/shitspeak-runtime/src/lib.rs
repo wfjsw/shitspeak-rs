@@ -22,6 +22,7 @@ pub mod protocol_version;
 pub mod proxy_protocol;
 pub mod rate_limits;
 pub mod register;
+pub mod runtime_workers;
 pub mod s2s;
 pub mod server;
 pub(crate) mod tcp_packet_collector;
@@ -74,6 +75,13 @@ impl ServerBuilder {
             .expect("Failed to install rustls crypto provider");
 
         let logging_guard = logging::init("shitspeak-rs", &self.config_path)?;
+        let runtime_workers = runtime_workers::runtime_worker_allocation();
+        tracing::info!(
+            main_workers = runtime_workers.main(),
+            s2s_workers = runtime_workers.s2s(),
+            acl_bulk_workers = runtime_workers.acl_bulk(),
+            "runtime worker allocation resolved"
+        );
 
         shitspeak_client_crypto::probe_aes_backend();
         shitspeak_client_crypto::probe_gf128_backend();

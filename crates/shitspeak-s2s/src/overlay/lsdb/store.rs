@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -271,7 +272,7 @@ pub struct LsaEntry {
     pub(crate) upper_layer_capabilities: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkAdvertised {
     pub neighbor: NodeIdentifier,
     pub rtt_us: u64,
@@ -1015,6 +1016,7 @@ fn floor_path(dir: &Path) -> PathBuf {
 /// In-memory link-state database. Owned by `OverlayInner`.
 pub struct LinkStateDb {
     inner: RwLock<HashMap<NodeIdentifier, LsaEntry>>,
+    revision: AtomicU64,
     floor: Arc<LsaFloor>,
     change_signal: Notify,
     dirty_origins: RwLock<HashSet<NodeIdentifier>>,
@@ -1029,6 +1031,7 @@ impl LinkStateDb {
     pub fn new(floor: Arc<LsaFloor>) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            revision: AtomicU64::new(0),
             floor,
             change_signal: Notify::new(),
             dirty_origins: RwLock::new(HashSet::new()),
@@ -1086,6 +1089,7 @@ impl LinkStateDb {
             // sees the updated value.
             self.floor.advance(origin, lsa.boot_epoch, lsa.seq);
             g.insert(origin, lsa);
+            self.revision.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(delta) = delta_for_log {
             trace!(
@@ -1119,11 +1123,18 @@ impl LinkStateDb {
     /// caller owns membership-event ordering and change notification.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn remove_active_origin_for_test(&self, origin: NodeIdentifier) -> Option<LsaEntry> {
-        let removed = self
-            .inner
-            .write()
-            .remove(&origin)
-            .filter(|entry| !entry.tombstone);
+        let removed = {
+            let mut entries = self.inner.write();
+            let removed = entries
+                .get(&origin)
+                .is_some_and(|entry| !entry.tombstone)
+                .then(|| entries.remove(&origin))
+                .flatten();
+            if removed.is_some() {
+                self.revision.fetch_add(1, Ordering::Relaxed);
+            }
+            removed
+        };
         if removed.is_some() {
             self.mark_dirty(origin);
         }
@@ -1138,6 +1149,21 @@ impl LinkStateDb {
         let mut out: Vec<LsaEntry> = self.inner.read().values().cloned().collect();
         out.sort_by_key(|e| e.origin);
         out
+    }
+
+    pub(crate) fn routing_snapshot(&self) -> (u64, Vec<LsaEntry>) {
+        let entries = self.inner.read();
+        let revision = self.revision.load(Ordering::Relaxed);
+        (revision, entries.values().cloned().collect())
+    }
+
+    pub(crate) fn if_revision(&self, revision: u64, f: impl FnOnce()) -> bool {
+        let _entries = self.inner.read();
+        if self.revision.load(Ordering::Relaxed) != revision {
+            return false;
+        }
+        f();
+        true
     }
 
     /// Stable structural epoch for profiled distribution trees.
@@ -1280,6 +1306,9 @@ impl LinkStateDb {
                 }
                 true
             });
+            if !failed.is_empty() || !tombstone_swept.is_empty() {
+                self.revision.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if !failed.is_empty() || !tombstone_swept.is_empty() {
             {
@@ -2044,6 +2073,10 @@ mod tests {
         assert_eq!(db.drain_dirty_origins(), HashSet::from([2]));
         assert_eq!(floor.get(2).unwrap().boot_epoch, 100);
         assert!(db.remove_active_origin_for_test(3).is_none());
+        assert!(
+            db.get(3).is_some(),
+            "a tombstone is not an active failure target"
+        );
     }
 
     #[test]

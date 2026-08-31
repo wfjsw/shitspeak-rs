@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
-use tracing::trace;
+use tracing::{trace, warn};
 
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{ConnectionManager, ServiceLevel};
@@ -35,141 +35,160 @@ pub fn spawn_recomputer(
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
-        // Compute once at start so the table reflects an empty graph
-        // before any LSAs land.
-        let mut dynamic = if cfg.routing_dynamic_spf_enabled() {
-            Some(recompute_dynamic_full(
-                &lsdb,
-                self_id,
-                &tables,
-                &transport,
-                &duplicate_detector,
-                &cfg,
-                &shutdown,
-            ))
-        } else {
-            recompute_now(
-                &lsdb,
-                self_id,
-                &tables,
-                &transport,
-                &duplicate_detector,
-                &cfg,
-                &shutdown,
-            );
-            None
-        };
+        let mut dynamic = None;
         lsdb.drain_dirty_origins();
 
         loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = lsdb.change_signal().notified() => {}
+            loop {
+                let Some(computation) = compute_routing_offloaded(
+                    lsdb.clone(),
+                    self_id,
+                    duplicate_detector.clone(),
+                    cfg.clone(),
+                    dynamic.take(),
+                    &shutdown,
+                )
+                .await
+                else {
+                    return;
+                };
+                let RoutingComputation {
+                    lsdb_revision,
+                    dynamic: next_dynamic,
+                    tables: new,
+                    bridge_targets,
+                } = computation;
+                let dynamic_spf = next_dynamic.is_some();
+                dynamic = next_dynamic;
+
+                if shutdown.is_cancelled() {
+                    return;
+                }
+                let published = lsdb.if_revision(lsdb_revision, || {
+                    transport.set_required_outgoing_nodes(bridge_targets);
+                    trace!(
+                        dynamic_spf,
+                        reliable = new.for_level(ServiceLevel::Reliable).len(),
+                        rll = new.for_level(ServiceLevel::ReliableLowLatency).len(),
+                        best_effort = new.for_level(ServiceLevel::BestEffort).len(),
+                        "routing recomputed"
+                    );
+                    publish_routing_tables(
+                        &tables,
+                        new,
+                        self_id,
+                        cfg.routing_recompute_debounce(),
+                        &shutdown,
+                    );
+                });
+                if published {
+                    break;
+                }
+                trace!(lsdb_revision, "discarded stale routing computation");
             }
-            // Debounce: drain further notifications during the sleep.
+
+            let notified = lsdb.change_signal().notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if lsdb.drain_dirty_origins().is_empty() {
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = &mut notified => {}
+                }
+            }
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = tokio::time::sleep(cfg.routing_recompute_debounce()) => {}
             }
-            if cfg.routing_dynamic_spf_enabled() {
-                let dirty = lsdb.drain_dirty_origins();
-                let engine = dynamic.get_or_insert_with(|| {
-                    DynamicSpf::rebuild_filtered(&lsdb, self_id, &cfg, |node| {
-                        !duplicate_detector.is_quarantined(node)
-                    })
-                });
-                let new = engine.update_filtered(&lsdb, dirty, &cfg, |node| {
-                    !duplicate_detector.is_quarantined(node)
-                });
-                transport
-                    .set_required_outgoing_nodes(component_bridge_targets(engine.graph(), self_id));
-                trace!(
-                    reliable = new.for_level(ServiceLevel::Reliable).len(),
-                    rll = new.for_level(ServiceLevel::ReliableLowLatency).len(),
-                    best_effort = new.for_level(ServiceLevel::BestEffort).len(),
-                    "routing dynamically recomputed"
-                );
-                publish_routing_tables(
-                    &tables,
-                    new,
-                    self_id,
-                    cfg.routing_recompute_debounce(),
-                    &shutdown,
-                );
-            } else {
-                recompute_now(
-                    &lsdb,
-                    self_id,
-                    &tables,
-                    &transport,
-                    &duplicate_detector,
-                    &cfg,
-                    &shutdown,
-                );
-                lsdb.drain_dirty_origins();
-            }
+            lsdb.drain_dirty_origins();
         }
     });
 }
 
-fn recompute_dynamic_full(
-    lsdb: &LinkStateDb,
-    self_id: NodeIdentifier,
-    tables: &Arc<ArcSwap<RoutingTables>>,
-    transport: &ConnectionManager,
-    duplicate_detector: &DuplicateDetector,
-    cfg: &OverlayConfig,
-    shutdown: &CancellationToken,
-) -> DynamicSpf {
-    let engine = DynamicSpf::rebuild_filtered(lsdb, self_id, cfg, |node| {
-        !duplicate_detector.is_quarantined(node)
-    });
-    transport.set_required_outgoing_nodes(component_bridge_targets(engine.graph(), self_id));
-    let new = engine.routing_tables(cfg);
-    trace!(
-        reliable = new.for_level(ServiceLevel::Reliable).len(),
-        rll = new.for_level(ServiceLevel::ReliableLowLatency).len(),
-        best_effort = new.for_level(ServiceLevel::BestEffort).len(),
-        "routing dynamically rebuilt"
-    );
-    publish_routing_tables(
-        tables,
-        new,
-        self_id,
-        cfg.routing_recompute_debounce(),
-        shutdown,
-    );
-    engine
+struct RoutingComputation {
+    lsdb_revision: u64,
+    dynamic: Option<DynamicSpf>,
+    tables: RoutingTables,
+    bridge_targets: HashSet<NodeIdentifier>,
 }
 
-fn recompute_now(
+fn spawn_routing_computation<F, T>(compute: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(compute)
+}
+
+async fn compute_routing_offloaded(
+    lsdb: Arc<LinkStateDb>,
+    self_id: NodeIdentifier,
+    duplicate_detector: Arc<DuplicateDetector>,
+    cfg: OverlayConfig,
+    dynamic: Option<DynamicSpf>,
+    shutdown: &CancellationToken,
+) -> Option<RoutingComputation> {
+    let computation = spawn_routing_computation(move || {
+        compute_routing(&lsdb, self_id, &duplicate_detector, &cfg, dynamic, || {})
+    });
+    tokio::select! {
+        _ = shutdown.cancelled() => None,
+        result = computation => match result {
+            Ok(computation) => Some(computation),
+            Err(error) => {
+                warn!(%error, "routing computation task failed");
+                None
+            }
+        }
+    }
+}
+
+fn compute_routing<F>(
     lsdb: &LinkStateDb,
     self_id: NodeIdentifier,
-    tables: &Arc<ArcSwap<RoutingTables>>,
-    transport: &ConnectionManager,
     duplicate_detector: &DuplicateDetector,
     cfg: &OverlayConfig,
-    shutdown: &CancellationToken,
-) {
-    let graph = dijkstra::RoutingGraph::from_lsdb_filtered(lsdb, |node| {
+    dynamic: Option<DynamicSpf>,
+    after_snapshot: F,
+) -> RoutingComputation
+where
+    F: FnOnce(),
+{
+    let (lsdb_revision, entries) = lsdb.routing_snapshot();
+    after_snapshot();
+    let graph = dijkstra::RoutingGraph::from_entries_filtered(entries.iter(), |node| {
         !duplicate_detector.is_quarantined(node)
     });
-    transport.set_required_outgoing_nodes(component_bridge_targets(&graph, self_id));
 
-    let new = RoutingTables::from_graph(&graph, self_id, cfg);
-    trace!(
-        reliable = new.for_level(ServiceLevel::Reliable).len(),
-        rll = new.for_level(ServiceLevel::ReliableLowLatency).len(),
-        best_effort = new.for_level(ServiceLevel::BestEffort).len(),
-        "routing recomputed"
-    );
-    publish_routing_tables(
-        tables,
-        new,
-        self_id,
-        cfg.routing_recompute_debounce(),
-        shutdown,
-    );
+    if cfg.routing_dynamic_spf_enabled() {
+        let (dynamic, tables) = match dynamic {
+            Some(mut dynamic) => {
+                let tables = dynamic.update_graph(graph, cfg);
+                (dynamic, tables)
+            }
+            None => {
+                let dynamic = DynamicSpf::from_graph(graph, self_id, cfg);
+                let tables = dynamic.routing_tables(cfg);
+                (dynamic, tables)
+            }
+        };
+        let bridge_targets = component_bridge_targets(dynamic.graph(), self_id);
+        RoutingComputation {
+            lsdb_revision,
+            dynamic: Some(dynamic),
+            tables,
+            bridge_targets,
+        }
+    } else {
+        let bridge_targets = component_bridge_targets(&graph, self_id);
+        let tables = RoutingTables::from_graph(&graph, self_id, cfg);
+        RoutingComputation {
+            lsdb_revision,
+            dynamic: None,
+            tables,
+            bridge_targets,
+        }
+    }
 }
 
 fn publish_routing_tables(
@@ -277,6 +296,7 @@ mod tests {
         ApplicationServices, LinkAdvertised, LsaEntry, LsaFloor, ReplicationServices,
     };
     use shitspeak_s2s_transport::TransportKind;
+    use std::sync::Barrier;
 
     fn entry(origin: NodeIdentifier, links: Vec<NodeIdentifier>) -> LsaEntry {
         LsaEntry {
@@ -350,6 +370,84 @@ mod tests {
             ]),
         );
         tables
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn routing_computation_does_not_block_the_async_worker() {
+        let release = Arc::new(Barrier::new(2));
+        let compute_release = release.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let computation = spawn_routing_computation(move || {
+            let _ = started_tx.send(());
+            compute_release.wait();
+        });
+        started_rx.await.expect("blocking computation started");
+
+        let heartbeat = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            1
+        });
+        assert_eq!(heartbeat.await.expect("heartbeat task completed"), 1);
+
+        release.wait();
+        computation.await.expect("blocking computation completed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lsa_admitted_during_computation_makes_result_stale_and_is_recomputed() {
+        let lsdb = Arc::new(build_db(vec![entry(1, vec![])]));
+        lsdb.drain_dirty_origins();
+        let duplicate_detector = Arc::new(DuplicateDetector::new(1, Duration::from_secs(1)));
+        let cfg = OverlayConfig::new(vec![]);
+        let release = Arc::new(Barrier::new(2));
+        let compute_release = release.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let compute_lsdb = lsdb.clone();
+        let compute_duplicates = duplicate_detector.clone();
+        let compute_cfg = cfg.clone();
+        let computation = spawn_routing_computation(move || {
+            compute_routing(
+                &compute_lsdb,
+                1,
+                &compute_duplicates,
+                &compute_cfg,
+                None,
+                || {
+                    let _ = started_tx.send(());
+                    compute_release.wait();
+                },
+            )
+        });
+        started_rx.await.expect("routing snapshot captured");
+
+        let mut local = entry(1, vec![2]);
+        local.seq = 2;
+        lsdb.admit(local);
+        lsdb.admit(entry(2, vec![1]));
+        release.wait();
+        let stale = computation.await.expect("stale computation completed");
+
+        let published = Arc::new(ArcSwap::from_pointee(RoutingTables::empty()));
+        assert!(!lsdb.if_revision(stale.lsdb_revision, || {
+            published.store(Arc::new(stale.tables.clone()));
+        }));
+        assert!(
+            published
+                .load()
+                .for_level(ServiceLevel::Reliable)
+                .is_empty()
+        );
+
+        let current = compute_routing(&lsdb, 1, &duplicate_detector, &cfg, stale.dynamic, || {});
+        assert!(lsdb.if_revision(current.lsdb_revision, || {}));
+        assert!(
+            current
+                .tables
+                .for_level(ServiceLevel::Reliable)
+                .contains_key(&2)
+        );
     }
 
     #[test]

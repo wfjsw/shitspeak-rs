@@ -1632,11 +1632,12 @@ impl S2SManager {
             native_runtime,
         };
 
+        let worker_threads = crate::runtime_workers::runtime_worker_allocation().s2s();
         let thread = thread::Builder::new()
             .name("s2s-runtime".to_owned())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
+                    .worker_threads(worker_threads)
                     .thread_name("s2s-runtime-worker")
                     .enable_all()
                     .build()
@@ -1647,6 +1648,8 @@ impl S2SManager {
                         return;
                     }
                 };
+
+                info!(worker_threads, "started s2s tokio runtime");
 
                 runtime.block_on(async move {
                     self.run_runtime(server, shutdown, gateways).await;

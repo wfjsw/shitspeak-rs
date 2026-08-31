@@ -172,13 +172,14 @@ Selection telemetry preserves this logical distinction:
 QUIC RTT, loss, and health remain shared under `TransportKind::Quic`; the path
 label describes delivery semantics, not a separate network link.
 
-BestEffort datagram health also runs as a shadow-only hysteretic observer, and
-its `suspect` state does not affect selection. Raw UDP uses weighted effective
-loss. QUIC DATAGRAM instead uses peer/path-local app-queue rejection and writer
-failure. Quinn buffer pressure, too-large events, and ingress validation remain
-separate diagnostic counters. No DATAGRAM ACK, on-time delivery, or end-to-end
-packet-loss signal exists. Aggregate QUIC stream RTT/loss does not drive this
-local score, and the observer does not affect routing or KCP behavior.
+BestEffort datagram health is a hysteretic observer whose `suspect` and
+`blocked` QUIC DATAGRAM states remove that path from delivery candidates. Raw
+UDP uses weighted effective loss. QUIC DATAGRAM instead uses peer/path-local
+app-queue rejection and writer failure. Quinn buffer pressure, too-large
+events, and ingress validation remain separate diagnostic counters. No
+DATAGRAM ACK, on-time delivery, or end-to-end packet-loss signal exists.
+Aggregate QUIC stream RTT/loss does not drive this local score, and the gate
+does not alter KCP behavior.
 
 QUIC DATAGRAM uses fixed one-second evidence windows with bounded 64-window
 replay. It requires two or three distinct completed bad windows (three by

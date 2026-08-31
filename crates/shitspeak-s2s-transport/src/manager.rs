@@ -60,14 +60,18 @@ use super::service_level::{
 };
 use super::tls::build_tls_configs;
 
-const OUTBOUND_DISPATCH_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+// Keep blocked lanes responsive during short transport stalls while retaining
+// a bounded retry rate for peers that cannot currently make progress.
+const OUTBOUND_DISPATCH_RETRY_INTERVAL: Duration = Duration::from_millis(2);
 const DEADLINE_DRAIN_FALLBACK_BYTES_PER_SEC: f64 = 16.0 * 1024.0;
 const DEADLINE_NEAR_EXPIRED_TTL: Duration = Duration::from_millis(20);
 const OUTBOUND_QUEUE_SATURATED_PERCENT: usize = 90;
 const MAX_CONSECUTIVE_HIGH_PRIORITY: usize = 32;
-const MAX_OUTBOUND_INGRESS_PER_TURN: usize = 256;
-const MAX_OUTBOUND_DISPATCH_ATTEMPTS_PER_TURN: usize = 128;
-const MAX_OUTBOUND_EXPIRY_PURGES_PER_TURN: usize = 256;
+// Larger bounded turns let an active peer drain bursts without waiting for
+// another wakeup; yield points below preserve executor fairness.
+const MAX_OUTBOUND_INGRESS_PER_TURN: usize = 512;
+const MAX_OUTBOUND_DISPATCH_ATTEMPTS_PER_TURN: usize = 256;
+const MAX_OUTBOUND_EXPIRY_PURGES_PER_TURN: usize = 512;
 const MAX_BLOCKED_LANE_PASSES: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
@@ -3578,17 +3582,45 @@ fn prefer_best_effort_datagram_paths(
         envelope.class(),
         envelope.options(),
     );
+    let has_stream_fallback = candidates
+        .iter()
+        .any(|candidate| !candidate.path.is_datagram());
+    let quic_datagram_health = candidates
+        .iter()
+        .find(|candidate| candidate.path == DeliveryPath::QuicDatagram)
+        .map(|candidate| {
+            observe_best_effort_datagram_path_health(peer, candidate.path, &snapshot, policy, now)
+        });
     candidates.retain(|candidate| {
         if !candidate.path.is_datagram() {
             return true;
         }
         let physical_health =
             udp_family_health(peer, &[candidate.path.transport()], &snapshot, policy);
-        observe_best_effort_datagram_path_health(peer, candidate.path, &snapshot, policy, now);
-        matches!(
+        let datagram_health = if candidate.path == DeliveryPath::QuicDatagram {
+            quic_datagram_health
+        } else {
+            Some(observe_best_effort_datagram_path_health(
+                peer,
+                candidate.path,
+                &snapshot,
+                policy,
+                now,
+            ))
+        };
+        let physical_usable = matches!(
             physical_health,
             UdpFamilyHealth::Probing | UdpFamilyHealth::Viable
-        )
+        );
+        let evidence_usable = match (candidate.path, datagram_health) {
+            (DeliveryPath::QuicDatagram, Some(DatagramPathHealthState::Blocked)) => false,
+            (DeliveryPath::QuicDatagram, Some(DatagramPathHealthState::Suspect)) => {
+                !has_stream_fallback
+            }
+            (DeliveryPath::QuicDatagram, _) | (DeliveryPath::UdpDatagram, _) => true,
+            _ => unreachable!("only datagram paths are retained here"),
+        };
+        physical_usable && evidence_usable
     });
     if expiring_voice {
         candidates.retain(|candidate| {
@@ -6398,7 +6430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn suspect_datagram_observation_does_not_change_selection() {
+    async fn suspect_quic_datagram_observation_falls_back_to_stream() {
         let (peer, mut stream_receivers) = peer_with_live_transports(&[TransportKind::Tcp]);
         let (_control, _high, _regular, mut quic_datagram) =
             install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1400).into_parts();
@@ -6435,16 +6467,49 @@ mod tests {
             assert_eq!(observed, expected, "window {window}, health={health:?}");
         }
 
-        try_dispatch_envelope(&peer, expiring_voice(b"shadow-suspect"), policy).unwrap();
+        try_dispatch_envelope(&peer, expiring_voice(b"evidence-fallback"), policy).unwrap();
 
         assert_eq!(
-            quic_datagram.recv().await.unwrap().payload(),
-            b"shadow-suspect".as_slice()
+            stream_receivers[0].try_recv().unwrap().payload(),
+            b"evidence-fallback".as_slice()
         );
-        assert!(stream_receivers[0].try_recv().is_err());
+        assert!(quic_datagram.try_recv().is_err());
         assert_eq!(
             peer.datagram_path_health_status(Duration::from_secs(10))[0].state(),
             DatagramPathHealthState::Suspect
+        );
+    }
+
+    #[tokio::test]
+    async fn suspect_quic_datagram_remains_last_resort_without_stream_fallback() {
+        let (peer, _stream_receivers) = peer_with_live_transports(&[]);
+        let (_control, _high, _regular, mut quic_datagram) =
+            install_test_quic_v2(&peer, socket("127.0.0.1:64742"), 1400).into_parts();
+        let policy = TransportRoutingPolicy::default();
+        let start = Instant::now();
+        for window in 0..policy.best_effort_datagram_suspect_bad_windows() {
+            let event_at = start + Duration::from_secs(u64::from(window) * 2);
+            for _ in 0..policy.udp_family_min_samples() {
+                peer.metrics().record_datagram_path_evidence_at(
+                    DeliveryPath::QuicDatagram,
+                    DatagramPathEvidenceEvent::OutcomeFailure,
+                    event_at,
+                );
+            }
+            let snapshot = peer.metrics().snapshot_per_transport();
+            observe_best_effort_datagram_path_health(
+                &peer,
+                DeliveryPath::QuicDatagram,
+                &snapshot,
+                policy,
+                event_at + Duration::from_millis(1_100),
+            );
+        }
+
+        try_dispatch_envelope(&peer, expiring_voice(b"last-resort"), policy).unwrap();
+        assert_eq!(
+            quic_datagram.recv().await.unwrap().payload(),
+            b"last-resort".as_slice()
         );
     }
 

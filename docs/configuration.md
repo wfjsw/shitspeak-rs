@@ -635,8 +635,9 @@ udp_family_block_loss_ppm = 250000
 udp_family_loss_excess_over_tcp_ppm = 50000
 # Observe separate BestEffort datagram states. Raw UDP uses weighted effective
 # loss. QUIC DATAGRAM uses path-local enqueue rejection and writer-failure
-# evidence; pressure, too-large, and ingress counters are diagnostic only.
-# This is shadow-only and does not affect routing or KCP.
+# evidence; suspect or blocked paths are removed from BestEffort candidates.
+# Pressure, too-large, and ingress counters remain diagnostic only; KCP is
+# unaffected.
 best_effort_datagram_effective_loss_suspect_ppm = 5000
 best_effort_datagram_effective_loss_recover_ppm = 2500
 best_effort_quic_datagram_health_suspect_ppm = 100000
@@ -703,6 +704,8 @@ delivery_strategy = "broadcast"
 # resolved recipient-node set changes.
 tree_delivery_enabled = true
 reorder_max_delay_ms = 40
+# After the gap deadline, retain the buffered suffix for late repair.
+chunk_hold_budget_ms = 600
 reorder_max_buffered_frames = 48
 reorder_max_total_buffer = 4096
 reorder_idle_reset_ms = 2000
@@ -713,13 +716,13 @@ adaptive_jitter_max_delay_ms = 120
 adaptive_jitter_growth_step_ms = 20
 adaptive_jitter_decay_step_ms = 10
 repair_enabled = true
-transport_ttl_ms = 750
-repair_transport_ttl_ms = 750
+transport_ttl_ms = 1500
+repair_transport_ttl_ms = 1500
 # Transport TTL for the NACK itself; defaults to repair_transport_ttl_ms. The
 # payload separately carries the requester's remaining actionable gap time as
 # a relative response deadline.
-repair_request_ttl_ms = 750
-repair_cache_ms = 1600
+repair_request_ttl_ms = 1500
+repair_cache_ms = 3000
 repair_loss_start_ppm = 10000
 repair_full_dup_loss_ppm = 30000
 repair_jitter_start_ms = 40
@@ -873,15 +876,16 @@ distinguishes logical selections with bounded `path` values such as
 metrics remain shared under `TransportKind::Quic`; delivery-path telemetry does
 not model DATAGRAM as a second physical link.
 
-BestEffort datagram health is a shadow-only hysteretic state (`probing`,
-`healthy`, `suspect`, or `blocked`) and never removes a candidate. Raw UDP uses
-the `best_effort_datagram_effective_loss_*_ppm` weighted effective-loss
+BestEffort datagram health is a hysteretic state (`probing`, `healthy`,
+`suspect`, or `blocked`). Suspect and blocked QUIC DATAGRAM paths are removed
+from BestEffort delivery candidates, allowing the normal stream fallback. Raw
+UDP uses the `best_effort_datagram_effective_loss_*_ppm` weighted effective-loss
 thresholds, not raw-loss cutoffs. QUIC DATAGRAM instead uses path-local app
 queue rejection and writer failure. Quinn buffer pressure, too-large events,
 and ingress validation remain separate diagnostic counters. No DATAGRAM ACK,
 on-time delivery, or end-to-end packet-loss signal exists. Aggregate QUIC
-stream RTT/loss does not drive the QUIC DATAGRAM state, and the observer does
-not affect routing or KCP behavior.
+stream RTT/loss does not drive the QUIC DATAGRAM state, and the gate does not
+alter KCP selection.
 
 QUIC DATAGRAM requires `best_effort_datagram_suspect_bad_windows` distinct
 completed one-second bad windows before entering `suspect`; up to 64 completed
@@ -965,9 +969,10 @@ acknowledged overlay lane between repair events.
 `transport_ttl_ms`, `repair_transport_ttl_ms`, and `repair_request_ttl_ms` are
 the remote S2S voice delivery budget. They are not a local listener playout
 delay. Set all three explicitly when the deployment includes long-haul links;
-the documented long-haul profile uses `750` ms. `repair_cache_ms` must cover that
-delivery window and the time needed to request a repair; it is `1600` ms in the
-deployment configuration.
+the tracked long-haul profile uses `1500` ms. `repair_cache_ms` must cover that
+delivery window and the time needed to request a repair; it is `3000` ms in the
+deployment configuration. `chunk_hold_budget_ms` is the additional receiver
+hold after the initial gap deadline while a repair is still actionable.
 
 Remote voice is released immediately after S2S sequence ordering. The server
 buffers only an observed sequence gap for its short per-speaker repair window;
