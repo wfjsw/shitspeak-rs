@@ -1,15 +1,19 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use scc::HashCache;
 use tokio::sync::Notify;
 
 const FLOW_CACHE_TTL: Duration = Duration::from_secs(10);
 const FLOW_METADATA_WAIT: Duration = Duration::from_secs(1);
-#[cfg(target_os = "linux")]
 const FLOW_CACHE_CAPACITY: usize = 16_384;
+
+type FlowCache = HashCache<FlowKey, SynMetadata>;
+
+fn new_flow_cache() -> FlowCache {
+    HashCache::with_capacity(FLOW_CACHE_CAPACITY, FLOW_CACHE_CAPACITY)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct TcpPacketMetadata {
@@ -46,31 +50,49 @@ struct SynMetadata {
 }
 
 pub(crate) struct TcpPacketCollector {
-    flows: Arc<Mutex<HashMap<FlowKey, SynMetadata>>>,
+    flows: Arc<FlowCache>,
     flow_updates: Arc<Notify>,
     active_backend: Option<String>,
+    #[cfg(target_os = "linux")]
+    packet_filter_controller: Option<Arc<linux::PacketFilterController>>,
 }
 
 impl TcpPacketCollector {
-    pub(crate) fn start(available_backends: &[String]) -> Arc<Self> {
+    pub(crate) fn start(
+        available_backends: &[String],
+        listener_ports: impl IntoIterator<Item = u16>,
+    ) -> Arc<Self> {
+        let listener_ports = listener_ports.into_iter().collect::<Vec<_>>();
         static COLLECTOR: OnceLock<Arc<TcpPacketCollector>> = OnceLock::new();
-        COLLECTOR
-            .get_or_init(|| Self::start_once(available_backends))
-            .clone()
+        let collector = COLLECTOR
+            .get_or_init(|| Self::start_once(available_backends, &listener_ports))
+            .clone();
+        collector.register_listener_ports(listener_ports);
+        collector
     }
 
     #[cfg(target_os = "linux")]
-    fn start_once(available_backends: &[String]) -> Arc<Self> {
-        linux::start(available_backends)
+    fn start_once(available_backends: &[String], listener_ports: &[u16]) -> Arc<Self> {
+        linux::start(available_backends, listener_ports)
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn start_once(_available_backends: &[String]) -> Arc<Self> {
+    fn start_once(_available_backends: &[String], _listener_ports: &[u16]) -> Arc<Self> {
         Arc::new(Self {
-            flows: Arc::new(Mutex::new(HashMap::new())),
+            flows: Arc::new(new_flow_cache()),
             flow_updates: Arc::new(Notify::new()),
             active_backend: None,
         })
+    }
+
+    pub(crate) fn register_listener_ports(&self, listener_ports: impl IntoIterator<Item = u16>) {
+        #[cfg(target_os = "linux")]
+        if let Some(controller) = &self.packet_filter_controller {
+            controller.register_listener_ports(listener_ports);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        let _ = listener_ports;
     }
 
     pub(crate) fn active_backend(&self) -> Option<&str> {
@@ -85,15 +107,14 @@ impl TcpPacketCollector {
         let source = shitspeak_auth::canonical_socket_addr(source);
         let destination = shitspeak_auth::canonical_socket_addr(destination);
         let now = Instant::now();
-        let metadata = self
-            .flows
-            .lock()
-            .get(&FlowKey {
-                source,
-                destination,
-            })?
-            .clone();
+        let key = FlowKey {
+            source,
+            destination,
+        };
+        let metadata = self.flows.read_sync(&key, |_, metadata| metadata.clone())?;
         if now.duration_since(metadata.observed_at) > FLOW_CACHE_TTL {
+            self.flows
+                .remove_if_sync(&key, |current| current.observed_at == metadata.observed_at);
             return None;
         }
         let ja4t = format!(
@@ -154,9 +175,12 @@ impl TcpPacketCollector {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use std::collections::{BTreeSet, HashMap};
     use std::mem;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+    use parking_lot::Mutex;
 
     const BPF_PROG_LOAD: u32 = 5;
     const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
@@ -167,6 +191,7 @@ mod linux {
     const BPF_JMP_JEQ_K: u8 = 0x15;
     const BPF_JMP_EXIT: u8 = 0x95;
     const SO_ATTACH_BPF: libc::c_int = 50;
+    const CAPTURE_SNAPSHOT_LEN: usize = 256;
 
     #[repr(C)]
     struct BpfInsn {
@@ -190,8 +215,79 @@ mod linux {
         prog_name: [u8; 16],
     }
 
-    pub(super) fn start(available_backends: &[String]) -> Arc<TcpPacketCollector> {
-        let flows = Arc::new(Mutex::new(HashMap::new()));
+    struct PacketFilterState {
+        listener_ports: BTreeSet<u16>,
+        narrowed: bool,
+    }
+
+    pub(super) struct PacketFilterController {
+        packet_fd: Arc<OwnedFd>,
+        state: Mutex<PacketFilterState>,
+    }
+
+    impl PacketFilterController {
+        fn new(packet_fd: Arc<OwnedFd>, listener_ports: &[u16]) -> Self {
+            Self {
+                packet_fd,
+                state: Mutex::new(PacketFilterState {
+                    listener_ports: listener_ports.iter().copied().collect(),
+                    narrowed: false,
+                }),
+            }
+        }
+
+        fn install_initial(&self) -> std::io::Result<()> {
+            let mut state = self.state.lock();
+            install_listener_filter(self.packet_fd.as_raw_fd(), &mut state)
+        }
+
+        pub(super) fn register_listener_ports(
+            &self,
+            listener_ports: impl IntoIterator<Item = u16>,
+        ) {
+            let mut state = self.state.lock();
+            let mut changed = false;
+            for port in listener_ports {
+                changed |= state.listener_ports.insert(port);
+            }
+            if !changed && state.narrowed {
+                return;
+            }
+            if let Err(error) = install_listener_filter(self.packet_fd.as_raw_fd(), &mut state) {
+                tracing::warn!(%error, "could not update listener-port TCP packet filter");
+            }
+        }
+    }
+
+    fn install_listener_filter(
+        socket_fd: RawFd,
+        state: &mut PacketFilterState,
+    ) -> std::io::Result<()> {
+        let ports = state.listener_ports.iter().copied().collect::<Vec<_>>();
+        match attach_ebpf_socket_filter(socket_fd, &ports) {
+            Ok(()) => {
+                state.narrowed = !ports.is_empty();
+                Ok(())
+            }
+            Err(narrow_error) if !ports.is_empty() => {
+                attach_ebpf_socket_filter(socket_fd, &[]).map_err(|broad_error| {
+                    std::io::Error::other(format!(
+                        "listener filter: {narrow_error}; broad fallback: {broad_error}"
+                    ))
+                })?;
+                state.narrowed = false;
+                tracing::warn!(%narrow_error, "listener-port eBPF filter unavailable; using broad TCP filter");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn start(
+        available_backends: &[String],
+        listener_ports: &[u16],
+    ) -> Arc<TcpPacketCollector> {
+        let flows = Arc::new(new_flow_cache());
         let flow_updates = Arc::new(Notify::new());
         let Ok(packet_fd) = open_packet_socket() else {
             tracing::debug!("could not open AF_PACKET socket for TCP metadata capture");
@@ -199,14 +295,23 @@ mod linux {
                 flows,
                 flow_updates,
                 active_backend: None,
+                packet_filter_controller: None,
             });
         };
         // An OwnedFd makes every error path close the socket, including a
         // thread-spawn failure.
-        let packet_fd = unsafe { OwnedFd::from_raw_fd(packet_fd) };
+        let packet_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(packet_fd) });
+        let mut packet_filter_controller = None;
         let backend = if available_backends.iter().any(|backend| backend == "ebpf") {
-            match attach_ebpf_socket_filter(packet_fd.as_raw_fd()) {
-                Ok(()) => Some("ebpf".to_owned()),
+            let controller = Arc::new(PacketFilterController::new(
+                Arc::clone(&packet_fd),
+                listener_ports,
+            ));
+            match controller.install_initial() {
+                Ok(()) => {
+                    packet_filter_controller = Some(controller);
+                    Some("ebpf".to_owned())
+                }
                 Err(error) => {
                     tracing::debug!(%error, "eBPF socket filter unavailable; falling back to AF_PACKET");
                     available_backends
@@ -226,6 +331,7 @@ mod linux {
                 flows,
                 flow_updates,
                 active_backend: None,
+                packet_filter_controller: None,
             });
         };
         let flow_cache = Arc::clone(&flows);
@@ -239,12 +345,14 @@ mod linux {
                 flows,
                 flow_updates,
                 active_backend: None,
+                packet_filter_controller: None,
             });
         }
         Arc::new(TcpPacketCollector {
             flows,
             flow_updates,
             active_backend: Some(backend),
+            packet_filter_controller,
         })
     }
 
@@ -262,126 +370,203 @@ mod linux {
             .ok_or_else(std::io::Error::last_os_error)
     }
 
-    fn attach_ebpf_socket_filter(socket_fd: RawFd) -> std::io::Result<()> {
-        // Keep non-TCP Ethernet frames in the kernel. VLAN-tagged packets
-        // deliberately pass through so the userspace parser can handle their
-        // variable header length; the overwhelmingly common untagged path is
-        // filtered before it reaches the receiver thread.
-        let instructions = [
-            socket_filter_context_prologue(),
-            BpfInsn {
+    struct FilterBuilder {
+        instructions: Vec<BpfInsn>,
+        labels: HashMap<usize, usize>,
+        jumps: Vec<(usize, usize)>,
+        next_label: usize,
+    }
+
+    impl FilterBuilder {
+        fn new() -> Self {
+            Self {
+                instructions: vec![socket_filter_context_prologue()],
+                labels: HashMap::new(),
+                jumps: Vec::new(),
+                next_label: 0,
+            }
+        }
+
+        fn new_label(&mut self) -> usize {
+            let label = self.next_label;
+            self.next_label += 1;
+            label
+        }
+
+        fn mark(&mut self, label: usize) {
+            self.labels.insert(label, self.instructions.len());
+        }
+
+        fn load_byte(&mut self, offset: usize) {
+            self.instructions.push(BpfInsn {
+                code: BPF_LD_ABS_B,
+                dst_src: 0,
+                off: 0,
+                imm: offset as i32,
+            });
+        }
+
+        fn load_half(&mut self, offset: usize) {
+            self.instructions.push(BpfInsn {
                 code: BPF_LD_ABS_H,
                 dst_src: 0,
                 off: 0,
-                imm: 12,
-            },
-            BpfInsn {
+                imm: offset as i32,
+            });
+        }
+
+        fn jump_equal(&mut self, value: i32, label: usize) {
+            let index = self.instructions.len();
+            self.instructions.push(BpfInsn {
                 code: BPF_JMP_JEQ_K,
                 dst_src: 0,
-                off: 6,
-                imm: 0x0800,
-            },
-            BpfInsn {
-                code: BPF_JMP_JEQ_K,
-                dst_src: 0,
-                off: 9,
-                imm: 0x86dd,
-            },
-            BpfInsn {
-                code: BPF_JMP_JEQ_K,
-                dst_src: 0,
-                off: 12,
-                imm: 0x8100,
-            },
-            BpfInsn {
-                code: BPF_JMP_JEQ_K,
-                dst_src: 0,
-                off: 11,
-                imm: 0x88a8,
-            },
-            BpfInsn {
-                code: BPF_JMP_JEQ_K,
-                dst_src: 0,
-                off: 10,
-                imm: 0x9100,
-            },
-            BpfInsn {
+                off: 0,
+                imm: value,
+            });
+            self.jumps.push((index, label));
+        }
+
+        fn return_value(&mut self, value: i32) {
+            self.instructions.push(BpfInsn {
                 code: BPF_ALU64_MOV_K,
                 dst_src: 0,
                 off: 0,
-                imm: 0,
-            },
-            BpfInsn {
+                imm: value,
+            });
+            self.instructions.push(BpfInsn {
                 code: BPF_JMP_EXIT,
                 dst_src: 0,
                 off: 0,
                 imm: 0,
-            },
-            BpfInsn {
-                code: BPF_LD_ABS_B,
-                dst_src: 0,
-                off: 0,
-                imm: 23,
-            },
-            BpfInsn {
-                code: BPF_JMP_JEQ_K,
-                dst_src: 0,
-                off: 6,
-                imm: libc::IPPROTO_TCP,
-            },
-            BpfInsn {
-                code: BPF_ALU64_MOV_K,
-                dst_src: 0,
-                off: 0,
-                imm: 0,
-            },
-            BpfInsn {
-                code: BPF_JMP_EXIT,
-                dst_src: 0,
-                off: 0,
-                imm: 0,
-            },
-            BpfInsn {
-                code: BPF_LD_ABS_B,
-                dst_src: 0,
-                off: 0,
-                imm: 20,
-            },
-            BpfInsn {
-                code: BPF_JMP_JEQ_K,
-                dst_src: 0,
-                off: 2,
-                imm: libc::IPPROTO_TCP,
-            },
-            BpfInsn {
-                code: BPF_ALU64_MOV_K,
-                dst_src: 0,
-                off: 0,
-                imm: 0,
-            },
-            BpfInsn {
-                code: BPF_JMP_EXIT,
-                dst_src: 0,
-                off: 0,
-                imm: 0,
-            },
-            BpfInsn {
-                code: BPF_ALU64_MOV_K,
-                dst_src: 0,
-                off: 0,
-                imm: -1,
-            },
-            BpfInsn {
-                code: BPF_JMP_EXIT,
-                dst_src: 0,
-                off: 0,
-                imm: 0,
-            },
-        ];
+            });
+        }
+
+        fn finish(mut self) -> std::io::Result<Vec<BpfInsn>> {
+            for (instruction, label) in self.jumps {
+                let target = *self
+                    .labels
+                    .get(&label)
+                    .ok_or_else(|| std::io::Error::other("unresolved eBPF filter label"))?;
+                let relative = target as isize - instruction as isize - 1;
+                self.instructions[instruction].off = i16::try_from(relative)
+                    .map_err(|_| std::io::Error::other("eBPF listener filter is too large"))?;
+            }
+            Ok(self.instructions)
+        }
+    }
+
+    fn build_socket_filter(listener_ports: &[u16]) -> std::io::Result<Vec<BpfInsn>> {
+        let mut builder = FilterBuilder::new();
+        let accept = builder.new_label();
+        append_ethernet_dispatch(&mut builder, 12, 14, 0, listener_ports, accept);
+        builder.mark(accept);
+        builder.return_value(CAPTURE_SNAPSHOT_LEN as i32);
+        builder.finish()
+    }
+
+    fn append_ethernet_dispatch(
+        builder: &mut FilterBuilder,
+        ether_type_offset: usize,
+        ip_offset: usize,
+        vlan_depth: usize,
+        listener_ports: &[u16],
+        accept: usize,
+    ) {
+        let ipv4 = builder.new_label();
+        let ipv6 = builder.new_label();
+        let vlan = builder.new_label();
+        builder.load_half(ether_type_offset);
+        builder.jump_equal(0x0800, ipv4);
+        builder.jump_equal(0x86dd, ipv6);
+        for ether_type in [0x8100, 0x88a8, 0x9100] {
+            builder.jump_equal(ether_type, if vlan_depth < 2 { vlan } else { accept });
+        }
+        builder.return_value(0);
+
+        builder.mark(ipv4);
+        append_ipv4_filter(builder, ip_offset, listener_ports, accept);
+        builder.mark(ipv6);
+        append_ipv6_filter(builder, ip_offset, listener_ports, accept);
+
+        if vlan_depth < 2 {
+            builder.mark(vlan);
+            append_ethernet_dispatch(
+                builder,
+                ether_type_offset + 4,
+                ip_offset + 4,
+                vlan_depth + 1,
+                listener_ports,
+                accept,
+            );
+        }
+    }
+
+    fn append_ipv4_filter(
+        builder: &mut FilterBuilder,
+        ip_offset: usize,
+        listener_ports: &[u16],
+        accept: usize,
+    ) {
+        let tcp = builder.new_label();
+        builder.load_byte(ip_offset + 9);
+        builder.jump_equal(libc::IPPROTO_TCP, tcp);
+        builder.return_value(0);
+        builder.mark(tcp);
+        if listener_ports.is_empty() {
+            builder.return_value(CAPTURE_SNAPSHOT_LEN as i32);
+            return;
+        }
+
+        let fixed_header = builder.new_label();
+        builder.load_byte(ip_offset);
+        builder.jump_equal(0x45, fixed_header);
+        builder.return_value(CAPTURE_SNAPSHOT_LEN as i32);
+        builder.mark(fixed_header);
+        append_port_filter(builder, ip_offset + 20, listener_ports, accept);
+    }
+
+    fn append_ipv6_filter(
+        builder: &mut FilterBuilder,
+        ip_offset: usize,
+        listener_ports: &[u16],
+        accept: usize,
+    ) {
+        let tcp = builder.new_label();
+        builder.load_byte(ip_offset + 6);
+        builder.jump_equal(libc::IPPROTO_TCP, tcp);
+        builder.return_value(0);
+        builder.mark(tcp);
+        if listener_ports.is_empty() {
+            builder.return_value(CAPTURE_SNAPSHOT_LEN as i32);
+            return;
+        }
+        append_port_filter(builder, ip_offset + 40, listener_ports, accept);
+    }
+
+    fn append_port_filter(
+        builder: &mut FilterBuilder,
+        tcp_offset: usize,
+        listener_ports: &[u16],
+        accept: usize,
+    ) {
+        builder.load_half(tcp_offset);
+        for port in listener_ports {
+            builder.jump_equal(i32::from(*port), accept);
+        }
+        builder.load_half(tcp_offset + 2);
+        for port in listener_ports {
+            builder.jump_equal(i32::from(*port), accept);
+        }
+        builder.return_value(0);
+    }
+
+    fn attach_ebpf_socket_filter(socket_fd: RawFd, listener_ports: &[u16]) -> std::io::Result<()> {
+        let instructions = build_socket_filter(listener_ports)?;
         let license = b"GPL\0";
         let attr = BpfProgLoadAttr {
             prog_type: BPF_PROG_TYPE_SOCKET_FILTER,
-            insn_cnt: instructions.len() as u32,
+            insn_cnt: u32::try_from(instructions.len())
+                .map_err(|_| std::io::Error::other("eBPF listener filter is too large"))?,
             insns: instructions.as_ptr() as u64,
             license: license.as_ptr() as u64,
             log_level: 0,
@@ -428,12 +613,9 @@ mod linux {
         }
     }
 
-    fn receive_packets(
-        packet_fd: OwnedFd,
-        flows: Arc<Mutex<HashMap<FlowKey, SynMetadata>>>,
-        flow_updates: Arc<Notify>,
-    ) {
-        let mut buffer = [0u8; 65_536];
+    fn receive_packets(packet_fd: Arc<OwnedFd>, flows: Arc<FlowCache>, flow_updates: Arc<Notify>) {
+        let mut buffer = [0u8; CAPTURE_SNAPSHOT_LEN];
+        let mut receive_error_active = false;
         loop {
             let len = unsafe {
                 libc::recv(
@@ -443,12 +625,33 @@ mod linux {
                     0,
                 )
             };
-            if len <= 0 {
+            if len < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if !receive_error_active {
+                    tracing::warn!(%error, "TCP packet capture receive failed; retrying with backoff");
+                }
+                receive_error_active = true;
+                std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
+            if len == 0 {
+                if !receive_error_active {
+                    tracing::warn!(
+                        "TCP packet capture returned an empty packet; retrying with backoff"
+                    );
+                }
+                receive_error_active = true;
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            receive_error_active = false;
             if let Some(packet) = parse_packet(&buffer[..len as usize]) {
-                update_flows(&flows, packet, Instant::now());
-                flow_updates.notify_waiters();
+                if update_flows(&flows, packet, Instant::now()) {
+                    flow_updates.notify_waiters();
+                }
             }
         }
     }
@@ -468,7 +671,7 @@ mod linux {
 
     fn parse_packet(bytes: &[u8]) -> Option<TcpPacket> {
         let (ether_type, mut offset) = ethernet_payload(bytes)?;
-        let (source_ip, destination_ip, ttl, tcp_offset) = match ether_type {
+        let (source_ip, destination_ip, ttl, tcp_offset, tcp_segment_len) = match ether_type {
             0x0800 => parse_ipv4(bytes, offset)?,
             0x86dd => parse_ipv6(bytes, offset)?,
             _ => return None,
@@ -482,14 +685,19 @@ mod linux {
             return None;
         }
         let flags = *tcp.get(13)?;
-        let (options, maximum_segment_size, window_scale) = parse_tcp_options(&tcp[20..header_len]);
+        let syn = flags & 0x02 != 0;
+        let (options, maximum_segment_size, window_scale) = if syn {
+            parse_tcp_options(&tcp[20..header_len])
+        } else {
+            (String::new(), None, None)
+        };
         Some(TcpPacket {
             source: SocketAddr::new(source_ip, source_port),
             destination: SocketAddr::new(destination_ip, destination_port),
             ttl,
-            syn: flags & 0x02 != 0,
+            syn,
             ack: flags & 0x10 != 0,
-            payload_len: tcp.len() - header_len,
+            payload_len: tcp_segment_len.checked_sub(header_len)?,
             window_size: u16::from_be_bytes([*tcp.get(14)?, *tcp.get(15)?]),
             options,
             maximum_segment_size,
@@ -507,11 +715,15 @@ mod linux {
         Some((ether_type, offset))
     }
 
-    fn parse_ipv4(bytes: &[u8], offset: usize) -> Option<(IpAddr, IpAddr, u8, usize)> {
+    fn parse_ipv4(bytes: &[u8], offset: usize) -> Option<(IpAddr, IpAddr, u8, usize, usize)> {
         let header = bytes.get(offset..)?;
         let header_len = usize::from(*header.first()? & 0x0f) * 4;
+        let total_len = usize::from(u16::from_be_bytes([*header.get(2)?, *header.get(3)?]));
+        let fragment = u16::from_be_bytes([*header.get(6)?, *header.get(7)?]);
         if header_len < 20
             || header.len() < header_len
+            || total_len < header_len
+            || fragment & 0x3fff != 0
             || *header.get(9)? != libc::IPPROTO_TCP as u8
         {
             return None;
@@ -528,21 +740,34 @@ mod linux {
             *header.get(18)?,
             *header.get(19)?,
         ));
-        Some((source, destination, *header.get(8)?, offset + header_len))
+        Some((
+            source,
+            destination,
+            *header.get(8)?,
+            offset + header_len,
+            total_len - header_len,
+        ))
     }
 
-    fn parse_ipv6(bytes: &[u8], offset: usize) -> Option<(IpAddr, IpAddr, u8, usize)> {
+    fn parse_ipv6(bytes: &[u8], offset: usize) -> Option<(IpAddr, IpAddr, u8, usize, usize)> {
         let header = bytes.get(offset..offset + 40)?;
         if *header.get(6)? != libc::IPPROTO_TCP as u8 {
             return None;
         }
+        let payload_len = usize::from(u16::from_be_bytes([*header.get(4)?, *header.get(5)?]));
         let source = IpAddr::V6(Ipv6Addr::from(
             <[u8; 16]>::try_from(header.get(8..24)?).ok()?,
         ));
         let destination = IpAddr::V6(Ipv6Addr::from(
             <[u8; 16]>::try_from(header.get(24..40)?).ok()?,
         ));
-        Some((source, destination, *header.get(7)?, offset + 40))
+        Some((
+            source,
+            destination,
+            *header.get(7)?,
+            offset + 40,
+            payload_len,
+        ))
     }
 
     fn parse_tcp_options(options: &[u8]) -> (String, Option<u16>, Option<u8>) {
@@ -578,7 +803,10 @@ mod linux {
         (kinds.join("-"), maximum_segment_size, window_scale)
     }
 
-    fn update_flows(flows: &Mutex<HashMap<FlowKey, SynMetadata>>, packet: TcpPacket, now: Instant) {
+    fn update_flows(flows: &FlowCache, packet: TcpPacket, now: Instant) -> bool {
+        if !packet.syn && packet.payload_len == 0 {
+            return false;
+        }
         let key = FlowKey {
             source: packet.source,
             destination: packet.destination,
@@ -587,47 +815,128 @@ mod linux {
             source: packet.destination,
             destination: packet.source,
         };
-        let mut flows = flows.lock();
         if packet.syn && !packet.ack {
-            if flows.len() >= FLOW_CACHE_CAPACITY {
-                flows.retain(|_, metadata| {
-                    now.duration_since(metadata.observed_at) <= FLOW_CACHE_TTL
-                });
-                if flows.len() >= FLOW_CACHE_CAPACITY
-                    && let Some(key) = flows.keys().next().copied()
-                {
-                    flows.remove(&key);
-                }
-            }
-            flows.insert(
-                key,
-                SynMetadata {
-                    observed_at: now,
-                    syn_ack_at: None,
-                    first_application_data_at: None,
-                    observed_ttl: packet.ttl,
-                    window_size: packet.window_size,
-                    options: packet.options,
-                    maximum_segment_size: packet.maximum_segment_size,
-                    window_scale: packet.window_scale,
-                },
-            );
+            flows.entry_sync(key).put_entry(SynMetadata {
+                observed_at: now,
+                syn_ack_at: None,
+                first_application_data_at: None,
+                observed_ttl: packet.ttl,
+                window_size: packet.window_size,
+                options: packet.options,
+                maximum_segment_size: packet.maximum_segment_size,
+                window_scale: packet.window_scale,
+            });
+            true
         } else if packet.syn && packet.ack {
-            if let Some(metadata) = flows.get_mut(&reverse) {
-                metadata.syn_ack_at = Some(now);
+            let Some(mut entry) = flows.get_sync(&reverse) else {
+                return false;
+            };
+            if now.duration_since(entry.get().observed_at) > FLOW_CACHE_TTL {
+                let _ = entry.remove();
+                return false;
             }
+            let metadata = entry.get_mut();
+            if metadata.syn_ack_at.is_some() {
+                return false;
+            }
+            metadata.syn_ack_at = Some(now);
+            true
         } else if packet.payload_len > 0 {
-            if let Some(metadata) = flows.get_mut(&key)
-                && metadata.first_application_data_at.is_none()
-            {
-                metadata.first_application_data_at = Some(now);
+            let Some(mut entry) = flows.get_sync(&key) else {
+                return false;
+            };
+            if now.duration_since(entry.get().observed_at) > FLOW_CACHE_TTL {
+                let _ = entry.remove();
+                return false;
             }
+            let metadata = entry.get_mut();
+            if metadata.first_application_data_at.is_some() {
+                return false;
+            }
+            metadata.first_application_data_at = Some(now);
+            true
+        } else {
+            false
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn ipv4_tcp_packet(source_port: u16, destination_port: u16, payload_len: usize) -> Vec<u8> {
+            let captured_payload_len = payload_len.min(CAPTURE_SNAPSHOT_LEN - 54);
+            let mut packet = vec![0; 14 + 20 + 20 + captured_payload_len];
+            packet[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            packet[14] = 0x45;
+            packet[16..18].copy_from_slice(&u16::try_from(40 + payload_len).unwrap().to_be_bytes());
+            packet[22] = 57;
+            packet[23] = libc::IPPROTO_TCP as u8;
+            packet[26..30].copy_from_slice(&[192, 0, 2, 1]);
+            packet[30..34].copy_from_slice(&[198, 51, 100, 2]);
+            packet[34..36].copy_from_slice(&source_port.to_be_bytes());
+            packet[36..38].copy_from_slice(&destination_port.to_be_bytes());
+            packet[46] = 5 << 4;
+            packet
+        }
+
+        fn vlan_packet(packet: &[u8], ether_type: u16) -> Vec<u8> {
+            let mut tagged = vec![0; packet.len() + 4];
+            tagged[..12].copy_from_slice(&packet[..12]);
+            tagged[12..14].copy_from_slice(&ether_type.to_be_bytes());
+            tagged[16..].copy_from_slice(&packet[12..]);
+            tagged
+        }
+
+        fn ipv6_tcp_packet(source_port: u16, destination_port: u16) -> Vec<u8> {
+            let mut packet = vec![0; 14 + 40 + 20];
+            packet[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+            packet[14] = 0x60;
+            packet[18..20].copy_from_slice(&20u16.to_be_bytes());
+            packet[20] = libc::IPPROTO_TCP as u8;
+            packet[21] = 57;
+            packet[22..38].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+            packet[38..54].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+            packet[54..56].copy_from_slice(&source_port.to_be_bytes());
+            packet[56..58].copy_from_slice(&destination_port.to_be_bytes());
+            packet[66] = 5 << 4;
+            packet
+        }
+
+        fn run_socket_filter(instructions: &[BpfInsn], packet: &[u8]) -> u32 {
+            let mut accumulator = 0i32;
+            let mut instruction = 0usize;
+            loop {
+                let current = &instructions[instruction];
+                match current.code {
+                    BPF_ALU64_MOV_X => {}
+                    BPF_ALU64_MOV_K => accumulator = current.imm,
+                    BPF_LD_ABS_B => {
+                        let Some(value) = packet.get(current.imm as usize) else {
+                            return 0;
+                        };
+                        accumulator = i32::from(*value);
+                    }
+                    BPF_LD_ABS_H => {
+                        let offset = current.imm as usize;
+                        let Some(bytes) = packet.get(offset..offset + 2) else {
+                            return 0;
+                        };
+                        accumulator = i32::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+                    }
+                    BPF_JMP_JEQ_K => {
+                        if accumulator == current.imm {
+                            instruction =
+                                (instruction as isize + isize::from(current.off) + 1) as usize;
+                            continue;
+                        }
+                    }
+                    BPF_JMP_EXIT => return accumulator as u32,
+                    code => panic!("unsupported test eBPF instruction {code:#x}"),
+                }
+                instruction += 1;
+            }
+        }
 
         #[test]
         fn socket_filter_initializes_r6_with_the_socket_buffer_context() {
@@ -640,10 +949,75 @@ mod linux {
         }
 
         #[test]
+        fn socket_filter_limits_capture_to_listener_ports() {
+            let instructions = build_socket_filter(&[443, 64738]).expect("build filter");
+
+            assert_eq!(
+                run_socket_filter(&instructions, &ipv4_tcp_packet(50000, 443, 0)),
+                CAPTURE_SNAPSHOT_LEN as u32
+            );
+            assert_eq!(
+                run_socket_filter(&instructions, &ipv4_tcp_packet(64738, 50000, 0)),
+                CAPTURE_SNAPSHOT_LEN as u32
+            );
+            assert_eq!(
+                run_socket_filter(&instructions, &ipv4_tcp_packet(50000, 8443, 0)),
+                0
+            );
+            assert_eq!(
+                run_socket_filter(&instructions, &ipv6_tcp_packet(50000, 443)),
+                CAPTURE_SNAPSHOT_LEN as u32
+            );
+            assert_eq!(
+                run_socket_filter(&instructions, &ipv6_tcp_packet(50000, 8443)),
+                0
+            );
+
+            let mut udp = ipv4_tcp_packet(50000, 443, 0);
+            udp[23] = libc::IPPROTO_UDP as u8;
+            assert_eq!(run_socket_filter(&instructions, &udp), 0);
+        }
+
+        #[test]
+        fn socket_filter_handles_common_vlan_depths() {
+            let instructions = build_socket_filter(&[443]).expect("build filter");
+            let untagged = ipv4_tcp_packet(50000, 443, 0);
+            let single = vlan_packet(&untagged, 0x8100);
+            let double = vlan_packet(&single, 0x88a8);
+
+            assert_eq!(
+                run_socket_filter(&instructions, &single),
+                CAPTURE_SNAPSHOT_LEN as u32
+            );
+            assert_eq!(
+                run_socket_filter(&instructions, &double),
+                CAPTURE_SNAPSHOT_LEN as u32
+            );
+
+            let unrelated = vlan_packet(&ipv4_tcp_packet(50000, 8443, 0), 0x8100);
+            assert_eq!(run_socket_filter(&instructions, &unrelated), 0);
+        }
+
+        #[test]
+        fn broad_socket_filter_keeps_tcp_and_rejects_udp() {
+            let instructions = build_socket_filter(&[]).expect("build filter");
+            let tcp = ipv4_tcp_packet(50000, 8443, 0);
+            assert_eq!(
+                run_socket_filter(&instructions, &tcp),
+                CAPTURE_SNAPSHOT_LEN as u32
+            );
+
+            let mut udp = tcp;
+            udp[23] = libc::IPPROTO_UDP as u8;
+            assert_eq!(run_socket_filter(&instructions, &udp), 0);
+        }
+
+        #[test]
         fn parses_syn_options_and_produces_tcp_fingerprints() {
             let mut packet = vec![0; 14 + 20 + 32];
             packet[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
             packet[14] = 0x45;
+            packet[16..18].copy_from_slice(&52u16.to_be_bytes());
             packet[22] = 57;
             packet[23] = libc::IPPROTO_TCP as u8;
             packet[26..30].copy_from_slice(&[192, 0, 2, 1]);
@@ -668,7 +1042,7 @@ mod linux {
             assert_eq!(syn.maximum_segment_size, Some(1460));
             assert_eq!(syn.window_scale, Some(8));
 
-            let flows = Mutex::new(HashMap::new());
+            let flows = new_flow_cache();
             let now = Instant::now();
             let source = syn.source;
             let destination = syn.destination;
@@ -710,6 +1084,7 @@ mod linux {
                 flows: Arc::new(flows),
                 flow_updates: Arc::new(Notify::new()),
                 active_backend: Some("af_packet".to_owned()),
+                packet_filter_controller: None,
             };
             let mapped_source = SocketAddr::new(
                 IpAddr::V6(match source.ip() {
@@ -732,14 +1107,139 @@ mod linux {
             assert_eq!(metadata.ja4l(), Some("125_57_150"));
         }
 
+        #[test]
+        fn ethernet_padding_does_not_count_as_tcp_payload() {
+            let mut packet = vec![0; 60];
+            packet[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            packet[14] = 0x45;
+            packet[16..18].copy_from_slice(&40u16.to_be_bytes());
+            packet[22] = 57;
+            packet[23] = libc::IPPROTO_TCP as u8;
+            packet[26..30].copy_from_slice(&[192, 0, 2, 1]);
+            packet[30..34].copy_from_slice(&[198, 51, 100, 2]);
+            let tcp = 34;
+            packet[tcp..tcp + 2].copy_from_slice(&50000u16.to_be_bytes());
+            packet[tcp + 2..tcp + 4].copy_from_slice(&443u16.to_be_bytes());
+            packet[tcp + 12] = 5 << 4;
+            packet[tcp + 13] = 0x10;
+
+            let ack = parse_packet(&packet).expect("ACK must parse");
+            assert_eq!(ack.payload_len, 0);
+            assert!(!update_flows(&new_flow_cache(), ack, Instant::now()));
+        }
+
+        #[test]
+        fn truncated_capture_uses_declared_tcp_payload_length() {
+            let packet = ipv4_tcp_packet(50000, 443, 1_000);
+            let parsed = parse_packet(&packet).expect("truncated packet must parse");
+            assert_eq!(parsed.payload_len, 1_000);
+            assert!(parsed.options.is_empty());
+        }
+
+        #[test]
+        fn fragmented_ipv4_packet_is_rejected() {
+            let mut packet = ipv4_tcp_packet(50000, 443, 0);
+            packet[20..22].copy_from_slice(&0x2000u16.to_be_bytes());
+            assert!(parse_packet(&packet).is_none());
+        }
+
+        #[test]
+        fn retransmitted_syn_ack_keeps_the_first_observation() {
+            let flows = new_flow_cache();
+            let source: SocketAddr = "192.0.2.1:50000".parse().expect("source address");
+            let destination: SocketAddr = "198.51.100.2:443".parse().expect("destination address");
+            let now = Instant::now();
+            assert!(update_flows(
+                &flows,
+                TcpPacket {
+                    source,
+                    destination,
+                    ttl: 57,
+                    syn: true,
+                    ack: false,
+                    payload_len: 0,
+                    window_size: 64240,
+                    options: "2-1-3-4".to_owned(),
+                    maximum_segment_size: Some(1460),
+                    window_scale: Some(8),
+                },
+                now,
+            ));
+            let first_syn_ack = now + Duration::from_micros(125);
+            for (index, observed_at) in [first_syn_ack, now + Duration::from_micros(250)]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    update_flows(
+                        &flows,
+                        TcpPacket {
+                            source: destination,
+                            destination: source,
+                            ttl: 64,
+                            syn: true,
+                            ack: true,
+                            payload_len: 0,
+                            window_size: 0,
+                            options: String::new(),
+                            maximum_segment_size: None,
+                            window_scale: None,
+                        },
+                        observed_at,
+                    ),
+                    index == 0
+                );
+            }
+
+            assert_eq!(
+                flows
+                    .read_sync(
+                        &FlowKey {
+                            source,
+                            destination,
+                        },
+                        |_, metadata| metadata.syn_ack_at,
+                    )
+                    .flatten(),
+                Some(first_syn_ack)
+            );
+
+            let first_data = now + Duration::from_micros(375);
+            for (index, observed_at) in [first_data, now + Duration::from_micros(500)]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    update_flows(
+                        &flows,
+                        TcpPacket {
+                            source,
+                            destination,
+                            ttl: 57,
+                            syn: false,
+                            ack: true,
+                            payload_len: 1,
+                            window_size: 0,
+                            options: String::new(),
+                            maximum_segment_size: None,
+                            window_scale: None,
+                        },
+                        observed_at,
+                    ),
+                    index == 0
+                );
+            }
+        }
+
         #[tokio::test]
         async fn waits_for_flow_publication_before_snapshotting_metadata() {
-            let flows = Arc::new(Mutex::new(HashMap::new()));
+            let flows = Arc::new(new_flow_cache());
             let flow_updates = Arc::new(Notify::new());
             let collector = Arc::new(TcpPacketCollector {
                 flows: Arc::clone(&flows),
                 flow_updates: Arc::clone(&flow_updates),
                 active_backend: Some("ebpf".to_owned()),
+                packet_filter_controller: None,
             });
             let source: SocketAddr = "192.0.2.1:50000".parse().expect("source address");
             let destination: SocketAddr = "198.51.100.2:443".parse().expect("destination address");

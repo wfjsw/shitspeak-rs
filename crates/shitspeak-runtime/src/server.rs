@@ -388,8 +388,15 @@ impl Server {
 
         let tls_acceptor = load_c2s_tls_acceptor(&config, &extensions, Arc::clone(&bans))?;
         let packet_capture_backends = crate::tls_fingerprint::available_packet_capture_backends();
-        let tcp_packet_collector =
-            crate::tcp_packet_collector::TcpPacketCollector::start(&packet_capture_backends);
+        let packet_capture_listener_ports = entrypoints
+            .tcp_listeners
+            .iter()
+            .filter_map(|entrypoint| entrypoint.listener.local_addr().ok())
+            .map(|address| address.port());
+        let tcp_packet_collector = crate::tcp_packet_collector::TcpPacketCollector::start(
+            &packet_capture_backends,
+            packet_capture_listener_ports,
+        );
         let packet_capture_backend = tcp_packet_collector.active_backend().map(ToOwned::to_owned);
         tracing::info!(
             packet_capture_backends = ?packet_capture_backends,
@@ -1579,6 +1586,9 @@ impl Server {
                 });
             }
         }
+
+        self.tcp_packet_collector
+            .register_listener_ports(new_bindings.iter().map(|binding| binding.5));
 
         for (server_id, _udp_ping_status_server_id, listener, udp_socket, _local_addr, port) in
             new_bindings
