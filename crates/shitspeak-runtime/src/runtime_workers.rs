@@ -38,10 +38,18 @@ pub fn allocation_for_cpu_count(cpu_count: usize) -> RuntimeWorkerAllocation {
 }
 
 pub fn runtime_worker_allocation() -> RuntimeWorkerAllocation {
-    let cpu_count = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
+    let cpu_count = available_cpu_count();
     allocation_for_cpu_count(cpu_count)
+}
+
+pub fn all_cpu_workers() -> usize {
+    available_cpu_count()
+}
+
+fn available_cpu_count() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
 }
 
 #[cfg(test)]
@@ -92,5 +100,10 @@ mod tests {
             assert!(current.acl_bulk() >= previous.acl_bulk());
             previous = current;
         }
+    }
+
+    #[test]
+    fn all_cpu_workers_is_nonzero() {
+        assert!(super::all_cpu_workers() >= 1);
     }
 }

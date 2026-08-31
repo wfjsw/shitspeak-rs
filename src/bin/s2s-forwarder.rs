@@ -1,7 +1,7 @@
 use clap::Parser;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let worker_threads = shitspeak_runtime::runtime_workers::runtime_worker_allocation().main();
+    let worker_threads = shitspeak_runtime::runtime_workers::all_cpu_workers();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .thread_name("main-runtime-worker")
