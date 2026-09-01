@@ -78,6 +78,7 @@ impl ServerBuilder {
         let runtime_workers = runtime_workers::runtime_worker_allocation();
         tracing::info!(
             main_workers = runtime_workers.main(),
+            voice_workers = runtime_workers.voice(),
             s2s_workers = runtime_workers.s2s(),
             acl_bulk_workers = runtime_workers.acl_bulk(),
             "runtime worker allocation resolved"

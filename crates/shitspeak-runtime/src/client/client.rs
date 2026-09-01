@@ -2293,6 +2293,14 @@ impl Client {
             .is_some_and(ClientLocalState::is_reauthentication_in_progress)
     }
 
+    pub(crate) fn defer_reauthentication(&self) {
+        let mut local_state = self.local_state.write();
+        let state = local_state
+            .as_mut()
+            .expect("Deferring authentication expiry on remote user");
+        state.defer_reauthentication();
+    }
+
     pub fn set_authentication_expiry(
         &self,
         auth_session_id: Option<String>,

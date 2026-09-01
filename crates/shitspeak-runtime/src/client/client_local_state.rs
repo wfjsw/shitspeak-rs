@@ -93,6 +93,12 @@ impl ClientLocalState {
         self.reauthentication_in_progress
     }
 
+    /// Allow an expiry-triggered reauthentication to be attempted again on a
+    /// later reaper pass while preserving the current authentication state.
+    pub(crate) fn defer_reauthentication(&mut self) {
+        self.reauthentication_in_progress = false;
+    }
+
     pub fn set_authentication_expiry(
         &mut self,
         auth_session_id: Option<String>,
@@ -355,6 +361,28 @@ mod tests {
             state.authentication_expiry_action(),
             AuthenticationExpiryAction::Deregister
         );
+    }
+
+    #[test]
+    fn deferred_reauthentication_clears_pending_claim_without_expiring_state() {
+        let mut state = ClientLocalState::new();
+        state.complete_authentication(
+            Some("auth-session".to_owned()),
+            Some(deadline()),
+            AuthenticationExpiryAction::Reauth,
+        );
+        assert!(
+            state
+                .take_expired_authentication(deadline(), true)
+                .is_some()
+        );
+
+        state.defer_reauthentication();
+
+        assert!(state.is_authenticated());
+        assert!(!state.is_reauthentication_in_progress());
+        assert_eq!(state.authenticated_until(), Some(deadline()));
+        assert_eq!(state.auth_session_id(), Some("auth-session"));
     }
 
     #[test]

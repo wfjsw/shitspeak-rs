@@ -29,7 +29,8 @@ use crate::{
     types::{NodeIdentifier, default_server_id},
 };
 use shitspeak_auth::{
-    AuthenticateAuxiliaryData, AuthenticateResult, Authenticator, ReloadableAuthenticator,
+    AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
+    ReloadableAuthenticator,
 };
 use shitspeak_messages::messages::encoder::Version;
 use shitspeak_runtime_config::{CertificateHashProtection, Config, UdpPingUserCountScope};
@@ -245,6 +246,7 @@ pub struct Server {
     visibility_fanout_index: Arc<crate::client::visibility::VisibilityFanoutIndex>,
     auth_finalization_queue: Arc<AuthFinalizationQueue>,
     acl_bulk_task_executor: BackgroundTaskExecutor,
+    voice_task_executor: crate::voice::VoiceTaskExecutor,
     crypt_setup_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     channel_blobs: Arc<ChannelBlobStore>,
     session_blobs: Arc<SessionBlobStore>,
@@ -337,7 +339,9 @@ impl Server {
         validate_visibility_config(&config)?;
         validate_privacy_config(&config)?;
 
-        let entrypoints = bind_entrypoints(&config).await?;
+        let runtime_workers = crate::runtime_workers::runtime_worker_allocation();
+        let voice_task_executor = crate::voice::VoiceTaskExecutor::shared(runtime_workers.voice())?;
+        let entrypoints = bind_entrypoints(&config, voice_task_executor.handle()).await?;
 
         // ── Channel repository & blob stores ─────────────────────────────
         let node_id = config.local_node_id().map_err(std::io::Error::other)?;
@@ -346,7 +350,7 @@ impl Server {
         let session_blob_cache_budget_bytes = config.session_blob_cache_budget_bytes;
         let auth_task_executor =
             BackgroundTaskExecutor::new("auth", auth_finalization_concurrency)?;
-        let acl_bulk_workers = crate::runtime_workers::runtime_worker_allocation().acl_bulk();
+        let acl_bulk_workers = runtime_workers.acl_bulk();
         let acl_bulk_task_executor = BackgroundTaskExecutor::new_with_worker_threads(
             "acl-bulk",
             acl_bulk_workers,
@@ -440,6 +444,7 @@ impl Server {
                 auth_task_executor,
             )),
             acl_bulk_task_executor,
+            voice_task_executor,
             crypt_setup_semaphore: (auth_finalization_concurrency != 0)
                 .then(|| Arc::new(tokio::sync::Semaphore::new(auth_finalization_concurrency))),
             channel_blobs,
@@ -527,6 +532,10 @@ impl Server {
 
     pub(crate) fn voice_dispatch_plan(&self) -> VoiceDispatchPlan {
         self.voice_dispatch_plan
+    }
+
+    pub(crate) fn voice_task_executor(&self) -> crate::voice::VoiceTaskExecutor {
+        self.voice_task_executor.clone()
     }
 
     /// Local TCP listen address. Useful for tests that bind to `127.0.0.1:0`.
@@ -808,7 +817,8 @@ impl Server {
         ping_enabled: bool,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+        let voice_task_executor = server.voice_task_executor();
+        voice_task_executor.spawn(async move {
             let mut batch = VoiceUdpRecvBatch::new(VOICE_UDP_RECV_BATCH_MAX_DATAGRAMS, MTU);
             let local_addr = socket
                 .local_addr()
@@ -988,7 +998,8 @@ impl Server {
         _ping_enabled: bool,
         mut shutdown: tokio::sync::watch::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+        let voice_task_executor = server.voice_task_executor();
+        voice_task_executor.spawn(async move {
             loop {
                 let udp_packet = tokio::select! {
                     msg = rx.recv() => match msg {
@@ -1523,7 +1534,8 @@ impl Server {
                 }
             }
 
-            let (listener, udp_socket) = bind_entrypoint_socket_pair(address).await?;
+            let (listener, udp_socket) =
+                bind_entrypoint_socket_pair(address, self.voice_task_executor.handle()).await?;
             let local_addr = listener.local_addr()?;
             let port = local_addr.port();
             if port == default_port {
@@ -1717,11 +1729,23 @@ impl Server {
         .await;
         drop(permit);
 
-        let Ok(Ok(mut result)) = result else {
-            self.disconnect_local_client(&client, "reauthentication rejected")
-                .await;
-            return;
+        let result = match result {
+            Ok(Ok(result)) => result,
+            Ok(Err(AuthenticationRejection::RetryLater)) | Err(_) => {
+                tracing::info!(
+                    session = ?client.get_session_id(),
+                    "deferring expired-client reauthentication after transient authentication failure"
+                );
+                client.defer_reauthentication();
+                return;
+            }
+            Ok(Err(_)) => {
+                self.disconnect_local_client(&client, "reauthentication rejected")
+                    .await;
+                return;
+            }
         };
+        let mut result = result;
 
         let previous_max_bandwidth = client.max_bandwidth(self.get_max_bandwidth());
 

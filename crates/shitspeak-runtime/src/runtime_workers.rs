@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeWorkerAllocation {
     main: usize,
+    voice: usize,
     s2s: usize,
     acl_bulk: usize,
 }
@@ -8,6 +9,10 @@ pub struct RuntimeWorkerAllocation {
 impl RuntimeWorkerAllocation {
     pub fn main(self) -> usize {
         self.main
+    }
+
+    pub fn voice(self) -> usize {
+        self.voice
     }
 
     pub fn s2s(self) -> usize {
@@ -24,14 +29,17 @@ pub fn allocation_for_cpu_count(cpu_count: usize) -> RuntimeWorkerAllocation {
     if cpu_count <= 4 {
         return RuntimeWorkerAllocation {
             main: cpu_count,
+            voice: cpu_count - cpu_count / 3,
             s2s: cpu_count,
             acl_bulk: cpu_count,
         };
     }
 
     let s2s = (cpu_count / 3).max(4);
+    let main = (cpu_count - cpu_count / 3).max(4);
     RuntimeWorkerAllocation {
-        main: (cpu_count - cpu_count / 3).max(4),
+        main,
+        voice: main - main / 3,
         s2s,
         acl_bulk: cpu_count.min(4),
     }
@@ -63,6 +71,7 @@ mod tests {
                 allocation_for_cpu_count(cpu_count),
                 RuntimeWorkerAllocation {
                     main: cpu_count,
+                    voice: cpu_count - cpu_count / 3,
                     s2s: cpu_count,
                     acl_bulk: cpu_count,
                 }
@@ -83,10 +92,23 @@ mod tests {
         ] {
             let allocation = allocation_for_cpu_count(cpu_count);
             assert_eq!(allocation.main(), main);
+            assert_eq!(allocation.voice(), main - main / 3);
             assert_eq!(allocation.s2s(), s2s);
             assert_eq!(allocation.acl_bulk(), 4);
             assert!(allocation.main() >= 4);
             assert!(allocation.s2s() >= 4);
+        }
+    }
+
+    #[test]
+    fn voice_workers_receive_a_bounded_share_of_main_workers() {
+        for cpu_count in 1..=128 {
+            let allocation = allocation_for_cpu_count(cpu_count);
+            let voice = allocation.voice();
+            let main = allocation.main();
+
+            assert!(voice >= main.div_ceil(2));
+            assert!(voice <= main - main / 3);
         }
     }
 
@@ -96,6 +118,7 @@ mod tests {
         for cpu_count in 2..=128 {
             let current = allocation_for_cpu_count(cpu_count);
             assert!(current.main() >= previous.main());
+            assert!(current.voice() >= previous.voice());
             assert!(current.s2s() >= previous.s2s());
             assert!(current.acl_bulk() >= previous.acl_bulk());
             previous = current;

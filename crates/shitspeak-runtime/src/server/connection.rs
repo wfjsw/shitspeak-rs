@@ -56,7 +56,10 @@ fn is_pre_auth_dropped_message(message: &Message) -> bool {
 }
 
 fn is_realtime_client_message(message: &Message) -> bool {
-    matches!(message, Message::Ping(_) | Message::UDPTunnel(_))
+    matches!(
+        message,
+        Message::Ping(_) | Message::VoiceTarget(_) | Message::UDPTunnel(_)
+    )
 }
 
 /// Classify a message into an optional rate-limit tier (see
@@ -1566,5 +1569,15 @@ mod rate_tier_tests {
             message_rate_tier(&Message::Ping(Ping::default())),
             Some(crate::rate_limits::MESSAGE_TIER_STATE)
         );
+    }
+
+    #[test]
+    fn voice_target_and_following_tunnel_share_the_ordered_realtime_path() {
+        assert!(is_realtime_client_message(&Message::VoiceTarget(
+            VoiceTarget::default()
+        )));
+        assert!(is_realtime_client_message(&Message::UDPTunnel(
+            bytes::Bytes::new()
+        )));
     }
 }

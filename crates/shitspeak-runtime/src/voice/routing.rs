@@ -2650,7 +2650,8 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
     let local_fanout_queue = Arc::new(LocalFanoutQueue::new());
     let fanout_server = server.clone();
     let fanout_queue = local_fanout_queue.clone();
-    tokio::spawn(
+    let voice_task_executor = server.voice_task_executor();
+    voice_task_executor.spawn(
         async move {
             while let Some(work) = fanout_queue.pop().await {
                 let local_queue_age = work.enqueued_at.elapsed();
@@ -2729,7 +2730,7 @@ pub fn spawn_voice_routing_task(server: Arc<Box<Server>>, sender: Arc<Box<Client
         }
         .instrument(span.clone()),
     );
-    tokio::spawn(
+    voice_task_executor.spawn(
         async move {
             while let Some(payload) = rx.recv().await {
                 let Some(sender) = weak_sender.upgrade() else {
@@ -2785,7 +2786,10 @@ pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
         }
     };
     let weak_client = Arc::downgrade(&client);
-    tokio::spawn(
+    let worker_threads = crate::runtime_workers::runtime_worker_allocation().voice();
+    let voice_task_executor = super::VoiceTaskExecutor::shared(worker_threads)
+        .expect("voice runtime should already be initialized");
+    voice_task_executor.spawn(
         async move {
             while let Some(raw) = rx.recv().await {
                 let Some(client) = weak_client.upgrade() else {

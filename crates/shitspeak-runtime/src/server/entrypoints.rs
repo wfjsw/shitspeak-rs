@@ -172,15 +172,16 @@ fn first_socket_addr(address: &str) -> Result<SocketAddr, Box<dyn std::error::Er
 
 pub(super) async fn bind_entrypoint_socket_pair(
     address: SocketAddr,
+    udp_runtime: &tokio::runtime::Handle,
 ) -> Result<(tokio::net::TcpListener, Arc<tokio::net::UdpSocket>), Box<dyn std::error::Error>> {
     if address.port() != 0 {
-        return bind_entrypoint_socket_pair_once(address).await;
+        return bind_entrypoint_socket_pair_once(address, udp_runtime).await;
     }
 
     let mut last_bind_error = None;
     for attempt in 1..=DYNAMIC_ENTRYPOINT_BIND_ATTEMPTS {
         let candidate = dynamic_entrypoint_bind_candidate(address, attempt);
-        let udp_socket = match tokio::net::UdpSocket::bind(candidate).await {
+        let udp_socket = match bind_udp_socket(candidate, udp_runtime) {
             Ok(socket) => socket,
             Err(err) if dynamic_bind_error_is_retryable(&err) => {
                 tracing::debug!(
@@ -197,7 +198,7 @@ pub(super) async fn bind_entrypoint_socket_pair(
         };
         let bound_address = udp_socket.local_addr()?;
         match tokio::net::TcpListener::bind(bound_address).await {
-            Ok(tcp_listener) => return Ok((tcp_listener, Arc::new(udp_socket))),
+            Ok(tcp_listener) => return Ok((tcp_listener, udp_socket)),
             Err(err) if dynamic_bind_error_is_retryable(&err) => {
                 tracing::debug!(
                     attempt,
@@ -243,11 +244,22 @@ pub(super) fn dynamic_bind_error_is_retryable(err: &std::io::Error) -> bool {
 
 async fn bind_entrypoint_socket_pair_once(
     address: SocketAddr,
+    udp_runtime: &tokio::runtime::Handle,
 ) -> Result<(tokio::net::TcpListener, Arc<tokio::net::UdpSocket>), Box<dyn std::error::Error>> {
     let tcp_listener = tokio::net::TcpListener::bind(address).await?;
     let bound_address = tcp_listener.local_addr()?;
-    let udp_socket = Arc::new(tokio::net::UdpSocket::bind(bound_address).await?);
+    let udp_socket = bind_udp_socket(bound_address, udp_runtime)?;
     Ok((tcp_listener, udp_socket))
+}
+
+fn bind_udp_socket(
+    address: SocketAddr,
+    udp_runtime: &tokio::runtime::Handle,
+) -> std::io::Result<Arc<tokio::net::UdpSocket>> {
+    let socket = std::net::UdpSocket::bind(address)?;
+    socket.set_nonblocking(true)?;
+    let _runtime_guard = udp_runtime.enter();
+    tokio::net::UdpSocket::from_std(socket).map(Arc::new)
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +275,7 @@ pub(super) fn normalize_sni_name(name: &str) -> String {
 
 pub(super) async fn bind_entrypoints(
     config: &Config,
+    udp_runtime: &tokio::runtime::Handle,
 ) -> Result<EntrypointBindings, Box<dyn std::error::Error>> {
     let mut tcp_listeners = Vec::new();
     let mut udp_sockets = Vec::new();
@@ -274,7 +287,7 @@ pub(super) async fn bind_entrypoints(
     let (server_id_by_sni, listen_specs) = entrypoint_config_routes(config)?;
 
     let listen_address = first_socket_addr(&config.listen)?;
-    let (listener, udp_socket) = bind_entrypoint_socket_pair(listen_address).await?;
+    let (listener, udp_socket) = bind_entrypoint_socket_pair(listen_address, udp_runtime).await?;
     let default_local_addr = listener.local_addr()?;
     let default_port = default_local_addr.port();
     udp_socket_by_port.insert(default_port, Arc::clone(&udp_socket));
@@ -290,7 +303,7 @@ pub(super) async fn bind_entrypoints(
             server_id,
             udp_ping_status_server_id,
         } = spec;
-        let (listener, udp_socket) = bind_entrypoint_socket_pair(address).await?;
+        let (listener, udp_socket) = bind_entrypoint_socket_pair(address, udp_runtime).await?;
         let local_addr = listener.local_addr()?;
         let port = local_addr.port();
         if port == default_port {

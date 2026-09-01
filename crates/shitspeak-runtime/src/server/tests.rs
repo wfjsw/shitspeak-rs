@@ -448,7 +448,9 @@ async fn bind_entrypoints_maps_default_and_extra_ports() {
         sni: Vec::new(),
     }]);
 
-    let bindings = bind_entrypoints(&config).await.expect("entrypoints bind");
+    let bindings = bind_entrypoints(&config, &tokio::runtime::Handle::current())
+        .await
+        .expect("entrypoints bind");
 
     assert_eq!(bindings.tcp_listeners.len(), 2);
     assert_eq!(bindings.udp_sockets.len(), 2);
@@ -505,7 +507,9 @@ async fn bind_entrypoints_maps_udp_ping_status_override() {
         sni: Vec::new(),
     }]);
 
-    let bindings = bind_entrypoints(&config).await.expect("entrypoints bind");
+    let bindings = bind_entrypoints(&config, &tokio::runtime::Handle::current())
+        .await
+        .expect("entrypoints bind");
     let port = bindings.tcp_listeners[1]
         .listener
         .local_addr()
@@ -1076,6 +1080,42 @@ async fn authentication_expiry_reauth_preserves_state_while_pending_and_applies_
         local.authentication_expiry_action(),
         AuthenticationExpiryAction::Kick
     );
+}
+
+#[tokio::test]
+async fn authentication_expiry_reauth_retries_after_transient_failure() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let server = Server::new(test_config(Vec::new()), authenticator)
+        .await
+        .expect("server");
+    let client = authentication_expiry_test_client(&server).await;
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    calls.recv().await.expect("first reauthentication call");
+    responses
+        .send(Err(AuthenticationRejection::RetryLater))
+        .expect("send transient failure");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.is_reauthentication_in_progress() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("transient reauthentication completed");
+    assert!(client.is_authenticated());
+    assert!(
+        server
+            .clients
+            .get_client_in_server(DEFAULT_SERVER_ID, client.get_session_id())
+            .await
+            .is_some()
+    );
+
+    authentication_expiry_reaper(&server, deadline + chrono::Duration::seconds(1)).await;
+    calls.recv().await.expect("retry reauthentication call");
 }
 
 fn write_max_bandwidth_reload_config(config: &Config, path: &std::path::Path, max_bandwidth: u32) {
