@@ -154,7 +154,7 @@ async fn superuser_can_unsuppress_other() {
     let live_bob = server
         .server
         .get_clients()
-        .get_client(bob.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session)
         .await
         .expect("live bob");
     {
@@ -241,7 +241,8 @@ async fn moderator_unsuppress_disables_hidden_superuser_mode() {
             matches!(message, Message::UserState(state)
                 if state.session == Some(alice.session_id)
                     && state.name.is_some()
-                    && state.channel_id.is_some())
+                    && state.channel_id.is_some()
+                    && state.actor.is_none())
         },
         Duration::from_secs(2),
     )
@@ -262,7 +263,7 @@ async fn moderator_unsuppress_disables_hidden_superuser_mode() {
     let live_alice = server
         .server
         .get_clients()
-        .get_client(alice.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
         .await
         .expect("live Alice");
     let state = live_alice.read_global_state();
@@ -287,9 +288,10 @@ async fn moderator_unsuppress_disables_hidden_superuser_mode() {
     bob.recv_until(
         |message| {
             matches!(message, Message::UserState(state)
-                if state.session == Some(alice.session_id)
-                    && state.name.is_some()
-                    && state.channel_id.is_some())
+                    if state.session == Some(alice.session_id)
+                        && state.name.is_some()
+                        && state.channel_id.is_some()
+                        && state.actor.is_none())
         },
         Duration::from_secs(2),
     )
@@ -379,6 +381,48 @@ async fn mod_kicks_other() {
     );
 }
 
+#[tokio::test]
+async fn invisible_moderator_action_is_delivered_as_server_action() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_invisible_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+
+    assert!(
+        bob.initial_user_states
+            .iter()
+            .all(|state| state.session != Some(alice.session_id))
+    );
+    let bob_session = bob.session_id;
+    alice.kick(bob_session, "invisible moderator kick").await;
+
+    let notice = bob
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserRemove(remove)
+                    if remove.session == bob_session
+                        && remove.actor.is_none()
+                        && remove.reason.as_deref() == Some("invisible moderator kick"))
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        notice.is_some(),
+        "an invisible moderator's action must be delivered without an actor"
+    );
+}
+
 /// An authenticated client can have received ServerSync while its connection
 /// task has not yet published AddClient. Kicking it in that window must still
 /// produce a UserRemove for existing peers.
@@ -397,7 +441,8 @@ async fn mod_kick_publishes_authenticated_target_before_removal() {
     let target = server
         .server
         .get_clients()
-        .allocate_web_client(
+        .allocate_web_client_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 30_101)),
             server.addr,

@@ -62,12 +62,12 @@ impl StrictReplicable for TestChannelReplicationAdapter {
     type Op = ChannelOperation;
 
     fn current_version(&self) -> u64 {
-        self.repo.current_version()
+        self.repo.current_version_in_server(DEFAULT_SERVER_ID)
     }
 
     fn history_metadata(&self) -> HistoryMetadata {
         HistoryMetadata {
-            version: self.repo.current_version(),
+            version: self.repo.current_version_in_server(DEFAULT_SERVER_ID),
             freshness: self.repo.latest_timestamp_in_server(DEFAULT_SERVER_ID),
         }
     }
@@ -225,10 +225,10 @@ async fn wait_for_converged_channel_history(
 
 async fn converged_channel_history_matches(repos: &[Arc<ChannelRepository>]) -> bool {
     for repo in repos {
-        if repo.current_version() != 6 {
+        if repo.current_version_in_server(DEFAULT_SERVER_ID) != 6 {
             return false;
         }
-        let channels = repo.get_all().await;
+        let channels = repo.get_all_in_server(DEFAULT_SERVER_ID).await;
         let has_channel = |id| channels.iter().any(|channel| channel.id == id);
         if !has_channel(20) || !has_channel(21) || !has_channel(22) || !has_channel(30) {
             return false;
@@ -241,7 +241,7 @@ async fn channel_history_status(repos: &[Arc<ChannelRepository>]) -> Vec<String>
     let mut out = Vec::with_capacity(repos.len());
     for (idx, repo) in repos.iter().enumerate() {
         let mut channels: Vec<_> = repo
-            .get_all()
+            .get_all_in_server(DEFAULT_SERVER_ID)
             .await
             .into_iter()
             .map(|channel| (channel.id, channel.name.clone()))
@@ -249,7 +249,7 @@ async fn channel_history_status(repos: &[Arc<ChannelRepository>]) -> Vec<String>
         channels.sort_by_key(|(id, _)| *id);
         out.push(format!(
             "repo{idx}: version={} channels={channels:?}",
-            repo.current_version()
+            repo.current_version_in_server(DEFAULT_SERVER_ID)
         ));
     }
     out
@@ -2207,7 +2207,9 @@ async fn strict_channel_repository_split_heal_preserves_all_terminal_commits() {
             .unwrap();
     }
     let converged = wait_until(Duration::from_secs(10), || {
-        repos.iter().all(|repo| repo.current_version() == 2)
+        repos
+            .iter()
+            .all(|repo| repo.current_version_in_server(DEFAULT_SERVER_ID) == 2)
     })
     .await;
     assert!(converged, "pre-split common history did not converge");
@@ -2260,10 +2262,10 @@ async fn strict_channel_repository_split_heal_preserves_all_terminal_commits() {
     }
 
     let divergent = wait_until(Duration::from_secs(10), || {
-        repos[0].current_version() == 5
-            && repos[1].current_version() == 5
-            && repos[2].current_version() == 3
-            && repos[3].current_version() == 3
+        repos[0].current_version_in_server(DEFAULT_SERVER_ID) == 5
+            && repos[1].current_version_in_server(DEFAULT_SERVER_ID) == 5
+            && repos[2].current_version_in_server(DEFAULT_SERVER_ID) == 3
+            && repos[3].current_version_in_server(DEFAULT_SERVER_ID) == 3
     })
     .await;
     assert!(
@@ -2294,7 +2296,7 @@ async fn strict_channel_repository_split_heal_preserves_all_terminal_commits() {
         .map(|repo| {
             let mut names = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
-                    .block_on(repo.get_all())
+                    .block_on(repo.get_all_in_server(DEFAULT_SERVER_ID))
                     .into_iter()
                     .map(|channel| channel.name.clone())
                     .collect::<Vec<_>>()
@@ -2320,7 +2322,7 @@ async fn strict_channel_repository_split_heal_preserves_all_terminal_commits() {
         "all replicas must expose the same deterministic union of terminal commits"
     );
 
-    let expected_operation_ids = repos[0].strict_operation_ids();
+    let expected_operation_ids = repos[0].strict_operation_ids_in_server(DEFAULT_SERVER_ID);
     assert_eq!(
         expected_operation_ids.len(),
         6,
@@ -2328,7 +2330,7 @@ async fn strict_channel_repository_split_heal_preserves_all_terminal_commits() {
     );
     for repo in &repos[1..] {
         assert_eq!(
-            repo.strict_operation_ids(),
+            repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID),
             expected_operation_ids,
             "all replicas must retain the same sorted operation-id ledger"
         );
@@ -2349,8 +2351,11 @@ async fn strict_channel_repository_split_heal_preserves_all_terminal_commits() {
         .await
         .expect("reopen durable strict channel repository");
         assert!(reopened.strict_operation_durability_enabled());
-        assert_eq!(reopened.current_version(), 6);
-        assert_eq!(reopened.strict_operation_ids(), expected_operation_ids);
+        assert_eq!(reopened.current_version_in_server(DEFAULT_SERVER_ID), 6);
+        assert_eq!(
+            reopened.strict_operation_ids_in_server(DEFAULT_SERVER_ID),
+            expected_operation_ids
+        );
     }
 }
 

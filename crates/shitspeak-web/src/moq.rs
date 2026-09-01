@@ -1479,9 +1479,10 @@ impl MoqSessionRuntime {
                     };
                     let slot = assignment.ssrc.saturating_sub(MOQ_FIRST_DOWN_SLOT_SSRC);
                     let context = outbound_context(&audio);
-                    let channel_id = outbound_speaker_channel(&server, sender_session_id)
-                        .await
-                        .unwrap_or_else(|| client.get_current_channel_id());
+                    let channel_id =
+                        outbound_speaker_channel(&server, &client.server_id(), sender_session_id)
+                            .await
+                            .unwrap_or_else(|| client.get_current_channel_id());
                     let events = vec![
                         ServerEvent::SpeakerAssigned(SpeakerAssigned {
                             ssrc: assignment.ssrc,
@@ -1893,10 +1894,14 @@ fn outbound_context(audio: &Audio) -> String {
 }
 
 #[cfg(feature = "moq")]
-async fn outbound_speaker_channel(server: &Arc<Box<Server>>, speaker_session: u32) -> Option<u32> {
+async fn outbound_speaker_channel(
+    server: &Arc<Box<Server>>,
+    server_id: &str,
+    speaker_session: u32,
+) -> Option<u32> {
     let client = server
         .get_clients()
-        .get_client(ClientSessionIdentifier::from(speaker_session))
+        .get_client_in_server(server_id, ClientSessionIdentifier::from(speaker_session))
         .await?;
     Some(client.get_current_channel_id())
 }
@@ -2122,7 +2127,10 @@ mod tests {
         let server = test_server(TestAuthenticator).await;
         server
             .get_channels()
-            .create_channel(shitspeak_state::Channel::new(1, "Lobby", 0, 0, Some(0)))
+            .create_channel_in_server(
+                shitspeak_runtime::types::DEFAULT_SERVER_ID,
+                shitspeak_state::Channel::new(1, "Lobby", 0, 0, Some(0)),
+            )
             .await
             .unwrap();
         let context = test_session_context(Arc::clone(&server));
@@ -2524,6 +2532,7 @@ mod tests {
                 display_name: Some("Alice".to_string()),
                 groups: vec!["web".to_string()],
                 is_superuser: false,
+                invisible: false,
                 virtual_server_id: None,
                 language: Language::default(),
                 max_bandwidth: None,

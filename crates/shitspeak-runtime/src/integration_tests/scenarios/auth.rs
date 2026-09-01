@@ -783,6 +783,68 @@ async fn auth_concurrent_clients_see_each_other() {
 }
 
 #[tokio::test]
+async fn authenticator_invisible_user_is_hidden_from_regular_and_superusers_and_does_not_use_capacity()
+ {
+    let server = spawn_test_server(TestServerOpts {
+        max_users: 2,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_invisible_user("ghost", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(3), vec!["admin".into()]);
+
+    let ghost = TestClient::connect_and_authenticate(&server, "ghost", None)
+        .await
+        .expect("ghost auth");
+    assert!(
+        ghost
+            .initial_user_states
+            .iter()
+            .any(|state| state.session == Some(ghost.session_id))
+    );
+    assert_eq!(
+        server
+            .server
+            .get_clients()
+            .authenticated_client_count_in_server(crate::types::DEFAULT_SERVER_ID),
+        0
+    );
+
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob auth despite invisible user");
+    assert!(
+        bob.initial_user_states
+            .iter()
+            .all(|state| state.session != Some(ghost.session_id))
+    );
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth despite invisible user");
+    assert!(
+        alice
+            .initial_user_states
+            .iter()
+            .all(|state| state.session != Some(ghost.session_id))
+    );
+    assert_eq!(
+        server
+            .server
+            .get_clients()
+            .authenticated_client_count_in_server(crate::types::DEFAULT_SERVER_ID),
+        2
+    );
+}
+
+#[tokio::test]
 async fn superuser_visibility_action_is_private_and_toggles_presence() {
     use crate::context_action::{Context, Operation, context as action_context};
     use crate::toggle_superuser_visibility::{ACTION_ID, HIDE_LABEL, SHOW_LABEL};
@@ -826,7 +888,7 @@ async fn superuser_visibility_action_is_private_and_toggles_presence() {
     let live_bob = server
         .server
         .get_clients()
-        .get_client(bob.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session)
         .await
         .expect("live Bob");
     assert!(!live_bob.is_hidden_from_regular_users());
@@ -899,7 +961,8 @@ async fn superuser_visibility_action_is_private_and_toggles_presence() {
             |message| {
                 matches!(message, Message::UserState(state)
                     if state.session == Some(alice.session_id)
-                        && state.suppress == Some(true))
+                        && state.suppress == Some(true)
+                        && state.actor.is_none())
             },
             Duration::from_secs(2),
         )
@@ -935,7 +998,8 @@ async fn superuser_visibility_action_is_private_and_toggles_presence() {
     bob.recv_until(
         |message| {
             matches!(message, Message::UserState(state)
-                if is_join_snapshot_for_session(state, alice.session_id))
+                if is_join_snapshot_for_session(state, alice.session_id)
+                    && state.actor.is_none())
         },
         Duration::from_secs(2),
     )
@@ -955,7 +1019,7 @@ async fn superuser_visibility_action_is_private_and_toggles_presence() {
     let live_alice = server
         .server
         .get_clients()
-        .get_client(alice.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
         .await
         .expect("live Alice");
     assert!(!live_alice.is_hidden_from_regular_users());
@@ -1066,7 +1130,8 @@ async fn auth_initial_snapshot_ignores_authenticated_unpublished_clients() {
     let pending = server
         .server
         .get_clients()
-        .allocate_web_client(
+        .allocate_web_client_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 30_001)),
             server.addr,
@@ -1106,7 +1171,7 @@ async fn auth_initial_snapshot_ignores_authenticated_unpublished_clients() {
     server
         .server
         .get_clients()
-        .publish_client(pending_session)
+        .publish_client_in_server(crate::types::DEFAULT_SERVER_ID, pending_session)
         .await;
     let published_state = observer
         .recv_until(
@@ -1174,7 +1239,7 @@ async fn auth_selected_server_id_absent_from_config_scopes_client() {
 }
 
 #[tokio::test]
-async fn blank_auth_selected_server_id_defaults_to_default_server() {
+async fn blank_auth_selected_server_id_keeps_incoming_default_server() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server.authenticator.register_user_in_server(
         "alice",
@@ -1209,7 +1274,7 @@ async fn blank_auth_selected_server_id_defaults_to_default_server() {
 }
 
 #[tokio::test]
-async fn whitespace_auth_selected_server_id_defaults_to_default_server() {
+async fn whitespace_auth_selected_server_id_keeps_incoming_default_server() {
     let server = spawn_test_server(TestServerOpts::default()).await;
     server.authenticator.register_user_in_server(
         "alice",
@@ -1282,7 +1347,8 @@ async fn auth_server_sync_reports_evaluated_root_permissions() {
     server
         .server
         .get_channels()
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![ACL {

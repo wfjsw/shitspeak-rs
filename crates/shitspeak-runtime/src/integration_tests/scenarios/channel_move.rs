@@ -27,7 +27,10 @@ async fn self_move_broadcasts_to_peer() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(30, "Lobby".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(30, "Lobby".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -70,7 +73,10 @@ async fn moderator_move_other() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(31, "Lobby".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(31, "Lobby".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -126,14 +132,21 @@ async fn unrelated_acl_update_preserves_temporary_visible_users_and_links() {
         (332, "Unrelated ACL target"),
     ] {
         channels
-            .create_channel(Channel::new(channel_id, name.to_owned(), 0, 0, Some(0)))
+            .create_channel_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                Channel::new(channel_id, name.to_owned(), 0, 0, Some(0)),
+            )
             .await
             .unwrap();
     }
-    channels.add_link(330, 331).await.unwrap();
+    channels
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, 330, 331)
+        .await
+        .unwrap();
     for channel_id in [330, 331] {
         channels
-            .set_acls(
+            .set_acls_in_server(
+                crate::types::DEFAULT_SERVER_ID,
                 channel_id,
                 true,
                 vec![group_acl(
@@ -286,12 +299,16 @@ async fn linked_channel_without_traverse_is_visible_from_traversable_current_cha
     let channels = server.server.get_channels();
     for (channel_id, name) in [(333, "Traversable current"), (334, "Hidden linked")] {
         channels
-            .create_channel(Channel::new(channel_id, name.to_owned(), 0, 0, Some(0)))
+            .create_channel_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                Channel::new(channel_id, name.to_owned(), 0, 0, Some(0)),
+            )
             .await
             .unwrap();
     }
     channels
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             334,
             true,
             vec![group_acl(
@@ -438,48 +455,49 @@ async fn configure_hidden_move_channels(
 ) {
     let channels = server.server.get_channels();
     channels
-        .create_channel(Channel::new(
-            HIDDEN_PARENT,
-            "Hidden parent".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(HIDDEN_PARENT, "Hidden parent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(
-            HIDDEN_CHILD,
-            "Hidden child".to_owned(),
-            0,
-            0,
-            Some(HIDDEN_PARENT),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(
+                HIDDEN_CHILD,
+                "Hidden child".to_owned(),
+                0,
+                0,
+                Some(HIDDEN_PARENT),
+            ),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(
-            HIDDEN_SIBLING,
-            "Hidden sibling".to_owned(),
-            0,
-            0,
-            Some(HIDDEN_PARENT),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(
+                HIDDEN_SIBLING,
+                "Hidden sibling".to_owned(),
+                0,
+                0,
+                Some(HIDDEN_PARENT),
+            ),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(
-            HIDDEN_LINKED,
-            "Hidden linked".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(HIDDEN_LINKED, "Hidden linked".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
     channels
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![group_acl(
@@ -492,7 +510,8 @@ async fn configure_hidden_move_channels(
         .await
         .unwrap();
     channels
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             HIDDEN_LINKED,
             true,
             vec![group_acl(
@@ -505,7 +524,8 @@ async fn configure_hidden_move_channels(
         .await
         .unwrap();
     channels
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             HIDDEN_PARENT,
             true,
             vec![group_acl(
@@ -598,7 +618,7 @@ async fn moderator_move_without_target_traverse_is_denied_by_default() {
     let live_bob = server
         .server
         .get_clients()
-        .get_client(bob.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session)
         .await
         .expect("Bob remains connected");
     assert_eq!(
@@ -780,7 +800,7 @@ async fn allowed_hidden_move_keeps_users_and_links_hidden_without_opt_in() {
     server
         .server
         .get_channels()
-        .add_link(HIDDEN_CHILD, HIDDEN_LINKED)
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, HIDDEN_CHILD, HIDDEN_LINKED)
         .await
         .expect("link hidden channels");
     server
@@ -865,7 +885,7 @@ async fn allowed_hidden_move_reveals_current_and_linked_channel_users_when_confi
     server
         .server
         .get_channels()
-        .add_link(HIDDEN_CHILD, HIDDEN_LINKED)
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, HIDDEN_CHILD, HIDDEN_LINKED)
         .await
         .expect("link hidden channels");
     server
@@ -1006,7 +1026,7 @@ async fn allowed_hidden_move_still_requires_destination_move_when_target_cannot_
     let live_bob = server
         .server
         .get_clients()
-        .get_client(bob.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session)
         .await
         .expect("Bob remains connected");
     assert_eq!(

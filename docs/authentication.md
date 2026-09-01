@@ -125,7 +125,7 @@ Successful authentication can provide identity, display name, groups, virtual se
 
 `authenticated_until` is an optional RFC 3339 timestamp. The deadline and action are connection-local state and are not persisted. Once the deadline has passed, the server applies `authentication_expiry_action` on an idle-reaper pass. The action defaults to `kick` when omitted:
 
-- `reauth` authenticates the user again with the original credential. The current `auth_session_id`, when one exists, is included in the request. The existing authenticated state remains in effect while the request is pending. A failed reauthentication disconnects the user; a successful response refreshes the user's identity, groups, local authentication metadata, and expiry settings.
+- `reauth` authenticates the user again with the original credential. The current `auth_session_id`, when one exists, is included in the request. The existing authenticated state remains in effect while the request is pending. A failed reauthentication disconnects the user; a successful response refreshes the user's identity, groups, local authentication metadata, and expiry settings. If the response selects a different virtual server, the user is disconnected.
 - `kick` disconnects the user.
 - `deregister` removes the connection's registered-user identity, reevaluates its ACL access, and disconnects it if it can no longer traverse the root channel. Other session state is retained.
 

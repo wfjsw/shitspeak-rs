@@ -715,7 +715,13 @@ async fn add_synthetic_published_users(server: &TestServer, node_id: u16) -> Vec
         let client = server
             .server
             .get_clients()
-            .allocate_web_client(peer.ip(), peer, local, tx)
+            .allocate_web_client_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                peer.ip(),
+                peer,
+                local,
+                tx,
+            )
             .await;
         {
             let mut gs = client.write_global_state_direct();
@@ -725,7 +731,11 @@ async fn add_synthetic_published_users(server: &TestServer, node_id: u16) -> Vec
         }
         let session = client.get_session_id();
         client.set_authenticated(true);
-        server.server.get_clients().publish_client(session).await;
+        server
+            .server
+            .get_clients()
+            .publish_client_in_server(crate::types::DEFAULT_SERVER_ID, session)
+            .await;
         sessions.push(u32::from(session));
     }
     sessions
@@ -745,7 +755,13 @@ async fn add_synthetic_published_user_count(
         let client = server
             .server
             .get_clients()
-            .allocate_web_client(peer.ip(), peer, local, tx)
+            .allocate_web_client_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                peer.ip(),
+                peer,
+                local,
+                tx,
+            )
             .await;
         {
             let mut gs = client.write_global_state_direct();
@@ -755,7 +771,11 @@ async fn add_synthetic_published_user_count(
         }
         let session = client.get_session_id();
         client.set_authenticated(true);
-        server.server.get_clients().publish_client(session).await;
+        server
+            .server
+            .get_clients()
+            .publish_client_in_server(crate::types::DEFAULT_SERVER_ID, session)
+            .await;
         sessions.push(u32::from(session));
     }
     sessions
@@ -833,12 +853,10 @@ async fn wait_for_servers_to_track_users(
             servers.iter().all(|server| {
                 sessions_by_node.iter().flatten().all(|&session| {
                     handle
-                        .block_on(
-                            server
-                                .server
-                                .get_clients()
-                                .get_client(ClientSessionIdentifier::from(session)),
-                        )
+                        .block_on(server.server.get_clients().get_client_in_server(
+                            crate::types::DEFAULT_SERVER_ID,
+                            ClientSessionIdentifier::from(session),
+                        ))
                         .is_some()
                 })
             })
@@ -859,12 +877,10 @@ async fn wait_for_server_sessions_in_channel(
             let handle = tokio::runtime::Handle::current();
             sessions.iter().copied().all(|session| {
                 handle
-                    .block_on(
-                        server
-                            .server
-                            .get_clients()
-                            .get_client(ClientSessionIdentifier::from(session)),
-                    )
+                    .block_on(server.server.get_clients().get_client_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        ClientSessionIdentifier::from(session),
+                    ))
                     .is_some_and(|client| client.get_current_channel_id() == channel_id)
             })
         })
@@ -891,7 +907,10 @@ async fn server_session_channel_summary(
         if let Some(client) = server
             .server
             .get_clients()
-            .get_client(ClientSessionIdentifier::from(session))
+            .get_client_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                ClientSessionIdentifier::from(session),
+            )
             .await
         {
             known += 1;
@@ -913,13 +932,16 @@ async fn move_synthetic_clients_to_channel(
     channel_id: u32,
 ) -> Duration {
     let started = Instant::now();
-    let channel_version = server.server.get_channels().current_version();
+    let channel_version = server
+        .server
+        .get_channels()
+        .current_version_in_server(crate::types::DEFAULT_SERVER_ID);
     for &session in sessions {
         let session_id = ClientSessionIdentifier::from(session);
         let client = server
             .server
             .get_clients()
-            .get_client(session_id)
+            .get_client_in_server(crate::types::DEFAULT_SERVER_ID, session_id)
             .await
             .expect("synthetic local client");
         client.set_current_channel_id(
@@ -1031,7 +1053,12 @@ async fn wait_for_server_to_track_client(server: &TestServer, session: ClientSes
     let tracked = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(server.server.get_clients().get_client(session))
+                .block_on(
+                    server
+                        .server
+                        .get_clients()
+                        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, session),
+                )
                 .is_some()
         })
     })
@@ -1754,7 +1781,7 @@ async fn wait_for_s2s_voice_target_installed(
         let sender = server
             .server
             .get_clients()
-            .get_client(client.server_session)
+            .get_client_in_server(crate::types::DEFAULT_SERVER_ID, client.server_session)
             .await
             .expect("sender should remain connected");
         if sender.voice_target(slot).is_some() {
@@ -1775,7 +1802,7 @@ async fn create_s2s_root_shout_traffic_tree(server: &TestServer) -> Vec<u32> {
             .server
             .s2s_manager()
             .propose_channel_op(
-                None,
+                crate::types::DEFAULT_SERVER_ID,
                 shitspeak_state::ChannelOp::CreateChannel {
                     channel: Channel::new(channel_id, name.to_owned(), 0, 0, Some(parent_id)),
                 },
@@ -1803,7 +1830,7 @@ async fn wait_for_s2s_channels_on_servers(
                 if server
                     .server
                     .get_channels()
-                    .get_channel(channel_id)
+                    .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, channel_id)
                     .await
                     .is_none()
                 {
@@ -1943,7 +1970,7 @@ async fn prepare_s2s_shout_udp_listeners(server: &TestServer, listeners: &mut [T
             let client = server
                 .server
                 .get_clients()
-                .get_client(listener.server_session)
+                .get_client_in_server(crate::types::DEFAULT_SERVER_ID, listener.server_session)
                 .await
                 .expect("UDP shout listener should remain connected");
             if client.get_udp_address().is_some() && !client.prefers_tcp_tunnel() {
@@ -2085,7 +2112,7 @@ async fn s2s_remote_channel_entry_updates_receiver_user_channel_cache() {
         .server
         .s2s_manager()
         .propose_channel_op(
-            None,
+            crate::types::DEFAULT_SERVER_ID,
             ChannelOp::CreateChannel {
                 channel: Channel::new(42, "Remote cached channel".to_owned(), 0, 0, Some(0)),
             },
@@ -2098,7 +2125,11 @@ async fn s2s_remote_channel_entry_updates_receiver_user_channel_cache() {
     let channel_replicated = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(b.server.get_channels().get_channel(42))
+                .block_on(
+                    b.server
+                        .get_channels()
+                        .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 42),
+                )
                 .is_some()
         })
     })
@@ -2106,17 +2137,21 @@ async fn s2s_remote_channel_entry_updates_receiver_user_channel_cache() {
     let a_strict_debug = a
         .server
         .s2s_manager()
-        .strict_channel_debug_state_for_test(None);
+        .strict_channel_debug_state_for_test(crate::types::DEFAULT_SERVER_ID);
     let b_strict_debug = b
         .server
         .s2s_manager()
-        .strict_channel_debug_state_for_test(None);
+        .strict_channel_debug_state_for_test(crate::types::DEFAULT_SERVER_ID);
     assert!(
         channel_replicated,
         "node B should learn the channel before Bob enters it; versions: a={} b={}; \
          strict: a={a_strict_debug:#?} b={b_strict_debug:#?}",
-        a.server.get_channels().current_version(),
-        b.server.get_channels().current_version(),
+        a.server
+            .get_channels()
+            .current_version_in_server(crate::types::DEFAULT_SERVER_ID),
+        b.server
+            .get_channels()
+            .current_version_in_server(crate::types::DEFAULT_SERVER_ID),
     );
 
     let bob = TestClient::connect_and_authenticate(&b, "bob", None)
@@ -2260,7 +2295,10 @@ async fn s2s_cross_node_text_message_routes_to_remote_recipient() {
     let bob_known_on_a = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(a.server.get_clients().get_client(bob.server_session.into()))
+                .block_on(a.server.get_clients().get_client_in_server(
+                    crate::types::DEFAULT_SERVER_ID,
+                    bob.server_session.into(),
+                ))
                 .is_some()
         })
     })
@@ -2326,7 +2364,10 @@ async fn s2s_cross_node_moderation_applies_to_owner() {
     let bob_known_on_a = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(a.server.get_clients().get_client(bob.server_session.into()))
+                .block_on(a.server.get_clients().get_client_in_server(
+                    crate::types::DEFAULT_SERVER_ID,
+                    bob.server_session.into(),
+                ))
                 .is_some()
         })
     })
@@ -2368,7 +2409,7 @@ async fn s2s_cross_node_moderator_move_projects_from_target_owner_log() {
         .server
         .s2s_manager()
         .propose_channel_op(
-            None,
+            crate::types::DEFAULT_SERVER_ID,
             ChannelOp::CreateChannel {
                 channel: Channel::new(
                     DESTINATION_CHANNEL,
@@ -2384,28 +2425,36 @@ async fn s2s_cross_node_moderator_move_projects_from_target_owner_log() {
         proposal.is_proposed(),
         "strict destination proposal should survive startup convergence: {proposal:?}"
     );
-    let destination_replicated = wait_until(S2S_DEADLINE, || {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(b.server.get_channels().get_channel(DESTINATION_CHANNEL))
-                .is_some()
+    let destination_replicated =
+        wait_until(S2S_DEADLINE, || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(b.server.get_channels().get_channel_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        DESTINATION_CHANNEL,
+                    ))
+                    .is_some()
+            })
         })
-    })
-    .await;
+        .await;
     let a_strict_debug = a
         .server
         .s2s_manager()
-        .strict_channel_debug_state_for_test(None);
+        .strict_channel_debug_state_for_test(crate::types::DEFAULT_SERVER_ID);
     let b_strict_debug = b
         .server
         .s2s_manager()
-        .strict_channel_debug_state_for_test(None);
+        .strict_channel_debug_state_for_test(crate::types::DEFAULT_SERVER_ID);
     assert!(
         destination_replicated,
         "target owner should replicate the destination channel; versions: a={} b={}; \
          strict: a={a_strict_debug:#?} b={b_strict_debug:#?}",
-        a.server.get_channels().current_version(),
-        b.server.get_channels().current_version(),
+        a.server
+            .get_channels()
+            .current_version_in_server(crate::types::DEFAULT_SERVER_ID),
+        b.server
+            .get_channels()
+            .current_version_in_server(crate::types::DEFAULT_SERVER_ID),
     );
 
     let alice = TestClient::connect_and_authenticate(&a, "alice", None)
@@ -2530,27 +2579,37 @@ async fn s2s_targeted_normal_voice_routes_to_linked_channel() {
 
     let channels = a.server.get_channels();
     channels
-        .create_channel(Channel::new(
-            SOURCE_CHANNEL,
-            "Normal link source".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(
+                SOURCE_CHANNEL,
+                "Normal link source".to_owned(),
+                0,
+                0,
+                Some(0),
+            ),
+        )
         .await
         .expect("create normal link source channel");
     channels
-        .create_channel(Channel::new(
-            LINKED_CHANNEL,
-            "Normal linked remote".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(
+                LINKED_CHANNEL,
+                "Normal linked remote".to_owned(),
+                0,
+                0,
+                Some(0),
+            ),
+        )
         .await
         .expect("create normal linked channel");
     channels
-        .add_link(SOURCE_CHANNEL, LINKED_CHANNEL)
+        .add_link_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            SOURCE_CHANNEL,
+            LINKED_CHANNEL,
+        )
         .await
         .expect("link normal voice channels");
 
@@ -2575,11 +2634,19 @@ async fn s2s_targeted_normal_voice_routes_to_linked_channel() {
     let placements_replicated = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
-            let b_knows_alice = handle
-                .block_on(b.server.get_clients().get_client(alice.server_session))
-                .is_some_and(|client| client.get_current_channel_id() == SOURCE_CHANNEL);
+            let b_knows_alice =
+                handle
+                    .block_on(b.server.get_clients().get_client_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        alice.server_session,
+                    ))
+                    .is_some_and(|client| client.get_current_channel_id() == SOURCE_CHANNEL);
             let a_knows_bob = handle
-                .block_on(a.server.get_clients().get_client(bob.server_session))
+                .block_on(
+                    a.server
+                        .get_clients()
+                        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session),
+                )
                 .is_some_and(|client| client.get_current_channel_id() == LINKED_CHANNEL);
             b_knows_alice && a_knows_bob
         })
@@ -2612,7 +2679,7 @@ async fn s2s_targeted_normal_voice_routes_to_linked_channel() {
     let replicated_alice = b
         .server
         .get_clients()
-        .get_client(alice.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
         .await
         .expect("server B should retain replicated Alice");
     assert!(
@@ -2654,27 +2721,25 @@ async fn s2s_cross_node_voice_target_shouts_to_linked_channel() {
 
     let channels = a.server.get_channels();
     channels
-        .create_channel(Channel::new(
-            SOURCE_CHANNEL,
-            "Link source".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(SOURCE_CHANNEL, "Link source".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .expect("create link source channel");
     channels
-        .create_channel(Channel::new(
-            LINKED_CHANNEL,
-            "Linked remote".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(LINKED_CHANNEL, "Linked remote".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .expect("create linked remote channel");
     channels
-        .add_link(SOURCE_CHANNEL, LINKED_CHANNEL)
+        .add_link_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            SOURCE_CHANNEL,
+            LINKED_CHANNEL,
+        )
         .await
         .expect("link voice target channels");
 
@@ -2700,14 +2765,26 @@ async fn s2s_cross_node_voice_target_shouts_to_linked_channel() {
     let placements_replicated = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
-            let b_knows_alice = handle
-                .block_on(b.server.get_clients().get_client(alice.server_session))
-                .is_some_and(|client| client.get_current_channel_id() == SOURCE_CHANNEL);
+            let b_knows_alice =
+                handle
+                    .block_on(b.server.get_clients().get_client_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        alice.server_session,
+                    ))
+                    .is_some_and(|client| client.get_current_channel_id() == SOURCE_CHANNEL);
             let b_knows_bob = handle
-                .block_on(b.server.get_clients().get_client(bob.server_session))
+                .block_on(
+                    b.server
+                        .get_clients()
+                        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session),
+                )
                 .is_some_and(|client| client.get_current_channel_id() == LINKED_CHANNEL);
             let a_knows_bob = handle
-                .block_on(a.server.get_clients().get_client(bob.server_session))
+                .block_on(
+                    a.server
+                        .get_clients()
+                        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session),
+                )
                 .is_some_and(|client| client.get_current_channel_id() == LINKED_CHANNEL);
             b_knows_alice && b_knows_bob && a_knows_bob
         })
@@ -2739,7 +2816,7 @@ async fn s2s_cross_node_voice_target_shouts_to_linked_channel() {
     let replicated_alice = b
         .server
         .get_clients()
-        .get_client(alice.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
         .await
         .expect("server B should retain replicated Alice");
     assert!(replicated_alice.is_superuser());
@@ -2753,7 +2830,7 @@ async fn s2s_cross_node_voice_target_shouts_to_linked_channel() {
     let local_bob = b
         .server
         .get_clients()
-        .get_client(bob.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session)
         .await
         .expect("server B should retain local Bob");
     assert!(
@@ -2826,23 +2903,30 @@ async fn s2s_cross_node_voice_target_shout_stream_is_contiguous_under_load() {
 
     a.server
         .get_channels()
-        .create_channel(Channel::new(
-            S2S_SHOUT_CHANNEL_ID,
-            "Remote Voice Room".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(
+                S2S_SHOUT_CHANNEL_ID,
+                "Remote Voice Room".to_owned(),
+                0,
+                0,
+                Some(0),
+            ),
+        )
         .await
         .expect("create cross-node shout channel");
-    let channel_replicated = wait_until(S2S_DEADLINE, || {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(b.server.get_channels().get_channel(S2S_SHOUT_CHANNEL_ID))
-                .is_some()
+    let channel_replicated =
+        wait_until(S2S_DEADLINE, || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(b.server.get_channels().get_channel_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        S2S_SHOUT_CHANNEL_ID,
+                    ))
+                    .is_some()
+            })
         })
-    })
-    .await;
+        .await;
     assert!(
         channel_replicated,
         "server B should learn the shout target channel before listeners connect"
@@ -3632,7 +3716,12 @@ async fn s2s_channel_replication_propagates() {
     );
 
     let replicated = wait_until(S2S_DEADLINE, || {
-        b.server.get_channels().current_version() >= a.server.get_channels().current_version()
+        b.server
+            .get_channels()
+            .current_version_in_server(crate::types::DEFAULT_SERVER_ID)
+            >= a.server
+                .get_channels()
+                .current_version_in_server(crate::types::DEFAULT_SERVER_ID)
     })
     .await;
     assert!(replicated, "Server B should advance its channel log");
@@ -3690,7 +3779,12 @@ async fn s2s_channel_replication_converges_then_catchup_stays_quiet() {
     );
     assert!(
         wait_until(S2S_DEADLINE, || {
-            b.server.get_channels().current_version() == a.server.get_channels().current_version()
+            b.server
+                .get_channels()
+                .current_version_in_server(crate::types::DEFAULT_SERVER_ID)
+                == a.server
+                    .get_channels()
+                    .current_version_in_server(crate::types::DEFAULT_SERVER_ID)
         })
         .await,
         "the channel repositories must converge before measuring steady-state traffic"
@@ -3749,7 +3843,10 @@ async fn s2s_channel_replication_converges_then_catchup_stays_quiet() {
     // Silence must not disable ordinary replication. Prove a subsequent
     // channel operation still crosses the real overlay, reaches a client, and
     // is committed to the destination repository.
-    let version_before_post_quiet_operation = a.server.get_channels().current_version();
+    let version_before_post_quiet_operation = a
+        .server
+        .get_channels()
+        .current_version_in_server(crate::types::DEFAULT_SERVER_ID);
     alice.create_channel(0, "S2S After Quiet", false).await;
     let replicated_message = bob
         .recv_until(
@@ -3772,8 +3869,14 @@ async fn s2s_channel_replication_converges_then_catchup_stays_quiet() {
     };
     assert!(
         wait_until(S2S_DEADLINE, || {
-            let a_version = a.server.get_channels().current_version();
-            let b_version = b.server.get_channels().current_version();
+            let a_version = a
+                .server
+                .get_channels()
+                .current_version_in_server(crate::types::DEFAULT_SERVER_ID);
+            let b_version = b
+                .server
+                .get_channels()
+                .current_version_in_server(crate::types::DEFAULT_SERVER_ID);
             a_version > version_before_post_quiet_operation && b_version == a_version
         })
         .await,
@@ -3782,7 +3885,7 @@ async fn s2s_channel_replication_converges_then_catchup_stays_quiet() {
     let replicated_channel = b
         .server
         .get_channels()
-        .get_channel(replicated_channel_id)
+        .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, replicated_channel_id)
         .await
         .expect("the destination repository must contain the replicated channel");
     assert_eq!(replicated_channel.name, "S2S After Quiet");
@@ -3969,7 +4072,11 @@ async fn s2s_temporary_channel_survives_when_remote_creator_remains_inside() {
     let bob_joined_locally = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(b.server.get_clients().get_client(bob.server_session))
+                .block_on(
+                    b.server
+                        .get_clients()
+                        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session),
+                )
                 .is_some_and(|client| client.get_current_channel_id() == temp_channel_id)
         })
     })
@@ -3979,14 +4086,18 @@ async fn s2s_temporary_channel_survives_when_remote_creator_remains_inside() {
         "Bob should join the temp channel on node B"
     );
 
-    let alice_replicated_to_b = wait_until(S2S_DEADLINE, || {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(b.server.get_clients().get_client(alice.server_session))
-                .is_some_and(|client| client.get_current_channel_id() == temp_channel_id)
+    let alice_replicated_to_b =
+        wait_until(S2S_DEADLINE, || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(b.server.get_clients().get_client_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        alice.server_session,
+                    ))
+                    .is_some_and(|client| client.get_current_channel_id() == temp_channel_id)
+            })
         })
-    })
-    .await;
+        .await;
     assert!(
         alice_replicated_to_b,
         "node B should know Alice still occupies the temp channel before Bob leaves"
@@ -4000,7 +4111,11 @@ async fn s2s_temporary_channel_survives_when_remote_creator_remains_inside() {
     let bob_left = wait_until(CLIENT_DEADLINE, || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(b.server.get_clients().get_client(bob.server_session))
+                .block_on(
+                    b.server
+                        .get_clients()
+                        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session),
+                )
                 .is_some_and(|client| client.get_current_channel_id() == 0)
         })
     })
@@ -4021,7 +4136,7 @@ async fn s2s_temporary_channel_survives_when_remote_creator_remains_inside() {
     assert!(
         a.server
             .get_channels()
-            .get_channel(temp_channel_id)
+            .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, temp_channel_id)
             .await
             .is_some(),
         "node A should retain the occupied temporary channel"
@@ -4029,7 +4144,7 @@ async fn s2s_temporary_channel_survives_when_remote_creator_remains_inside() {
     assert!(
         b.server
             .get_channels()
-            .get_channel(temp_channel_id)
+            .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, temp_channel_id)
             .await
             .is_some(),
         "node B should retain the occupied temporary channel"
@@ -4075,35 +4190,26 @@ async fn s2s_divergent_channel_layout_converges_before_client_integration() {
 
     a.server
         .get_channels()
-        .create_channel(shitspeak_state::Channel::new(
-            42,
-            "Elected Lobby".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            shitspeak_state::Channel::new(42, "Elected Lobby".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .expect("create A channel 42");
     a.server
         .get_channels()
-        .create_channel(shitspeak_state::Channel::new(
-            43,
-            "Elected Annex".to_owned(),
-            1,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            shitspeak_state::Channel::new(43, "Elected Annex".to_owned(), 1, 0, Some(0)),
+        )
         .await
         .expect("create A channel 43");
     b.server
         .get_channels()
-        .create_channel(shitspeak_state::Channel::new(
-            84,
-            "Discarded Lobby".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            shitspeak_state::Channel::new(84, "Discarded Lobby".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .expect("create B-only channel 84");
 
@@ -4120,11 +4226,19 @@ async fn s2s_divergent_channel_layout_converges_before_client_integration() {
     let local_moves_applied = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
-            let alice_channel = handle
-                .block_on(a.server.get_clients().get_client(alice.server_session))
-                .map(|client| client.get_current_channel_id());
+            let alice_channel =
+                handle
+                    .block_on(a.server.get_clients().get_client_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        alice.server_session,
+                    ))
+                    .map(|client| client.get_current_channel_id());
             let bob_channel = handle
-                .block_on(b.server.get_clients().get_client(bob.server_session))
+                .block_on(
+                    b.server
+                        .get_clients()
+                        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session),
+                )
                 .map(|client| client.get_current_channel_id());
             alice_channel == Some(42) && bob_channel == Some(84)
         })
@@ -4145,25 +4259,55 @@ async fn s2s_divergent_channel_layout_converges_before_client_integration() {
     let channel_layout_converged = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
-            a.server.get_channels().current_version() == 2
-                && b.server.get_channels().current_version() == 2
+            a.server
+                .get_channels()
+                .current_version_in_server(crate::types::DEFAULT_SERVER_ID)
+                == 2
+                && b.server
+                    .get_channels()
+                    .current_version_in_server(crate::types::DEFAULT_SERVER_ID)
+                    == 2
                 && handle
-                    .block_on(a.server.get_channels().get_channel(42))
+                    .block_on(
+                        a.server
+                            .get_channels()
+                            .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 42),
+                    )
                     .is_some()
                 && handle
-                    .block_on(a.server.get_channels().get_channel(43))
+                    .block_on(
+                        a.server
+                            .get_channels()
+                            .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 43),
+                    )
                     .is_some()
                 && handle
-                    .block_on(a.server.get_channels().get_channel(84))
+                    .block_on(
+                        a.server
+                            .get_channels()
+                            .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 84),
+                    )
                     .is_none()
                 && handle
-                    .block_on(b.server.get_channels().get_channel(42))
+                    .block_on(
+                        b.server
+                            .get_channels()
+                            .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 42),
+                    )
                     .is_some()
                 && handle
-                    .block_on(b.server.get_channels().get_channel(43))
+                    .block_on(
+                        b.server
+                            .get_channels()
+                            .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 43),
+                    )
                     .is_some()
                 && handle
-                    .block_on(b.server.get_channels().get_channel(84))
+                    .block_on(
+                        b.server
+                            .get_channels()
+                            .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 84),
+                    )
                     .is_none()
         })
     })
@@ -4171,17 +4315,21 @@ async fn s2s_divergent_channel_layout_converges_before_client_integration() {
     let a_strict_debug = a
         .server
         .s2s_manager()
-        .strict_channel_debug_state_for_test(None);
+        .strict_channel_debug_state_for_test(crate::types::DEFAULT_SERVER_ID);
     let b_strict_debug = b
         .server
         .s2s_manager()
-        .strict_channel_debug_state_for_test(None);
+        .strict_channel_debug_state_for_test(crate::types::DEFAULT_SERVER_ID);
     assert!(
         channel_layout_converged,
         "servers should converge on A's channel layout before client integration; \
          versions: a={} b={}; strict: a={a_strict_debug:#?} b={b_strict_debug:#?}",
-        a.server.get_channels().current_version(),
-        b.server.get_channels().current_version(),
+        a.server
+            .get_channels()
+            .current_version_in_server(crate::types::DEFAULT_SERVER_ID),
+        b.server
+            .get_channels()
+            .current_version_in_server(crate::types::DEFAULT_SERVER_ID),
     );
 
     let bob_received_repaired_layout = tokio::time::timeout(S2S_DEADLINE, async {
@@ -4228,8 +4376,16 @@ async fn s2s_divergent_channel_layout_converges_before_client_integration() {
     let final_client_state_safe = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
-            let bob_on_a = handle.block_on(a.server.get_clients().get_client(bob.server_session));
-            let bob_on_b = handle.block_on(b.server.get_clients().get_client(bob.server_session));
+            let bob_on_a = handle.block_on(
+                a.server
+                    .get_clients()
+                    .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session),
+            );
+            let bob_on_b = handle.block_on(
+                b.server
+                    .get_clients()
+                    .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session),
+            );
             bob_on_a
                 .as_ref()
                 .is_some_and(|client| client.get_current_channel_id() != 84)
@@ -4340,14 +4496,18 @@ async fn s2s_client_replication_propagates_add_update_remove() {
 
     let alice_session = alice.server_session;
     let alice_session_wire = u32::from(alice_session);
-    let indexed_add = wait_until(S2S_DEADLINE, || {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(b.server.get_clients().get_client(alice_session.into()))
-                .is_some()
+    let indexed_add =
+        wait_until(S2S_DEADLINE, || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(b.server.get_clients().get_client_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        alice_session.into(),
+                    ))
+                    .is_some()
+            })
         })
-    })
-    .await;
+        .await;
     assert!(
         indexed_add,
         "Server B should materialize Alice in its remote index"
@@ -4360,7 +4520,11 @@ async fn s2s_client_replication_propagates_add_update_remove() {
     let bob_indexed_on_a = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(a.server.get_clients().get_client(bob_session))
+                .block_on(
+                    a.server
+                        .get_clients()
+                        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob_session),
+                )
                 .is_some()
         })
     })
@@ -4400,14 +4564,18 @@ async fn s2s_client_replication_propagates_add_update_remove() {
         "Bob should see Alice's replicated removal"
     );
 
-    let removed = wait_until(S2S_DEADLINE, || {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(b.server.get_clients().get_client(alice_session.into()))
-                .is_none()
+    let removed =
+        wait_until(S2S_DEADLINE, || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(b.server.get_clients().get_client_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        alice_session.into(),
+                    ))
+                    .is_none()
+            })
         })
-    })
-    .await;
+        .await;
     assert!(
         removed,
         "Server B should remove Alice from its remote index"
@@ -4455,7 +4623,7 @@ async fn s2s_eight_node_400ms_150_clients_channel_move_lag_diagnostic() {
         cluster.servers[0]
             .server
             .s2s_manager()
-            .propose_channel_op(None, diagnostic_channel_op)
+            .propose_channel_op(crate::types::DEFAULT_SERVER_ID, diagnostic_channel_op)
             .await
             .is_proposed(),
         "diagnostic channel should be created through strict S2S replication"
@@ -4465,12 +4633,10 @@ async fn s2s_eight_node_400ms_150_clients_channel_move_lag_diagnostic() {
             let handle = tokio::runtime::Handle::current();
             cluster.servers.iter().all(|server| {
                 handle
-                    .block_on(
-                        server
-                            .server
-                            .get_channels()
-                            .get_channel(S2S_LAG_DIAGNOSTIC_CHANNEL_ID),
-                    )
+                    .block_on(server.server.get_channels().get_channel_in_server(
+                        crate::types::DEFAULT_SERVER_ID,
+                        S2S_LAG_DIAGNOSTIC_CHANNEL_ID,
+                    ))
                     .is_some()
             })
         })
@@ -5071,20 +5237,21 @@ async fn s2s_reconnect_initial_snapshot_preserves_remote_user_channel() {
 
     a.server
         .get_channels()
-        .create_channel(shitspeak_state::Channel::new(
-            42,
-            "S2S Lobby".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            shitspeak_state::Channel::new(42, "S2S Lobby".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .expect("create replicated channel");
 
     let channel_replicated = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(b.server.get_channels().get_channel(42))
+                .block_on(
+                    b.server
+                        .get_channels()
+                        .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 42),
+                )
                 .is_some()
         })
     })
@@ -5103,8 +5270,11 @@ async fn s2s_reconnect_initial_snapshot_preserves_remote_user_channel() {
 
     let alice_materialized_on_b = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
-            let client = tokio::runtime::Handle::current()
-                .block_on(b.server.get_clients().get_client(alice.server_session));
+            let client = tokio::runtime::Handle::current().block_on(
+                b.server
+                    .get_clients()
+                    .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session),
+            );
             client.is_some_and(|client| client.get_current_channel_id() == 42)
         })
     })
@@ -5112,19 +5282,24 @@ async fn s2s_reconnect_initial_snapshot_preserves_remote_user_channel() {
     assert!(
         alice_materialized_on_b,
         "Server B should track Alice in channel 42 before Bob reconnects; channel_version={}, client_versions={:?}, alice_channel={:?}",
-        b.server.get_channels().current_version(),
+        b.server
+            .get_channels()
+            .current_version_in_server(crate::types::DEFAULT_SERVER_ID),
         b.server.get_clients().snapshot_with_versions().await.1,
         b.server
             .get_clients()
-            .get_client(alice.server_session)
+            .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
             .await
             .map(|client| client.get_current_channel_id())
     );
 
     let bob_materialized_on_a = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
-            let client = tokio::runtime::Handle::current()
-                .block_on(a.server.get_clients().get_client(bob.server_session));
+            let client = tokio::runtime::Handle::current().block_on(
+                a.server
+                    .get_clients()
+                    .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session),
+            );
             client.is_some_and(|client| client.get_current_channel_id() == 42)
         })
     })
@@ -5140,7 +5315,11 @@ async fn s2s_reconnect_initial_snapshot_preserves_remote_user_channel() {
     let old_bob_removed = wait_until(S2S_DEADLINE, || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(a.server.get_clients().get_client(old_bob_session))
+                .block_on(
+                    a.server
+                        .get_clients()
+                        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, old_bob_session),
+                )
                 .is_none()
         })
     })

@@ -538,7 +538,10 @@ async fn wait_for_large_tree_clients_indexed(
         let target_channels: HashSet<u32> =
             clients.iter().map(|client| client.channel_id).collect();
         for channel_id in target_channels {
-            for client in repo.get_local_clients_in_channel(channel_id).await {
+            for client in repo
+                .get_local_clients_in_channel_in_server(crate::types::DEFAULT_SERVER_ID, channel_id)
+                .await
+            {
                 indexed.insert(u32::from(client.get_session_id()));
             }
         }
@@ -837,7 +840,7 @@ async fn wait_for_voice_target_installed_with_deadline(
         let sender = server
             .server
             .get_clients()
-            .get_client(client.server_session)
+            .get_client_in_server(crate::types::DEFAULT_SERVER_ID, client.server_session)
             .await
             .expect("sender should remain connected");
         if sender.voice_target(slot).is_some() {
@@ -862,7 +865,7 @@ async fn wait_for_voice_target_channel_installed(
         let sender = server
             .server
             .get_clients()
-            .get_client(client.server_session)
+            .get_client_in_server(crate::types::DEFAULT_SERVER_ID, client.server_session)
             .await
             .expect("sender should remain connected");
         if sender.voice_target(slot).is_some_and(|target| {
@@ -888,7 +891,7 @@ async fn wait_for_voice_target_removed(
         let sender = server
             .server
             .get_clients()
-            .get_client(client.server_session)
+            .get_client_in_server(crate::types::DEFAULT_SERVER_ID, client.server_session)
             .await
             .expect("sender should remain connected");
         if sender.voice_target(slot).is_none() {
@@ -1237,7 +1240,10 @@ async fn voice_tcp_different_channel_does_not_route() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(50, "Lobby".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(50, "Lobby".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -1436,15 +1442,27 @@ async fn voice_tcp_linked_channel_routes() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(70, "Lobby".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(70, "Lobby".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(71, "Side".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(71, "Side".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
-    chans.add_link(0, 70).await.unwrap();
-    chans.add_link(70, 71).await.unwrap();
+    chans
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, 0, 70)
+        .await
+        .unwrap();
+    chans
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, 70, 71)
+        .await
+        .unwrap();
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -1486,14 +1504,23 @@ async fn voice_tcp_linked_channel_requires_speak_permission() {
 
     let channels = server.server.get_channels();
     channels
-        .create_channel(Channel::new(72, "Source".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(72, "Source".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(73, "Linked".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(73, "Linked".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
-    channels.add_link(72, 73).await.unwrap();
+    channels
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, 72, 73)
+        .await
+        .unwrap();
 
     let admin = TestClient::connect_and_authenticate(&server, "admin", None)
         .await
@@ -1536,7 +1563,7 @@ async fn voice_tcp_linked_channel_requires_speak_permission() {
     let alice_server = server
         .server
         .get_clients()
-        .get_client(alice.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
         .await
         .expect("Alice is still connected");
     let source_permissions =
@@ -1575,7 +1602,10 @@ async fn voice_target_to_user_whispers_only_to_that_session() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(90, "WhisperTarget".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(90, "WhisperTarget".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -1626,11 +1656,17 @@ async fn voice_target_to_channel_shouts_only_to_that_channel() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(100, "TargetChannel".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(100, "TargetChannel".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(101, "TargetChild".to_owned(), 0, 0, Some(100)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(101, "TargetChild".to_owned(), 0, 0, Some(100)),
+        )
         .await
         .unwrap();
 
@@ -1683,17 +1719,17 @@ async fn voice_target_channel_cache_tracks_client_moves() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(102, "CachedTarget".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(102, "CachedTarget".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(
-            103,
-            "CachedElsewhere".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(103, "CachedElsewhere".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -1784,33 +1820,30 @@ async fn voice_target_same_slot_replacement_after_sender_move_uses_new_channel()
 
     let channels = server.server.get_channels();
     channels
-        .create_channel(Channel::new(
-            PARENT_CHANNEL,
-            "Parent".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(PARENT_CHANNEL, "Parent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(
-            INITIAL_CHILD_CHANNEL,
-            "InitialChild".to_owned(),
-            0,
-            0,
-            Some(PARENT_CHANNEL),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(
+                INITIAL_CHILD_CHANNEL,
+                "InitialChild".to_owned(),
+                0,
+                0,
+                Some(PARENT_CHANNEL),
+            ),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(
-            SIBLING_CHANNEL,
-            "Sibling".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(SIBLING_CHANNEL, "Sibling".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -1995,15 +2028,24 @@ async fn voice_target_channel_cache_tracks_reparented_subtrees() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(140, "Target".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(140, "Target".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(141, "MovingSubtree".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(141, "MovingSubtree".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(142, "SubtreeLeaf".to_owned(), 0, 0, Some(141)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(142, "SubtreeLeaf".to_owned(), 0, 0, Some(141)),
+        )
         .await
         .unwrap();
 
@@ -2035,7 +2077,11 @@ async fn voice_target_channel_cache_tracks_reparented_subtrees() {
     .await;
 
     chans
-        .update_channel(141, channel_parent_patch(140))
+        .update_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            141,
+            channel_parent_patch(140),
+        )
         .await
         .unwrap();
     alice
@@ -2049,7 +2095,11 @@ async fn voice_target_channel_cache_tracks_reparented_subtrees() {
     .await;
 
     chans
-        .update_channel(141, channel_parent_patch(0))
+        .update_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            141,
+            channel_parent_patch(0),
+        )
         .await
         .unwrap();
     alice
@@ -2062,13 +2112,10 @@ async fn voice_target_channel_cache_tracks_reparented_subtrees() {
     .await;
 
     chans
-        .create_channel(Channel::new(
-            143,
-            "NewTargetChild".to_owned(),
-            0,
-            0,
-            Some(140),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(143, "NewTargetChild".to_owned(), 0, 0, Some(140)),
+        )
         .await
         .unwrap();
     bob.move_to_channel(143).await;
@@ -2101,15 +2148,24 @@ async fn voice_target_channel_cache_tracks_target_and_child_link_mutations() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(150, "Target".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(150, "Target".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(151, "TargetChild".to_owned(), 0, 0, Some(150)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(151, "TargetChild".to_owned(), 0, 0, Some(150)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(152, "External".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(152, "External".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -2140,7 +2196,10 @@ async fn voice_target_channel_cache_tracks_target_and_child_link_mutations() {
     )
     .await;
 
-    chans.add_link(150, 152).await.unwrap();
+    chans
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, 150, 152)
+        .await
+        .unwrap();
     alice
         .send_voice_tcp(VOICE_TARGET_SLOT, 54, Bytes::from_static(SAMPLE_OPUS))
         .await;
@@ -2151,7 +2210,10 @@ async fn voice_target_channel_cache_tracks_target_and_child_link_mutations() {
     )
     .await;
 
-    chans.remove_link(150, 152).await.unwrap();
+    chans
+        .remove_link_in_server(crate::types::DEFAULT_SERVER_ID, 150, 152)
+        .await
+        .unwrap();
     alice
         .send_voice_tcp(VOICE_TARGET_SLOT, 55, Bytes::from_static(SAMPLE_OPUS))
         .await;
@@ -2161,7 +2223,10 @@ async fn voice_target_channel_cache_tracks_target_and_child_link_mutations() {
     )
     .await;
 
-    chans.add_link(151, 152).await.unwrap();
+    chans
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, 151, 152)
+        .await
+        .unwrap();
     alice
         .send_voice_tcp(VOICE_TARGET_SLOT, 56, Bytes::from_static(SAMPLE_OPUS))
         .await;
@@ -2172,7 +2237,10 @@ async fn voice_target_channel_cache_tracks_target_and_child_link_mutations() {
     )
     .await;
 
-    chans.remove_link(151, 152).await.unwrap();
+    chans
+        .remove_link_in_server(crate::types::DEFAULT_SERVER_ID, 151, 152)
+        .await
+        .unwrap();
     alice
         .send_voice_tcp(VOICE_TARGET_SLOT, 57, Bytes::from_static(SAMPLE_OPUS))
         .await;
@@ -2204,7 +2272,10 @@ async fn voice_target_plain_current_channel_uses_speak_permission() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(105, "CurrentTarget".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(105, "CurrentTarget".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -2260,7 +2331,7 @@ async fn voice_target_plain_current_channel_uses_speak_permission() {
     let alice_server = server
         .server
         .get_clients()
-        .get_client(alice.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
         .await
         .expect("Alice is still connected");
     let perms =
@@ -2314,17 +2385,17 @@ async fn voice_target_to_current_channel_children_still_requires_whisper() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(106, "CurrentParent".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(106, "CurrentParent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(
-            107,
-            "CurrentChild".to_owned(),
-            0,
-            0,
-            Some(106),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(107, "CurrentChild".to_owned(), 0, 0, Some(106)),
+        )
         .await
         .unwrap();
 
@@ -2363,7 +2434,7 @@ async fn voice_target_to_current_channel_children_still_requires_whisper() {
     let alice_server = server
         .server
         .get_clients()
-        .get_client(alice.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
         .await
         .expect("Alice is still connected");
     let parent_perms =
@@ -2411,15 +2482,24 @@ async fn voice_target_to_children_shouts_to_descendants() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(110, "Parent".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(110, "Parent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(111, "Child".to_owned(), 0, 0, Some(110)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(111, "Child".to_owned(), 0, 0, Some(110)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(112, "Elsewhere".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(112, "Elsewhere".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -2476,7 +2556,10 @@ async fn root_children_shout_targets_server_users_once_and_applies_group() {
     server
         .server
         .get_channels()
-        .create_channel(Channel::new(120, "Branch".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(120, "Branch".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -2534,18 +2617,30 @@ async fn voice_target_to_linked_channels_shouts_across_links() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(120, "LinkSource".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(120, "LinkSource".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(121, "Linked".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(121, "Linked".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(122, "Unlinked".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(122, "Unlinked".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
-    chans.add_link(120, 121).await.unwrap();
+    chans
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, 120, 121)
+        .await
+        .unwrap();
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -2601,20 +2696,23 @@ async fn voice_target_to_current_channel_links_still_requires_whisper() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(
-            123,
-            "CurrentLinkSource".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(123, "CurrentLinkSource".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(124, "CurrentLinked".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(124, "CurrentLinked".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
-    chans.add_link(123, 124).await.unwrap();
+    chans
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, 123, 124)
+        .await
+        .unwrap();
 
     let admin = TestClient::connect_and_authenticate(&server, "admin", None)
         .await
@@ -2653,7 +2751,7 @@ async fn voice_target_to_current_channel_links_still_requires_whisper() {
     let alice_server = server
         .server
         .get_clients()
-        .get_client(alice.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
         .await
         .expect("Alice is still connected");
     let source_perms =
@@ -2701,7 +2799,10 @@ async fn voice_target_to_specific_group_filters_recipients() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(130, "Grouped".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(130, "Grouped".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -2760,13 +2861,10 @@ async fn voice_target_group_filter_excludes_non_member_listeners() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(
-            131,
-            "GroupedListener".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(131, "GroupedListener".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -2829,17 +2927,17 @@ async fn voice_target_group_filter_applies_to_child_channel_listeners() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(132, "GroupedParent".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(132, "GroupedParent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(
-            133,
-            "GroupedChild".to_owned(),
-            0,
-            0,
-            Some(132),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(133, "GroupedChild".to_owned(), 0, 0, Some(132)),
+        )
         .await
         .unwrap();
 
@@ -2905,20 +3003,23 @@ async fn voice_target_group_filter_applies_to_linked_channel_listeners() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(
-            134,
-            "GroupedLinkSource".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(134, "GroupedLinkSource".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(135, "GroupedLinked".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(135, "GroupedLinked".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
-    chans.add_link(134, 135).await.unwrap();
+    chans
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, 134, 135)
+        .await
+        .unwrap();
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -3024,13 +3125,16 @@ async fn voice_target_large_root_multi_branch_1000_clients_shout_matrix() {
                 continue;
             }
             chans
-                .create_channel(Channel::new(
-                    spec.id,
-                    spec.name.clone(),
-                    spec.position,
-                    spec.max_users,
-                    Some(parent_id),
-                ))
+                .create_channel_in_server(
+                    crate::types::DEFAULT_SERVER_ID,
+                    Channel::new(
+                        spec.id,
+                        spec.name.clone(),
+                        spec.position,
+                        spec.max_users,
+                        Some(parent_id),
+                    ),
+                )
                 .await
                 .unwrap();
             created.insert(spec.id);
@@ -3044,7 +3148,10 @@ async fn voice_target_large_root_multi_branch_1000_clients_shout_matrix() {
     for spec in &specs {
         for &linked_id in &spec.links {
             if spec.id < linked_id {
-                chans.add_link(spec.id, linked_id).await.unwrap();
+                chans
+                    .add_link_in_server(crate::types::DEFAULT_SERVER_ID, spec.id, linked_id)
+                    .await
+                    .unwrap();
             }
         }
     }
@@ -3606,7 +3713,10 @@ async fn voice_udp_different_channel_does_not_route() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(60, "Lobby".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(60, "Lobby".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 

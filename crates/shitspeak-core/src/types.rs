@@ -54,10 +54,6 @@ impl ScopedSessionId {
         }
     }
 
-    pub fn default(session_id: ClientSessionIdentifier) -> Self {
-        Self::new(DEFAULT_SERVER_ID, session_id)
-    }
-
     pub fn server_id(&self) -> &str {
         &self.server_id
     }
@@ -80,10 +76,6 @@ impl ScopedChannelId {
             server_id: server_id.into(),
             channel_id,
         }
-    }
-
-    pub fn default(channel_id: u32) -> Self {
-        Self::new(DEFAULT_SERVER_ID, channel_id)
     }
 
     pub fn server_id(&self) -> &str {

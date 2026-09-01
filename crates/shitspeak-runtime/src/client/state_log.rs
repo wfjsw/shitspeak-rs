@@ -56,6 +56,7 @@ pub struct ClientGlobalStateDelta {
     // Append new replicated fields to preserve positional MessagePack compatibility.
     pub hidden_from_regular_users: Option<bool>,
     pub fqdn: Option<Option<String>>,
+    pub invisible: Option<bool>,
 }
 
 impl ClientGlobalStateDelta {
@@ -86,6 +87,7 @@ impl ClientGlobalStateDelta {
             tokens: Some(state.get_tokens().clone()),
             display_name: Some(state.get_display_name_opt().map(ToOwned::to_owned)),
             fqdn: Some(state.get_fqdn().map(ToOwned::to_owned)),
+            invisible: Some(state.is_invisible()),
         }
     }
 
@@ -113,7 +115,8 @@ impl ClientGlobalStateDelta {
             || self.is_superuser.is_some()
             || self.tokens.is_some()
             || self.display_name.is_some()
-            || self.fqdn.is_some())
+            || self.fqdn.is_some()
+            || self.invisible.is_some())
     }
 
     pub fn affects_acl_generation(&self) -> bool {
@@ -135,6 +138,7 @@ impl ClientGlobalStateDelta {
             || self.groups.is_some()
             || self.is_superuser.is_some()
             || self.tokens.is_some()
+            || self.invisible.is_some()
     }
 
     pub fn to_initial_user_state(

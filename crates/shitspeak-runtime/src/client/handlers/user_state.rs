@@ -534,12 +534,7 @@ pub async fn handle_user_state(
             };
             if !server
                 .s2s_manager()
-                .dispatch_moderation_user_state(
-                    Some(&server_id),
-                    sender_id,
-                    target_session_id,
-                    patch,
-                )
+                .dispatch_moderation_user_state(&server_id, sender_id, target_session_id, patch)
                 .await
             {
                 tracing::trace!(
@@ -571,9 +566,15 @@ pub async fn handle_user_state(
     let mut cache_last_channel_id = None;
     let mut cache_listening_channel_ids = None;
     let hidden_before = target.is_hidden_from_regular_users();
+    let moderator_reveals_hidden_superuser = !is_self
+        && target.is_superuser()
+        && hidden_before
+        && (msg.suppress == Some(false)
+            || (msg.mute == Some(false) && target.read_global_state().is_suppressed()));
     let can_receive_voice;
     {
-        let mut gs = target.write_global_state_as(repo, Some(sender_id), channel_version_dep);
+        let actor = (!moderator_reveals_hidden_superuser).then_some(sender_id);
+        let mut gs = target.write_global_state_as(repo, actor, channel_version_dep);
 
         // ── Self-mute / self-deaf (only target can set their own) ─────────────
         if is_self {

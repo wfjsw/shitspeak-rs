@@ -106,6 +106,7 @@ impl Authenticator for TestAuthenticator {
             display_name: Some(username.to_owned()),
             groups: Vec::new(),
             is_superuser: false,
+            invisible: false,
             virtual_server_id: None,
             language: Language::default(),
             max_bandwidth: None,
@@ -368,7 +369,8 @@ fn auth_queue_test_client(
     let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 30_000 + session as u16);
     let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000 + session as u16);
     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(8);
-    let client = Client::new_web_gateway(
+    let client = Client::new_web_gateway_in_server(
+        DEFAULT_SERVER_ID.to_owned(),
         ClientSessionIdentifier::new(1, session).expect("test session id"),
         peer.ip(),
         peer,
@@ -805,8 +807,10 @@ async fn idle_reaper_only_disconnects_local_clients() {
     );
 }
 
-async fn authentication_expiry_test_client(server: &Arc<Box<Server>>) -> Arc<Box<Client>> {
-    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+async fn authentication_expiry_test_client_with_outbound(
+    server: &Arc<Box<Server>>,
+) -> (Arc<Box<Client>>, tokio::sync::mpsc::Receiver<Message>) {
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(1);
     let client = server
         .clients
         .allocate_web_client_in_server(
@@ -831,6 +835,11 @@ async fn authentication_expiry_test_client(server: &Arc<Box<Server>>) -> Arc<Box
             Some("original-password".to_owned()),
         ));
     }
+    (client, outbound_rx)
+}
+
+async fn authentication_expiry_test_client(server: &Arc<Box<Server>>) -> Arc<Box<Client>> {
+    let (client, _outbound_rx) = authentication_expiry_test_client_with_outbound(server).await;
     client
 }
 
@@ -940,7 +949,8 @@ async fn authentication_expiry_deregister_kicks_without_root_traverse() {
         .expect("server");
     server
         .channels
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![
@@ -1025,6 +1035,7 @@ async fn authentication_expiry_reauth_preserves_state_while_pending_and_applies_
             display_name: Some("Updated Name".to_owned()),
             groups: vec!["updated-group".to_owned()],
             is_superuser: false,
+            invisible: false,
             virtual_server_id: None,
             language: Language::default(),
             max_bandwidth: None,
@@ -1067,6 +1078,301 @@ async fn authentication_expiry_reauth_preserves_state_while_pending_and_applies_
     );
 }
 
+fn write_max_bandwidth_reload_config(config: &Config, path: &std::path::Path, max_bandwidth: u32) {
+    let contents = format!(
+        "listen = \"127.0.0.1:0\"\n\
+register_name = \"test\"\n\
+cert_path = {:?}\n\
+key_path = {:?}\n\
+send_version = false\n\
+send_build_info = false\n\
+send_os_info = false\n\
+allowed_proxies = []\n\
+min_client_version = 0\n\
+max_users = 100\n\
+max_bandwidth = {max_bandwidth}\n",
+        config.cert_path, config.key_path,
+    );
+    std::fs::write(path, contents).expect("write reload config");
+}
+
+#[tokio::test]
+async fn config_reload_updates_inherited_bandwidth_without_updating_overrides() {
+    let mut config = test_config(Vec::new());
+    config.max_bandwidth = 72_000;
+    let cert_config = config.clone();
+    let server = Server::new(config, TestAuthenticator)
+        .await
+        .expect("server");
+
+    let (inherited_tx, mut inherited_gateway_rx) = tokio::sync::mpsc::channel(1);
+    let inherited = server
+        .clients
+        .allocate_web_client_in_server(
+            DEFAULT_SERVER_ID,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:52000".parse().unwrap(),
+            "127.0.0.1:52001".parse().unwrap(),
+            inherited_tx,
+        )
+        .await;
+    inherited.set_authenticated(true);
+    let (overridden_tx, mut overridden_gateway_rx) = tokio::sync::mpsc::channel(1);
+    let overridden = server
+        .clients
+        .allocate_web_client_in_server(
+            DEFAULT_SERVER_ID,
+            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:52002".parse().unwrap(),
+            "127.0.0.1:52003".parse().unwrap(),
+            overridden_tx,
+        )
+        .await;
+    overridden.set_authenticated(true);
+    overridden.set_max_bandwidth(Some(24_000));
+    let temp = tempfile::tempdir().expect("reload config tempdir");
+    let config_path = temp.path().join("config.toml");
+    write_max_bandwidth_reload_config(&cert_config, &config_path, 96_000);
+    server
+        .reload_config_from(&config_path)
+        .await
+        .expect("reload config");
+
+    match tokio::time::timeout(Duration::from_secs(1), inherited_gateway_rx.recv())
+        .await
+        .expect("inherited bandwidth update timeout")
+        .expect("inherited bandwidth update")
+    {
+        Message::ServerSync(sync) => {
+            assert_eq!(sync.max_bandwidth, Some(96_000));
+            assert_eq!(sync.session, None);
+            assert_eq!(sync.welcome_text, None);
+            assert_eq!(sync.permissions, None);
+        }
+        other => panic!("expected inherited ServerSync bandwidth update, got {other:?}"),
+    }
+    assert!(matches!(
+        overridden_gateway_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn authentication_expiry_reauth_applies_invisible_transitions() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let mut config = test_config(Vec::new());
+    config.max_users = 1;
+    let server = Server::new(config, authenticator).await.expect("server");
+    let client = authentication_expiry_test_client(&server).await;
+    assert!(
+        server
+            .clients
+            .try_reserve_authenticated_client_in_server(
+                DEFAULT_SERVER_ID,
+                client.get_session_id(),
+                1,
+            )
+            .await
+    );
+    assert_eq!(
+        server
+            .clients
+            .authenticated_client_count_in_server(DEFAULT_SERVER_ID),
+        1
+    );
+
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+    authentication_expiry_reaper(&server, deadline).await;
+    calls.recv().await.expect("first reauthentication call");
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("previous-auth-session".to_owned()),
+            authenticated_until: Some(deadline + chrono::Duration::hours(1)),
+            authentication_expiry_action: AuthenticationExpiryAction::Reauth,
+            user_id: Some(7),
+            fqdn: None,
+            display_name: Some("Original Name".to_owned()),
+            groups: vec!["original-group".to_owned()],
+            is_superuser: false,
+            invisible: true,
+            virtual_server_id: None,
+            language: Language::default(),
+            max_bandwidth: None,
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send invisible reauthentication");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.is_reauthentication_in_progress() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("invisible reauthentication completed");
+    assert!(client.is_invisible());
+    assert_eq!(
+        server
+            .clients
+            .authenticated_client_count_in_server(DEFAULT_SERVER_ID),
+        0
+    );
+
+    let next_deadline = deadline + chrono::Duration::hours(2);
+    set_expiring_authentication(&client, next_deadline, AuthenticationExpiryAction::Reauth);
+    authentication_expiry_reaper(&server, next_deadline).await;
+    calls.recv().await.expect("second reauthentication call");
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("previous-auth-session".to_owned()),
+            authenticated_until: Some(next_deadline + chrono::Duration::hours(1)),
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
+            user_id: Some(7),
+            fqdn: None,
+            display_name: Some("Original Name".to_owned()),
+            groups: vec!["original-group".to_owned()],
+            is_superuser: false,
+            invisible: false,
+            virtual_server_id: None,
+            language: Language::default(),
+            max_bandwidth: None,
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send visible reauthentication");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.is_reauthentication_in_progress() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("visible reauthentication completed");
+    assert!(!client.is_invisible());
+    assert_eq!(
+        server
+            .clients
+            .authenticated_client_count_in_server(DEFAULT_SERVER_ID),
+        1
+    );
+}
+
+#[tokio::test]
+async fn reauthentication_sends_new_authenticator_bandwidth_to_client() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let server = Server::new(test_config(Vec::new()), authenticator)
+        .await
+        .expect("server");
+    let (client, mut outbound) = authentication_expiry_test_client_with_outbound(&server).await;
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication started")
+        .expect("reauthentication call");
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("previous-auth-session".to_owned()),
+            authenticated_until: Some(deadline + chrono::Duration::hours(1)),
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
+            user_id: Some(7),
+            fqdn: None,
+            display_name: Some("Updated Name".to_owned()),
+            groups: vec!["original-group".to_owned()],
+            is_superuser: false,
+            invisible: false,
+            virtual_server_id: None,
+            language: Language::default(),
+            max_bandwidth: Some(24_000),
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send successful reauthentication");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.is_reauthentication_in_progress() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reauthentication completed");
+
+    match tokio::time::timeout(Duration::from_secs(1), outbound.recv())
+        .await
+        .expect("authenticator bandwidth update timeout")
+        .expect("authenticator bandwidth update")
+    {
+        Message::ServerSync(sync) => {
+            assert_eq!(sync.max_bandwidth, Some(24_000));
+            assert_eq!(sync.session, None);
+            assert_eq!(sync.welcome_text, None);
+            assert_eq!(sync.permissions, None);
+        }
+        other => panic!("expected reauthentication ServerSync bandwidth update, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn reauthentication_clearing_bandwidth_override_follows_config() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let server = Server::new(test_config(Vec::new()), authenticator)
+        .await
+        .expect("server");
+    let (client, mut outbound) = authentication_expiry_test_client_with_outbound(&server).await;
+    client.set_max_bandwidth(Some(24_000));
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication started")
+        .expect("reauthentication call");
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("previous-auth-session".to_owned()),
+            authenticated_until: Some(deadline + chrono::Duration::hours(1)),
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
+            user_id: Some(7),
+            fqdn: None,
+            display_name: Some("Updated Name".to_owned()),
+            groups: vec!["original-group".to_owned()],
+            is_superuser: false,
+            invisible: false,
+            virtual_server_id: None,
+            language: Language::default(),
+            max_bandwidth: None,
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send successful reauthentication");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.is_reauthentication_in_progress() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reauthentication completed");
+
+    assert_eq!(client.max_bandwidth(server.get_max_bandwidth()), 72_000);
+    assert_eq!(client.max_bandwidth_override(), None);
+    match tokio::time::timeout(Duration::from_secs(1), outbound.recv())
+        .await
+        .expect("cleared override bandwidth update timeout")
+        .expect("cleared override bandwidth update")
+    {
+        Message::ServerSync(sync) => {
+            assert_eq!(sync.max_bandwidth, Some(72_000));
+            assert_eq!(sync.session, None);
+            assert_eq!(sync.welcome_text, None);
+            assert_eq!(sync.permissions, None);
+        }
+        other => panic!("expected cleared override ServerSync update, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn authentication_expiry_reauth_kicks_registered_client_when_user_id_is_removed() {
     let (authenticator, mut calls, responses) = controlled_authenticator();
@@ -1097,6 +1403,7 @@ async fn authentication_expiry_reauth_kicks_registered_client_when_user_id_is_re
             display_name: Some("Anonymous Name".to_owned()),
             groups: vec!["updated-group".to_owned()],
             is_superuser: false,
+            invisible: false,
             virtual_server_id: None,
             language: Language::default(),
             max_bandwidth: None,
@@ -1149,6 +1456,7 @@ async fn authentication_expiry_reauth_kicks_client_when_auth_session_id_changes_
                 display_name: Some("Original Name".to_owned()),
                 groups: vec!["original-group".to_owned()],
                 is_superuser: false,
+                invisible: false,
                 virtual_server_id: None,
                 language: Language::default(),
                 max_bandwidth: None,
@@ -1178,6 +1486,58 @@ async fn authentication_expiry_reauth_kicks_client_when_auth_session_id_changes_
 }
 
 #[tokio::test]
+async fn authentication_expiry_reauth_kicks_client_when_virtual_server_id_changes() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let server = Server::new(test_config(Vec::new()), authenticator)
+        .await
+        .expect("server");
+    let client = authentication_expiry_test_client(&server).await;
+    let session_id = client.get_session_id();
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication started")
+        .expect("reauthentication call");
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("previous-auth-session".to_owned()),
+            authenticated_until: Some(deadline + chrono::Duration::hours(1)),
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
+            user_id: Some(7),
+            fqdn: None,
+            display_name: Some("Original Name".to_owned()),
+            groups: vec!["original-group".to_owned()],
+            is_superuser: false,
+            invisible: false,
+            virtual_server_id: Some("other-server".to_owned()),
+            language: Language::default(),
+            max_bandwidth: None,
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send reauthentication with changed virtual server id");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server
+                .clients
+                .get_client_in_server(DEFAULT_SERVER_ID, session_id)
+                .await
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reauthentication that changes the virtual server id disconnects the client");
+}
+
+#[tokio::test]
 async fn authentication_expiry_reauth_moves_user_to_default_after_losing_traverse() {
     let (authenticator, mut calls, responses) = controlled_authenticator();
     let mut config = test_config(Vec::new());
@@ -1185,29 +1545,24 @@ async fn authentication_expiry_reauth_moves_user_to_default_after_losing_travers
     let server = Server::new(config, authenticator).await.expect("server");
     server
         .channels
-        .create_channel(shitspeak_state::Channel::new(
-            1,
-            "Default".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            shitspeak_state::Channel::new(1, "Default".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .expect("default channel");
     server
         .channels
-        .create_channel(shitspeak_state::Channel::new(
-            2,
-            "Restricted".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            shitspeak_state::Channel::new(2, "Restricted".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .expect("restricted channel");
     server
         .channels
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             2,
             true,
             vec![shitspeak_state::ACL {
@@ -1245,6 +1600,7 @@ async fn authentication_expiry_reauth_moves_user_to_default_after_losing_travers
             display_name: Some("Updated Name".to_owned()),
             groups: vec!["updated-group".to_owned()],
             is_superuser: false,
+            invisible: false,
             virtual_server_id: None,
             language: Language::default(),
             max_bandwidth: None,

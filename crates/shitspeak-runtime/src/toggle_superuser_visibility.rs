@@ -30,8 +30,7 @@ pub(crate) async fn handle(
 
     let hidden = sender.is_hidden_from_regular_users();
     if !hidden {
-        let mut state =
-            sender.write_global_state_as(server.get_clients(), Some(sender.get_session_id()), None);
+        let mut state = sender.write_global_state_as(server.get_clients(), None, None);
         state.set_hidden_from_regular_users(true);
     } else {
         let server_id = sender.server_id();
@@ -48,7 +47,7 @@ pub(crate) async fn handle(
             .contains(shitspeak_state::ACLPermissions::Speak);
             let mut state = sender.write_global_state_as(
                 server.get_clients(),
-                Some(sender.get_session_id()),
+                None,
                 Some(evaluated_channel_version),
             );
             if state.get_current_channel_id() != evaluated_channel_id

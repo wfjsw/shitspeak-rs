@@ -1097,7 +1097,7 @@ impl S2SManager {
 
     pub async fn propose_channel_op(
         &self,
-        server_id: Option<&str>,
+        server_id: &str,
         op: ChannelOp,
     ) -> ChannelOpProposeResult {
         self.start_channel_op_proposal(server_id, op)
@@ -1108,13 +1108,13 @@ impl S2SManager {
 
     pub async fn start_channel_op_proposal(
         &self,
-        server_id: Option<&str>,
+        server_id: &str,
         op: ChannelOp,
     ) -> ChannelOpProposalStart {
         if !self.enabled {
             return ChannelOpProposalStart::Standalone;
         }
-        let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID).to_owned();
+        let server_id = server_id.to_owned();
         let Some(tx) = self.state.read().gateway_tx.clone() else {
             return ChannelOpProposalStart::Failed(
                 "s2s channel proposal gateway unavailable".to_owned(),
@@ -1355,12 +1355,11 @@ impl S2SManager {
 
     pub async fn dispatch_moderation_user_state(
         &self,
-        server_id: Option<&str>,
+        server_id: &str,
         actor: ClientSessionIdentifier,
         target: ClientSessionIdentifier,
         patch: UserStatePatch,
     ) -> bool {
-        let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID);
         let envelope = ModerationEnvelope {
             actor_session: actor.to_u32(),
             target_session: target.to_u32(),
@@ -1377,12 +1376,11 @@ impl S2SManager {
 
     pub async fn dispatch_moderation_user_remove(
         &self,
-        server_id: Option<&str>,
+        server_id: &str,
         actor: ClientSessionIdentifier,
         target: ClientSessionIdentifier,
         patch: UserRemovePatch,
     ) -> bool {
-        let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID);
         let envelope = ModerationEnvelope {
             actor_session: actor.to_u32(),
             target_session: target.to_u32(),
@@ -1531,8 +1529,7 @@ impl S2SManager {
         sent
     }
 
-    pub async fn get_channel_blob(&self, server_id: Option<&str>, key: &str) -> Option<Bytes> {
-        let server_id = server_id.unwrap_or(DEFAULT_SERVER_ID);
+    pub async fn get_channel_blob(&self, server_id: &str, key: &str) -> Option<Bytes> {
         let handle = self.channel_blob_replication_handle(server_id)?;
         handle.get(key).await
     }
@@ -1573,9 +1570,9 @@ impl S2SManager {
     #[cfg(test)]
     pub(crate) fn strict_channel_debug_state_for_test(
         &self,
-        server_id: Option<&str>,
+        server_id: &str,
     ) -> Option<s2s_replications::strict::StrictDebugState> {
-        self.channel_replication_handle(server_id.unwrap_or(DEFAULT_SERVER_ID))
+        self.channel_replication_handle(server_id)
             .map(|handle| handle.debug_state())
     }
 
@@ -3036,11 +3033,11 @@ async fn deliver_plugin_data_to_local_recipients(
         return;
     }
 
-    let server_id = if envelope.server_id.is_empty() {
-        crate::types::default_server_id()
-    } else {
-        envelope.server_id
-    };
+    let server_id = envelope.server_id;
+    if server_id.is_empty() {
+        trace!("dropping plugin data envelope without a server scope");
+        return;
+    }
     let sender_id = ClientSessionIdentifier::from(envelope.sender_session);
     let sender = server
         .get_clients()
@@ -3091,11 +3088,11 @@ async fn deliver_text_message_to_local_recipients(
         return;
     }
 
-    let server_id = if envelope.server_id.is_empty() {
-        crate::types::default_server_id()
-    } else {
-        envelope.server_id
-    };
+    let server_id = envelope.server_id;
+    if server_id.is_empty() {
+        trace!("dropping text message envelope without a server scope");
+        return;
+    }
     let sender_id = ClientSessionIdentifier::from(envelope.sender_session);
     let sender = server
         .get_clients()
@@ -3158,11 +3155,11 @@ async fn apply_s2s_moderation(
         return;
     }
 
-    let server_id = if envelope.server_id.is_empty() {
-        crate::types::default_server_id()
-    } else {
-        envelope.server_id.clone()
-    };
+    let server_id = envelope.server_id.clone();
+    if server_id.is_empty() {
+        trace!(from, "dropping moderation envelope without a server scope");
+        return;
+    }
     match envelope.command {
         Some(ModerationCommand::UserState(patch)) => {
             apply_user_state_patch(server, &server_id, envelope.actor_session, target_id, patch)
@@ -3235,6 +3232,10 @@ async fn apply_user_state_patch(
     };
     let mut cache_listening_channel_ids = None;
     let hidden_before = target.is_hidden_from_regular_users();
+    let moderator_reveals_hidden_superuser = target.is_superuser()
+        && hidden_before
+        && (patch.suppress == Some(false)
+            || (patch.mute == Some(false) && target.read_global_state().is_suppressed()));
     let post_move_destination_perms = if let Some(channel_id) = patch.channel_id {
         Some(
             crate::client::acl::compute_permissions_for_client_as_if_in_channel(
@@ -3247,8 +3248,8 @@ async fn apply_user_state_patch(
     };
     let can_receive_voice;
     {
-        let mut gs =
-            target.write_global_state_as(server.get_clients(), Some(actor), channel_version_dep);
+        let actor = (!moderator_reveals_hidden_superuser).then_some(actor);
+        let mut gs = target.write_global_state_as(server.get_clients(), actor, channel_version_dep);
 
         if let Some(mute) = patch.mute {
             if gs.is_muted() != mute {
@@ -3461,9 +3462,10 @@ async fn apply_user_remove_patch(
     let old_channel_id = target.get_current_channel_id();
     let removed = server
         .get_clients()
-        .remove_client_in_server_with_metadata(
+        .remove_client_instance_in_server_with_metadata(
             server_id,
             target_id,
+            target.client_instance_id(),
             Some(actor),
             patch.reason.clone(),
             patch.ban,
@@ -3562,9 +3564,6 @@ impl ChannelReplicationAdapter {
     }
 
     fn bind_operation_to_topic(&self, op: &mut ChannelOperation) -> bool {
-        if op.server_id.is_empty() || op.server_id == DEFAULT_SERVER_ID {
-            op.server_id.clone_from(&self.server_id);
-        }
         op.server_id == self.server_id
     }
 
@@ -5415,12 +5414,18 @@ mod tests {
     async fn current_protocol_repository_snapshots_ignore_distinct_legacy_ledgers() {
         let left_channels = test_channel_repo(1);
         left_channels
-            .merge_strict_operation_ids(vec![StrictOperationId::new(101, 102)])
+            .merge_strict_operation_ids_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                vec![StrictOperationId::new(101, 102)],
+            )
             .await
             .unwrap();
         let right_channels = test_channel_repo(2);
         right_channels
-            .merge_strict_operation_ids(vec![StrictOperationId::new(201, 202)])
+            .merge_strict_operation_ids_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                vec![StrictOperationId::new(201, 202)],
+            )
             .await
             .unwrap();
         let left_channel_adapter = ChannelReplicationAdapter::new(
@@ -5445,11 +5450,11 @@ mod tests {
             .expect("decode canonical channel snapshot");
         assert!(decoded_channels.strict_operation_ids.is_empty());
         assert_eq!(
-            left_channels.strict_operation_ids(),
+            left_channels.strict_operation_ids_in_server(crate::types::DEFAULT_SERVER_ID),
             vec![StrictOperationId::new(101, 102)]
         );
         assert_eq!(
-            right_channels.strict_operation_ids(),
+            right_channels.strict_operation_ids_in_server(crate::types::DEFAULT_SERVER_ID),
             vec![StrictOperationId::new(201, 202)]
         );
 
@@ -5520,10 +5525,22 @@ mod tests {
             .install_snapshot(1, Bytes::from(channel_snapshot))
             .await
             .unwrap();
-        assert!(channels.get_channel(70).await.is_none());
-        assert_eq!(channels.get_channel(71).await.unwrap().name, "replacement");
+        assert!(
+            channels
+                .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 70)
+                .await
+                .is_none()
+        );
         assert_eq!(
-            channels.strict_operation_ids(),
+            channels
+                .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 71)
+                .await
+                .unwrap()
+                .name,
+            "replacement"
+        );
+        assert_eq!(
+            channels.strict_operation_ids_in_server(crate::types::DEFAULT_SERVER_ID),
             vec![StrictOperationId::new(901, 902)]
         );
 
@@ -5656,7 +5673,10 @@ mod tests {
     async fn strict_production_adapters_fail_delivery_on_version_conflict() {
         let channels = test_channel_repo(1);
         channels
-            .create_channel(shitspeak_state::Channel::new(70, "existing", 0, 0, Some(0)))
+            .create_channel_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                shitspeak_state::Channel::new(70, "existing", 0, 0, Some(0)),
+            )
             .await
             .expect("create existing channel");
         let channel_adapter = ChannelReplicationAdapter::new(
@@ -5697,6 +5717,23 @@ mod tests {
         let channels = test_channel_repo(1);
         let adapter =
             ChannelReplicationAdapter::new("tenant-a".to_owned(), Arc::clone(&channels), None);
+        let default_scoped_op = strict_channel_create_op(72);
+        adapter.apply_committed(1, default_scoped_op.clone()).await;
+        assert_eq!(channels.current_version_in_server("tenant-a"), 0);
+        assert_eq!(channels.current_version_in_server(DEFAULT_SERVER_ID), 0);
+        assert!(
+            channels
+                .get_channel_in_server("tenant-a", 72)
+                .await
+                .is_none()
+        );
+        assert!(
+            channels
+                .get_channel_in_server(DEFAULT_SERVER_ID, 72)
+                .await
+                .is_none()
+        );
+
         let mut mismatched_op = strict_channel_create_op(72);
         mismatched_op.server_id = "tenant-b".to_owned();
 
@@ -5754,7 +5791,11 @@ mod tests {
                 .await,
             s2s_replications::strict::StrictCommitApplyOutcome::Applied
         );
-        assert!(source_repo.strict_operation_ids().is_empty());
+        assert!(
+            source_repo
+                .strict_operation_ids_in_server(crate::types::DEFAULT_SERVER_ID)
+                .is_empty()
+        );
         let (version, bytes) = source.snapshot().expect("capture channel snapshot");
         assert_eq!(version, 1);
         let decoded: ChannelSnapshot =
@@ -5779,7 +5820,12 @@ mod tests {
             sink.install_snapshot(version, bytes)
                 .await
                 .expect("install channel snapshot");
-            assert!(sink_repo.get_channel(71).await.is_some());
+            assert!(
+                sink_repo
+                    .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 71)
+                    .await
+                    .is_some()
+            );
             assert!(matches!(
                 sink.log_since(0),
                 s2s_replications::strict::LogSlice::TooOld
@@ -5799,8 +5845,15 @@ mod tests {
             Arc::clone(&recovered_repo),
             None,
         );
-        assert_eq!(recovered_repo.current_version(), version);
-        assert!(recovered_repo.strict_operation_ids().is_empty());
+        assert_eq!(
+            recovered_repo.current_version_in_server(crate::types::DEFAULT_SERVER_ID),
+            version
+        );
+        assert!(
+            recovered_repo
+                .strict_operation_ids_in_server(crate::types::DEFAULT_SERVER_ID)
+                .is_empty()
+        );
         let next = strict_channel_create_op(72);
         assert_eq!(
             recovered
@@ -5808,11 +5861,18 @@ mod tests {
                 .await,
             s2s_replications::strict::StrictCommitApplyOutcome::Applied
         );
-        assert_eq!(recovered_repo.current_version(), 2);
-        assert!(recovered_repo.strict_operation_ids().is_empty());
+        assert_eq!(
+            recovered_repo.current_version_in_server(crate::types::DEFAULT_SERVER_ID),
+            2
+        );
+        assert!(
+            recovered_repo
+                .strict_operation_ids_in_server(crate::types::DEFAULT_SERVER_ID)
+                .is_empty()
+        );
         assert_eq!(
             recovered_repo
-                .get_channel(71)
+                .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 71)
                 .await
                 .expect("snapshot channel exists")
                 .name,
@@ -6182,21 +6242,26 @@ mod tests {
         );
         assert!(
             peer_clients
-                .get_client(live.get_session_id())
+                .get_client_in_server(crate::types::DEFAULT_SERVER_ID, live.get_session_id())
                 .await
                 .is_none()
         );
         assert!(!peer_adapter.known_versions().contains_key(&1));
 
         let mut channel_snapshot = peer_channels
-            .get_all()
+            .get_all_in_server(crate::types::DEFAULT_SERVER_ID)
             .await
             .into_iter()
             .map(|channel| channel.as_ref().clone())
             .collect::<Vec<_>>();
         channel_snapshot.push(shitspeak_state::Channel::new(42, "ready", 0, 0, Some(0)));
         peer_channels
-            .install_s2s_snapshot(1, channel_snapshot)
+            .install_s2s_snapshot_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                1,
+                channel_snapshot,
+                chrono::Utc::now().timestamp(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -6212,7 +6277,7 @@ mod tests {
             "installing the snapshot clears its deferral watchdog"
         );
         let replicated = peer_clients
-            .get_client(live.get_session_id())
+            .get_client_in_server(crate::types::DEFAULT_SERVER_ID, live.get_session_id())
             .await
             .expect("deferred snapshot installs after channel convergence");
         assert_eq!(replicated.get_current_channel_id(), 42);
@@ -6291,7 +6356,7 @@ mod tests {
         );
         assert!(
             peer_clients
-                .get_client(live.get_session_id())
+                .get_client_in_server(crate::types::DEFAULT_SERVER_ID, live.get_session_id())
                 .await
                 .is_some()
         );
@@ -6373,7 +6438,7 @@ mod tests {
         );
         assert!(
             peer_clients
-                .get_client(live.get_session_id())
+                .get_client_in_server(crate::types::DEFAULT_SERVER_ID, live.get_session_id())
                 .await
                 .is_none()
         );

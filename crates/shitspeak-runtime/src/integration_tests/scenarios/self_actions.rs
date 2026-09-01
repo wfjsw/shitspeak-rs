@@ -157,7 +157,8 @@ async fn mute_deafen_user_can_set_own_priority_speaker() {
     server
         .server
         .get_channels()
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![ACL {
@@ -241,7 +242,8 @@ async fn mute_deafen_user_can_clear_own_server_mute_deaf_and_suppress() {
     server
         .server
         .get_channels()
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![ACL {
@@ -272,7 +274,7 @@ async fn mute_deafen_user_can_clear_own_server_mute_deaf_and_suppress() {
     let live_alice = server
         .server
         .get_clients()
-        .get_client(alice.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, alice.server_session)
         .await
         .expect("live alice");
     {

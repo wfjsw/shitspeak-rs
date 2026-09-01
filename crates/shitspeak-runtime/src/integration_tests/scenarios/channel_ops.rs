@@ -147,7 +147,8 @@ async fn temp_channel_create_requires_temp_channel_permission() {
     server
         .server
         .get_channels()
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![ACL {
@@ -223,7 +224,10 @@ async fn creating_temp_channel_moves_creator_into_it() {
         server
             .server
             .get_clients()
-            .get_local_clients_in_channel(temp_channel_id)
+            .get_local_clients_in_channel_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                temp_channel_id
+            )
             .await
             .iter()
             .map(|client| u32::from(client.get_session_id()))
@@ -258,7 +262,8 @@ async fn temp_channel_creation_grants_only_missing_creator_permissions() {
     server
         .server
         .get_channels()
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![
@@ -322,7 +327,8 @@ async fn temp_channel_creation_does_not_duplicate_inherited_creator_permissions(
     server
         .server
         .get_channels()
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![
@@ -384,7 +390,8 @@ async fn temp_channel_creator_acl_grant_can_be_disabled() {
     server
         .server
         .get_channels()
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![
@@ -444,7 +451,8 @@ async fn temp_channel_creation_grants_certificate_hash_acl_without_user_id() {
     server
         .server
         .get_channels()
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![
@@ -618,17 +626,17 @@ async fn disconnect_removes_listeners_before_user() {
 
     let channels = server.server.get_channels();
     channels
-        .create_channel(Channel::new(90, "First listener".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(90, "First listener".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(
-            91,
-            "Second listener".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(91, "Second listener".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -729,13 +737,10 @@ async fn channel_delete_removes_listener_before_channel_once() {
     server
         .server
         .get_channels()
-        .create_channel(Channel::new(
-            92,
-            "Listened channel".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(92, "Listened channel".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -1245,7 +1250,10 @@ async fn update_channel_name_propagates() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(11, "Old".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(11, "Old".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -1288,7 +1296,10 @@ async fn remove_channel_migrates_users_to_parent() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(20, "Doomed".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(20, "Doomed".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -1342,15 +1353,24 @@ async fn remove_channel_migrates_users_to_first_enterable_fallback() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(30, "Lobby".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(30, "Lobby".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(40, "DeniedParent".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(40, "DeniedParent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(41, "Doomed".to_owned(), 0, 0, Some(40)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(41, "Doomed".to_owned(), 0, 0, Some(40)),
+        )
         .await
         .unwrap();
     let deny_enter = ACL {
@@ -1362,10 +1382,18 @@ async fn remove_channel_migrates_users_to_first_enterable_fallback() {
         deny: ACLPermissions::Enter.into(),
     };
     chans
-        .set_acls(0, true, vec![deny_enter.clone()])
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            0,
+            true,
+            vec![deny_enter.clone()],
+        )
         .await
         .unwrap();
-    chans.set_acls(40, true, vec![deny_enter]).await.unwrap();
+    chans
+        .set_acls_in_server(crate::types::DEFAULT_SERVER_ID, 40, true, vec![deny_enter])
+        .await
+        .unwrap();
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await

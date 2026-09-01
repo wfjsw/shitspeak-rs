@@ -143,12 +143,11 @@ impl ModerationService {
     /// back via owner-scoped replication of `ClientGlobalState`.
     pub async fn dispatch_user_state(
         &self,
-        server_id: Option<&str>,
+        server_id: &str,
         actor: ClientSessionIdentifier,
         target: ClientSessionIdentifier,
         patch: UserStatePatch,
     ) -> Result<(), ApplicationError> {
-        let server_id = server_id.unwrap_or(shitspeak_core::DEFAULT_SERVER_ID);
         let env = ModerationEnvelope {
             actor_session: actor.to_u32(),
             target_session: target.to_u32(),
@@ -162,12 +161,11 @@ impl ModerationService {
     /// Ship a moderator-driven UserRemove (kick / ban) to the owner.
     pub async fn dispatch_user_remove(
         &self,
-        server_id: Option<&str>,
+        server_id: &str,
         actor: ClientSessionIdentifier,
         target: ClientSessionIdentifier,
         patch: UserRemovePatch,
     ) -> Result<(), ApplicationError> {
-        let server_id = server_id.unwrap_or(shitspeak_core::DEFAULT_SERVER_ID);
         let env = ModerationEnvelope {
             actor_session: actor.to_u32(),
             target_session: target.to_u32(),
@@ -338,9 +336,14 @@ mod tests {
             listening_channel_remove: vec![],
             expected_from_channel: None,
         };
-        svc.dispatch_user_state(None, actor, target, patch.clone())
-            .await
-            .unwrap();
+        svc.dispatch_user_state(
+            shitspeak_core::DEFAULT_SERVER_ID,
+            actor,
+            target,
+            patch.clone(),
+        )
+        .await
+        .unwrap();
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         let (dst, body) = &calls[0];
@@ -366,9 +369,14 @@ mod tests {
             ban_certificate: Some(true),
             ban_ip: Some(true),
         };
-        svc.dispatch_user_remove(None, actor, target, patch.clone())
-            .await
-            .unwrap();
+        svc.dispatch_user_remove(
+            shitspeak_core::DEFAULT_SERVER_ID,
+            actor,
+            target,
+            patch.clone(),
+        )
+        .await
+        .unwrap();
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, 7);

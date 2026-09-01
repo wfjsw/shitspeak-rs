@@ -180,7 +180,9 @@ pub(super) async fn activate_client_subscriptions(
                     .get_all_clients_in_server(&server_id)
                     .await
                     .into_iter()
-                    .filter(|client| client.is_authenticated() && client.is_published())
+                    .filter(|client| {
+                        client.is_authenticated() && client.is_published() && !client.is_invisible()
+                    })
                     .map(|client| (client.get_session_id(), client.get_current_channel_id())),
             );
         }
@@ -295,7 +297,11 @@ pub(super) async fn activate_client_projection(
                 session_channel_shadow.extend(
                     snapshot_clients
                         .into_iter()
-                        .filter(|client| client.is_authenticated() && client.is_published())
+                        .filter(|client| {
+                            client.is_authenticated()
+                                && client.is_published()
+                                && !client.is_invisible()
+                        })
                         .map(|client| (client.get_session_id(), client.get_current_channel_id())),
                 );
             }

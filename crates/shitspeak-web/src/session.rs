@@ -416,10 +416,11 @@ async fn configure_authenticated_client_inner(
             )
         })
         .flatten();
-    if server
-        .get_clients()
-        .authenticated_client_count_in_server(&server_id)
-        >= server.get_max_users()
+    if !result.invisible
+        && server
+            .get_clients()
+            .authenticated_client_count_in_server(&server_id)
+            >= server.get_max_users()
     {
         return Err(ConfigureAuthenticatedClientError::ServerFull);
     }
@@ -434,14 +435,15 @@ async fn configure_authenticated_client_inner(
             return Err(ConfigureAuthenticatedClientError::MissingRequiredGroup);
         }
     }
-    if !server
-        .get_clients()
-        .try_reserve_authenticated_client_in_server(
-            &server_id,
-            client.get_session_id(),
-            server.get_max_users(),
-        )
-        .await
+    if !result.invisible
+        && !server
+            .get_clients()
+            .try_reserve_authenticated_client_in_server(
+                &server_id,
+                client.get_session_id(),
+                server.get_max_users(),
+            )
+            .await
     {
         return Err(ConfigureAuthenticatedClientError::ServerFull);
     }
@@ -456,6 +458,7 @@ async fn configure_authenticated_client_inner(
         gs.set_fqdn(result.fqdn);
         gs.set_display_name(result.display_name);
         gs.set_superuser(result.is_superuser);
+        gs.set_invisible(result.invisible);
         gs.set_groups(result.groups.into_iter().collect());
         gs.set_texture_blob(initial_texture_url, None);
         gs.set_comment_blob(initial_comment_url, None);

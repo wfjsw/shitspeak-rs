@@ -4,6 +4,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ChannelRepoError {
+    #[error("channel operation requires a non-empty server id")]
+    InvalidServerId,
+
     #[error("channel {0} not found")]
     NotFound(u32),
 

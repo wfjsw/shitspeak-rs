@@ -470,9 +470,10 @@ async fn spawn_web_voice_outbound_task(
                     continue;
                 };
                 let context = outbound_context(&audio);
-                let channel_id = outbound_speaker_channel(&server, sender_session_id)
-                    .await
-                    .unwrap_or_else(|| client.get_current_channel_id());
+                let channel_id =
+                    outbound_speaker_channel(&server, &client.server_id(), sender_session_id)
+                        .await
+                        .unwrap_or_else(|| client.get_current_channel_id());
 
                 let (assigned, segment) = speaker_assignment_events(
                     &audio,
@@ -599,12 +600,13 @@ async fn send_peer_event(signaling_tx: &mpsc::Sender<PeerSignal>, event: ServerE
 
 async fn outbound_speaker_channel(
     server: &Option<Arc<Box<Server>>>,
+    server_id: &str,
     speaker_session: u32,
 ) -> Option<u32> {
     let server = server.as_ref()?;
     let client = server
         .get_clients()
-        .get_client(ClientSessionIdentifier::from(speaker_session))
+        .get_client_in_server(server_id, ClientSessionIdentifier::from(speaker_session))
         .await?;
     Some(client.get_current_channel_id())
 }

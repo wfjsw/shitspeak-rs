@@ -36,7 +36,10 @@ async fn acl_denies_enter_for_non_admin() {
     // Pre-create a "Private" sub-channel under root.
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(40, "Private".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(40, "Private".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -112,11 +115,15 @@ async fn superuser_respects_enter_when_debug_acl_enter_disabled() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(41, "Private".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(41, "Private".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             41,
             true,
             vec![ACL {
@@ -180,11 +187,15 @@ async fn superuser_ignores_enter_by_default() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(42, "Private".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(42, "Private".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             42,
             true,
             vec![ACL {
@@ -234,7 +245,10 @@ async fn acl_query_returns_chain() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(41, "Pub".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(41, "Pub".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -278,7 +292,10 @@ async fn superuser_acl_edit_does_not_add_personal_write_fallback() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(45, "SuperEdit".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(45, "SuperEdit".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -303,7 +320,10 @@ async fn superuser_acl_edit_does_not_add_personal_write_fallback() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let channel = chans.get_channel(45).await.expect("channel 45");
+    let channel = chans
+        .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 45)
+        .await
+        .expect("channel 45");
     assert_eq!(channel.acls.len(), 1);
     assert!(
         channel.acls.iter().all(|acl| acl.user_id != Some(1)),
@@ -324,11 +344,15 @@ async fn preserve_write_acl_on_edit_flag_disables_personal_write_fallback() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(46, "NormalEdit".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(46, "NormalEdit".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             46,
             true,
             vec![ACL {
@@ -350,7 +374,10 @@ async fn preserve_write_acl_on_edit_flag_disables_personal_write_fallback() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let channel = chans.get_channel(46).await.expect("channel 46");
+    let channel = chans
+        .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, 46)
+        .await
+        .expect("channel 46");
     assert!(
         channel.acls.is_empty(),
         "disabled preserve_write_acl_on_edit should let the ACL update remove the editor's Write"
@@ -366,19 +393,29 @@ async fn acl_query_returns_inherited_entries_before_local_entries() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(42, "Outer".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(42, "Outer".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(43, "Middle".to_owned(), 0, 0, Some(42)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(43, "Middle".to_owned(), 0, 0, Some(42)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(44, "Inner".to_owned(), 0, 0, Some(43)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(44, "Inner".to_owned(), 0, 0, Some(43)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             42,
             true,
             vec![acl_for_group(
@@ -391,7 +428,8 @@ async fn acl_query_returns_inherited_entries_before_local_entries() {
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             43,
             true,
             vec![acl_for_group(
@@ -404,7 +442,8 @@ async fn acl_query_returns_inherited_entries_before_local_entries() {
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             44,
             true,
             vec![acl_for_group(
@@ -638,7 +677,10 @@ async fn traverse_visibility_delete_refresh_skips_unrelated_known_users() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(90, "Doomed".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(90, "Doomed".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -694,11 +736,17 @@ async fn traverse_visibility_delete_refresh_removes_deleted_listener_channel() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(91, "Parent".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(91, "Parent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(92, "Child".to_owned(), 0, 0, Some(91)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(92, "Child".to_owned(), 0, 0, Some(91)),
+        )
         .await
         .unwrap();
 
@@ -949,15 +997,22 @@ async fn traverse_visibility_honors_child_allow_over_inherited_deny() {
 
     let channels = server.server.get_channels();
     channels
-        .create_channel(Channel::new(70, "Default".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(70, "Default".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(71, "Sibling".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(71, "Sibling".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![
@@ -983,7 +1038,8 @@ async fn traverse_visibility_honors_child_allow_over_inherited_deny() {
         .unwrap();
     for channel_id in [70, 71] {
         channels
-            .set_acls(
+            .set_acls_in_server(
+                crate::types::DEFAULT_SERVER_ID,
                 channel_id,
                 true,
                 vec![acl_for_group(
@@ -1147,7 +1203,10 @@ async fn traverse_visibility_reconciles_acl_changes() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(82, "Acl Flip".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(82, "Acl Flip".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -1216,27 +1275,37 @@ async fn traverse_visibility_reconciles_links_across_visibility_boundary() {
 
     let channels = server.server.get_channels();
     channels
-        .create_channel(Channel::new(
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(
+                SURVIVING_CHANNEL_ID,
+                "Visible Link Endpoint".to_owned(),
+                0,
+                0,
+                Some(0),
+            ),
+        )
+        .await
+        .unwrap();
+    channels
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(
+                FLIPPING_CHANNEL_ID,
+                "Visibility Link Target".to_owned(),
+                0,
+                0,
+                Some(0),
+            ),
+        )
+        .await
+        .unwrap();
+    channels
+        .add_link_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             SURVIVING_CHANNEL_ID,
-            "Visible Link Endpoint".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
-        .await
-        .unwrap();
-    channels
-        .create_channel(Channel::new(
             FLIPPING_CHANNEL_ID,
-            "Visibility Link Target".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
-        .await
-        .unwrap();
-    channels
-        .add_link(SURVIVING_CHANNEL_ID, FLIPPING_CHANNEL_ID)
+        )
         .await
         .unwrap();
 
@@ -1342,13 +1411,10 @@ async fn live_acl_changes_do_not_hide_users_when_visibility_filtering_is_disable
     server
         .server
         .get_channels()
-        .create_channel(Channel::new(
-            83,
-            "Visible ACL Flip".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(83, "Visible ACL Flip".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -1423,7 +1489,10 @@ async fn traverse_visibility_retains_viewer_self_and_channel_after_losing_traver
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(89, "Current".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(89, "Current".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -1761,7 +1830,10 @@ async fn traverse_visibility_scrubs_hidden_actor_from_projected_user_events() {
     create_secret_channel(&server, 84).await;
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(85, "Public Move".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(85, "Public Move".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -1971,17 +2043,15 @@ async fn create_secret_channel(
 ) {
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(
-            channel_id,
-            format!("Secret {channel_id}"),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(channel_id, format!("Secret {channel_id}"), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             channel_id,
             true,
             vec![acl_for_group(
@@ -2012,7 +2082,7 @@ async fn connected_client(
     server
         .server
         .get_clients()
-        .get_client(client.server_session)
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, client.server_session)
         .await
         .expect("connected client")
 }
@@ -2048,19 +2118,29 @@ async fn acl_cache_home_move_only_invalidates_home_dependent_entries() {
 
     let channels = server.server.get_channels();
     channels
-        .create_channel(Channel::new(200, "Static ACL".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(200, "Static ACL".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(201, "Home ACL".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(201, "Home ACL".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(202, "Destination".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(202, "Destination".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             200,
             true,
             vec![acl_for_group(
@@ -2073,7 +2153,8 @@ async fn acl_cache_home_move_only_invalidates_home_dependent_entries() {
         .await
         .unwrap();
     channels
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             201,
             true,
             vec![acl_for_group(
@@ -2180,11 +2261,17 @@ async fn acl_cache_parent_acl_change_updates_descendant_permissions() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(50, "Parent".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(50, "Parent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(51, "Child".to_owned(), 0, 0, Some(50)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(51, "Child".to_owned(), 0, 0, Some(50)),
+        )
         .await
         .unwrap();
 
@@ -2196,7 +2283,8 @@ async fn acl_cache_parent_acl_change_updates_descendant_permissions() {
     assert!(initial.contains(ACLPermissions::Enter));
 
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             50,
             true,
             vec![acl_for_group(
@@ -2222,27 +2310,24 @@ async fn acl_cache_parent_acl_change_does_not_invalidate_unrelated_channel_cache
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(
-            54,
-            "Affected Parent".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(54, "Affected Parent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(
-            55,
-            "Affected Child".to_owned(),
-            0,
-            0,
-            Some(54),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(55, "Affected Child".to_owned(), 0, 0, Some(54)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(56, "Unrelated".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(56, "Unrelated".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -2258,7 +2343,8 @@ async fn acl_cache_parent_acl_change_does_not_invalidate_unrelated_channel_cache
     assert!(unrelated.contains(ACLPermissions::Enter));
 
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             54,
             true,
             vec![acl_for_group(
@@ -2296,11 +2382,15 @@ async fn explicit_enter_deny_can_override_write_permission() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(52, "Writable".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(52, "Writable".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             52,
             true,
             vec![acl_for_group(
@@ -2331,15 +2421,22 @@ async fn acl_cache_inherit_toggle_updates_child_permissions() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(52, "Parent".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(52, "Parent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(53, "Child".to_owned(), 0, 0, Some(52)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(53, "Child".to_owned(), 0, 0, Some(52)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             52,
             true,
             vec![acl_for_group(
@@ -2360,7 +2457,8 @@ async fn acl_cache_inherit_toggle_updates_child_permissions() {
     assert!(!denied.contains(ACLPermissions::Enter));
 
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             53,
             false,
             vec![acl_for_group(
@@ -2386,16 +2484,23 @@ async fn acl_child_allow_overrides_parent_deny() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(60, "Parent".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(60, "Parent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(61, "Child".to_owned(), 0, 0, Some(60)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(61, "Child".to_owned(), 0, 0, Some(60)),
+        )
         .await
         .unwrap();
 
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             60,
             true,
             vec![acl_for_group(
@@ -2408,7 +2513,8 @@ async fn acl_child_allow_overrides_parent_deny() {
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             61,
             true,
             vec![acl_for_group(
@@ -2444,16 +2550,23 @@ async fn acl_target_inherit_false_drops_parent_denies() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(63, "Parent".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(63, "Parent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(64, "Child".to_owned(), 0, 0, Some(63)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(64, "Child".to_owned(), 0, 0, Some(63)),
+        )
         .await
         .unwrap();
 
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             63,
             true,
             vec![acl_for_group(
@@ -2465,7 +2578,10 @@ async fn acl_target_inherit_false_drops_parent_denies() {
         )
         .await
         .unwrap();
-    chans.set_acls(64, false, Vec::new()).await.unwrap();
+    chans
+        .set_acls_in_server(crate::types::DEFAULT_SERVER_ID, 64, false, Vec::new())
+        .await
+        .unwrap();
 
     let bob = TestClient::connect_and_authenticate(&server, "bob", None)
         .await
@@ -2487,11 +2603,15 @@ async fn permission_query_reports_evaluated_bits() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(62, "NoText".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(62, "NoText".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             62,
             true,
             vec![acl_for_group(
@@ -2578,11 +2698,15 @@ async fn user_without_user_id_matches_all_but_not_auth_group() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(72, "Guest".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(72, "Guest".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             72,
             true,
             vec![
@@ -2621,11 +2745,17 @@ async fn entering_channel_sends_permission_query_for_channel_and_parent() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(65, "Parent".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(65, "Parent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(66, "Child".to_owned(), 0, 0, Some(65)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(66, "Child".to_owned(), 0, 0, Some(65)),
+        )
         .await
         .unwrap();
 
@@ -2667,7 +2797,8 @@ async fn in_group_speak_allow_clears_suppress_after_entering_channel() {
 
     let chans = server.server.get_channels();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![acl_for_group(
@@ -2680,11 +2811,15 @@ async fn in_group_speak_allow_clears_suppress_after_entering_channel() {
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(74, "Stage".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(74, "Stage".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             74,
             true,
             vec![acl_for_group(
@@ -2736,7 +2871,8 @@ async fn cached_login_into_in_group_speak_channel_starts_unsuppressed() {
 
     let chans = server.server.get_channels();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![acl_for_group(
@@ -2749,21 +2885,22 @@ async fn cached_login_into_in_group_speak_channel_starts_unsuppressed() {
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(75, "Fleet 04".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(75, "Fleet 04".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(
-            76,
-            "Fleet 04 Ready".to_owned(),
-            0,
-            0,
-            Some(75),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(76, "Fleet 04 Ready".to_owned(), 0, 0, Some(75)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             76,
             true,
             vec![acl_for_group(
@@ -2808,11 +2945,15 @@ async fn cached_login_without_traverse_falls_back_to_default_channel() {
 
     let channels = server.server.get_channels();
     channels
-        .create_channel(Channel::new(78, "Cached hidden".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(78, "Cached hidden".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             78,
             true,
             vec![acl_for_group(
@@ -2866,17 +3007,15 @@ async fn cached_listener_without_listen_permission_is_not_restored() {
 
     let channels = server.server.get_channels();
     channels
-        .create_channel(Channel::new(
-            79,
-            "Cached listener".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(79, "Cached listener".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             79,
             true,
             vec![acl_for_group(
@@ -2944,7 +3083,8 @@ async fn acl_cache_does_not_cross_reused_local_session_ids() {
 
     let chans = server.server.get_channels();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![
@@ -2967,7 +3107,10 @@ async fn acl_cache_does_not_cross_reused_local_session_ids() {
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(77, "Fleet 04".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(77, "Fleet 04".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -3030,7 +3173,10 @@ async fn acl_cache_acl_update_sends_channel_scoped_permission_refresh_to_all_cli
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(67, "Shared".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(67, "Shared".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -3044,7 +3190,8 @@ async fn acl_cache_acl_update_sends_channel_scoped_permission_refresh_to_all_cli
     bob.drain_now().await;
 
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             67,
             true,
             vec![acl_for_group(
@@ -3119,7 +3266,10 @@ async fn identical_acl_save_preserves_version_and_emits_no_permission_refresh() 
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(68, "Stable".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(68, "Stable".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -3222,11 +3372,17 @@ async fn explicit_user_non_traverse_acl_delta_refreshes_only_target_user() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(90, "Parent".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(90, "Parent".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(91, "Child".to_owned(), 0, 0, Some(90)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(91, "Child".to_owned(), 0, 0, Some(90)),
+        )
         .await
         .unwrap();
 
@@ -3377,13 +3533,16 @@ async fn explicit_user_traverse_delta_reconciles_only_target_across_subtree() {
         (107, 0),
     ] {
         chans
-            .create_channel(Channel::new(
-                channel_id,
-                format!("Channel {channel_id}"),
-                0,
-                0,
-                Some(parent_id),
-            ))
+            .create_channel_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                Channel::new(
+                    channel_id,
+                    format!("Channel {channel_id}"),
+                    0,
+                    0,
+                    Some(parent_id),
+                ),
+            )
             .await
             .unwrap();
     }
@@ -3511,18 +3670,30 @@ async fn inherited_traverse_delta_closes_visibility_across_acl_barrier() {
 
     let channels = server.server.get_channels();
     channels
-        .create_channel(Channel::new(110, "Edited".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(110, "Edited".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(111, "Inheriting".to_owned(), 0, 0, Some(110)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(111, "Inheriting".to_owned(), 0, 0, Some(110)),
+        )
         .await
         .unwrap();
     channels
-        .create_channel(Channel::new(112, "Barrier".to_owned(), 0, 0, Some(111)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(112, "Barrier".to_owned(), 0, 0, Some(111)),
+        )
         .await
         .unwrap();
-    channels.set_acls(112, false, Vec::new()).await.unwrap();
+    channels
+        .set_acls_in_server(crate::types::DEFAULT_SERVER_ID, 112, false, Vec::new())
+        .await
+        .unwrap();
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -3774,13 +3945,17 @@ async fn channel_state_initial_sync_includes_permission_info_when_enabled() {
     server
         .server
         .get_channels()
-        .create_channel(Channel::new(68, "Private".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(68, "Private".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     server
         .server
         .get_channels()
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             68,
             true,
             vec![acl_for_group(
@@ -3823,13 +3998,16 @@ async fn initial_permission_info_is_embedded_without_a_deferred_duplicate_sweep(
         server
             .server
             .get_channels()
-            .create_channel(Channel::new(
-                channel_id,
-                format!("channel-{channel_id}"),
-                channel_id as i32,
-                0,
-                Some(0),
-            ))
+            .create_channel_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                Channel::new(
+                    channel_id,
+                    format!("channel-{channel_id}"),
+                    channel_id as i32,
+                    0,
+                    Some(0),
+                ),
+            )
             .await
             .unwrap();
     }
@@ -3884,11 +4062,15 @@ async fn channel_state_permission_info_includes_inherited_restrictions() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(71, "Child".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(71, "Child".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![acl_for_group(
@@ -3962,7 +4144,10 @@ async fn channel_state_permission_info_refreshes_after_acl_update() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(69, "Private".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(69, "Private".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 
@@ -4024,11 +4209,15 @@ async fn channel_create_permission_info_does_not_refresh_existing_channels() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(72, "Existing".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(72, "Existing".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             72,
             true,
             vec![acl_for_group(
@@ -4114,11 +4303,15 @@ async fn channel_state_permission_info_refreshes_only_affected_user_after_token_
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(70, "Door".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(70, "Door".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             70,
             true,
             vec![acl_for_group(
@@ -4188,25 +4381,29 @@ async fn channel_move_permission_info_refreshes_only_home_channel_dependent_acls
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(73, "Lobby".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(73, "Lobby".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(
-            74,
-            "Current Sensitive".to_owned(),
-            0,
-            0,
-            Some(0),
-        ))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(74, "Current Sensitive".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(75, "Static".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(75, "Static".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             74,
             true,
             vec![acl_for_group(
@@ -4219,7 +4416,8 @@ async fn channel_move_permission_info_refreshes_only_home_channel_dependent_acls
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             75,
             true,
             vec![acl_for_group(
@@ -4300,19 +4498,29 @@ async fn channel_move_permission_info_refresh_scope_includes_inherited_sub_acls(
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(76, "Fleet".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(76, "Fleet".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(77, "Squad".to_owned(), 0, 0, Some(76)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(77, "Squad".to_owned(), 0, 0, Some(76)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(78, "Command".to_owned(), 0, 0, Some(76)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(78, "Command".to_owned(), 0, 0, Some(76)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             76,
             true,
             vec![acl_for_group(
@@ -4384,7 +4592,8 @@ async fn superuser_speak_and_whisper_follow_acl_evaluation() {
     server
         .server
         .get_channels()
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![acl_for_group(
@@ -4412,19 +4621,29 @@ async fn acl_cache_parent_move_updates_inherited_permissions() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(54, "Open".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(54, "Open".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(55, "Restricted".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(55, "Restricted".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(56, "Child".to_owned(), 0, 0, Some(54)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(56, "Child".to_owned(), 0, 0, Some(54)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             55,
             true,
             vec![acl_for_group(
@@ -4446,7 +4665,10 @@ async fn acl_cache_parent_move_updates_inherited_permissions() {
 
     let mut patch = empty_channel_patch();
     patch.parent_id = Some(Some(55));
-    chans.update_channel(56, patch).await.unwrap();
+    chans
+        .update_channel_in_server(crate::types::DEFAULT_SERVER_ID, 56, patch)
+        .await
+        .unwrap();
 
     let after = cached_permissions(&server, &bob, 56).await;
     assert!(!after.contains(ACLPermissions::Enter));
@@ -4461,11 +4683,15 @@ async fn acl_cache_token_update_changes_permissions() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(57, "Token".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(57, "Token".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             57,
             true,
             vec![acl_for_group(
@@ -4501,11 +4727,15 @@ async fn acl_cache_group_and_user_id_changes_update_permissions() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(58, "Identity".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(58, "Identity".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             58,
             true,
             vec![acl_for_group(
@@ -4547,7 +4777,8 @@ async fn acl_cache_group_and_user_id_changes_update_permissions() {
     }
 
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             58,
             true,
             vec![ACL {
@@ -4591,7 +4822,10 @@ async fn acl_cache_missing_channel_result_is_not_cached() {
     server
         .server
         .get_channels()
-        .create_channel(Channel::new(59, "Later".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(59, "Later".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 

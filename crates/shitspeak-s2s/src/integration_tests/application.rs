@@ -522,7 +522,12 @@ async fn three_node_moderation_unicasts_to_owner() {
     };
     app_a
         .moderation()
-        .dispatch_user_state(None, actor, target, patch.clone())
+        .dispatch_user_state(
+            shitspeak_core::DEFAULT_SERVER_ID,
+            actor,
+            target,
+            patch.clone(),
+        )
         .await
         .expect("dispatch_user_state");
 

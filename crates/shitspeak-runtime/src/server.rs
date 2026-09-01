@@ -1723,6 +1723,8 @@ impl Server {
             return;
         };
 
+        let previous_max_bandwidth = client.max_bandwidth(self.get_max_bandwidth());
+
         result.virtual_server_id =
             shitspeak_auth::normalize_virtual_server_id(result.virtual_server_id);
 
@@ -1741,6 +1743,7 @@ impl Server {
             display_name,
             groups,
             is_superuser,
+            invisible,
             virtual_server_id,
             language,
             max_bandwidth,
@@ -1749,6 +1752,7 @@ impl Server {
             auth_session_id,
             authenticated_until,
             authentication_expiry_action,
+            ..
         } = result;
         if user_id == Some(u32::MAX) {
             self.disconnect_local_client(&client, "reauthentication returned reserved user id")
@@ -1771,12 +1775,9 @@ impl Server {
             .as_deref()
             .is_some_and(|server_id| server_id != client.server_id())
         {
-            tracing::warn!(
-                session = u32::from(client.get_session_id()),
-                current_server_id = %client.server_id(),
-                requested_server_id = ?virtual_server_id,
-                "ignoring virtual-server change during reauthentication"
-            );
+            self.disconnect_local_client(&client, "reauthentication changed virtual server id")
+                .await;
+            return;
         }
 
         client.set_language(language);
@@ -1828,6 +1829,29 @@ impl Server {
         if !self.client_instance_is_current(&client).await {
             return;
         }
+        let was_invisible = client.is_invisible();
+        if was_invisible && !invisible {
+            if !self
+                .clients
+                .try_reserve_authenticated_client_in_server(
+                    &client.server_id(),
+                    client.get_session_id(),
+                    self.get_max_users(),
+                )
+                .await
+            {
+                self.disconnect_local_client(&client, "reauthentication server full")
+                    .await;
+                return;
+            }
+        } else if !was_invisible && invisible {
+            self.clients
+                .release_authenticated_client_reservation_in_server(
+                    &client.server_id(),
+                    client.get_session_id(),
+                )
+                .await;
+        }
         if let (Some(user_id), Some(fqdn)) =
             (user_id, fqdn.as_deref().filter(|fqdn| !fqdn.is_empty()))
         {
@@ -1853,6 +1877,7 @@ impl Server {
             state.set_display_name(display_name);
             state.set_groups(groups);
             state.set_superuser(is_superuser);
+            state.set_invisible(invisible);
             state.set_current_channel_id(target_channel_id);
             state
                 .set_suppress(!target_permissions.contains(shitspeak_state::ACLPermissions::Speak));
@@ -1866,6 +1891,10 @@ impl Server {
             authenticated_until,
             authentication_expiry_action,
         );
+        let max_bandwidth = client.max_bandwidth(self.get_max_bandwidth());
+        if max_bandwidth != previous_max_bandwidth {
+            self.send_max_bandwidth_update(&client, max_bandwidth).await;
+        }
         tracing::trace!(
             session = u32::from(client.get_session_id()),
             user_id = ?client.get_user_id(),
@@ -2041,7 +2070,7 @@ impl Server {
                         };
                         if server
                             .s2s_manager()
-                            .propose_channel_op(Some(&server_id), op)
+                            .propose_channel_op(&server_id, op)
                             .await
                             .should_apply_locally()
                         {
@@ -2095,11 +2124,17 @@ impl Server {
 
                 self.apply_entrypoint_config(&new_config).await?;
 
-                let (root_channel_config_update, invalidate_acl_cache, visibility_reload) = {
+                let (
+                    root_channel_config_update,
+                    invalidate_acl_cache,
+                    visibility_reload,
+                    max_bandwidth_changed,
+                ) = {
                     let mut invalidate_acl_cache = false;
                     let mut root_channel_config_update = None;
                     let mut visibility_reload = false;
                     let current = self.config.load_full();
+                    let max_bandwidth_changed = current.max_bandwidth != new_config.max_bandwidth;
                     // Log notable changes
                     if current.welcome_text != new_config.welcome_text {
                         tracing::info!("config reload: welcome_text changed");
@@ -2336,6 +2371,7 @@ impl Server {
                         root_channel_config_update,
                         invalidate_acl_cache,
                         visibility_reload,
+                        max_bandwidth_changed,
                     )
                 };
                 if let Some(root_channel_config) = root_channel_config_update {
@@ -2349,6 +2385,9 @@ impl Server {
                 if visibility_reload {
                     self.visibility_generation.fetch_add(1, Ordering::SeqCst);
                     let _ = self.visibility_reload_tx.send(());
+                }
+                if max_bandwidth_changed {
+                    self.update_inherited_client_max_bandwidth().await;
                 }
                 self.auth_finalization_queue
                     .apply_prepared_authenticator_reload(prepared_authenticator);
@@ -2760,6 +2799,32 @@ impl Server {
         self.read_config().max_bandwidth
     }
 
+    async fn update_inherited_client_max_bandwidth(&self) {
+        let max_bandwidth = self.get_max_bandwidth();
+        for client in self.clients.get_local_clients().await {
+            if !client.is_authenticated() || client.max_bandwidth_override().is_some() {
+                continue;
+            }
+            self.send_max_bandwidth_update(&client, max_bandwidth).await;
+        }
+    }
+
+    async fn send_max_bandwidth_update(&self, client: &Client, max_bandwidth: u32) {
+        let message: shitspeak_messages::messages::Message =
+            shitspeak_messages::messages::encoder::ServerSync {
+                session: None,
+                max_bandwidth: Some(max_bandwidth),
+                welcome_text: None,
+                permissions: None,
+            }
+            .into();
+        if let Err(error) = client.enqueue_proto_message(&message).await {
+            client.in_tracing_scope(
+                || tracing::debug!(%error, "failed to send max_bandwidth update"),
+            );
+        }
+    }
+
     pub fn get_server_protocol_version(&self) -> crate::protocol_version::ProtocolVersion {
         self.read_config().server_protocol_version
     }
@@ -2808,7 +2873,9 @@ impl Server {
 
         let (user_count, max_user_count) = match user_count_scope {
             UdpPingUserCountScope::Cluster => {
-                let users = server.clients.len_in_server(status_server_id).await;
+                let users = server
+                    .clients
+                    .authenticated_client_count_in_server(status_server_id);
                 let max_users = server
                     .s2s_manager
                     .cluster_max_users()
@@ -2817,8 +2884,10 @@ impl Server {
                 (users as u64, max_users)
             }
             UdpPingUserCountScope::Local => {
-                let users = server.clients.local_len_in_server(status_server_id).await;
-                (users as u64, local_max_users)
+                let users = server
+                    .clients
+                    .local_authenticated_client_count_in_server(status_server_id);
+                (users, local_max_users)
             }
         };
 
@@ -2884,7 +2953,13 @@ impl Server {
                 }
                 .into()
             };
-            self.clients.broadcast_all(&msg).await;
+            let server_ids = all_clients
+                .iter()
+                .map(|client| client.server_id())
+                .collect::<HashSet<_>>();
+            for server_id in server_ids {
+                self.clients.broadcast_all_in_server(&server_id, &msg).await;
+            }
         }
     }
 }

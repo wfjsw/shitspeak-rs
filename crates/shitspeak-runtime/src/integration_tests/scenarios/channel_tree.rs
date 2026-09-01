@@ -29,15 +29,24 @@ async fn tree_burst_includes_all_channels() {
     //       └── corner (3)
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(1, "general".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(1, "general".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(2, "lobby".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(2, "lobby".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(3, "corner".to_owned(), 0, 0, Some(2)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(3, "corner".to_owned(), 0, 0, Some(2)),
+        )
         .await
         .unwrap();
 
@@ -81,14 +90,23 @@ async fn tree_burst_defers_links_until_after_channel_map() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(1, "first".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(1, "first".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .create_channel(Channel::new(2, "second".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(2, "second".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
-    chans.add_link(1, 2).await.unwrap();
+    chans
+        .add_link_in_server(crate::types::DEFAULT_SERVER_ID, 1, 2)
+        .await
+        .unwrap();
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -171,7 +189,10 @@ async fn tree_remove_propagates_to_peer() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(7, "doomed".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(7, "doomed".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
 

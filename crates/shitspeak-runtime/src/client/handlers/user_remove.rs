@@ -110,7 +110,7 @@ pub async fn handle_user_remove(
         if !server
             .s2s_manager()
             .dispatch_moderation_user_remove(
-                Some(&server_id),
+                &server_id,
                 sender.get_session_id(),
                 target_session,
                 patch,
@@ -225,9 +225,10 @@ pub async fn handle_user_remove(
     let old_channel_id = target.get_current_channel_id();
     let removed = server
         .get_clients()
-        .remove_client_in_server_with_metadata(
+        .remove_client_instance_in_server_with_metadata(
             &server_id,
             target_session,
+            target.client_instance_id(),
             Some(actor),
             msg.reason.clone(),
             is_ban,

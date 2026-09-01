@@ -449,6 +449,14 @@ impl ClientProjectionState {
         tracing::trace!(?broadcast, "shard received client log broadcast");
         let entry = &broadcast.entry;
         if matches!(entry.op, ClientStateOperation::ResetNode { .. }) {
+            if entry.op.server_id() != self.client.server_id() {
+                if let Some(version) = broadcast.versions.get(&entry.node_id).copied()
+                    && version != 0
+                {
+                    merge_version_vector(&mut self.last_client_versions, &broadcast.versions);
+                }
+                return Ok(());
+            }
             match broadcast.versions.get(&entry.node_id).copied() {
                 Some(0) => {
                     self.append_origin_reset(server, entry.node_id, outbound)
@@ -981,7 +989,13 @@ mod tests {
         let local = SocketAddr::new(ip, 64738);
         let (output_tx, _output_rx) = tokio::sync::mpsc::channel(1);
         let client = repo
-            .allocate_web_client(ip, SocketAddr::new(ip, 30000), local, output_tx)
+            .allocate_web_client_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                ip,
+                SocketAddr::new(ip, 30000),
+                local,
+                output_tx,
+            )
             .await;
         let mut projection = projection_for_delivery(client);
 
@@ -998,10 +1012,22 @@ mod tests {
         let (slow_tx, mut slow_rx) = tokio::sync::mpsc::channel(1);
         let (fast_tx, mut fast_rx) = tokio::sync::mpsc::channel(1);
         let slow_client = repo
-            .allocate_web_client(ip, SocketAddr::new(ip, 30001), local, slow_tx.clone())
+            .allocate_web_client_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                ip,
+                SocketAddr::new(ip, 30001),
+                local,
+                slow_tx.clone(),
+            )
             .await;
         let fast_client = repo
-            .allocate_web_client(ip, SocketAddr::new(ip, 30002), local, fast_tx)
+            .allocate_web_client_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                ip,
+                SocketAddr::new(ip, 30002),
+                local,
+                fast_tx,
+            )
             .await;
         let slow_projection = projection_for_delivery(Arc::clone(&slow_client));
         let fast_projection = projection_for_delivery(fast_client);

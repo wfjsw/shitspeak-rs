@@ -3017,7 +3017,10 @@ mod tests {
 
         let authenticated_client = server
             .get_clients()
-            .get_client(ClientSessionIdentifier::from(session))
+            .get_client_in_server(
+                shitspeak_runtime::types::DEFAULT_SERVER_ID,
+                ClientSessionIdentifier::from(session),
+            )
             .await
             .expect("authenticated web client");
         {
@@ -3096,7 +3099,10 @@ mod tests {
         let server = test_server_with_authenticator(TestAuthenticator::default_session()).await;
         server
             .get_channels()
-            .create_channel(shitspeak_state::Channel::new(1, "Lobby", 0, 0, Some(0)))
+            .create_channel_in_server(
+                shitspeak_runtime::types::DEFAULT_SERVER_ID,
+                shitspeak_state::Channel::new(1, "Lobby", 0, 0, Some(0)),
+            )
             .await
             .unwrap();
 
@@ -3337,6 +3343,7 @@ mod tests {
                 display_name: Some("Alice".to_string()),
                 groups: vec!["web".to_string()],
                 is_superuser: false,
+                invisible: false,
                 virtual_server_id: None,
                 language: Language::default(),
                 max_bandwidth: None,

@@ -36,6 +36,7 @@ pub struct ClientGlobalState {
     fqdn: Option<String>,
     groups: HashSet<String>,
     is_superuser: bool,
+    invisible: bool,
     tokens: HashSet<String>,
     display_name: Option<String>,
     /// Broad generation retained for voice-routing caches, which depend on
@@ -79,6 +80,7 @@ impl ClientGlobalState {
             fqdn: None,
             groups: HashSet::new(),
             is_superuser: false,
+            invisible: false,
             tokens: HashSet::new(),
             display_name: None,
             acl_generation: 0,
@@ -461,6 +463,20 @@ impl ClientGlobalState {
 
     pub fn is_superuser(&self) -> bool {
         self.is_superuser
+    }
+
+    pub fn is_invisible(&self) -> bool {
+        self.invisible
+    }
+
+    pub fn set_invisible(&mut self, value: bool) {
+        if self.invisible == value {
+            return;
+        }
+        self.invisible = value;
+        if self.delta_recording {
+            self.pending_delta.invisible = Some(value);
+        }
     }
 
     pub fn set_superuser(&mut self, value: bool) {

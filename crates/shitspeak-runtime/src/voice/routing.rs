@@ -1911,11 +1911,15 @@ async fn route_decoded_s2s_voice_frame(
         frame.sender_session,
     );
 
-    let server_id = if frame.server_id.is_empty() {
-        crate::types::default_server_id()
-    } else {
-        frame.server_id.clone()
-    };
+    if frame.server_id.is_empty() {
+        tracing::trace!(
+            from = from_immediate,
+            sender = frame.sender_session,
+            "dropping s2s voice frame without a server scope"
+        );
+        return;
+    }
+    let server_id = frame.server_id.clone();
     let replicated_sender = server
         .get_clients()
         .get_client_in_server(&server_id, sender_id)

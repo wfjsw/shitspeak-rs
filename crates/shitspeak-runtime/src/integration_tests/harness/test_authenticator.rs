@@ -22,6 +22,7 @@ struct ScriptedUser {
     user_id: Option<u32>,
     groups: Vec<String>,
     is_superuser: bool,
+    invisible: bool,
     language: Language,
     virtual_server_id: Option<String>,
     max_bandwidth: Option<u32>,
@@ -149,6 +150,50 @@ impl TestAuthenticator {
         );
     }
 
+    pub fn register_invisible_user(
+        &self,
+        name: &str,
+        password: Option<&str>,
+        user_id: Option<u32>,
+        groups: Vec<String>,
+    ) {
+        self.users.lock().unwrap().insert(
+            name.to_owned(),
+            ScriptedUser {
+                password: password.map(str::to_owned),
+                user_id,
+                groups,
+                is_superuser: false,
+                invisible: true,
+                language: Language::default(),
+                virtual_server_id: None,
+                max_bandwidth: None,
+            },
+        );
+    }
+
+    pub fn register_invisible_superuser(
+        &self,
+        name: &str,
+        password: Option<&str>,
+        user_id: Option<u32>,
+        groups: Vec<String>,
+    ) {
+        self.users.lock().unwrap().insert(
+            name.to_owned(),
+            ScriptedUser {
+                password: password.map(str::to_owned),
+                user_id,
+                groups,
+                is_superuser: true,
+                invisible: true,
+                language: Language::default(),
+                virtual_server_id: None,
+                max_bandwidth: None,
+            },
+        );
+    }
+
     pub fn register_user_with_max_bandwidth(
         &self,
         name: &str,
@@ -219,6 +264,7 @@ impl TestAuthenticator {
                 user_id,
                 groups,
                 is_superuser,
+                invisible: false,
                 language,
                 virtual_server_id: virtual_server_id.map(str::to_owned),
                 max_bandwidth,
@@ -285,6 +331,7 @@ impl Authenticator for AuthenticatorAdapter {
             display_name: Some(username.to_owned()),
             groups: entry.groups,
             is_superuser: entry.is_superuser,
+            invisible: entry.invisible,
             virtual_server_id: entry.virtual_server_id,
             language: entry.language,
             max_bandwidth: entry.max_bandwidth,

@@ -1447,10 +1447,6 @@ impl ChannelRepository {
 
     // ── Version ───────────────────────────────────────────────────────────
 
-    pub fn current_version(&self) -> u64 {
-        self.current_version_in_server(DEFAULT_SERVER_ID)
-    }
-
     pub fn current_version_in_server(&self, server_id: &str) -> u64 {
         self.versions.read().get(server_id).copied().unwrap_or(0)
     }
@@ -1460,11 +1456,6 @@ impl ChannelRepository {
     /// ambiguous until startup recovery reloads it.
     pub fn strict_operation_durability_enabled(&self) -> bool {
         self.storage_dir.is_some() && !self.wal_poisoned.load(Ordering::Acquire)
-    }
-
-    /// Return the durable strict operation ids for the default channel scope.
-    pub fn strict_operation_ids(&self) -> Vec<StrictOperationId> {
-        self.strict_operation_ids_in_server(DEFAULT_SERVER_ID)
     }
 
     /// Return the durable strict operation ids for one channel scope. These
@@ -1549,16 +1540,6 @@ impl ChannelRepository {
             freshness,
             operation_ids,
         }
-    }
-
-    /// Merge strict operation ids received with a snapshot for the default
-    /// channel scope and persist the expanded ledger.
-    pub async fn merge_strict_operation_ids(
-        self: &Arc<Self>,
-        operation_ids: Vec<StrictOperationId>,
-    ) -> Result<(), ChannelRepoError> {
-        self.merge_strict_operation_ids_in_server(DEFAULT_SERVER_ID, operation_ids)
-            .await
     }
 
     /// Merge strict operation ids received with a snapshot for one channel
@@ -1764,10 +1745,6 @@ impl ChannelRepository {
 
     // ── Read API ──────────────────────────────────────────────────────────
 
-    pub async fn get_channel(&self, id: u32) -> Option<Arc<Channel>> {
-        self.get_channel_in_server(DEFAULT_SERVER_ID, id).await
-    }
-
     pub async fn get_channel_in_server(&self, server_id: &str, id: u32) -> Option<Arc<Channel>> {
         self.channels
             .read()
@@ -1883,11 +1860,6 @@ impl ChannelRepository {
     }
 
     /// Returns true if `channel_id` is inside a subtree currently marked for deletion.
-    pub async fn is_pending_delete_subtree(&self, channel_id: u32) -> bool {
-        self.is_pending_delete_subtree_in_server(DEFAULT_SERVER_ID, channel_id)
-            .await
-    }
-
     pub async fn is_pending_delete_subtree_in_server(
         &self,
         server_id: &str,
@@ -1911,11 +1883,6 @@ impl ChannelRepository {
     }
 
     /// Resolve `channel_id` to the nearest non-pending ancestor, or root.
-    pub async fn redirect_pending_delete_target(&self, channel_id: u32) -> u32 {
-        self.redirect_pending_delete_target_in_server(DEFAULT_SERVER_ID, channel_id)
-            .await
-    }
-
     pub async fn redirect_pending_delete_target_in_server(
         &self,
         server_id: &str,
@@ -1939,11 +1906,6 @@ impl ChannelRepository {
     }
 
     /// Return the subtree ids if `id` is currently marked with `nonce`.
-    pub async fn pending_delete_subtree(&self, id: u32, nonce: u64) -> Vec<u32> {
-        self.pending_delete_subtree_in_server(DEFAULT_SERVER_ID, id, nonce)
-            .await
-    }
-
     pub async fn pending_delete_subtree_in_server(
         &self,
         server_id: &str,
@@ -1976,11 +1938,6 @@ impl ChannelRepository {
     }
 
     /// Return root pending-delete markers that have exceeded `timeout_ms`.
-    pub async fn expired_pending_deletes(&self, timeout_ms: i64) -> Vec<(u32, u64)> {
-        self.expired_pending_deletes_in_server(DEFAULT_SERVER_ID, timeout_ms)
-            .await
-    }
-
     pub async fn expired_pending_deletes_in_server(
         &self,
         server_id: &str,
@@ -2041,10 +1998,6 @@ impl ChannelRepository {
             .await
     }
 
-    pub async fn get_all(&self) -> Vec<Arc<Channel>> {
-        self.get_all_in_server(DEFAULT_SERVER_ID).await
-    }
-
     pub async fn get_all_in_server(&self, server_id: &str) -> Vec<Arc<Channel>> {
         self.ordered_snapshot_in_server(server_id).as_ref().to_vec()
     }
@@ -2100,21 +2053,12 @@ impl ChannelRepository {
     }
 
     /// Return the total number of channels.
-    pub async fn len(&self) -> usize {
-        self.len_in_server(DEFAULT_SERVER_ID).await
-    }
-
     pub async fn len_in_server(&self, server_id: &str) -> usize {
         self.channels
             .read()
             .get(server_id)
             .map(|channels| channels.len().max(1))
             .unwrap_or(1)
-    }
-
-    pub async fn get_children(&self, parent_id: u32) -> Vec<Arc<Channel>> {
-        self.get_children_in_server(DEFAULT_SERVER_ID, parent_id)
-            .await
     }
 
     pub async fn get_children_in_server(
@@ -2154,11 +2098,6 @@ impl ChannelRepository {
 
     /// Returns the chain of ancestors for `channel_id`, starting from the
     /// immediate parent up to (and including) the root.
-    pub async fn get_ancestors(&self, channel_id: u32) -> Vec<Arc<Channel>> {
-        self.get_ancestors_in_server(DEFAULT_SERVER_ID, channel_id)
-            .await
-    }
-
     pub async fn get_ancestors_in_server(
         &self,
         server_id: &str,
@@ -2186,14 +2125,6 @@ impl ChannelRepository {
 
     /// Return both a channel and its ancestor chain in a single lock
     /// acquisition.  Avoids the double-lock pattern in ACL evaluation.
-    pub async fn get_channel_with_ancestors(
-        &self,
-        channel_id: u32,
-    ) -> (Option<Arc<Channel>>, Vec<Arc<Channel>>) {
-        self.get_channel_with_ancestors_in_server(DEFAULT_SERVER_ID, channel_id)
-            .await
-    }
-
     pub async fn get_channel_with_ancestors_in_server(
         &self,
         server_id: &str,
@@ -2235,15 +2166,6 @@ impl ChannelRepository {
         (channel, ancestors)
     }
 
-    /// Return a channel and ancestors from a stable ACL generation snapshot.
-    pub async fn get_channel_with_ancestors_for_acl(
-        &self,
-        channel_id: u32,
-    ) -> (u64, Option<Arc<Channel>>, Vec<Arc<Channel>>) {
-        self.get_channel_with_ancestors_for_acl_in_server(DEFAULT_SERVER_ID, channel_id)
-            .await
-    }
-
     pub async fn get_channel_with_ancestors_for_acl_in_server(
         &self,
         server_id: &str,
@@ -2280,12 +2202,6 @@ impl ChannelRepository {
 
     // ── Mutation API ──────────────────────────────────────────────────────
 
-    /// Allocate a fresh channel ID.  Temporary channels get bit-31 set.
-    pub async fn next_channel_id(&self, temporary: bool) -> u32 {
-        self.next_channel_id_in_server(DEFAULT_SERVER_ID, temporary)
-            .await
-    }
-
     pub async fn next_channel_id_in_server(&self, server_id: &str, temporary: bool) -> u32 {
         let channels = self.channels.read();
         let Some(channels) = channels.get(server_id) else {
@@ -2296,14 +2212,6 @@ impl ChannelRepository {
             };
         };
         next_available_channel_id(channels, temporary)
-    }
-
-    pub async fn create_channel(
-        self: &Arc<Self>,
-        channel: Channel,
-    ) -> Result<Arc<Channel>, ChannelRepoError> {
-        self.create_channel_in_server(DEFAULT_SERVER_ID, channel)
-            .await
     }
 
     pub async fn create_channel_in_server(
@@ -2363,15 +2271,6 @@ impl ChannelRepository {
 
         self.commit(op).await?;
         Ok(created)
-    }
-
-    pub async fn update_channel(
-        self: &Arc<Self>,
-        id: u32,
-        patch: ChannelPatch,
-    ) -> Result<Arc<Channel>, ChannelRepoError> {
-        self.update_channel_in_server(DEFAULT_SERVER_ID, id, patch)
-            .await
     }
 
     pub async fn update_channel_in_server(
@@ -2446,17 +2345,6 @@ impl ChannelRepository {
         }
         self.commit(op).await?;
         Ok(updated)
-    }
-
-    pub async fn edit_channel(
-        self: &Arc<Self>,
-        id: u32,
-        patch: ChannelPatch,
-        links_add: Vec<u32>,
-        links_remove: Vec<u32>,
-    ) -> Result<Arc<Channel>, ChannelRepoError> {
-        self.edit_channel_in_server(DEFAULT_SERVER_ID, id, patch, links_add, links_remove)
-            .await
     }
 
     pub async fn edit_channel_in_server(
@@ -2574,12 +2462,6 @@ impl ChannelRepository {
         Ok(updated)
     }
 
-    /// Delete a channel and all its descendants.  Users should be moved to
-    /// the parent by the caller before invoking this.
-    pub async fn delete_channel(self: &Arc<Self>, id: u32) -> Result<Vec<u32>, ChannelRepoError> {
-        self.delete_channel_in_server(DEFAULT_SERVER_ID, id).await
-    }
-
     pub async fn delete_channel_in_server(
         self: &Arc<Self>,
         server_id: &str,
@@ -2596,17 +2478,6 @@ impl ChannelRepository {
         self.apply_delete_channel_in_server(server_id, id, nonce)
             .await?;
         Ok(to_delete)
-    }
-
-    /// Mark a channel subtree as pending deletion using a nonce shared by the
-    /// later delete operation. Returns the subtree ids that were marked.
-    pub async fn mark_pending_delete(
-        self: &Arc<Self>,
-        id: u32,
-        nonce: u64,
-    ) -> Result<Vec<u32>, ChannelRepoError> {
-        self.mark_pending_delete_in_server(DEFAULT_SERVER_ID, id, nonce)
-            .await
     }
 
     pub async fn mark_pending_delete_in_server(
@@ -2663,17 +2534,6 @@ impl ChannelRepository {
         );
         self.commit(op).await?;
         Ok(to_delete)
-    }
-
-    /// Apply a nonce-bearing delete. If the pending nonce no longer matches,
-    /// the operation is committed as a semantic no-op and emits no ChannelRemove.
-    pub async fn apply_delete_channel(
-        self: &Arc<Self>,
-        id: u32,
-        nonce: u64,
-    ) -> Result<bool, ChannelRepoError> {
-        self.apply_delete_channel_in_server(DEFAULT_SERVER_ID, id, nonce)
-            .await
     }
 
     pub async fn apply_delete_channel_in_server(
@@ -2738,16 +2598,6 @@ impl ChannelRepository {
         Ok(deleted)
     }
 
-    /// Cancel a pending delete if the nonce still matches.
-    pub async fn cancel_pending_delete(
-        self: &Arc<Self>,
-        id: u32,
-        nonce: u64,
-    ) -> Result<(), ChannelRepoError> {
-        self.cancel_pending_delete_in_server(DEFAULT_SERVER_ID, id, nonce)
-            .await
-    }
-
     pub async fn cancel_pending_delete_in_server(
         self: &Arc<Self>,
         server_id: &str,
@@ -2781,10 +2631,6 @@ impl ChannelRepository {
         let op = self.make_op_in_server(server_id, ChannelOp::CancelPendingDelete { id, nonce });
         self.commit(op).await?;
         Ok(())
-    }
-
-    pub async fn add_link(self: &Arc<Self>, a: u32, b: u32) -> Result<(), ChannelRepoError> {
-        self.add_link_in_server(DEFAULT_SERVER_ID, a, b).await
     }
 
     pub async fn add_link_in_server(
@@ -2827,10 +2673,6 @@ impl ChannelRepository {
         Ok(())
     }
 
-    pub async fn remove_link(self: &Arc<Self>, a: u32, b: u32) -> Result<(), ChannelRepoError> {
-        self.remove_link_in_server(DEFAULT_SERVER_ID, a, b).await
-    }
-
     pub async fn remove_link_in_server(
         self: &Arc<Self>,
         server_id: &str,
@@ -2858,28 +2700,6 @@ impl ChannelRepository {
         let op = self.make_op_in_server(server_id, ChannelOp::RemoveLink { a, b });
         self.commit(op).await?;
         Ok(())
-    }
-
-    pub async fn set_acls(
-        self: &Arc<Self>,
-        channel_id: u32,
-        inherit_acl: bool,
-        acls: Vec<ACL>,
-    ) -> Result<(), ChannelRepoError> {
-        self.set_acls_if_changed(channel_id, inherit_acl, acls)
-            .await
-            .map(drop)
-    }
-
-    /// Set a channel's ACLs, returning whether the stored ACL state changed.
-    pub async fn set_acls_if_changed(
-        self: &Arc<Self>,
-        channel_id: u32,
-        inherit_acl: bool,
-        acls: Vec<ACL>,
-    ) -> Result<bool, ChannelRepoError> {
-        self.set_acls_if_changed_in_server(DEFAULT_SERVER_ID, channel_id, inherit_acl, acls)
-            .await
     }
 
     pub async fn set_acls_in_server(
@@ -2977,26 +2797,6 @@ impl ChannelRepository {
 
     // ── ACL cache ─────────────────────────────────────────────────────────
 
-    pub async fn get_cached_permissions(
-        &self,
-        session_id: u64,
-        client_instance_id: u64,
-        channel_id: u32,
-        channel_acl_generation: u64,
-        client_acl_generation: u64,
-    ) -> Option<BitFlags<ACLPermissions>> {
-        self.get_cached_permissions_in_server(
-            DEFAULT_SERVER_ID,
-            session_id,
-            client_instance_id,
-            channel_id,
-            channel_acl_generation,
-            client_acl_generation,
-            false,
-        )
-        .await
-    }
-
     pub async fn get_cached_permissions_in_server(
         &self,
         server_id: &str,
@@ -3047,28 +2847,6 @@ impl ChannelRepository {
                     explicit_enter_deny_overrides_write,
                 )
             })
-    }
-
-    pub async fn cache_permissions(
-        &self,
-        session_id: u64,
-        client_instance_id: u64,
-        channel_id: u32,
-        channel_acl_generation: u64,
-        client_acl_generation: u64,
-        permissions: BitFlags<ACLPermissions>,
-    ) {
-        self.cache_permissions_in_server(
-            DEFAULT_SERVER_ID,
-            session_id,
-            client_instance_id,
-            channel_id,
-            channel_acl_generation,
-            client_acl_generation,
-            false,
-            permissions,
-        )
-        .await;
     }
 
     pub async fn cache_permissions_in_server(
@@ -3127,11 +2905,6 @@ impl ChannelRepository {
                 explicit_enter_deny_overrides_write,
                 permissions,
             });
-    }
-
-    pub async fn invalidate_acl_cache_for_channel(&self, channel_id: u32) {
-        self.invalidate_acl_cache_for_channel_in_server(DEFAULT_SERVER_ID, channel_id)
-            .await;
     }
 
     pub async fn invalidate_acl_cache_for_channel_in_server(
@@ -3409,15 +3182,6 @@ impl ChannelRepository {
         self.tx.subscribe()
     }
 
-    /// Return all log entries with `version > since_version`.
-    pub async fn get_log_since(&self, since_version: u64) -> Vec<Arc<ChannelOperation>> {
-        self.get_log_entries_since(DEFAULT_SERVER_ID, since_version)
-            .await
-            .into_iter()
-            .map(|entry| entry.op())
-            .collect()
-    }
-
     pub async fn get_log_entries_since(
         &self,
         server_id: &str,
@@ -3508,6 +3272,9 @@ impl ChannelRepository {
         &self,
         op: Arc<ChannelOperation>,
     ) -> Result<(), ChannelRepoError> {
+        if op.server_id.is_empty() {
+            return Err(ChannelRepoError::InvalidServerId);
+        }
         let _write_transaction = self.strict_apply_lock.lock().await;
         if op.version <= self.current_version_in_server(&op.server_id) {
             return Ok(());
@@ -3598,6 +3365,9 @@ impl ChannelRepository {
         self: &Arc<Self>,
         op: ChannelOperation,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
+        if op.server_id.is_empty() {
+            return Err(ChannelRepoError::InvalidServerId);
+        }
         let _write_transaction = self.strict_apply_lock.lock().await;
         self.apply_committed_operation_inner(op, None, None, false)
             .await
@@ -3612,6 +3382,9 @@ impl ChannelRepository {
         op: ChannelOperation,
         strict_metadata: Option<StrictReplicationMetadata>,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
+        if op.server_id.is_empty() {
+            return Err(ChannelRepoError::InvalidServerId);
+        }
         match strict_metadata {
             Some(metadata) => self
                 .apply_strict_operation_once_inner(op, metadata)
@@ -3630,11 +3403,11 @@ impl ChannelRepository {
     /// rebuilt from WAL records during startup.
     pub async fn apply_strict_operation_once(
         self: &Arc<Self>,
-        mut op: ChannelOperation,
+        op: ChannelOperation,
         strict_metadata: StrictReplicationMetadata,
     ) -> Result<StrictOperationApplyOutcome, ChannelRepoError> {
         if op.server_id.is_empty() {
-            op.server_id = default_server_id();
+            return Err(ChannelRepoError::InvalidServerId);
         }
         self.apply_strict_operation_once_inner(op, strict_metadata)
             .await
@@ -3643,12 +3416,9 @@ impl ChannelRepository {
 
     async fn apply_strict_operation_once_inner(
         self: &Arc<Self>,
-        mut op: ChannelOperation,
+        op: ChannelOperation,
         strict_metadata: StrictReplicationMetadata,
     ) -> Result<(StrictOperationApplyOutcome, Arc<ChannelOperation>), ChannelRepoError> {
-        if op.server_id.is_empty() {
-            op.server_id = default_server_id();
-        }
         let strict_operation_id = StrictOperationKey::new(&op.server_id, strict_metadata);
         let _strict_apply_guard = self.strict_apply_lock.lock().await;
 
@@ -3683,11 +3453,11 @@ impl ChannelRepository {
     /// repository-owned operation-id ledger.
     pub async fn apply_s2s_strict_operation(
         self: &Arc<Self>,
-        mut op: ChannelOperation,
+        op: ChannelOperation,
         strict_metadata: StrictReplicationMetadata,
     ) -> Result<StrictOperationApplyOutcome, ChannelRepoError> {
         if op.server_id.is_empty() {
-            op.server_id = default_server_id();
+            return Err(ChannelRepoError::InvalidServerId);
         }
         let _strict_apply_guard = self.strict_apply_lock.lock().await;
         if op.version <= self.current_version_in_server(&op.server_id) {
@@ -3709,9 +3479,6 @@ impl ChannelRepository {
         strict_operation_id: Option<StrictOperationKey>,
         wal_already_persisted: bool,
     ) -> Result<Arc<ChannelOperation>, ChannelRepoError> {
-        if op.server_id.is_empty() {
-            op.server_id = default_server_id();
-        }
         if op.version <= self.current_version_in_server(&op.server_id) {
             return Ok(Arc::new(op));
         }
@@ -3842,33 +3609,6 @@ impl ChannelRepository {
         }
 
         Ok(committed)
-    }
-
-    pub async fn install_s2s_snapshot(
-        self: &Arc<Self>,
-        version: u64,
-        channels_snapshot: Vec<Channel>,
-    ) -> Result<(), ChannelRepoError> {
-        self.install_s2s_snapshot_with_strict_operation_ids(version, channels_snapshot, Vec::new())
-            .await
-    }
-
-    /// Install a default-scope S2S snapshot together with strict operation
-    /// ids already represented by the snapshot.
-    pub async fn install_s2s_snapshot_with_strict_operation_ids(
-        self: &Arc<Self>,
-        version: u64,
-        channels_snapshot: Vec<Channel>,
-        strict_operation_ids: Vec<StrictOperationId>,
-    ) -> Result<(), ChannelRepoError> {
-        self.install_s2s_snapshot_with_strict_operation_ids_in_server(
-            DEFAULT_SERVER_ID,
-            version,
-            channels_snapshot,
-            chrono::Utc::now().timestamp(),
-            strict_operation_ids,
-        )
-        .await
     }
 
     pub async fn install_s2s_snapshot_in_server(
@@ -4184,10 +3924,6 @@ impl ChannelRepository {
             emits_client_message: true,
             op: normalize_op_for_root(&op, &root_config),
         }
-    }
-
-    pub async fn validate_s2s_op(&self, op: &ChannelOp) -> Result<(), ChannelRepoError> {
-        self.validate_s2s_op_in_server(DEFAULT_SERVER_ID, op).await
     }
 
     pub async fn validate_s2s_op_in_server(
@@ -5656,13 +5392,20 @@ mod tests {
             let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
                 .await
                 .unwrap();
-            repo.create_channel(Channel::new(1, "parent", 0, 0, Some(0)))
-                .await
-                .unwrap();
-            repo.create_channel(Channel::new(2, "leaf", 0, 0, Some(1)))
-                .await
-                .unwrap();
-            repo.set_acls(
+            repo.create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(1, "parent", 0, 0, Some(0)),
+            )
+            .await
+            .unwrap();
+            repo.create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(2, "leaf", 0, 0, Some(1)),
+            )
+            .await
+            .unwrap();
+            repo.set_acls_in_server(
+                DEFAULT_SERVER_ID,
                 1,
                 true,
                 vec![group_acl(
@@ -5680,7 +5423,10 @@ mod tests {
         let reopened = ChannelRepository::open(1, dir.path(), root_config(), tuning())
             .await
             .unwrap();
-        let leaf = reopened.get_channel(2).await.unwrap();
+        let leaf = reopened
+            .get_channel_in_server(DEFAULT_SERVER_ID, 2)
+            .await
+            .unwrap();
 
         assert!(cached_group_permissions(&leaf, &["staff"]).contains(ACLPermissions::Move));
     }
@@ -5692,12 +5438,18 @@ mod tests {
             let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
                 .await
                 .unwrap();
-            repo.create_channel(Channel::new(1, "parent", 0, 0, Some(0)))
-                .await
-                .unwrap();
-            repo.create_channel(Channel::new(2, "leaf", 0, 0, Some(1)))
-                .await
-                .unwrap();
+            repo.create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(1, "parent", 0, 0, Some(0)),
+            )
+            .await
+            .unwrap();
+            repo.create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(2, "leaf", 0, 0, Some(1)),
+            )
+            .await
+            .unwrap();
             repo.save_snapshot().await.unwrap();
         }
 
@@ -5709,7 +5461,7 @@ mod tests {
         assert_eq!(effective_acl_compile_count(), 0);
         assert!(
             reopened
-                .get_channel(2)
+                .get_channel_in_server(DEFAULT_SERVER_ID, 2)
                 .await
                 .unwrap()
                 .has_effective_acl_cache()
@@ -5728,10 +5480,12 @@ mod tests {
                 Channel::new(2, "leaf", 0, 0, Some(1)),
                 Channel::new(3, "sibling", 0, 0, Some(0)),
             ] {
-                repo.create_channel(channel).await.unwrap();
+                repo.create_channel_in_server(DEFAULT_SERVER_ID, channel)
+                    .await
+                    .unwrap();
             }
             repo.save_snapshot().await.unwrap();
-            repo.set_acls(1, true, vec![test_acl("staff")])
+            repo.set_acls_in_server(DEFAULT_SERVER_ID, 1, true, vec![test_acl("staff")])
                 .await
                 .unwrap();
         }
@@ -5744,7 +5498,7 @@ mod tests {
         assert_eq!(effective_acl_compile_count(), 2);
         assert!(
             reopened
-                .get_channel(3)
+                .get_channel_in_server(DEFAULT_SERVER_ID, 3)
                 .await
                 .unwrap()
                 .has_effective_acl_cache()
@@ -5758,11 +5512,15 @@ mod tests {
             let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
                 .await
                 .unwrap();
-            repo.create_channel(Channel::new(1, "before", 0, 0, Some(0)))
-                .await
-                .unwrap();
+            repo.create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(1, "before", 0, 0, Some(0)),
+            )
+            .await
+            .unwrap();
             repo.save_snapshot().await.unwrap();
-            repo.update_channel(
+            repo.update_channel_in_server(
+                DEFAULT_SERVER_ID,
                 1,
                 ChannelPatch {
                     name: Some("after".to_owned()),
@@ -5782,7 +5540,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(effective_acl_compile_count(), 0);
-        assert_eq!(reopened.get_channel(1).await.unwrap().name, "after");
+        assert_eq!(
+            reopened
+                .get_channel_in_server(DEFAULT_SERVER_ID, 1)
+                .await
+                .unwrap()
+                .name,
+            "after"
+        );
     }
 
     #[tokio::test]
@@ -5797,10 +5562,12 @@ mod tests {
                 Channel::new(2, "leaf", 0, 0, Some(1)),
                 Channel::new(3, "sibling", 0, 0, Some(0)),
             ] {
-                repo.create_channel(channel).await.unwrap();
+                repo.create_channel_in_server(DEFAULT_SERVER_ID, channel)
+                    .await
+                    .unwrap();
             }
             repo.save_snapshot().await.unwrap();
-            let skipped_version = repo.current_version() + 2;
+            let skipped_version = repo.current_version_in_server(DEFAULT_SERVER_ID) + 2;
             repo.apply_committed_operation(ChannelOperation {
                 server_id: DEFAULT_SERVER_ID.to_owned(),
                 version: skipped_version,
@@ -5825,7 +5592,7 @@ mod tests {
         assert_eq!(effective_acl_compile_count(), 4);
         assert!(
             reopened
-                .get_channel(2)
+                .get_channel_in_server(DEFAULT_SERVER_ID, 2)
                 .await
                 .unwrap()
                 .has_effective_acl_cache()
@@ -5839,9 +5606,12 @@ mod tests {
             let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
                 .await
                 .unwrap();
-            repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
-                .await
-                .unwrap();
+            repo.create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(1, "channel", 0, 0, Some(0)),
+            )
+            .await
+            .unwrap();
             repo.save_snapshot().await.unwrap();
         }
         let path = dir.path().join("channels.effective-acl-cache.json");
@@ -5860,7 +5630,7 @@ mod tests {
         assert_eq!(effective_acl_compile_count(), 2);
         assert!(
             reopened
-                .get_channel(1)
+                .get_channel_in_server(DEFAULT_SERVER_ID, 1)
                 .await
                 .unwrap()
                 .has_effective_acl_cache()
@@ -5873,7 +5643,7 @@ mod tests {
         let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
             .await
             .unwrap();
-        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(1, "channel", 0, 0, Some(0)))
             .await
             .unwrap();
         repo.save_snapshot().await.unwrap();
@@ -5888,10 +5658,11 @@ mod tests {
     #[tokio::test]
     async fn own_acl_change_rebuilds_effective_acl_cache() {
         let repo = repo();
-        repo.create_channel(Channel::new(1, "target", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(1, "target", 0, 0, Some(0)))
             .await
             .unwrap();
-        repo.set_acls(
+        repo.set_acls_in_server(
+            DEFAULT_SERVER_ID,
             1,
             true,
             vec![group_acl(
@@ -5904,10 +5675,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let target = repo.get_channel(1).await.unwrap();
+        let target = repo
+            .get_channel_in_server(DEFAULT_SERVER_ID, 1)
+            .await
+            .unwrap();
         assert!(cached_group_permissions(&target, &["staff"]).contains(ACLPermissions::Move));
 
-        repo.set_acls(
+        repo.set_acls_in_server(
+            DEFAULT_SERVER_ID,
             1,
             true,
             vec![group_acl(
@@ -5920,7 +5695,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let target = repo.get_channel(1).await.unwrap();
+        let target = repo
+            .get_channel_in_server(DEFAULT_SERVER_ID, 1)
+            .await
+            .unwrap();
         assert!(!cached_group_permissions(&target, &["staff"]).contains(ACLPermissions::Move));
     }
 
@@ -5933,9 +5711,12 @@ mod tests {
             Channel::new(3, "moved", 0, 0, Some(1)),
             Channel::new(4, "leaf", 0, 0, Some(3)),
         ] {
-            repo.create_channel(channel).await.unwrap();
+            repo.create_channel_in_server(DEFAULT_SERVER_ID, channel)
+                .await
+                .unwrap();
         }
-        repo.set_acls(
+        repo.set_acls_in_server(
+            DEFAULT_SERVER_ID,
             1,
             true,
             vec![group_acl(
@@ -5948,7 +5729,8 @@ mod tests {
         )
         .await
         .unwrap();
-        repo.set_acls(
+        repo.set_acls_in_server(
+            DEFAULT_SERVER_ID,
             2,
             true,
             vec![group_acl(
@@ -5963,14 +5745,22 @@ mod tests {
         .unwrap();
 
         for id in [3, 4] {
-            let channel = repo.get_channel(id).await.unwrap();
+            let channel = repo
+                .get_channel_in_server(DEFAULT_SERVER_ID, id)
+                .await
+                .unwrap();
             assert!(cached_group_permissions(&channel, &["staff"]).contains(ACLPermissions::Move));
         }
 
-        repo.update_channel(3, parent_patch(2)).await.unwrap();
+        repo.update_channel_in_server(DEFAULT_SERVER_ID, 3, parent_patch(2))
+            .await
+            .unwrap();
 
         for id in [3, 4] {
-            let channel = repo.get_channel(id).await.unwrap();
+            let channel = repo
+                .get_channel_in_server(DEFAULT_SERVER_ID, id)
+                .await
+                .unwrap();
             assert!(!cached_group_permissions(&channel, &["staff"]).contains(ACLPermissions::Move));
         }
     }
@@ -5983,13 +5773,21 @@ mod tests {
             Channel::new(2, "barrier", 0, 0, Some(1)),
             Channel::new(3, "leaf", 0, 0, Some(2)),
         ] {
-            repo.create_channel(channel).await.unwrap();
+            repo.create_channel_in_server(DEFAULT_SERVER_ID, channel)
+                .await
+                .unwrap();
         }
-        repo.set_acls(2, false, Vec::new()).await.unwrap();
-        let leaf = repo.get_channel(3).await.unwrap();
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 2, false, Vec::new())
+            .await
+            .unwrap();
+        let leaf = repo
+            .get_channel_in_server(DEFAULT_SERVER_ID, 3)
+            .await
+            .unwrap();
         assert!(!cached_group_permissions(&leaf, &["staff"]).is_empty());
 
-        repo.set_acls(
+        repo.set_acls_in_server(
+            DEFAULT_SERVER_ID,
             1,
             true,
             vec![group_acl(
@@ -6002,7 +5800,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let leaf = repo.get_channel(3).await.unwrap();
+        let leaf = repo
+            .get_channel_in_server(DEFAULT_SERVER_ID, 3)
+            .await
+            .unwrap();
         assert!(cached_group_permissions(&leaf, &["staff"]).is_empty());
     }
 
@@ -6010,19 +5811,29 @@ mod tests {
     async fn linked_channels_form_effective_transitive_groups() {
         let repo = repo();
         for id in 1..=3 {
-            repo.create_channel(Channel::new(id, format!("ch{id}"), 0, 0, Some(0)))
-                .await
-                .unwrap();
+            repo.create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(id, format!("ch{id}"), 0, 0, Some(0)),
+            )
+            .await
+            .unwrap();
         }
 
-        repo.add_link(1, 2).await.unwrap();
-        repo.add_link(2, 3).await.unwrap();
+        repo.add_link_in_server(DEFAULT_SERVER_ID, 1, 2)
+            .await
+            .unwrap();
+        repo.add_link_in_server(DEFAULT_SERVER_ID, 2, 3)
+            .await
+            .unwrap();
 
         assert_eq!(effective_group(&repo, 1), vec![1, 2, 3]);
         assert_eq!(effective_group(&repo, 2), vec![1, 2, 3]);
         assert_eq!(effective_group(&repo, 3), vec![1, 2, 3]);
 
-        let ch1 = repo.get_channel(1).await.unwrap();
+        let ch1 = repo
+            .get_channel_in_server(DEFAULT_SERVER_ID, 1)
+            .await
+            .unwrap();
         assert_eq!(ch1.links, HashSet::from([2]));
     }
 
@@ -6030,24 +5841,34 @@ mod tests {
     async fn temporary_channels_cannot_have_children_or_links() {
         let repo = repo();
         let temp_id = TEMPORARY_CHANNEL_ID_BIT | 1;
-        repo.create_channel(Channel::new(temp_id, "temp", 0, 0, Some(0)))
-            .await
-            .unwrap();
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(temp_id, "temp", 0, 0, Some(0)),
+        )
+        .await
+        .unwrap();
 
         let child = repo
-            .create_channel(Channel::new(10, "child", 0, 0, Some(temp_id)))
+            .create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(10, "child", 0, 0, Some(temp_id)),
+            )
             .await;
         assert!(matches!(
             child,
             Err(ChannelRepoError::TemporaryChannelCannotHaveChildren(id)) if id == temp_id
         ));
 
-        repo.create_channel(Channel::new(10, "ordinary", 0, 0, Some(0)))
-            .await
-            .unwrap();
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(10, "ordinary", 0, 0, Some(0)),
+        )
+        .await
+        .unwrap();
 
         let moved_child = repo
-            .update_channel(
+            .update_channel_in_server(
+                DEFAULT_SERVER_ID,
                 10,
                 ChannelPatch {
                     name: None,
@@ -6063,14 +5884,17 @@ mod tests {
             Err(ChannelRepoError::TemporaryChannelCannotHaveChildren(id)) if id == temp_id
         ));
 
-        let linked = repo.add_link(temp_id, 10).await;
+        let linked = repo
+            .add_link_in_server(DEFAULT_SERVER_ID, temp_id, 10)
+            .await;
         assert!(matches!(
             linked,
             Err(ChannelRepoError::TemporaryChannelCannotBeLinked(id)) if id == temp_id
         ));
 
         let edit_link = repo
-            .edit_channel(
+            .edit_channel_in_server(
+                DEFAULT_SERVER_ID,
                 10,
                 ChannelPatch {
                     name: None,
@@ -6108,16 +5932,16 @@ mod tests {
     #[tokio::test]
     async fn channel_tree_snapshot_indexes_subtrees_and_ancestors_once() {
         let repo = repo();
-        repo.create_channel(Channel::new(1, "one", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(1, "one", 0, 0, Some(0)))
             .await
             .unwrap();
-        repo.create_channel(Channel::new(3, "three", 0, 0, Some(1)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(3, "three", 0, 0, Some(1)))
             .await
             .unwrap();
-        repo.create_channel(Channel::new(2, "two", 0, 0, Some(1)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(2, "two", 0, 0, Some(1)))
             .await
             .unwrap();
-        repo.create_channel(Channel::new(4, "four", 0, 0, Some(2)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(4, "four", 0, 0, Some(2)))
             .await
             .unwrap();
 
@@ -6130,7 +5954,7 @@ mod tests {
         assert_eq!(snapshot.ancestor_ids(0), Some([].as_slice()));
         assert_eq!(snapshot.ancestor_ids(99), None);
 
-        repo.create_channel(Channel::new(5, "later", 0, 0, Some(1)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(5, "later", 0, 0, Some(1)))
             .await
             .unwrap();
         assert!(snapshot.channel(5).is_none(), "snapshot must remain stable");
@@ -6140,13 +5964,13 @@ mod tests {
     #[tokio::test]
     async fn channel_tree_snapshot_reuses_index_for_acl_operation_scope() {
         let repo = repo();
-        repo.create_channel(Channel::new(1, "one", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(1, "one", 0, 0, Some(0)))
             .await
             .unwrap();
-        repo.create_channel(Channel::new(2, "two", 0, 0, Some(1)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(2, "two", 0, 0, Some(1)))
             .await
             .unwrap();
-        repo.create_channel(Channel::new(3, "three", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(3, "three", 0, 0, Some(0)))
             .await
             .unwrap();
 
@@ -6188,11 +6012,15 @@ mod tests {
     async fn reparent_acl_scope_includes_home_channel_dependent_channels() {
         let repo = repo();
         for id in 1..=3 {
-            repo.create_channel(Channel::new(id, format!("ch{id}"), 0, 0, Some(0)))
-                .await
-                .unwrap();
+            repo.create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(id, format!("ch{id}"), 0, 0, Some(0)),
+            )
+            .await
+            .unwrap();
         }
-        repo.set_acls(
+        repo.set_acls_in_server(
+            DEFAULT_SERVER_ID,
             3,
             true,
             vec![ACL {
@@ -6207,7 +6035,8 @@ mod tests {
         .await
         .unwrap();
 
-        repo.update_channel(
+        repo.update_channel_in_server(
+            DEFAULT_SERVER_ID,
             1,
             ChannelPatch {
                 name: None,
@@ -6221,7 +6050,7 @@ mod tests {
         .unwrap();
 
         let op = repo
-            .get_log_since(0)
+            .get_log_since_in_server(DEFAULT_SERVER_ID, 0)
             .await
             .into_iter()
             .find(|op| matches!(op.op, ChannelOp::UpdateChannel { id: 1, .. }))
@@ -6237,23 +6066,35 @@ mod tests {
     #[tokio::test]
     async fn identical_acl_update_does_not_advance_or_invalidate_repository_state() {
         let repo = repo();
-        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(1, "channel", 0, 0, Some(0)))
             .await
             .unwrap();
         let acls = vec![test_acl("all")];
 
         assert!(
-            repo.set_acls_if_changed(1, false, acls.clone())
+            repo.set_acls_if_changed_in_server(DEFAULT_SERVER_ID, 1, false, acls.clone())
                 .await
                 .unwrap()
         );
 
-        let version = repo.current_version();
-        let log_len = repo.get_log_since(0).await.len();
+        let version = repo.current_version_in_server(DEFAULT_SERVER_ID);
+        let log_len = repo
+            .get_log_since_in_server(DEFAULT_SERVER_ID, 0)
+            .await
+            .len();
         let acl_generation = repo.channel_acl_generation_for_channel(DEFAULT_SERVER_ID, 1);
         let expected_permissions: BitFlags<ACLPermissions> = ACLPermissions::Enter.into();
-        repo.cache_permissions(10, 20, 1, acl_generation, 30, expected_permissions)
-            .await;
+        repo.cache_permissions_in_server(
+            DEFAULT_SERVER_ID,
+            10,
+            20,
+            1,
+            acl_generation,
+            30,
+            false,
+            expected_permissions,
+        )
+        .await;
 
         let observer = Arc::new(RecordingObserver::default());
         repo.set_observer(observer.clone());
@@ -6261,25 +6102,46 @@ mod tests {
 
         assert!(
             !repo
-                .set_acls_if_changed(1, false, acls.clone())
+                .set_acls_if_changed_in_server(DEFAULT_SERVER_ID, 1, false, acls.clone())
                 .await
                 .unwrap()
         );
         // The compatibility wrapper must share the same no-op behavior.
-        repo.set_acls(1, false, acls.clone()).await.unwrap();
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 1, false, acls.clone())
+            .await
+            .unwrap();
 
-        assert_eq!(repo.current_version(), version);
-        assert_eq!(repo.get_log_since(0).await.len(), log_len);
+        assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), version);
+        assert_eq!(
+            repo.get_log_since_in_server(DEFAULT_SERVER_ID, 0)
+                .await
+                .len(),
+            log_len
+        );
         assert_eq!(
             repo.channel_acl_generation_for_channel(DEFAULT_SERVER_ID, 1),
             acl_generation
         );
         assert_eq!(
-            repo.get_cached_permissions(10, 20, 1, acl_generation, 30)
-                .await,
+            repo.get_cached_permissions_in_server(
+                DEFAULT_SERVER_ID,
+                10,
+                20,
+                1,
+                acl_generation,
+                30,
+                false,
+            )
+            .await,
             Some(expected_permissions)
         );
-        assert_eq!(repo.get_channel(1).await.unwrap().acls, acls);
+        assert_eq!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 1)
+                .await
+                .unwrap()
+                .acls,
+            acls
+        );
         assert!(matches!(
             operations.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -6296,27 +6158,30 @@ mod tests {
     #[tokio::test]
     async fn acl_change_result_distinguishes_inheritance_and_entries() {
         let repo = repo();
-        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(1, "channel", 0, 0, Some(0)))
             .await
             .unwrap();
 
         assert!(
-            repo.set_acls_if_changed(1, false, vec![test_acl("all")])
+            repo.set_acls_if_changed_in_server(DEFAULT_SERVER_ID, 1, false, vec![test_acl("all")])
                 .await
                 .unwrap()
         );
         assert!(
-            repo.set_acls_if_changed(1, true, vec![test_acl("all")])
+            repo.set_acls_if_changed_in_server(DEFAULT_SERVER_ID, 1, true, vec![test_acl("all")])
                 .await
                 .unwrap()
         );
         assert!(
-            repo.set_acls_if_changed(1, true, vec![test_acl("auth")])
+            repo.set_acls_if_changed_in_server(DEFAULT_SERVER_ID, 1, true, vec![test_acl("auth")])
                 .await
                 .unwrap()
         );
 
-        let channel = repo.get_channel(1).await.unwrap();
+        let channel = repo
+            .get_channel_in_server(DEFAULT_SERVER_ID, 1)
+            .await
+            .unwrap();
         assert!(channel.inherit_acl);
         assert_eq!(channel.acls, vec![test_acl("auth")]);
     }
@@ -6324,17 +6189,21 @@ mod tests {
     #[tokio::test]
     async fn local_acl_operation_retains_before_and_shared_after_context() {
         let repo = repo();
-        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(1, "channel", 0, 0, Some(0)))
             .await
             .unwrap();
         let old_acls = vec![test_acl("all")];
-        repo.set_acls(1, false, old_acls.clone()).await.unwrap();
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 1, false, old_acls.clone())
+            .await
+            .unwrap();
 
-        let first_new_version = repo.current_version() + 1;
+        let first_new_version = repo.current_version_in_server(DEFAULT_SERVER_ID) + 1;
         let new_acls = vec![test_acl("auth")];
-        repo.set_acls(1, true, new_acls.clone()).await.unwrap();
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 1, true, new_acls.clone())
+            .await
+            .unwrap();
         let op = repo
-            .get_log_since(first_new_version - 1)
+            .get_log_since_in_server(DEFAULT_SERVER_ID, first_new_version - 1)
             .await
             .into_iter()
             .find(|op| op.version == first_new_version)
@@ -6357,12 +6226,14 @@ mod tests {
     #[tokio::test]
     async fn replicated_acl_noop_advances_version_without_invalidating_cache() {
         let repo = repo();
-        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(1, "channel", 0, 0, Some(0)))
             .await
             .unwrap();
         let acls = vec![test_acl("all")];
-        repo.set_acls(1, false, acls.clone()).await.unwrap();
-        let old_version = repo.current_version();
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 1, false, acls.clone())
+            .await
+            .unwrap();
+        let old_version = repo.current_version_in_server(DEFAULT_SERVER_ID);
         let old_generation = repo.channel_acl_generation_for_channel(DEFAULT_SERVER_ID, 1);
 
         let committed = repo
@@ -6381,7 +6252,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(repo.current_version(), old_version + 1);
+        assert_eq!(
+            repo.current_version_in_server(DEFAULT_SERVER_ID),
+            old_version + 1
+        );
         assert_eq!(
             repo.channel_acl_generation_for_channel(DEFAULT_SERVER_ID, 1),
             old_generation
@@ -6402,15 +6276,19 @@ mod tests {
             if id == 3 {
                 channel.inherit_acl = false;
             }
-            repo.create_channel(channel).await.unwrap();
+            repo.create_channel_in_server(DEFAULT_SERVER_ID, channel)
+                .await
+                .unwrap();
         }
 
         let mut speak_here = test_acl("all");
         speak_here.allow = ACLPermissions::Speak.into();
-        let version = repo.current_version() + 1;
-        repo.set_acls(1, true, vec![speak_here]).await.unwrap();
+        let version = repo.current_version_in_server(DEFAULT_SERVER_ID) + 1;
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 1, true, vec![speak_here])
+            .await
+            .unwrap();
         let speak_op = repo
-            .get_log_since(version - 1)
+            .get_log_since_in_server(DEFAULT_SERVER_ID, version - 1)
             .await
             .into_iter()
             .find(|op| op.version == version)
@@ -6424,10 +6302,12 @@ mod tests {
 
         let mut traverse_here = test_acl("all");
         traverse_here.allow = ACLPermissions::Traverse.into();
-        let version = repo.current_version() + 1;
-        repo.set_acls(1, true, vec![traverse_here]).await.unwrap();
+        let version = repo.current_version_in_server(DEFAULT_SERVER_ID) + 1;
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 1, true, vec![traverse_here])
+            .await
+            .unwrap();
         let traverse_here_op = repo
-            .get_log_since(version - 1)
+            .get_log_since_in_server(DEFAULT_SERVER_ID, version - 1)
             .await
             .into_iter()
             .find(|op| op.version == version)
@@ -6442,15 +6322,19 @@ mod tests {
             "structural Traverse visibility closure is intentionally separate"
         );
 
-        repo.set_acls(1, true, Vec::new()).await.unwrap();
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 1, true, Vec::new())
+            .await
+            .unwrap();
         let mut traverse_subs = test_acl("all");
         traverse_subs.apply_here = false;
         traverse_subs.apply_subs = true;
         traverse_subs.allow = ACLPermissions::Traverse.into();
-        let version = repo.current_version() + 1;
-        repo.set_acls(1, true, vec![traverse_subs]).await.unwrap();
+        let version = repo.current_version_in_server(DEFAULT_SERVER_ID) + 1;
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 1, true, vec![traverse_subs])
+            .await
+            .unwrap();
         let traverse_op = repo
-            .get_log_since(version - 1)
+            .get_log_since_in_server(DEFAULT_SERVER_ID, version - 1)
             .await
             .into_iter()
             .find(|op| op.version == version)
@@ -6466,32 +6350,47 @@ mod tests {
     #[tokio::test]
     async fn acl_hints_expire_with_log_eviction_and_snapshot_replacement() {
         let repo = repo_with_log_max_entries(1);
-        repo.create_channel(Channel::new(1, "channel", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(1, "channel", 0, 0, Some(0)))
             .await
             .unwrap();
-        repo.set_acls(1, true, vec![test_acl("all")]).await.unwrap();
-        let acl_op = repo.get_log_since(0).await.pop().unwrap();
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 1, true, vec![test_acl("all")])
+            .await
+            .unwrap();
+        let acl_op = repo
+            .get_log_since_in_server(DEFAULT_SERVER_ID, 0)
+            .await
+            .pop()
+            .unwrap();
         assert!(repo.acl_change_hint_for_operation(&acl_op).is_some());
 
-        repo.create_channel(Channel::new(2, "other", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(2, "other", 0, 0, Some(0)))
             .await
             .unwrap();
         assert!(repo.acl_change_hint_for_operation(&acl_op).is_none());
 
-        repo.set_acls(1, true, vec![test_acl("auth")])
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 1, true, vec![test_acl("auth")])
             .await
             .unwrap();
-        let acl_op = repo.get_log_since(0).await.pop().unwrap();
+        let acl_op = repo
+            .get_log_since_in_server(DEFAULT_SERVER_ID, 0)
+            .await
+            .pop()
+            .unwrap();
         assert!(repo.acl_change_hint_for_operation(&acl_op).is_some());
         let channels = repo
-            .get_all()
+            .get_all_in_server(DEFAULT_SERVER_ID)
             .await
             .into_iter()
             .map(|channel| channel.as_ref().clone())
             .collect();
-        repo.install_s2s_snapshot(repo.current_version(), channels)
-            .await
-            .unwrap();
+        repo.install_s2s_snapshot_in_server(
+            DEFAULT_SERVER_ID,
+            repo.current_version_in_server(DEFAULT_SERVER_ID),
+            channels,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
         assert!(repo.acl_change_hint_for_operation(&acl_op).is_none());
     }
 
@@ -6499,20 +6398,33 @@ mod tests {
     async fn removing_link_splits_effective_group_only_when_connectivity_breaks() {
         let repo = repo();
         for id in 1..=3 {
-            repo.create_channel(Channel::new(id, format!("ch{id}"), 0, 0, Some(0)))
-                .await
-                .unwrap();
+            repo.create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(id, format!("ch{id}"), 0, 0, Some(0)),
+            )
+            .await
+            .unwrap();
         }
 
-        repo.add_link(1, 2).await.unwrap();
-        repo.add_link(2, 3).await.unwrap();
-        repo.add_link(1, 3).await.unwrap();
-        repo.remove_link(2, 3).await.unwrap();
+        repo.add_link_in_server(DEFAULT_SERVER_ID, 1, 2)
+            .await
+            .unwrap();
+        repo.add_link_in_server(DEFAULT_SERVER_ID, 2, 3)
+            .await
+            .unwrap();
+        repo.add_link_in_server(DEFAULT_SERVER_ID, 1, 3)
+            .await
+            .unwrap();
+        repo.remove_link_in_server(DEFAULT_SERVER_ID, 2, 3)
+            .await
+            .unwrap();
 
         assert_eq!(effective_group(&repo, 1), vec![1, 2, 3]);
         assert_eq!(effective_group(&repo, 3), vec![1, 2, 3]);
 
-        repo.remove_link(1, 3).await.unwrap();
+        repo.remove_link_in_server(DEFAULT_SERVER_ID, 1, 3)
+            .await
+            .unwrap();
 
         assert_eq!(effective_group(&repo, 1), vec![1, 2]);
         assert_eq!(effective_group(&repo, 2), vec![1, 2]);
@@ -6523,60 +6435,112 @@ mod tests {
     async fn deleting_channel_removes_it_from_link_topology() {
         let repo = repo();
         for id in 1..=3 {
-            repo.create_channel(Channel::new(id, format!("ch{id}"), 0, 0, Some(0)))
-                .await
-                .unwrap();
+            repo.create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(id, format!("ch{id}"), 0, 0, Some(0)),
+            )
+            .await
+            .unwrap();
         }
 
-        repo.add_link(1, 2).await.unwrap();
-        repo.add_link(2, 3).await.unwrap();
-        repo.mark_pending_delete(2, 99).await.unwrap();
-        repo.apply_delete_channel(2, 99).await.unwrap();
+        repo.add_link_in_server(DEFAULT_SERVER_ID, 1, 2)
+            .await
+            .unwrap();
+        repo.add_link_in_server(DEFAULT_SERVER_ID, 2, 3)
+            .await
+            .unwrap();
+        repo.mark_pending_delete_in_server(DEFAULT_SERVER_ID, 2, 99)
+            .await
+            .unwrap();
+        repo.apply_delete_channel_in_server(DEFAULT_SERVER_ID, 2, 99)
+            .await
+            .unwrap();
 
         assert!(effective_group(&repo, 1).is_empty());
         assert!(effective_group(&repo, 3).is_empty());
-        assert!(repo.get_channel(1).await.unwrap().links.is_empty());
-        assert!(repo.get_channel(3).await.unwrap().links.is_empty());
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 1)
+                .await
+                .unwrap()
+                .links
+                .is_empty()
+        );
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 3)
+                .await
+                .unwrap()
+                .links
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn deleting_linked_channel_updates_only_affected_link_component() {
         let repo = repo();
         for id in 1..=6 {
-            repo.create_channel(Channel::new(id, format!("ch{id}"), 0, 0, Some(0)))
-                .await
-                .unwrap();
+            repo.create_channel_in_server(
+                DEFAULT_SERVER_ID,
+                Channel::new(id, format!("ch{id}"), 0, 0, Some(0)),
+            )
+            .await
+            .unwrap();
         }
 
-        repo.add_link(1, 2).await.unwrap();
-        repo.add_link(2, 3).await.unwrap();
-        repo.add_link(4, 5).await.unwrap();
-        repo.mark_pending_delete(2, 99).await.unwrap();
-        repo.apply_delete_channel(2, 99).await.unwrap();
+        repo.add_link_in_server(DEFAULT_SERVER_ID, 1, 2)
+            .await
+            .unwrap();
+        repo.add_link_in_server(DEFAULT_SERVER_ID, 2, 3)
+            .await
+            .unwrap();
+        repo.add_link_in_server(DEFAULT_SERVER_ID, 4, 5)
+            .await
+            .unwrap();
+        repo.mark_pending_delete_in_server(DEFAULT_SERVER_ID, 2, 99)
+            .await
+            .unwrap();
+        repo.apply_delete_channel_in_server(DEFAULT_SERVER_ID, 2, 99)
+            .await
+            .unwrap();
 
         assert!(effective_group(&repo, 1).is_empty());
         assert!(effective_group(&repo, 3).is_empty());
         assert_eq!(effective_group(&repo, 4), vec![4, 5]);
         assert_eq!(effective_group(&repo, 5), vec![4, 5]);
         assert!(effective_group(&repo, 6).is_empty());
-        assert!(repo.get_channel(1).await.unwrap().links.is_empty());
-        assert!(repo.get_channel(3).await.unwrap().links.is_empty());
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 1)
+                .await
+                .unwrap()
+                .links
+                .is_empty()
+        );
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 3)
+                .await
+                .unwrap()
+                .links
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn delete_visibility_hint_is_stored_for_successful_delete() {
         let repo = repo();
-        repo.create_channel(Channel::new(2, "parent", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(2, "parent", 0, 0, Some(0)))
             .await
             .unwrap();
-        repo.create_channel(Channel::new(3, "child", 0, 0, Some(2)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(3, "child", 0, 0, Some(2)))
             .await
             .unwrap();
-        repo.mark_pending_delete(2, 99).await.unwrap();
-        repo.apply_delete_channel(2, 99).await.unwrap();
+        repo.mark_pending_delete_in_server(DEFAULT_SERVER_ID, 2, 99)
+            .await
+            .unwrap();
+        repo.apply_delete_channel_in_server(DEFAULT_SERVER_ID, 2, 99)
+            .await
+            .unwrap();
 
         let op = repo
-            .get_log_since(0)
+            .get_log_since_in_server(DEFAULT_SERVER_ID, 0)
             .await
             .into_iter()
             .find(|op| matches!(op.op, ChannelOp::DeleteChannel { id: 2, .. }))
@@ -6591,14 +6555,18 @@ mod tests {
     #[tokio::test]
     async fn delete_visibility_hint_is_absent_for_stale_no_op_delete() {
         let repo = repo();
-        repo.create_channel(Channel::new(2, "parent", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(2, "parent", 0, 0, Some(0)))
             .await
             .unwrap();
-        repo.mark_pending_delete(2, 99).await.unwrap();
-        repo.apply_delete_channel(2, 100).await.unwrap();
+        repo.mark_pending_delete_in_server(DEFAULT_SERVER_ID, 2, 99)
+            .await
+            .unwrap();
+        repo.apply_delete_channel_in_server(DEFAULT_SERVER_ID, 2, 100)
+            .await
+            .unwrap();
 
         let op = repo
-            .get_log_since(0)
+            .get_log_since_in_server(DEFAULT_SERVER_ID, 0)
             .await
             .into_iter()
             .find(|op| matches!(op.op, ChannelOp::DeleteChannel { id: 2, .. }))
@@ -6610,14 +6578,18 @@ mod tests {
     #[tokio::test]
     async fn delete_visibility_hint_is_pruned_with_channel_log() {
         let repo = repo_with_log_max_entries(1);
-        repo.create_channel(Channel::new(2, "doomed", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(2, "doomed", 0, 0, Some(0)))
             .await
             .unwrap();
-        repo.mark_pending_delete(2, 99).await.unwrap();
-        repo.apply_delete_channel(2, 99).await.unwrap();
+        repo.mark_pending_delete_in_server(DEFAULT_SERVER_ID, 2, 99)
+            .await
+            .unwrap();
+        repo.apply_delete_channel_in_server(DEFAULT_SERVER_ID, 2, 99)
+            .await
+            .unwrap();
         let delete_op = ChannelOperation {
             server_id: DEFAULT_SERVER_ID.to_owned(),
-            version: repo.current_version(),
+            version: repo.current_version_in_server(DEFAULT_SERVER_ID),
             node_id: 1,
             timestamp: 0,
             emits_client_message: true,
@@ -6629,7 +6601,7 @@ mod tests {
                 .is_some()
         );
 
-        repo.create_channel(Channel::new(3, "after", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(3, "after", 0, 0, Some(0)))
             .await
             .unwrap();
 
@@ -6648,12 +6620,19 @@ mod tests {
                 .await
                 .unwrap();
             for id in 1..=3 {
-                repo.create_channel(Channel::new(id, format!("ch{id}"), 0, 0, Some(0)))
-                    .await
-                    .unwrap();
+                repo.create_channel_in_server(
+                    DEFAULT_SERVER_ID,
+                    Channel::new(id, format!("ch{id}"), 0, 0, Some(0)),
+                )
+                .await
+                .unwrap();
             }
-            repo.add_link(1, 2).await.unwrap();
-            repo.add_link(2, 3).await.unwrap();
+            repo.add_link_in_server(DEFAULT_SERVER_ID, 1, 2)
+                .await
+                .unwrap();
+            repo.add_link_in_server(DEFAULT_SERVER_ID, 2, 3)
+                .await
+                .unwrap();
             repo.save_snapshot().await.unwrap();
         }
 
@@ -6678,7 +6657,9 @@ mod tests {
             )
             .await
             .unwrap();
-            repo.set_acls(0, false, Vec::new()).await.unwrap();
+            repo.set_acls_in_server(DEFAULT_SERVER_ID, 0, false, Vec::new())
+                .await
+                .unwrap();
             repo.save_snapshot().await.unwrap();
 
             let raw = std::fs::read_to_string(temp.path().join("channels.snapshot.json")).unwrap();
@@ -6703,7 +6684,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let root = repo.get_channel(0).await.unwrap();
+        let root = repo
+            .get_channel_in_server(DEFAULT_SERVER_ID, 0)
+            .await
+            .unwrap();
         assert_eq!(root.name, "Renamed By Config");
         assert!(
             !root.inherit_acl,
@@ -6720,7 +6704,8 @@ mod tests {
         );
 
         let updated = repo
-            .update_channel(
+            .update_channel_in_server(
+                DEFAULT_SERVER_ID,
                 0,
                 ChannelPatch {
                     name: Some("Ignored Patch".to_owned()),
@@ -6735,7 +6720,13 @@ mod tests {
 
         assert_eq!(updated.name, "Configured Root");
         assert_eq!(updated.position, 7);
-        assert_eq!(repo.get_channel(0).await.unwrap().name, "Configured Root");
+        assert_eq!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 0)
+                .await
+                .unwrap()
+                .name,
+            "Configured Root"
+        );
     }
 
     #[tokio::test]
@@ -6744,7 +6735,7 @@ mod tests {
         let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
             .await
             .unwrap();
-        repo.create_channel(Channel::new(7, "old", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(7, "old", 0, 0, Some(0)))
             .await
             .unwrap();
 
@@ -6757,7 +6748,8 @@ mod tests {
         let mut update = tokio::spawn({
             let repo = Arc::clone(&repo);
             async move {
-                repo.update_channel(
+                repo.update_channel_in_server(
+                    DEFAULT_SERVER_ID,
                     7,
                     ChannelPatch {
                         name: Some("new".to_owned()),
@@ -6778,11 +6770,13 @@ mod tests {
             "precondition: channel update should be waiting for the WAL commit"
         );
 
-        let channel =
-            tokio::time::timeout(std::time::Duration::from_millis(50), repo.get_channel(7))
-                .await
-                .expect("channel reads should not wait behind a blocked commit")
-                .expect("channel exists");
+        let channel = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 7),
+        )
+        .await
+        .expect("channel reads should not wait behind a blocked commit")
+        .expect("channel exists");
         assert_eq!(channel.name, "new");
 
         drop(wal_guard);
@@ -6792,38 +6786,71 @@ mod tests {
     #[tokio::test]
     async fn stale_nonce_delete_is_semantic_no_op() {
         let repo = repo();
-        repo.create_channel(Channel::new(7, "doomed", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(7, "doomed", 0, 0, Some(0)))
             .await
             .unwrap();
 
-        repo.mark_pending_delete(7, 10).await.unwrap();
-        repo.cancel_pending_delete(7, 10).await.unwrap();
-        let deleted = repo.apply_delete_channel(7, 10).await.unwrap();
+        repo.mark_pending_delete_in_server(DEFAULT_SERVER_ID, 7, 10)
+            .await
+            .unwrap();
+        repo.cancel_pending_delete_in_server(DEFAULT_SERVER_ID, 7, 10)
+            .await
+            .unwrap();
+        let deleted = repo
+            .apply_delete_channel_in_server(DEFAULT_SERVER_ID, 7, 10)
+            .await
+            .unwrap();
 
         assert!(!deleted);
-        assert!(repo.get_channel(7).await.is_some());
-        let last = repo.get_log_since(0).await.pop().unwrap();
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .is_some()
+        );
+        let last = repo
+            .get_log_since_in_server(DEFAULT_SERVER_ID, 0)
+            .await
+            .pop()
+            .unwrap();
         assert!(last.to_message().is_none());
     }
 
     #[tokio::test]
     async fn matching_nonce_delete_removes_subtree_and_emits_remove() {
         let repo = repo();
-        repo.create_channel(Channel::new(7, "parent", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(7, "parent", 0, 0, Some(0)))
             .await
             .unwrap();
-        repo.create_channel(Channel::new(8, "child", 0, 0, Some(7)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(8, "child", 0, 0, Some(7)))
             .await
             .unwrap();
 
-        let marked = repo.mark_pending_delete(7, 99).await.unwrap();
+        let marked = repo
+            .mark_pending_delete_in_server(DEFAULT_SERVER_ID, 7, 99)
+            .await
+            .unwrap();
         assert_eq!(marked.len(), 2);
-        let deleted = repo.apply_delete_channel(7, 99).await.unwrap();
+        let deleted = repo
+            .apply_delete_channel_in_server(DEFAULT_SERVER_ID, 7, 99)
+            .await
+            .unwrap();
 
         assert!(deleted);
-        assert!(repo.get_channel(7).await.is_none());
-        assert!(repo.get_channel(8).await.is_none());
-        let last = repo.get_log_since(0).await.pop().unwrap();
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .is_none()
+        );
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 8)
+                .await
+                .is_none()
+        );
+        let last = repo
+            .get_log_since_in_server(DEFAULT_SERVER_ID, 0)
+            .await
+            .pop()
+            .unwrap();
         assert!(matches!(
             last.to_message(),
             Some(shitspeak_messages::messages::Message::ChannelRemove(_))
@@ -6856,22 +6883,30 @@ mod tests {
     #[tokio::test]
     async fn stale_allocated_channel_id_does_not_overwrite_existing_channel() {
         let repo = repo();
-        let stale_id = repo.next_channel_id(true).await;
+        let stale_id = repo
+            .next_channel_id_in_server(DEFAULT_SERVER_ID, true)
+            .await;
 
-        repo.create_channel(Channel::new(stale_id, "first", 0, 0, Some(0)))
-            .await
-            .unwrap();
-        repo.create_channel(Channel::new(stale_id, "second", 0, 0, Some(0)))
-            .await
-            .unwrap();
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(stale_id, "first", 0, 0, Some(0)),
+        )
+        .await
+        .unwrap();
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(stale_id, "second", 0, 0, Some(0)),
+        )
+        .await
+        .unwrap();
 
         let first = repo
-            .get_channel(stale_id)
+            .get_channel_in_server(DEFAULT_SERVER_ID, stale_id)
             .await
             .expect("first channel should still exist at its original id");
         assert_eq!(first.name, "first");
         assert!(
-            repo.get_all()
+            repo.get_all_in_server(DEFAULT_SERVER_ID)
                 .await
                 .into_iter()
                 .any(|channel| channel.id != stale_id && channel.name == "second"),
@@ -6883,52 +6918,88 @@ mod tests {
     async fn simultaneous_temporary_channels_get_distinct_ids() {
         let repo = repo();
 
-        let alice_temp = repo.next_channel_id(true).await;
-        repo.create_channel(Channel::new(alice_temp, "AliceTemp", 0, 0, Some(0)))
-            .await
-            .unwrap();
+        let alice_temp = repo
+            .next_channel_id_in_server(DEFAULT_SERVER_ID, true)
+            .await;
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(alice_temp, "AliceTemp", 0, 0, Some(0)),
+        )
+        .await
+        .unwrap();
 
-        let bob_temp = repo.next_channel_id(true).await;
-        repo.create_channel(Channel::new(bob_temp, "BobTemp", 0, 0, Some(0)))
-            .await
-            .unwrap();
+        let bob_temp = repo
+            .next_channel_id_in_server(DEFAULT_SERVER_ID, true)
+            .await;
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(bob_temp, "BobTemp", 0, 0, Some(0)),
+        )
+        .await
+        .unwrap();
 
         assert_ne!(
             alice_temp, bob_temp,
             "active temporary channels must not reuse the same id"
         );
         assert_eq!(
-            repo.get_channel(alice_temp).await.unwrap().name,
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, alice_temp)
+                .await
+                .unwrap()
+                .name,
             "AliceTemp"
         );
-        assert_eq!(repo.get_channel(bob_temp).await.unwrap().name, "BobTemp");
+        assert_eq!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, bob_temp)
+                .await
+                .unwrap()
+                .name,
+            "BobTemp"
+        );
     }
 
     #[tokio::test]
     async fn removed_temporary_channel_id_is_reused() {
         let repo = repo();
 
-        let first_temp = repo.next_channel_id(true).await;
-        repo.create_channel(Channel::new(first_temp, "ReusableTemp", 0, 0, Some(0)))
+        let first_temp = repo
+            .next_channel_id_in_server(DEFAULT_SERVER_ID, true)
+            .await;
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(first_temp, "ReusableTemp", 0, 0, Some(0)),
+        )
+        .await
+        .unwrap();
+        repo.delete_channel_in_server(DEFAULT_SERVER_ID, first_temp)
             .await
             .unwrap();
-        repo.delete_channel(first_temp).await.unwrap();
         assert!(
-            repo.get_channel(first_temp).await.is_none(),
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, first_temp)
+                .await
+                .is_none(),
             "precondition: temporary channel should be removed before reuse"
         );
 
-        let second_temp = repo.next_channel_id(true).await;
-        repo.create_channel(Channel::new(second_temp, "ReusedTemp", 0, 0, Some(0)))
-            .await
-            .unwrap();
+        let second_temp = repo
+            .next_channel_id_in_server(DEFAULT_SERVER_ID, true)
+            .await;
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(second_temp, "ReusedTemp", 0, 0, Some(0)),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             second_temp, first_temp,
             "temporary channel ids should be recycled once the old channel has been removed"
         );
         assert_eq!(
-            repo.get_channel(second_temp).await.unwrap().name,
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, second_temp)
+                .await
+                .unwrap()
+                .name,
             "ReusedTemp"
         );
     }
@@ -6957,21 +7028,27 @@ mod tests {
     #[tokio::test]
     async fn repository_snapshots_reuse_root_first_position_order_after_mutations() {
         let repo = repo();
-        repo.create_channel(Channel::new(3, "right", 0, 1, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(3, "right", 0, 1, Some(0)))
             .await
             .unwrap();
-        repo.create_channel(Channel::new(2, "left", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(2, "left", 0, 0, Some(0)))
             .await
             .unwrap();
-        repo.create_channel(Channel::new(5, "left-child", 0, 0, Some(2)))
-            .await
-            .unwrap();
-        repo.create_channel(Channel::new(4, "right-child", 0, 0, Some(3)))
-            .await
-            .unwrap();
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(5, "left-child", 0, 0, Some(2)),
+        )
+        .await
+        .unwrap();
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(4, "right-child", 0, 0, Some(3)),
+        )
+        .await
+        .unwrap();
 
         let ids = repo
-            .get_all()
+            .get_all_in_server(DEFAULT_SERVER_ID)
             .await
             .into_iter()
             .map(|channel| channel.id)
@@ -6996,7 +7073,7 @@ mod tests {
         let unchanged_before = Arc::clone(repo.channels.read()[DEFAULT_SERVER_ID].get(&2).unwrap());
         let root_before = Arc::clone(repo.channels.read()[DEFAULT_SERVER_ID].get(&0).unwrap());
 
-        repo.create_channel(Channel::new(99, "right", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(99, "right", 0, 0, Some(0)))
             .await
             .expect_err("duplicate sibling name is rejected");
         let after_rejection = repo.ordered_snapshot_in_server(DEFAULT_SERVER_ID);
@@ -7006,7 +7083,8 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(&root_before, &after_rejection[0]));
 
-        repo.update_channel(
+        repo.update_channel_in_server(
+            DEFAULT_SERVER_ID,
             3,
             ChannelPatch {
                 name: Some("renamed-right".to_owned()),
@@ -7045,7 +7123,7 @@ mod tests {
                 .unwrap()
         ));
 
-        repo.set_acls(3, false, vec![test_acl("staff")])
+        repo.set_acls_in_server(DEFAULT_SERVER_ID, 3, false, vec![test_acl("staff")])
             .await
             .unwrap();
         let (acl_update, _, _) =
@@ -7069,7 +7147,8 @@ mod tests {
             1
         );
 
-        repo.update_channel(
+        repo.update_channel_in_server(
+            DEFAULT_SERVER_ID,
             3,
             ChannelPatch {
                 name: None,
@@ -7170,18 +7249,27 @@ mod tests {
         let observer = Arc::new(RecordingObserver::default());
         repo.set_observer(observer.clone());
 
-        repo.create_channel(Channel::new(7, "kept", 0, 0, Some(0)))
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(7, "kept", 0, 0, Some(0)))
             .await
             .unwrap();
-        repo.create_channel(Channel::new(8, "removed", 0, 0, Some(0)))
-            .await
-            .unwrap();
-
-        repo.install_s2s_snapshot(3, vec![Channel::new(7, "kept", 0, 0, Some(0))])
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(8, "removed", 0, 0, Some(0)))
             .await
             .unwrap();
 
-        assert!(repo.get_channel(8).await.is_none());
+        repo.install_s2s_snapshot_in_server(
+            DEFAULT_SERVER_ID,
+            3,
+            vec![Channel::new(7, "kept", 0, 0, Some(0))],
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 8)
+                .await
+                .is_none()
+        );
         assert_eq!(
             observer
                 .versions
@@ -7199,6 +7287,31 @@ mod tests {
         assert!(valid_channel_ids.contains(&0));
         assert!(valid_channel_ids.contains(&7));
         assert!(!valid_channel_ids.contains(&8));
+    }
+
+    #[tokio::test]
+    async fn channel_operation_without_server_id_is_rejected() {
+        let repo = repo();
+        let op = ChannelOperation {
+            server_id: String::new(),
+            version: 1,
+            node_id: 1,
+            timestamp: 123,
+            emits_client_message: true,
+            op: ChannelOp::CreateChannel {
+                channel: Channel::new(99, "unscoped", 0, 0, Some(0)),
+            },
+        };
+
+        assert!(matches!(
+            repo.apply_committed_operation(op).await,
+            Err(ChannelRepoError::InvalidServerId)
+        ));
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 99)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -7312,14 +7425,20 @@ mod tests {
             .unwrap(),
             StrictOperationApplyOutcome::AlreadyApplied
         );
-        assert_eq!(repo.current_version(), 1);
-        assert_eq!(repo.get_channel(9).await.unwrap().name, "first");
+        assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), 1);
+        assert_eq!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 9)
+                .await
+                .unwrap()
+                .name,
+            "first"
+        );
         assert_eq!(
             repo.get_log_entries_since(DEFAULT_SERVER_ID, 0).await.len(),
             1
         );
         assert_eq!(
-            repo.strict_operation_ids(),
+            repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID),
             vec![StrictOperationId::new(11, 22)]
         );
     }
@@ -7358,7 +7477,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(repo.current_version(), 1);
+        assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), 1);
         assert_eq!(
             repo.get_log_entries_since(DEFAULT_SERVER_ID, 0).await.len(),
             1
@@ -7420,7 +7539,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.strict_operation_ids(),
+            repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID),
             vec![StrictOperationId::new(44, 55)]
         );
 
@@ -7447,8 +7566,14 @@ mod tests {
                 .unwrap(),
             StrictOperationApplyOutcome::AlreadyApplied
         );
-        assert_eq!(repo.current_version(), 2);
-        assert_eq!(repo.get_channel(9).await.unwrap().name, "snapshot-state");
+        assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), 2);
+        assert_eq!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 9)
+                .await
+                .unwrap()
+                .name,
+            "snapshot-state"
+        );
         assert!(
             repo.strict_log_entries_since_in_server(DEFAULT_SERVER_ID, 0)
                 .await
@@ -7468,9 +7593,11 @@ mod tests {
     async fn channel_snapshot_merges_strict_operation_ids() {
         let repo = repo();
         let operation_id = StrictOperationId::new(71, 72);
-        repo.install_s2s_snapshot_with_strict_operation_ids(
+        repo.install_s2s_snapshot_with_strict_operation_ids_in_server(
+            DEFAULT_SERVER_ID,
             1,
             vec![Channel::new(9, "snapshot", 0, 0, Some(0))],
+            chrono::Utc::now().timestamp(),
             vec![operation_id.clone()],
         )
         .await
@@ -7499,7 +7626,13 @@ mod tests {
                 .unwrap(),
             StrictOperationApplyOutcome::AlreadyApplied
         );
-        assert_eq!(repo.get_channel(9).await.unwrap().name, "snapshot");
+        assert_eq!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 9)
+                .await
+                .unwrap()
+                .name,
+            "snapshot"
+        );
     }
 
     #[tokio::test]
@@ -7531,18 +7664,33 @@ mod tests {
         );
 
         assert!(matches!(
-            repo.install_s2s_snapshot_with_strict_operation_ids(
+            repo.install_s2s_snapshot_with_strict_operation_ids_in_server(
+                DEFAULT_SERVER_ID,
                 1,
                 vec![Channel::new(10, "replacement", 0, 0, Some(0))],
+                chrono::Utc::now().timestamp(),
                 vec![StrictOperationId::new(83, 84)],
             )
             .await,
             Err(ChannelRepoError::StrictSnapshotOperationIdsIncomplete { missing: 1 })
         ));
-        assert_eq!(repo.current_version(), 1);
-        assert_eq!(repo.get_channel(9).await.unwrap().name, "local");
-        assert!(repo.get_channel(10).await.is_none());
-        assert_eq!(repo.strict_operation_ids(), vec![local_operation_id]);
+        assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), 1);
+        assert_eq!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 9)
+                .await
+                .unwrap()
+                .name,
+            "local"
+        );
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 10)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID),
+            vec![local_operation_id]
+        );
     }
 
     #[tokio::test]
@@ -7575,9 +7723,11 @@ mod tests {
         let before = repo.strict_snapshot_in_server(DEFAULT_SERVER_ID).await;
 
         assert!(matches!(
-            repo.install_s2s_snapshot_with_strict_operation_ids(
+            repo.install_s2s_snapshot_with_strict_operation_ids_in_server(
+                DEFAULT_SERVER_ID,
                 2,
                 vec![Channel::new(10, "replacement", 0, 0, Some(0))],
+                chrono::Utc::now().timestamp(),
                 vec![StrictOperationId::new(87, 88)],
             )
             .await,
@@ -7588,8 +7738,18 @@ mod tests {
         assert_eq!(after.version(), before.version());
         assert_eq!(after.freshness(), before.freshness());
         assert_eq!(after.operation_ids(), before.operation_ids());
-        assert_eq!(repo.get_channel(9).await.unwrap().name, "local");
-        assert!(repo.get_channel(10).await.is_none());
+        assert_eq!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 9)
+                .await
+                .unwrap()
+                .name,
+            "local"
+        );
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 10)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -7621,19 +7781,31 @@ mod tests {
         );
 
         let incoming_operation_id = StrictOperationId::new(93, 94);
-        repo.install_s2s_snapshot_with_strict_operation_ids(
+        repo.install_s2s_snapshot_with_strict_operation_ids_in_server(
+            DEFAULT_SERVER_ID,
             2,
             vec![Channel::new(10, "replacement", 0, 0, Some(0))],
+            chrono::Utc::now().timestamp(),
             vec![local_operation_id.clone(), incoming_operation_id.clone()],
         )
         .await
         .unwrap();
 
-        assert_eq!(repo.current_version(), 2);
-        assert!(repo.get_channel(9).await.is_none());
-        assert_eq!(repo.get_channel(10).await.unwrap().name, "replacement");
+        assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), 2);
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 9)
+                .await
+                .is_none()
+        );
         assert_eq!(
-            repo.strict_operation_ids(),
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 10)
+                .await
+                .unwrap()
+                .name,
+            "replacement"
+        );
+        assert_eq!(
+            repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID),
             vec![local_operation_id, incoming_operation_id]
         );
     }
@@ -7661,15 +7833,23 @@ mod tests {
             StrictOperationApplyOutcome::Applied
         );
 
-        repo.install_s2s_snapshot_with_strict_operation_ids(
+        repo.install_s2s_snapshot_with_strict_operation_ids_in_server(
+            DEFAULT_SERVER_ID,
             1,
             vec![Channel::new(10, "default", 0, 0, Some(0))],
+            chrono::Utc::now().timestamp(),
             Vec::new(),
         )
         .await
         .unwrap();
 
-        assert_eq!(repo.get_channel(10).await.unwrap().name, "default");
+        assert_eq!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 10)
+                .await
+                .unwrap()
+                .name,
+            "default"
+        );
         assert_eq!(
             repo.get_channel_in_server("other-server", 9)
                 .await
@@ -7716,14 +7896,18 @@ mod tests {
             StrictOperationApplyOutcome::VersionConflict
         );
 
-        assert_eq!(repo.current_version(), 1);
-        assert!(repo.get_channel(10).await.is_none());
+        assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), 1);
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 10)
+                .await
+                .is_none()
+        );
         assert_eq!(
             repo.get_log_entries_since(DEFAULT_SERVER_ID, 0).await.len(),
             1
         );
         assert_eq!(
-            repo.strict_operation_ids(),
+            repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID),
             vec![StrictOperationId::new(1, 2)]
         );
     }
@@ -7782,7 +7966,7 @@ mod tests {
         assert_eq!(snapshot.version(), 1);
         assert_eq!(snapshot.operation_ids(), &[StrictOperationId::new(31, 32)]);
         assert_eq!(
-            repo.strict_operation_ids(),
+            repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID),
             vec![StrictOperationId::new(31, 32)]
         );
     }
@@ -7810,24 +7994,41 @@ mod tests {
                     .unwrap(),
                 StrictOperationApplyOutcome::Applied
             );
-            assert!(repo.strict_operation_ids().is_empty());
+            assert!(
+                repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID)
+                    .is_empty()
+            );
         }
 
         let reopened = ChannelRepository::open(1, temp.path(), root_config(), tuning())
             .await
             .unwrap();
-        assert_eq!(reopened.current_version(), 1);
-        assert_eq!(reopened.get_channel(9).await.unwrap().name, "strict");
-        assert!(reopened.strict_operation_ids().is_empty());
+        assert_eq!(reopened.current_version_in_server(DEFAULT_SERVER_ID), 1);
+        assert_eq!(
+            reopened
+                .get_channel_in_server(DEFAULT_SERVER_ID, 9)
+                .await
+                .unwrap()
+                .name,
+            "strict"
+        );
+        assert!(
+            reopened
+                .strict_operation_ids_in_server(DEFAULT_SERVER_ID)
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn s2s_checkpoint_snapshot_preserves_but_does_not_require_legacy_ledger() {
         let repo = repo();
         let legacy_operation_id = StrictOperationId::new(31, 32);
-        repo.merge_strict_operation_ids(vec![legacy_operation_id.clone()])
-            .await
-            .unwrap();
+        repo.merge_strict_operation_ids_in_server(
+            DEFAULT_SERVER_ID,
+            vec![legacy_operation_id.clone()],
+        )
+        .await
+        .unwrap();
 
         repo.install_s2s_checkpoint_snapshot_in_server(
             DEFAULT_SERVER_ID,
@@ -7838,8 +8039,17 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(repo.get_channel(9).await.unwrap().name, "replacement");
-        assert_eq!(repo.strict_operation_ids(), vec![legacy_operation_id]);
+        assert_eq!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 9)
+                .await
+                .unwrap()
+                .name,
+            "replacement"
+        );
+        assert_eq!(
+            repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID),
+            vec![legacy_operation_id]
+        );
     }
 
     #[tokio::test]
@@ -7866,14 +8076,21 @@ mod tests {
                 .await,
             Err(ChannelRepoError::WalIo(_))
         ));
-        assert_eq!(repo.current_version(), 0);
-        assert!(repo.get_channel(9).await.is_none());
+        assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), 0);
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 9)
+                .await
+                .is_none()
+        );
         assert!(
             repo.get_log_entries_since(DEFAULT_SERVER_ID, 0)
                 .await
                 .is_empty()
         );
-        assert!(repo.strict_operation_ids().is_empty());
+        assert!(
+            repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID)
+                .is_empty()
+        );
         assert!(!repo.strict_operation_durability_enabled());
     }
 
@@ -7884,24 +8101,42 @@ mod tests {
             .await
             .unwrap();
         assert!(repo.strict_operation_durability_enabled());
-        repo.create_channel(Channel::new(7, "existing", 0, 0, Some(0)))
-            .await
-            .unwrap();
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(7, "existing", 0, 0, Some(0)),
+        )
+        .await
+        .unwrap();
         repo.force_next_snapshot_write_failure_for_test();
 
         assert!(matches!(
-            repo.install_s2s_snapshot_with_strict_operation_ids(
+            repo.install_s2s_snapshot_with_strict_operation_ids_in_server(
+                DEFAULT_SERVER_ID,
                 5,
                 vec![Channel::new(9, "replacement", 0, 0, Some(0))],
+                chrono::Utc::now().timestamp(),
                 vec![StrictOperationId::new(51, 52)],
             )
             .await,
             Err(ChannelRepoError::WalIo(_))
         ));
-        assert_eq!(repo.current_version(), 1);
-        assert_eq!(repo.get_channel(7).await.unwrap().name, "existing");
-        assert!(repo.get_channel(9).await.is_none());
-        assert!(repo.strict_operation_ids().is_empty());
+        assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), 1);
+        assert_eq!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .unwrap()
+                .name,
+            "existing"
+        );
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 9)
+                .await
+                .is_none()
+        );
+        assert!(
+            repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID)
+                .is_empty()
+        );
         assert!(!repo.strict_operation_durability_enabled());
     }
 
@@ -7926,9 +8161,11 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            repo.install_s2s_snapshot_with_strict_operation_ids(
+            repo.install_s2s_snapshot_with_strict_operation_ids_in_server(
+                DEFAULT_SERVER_ID,
                 1,
                 vec![Channel::new(9, "replacement", 0, 0, Some(0))],
+                chrono::Utc::now().timestamp(),
                 Vec::new(),
             )
             .await,
@@ -7947,11 +8184,17 @@ mod tests {
         repo.force_next_snapshot_write_failure_for_test();
 
         assert!(matches!(
-            repo.merge_strict_operation_ids(vec![StrictOperationId::new(61, 62)])
-                .await,
+            repo.merge_strict_operation_ids_in_server(
+                DEFAULT_SERVER_ID,
+                vec![StrictOperationId::new(61, 62)]
+            )
+            .await,
             Err(ChannelRepoError::WalIo(_))
         ));
-        assert!(repo.strict_operation_ids().is_empty());
+        assert!(
+            repo.strict_operation_ids_in_server(DEFAULT_SERVER_ID)
+                .is_empty()
+        );
         assert!(!repo.strict_operation_durability_enabled());
     }
 
@@ -7962,16 +8205,20 @@ mod tests {
             let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
                 .await
                 .unwrap();
-            repo.install_s2s_snapshot_with_strict_operation_ids(
+            repo.install_s2s_snapshot_with_strict_operation_ids_in_server(
+                DEFAULT_SERVER_ID,
                 1,
                 vec![Channel::new(7, "first", 0, 0, Some(0))],
+                chrono::Utc::now().timestamp(),
                 vec![StrictOperationId::new(71, 72)],
             )
             .await
             .unwrap();
-            repo.install_s2s_snapshot_with_strict_operation_ids(
+            repo.install_s2s_snapshot_with_strict_operation_ids_in_server(
+                DEFAULT_SERVER_ID,
                 2,
                 vec![Channel::new(9, "second", 0, 0, Some(0))],
+                chrono::Utc::now().timestamp(),
                 vec![
                     StrictOperationId::new(71, 72),
                     StrictOperationId::new(73, 74),
@@ -7979,25 +8226,43 @@ mod tests {
             )
             .await
             .unwrap();
-            repo.install_s2s_snapshot_with_strict_operation_ids(
+            repo.install_s2s_snapshot_with_strict_operation_ids_in_server(
+                DEFAULT_SERVER_ID,
                 1,
                 vec![Channel::new(10, "stale", 0, 0, Some(0))],
+                chrono::Utc::now().timestamp(),
                 vec![StrictOperationId::new(75, 76)],
             )
             .await
             .unwrap();
-            assert_eq!(repo.current_version(), 2);
-            assert!(repo.get_channel(10).await.is_none());
+            assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), 2);
+            assert!(
+                repo.get_channel_in_server(DEFAULT_SERVER_ID, 10)
+                    .await
+                    .is_none()
+            );
         }
 
         let reopened = ChannelRepository::open(1, temp.path(), root_config(), tuning())
             .await
             .unwrap();
-        assert_eq!(reopened.current_version(), 2);
-        assert!(reopened.get_channel(7).await.is_none());
-        assert_eq!(reopened.get_channel(9).await.unwrap().name, "second");
+        assert_eq!(reopened.current_version_in_server(DEFAULT_SERVER_ID), 2);
+        assert!(
+            reopened
+                .get_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .is_none()
+        );
         assert_eq!(
-            reopened.strict_operation_ids(),
+            reopened
+                .get_channel_in_server(DEFAULT_SERVER_ID, 9)
+                .await
+                .unwrap()
+                .name,
+            "second"
+        );
+        assert_eq!(
+            reopened.strict_operation_ids_in_server(DEFAULT_SERVER_ID),
             vec![
                 StrictOperationId::new(71, 72),
                 StrictOperationId::new(73, 74)

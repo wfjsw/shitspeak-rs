@@ -844,6 +844,9 @@ async fn can_view_user_with_home(
     if !target.is_authenticated() {
         return false;
     }
+    if target.is_invisible() {
+        return false;
+    }
     if superuser_hidden_from_viewer(viewer, target) {
         return false;
     }
@@ -1413,6 +1416,17 @@ async fn project_message_at_home(
                     .get_client_in_server(&server_id, session)
                     .await;
                 if let Some(target) = &target {
+                    if session != viewer.get_session_id() && target.is_invisible() {
+                        return remove_hidden_user(visibility, session);
+                    }
+                    if session != viewer.get_session_id() && visibility.get(session).is_none() {
+                        visibility.insert(
+                            session,
+                            target.get_current_channel_id(),
+                            target.get_listening_channel_ids(),
+                        );
+                        return vec![target.build_user_state_for_broadcast().into()];
+                    }
                     let old_listeners = visibility
                         .get(session)
                         .map(|known| known.listener_channels.clone())
@@ -2299,6 +2313,8 @@ async fn refresh_target_visibility(
         .unwrap_or_else(|| target.get_current_channel_id());
     let visible = if viewer.get_session_id() == target.get_session_id() {
         true
+    } else if target.is_invisible() {
+        false
     } else if superuser_hidden_from_viewer(viewer, target) {
         false
     } else if let Some(context) = acl_context {

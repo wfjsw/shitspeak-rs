@@ -63,8 +63,12 @@ pub async fn handle_context_action(
     // Rebuild and broadcast the full action list so all clients see
     // updated toggle labels.
     let modify_list = registry.build_modify_list().await;
+    let server_id = sender.server_id();
     for modify in modify_list {
-        server.get_clients().broadcast_all(&modify.into()).await;
+        server
+            .get_clients()
+            .broadcast_all_in_server(&server_id, &modify.into())
+            .await;
     }
 
     Ok(())

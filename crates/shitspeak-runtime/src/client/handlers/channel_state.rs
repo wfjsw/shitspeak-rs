@@ -178,7 +178,7 @@ pub async fn handle_channel_state(
             }
             let proposed_s2s = server
                 .s2s_manager()
-                .start_channel_op_proposal(Some(&server_id), op.clone())
+                .start_channel_op_proposal(&server_id, op.clone())
                 .await;
             if proposed_s2s.should_apply_locally() {
                 let created = match channels.create_channel_in_server(&server_id, new_ch).await {
@@ -430,7 +430,7 @@ pub async fn handle_channel_state(
             }
             let proposed_s2s = server
                 .s2s_manager()
-                .start_channel_op_proposal(Some(&server_id), op)
+                .start_channel_op_proposal(&server_id, op)
                 .await;
             if proposed_s2s.should_apply_locally() {
                 if let Err(e) = channels

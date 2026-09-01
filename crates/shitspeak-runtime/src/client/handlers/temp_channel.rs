@@ -101,7 +101,7 @@ pub async fn reap_if_empty_temporary_on_server(
 
     let s2s_marked = server
         .s2s_manager()
-        .propose_channel_op(Some(server_id), mark)
+        .propose_channel_op(server_id, mark)
         .await;
     let marked_locally = if s2s_marked.should_apply_locally() {
         if channels
@@ -128,7 +128,7 @@ pub async fn reap_if_empty_temporary_on_server(
         };
         if server
             .s2s_manager()
-            .propose_channel_op(Some(server_id), cancel)
+            .propose_channel_op(server_id, cancel)
             .await
             .should_apply_locally()
             || marked_locally
@@ -155,7 +155,7 @@ pub async fn reap_if_empty_temporary_on_server(
         };
         if server
             .s2s_manager()
-            .propose_channel_op(Some(server_id), cancel)
+            .propose_channel_op(server_id, cancel)
             .await
             .should_apply_locally()
             || marked_locally
@@ -169,7 +169,7 @@ pub async fn reap_if_empty_temporary_on_server(
 
     let s2s_deleted = server
         .s2s_manager()
-        .propose_channel_op(Some(server_id), delete)
+        .propose_channel_op(server_id, delete)
         .await;
     if s2s_deleted.is_proposed() {
         true
@@ -299,7 +299,13 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(8);
         let creator = clients
-            .allocate_web_client(peer().ip(), peer(), local(), tx)
+            .allocate_web_client_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                peer().ip(),
+                peer(),
+                local(),
+                tx,
+            )
             .await;
 
         // Simulate what the handler does: move creator into new temp channel.
@@ -380,7 +386,13 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(8);
         let client = clients
-            .allocate_web_client(peer().ip(), peer(), local(), tx)
+            .allocate_web_client_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                peer().ip(),
+                peer(),
+                local(),
+                tx,
+            )
             .await;
         client.set_current_channel_id(
             temp_id,
@@ -489,7 +501,13 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(8);
         let client = clients
-            .allocate_web_client(peer().ip(), peer(), local(), tx)
+            .allocate_web_client_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                peer().ip(),
+                peer(),
+                local(),
+                tx,
+            )
             .await;
         client.set_current_channel_id(
             temp_id,
@@ -541,7 +559,13 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel(8);
         let client = clients
-            .allocate_web_client(peer().ip(), peer(), local(), tx)
+            .allocate_web_client_in_server(
+                crate::types::DEFAULT_SERVER_ID,
+                peer().ip(),
+                peer(),
+                local(),
+                tx,
+            )
             .await;
         let session_id = client.get_session_id();
         client.set_current_channel_id(

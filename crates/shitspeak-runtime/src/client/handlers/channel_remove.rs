@@ -78,7 +78,7 @@ pub async fn handle_channel_remove(
 
     let s2s_marked = server
         .s2s_manager()
-        .propose_channel_op(Some(&server_id), mark)
+        .propose_channel_op(&server_id, mark)
         .await;
     let (deleting_subtree, marked_locally): (std::collections::HashSet<u32>, bool) =
         if s2s_marked.should_apply_locally() {
@@ -138,7 +138,7 @@ pub async fn handle_channel_remove(
         };
         let s2s_cancelled = server
             .s2s_manager()
-            .propose_channel_op(Some(&server_id), cancel)
+            .propose_channel_op(&server_id, cancel)
             .await;
         if s2s_cancelled.should_apply_locally() || marked_locally {
             let _ = server
@@ -156,7 +156,7 @@ pub async fn handle_channel_remove(
     }
     let s2s_deleted = server
         .s2s_manager()
-        .propose_channel_op(Some(&server_id), delete)
+        .propose_channel_op(&server_id, delete)
         .await;
     if s2s_deleted.should_apply_locally() {
         match server

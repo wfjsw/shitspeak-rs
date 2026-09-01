@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use shitspeak_core::{DEFAULT_SERVER_ID, ProtocolVersion};
+use shitspeak_core::ProtocolVersion;
 
 use crate::Language;
 
@@ -25,16 +25,10 @@ pub fn canonical_socket_addr(address: SocketAddr) -> SocketAddr {
     SocketAddr::new(canonical_authenticator_ip(address.ip()), address.port())
 }
 
-/// Preserve an absent virtual-server selection while ensuring an explicitly
-/// empty selection cannot create an invalid server scope.
+/// Treat an empty authenticator selection as no override so the client stays
+/// in the server that accepted the connection.
 pub fn normalize_virtual_server_id(server_id: Option<String>) -> Option<String> {
-    server_id.map(|server_id| {
-        if server_id.trim().is_empty() {
-            DEFAULT_SERVER_ID.to_owned()
-        } else {
-            server_id
-        }
-    })
+    server_id.and_then(|server_id| (!server_id.trim().is_empty()).then_some(server_id))
 }
 
 #[derive(Debug)]
@@ -52,6 +46,8 @@ pub struct AuthenticateResult {
     pub display_name: Option<String>,
     pub groups: Vec<String>,
     pub is_superuser: bool,
+    /// Hide this client from all other clients, including superusers.
+    pub invisible: bool,
     /// Optional server-id scope selected by the authenticator.  Configured
     /// virtual-server entrypoints do not constrain this value.
     pub virtual_server_id: Option<String>,
@@ -155,6 +151,7 @@ pub trait Authenticator: Send + Sync + 'static {
                 .or_else(|| Some(claims.username.clone())),
             groups: claims.groups.clone(),
             is_superuser: false,
+            invisible: false,
             virtual_server_id: None,
             language: Language::default(),
             max_bandwidth: None,
@@ -211,7 +208,7 @@ pub trait Authenticator: Send + Sync + 'static {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-    use super::{canonical_authenticator_ip, canonical_socket_addr};
+    use super::{canonical_authenticator_ip, canonical_socket_addr, normalize_virtual_server_id};
 
     #[test]
     fn canonical_authenticator_ip_unmaps_ipv4_mapped_ipv6() {
@@ -237,6 +234,17 @@ mod tests {
         assert_eq!(
             canonical_socket_addr(mapped),
             "118.171.43.53:60842".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn blank_virtual_server_selection_keeps_the_incoming_server() {
+        assert_eq!(normalize_virtual_server_id(None), None);
+        assert_eq!(normalize_virtual_server_id(Some(String::new())), None);
+        assert_eq!(normalize_virtual_server_id(Some(" \t\n ".to_owned())), None);
+        assert_eq!(
+            normalize_virtual_server_id(Some("tenant-a".to_owned())),
+            Some("tenant-a".to_owned())
         );
     }
 }

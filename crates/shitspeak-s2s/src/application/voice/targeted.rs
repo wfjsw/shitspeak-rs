@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::RwLock;
 use scc::HashCache;
 
-use shitspeak_core::{NodeIdentifier, default_server_id};
+use shitspeak_core::NodeIdentifier;
 
 const REMOTE_NODE_LOOKUP_CACHE_MIN_CAPACITY: usize = 256;
 const REMOTE_NODE_LOOKUP_CACHE_CHANNEL_MULTIPLIER: usize = 4;
@@ -496,26 +496,6 @@ impl RecipientIndex {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// Default-server compatibility wrapper.
-    pub fn set_channel_nodes(&self, channel_id: u32, nodes: BTreeSet<NodeIdentifier>) {
-        self.set_channel_nodes_in_server(default_server_id().as_str(), channel_id, nodes);
-    }
-
-    /// Default-server compatibility wrapper.
-    pub fn add(&self, channel_id: u32, node: NodeIdentifier) {
-        self.add_in_server(default_server_id().as_str(), channel_id, node);
-    }
-
-    /// Default-server compatibility wrapper.
-    pub fn remove(&self, channel_id: u32, node: NodeIdentifier) {
-        self.remove_in_server(default_server_id().as_str(), channel_id, node);
-    }
-
-    /// Default-server compatibility wrapper.
-    pub fn lookup_nodes_for(&self, channel_id: u32) -> Option<Vec<NodeIdentifier>> {
-        self.lookup_nodes_for_in_server(default_server_id().as_str(), channel_id)
-    }
-
     /// Number of channels currently tracked. Mostly for tests / metrics.
     pub fn channel_count(&self) -> usize {
         self.inner.read().len()
@@ -601,6 +581,7 @@ impl Default for RecipientIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shitspeak_core::default_server_id;
 
     #[test]
     fn complete_snapshot_supports_server_scope_and_known_empty_channels() {
@@ -634,21 +615,28 @@ mod tests {
     #[test]
     fn add_remove_lookup() {
         let idx = RecipientIndex::new();
-        idx.add(7, 1);
-        idx.add(7, 2);
-        idx.add(7, 3);
-        let mut nodes = idx.lookup_nodes_for(7).unwrap();
+        idx.add_in_server(default_server_id().as_str(), 7, 1);
+        idx.add_in_server(default_server_id().as_str(), 7, 2);
+        idx.add_in_server(default_server_id().as_str(), 7, 3);
+        let mut nodes = idx
+            .lookup_nodes_for_in_server(default_server_id().as_str(), 7)
+            .unwrap();
         nodes.sort();
         assert_eq!(nodes, vec![1, 2, 3]);
 
-        idx.remove(7, 2);
-        let mut nodes = idx.lookup_nodes_for(7).unwrap();
+        idx.remove_in_server(default_server_id().as_str(), 7, 2);
+        let mut nodes = idx
+            .lookup_nodes_for_in_server(default_server_id().as_str(), 7)
+            .unwrap();
         nodes.sort();
         assert_eq!(nodes, vec![1, 3]);
 
-        idx.remove(7, 1);
-        idx.remove(7, 3);
-        assert!(idx.lookup_nodes_for(7).is_none());
+        idx.remove_in_server(default_server_id().as_str(), 7, 1);
+        idx.remove_in_server(default_server_id().as_str(), 7, 3);
+        assert!(
+            idx.lookup_nodes_for_in_server(default_server_id().as_str(), 7)
+                .is_none()
+        );
         assert_eq!(idx.channel_count(), 0);
     }
 
@@ -666,17 +654,25 @@ mod tests {
     #[test]
     fn replace_all_overwrites() {
         let idx = RecipientIndex::new();
-        idx.add(1, 10);
-        idx.add(2, 20);
+        idx.add_in_server(default_server_id().as_str(), 1, 10);
+        idx.add_in_server(default_server_id().as_str(), 2, 20);
         let mut snapshot = HashMap::new();
         snapshot.insert(
             RecipientIndexKey::new(default_server_id(), 3),
             [30, 31].into_iter().collect(),
         );
         idx.replace_all(snapshot);
-        assert!(idx.lookup_nodes_for(1).is_none());
-        assert!(idx.lookup_nodes_for(2).is_none());
-        let mut nodes = idx.lookup_nodes_for(3).unwrap();
+        assert!(
+            idx.lookup_nodes_for_in_server(default_server_id().as_str(), 1)
+                .is_none()
+        );
+        assert!(
+            idx.lookup_nodes_for_in_server(default_server_id().as_str(), 2)
+                .is_none()
+        );
+        let mut nodes = idx
+            .lookup_nodes_for_in_server(default_server_id().as_str(), 3)
+            .unwrap();
         nodes.sort();
         assert_eq!(nodes, vec![30, 31]);
     }
@@ -684,17 +680,20 @@ mod tests {
     #[test]
     fn set_channel_nodes_empty_removes() {
         let idx = RecipientIndex::new();
-        idx.add(7, 1);
-        idx.set_channel_nodes(7, BTreeSet::new());
-        assert!(idx.lookup_nodes_for(7).is_none());
+        idx.add_in_server(default_server_id().as_str(), 7, 1);
+        idx.set_channel_nodes_in_server(default_server_id().as_str(), 7, BTreeSet::new());
+        assert!(
+            idx.lookup_nodes_for_in_server(default_server_id().as_str(), 7)
+                .is_none()
+        );
     }
 
     #[test]
     fn remote_lookup_filters_self_and_reuses_cached_nodes() {
         let idx = RecipientIndex::new();
-        idx.add(5, 1);
-        idx.add(5, 2);
-        idx.add(5, 7);
+        idx.add_in_server(default_server_id().as_str(), 5, 1);
+        idx.add_in_server(default_server_id().as_str(), 5, 2);
+        idx.add_in_server(default_server_id().as_str(), 5, 7);
 
         let first = idx.lookup_remote_nodes_for_in_server(default_server_id().as_str(), 5, 7);
         let second = idx.lookup_remote_nodes_for_in_server(default_server_id().as_str(), 5, 7);
@@ -711,7 +710,7 @@ mod tests {
     #[test]
     fn remote_lookup_generation_invalidates_on_replace_all() {
         let idx = RecipientIndex::new();
-        idx.add(5, 1);
+        idx.add_in_server(default_server_id().as_str(), 5, 1);
         let generation_after_add = idx.generation();
 
         let before = idx.lookup_remote_nodes_for_in_server(default_server_id().as_str(), 5, 7);
@@ -738,7 +737,7 @@ mod tests {
     #[test]
     fn remote_lookup_missing_channel_preserves_fallback_signal() {
         let idx = RecipientIndex::new();
-        idx.add(5, 1);
+        idx.add_in_server(default_server_id().as_str(), 5, 1);
 
         let single = idx.lookup_remote_nodes_for_in_server(default_server_id().as_str(), 6, 7);
         assert_eq!(single, RemoteNodeLookup::Missing { channel_id: 6 });
@@ -754,11 +753,11 @@ mod tests {
     #[test]
     fn remote_lookup_deduplicates_target_channels_and_noops_self_only() {
         let idx = RecipientIndex::new();
-        idx.add(5, 1);
-        idx.add(5, 7);
-        idx.add(6, 1);
-        idx.add(6, 2);
-        idx.add(8, 7);
+        idx.add_in_server(default_server_id().as_str(), 5, 1);
+        idx.add_in_server(default_server_id().as_str(), 5, 7);
+        idx.add_in_server(default_server_id().as_str(), 6, 1);
+        idx.add_in_server(default_server_id().as_str(), 6, 2);
+        idx.add_in_server(default_server_id().as_str(), 8, 7);
 
         let lookup = idx.lookup_remote_nodes_for_channels_in_server(
             default_server_id().as_str(),

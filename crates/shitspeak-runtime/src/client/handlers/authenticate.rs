@@ -240,7 +240,9 @@ pub async fn handle_authenticate(
 
     // Avoid identity/ACL finalization work when the selected server is
     // already full. The reservation CAS below remains the race-safe check.
-    if repo.authenticated_client_count_in_server(&server_id) >= auth_config.max_users {
+    if !result.invisible
+        && repo.local_authenticated_client_count_in_server(&server_id) >= auth_config.max_users
+    {
         return Err(
             AuthRejection::new_with_language(RejectType::ServerFull, sender.language()).into(),
         );
@@ -276,6 +278,7 @@ pub async fn handle_authenticate(
         gs.set_fqdn(result.fqdn);
         gs.set_display_name(result.display_name);
         gs.set_superuser(result.is_superuser);
+        gs.set_invisible(result.invisible);
         gs.set_groups(result.groups.into_iter().collect());
         gs.set_texture_blob(initial_texture_url, None);
         gs.set_comment_blob(initial_comment_url, None);
@@ -287,16 +290,16 @@ pub async fn handle_authenticate(
         ext.set_credential(Credential::new(username, password));
     }
 
-    // Reserve before the root ACL check so concurrent over-capacity attempts
-    // do not all perform the same permission computation. Replicated counts
-    // remain eventually consistent across cluster nodes.
-    if !repo
-        .try_reserve_authenticated_client_in_server(
-            &server_id,
-            sender.get_session_id(),
-            auth_config.max_users,
-        )
-        .await
+    // Reserve local capacity before the root ACL check so concurrent
+    // over-capacity attempts do not all perform the same permission computation.
+    if !result.invisible
+        && !repo
+            .try_reserve_authenticated_client_in_server(
+                &server_id,
+                sender.get_session_id(),
+                auth_config.max_users,
+            )
+            .await
     {
         return Err(
             AuthRejection::new_with_language(RejectType::ServerFull, sender.language()).into(),
@@ -495,6 +498,9 @@ pub async fn handle_authenticate(
                 continue;
             }
             if !client.is_authenticated() {
+                continue;
+            }
+            if client.is_invisible() && client.get_session_id() != session_id {
                 continue;
             }
             if viewer_independent_user_state {

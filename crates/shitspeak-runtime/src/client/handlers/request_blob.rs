@@ -351,7 +351,7 @@ async fn handle_request_blob_inner(
                 None => {
                     server
                         .s2s_manager()
-                        .get_channel_blob(Some(&server_id), hash)
+                        .get_channel_blob(&server_id, hash)
                         .await
                 }
             },

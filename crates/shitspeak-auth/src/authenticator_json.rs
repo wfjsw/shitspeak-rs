@@ -198,6 +198,8 @@ pub(crate) struct AuthenticatorJsonAuthenticateResponse {
     #[serde(default)]
     is_superuser: bool,
     #[serde(default)]
+    invisible: bool,
+    #[serde(default)]
     virtual_server_id: Option<String>,
     #[serde(default)]
     language: Option<String>,
@@ -234,6 +236,7 @@ impl AuthenticatorJsonAuthenticateResponse {
             display_name: self.display_name,
             groups: self.groups,
             is_superuser: self.is_superuser,
+            invisible: self.invisible,
             virtual_server_id: self.virtual_server_id,
             language: self
                 .language
@@ -262,6 +265,7 @@ pub(crate) fn authenticate_result_from_external_claims(
             .or_else(|| Some(claims.username.clone())),
         groups: claims.groups.clone(),
         is_superuser: false,
+        invisible: false,
         virtual_server_id: None,
         language: Language::default(),
         max_bandwidth: None,

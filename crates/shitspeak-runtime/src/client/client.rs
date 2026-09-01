@@ -43,7 +43,7 @@ use crate::{
     messages::{Message, ReadMessageExt, WriteMessageExt, encoder as msg_encoder},
     protocol_version::ProtocolVersion,
     tls_fingerprint::{TlsFingerprints, ja4x_from_certificate},
-    types::{DEFAULT_SERVER_ID, ScopedSessionId},
+    types::ScopedSessionId,
     voice::VoiceRoutingPayload,
 };
 use shitspeak_auth::AuthenticationExpiryAction;
@@ -600,27 +600,6 @@ impl ClientTransport {
 }
 
 impl Client {
-    pub fn new_local(
-        session_id: ClientSessionIdentifier,
-        real_ip_address: IpAddr,
-        tcp_address: SocketAddr,
-        udp_address: Option<SocketAddr>,
-        local_address: SocketAddr,
-        connection: TlsStream<TcpStream>,
-    ) -> Box<Self> {
-        Self::new_local_in_server(
-            DEFAULT_SERVER_ID.to_owned(),
-            session_id,
-            real_ip_address,
-            tcp_address,
-            udp_address,
-            local_address,
-            connection,
-            None,
-            false,
-        )
-    }
-
     pub fn new_local_in_server(
         server_id: String,
         session_id: ClientSessionIdentifier,
@@ -775,25 +754,6 @@ impl Client {
             client_state_cursors: ParkingMutex::new(ClientProjectionCursorState::default()),
             last_channel_version: ParkingMutex::new(0),
         })
-    }
-
-    pub fn new_web_gateway(
-        session_id: ClientSessionIdentifier,
-        real_ip_address: IpAddr,
-        tcp_address: SocketAddr,
-        local_address: SocketAddr,
-        outbound_tx: mpsc::Sender<Message>,
-    ) -> Box<Self> {
-        Self::new_web_gateway_with_kind_in_server(
-            DEFAULT_SERVER_ID.to_owned(),
-            session_id,
-            real_ip_address,
-            tcp_address,
-            local_address,
-            outbound_tx,
-            ClientTransportKind::WebRtc,
-            next_client_instance_id(session_id.get_node_id()),
-        )
     }
 
     pub fn new_web_gateway_in_server(
@@ -961,28 +921,6 @@ impl Client {
             client_state_cursors: ParkingMutex::new(ClientProjectionCursorState::default()),
             last_channel_version: ParkingMutex::new(0),
         })
-    }
-
-    pub fn new_remote(
-        session_id: ClientSessionIdentifier,
-        real_ip_address: IpAddr,
-        tcp_address: SocketAddr,
-        udp_address: Option<SocketAddr>,
-        local_address: SocketAddr,
-        cert_hash: Option<Bytes>,
-        login_time: DateTime<Utc>,
-    ) -> Box<Self> {
-        Self::new_remote_in_server(
-            DEFAULT_SERVER_ID.to_owned(),
-            session_id,
-            real_ip_address,
-            tcp_address,
-            udp_address,
-            local_address,
-            cert_hash,
-            login_time,
-            next_client_instance_id(session_id.get_node_id()),
-        )
     }
 
     pub fn new_remote_in_server(
@@ -2332,6 +2270,10 @@ impl Client {
         self.global_state.read().is_superuser()
     }
 
+    pub fn is_invisible(&self) -> bool {
+        self.global_state.read().is_invisible()
+    }
+
     pub(crate) fn is_hidden_from_regular_users(&self) -> bool {
         self.global_state.read().is_hidden_from_regular_users()
     }
@@ -2465,6 +2407,13 @@ impl Client {
             .as_ref()
             .and_then(|state| state.max_bandwidth())
             .unwrap_or(fallback)
+    }
+
+    pub fn max_bandwidth_override(&self) -> Option<u32> {
+        self.local_state
+            .read()
+            .as_ref()
+            .and_then(|state| state.max_bandwidth())
     }
 
     pub fn set_max_bandwidth(&self, max_bandwidth: Option<u32>) {
@@ -2712,12 +2661,14 @@ fn transport_closed_error() -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::DEFAULT_SERVER_ID;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::mpsc as std_mpsc;
 
     fn local_test_client() -> Box<Client> {
         let (outbound_tx, _outbound_rx) = mpsc::channel(1);
-        Client::new_web_gateway(
+        Client::new_web_gateway_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
             ClientSessionIdentifier::from(0x0002_0001),
             Ipv4Addr::LOCALHOST.into(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
@@ -2787,7 +2738,8 @@ mod tests {
     fn real_ip_getter_unmaps_ipv4_mapped_ipv6_addresses() {
         let mapped_address = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x5144, 0x2a63));
         let (outbound_tx, _outbound_rx) = mpsc::channel(1);
-        let client = Client::new_web_gateway(
+        let client = Client::new_web_gateway_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
             ClientSessionIdentifier::from(0x0002_0001),
             mapped_address,
             SocketAddr::new(mapped_address, 64738),
@@ -2804,7 +2756,8 @@ mod tests {
     #[test]
     fn request_blob_queue_is_lazy_fifo_bounded_and_releases_after_drain() {
         let (outbound_tx, _outbound_rx) = mpsc::channel(1);
-        let client = Client::new_web_gateway(
+        let client = Client::new_web_gateway_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
             ClientSessionIdentifier::from(0x0002_0001),
             Ipv4Addr::LOCALHOST.into(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
@@ -3146,7 +3099,8 @@ mod tests {
     #[tokio::test]
     async fn owned_message_batch_gateway_preserves_order_and_backpressure() {
         let (tx, mut rx) = mpsc::channel(1);
-        let client = Client::new_web_gateway(
+        let client = Client::new_web_gateway_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
             ClientSessionIdentifier::from(0x0002_0001),
             Ipv4Addr::LOCALHOST.into(),
             SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),

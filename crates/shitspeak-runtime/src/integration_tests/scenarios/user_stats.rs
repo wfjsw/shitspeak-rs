@@ -19,7 +19,10 @@ async fn user_stats_cross_channel_omits_extended_fields_for_non_superuser() {
     server
         .server
         .get_channels()
-        .create_channel(Channel::new(80, "Other".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(80, "Other".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .expect("create target channel");
 
@@ -95,7 +98,8 @@ async fn user_stats_privacy_hides_identity_from_root_ban_user() {
     server
         .server
         .get_channels()
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             0,
             true,
             vec![ACL {
@@ -404,11 +408,15 @@ async fn user_stats_requires_enter_on_target_channel_without_root_ban() {
 
     let chans = server.server.get_channels();
     chans
-        .create_channel(Channel::new(80, "Hidden".to_owned(), 0, 0, Some(0)))
+        .create_channel_in_server(
+            crate::types::DEFAULT_SERVER_ID,
+            Channel::new(80, "Hidden".to_owned(), 0, 0, Some(0)),
+        )
         .await
         .unwrap();
     chans
-        .set_acls(
+        .set_acls_in_server(
+            crate::types::DEFAULT_SERVER_ID,
             80,
             true,
             vec![ACL {

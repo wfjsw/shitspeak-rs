@@ -3759,6 +3759,7 @@ async fn send_budgeted_repair_frame(
 
 #[cfg(test)]
 mod tests {
+    use shitspeak_core::default_server_id;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -6537,9 +6538,9 @@ mod tests {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let svc = make_service_with_strategy(transport.clone(), "targeted");
         let idx = RecipientIndex::new();
-        idx.add(5, 1);
-        idx.add(5, 2);
-        idx.add(5, 7); // self — must be filtered out
+        idx.add_in_server(default_server_id().as_str(), 5, 1);
+        idx.add_in_server(default_server_id().as_str(), 5, 2);
+        idx.add_in_server(default_server_id().as_str(), 5, 7); // self — must be filtered out
         svc.set_recipient_index(idx);
         svc.send_for_channel(
             0xABC,
@@ -6834,7 +6835,7 @@ mod tests {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let svc = make_service_with_strategy(transport.clone(), "targeted");
         let idx = RecipientIndex::new();
-        idx.add(5, 1);
+        idx.add_in_server(default_server_id().as_str(), 5, 1);
         svc.set_recipient_index(idx);
 
         let intent = VoiceIntent {
@@ -6874,7 +6875,7 @@ mod tests {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let svc = make_service_with_strategy(transport.clone(), "targeted");
         let idx = RecipientIndex::new();
-        idx.add(5, 1);
+        idx.add_in_server(default_server_id().as_str(), 5, 1);
         svc.set_recipient_index(idx);
 
         svc.send_for_target_channels(
@@ -6953,7 +6954,7 @@ mod tests {
         let transport = FakeVoiceTransport::new(7, vec![1, 2]);
         let svc = make_service_with_strategy(transport.clone(), "targeted");
         let idx = RecipientIndex::new();
-        idx.add(5, 7); // only self
+        idx.add_in_server(default_server_id().as_str(), 5, 7); // only self
         svc.set_recipient_index(idx);
         svc.send_for_channel(
             0xABC,

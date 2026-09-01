@@ -297,11 +297,14 @@ impl UserStatsResponder for ServerUserStatsResponder {
         let target_id = crate::client::client_session_identifier::ClientSessionIdentifier::from(
             request.target_session,
         );
-        let server_id = if request.server_id.is_empty() {
-            crate::types::default_server_id()
-        } else {
-            request.server_id.clone()
-        };
+        if request.server_id.is_empty() {
+            tracing::trace!("dropping user-stats request without a server scope");
+            return UserStatsApplyOutcome {
+                found: false,
+                payload: Bytes::new(),
+            };
+        }
+        let server_id = request.server_id.clone();
         // Owner-only RPC: target should belong to this node. If for some
         // reason it doesn't (replication / lookup race), reply not_found.
         if target_id.get_node_id() != server.get_clients().local_node_id() {

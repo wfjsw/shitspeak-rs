@@ -1168,7 +1168,10 @@ async fn spawn_live_nodes(
                 TestStrictReplicationState::from_directory(&state_directory),
             )
             .await;
-            let initial_version = server.server.get_channels().current_version();
+            let initial_version = server
+                .server
+                .get_channels()
+                .current_version_in_server(crate::types::DEFAULT_SERVER_ID);
             if copied_version < fixture.healthy_version {
                 assert!(
                     (copied_version..=fixture.healthy_version).contains(&initial_version),
@@ -1195,7 +1198,10 @@ async fn spawn_live_nodes(
             )
             .await;
             assert_eq!(
-                server.server.get_channels().current_version(),
+                server
+                    .server
+                    .get_channels()
+                    .current_version_in_server(crate::types::DEFAULT_SERVER_ID),
                 0,
                 "network-bootstrap node did not start with an empty repository"
             );
@@ -1286,7 +1292,15 @@ fn node<'a>(servers: &'a [(u16, TestServer)], node_id: u16) -> &'a TestServer {
 fn versions(servers: &[(u16, TestServer)]) -> Vec<(u16, u64)> {
     servers
         .iter()
-        .map(|(node_id, server)| (*node_id, server.server.get_channels().current_version()))
+        .map(|(node_id, server)| {
+            (
+                *node_id,
+                server
+                    .server
+                    .get_channels()
+                    .current_version_in_server(crate::types::DEFAULT_SERVER_ID),
+            )
+        })
         .collect()
 }
 
@@ -1593,10 +1607,13 @@ fn live_node_diagnostics(servers: &[(u16, TestServer)]) -> Vec<LiveNodeDiagnosti
             let debug = server
                 .server
                 .s2s_manager()
-                .strict_channel_debug_state_for_test(None);
+                .strict_channel_debug_state_for_test(DEFAULT_SERVER_ID);
             LiveNodeDiagnostic {
                 node_id: *node_id,
-                repository_version: server.server.get_channels().current_version(),
+                repository_version: server
+                    .server
+                    .get_channels()
+                    .current_version_in_server(crate::types::DEFAULT_SERVER_ID),
                 terminal_cut,
                 repository_image_install_pending,
                 recovery_healthy: debug.as_ref().map(|state| state.recovery_healthy()),
@@ -1706,7 +1723,11 @@ async fn wait_for_repositories(servers: &[(u16, TestServer)], fixture: &LiveFixt
     assert!(
         wait_until(CONVERGENCE_DEADLINE, || {
             servers.iter().all(|(_, server)| {
-                server.server.get_channels().current_version() == fixture.healthy_version
+                server
+                    .server
+                    .get_channels()
+                    .current_version_in_server(crate::types::DEFAULT_SERVER_ID)
+                    == fixture.healthy_version
             })
         })
         .await,
@@ -2131,7 +2152,10 @@ fn assert_incident_still_stalled(servers: &[(u16, TestServer)], fixture: &LiveFi
     for (node_id, server) in servers {
         let expected_version = fixture.initial_repository_versions[node_id];
         assert_eq!(
-            server.server.get_channels().current_version(),
+            server
+                .server
+                .get_channels()
+                .current_version_in_server(crate::types::DEFAULT_SERVER_ID),
             expected_version,
             "node {node_id} did not retain its incident repository head"
         );
@@ -2228,7 +2252,7 @@ async fn assert_post_recovery_strict_write(
         .1
         .server
         .get_channels()
-        .current_version()
+        .current_version_in_server(crate::types::DEFAULT_SERVER_ID)
         .checked_add(1)
         .expect("post-recovery repository version");
     assert_eq!(
@@ -2241,7 +2265,7 @@ async fn assert_post_recovery_strict_write(
             server
                 .server
                 .get_channels()
-                .get_channel(POST_RECOVERY_CHANNEL_ID)
+                .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, POST_RECOVERY_CHANNEL_ID)
                 .await
                 .is_none(),
             "post-recovery strict-write channel already exists on node {node_id}"
@@ -2254,7 +2278,7 @@ async fn assert_post_recovery_strict_write(
         .server
         .s2s_manager()
         .propose_channel_op(
-            None,
+            DEFAULT_SERVER_ID,
             shitspeak_state::ChannelOp::CreateChannel {
                 channel: Channel::new(
                     POST_RECOVERY_CHANNEL_ID,
@@ -2278,7 +2302,7 @@ async fn assert_post_recovery_strict_write(
             if server
                 .server
                 .get_channels()
-                .get_channel(POST_RECOVERY_CHANNEL_ID)
+                .get_channel_in_server(crate::types::DEFAULT_SERVER_ID, POST_RECOVERY_CHANNEL_ID)
                 .await
                 .is_none()
             {
@@ -2323,7 +2347,7 @@ async fn assert_foreign_node_certified_full_topology(
             let state = node(servers, 15)
                 .server
                 .s2s_manager()
-                .strict_channel_debug_state_for_test(None)
+                .strict_channel_debug_state_for_test(DEFAULT_SERVER_ID)
                 .expect("node 15 strict recovery debug state");
             state.recovery_frozen_denominator() == 9
                 && state.recovery_certificate_witnesses() >= quorum
@@ -2333,7 +2357,7 @@ async fn assert_foreign_node_certified_full_topology(
         node(servers, 15)
             .server
             .s2s_manager()
-            .strict_channel_debug_state_for_test(None),
+            .strict_channel_debug_state_for_test(DEFAULT_SERVER_ID),
         versions(servers),
     );
     assert!(

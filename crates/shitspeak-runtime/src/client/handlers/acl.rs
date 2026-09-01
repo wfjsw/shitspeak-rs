@@ -228,7 +228,7 @@ pub async fn handle_acl(
         }
         let proposed_s2s = server
             .s2s_manager()
-            .start_channel_op_proposal(Some(&server_id), op.clone())
+            .start_channel_op_proposal(&server_id, op.clone())
             .await;
         if proposed_s2s.should_apply_locally() {
             let committed = match server
