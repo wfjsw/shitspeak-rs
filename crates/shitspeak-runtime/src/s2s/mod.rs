@@ -6133,7 +6133,8 @@ mod tests {
             .expect("snapshot broadcast channel open");
         assert!(matches!(
             snapshot_start.entry.op,
-            ClientStateOperation::ResetNode { .. }
+            ClientStateOperation::ResetNode { ref server_id }
+                if server_id == DEFAULT_SERVER_ID
         ));
         assert_eq!(snapshot_start.versions.get(&1), Some(&0));
         let snapshot_marker = rx.recv().await.expect("snapshot version marker");

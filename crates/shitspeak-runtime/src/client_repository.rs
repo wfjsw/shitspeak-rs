@@ -2374,6 +2374,9 @@ impl ClientRepository {
         }
         let mut reset_server_ids = register_server_ids(&register);
         reset_server_ids.extend(entries.iter().map(|entry| entry.op.server_id().to_owned()));
+        if reset_server_ids.is_empty() {
+            reset_server_ids.insert(crate::types::default_server_id());
+        }
         if register.materialized
             && register.epoch == Some(epoch)
             && envelope_version == register.version
