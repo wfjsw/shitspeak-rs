@@ -60,24 +60,24 @@ pub(crate) struct TcpPacketCollector {
 impl TcpPacketCollector {
     pub(crate) fn start(
         available_backends: &[String],
-        listener_ports: impl IntoIterator<Item = u16>,
+        listener_addresses: impl IntoIterator<Item = SocketAddr>,
     ) -> Arc<Self> {
-        let listener_ports = listener_ports.into_iter().collect::<Vec<_>>();
+        let listener_addresses = listener_addresses.into_iter().collect::<Vec<_>>();
         static COLLECTOR: OnceLock<Arc<TcpPacketCollector>> = OnceLock::new();
         let collector = COLLECTOR
-            .get_or_init(|| Self::start_once(available_backends, &listener_ports))
+            .get_or_init(|| Self::start_once(available_backends, &listener_addresses))
             .clone();
-        collector.register_listener_ports(listener_ports);
+        collector.register_listener_addresses(listener_addresses);
         collector
     }
 
     #[cfg(target_os = "linux")]
-    fn start_once(available_backends: &[String], listener_ports: &[u16]) -> Arc<Self> {
-        linux::start(available_backends, listener_ports)
+    fn start_once(available_backends: &[String], listener_addresses: &[SocketAddr]) -> Arc<Self> {
+        linux::start(available_backends, listener_addresses)
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn start_once(_available_backends: &[String], _listener_ports: &[u16]) -> Arc<Self> {
+    fn start_once(_available_backends: &[String], _listener_addresses: &[SocketAddr]) -> Arc<Self> {
         Arc::new(Self {
             flows: Arc::new(new_flow_cache()),
             flow_updates: Arc::new(Notify::new()),
@@ -85,14 +85,17 @@ impl TcpPacketCollector {
         })
     }
 
-    pub(crate) fn register_listener_ports(&self, listener_ports: impl IntoIterator<Item = u16>) {
+    pub(crate) fn register_listener_addresses(
+        &self,
+        listener_addresses: impl IntoIterator<Item = SocketAddr>,
+    ) {
         #[cfg(target_os = "linux")]
         if let Some(controller) = &self.packet_filter_controller {
-            controller.register_listener_ports(listener_ports);
+            controller.register_listener_addresses(listener_addresses);
         }
 
         #[cfg(not(target_os = "linux"))]
-        let _ = listener_ports;
+        let _ = listener_addresses;
     }
 
     pub(crate) fn active_backend(&self) -> Option<&str> {
@@ -186,11 +189,16 @@ mod linux {
     const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
     const BPF_LD_ABS_H: u8 = 0x28;
     const BPF_LD_ABS_B: u8 = 0x30;
+    const BPF_ALU_AND_K: u8 = 0x54;
     const BPF_ALU64_MOV_K: u8 = 0xb7;
     const BPF_ALU64_MOV_X: u8 = 0xbf;
     const BPF_JMP_JEQ_K: u8 = 0x15;
+    const BPF_JMP_JNE_K: u8 = 0x55;
     const BPF_JMP_EXIT: u8 = 0x95;
     const SO_ATTACH_BPF: libc::c_int = 50;
+    const SO_ATTACH_FILTER: libc::c_int = 26;
+    const SKF_AD_OFF: i32 = -0x1000;
+    const SKF_AD_PKTTYPE: i32 = 4;
     const CAPTURE_SNAPSHOT_LEN: usize = 256;
 
     #[repr(C)]
@@ -215,77 +223,111 @@ mod linux {
         prog_name: [u8; 16],
     }
 
+    #[repr(C)]
+    struct ClassicBpfInsn {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+
+    #[repr(C)]
+    struct ClassicBpfProg {
+        len: u16,
+        filter: *const ClassicBpfInsn,
+    }
+
+    #[derive(Clone)]
     struct PacketFilterState {
-        listener_ports: BTreeSet<u16>,
-        narrowed: bool,
+        listener_addresses: BTreeSet<SocketAddr>,
+        capture_addresses: BTreeSet<SocketAddr>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum PacketFilterKind {
+        Ebpf,
+        Classic,
     }
 
     pub(super) struct PacketFilterController {
         packet_fd: Arc<OwnedFd>,
-        state: Mutex<PacketFilterState>,
+        state: Arc<Mutex<PacketFilterState>>,
+        kind: PacketFilterKind,
     }
 
     impl PacketFilterController {
-        fn new(packet_fd: Arc<OwnedFd>, listener_ports: &[u16]) -> Self {
-            Self {
+        fn new(
+            packet_fd: Arc<OwnedFd>,
+            listener_addresses: &[SocketAddr],
+            kind: PacketFilterKind,
+        ) -> std::io::Result<Self> {
+            let listener_addresses = listener_addresses.iter().copied().collect();
+            let capture_addresses = resolve_capture_addresses(&listener_addresses)?;
+            Ok(Self {
                 packet_fd,
-                state: Mutex::new(PacketFilterState {
-                    listener_ports: listener_ports.iter().copied().collect(),
-                    narrowed: false,
-                }),
-            }
+                state: Arc::new(Mutex::new(PacketFilterState {
+                    listener_addresses,
+                    capture_addresses,
+                })),
+                kind,
+            })
         }
 
         fn install_initial(&self) -> std::io::Result<()> {
-            let mut state = self.state.lock();
-            install_listener_filter(self.packet_fd.as_raw_fd(), &mut state)
+            install_listener_filter(
+                self.packet_fd.as_raw_fd(),
+                self.kind,
+                &self.state.lock().capture_addresses,
+            )
         }
 
-        pub(super) fn register_listener_ports(
+        pub(super) fn register_listener_addresses(
             &self,
-            listener_ports: impl IntoIterator<Item = u16>,
+            listener_addresses: impl IntoIterator<Item = SocketAddr>,
         ) {
             let mut state = self.state.lock();
+            let mut candidate = state.clone();
             let mut changed = false;
-            for port in listener_ports {
-                changed |= state.listener_ports.insert(port);
+            for address in listener_addresses {
+                changed |= candidate.listener_addresses.insert(address);
             }
-            if !changed && state.narrowed {
+            if !changed {
                 return;
             }
-            if let Err(error) = install_listener_filter(self.packet_fd.as_raw_fd(), &mut state) {
-                tracing::warn!(%error, "could not update listener-port TCP packet filter");
+            let capture_addresses = match resolve_capture_addresses(&candidate.listener_addresses) {
+                Ok(addresses) => addresses,
+                Err(error) => {
+                    tracing::warn!(%error, "could not resolve addresses for TCP packet filter update");
+                    return;
+                }
+            };
+            if let Err(error) =
+                install_listener_filter(self.packet_fd.as_raw_fd(), self.kind, &capture_addresses)
+            {
+                tracing::warn!(%error, "could not update TCP packet filter");
+                return;
             }
+            candidate.capture_addresses = capture_addresses;
+            *state = candidate;
         }
     }
 
     fn install_listener_filter(
         socket_fd: RawFd,
-        state: &mut PacketFilterState,
+        kind: PacketFilterKind,
+        listener_addresses: &BTreeSet<SocketAddr>,
     ) -> std::io::Result<()> {
-        let ports = state.listener_ports.iter().copied().collect::<Vec<_>>();
-        match attach_ebpf_socket_filter(socket_fd, &ports) {
-            Ok(()) => {
-                state.narrowed = !ports.is_empty();
-                Ok(())
+        match kind {
+            PacketFilterKind::Ebpf => attach_ebpf_socket_filter(socket_fd, listener_addresses),
+            PacketFilterKind::Classic => {
+                attach_classic_socket_filter(socket_fd, listener_addresses)
             }
-            Err(narrow_error) if !ports.is_empty() => {
-                attach_ebpf_socket_filter(socket_fd, &[]).map_err(|broad_error| {
-                    std::io::Error::other(format!(
-                        "listener filter: {narrow_error}; broad fallback: {broad_error}"
-                    ))
-                })?;
-                state.narrowed = false;
-                tracing::warn!(%narrow_error, "listener-port eBPF filter unavailable; using broad TCP filter");
-                Ok(())
-            }
-            Err(error) => Err(error),
         }
     }
 
     pub(super) fn start(
         available_backends: &[String],
-        listener_ports: &[u16],
+        listener_addresses: &[SocketAddr],
     ) -> Arc<TcpPacketCollector> {
         let flows = Arc::new(new_flow_cache());
         let flow_updates = Arc::new(Notify::new());
@@ -301,32 +343,44 @@ mod linux {
         // An OwnedFd makes every error path close the socket, including a
         // thread-spawn failure.
         let packet_fd = Arc::new(unsafe { OwnedFd::from_raw_fd(packet_fd) });
-        let mut packet_filter_controller = None;
-        let backend = if available_backends.iter().any(|backend| backend == "ebpf") {
-            let controller = Arc::new(PacketFilterController::new(
+        let mut selected = None;
+        if available_backends.iter().any(|backend| backend == "ebpf") {
+            match PacketFilterController::new(
                 Arc::clone(&packet_fd),
-                listener_ports,
-            ));
-            match controller.install_initial() {
-                Ok(()) => {
-                    packet_filter_controller = Some(controller);
-                    Some("ebpf".to_owned())
-                }
+                listener_addresses,
+                PacketFilterKind::Ebpf,
+            )
+            .and_then(|controller| {
+                controller.install_initial()?;
+                Ok(controller)
+            }) {
+                Ok(controller) => selected = Some(("ebpf".to_owned(), Arc::new(controller))),
                 Err(error) => {
                     tracing::debug!(%error, "eBPF socket filter unavailable; falling back to AF_PACKET");
-                    available_backends
-                        .iter()
-                        .any(|backend| backend == "af_packet")
-                        .then(|| "af_packet".to_owned())
                 }
             }
-        } else {
-            available_backends
+        }
+        if selected.is_none()
+            && available_backends
                 .iter()
                 .any(|backend| backend == "af_packet")
-                .then(|| "af_packet".to_owned())
-        };
-        let Some(backend) = backend else {
+        {
+            match PacketFilterController::new(
+                Arc::clone(&packet_fd),
+                listener_addresses,
+                PacketFilterKind::Classic,
+            )
+            .and_then(|controller| {
+                controller.install_initial()?;
+                Ok(controller)
+            }) {
+                Ok(controller) => selected = Some(("af_packet".to_owned(), Arc::new(controller))),
+                Err(error) => {
+                    tracing::debug!(%error, "classic AF_PACKET socket filter unavailable");
+                }
+            }
+        }
+        let Some((backend, packet_filter_controller)) = selected else {
             return Arc::new(TcpPacketCollector {
                 flows,
                 flow_updates,
@@ -336,9 +390,10 @@ mod linux {
         };
         let flow_cache = Arc::clone(&flows);
         let updates = Arc::clone(&flow_updates);
+        let filter_state = Arc::clone(&packet_filter_controller.state);
         let thread = std::thread::Builder::new()
             .name("shitspeak-tcp-packet-capture".to_owned())
-            .spawn(move || receive_packets(packet_fd, flow_cache, updates));
+            .spawn(move || receive_packets(packet_fd, flow_cache, updates, filter_state));
         if let Err(error) = thread {
             tracing::warn!(%error, "could not start TCP packet capture thread");
             return Arc::new(TcpPacketCollector {
@@ -352,7 +407,7 @@ mod linux {
             flows,
             flow_updates,
             active_backend: Some(backend),
-            packet_filter_controller,
+            packet_filter_controller: Some(packet_filter_controller),
         })
     }
 
@@ -406,6 +461,15 @@ mod linux {
             });
         }
 
+        fn load_metadata_byte(&mut self, offset: i32) {
+            self.instructions.push(BpfInsn {
+                code: BPF_LD_ABS_B,
+                dst_src: 0,
+                off: 0,
+                imm: offset,
+            });
+        }
+
         fn load_half(&mut self, offset: usize) {
             self.instructions.push(BpfInsn {
                 code: BPF_LD_ABS_H,
@@ -424,6 +488,26 @@ mod linux {
                 imm: value,
             });
             self.jumps.push((index, label));
+        }
+
+        fn jump_not_equal(&mut self, value: i32, label: usize) {
+            let index = self.instructions.len();
+            self.instructions.push(BpfInsn {
+                code: BPF_JMP_JNE_K,
+                dst_src: 0,
+                off: 0,
+                imm: value,
+            });
+            self.jumps.push((index, label));
+        }
+
+        fn and(&mut self, value: i32) {
+            self.instructions.push(BpfInsn {
+                code: BPF_ALU_AND_K,
+                dst_src: 0,
+                off: 0,
+                imm: value,
+            });
         }
 
         fn return_value(&mut self, value: i32) {
@@ -455,10 +539,44 @@ mod linux {
         }
     }
 
-    fn build_socket_filter(listener_ports: &[u16]) -> std::io::Result<Vec<BpfInsn>> {
+    #[derive(Clone, Copy)]
+    enum PacketDirection {
+        Incoming,
+        Outgoing,
+    }
+
+    fn build_socket_filter(
+        listener_addresses: &BTreeSet<SocketAddr>,
+    ) -> std::io::Result<Vec<BpfInsn>> {
         let mut builder = FilterBuilder::new();
+        let incoming = builder.new_label();
+        let outgoing = builder.new_label();
         let accept = builder.new_label();
-        append_ethernet_dispatch(&mut builder, 12, 14, 0, listener_ports, accept);
+        builder.load_metadata_byte(SKF_AD_OFF + SKF_AD_PKTTYPE);
+        builder.jump_equal(i32::from(libc::PACKET_HOST), incoming);
+        builder.jump_equal(i32::from(libc::PACKET_OUTGOING), outgoing);
+        builder.return_value(0);
+
+        builder.mark(incoming);
+        append_ethernet_dispatch(
+            &mut builder,
+            12,
+            14,
+            0,
+            listener_addresses,
+            PacketDirection::Incoming,
+            accept,
+        );
+        builder.mark(outgoing);
+        append_ethernet_dispatch(
+            &mut builder,
+            12,
+            14,
+            0,
+            listener_addresses,
+            PacketDirection::Outgoing,
+            accept,
+        );
         builder.mark(accept);
         builder.return_value(CAPTURE_SNAPSHOT_LEN as i32);
         builder.finish()
@@ -469,7 +587,8 @@ mod linux {
         ether_type_offset: usize,
         ip_offset: usize,
         vlan_depth: usize,
-        listener_ports: &[u16],
+        listener_addresses: &BTreeSet<SocketAddr>,
+        direction: PacketDirection,
         accept: usize,
     ) {
         let ipv4 = builder.new_label();
@@ -479,14 +598,16 @@ mod linux {
         builder.jump_equal(0x0800, ipv4);
         builder.jump_equal(0x86dd, ipv6);
         for ether_type in [0x8100, 0x88a8, 0x9100] {
-            builder.jump_equal(ether_type, if vlan_depth < 2 { vlan } else { accept });
+            if vlan_depth < 2 {
+                builder.jump_equal(ether_type, vlan);
+            }
         }
         builder.return_value(0);
 
         builder.mark(ipv4);
-        append_ipv4_filter(builder, ip_offset, listener_ports, accept);
+        append_ipv4_filter(builder, ip_offset, listener_addresses, direction, accept);
         builder.mark(ipv6);
-        append_ipv6_filter(builder, ip_offset, listener_ports, accept);
+        append_ipv6_filter(builder, ip_offset, listener_addresses, direction, accept);
 
         if vlan_depth < 2 {
             builder.mark(vlan);
@@ -495,7 +616,8 @@ mod linux {
                 ether_type_offset + 4,
                 ip_offset + 4,
                 vlan_depth + 1,
-                listener_ports,
+                listener_addresses,
+                direction,
                 accept,
             );
         }
@@ -504,7 +626,8 @@ mod linux {
     fn append_ipv4_filter(
         builder: &mut FilterBuilder,
         ip_offset: usize,
-        listener_ports: &[u16],
+        listener_addresses: &BTreeSet<SocketAddr>,
+        direction: PacketDirection,
         accept: usize,
     ) {
         let tcp = builder.new_label();
@@ -512,23 +635,41 @@ mod linux {
         builder.jump_equal(libc::IPPROTO_TCP, tcp);
         builder.return_value(0);
         builder.mark(tcp);
-        if listener_ports.is_empty() {
-            builder.return_value(CAPTURE_SNAPSHOT_LEN as i32);
-            return;
-        }
+        let unfragmented = builder.new_label();
+        builder.load_half(ip_offset + 6);
+        builder.and(0x3fff);
+        builder.jump_equal(0, unfragmented);
+        builder.return_value(0);
+        builder.mark(unfragmented);
 
-        let fixed_header = builder.new_label();
+        let mut header_lengths = Vec::new();
+        for words in 5usize..=15 {
+            header_lengths.push((words, builder.new_label()));
+        }
         builder.load_byte(ip_offset);
-        builder.jump_equal(0x45, fixed_header);
-        builder.return_value(CAPTURE_SNAPSHOT_LEN as i32);
-        builder.mark(fixed_header);
-        append_port_filter(builder, ip_offset + 20, listener_ports, accept);
+        for (words, label) in &header_lengths {
+            builder.jump_equal((0x40 | words) as i32, *label);
+        }
+        builder.return_value(0);
+        for (words, label) in header_lengths {
+            builder.mark(label);
+            append_endpoint_filter(
+                builder,
+                ip_offset,
+                ip_offset + words * 4,
+                listener_addresses,
+                direction,
+                accept,
+                false,
+            );
+        }
     }
 
     fn append_ipv6_filter(
         builder: &mut FilterBuilder,
         ip_offset: usize,
-        listener_ports: &[u16],
+        listener_addresses: &BTreeSet<SocketAddr>,
+        direction: PacketDirection,
         accept: usize,
     ) {
         let tcp = builder.new_label();
@@ -536,32 +677,80 @@ mod linux {
         builder.jump_equal(libc::IPPROTO_TCP, tcp);
         builder.return_value(0);
         builder.mark(tcp);
-        if listener_ports.is_empty() {
-            builder.return_value(CAPTURE_SNAPSHOT_LEN as i32);
-            return;
-        }
-        append_port_filter(builder, ip_offset + 40, listener_ports, accept);
+        append_endpoint_filter(
+            builder,
+            ip_offset,
+            ip_offset + 40,
+            listener_addresses,
+            direction,
+            accept,
+            true,
+        );
     }
 
-    fn append_port_filter(
+    fn append_endpoint_filter(
         builder: &mut FilterBuilder,
+        ip_offset: usize,
         tcp_offset: usize,
-        listener_ports: &[u16],
+        listener_addresses: &BTreeSet<SocketAddr>,
+        direction: PacketDirection,
         accept: usize,
+        ipv6: bool,
     ) {
-        builder.load_half(tcp_offset);
-        for port in listener_ports {
-            builder.jump_equal(i32::from(*port), accept);
+        if matches!(direction, PacketDirection::Outgoing) {
+            builder.load_byte(tcp_offset + 13);
+            builder.and(0x12);
+            let syn_ack = builder.new_label();
+            builder.jump_equal(0x12, syn_ack);
+            builder.return_value(0);
+            builder.mark(syn_ack);
         }
-        builder.load_half(tcp_offset + 2);
-        for port in listener_ports {
-            builder.jump_equal(i32::from(*port), accept);
+
+        for listener in listener_addresses {
+            if listener.is_ipv6() != ipv6 {
+                continue;
+            }
+            let next = builder.new_label();
+            let address_offset = match direction {
+                PacketDirection::Incoming => ip_offset + if ipv6 { 24 } else { 16 },
+                PacketDirection::Outgoing => ip_offset + if ipv6 { 8 } else { 12 },
+            };
+            match listener.ip() {
+                IpAddr::V4(address) => {
+                    for (index, word) in address.octets().chunks_exact(2).enumerate() {
+                        builder.load_half(address_offset + index * 2);
+                        builder.jump_not_equal(
+                            i32::from(u16::from_be_bytes([word[0], word[1]])),
+                            next,
+                        );
+                    }
+                }
+                IpAddr::V6(address) => {
+                    for (index, word) in address.octets().chunks_exact(2).enumerate() {
+                        builder.load_half(address_offset + index * 2);
+                        builder.jump_not_equal(
+                            i32::from(u16::from_be_bytes([word[0], word[1]])),
+                            next,
+                        );
+                    }
+                }
+            }
+            let port_offset = match direction {
+                PacketDirection::Incoming => tcp_offset + 2,
+                PacketDirection::Outgoing => tcp_offset,
+            };
+            builder.load_half(port_offset);
+            builder.jump_equal(i32::from(listener.port()), accept);
+            builder.mark(next);
         }
         builder.return_value(0);
     }
 
-    fn attach_ebpf_socket_filter(socket_fd: RawFd, listener_ports: &[u16]) -> std::io::Result<()> {
-        let instructions = build_socket_filter(listener_ports)?;
+    fn attach_ebpf_socket_filter(
+        socket_fd: RawFd,
+        listener_addresses: &BTreeSet<SocketAddr>,
+    ) -> std::io::Result<()> {
+        let instructions = build_socket_filter(listener_addresses)?;
         let license = b"GPL\0";
         let attr = BpfProgLoadAttr {
             prog_type: BPF_PROG_TYPE_SOCKET_FILTER,
@@ -602,6 +791,188 @@ mod linux {
             .ok_or_else(std::io::Error::last_os_error)
     }
 
+    fn attach_classic_socket_filter(
+        socket_fd: RawFd,
+        listener_addresses: &BTreeSet<SocketAddr>,
+    ) -> std::io::Result<()> {
+        let ebpf = build_socket_filter(listener_addresses)?;
+        let instructions = translate_to_classic_filter(&ebpf)?;
+        let program = ClassicBpfProg {
+            len: u16::try_from(instructions.len())
+                .map_err(|_| std::io::Error::other("classic socket filter is too large"))?,
+            filter: instructions.as_ptr(),
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                socket_fd,
+                libc::SOL_SOCKET,
+                SO_ATTACH_FILTER,
+                (&raw const program).cast(),
+                mem::size_of::<ClassicBpfProg>() as libc::socklen_t,
+            )
+        };
+        (result == 0)
+            .then_some(())
+            .ok_or_else(std::io::Error::last_os_error)
+    }
+
+    fn translate_to_classic_filter(
+        instructions: &[BpfInsn],
+    ) -> std::io::Result<Vec<ClassicBpfInsn>> {
+        let mut classic_offsets = vec![0usize; instructions.len() + 1];
+        let mut source = 0;
+        let mut classic_len = 0;
+        while source < instructions.len() {
+            classic_offsets[source] = classic_len;
+            let instruction = &instructions[source];
+            if instruction.code == BPF_ALU64_MOV_X {
+                source += 1;
+            } else if instruction.code == BPF_ALU64_MOV_K
+                && instructions
+                    .get(source + 1)
+                    .is_some_and(|next| next.code == BPF_JMP_EXIT)
+            {
+                classic_offsets[source + 1] = classic_len;
+                classic_len += 1;
+                source += 2;
+            } else {
+                classic_len +=
+                    usize::from(matches!(instruction.code, BPF_JMP_JEQ_K | BPF_JMP_JNE_K)) + 1;
+                source += 1;
+            }
+        }
+        classic_offsets[instructions.len()] = classic_len;
+
+        let mut classic = Vec::with_capacity(classic_len);
+        let mut source = 0;
+        while source < instructions.len() {
+            let instruction = &instructions[source];
+            match instruction.code {
+                BPF_ALU64_MOV_X => {}
+                BPF_LD_ABS_H | BPF_LD_ABS_B | BPF_ALU_AND_K => {
+                    classic.push(ClassicBpfInsn {
+                        code: u16::from(instruction.code),
+                        jt: 0,
+                        jf: 0,
+                        k: instruction.imm as u32,
+                    });
+                }
+                BPF_JMP_JEQ_K | BPF_JMP_JNE_K => {
+                    let target = (source as isize + isize::from(instruction.off) + 1) as usize;
+                    let jump_index = classic.len() + 1;
+                    let relative = classic_offsets[target]
+                        .checked_sub(jump_index + 1)
+                        .ok_or_else(|| std::io::Error::other("backward classic BPF jump"))?;
+                    let (jt, jf) = if instruction.code == BPF_JMP_JEQ_K {
+                        (0, 1)
+                    } else {
+                        (1, 0)
+                    };
+                    classic.push(ClassicBpfInsn {
+                        code: u16::from(BPF_JMP_JEQ_K),
+                        jt,
+                        jf,
+                        k: instruction.imm as u32,
+                    });
+                    classic.push(ClassicBpfInsn {
+                        code: 0x05,
+                        jt: 0,
+                        jf: 0,
+                        k: u32::try_from(relative)
+                            .map_err(|_| std::io::Error::other("classic BPF jump is too large"))?,
+                    });
+                }
+                BPF_ALU64_MOV_K
+                    if instructions
+                        .get(source + 1)
+                        .is_some_and(|next| next.code == BPF_JMP_EXIT) =>
+                {
+                    classic.push(ClassicBpfInsn {
+                        code: 0x06,
+                        jt: 0,
+                        jf: 0,
+                        k: instruction.imm as u32,
+                    });
+                    source += 1;
+                }
+                code => {
+                    return Err(std::io::Error::other(format!(
+                        "unsupported eBPF-to-classic instruction {code:#x}"
+                    )));
+                }
+            }
+            source += 1;
+        }
+        Ok(classic)
+    }
+
+    fn resolve_capture_addresses(
+        listener_addresses: &BTreeSet<SocketAddr>,
+    ) -> std::io::Result<BTreeSet<SocketAddr>> {
+        let needs_interfaces = listener_addresses
+            .iter()
+            .any(|address| address.ip().is_unspecified());
+        let interface_addresses = if needs_interfaces {
+            local_interface_addresses()?
+        } else {
+            BTreeSet::new()
+        };
+        let mut resolved = BTreeSet::new();
+        for listener in listener_addresses {
+            match listener.ip() {
+                IpAddr::V4(address) if address.is_unspecified() => {
+                    resolved.extend(
+                        interface_addresses
+                            .iter()
+                            .filter(|address| address.is_ipv4())
+                            .map(|address| SocketAddr::new(*address, listener.port())),
+                    );
+                }
+                IpAddr::V6(address) if address.is_unspecified() => {
+                    resolved.extend(
+                        interface_addresses
+                            .iter()
+                            .map(|address| SocketAddr::new(*address, listener.port())),
+                    );
+                }
+                address => {
+                    resolved.insert(SocketAddr::new(address, listener.port()));
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn local_interface_addresses() -> std::io::Result<BTreeSet<IpAddr>> {
+        let mut head = std::ptr::null_mut();
+        if unsafe { libc::getifaddrs(&mut head) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut addresses = BTreeSet::new();
+        let mut current = head;
+        while let Some(interface) = unsafe { current.as_ref() } {
+            let socket_address = interface.ifa_addr;
+            if let Some(socket_address) = unsafe { socket_address.as_ref() } {
+                match i32::from(socket_address.sa_family) {
+                    libc::AF_INET => {
+                        let address = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in>() };
+                        addresses.insert(IpAddr::V4(Ipv4Addr::from(
+                            address.sin_addr.s_addr.to_ne_bytes(),
+                        )));
+                    }
+                    libc::AF_INET6 => {
+                        let address = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in6>() };
+                        addresses.insert(IpAddr::V6(Ipv6Addr::from(address.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            current = interface.ifa_next;
+        }
+        unsafe { libc::freeifaddrs(head) };
+        Ok(addresses)
+    }
+
     fn socket_filter_context_prologue() -> BpfInsn {
         // BPF_LD_ABS uses r6 as the saved socket-buffer context. The verifier
         // rejects the packet loads unless it is initialized from r1 first.
@@ -613,7 +984,12 @@ mod linux {
         }
     }
 
-    fn receive_packets(packet_fd: Arc<OwnedFd>, flows: Arc<FlowCache>, flow_updates: Arc<Notify>) {
+    fn receive_packets(
+        packet_fd: Arc<OwnedFd>,
+        flows: Arc<FlowCache>,
+        flow_updates: Arc<Notify>,
+        filter_state: Arc<Mutex<PacketFilterState>>,
+    ) {
         let mut buffer = [0u8; CAPTURE_SNAPSHOT_LEN];
         let mut receive_error_active = false;
         loop {
@@ -648,7 +1024,11 @@ mod linux {
                 continue;
             }
             receive_error_active = false;
-            if let Some(packet) = parse_packet(&buffer[..len as usize]) {
+            let packet = {
+                let state = filter_state.lock();
+                parse_packet(&buffer[..len as usize], &state.capture_addresses)
+            };
+            if let Some(packet) = packet {
                 if update_flows(&flows, packet, Instant::now()) {
                     flow_updates.notify_waiters();
                 }
@@ -669,7 +1049,7 @@ mod linux {
         window_scale: Option<u8>,
     }
 
-    fn parse_packet(bytes: &[u8]) -> Option<TcpPacket> {
+    fn parse_packet(bytes: &[u8], listener_addresses: &BTreeSet<SocketAddr>) -> Option<TcpPacket> {
         let (ether_type, mut offset) = ethernet_payload(bytes)?;
         let (source_ip, destination_ip, ttl, tcp_offset, tcp_segment_len) = match ether_type {
             0x0800 => parse_ipv4(bytes, offset)?,
@@ -680,6 +1060,11 @@ mod linux {
         let tcp = bytes.get(offset..)?;
         let source_port = u16::from_be_bytes([*tcp.first()?, *tcp.get(1)?]);
         let destination_port = u16::from_be_bytes([*tcp.get(2)?, *tcp.get(3)?]);
+        let source = SocketAddr::new(source_ip, source_port);
+        let destination = SocketAddr::new(destination_ip, destination_port);
+        if !listener_addresses.contains(&source) && !listener_addresses.contains(&destination) {
+            return None;
+        }
         let header_len = usize::from(*tcp.get(12)? >> 4) * 4;
         if header_len < 20 || tcp.len() < header_len {
             return None;
@@ -692,8 +1077,8 @@ mod linux {
             (String::new(), None, None)
         };
         Some(TcpPacket {
-            source: SocketAddr::new(source_ip, source_port),
-            destination: SocketAddr::new(destination_ip, destination_port),
+            source,
+            destination,
             ttl,
             syn,
             ack: flags & 0x10 != 0,
@@ -903,7 +1288,19 @@ mod linux {
             packet
         }
 
-        fn run_socket_filter(instructions: &[BpfInsn], packet: &[u8]) -> u32 {
+        fn listener_addresses(ports: &[u16]) -> BTreeSet<SocketAddr> {
+            ports
+                .iter()
+                .flat_map(|port| {
+                    [
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)), *port),
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), *port),
+                    ]
+                })
+                .collect()
+        }
+
+        fn run_socket_filter(instructions: &[BpfInsn], packet: &[u8], packet_type: u8) -> u32 {
             let mut accumulator = 0i32;
             let mut instruction = 0usize;
             loop {
@@ -912,6 +1309,11 @@ mod linux {
                     BPF_ALU64_MOV_X => {}
                     BPF_ALU64_MOV_K => accumulator = current.imm,
                     BPF_LD_ABS_B => {
+                        if current.imm == -0x1000 + 4 {
+                            accumulator = i32::from(packet_type);
+                            instruction += 1;
+                            continue;
+                        }
                         let Some(value) = packet.get(current.imm as usize) else {
                             return 0;
                         };
@@ -931,8 +1333,59 @@ mod linux {
                             continue;
                         }
                     }
+                    BPF_JMP_JNE_K => {
+                        if accumulator != current.imm {
+                            instruction =
+                                (instruction as isize + isize::from(current.off) + 1) as usize;
+                            continue;
+                        }
+                    }
+                    BPF_ALU_AND_K => accumulator &= current.imm,
                     BPF_JMP_EXIT => return accumulator as u32,
                     code => panic!("unsupported test eBPF instruction {code:#x}"),
+                }
+                instruction += 1;
+            }
+        }
+
+        fn run_classic_socket_filter(
+            instructions: &[ClassicBpfInsn],
+            packet: &[u8],
+            packet_type: u8,
+        ) -> u32 {
+            let mut accumulator = 0u32;
+            let mut instruction = 0usize;
+            loop {
+                let current = &instructions[instruction];
+                match current.code {
+                    0x30 => {
+                        if current.k == (SKF_AD_OFF + SKF_AD_PKTTYPE) as u32 {
+                            accumulator = u32::from(packet_type);
+                        } else {
+                            let Some(value) = packet.get(current.k as usize) else {
+                                return 0;
+                            };
+                            accumulator = u32::from(*value);
+                        }
+                    }
+                    0x28 => {
+                        let offset = current.k as usize;
+                        let Some(bytes) = packet.get(offset..offset + 2) else {
+                            return 0;
+                        };
+                        accumulator = u32::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+                    }
+                    0x54 => accumulator &= current.k,
+                    0x15 => {
+                        instruction += usize::from(if accumulator == current.k {
+                            current.jt
+                        } else {
+                            current.jf
+                        });
+                    }
+                    0x05 => instruction += current.k as usize,
+                    0x06 => return current.k,
+                    code => panic!("unsupported test classic BPF instruction {code:#x}"),
                 }
                 instruction += 1;
             }
@@ -950,66 +1403,175 @@ mod linux {
 
         #[test]
         fn socket_filter_limits_capture_to_listener_ports() {
-            let instructions = build_socket_filter(&[443, 64738]).expect("build filter");
+            let instructions =
+                build_socket_filter(&listener_addresses(&[443, 64738])).expect("build filter");
 
             assert_eq!(
-                run_socket_filter(&instructions, &ipv4_tcp_packet(50000, 443, 0)),
+                run_socket_filter(
+                    &instructions,
+                    &ipv4_tcp_packet(50000, 443, 0),
+                    libc::PACKET_HOST,
+                ),
+                CAPTURE_SNAPSHOT_LEN as u32
+            );
+            let mut outgoing = ipv4_tcp_packet(64738, 50000, 0);
+            outgoing[26..30].copy_from_slice(&[198, 51, 100, 2]);
+            outgoing[30..34].copy_from_slice(&[192, 0, 2, 1]);
+            assert_eq!(
+                run_socket_filter(&instructions, &outgoing, libc::PACKET_OUTGOING),
+                0,
+                "outgoing non-SYN-ACK traffic must be rejected"
+            );
+            let mut syn_ack = outgoing;
+            syn_ack[47] = 0x12;
+            assert_eq!(
+                run_socket_filter(&instructions, &syn_ack, libc::PACKET_OUTGOING),
                 CAPTURE_SNAPSHOT_LEN as u32
             );
             assert_eq!(
-                run_socket_filter(&instructions, &ipv4_tcp_packet(64738, 50000, 0)),
-                CAPTURE_SNAPSHOT_LEN as u32
-            );
-            assert_eq!(
-                run_socket_filter(&instructions, &ipv4_tcp_packet(50000, 8443, 0)),
+                run_socket_filter(
+                    &instructions,
+                    &ipv4_tcp_packet(50000, 8443, 0),
+                    libc::PACKET_HOST,
+                ),
                 0
             );
+            let mut wrong_address = ipv4_tcp_packet(50000, 443, 0);
+            wrong_address[30..34].copy_from_slice(&[203, 0, 113, 9]);
             assert_eq!(
-                run_socket_filter(&instructions, &ipv6_tcp_packet(50000, 443)),
+                run_socket_filter(&instructions, &wrong_address, libc::PACKET_HOST),
+                0,
+                "traffic to another local or forwarded address must be rejected"
+            );
+            assert_eq!(
+                run_socket_filter(
+                    &instructions,
+                    &ipv6_tcp_packet(50000, 443),
+                    libc::PACKET_HOST,
+                ),
                 CAPTURE_SNAPSHOT_LEN as u32
             );
             assert_eq!(
-                run_socket_filter(&instructions, &ipv6_tcp_packet(50000, 8443)),
+                run_socket_filter(
+                    &instructions,
+                    &ipv6_tcp_packet(50000, 8443),
+                    libc::PACKET_HOST,
+                ),
                 0
             );
 
             let mut udp = ipv4_tcp_packet(50000, 443, 0);
             udp[23] = libc::IPPROTO_UDP as u8;
-            assert_eq!(run_socket_filter(&instructions, &udp), 0);
+            assert_eq!(run_socket_filter(&instructions, &udp, libc::PACKET_HOST), 0);
         }
 
         #[test]
         fn socket_filter_handles_common_vlan_depths() {
-            let instructions = build_socket_filter(&[443]).expect("build filter");
+            let instructions =
+                build_socket_filter(&listener_addresses(&[443])).expect("build filter");
             let untagged = ipv4_tcp_packet(50000, 443, 0);
             let single = vlan_packet(&untagged, 0x8100);
             let double = vlan_packet(&single, 0x88a8);
 
             assert_eq!(
-                run_socket_filter(&instructions, &single),
+                run_socket_filter(&instructions, &single, libc::PACKET_HOST),
                 CAPTURE_SNAPSHOT_LEN as u32
             );
             assert_eq!(
-                run_socket_filter(&instructions, &double),
+                run_socket_filter(&instructions, &double, libc::PACKET_HOST),
                 CAPTURE_SNAPSHOT_LEN as u32
             );
 
             let unrelated = vlan_packet(&ipv4_tcp_packet(50000, 8443, 0), 0x8100);
-            assert_eq!(run_socket_filter(&instructions, &unrelated), 0);
+            assert_eq!(
+                run_socket_filter(&instructions, &unrelated, libc::PACKET_HOST),
+                0
+            );
+
+            let triple = vlan_packet(&double, 0x9100);
+            assert_eq!(
+                run_socket_filter(&instructions, &triple, libc::PACKET_HOST),
+                0,
+                "unsupported VLAN depths must be rejected"
+            );
         }
 
         #[test]
-        fn broad_socket_filter_keeps_tcp_and_rejects_udp() {
-            let instructions = build_socket_filter(&[]).expect("build filter");
+        fn socket_filter_keeps_target_tcp_and_rejects_udp() {
+            let instructions =
+                build_socket_filter(&listener_addresses(&[8443])).expect("build filter");
             let tcp = ipv4_tcp_packet(50000, 8443, 0);
             assert_eq!(
-                run_socket_filter(&instructions, &tcp),
+                run_socket_filter(&instructions, &tcp, libc::PACKET_HOST),
                 CAPTURE_SNAPSHOT_LEN as u32
             );
 
             let mut udp = tcp;
             udp[23] = libc::IPPROTO_UDP as u8;
-            assert_eq!(run_socket_filter(&instructions, &udp), 0);
+            assert_eq!(run_socket_filter(&instructions, &udp, libc::PACKET_HOST), 0);
+        }
+
+        #[test]
+        fn socket_filter_does_not_bypass_ports_for_ipv4_options() {
+            let instructions =
+                build_socket_filter(&listener_addresses(&[443])).expect("build filter");
+            let mut unrelated = ipv4_tcp_packet(50000, 8443, 0);
+            unrelated[14] = 0x46;
+
+            assert_eq!(
+                run_socket_filter(&instructions, &unrelated, libc::PACKET_HOST),
+                0
+            );
+
+            let mut relevant = ipv4_tcp_packet(50000, 443, 0);
+            relevant.splice(34..34, [0; 4]);
+            relevant[14] = 0x46;
+            relevant[16..18].copy_from_slice(&44u16.to_be_bytes());
+            assert_eq!(
+                run_socket_filter(&instructions, &relevant, libc::PACKET_HOST),
+                CAPTURE_SNAPSHOT_LEN as u32
+            );
+        }
+
+        #[test]
+        fn classic_fallback_filter_matches_early_rejection_rules() {
+            let ebpf = build_socket_filter(&listener_addresses(&[443])).expect("build filter");
+            let classic = translate_to_classic_filter(&ebpf).expect("translate filter");
+            let incoming = ipv4_tcp_packet(50000, 443, 0);
+            assert_eq!(
+                run_classic_socket_filter(&classic, &incoming, libc::PACKET_HOST),
+                CAPTURE_SNAPSHOT_LEN as u32
+            );
+
+            let mut wrong_address = incoming.clone();
+            wrong_address[30..34].copy_from_slice(&[203, 0, 113, 9]);
+            assert_eq!(
+                run_classic_socket_filter(&classic, &wrong_address, libc::PACKET_HOST),
+                0
+            );
+
+            let mut outgoing = ipv4_tcp_packet(443, 50000, 0);
+            outgoing[26..30].copy_from_slice(&[198, 51, 100, 2]);
+            outgoing[30..34].copy_from_slice(&[192, 0, 2, 1]);
+            assert_eq!(
+                run_classic_socket_filter(&classic, &outgoing, libc::PACKET_OUTGOING),
+                0
+            );
+            outgoing[47] = 0x12;
+            assert_eq!(
+                run_classic_socket_filter(&classic, &outgoing, libc::PACKET_OUTGOING),
+                CAPTURE_SNAPSHOT_LEN as u32
+            );
+        }
+
+        #[test]
+        fn userspace_parser_rejects_packets_outside_listener_endpoints() {
+            let packet = ipv4_tcp_packet(50000, 443, 0);
+            let different_listener: BTreeSet<_> =
+                ["203.0.113.9:443".parse().expect("listener address")]
+                    .into_iter()
+                    .collect();
+            assert!(parse_packet(&packet, &different_listener).is_none());
         }
 
         #[test]
@@ -1036,7 +1598,7 @@ mod linux {
                 0, 0, // end of option list and padding
             ]);
 
-            let syn = parse_packet(&packet).expect("SYN must parse");
+            let syn = parse_packet(&packet, &listener_addresses(&[443])).expect("SYN must parse");
             assert!(syn.syn);
             assert_eq!(syn.options, "2-1-3-4");
             assert_eq!(syn.maximum_segment_size, Some(1460));
@@ -1123,7 +1685,7 @@ mod linux {
             packet[tcp + 12] = 5 << 4;
             packet[tcp + 13] = 0x10;
 
-            let ack = parse_packet(&packet).expect("ACK must parse");
+            let ack = parse_packet(&packet, &listener_addresses(&[443])).expect("ACK must parse");
             assert_eq!(ack.payload_len, 0);
             assert!(!update_flows(&new_flow_cache(), ack, Instant::now()));
         }
@@ -1131,7 +1693,8 @@ mod linux {
         #[test]
         fn truncated_capture_uses_declared_tcp_payload_length() {
             let packet = ipv4_tcp_packet(50000, 443, 1_000);
-            let parsed = parse_packet(&packet).expect("truncated packet must parse");
+            let parsed = parse_packet(&packet, &listener_addresses(&[443]))
+                .expect("truncated packet must parse");
             assert_eq!(parsed.payload_len, 1_000);
             assert!(parsed.options.is_empty());
         }
@@ -1140,7 +1703,7 @@ mod linux {
         fn fragmented_ipv4_packet_is_rejected() {
             let mut packet = ipv4_tcp_packet(50000, 443, 0);
             packet[20..22].copy_from_slice(&0x2000u16.to_be_bytes());
-            assert!(parse_packet(&packet).is_none());
+            assert!(parse_packet(&packet, &listener_addresses(&[443])).is_none());
         }
 
         #[test]
