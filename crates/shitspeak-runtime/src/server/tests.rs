@@ -1711,7 +1711,7 @@ async fn authentication_expiry_reauth_rejection_kicks_client() {
 }
 
 #[tokio::test]
-async fn authentication_expiry_reauth_timeout_kicks_client() {
+async fn authentication_expiry_reauth_timeout_retries() {
     let (authenticator, mut calls, _responses) = controlled_authenticator();
     let mut config = test_config(Vec::new());
     config.authenticate_timeout_ms = 20;
@@ -1728,20 +1728,27 @@ async fn authentication_expiry_reauth_timeout_kicks_client() {
         .expect("reauthentication call");
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if server
-                .clients
-                .get_client_in_server(DEFAULT_SERVER_ID, session_id)
-                .await
-                .is_none()
-            {
-                break;
-            }
+        while client.is_reauthentication_in_progress() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("timed-out client removed");
+    .expect("timed-out reauthentication completed");
+    assert!(client.is_authenticated());
+    assert!(
+        server
+            .clients
+            .get_client_in_server(DEFAULT_SERVER_ID, session_id)
+            .await
+            .is_some(),
+        "an authenticator timeout preserves the client for retry"
+    );
+
+    authentication_expiry_reaper(&server, deadline + chrono::Duration::seconds(1)).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication retried after timeout")
+        .expect("retry reauthentication call");
 }
 
 #[tokio::test]
