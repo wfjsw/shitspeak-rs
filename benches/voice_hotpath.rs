@@ -12,7 +12,7 @@
 //! per-recipient fan-out scales.
 
 use bytes::Bytes;
-use std::hint::black_box;
+use std::{hint::black_box, time::Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
@@ -87,9 +87,154 @@ fn recipient_counts() -> [usize; 9] {
     [1, 4, 16, 64, 128, 256, 512, 1024, 2048]
 }
 
+fn run_fanout_report() {
+    if std::env::var_os("SHITSPEAK_BENCH_REPORT").is_none() {
+        return;
+    }
+
+    let audio = make_audio(170);
+    let iterations = 50;
+    println!(
+        "fanout report: opus=170 iterations={iterations} rayon_workers={}",
+        rayon::current_num_threads()
+    );
+    println!("fanout\tsequential_us\trayon_us\trayon_speedup\tmeets_5pct");
+    for fanout in recipient_counts() {
+        let mut sequential_ns = 0u128;
+        let mut rayon_ns = 0u128;
+        for _ in 0..iterations {
+            let mut states = (0..fanout).map(|_| make_crypt()).collect::<Vec<_>>();
+            let start = Instant::now();
+            let out: Vec<Bytes> = states
+                .iter_mut()
+                .map(|state| {
+                    let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
+                    let mut buf = vec![0u8; raw.len() + state.overhead()];
+                    state.encrypt(&mut buf, &raw).unwrap();
+                    Bytes::from(buf)
+                })
+                .collect();
+            black_box(out);
+            sequential_ns += start.elapsed().as_nanos();
+
+            let states = (0..fanout).map(|_| make_crypt()).collect::<Vec<_>>();
+            let start = Instant::now();
+            let out: Vec<Bytes> = states
+                .into_par_iter()
+                .map(|mut state| {
+                    let raw = Audio::encode(&audio, AudioContext::Normal, PacketFormat::Legacy);
+                    let mut buf = vec![0u8; raw.len() + state.overhead()];
+                    state.encrypt(&mut buf, &raw).unwrap();
+                    Bytes::from(buf)
+                })
+                .collect();
+            black_box(out);
+            rayon_ns += start.elapsed().as_nanos();
+        }
+        let sequential = sequential_ns as f64 / iterations as f64 / 1_000.0;
+        let rayon = rayon_ns as f64 / iterations as f64 / 1_000.0;
+        let speedup = sequential / rayon;
+        println!(
+            "{fanout}\t{sequential:.1}\t{rayon:.1}\t{speedup:.3}x\t{}",
+            speedup >= 1.05
+        );
+    }
+
+    run_adaptive_partition_report();
+}
+
+fn run_adaptive_partition_report() {
+    let raw = Audio::encode(&make_audio(170), AudioContext::Normal, PacketFormat::Legacy);
+    let checksum = CryptState::compute_plaintext_checksum(&raw);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 64738));
+    let workers = rayon::current_num_threads();
+    let iterations = 20;
+    // Ensure worker wake-up is not charged only to the first candidate.
+    rayon::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|_| black_box(()));
+        }
+    });
+    println!("adaptive partition report: opus=170 iterations={iterations} workers={workers}");
+    println!(
+        "fanout\tsequential_us\tbest_rayon_us\tbest_chunks\tchunk_len\tspeedup\tmeets_5pct\tcandidate_us_by_chunks"
+    );
+
+    for fanout in [40, 64, 128, 256, 512, 1024, 2048] {
+        let mut sequential_ns = 0u128;
+        for _ in 0..iterations {
+            let mut states = (0..fanout).map(|_| make_crypt()).collect::<Vec<_>>();
+            let start = Instant::now();
+            let mut batch = DatagramBatch::with_capacity(fanout);
+            for state in &mut states {
+                let encrypted_len = raw.len() + state.overhead();
+                batch
+                    .try_push_zeroed(addr, encrypted_len, |buf| {
+                        state.encrypt_with_precomputed_checksum(buf, &raw, &checksum)
+                    })
+                    .unwrap();
+            }
+            black_box(batch);
+            sequential_ns += start.elapsed().as_nanos();
+        }
+
+        let mut candidates = Vec::new();
+        for chunk_count in 1..=workers.min(fanout) {
+            let chunk_len = fanout.div_ceil(chunk_count);
+            let mut elapsed_ns = 0u128;
+            for _ in 0..iterations {
+                let chunks = make_crypt_chunks(fanout, chunk_count);
+                let start = Instant::now();
+                let batch = chunks
+                    .into_par_iter()
+                    .map(|mut states| {
+                        let mut batch = DatagramBatch::with_capacity(states.len());
+                        for state in &mut states {
+                            let encrypted_len = raw.len() + state.overhead();
+                            batch
+                                .try_push_zeroed(addr, encrypted_len, |buf| {
+                                    state.encrypt_with_precomputed_checksum(buf, &raw, &checksum)
+                                })
+                                .unwrap();
+                        }
+                        batch
+                    })
+                    .reduce(DatagramBatch::new, |mut left, right| {
+                        left.append(right);
+                        left
+                    });
+                black_box(batch);
+                elapsed_ns += start.elapsed().as_nanos();
+            }
+            candidates.push((elapsed_ns / iterations as u128, chunk_count, chunk_len));
+        }
+
+        let &(best_ns, best_chunks, best_len) = candidates
+            .iter()
+            .min_by_key(|candidate| candidate.0)
+            .expect("at least one partition candidate");
+        let candidate_timings = candidates
+            .iter()
+            .map(|(ns, chunks, _)| format!("{chunks}:{:.1}", *ns as f64 / 1_000.0))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sequential_us = sequential_ns as f64 / iterations as f64 / 1_000.0;
+        let best_us = best_ns as f64 / 1_000.0;
+        let speedup = sequential_us / best_us;
+        println!(
+            "{fanout}\t{sequential_us:.1}\t{best_us:.1}\t{best_chunks}\t{best_len}\t{speedup:.3}x\t{}\t{candidate_timings}",
+            speedup >= 1.05,
+        );
+    }
+}
+
 // ── 1. Encoding only ─────────────────────────────────────────────────────────
 
 fn bench_encode_legacy(c: &mut Criterion) {
+    if std::env::var_os("SHITSPEAK_BENCH_REPORT").is_some() {
+        run_fanout_report();
+        std::process::exit(0);
+    }
     let mut group = c.benchmark_group("encode/legacy");
     for &len in opus_sizes().iter() {
         let audio = make_audio(len);

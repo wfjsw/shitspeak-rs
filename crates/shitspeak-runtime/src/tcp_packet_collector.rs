@@ -277,7 +277,7 @@ mod linux {
             install_listener_filter(
                 self.packet_fd.as_raw_fd(),
                 self.kind,
-                &self.state.lock().capture_addresses,
+                &self.state.lock().listener_addresses,
             )
         }
 
@@ -554,6 +554,10 @@ mod linux {
         let accept = builder.new_label();
         builder.load_metadata_byte(SKF_AD_OFF + SKF_AD_PKTTYPE);
         builder.jump_equal(i32::from(libc::PACKET_HOST), incoming);
+        // On some physical interfaces the kernel classifies locally
+        // delivered frames as OTHERHOST (for example when the interface MAC
+        // is shared). They are still valid inbound traffic for our listener.
+        builder.jump_equal(i32::from(libc::PACKET_OTHERHOST), incoming);
         builder.jump_equal(i32::from(libc::PACKET_OUTGOING), outgoing);
         builder.return_value(0);
 
@@ -957,7 +961,7 @@ mod linux {
                     libc::AF_INET => {
                         let address = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in>() };
                         addresses.insert(IpAddr::V4(Ipv4Addr::from(
-                            address.sin_addr.s_addr.to_ne_bytes(),
+                            address.sin_addr.s_addr.to_be_bytes(),
                         )));
                     }
                     libc::AF_INET6 => {
@@ -1566,7 +1570,7 @@ mod linux {
 
         #[test]
         fn userspace_parser_rejects_packets_outside_listener_endpoints() {
-            let packet = ipv4_tcp_packet(50000, 443, 0);
+            let packet = ipv4_tcp_packet(50000, 8443, 0);
             let different_listener: BTreeSet<_> =
                 ["203.0.113.9:443".parse().expect("listener address")]
                     .into_iter()
