@@ -178,7 +178,7 @@ impl TcpPacketCollector {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::mem;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -192,8 +192,8 @@ mod linux {
     const BPF_ALU_AND_K: u8 = 0x54;
     const BPF_ALU64_MOV_K: u8 = 0xb7;
     const BPF_ALU64_MOV_X: u8 = 0xbf;
+    const BPF_JMP_JA: u8 = 0x05;
     const BPF_JMP_JEQ_K: u8 = 0x15;
-    const BPF_JMP_JNE_K: u8 = 0x55;
     const BPF_JMP_EXIT: u8 = 0x95;
     const SO_ATTACH_BPF: libc::c_int = 50;
     const SO_ATTACH_FILTER: libc::c_int = 26;
@@ -275,7 +275,7 @@ mod linux {
             install_listener_filter(
                 self.packet_fd.as_raw_fd(),
                 self.kind,
-                &self.state.lock().listener_addresses,
+                &self.state.lock().capture_addresses,
             )
         }
 
@@ -479,13 +479,13 @@ mod linux {
             self.jumps.push((index, label));
         }
 
-        fn jump_not_equal(&mut self, value: i32, label: usize) {
+        fn jump_always(&mut self, label: usize) {
             let index = self.instructions.len();
             self.instructions.push(BpfInsn {
-                code: BPF_JMP_JNE_K,
+                code: BPF_JMP_JA,
                 dst_src: 0,
                 off: 0,
-                imm: value,
+                imm: 0,
             });
             self.jumps.push((index, label));
         }
@@ -596,6 +596,24 @@ mod linux {
         builder.return_value(0);
         builder.mark(unfragmented);
 
+        let address_groups = listener_addresses.iter().filter_map(|listener| {
+            let IpAddr::V4(address) = listener.ip() else {
+                return None;
+            };
+            Some((listener.port(), address))
+        });
+        let mut addresses_by_port = BTreeMap::<u16, Vec<Ipv4Addr>>::new();
+        for (port, address) in address_groups {
+            addresses_by_port.entry(port).or_default().push(address);
+        }
+        let incoming_ports = addresses_by_port
+            .keys()
+            .map(|port| (*port, builder.new_label()))
+            .collect::<Vec<_>>();
+        let outgoing_ports = addresses_by_port
+            .keys()
+            .map(|port| (*port, builder.new_label()))
+            .collect::<Vec<_>>();
         let mut header_lengths = Vec::new();
         for words in 5usize..=15 {
             header_lengths.push((words, builder.new_label()));
@@ -607,15 +625,52 @@ mod linux {
         builder.return_value(0);
         for (words, label) in header_lengths {
             builder.mark(label);
-            append_endpoint_filter(
-                builder,
-                ip_offset,
-                ip_offset + words * 4,
-                listener_addresses,
-                accept,
-                false,
-            );
+            let tcp_offset = ip_offset + words * 4;
+            builder.load_half(tcp_offset + 2);
+            for (port, port_label) in &incoming_ports {
+                builder.jump_equal(i32::from(*port), *port_label);
+            }
+            builder.load_byte(tcp_offset + 13);
+            builder.and(0x12);
+            let syn_ack = builder.new_label();
+            builder.jump_equal(0x12, syn_ack);
+            builder.return_value(0);
+            builder.mark(syn_ack);
+            builder.load_half(tcp_offset);
+            for (port, port_label) in &outgoing_ports {
+                builder.jump_equal(i32::from(*port), *port_label);
+            }
+            builder.return_value(0);
         }
+        for (port, label) in incoming_ports {
+            builder.mark(label);
+            append_ipv4_address_matches(builder, ip_offset + 16, &addresses_by_port[&port], accept);
+        }
+        for (port, label) in outgoing_ports {
+            builder.mark(label);
+            append_ipv4_address_matches(builder, ip_offset + 12, &addresses_by_port[&port], accept);
+        }
+    }
+
+    fn append_ipv4_address_matches(
+        builder: &mut FilterBuilder,
+        address_offset: usize,
+        addresses: &[Ipv4Addr],
+        accept: usize,
+    ) {
+        for address in addresses {
+            let next = builder.new_label();
+            for (index, word) in address.octets().chunks_exact(2).enumerate() {
+                let equal = builder.new_label();
+                builder.load_half(address_offset + index * 2);
+                builder.jump_equal(i32::from(u16::from_be_bytes([word[0], word[1]])), equal);
+                builder.jump_always(next);
+                builder.mark(equal);
+            }
+            builder.jump_always(accept);
+            builder.mark(next);
+        }
+        builder.return_value(0);
     }
 
     fn append_ipv6_filter(
@@ -688,20 +743,22 @@ mod linux {
             match listener.ip() {
                 IpAddr::V4(address) => {
                     for (index, word) in address.octets().chunks_exact(2).enumerate() {
+                        let equal = builder.new_label();
                         builder.load_half(address_offset + index * 2);
-                        builder.jump_not_equal(
-                            i32::from(u16::from_be_bytes([word[0], word[1]])),
-                            next,
-                        );
+                        builder
+                            .jump_equal(i32::from(u16::from_be_bytes([word[0], word[1]])), equal);
+                        builder.jump_always(next);
+                        builder.mark(equal);
                     }
                 }
                 IpAddr::V6(address) => {
                     for (index, word) in address.octets().chunks_exact(2).enumerate() {
+                        let equal = builder.new_label();
                         builder.load_half(address_offset + index * 2);
-                        builder.jump_not_equal(
-                            i32::from(u16::from_be_bytes([word[0], word[1]])),
-                            next,
-                        );
+                        builder
+                            .jump_equal(i32::from(u16::from_be_bytes([word[0], word[1]])), equal);
+                        builder.jump_always(next);
+                        builder.mark(equal);
                     }
                 }
             }
@@ -801,8 +858,7 @@ mod linux {
                 classic_len += 1;
                 source += 2;
             } else {
-                classic_len +=
-                    usize::from(matches!(instruction.code, BPF_JMP_JEQ_K | BPF_JMP_JNE_K)) + 1;
+                classic_len += usize::from(instruction.code == BPF_JMP_JEQ_K) + 1;
                 source += 1;
             }
         }
@@ -822,25 +878,33 @@ mod linux {
                         k: instruction.imm as u32,
                     });
                 }
-                BPF_JMP_JEQ_K | BPF_JMP_JNE_K => {
+                BPF_JMP_JEQ_K => {
                     let target = (source as isize + isize::from(instruction.off) + 1) as usize;
                     let jump_index = classic.len() + 1;
                     let relative = classic_offsets[target]
                         .checked_sub(jump_index + 1)
                         .ok_or_else(|| std::io::Error::other("backward classic BPF jump"))?;
-                    let (jt, jf) = if instruction.code == BPF_JMP_JEQ_K {
-                        (0, 1)
-                    } else {
-                        (1, 0)
-                    };
                     classic.push(ClassicBpfInsn {
                         code: u16::from(BPF_JMP_JEQ_K),
-                        jt,
-                        jf,
+                        jt: 0,
+                        jf: 1,
                         k: instruction.imm as u32,
                     });
                     classic.push(ClassicBpfInsn {
                         code: 0x05,
+                        jt: 0,
+                        jf: 0,
+                        k: u32::try_from(relative)
+                            .map_err(|_| std::io::Error::other("classic BPF jump is too large"))?,
+                    });
+                }
+                BPF_JMP_JA => {
+                    let target = (source as isize + isize::from(instruction.off) + 1) as usize;
+                    let relative = classic_offsets[target]
+                        .checked_sub(classic.len() + 1)
+                        .ok_or_else(|| std::io::Error::other("backward classic BPF jump"))?;
+                    classic.push(ClassicBpfInsn {
+                        code: u16::from(BPF_JMP_JA),
                         jt: 0,
                         jf: 0,
                         k: u32::try_from(relative)
@@ -922,7 +986,7 @@ mod linux {
                     libc::AF_INET => {
                         let address = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in>() };
                         addresses.insert(IpAddr::V4(Ipv4Addr::from(
-                            address.sin_addr.s_addr.to_be_bytes(),
+                            address.sin_addr.s_addr.to_ne_bytes(),
                         )));
                     }
                     libc::AF_INET6 => {
@@ -1293,12 +1357,10 @@ mod linux {
                             continue;
                         }
                     }
-                    BPF_JMP_JNE_K => {
-                        if accumulator != current.imm {
-                            instruction =
-                                (instruction as isize + isize::from(current.off) + 1) as usize;
-                            continue;
-                        }
+                    BPF_JMP_JA => {
+                        instruction =
+                            (instruction as isize + isize::from(current.off) + 1) as usize;
+                        continue;
                     }
                     BPF_ALU_AND_K => accumulator &= current.imm,
                     BPF_JMP_EXIT => return accumulator as u32,
@@ -1835,27 +1897,67 @@ mod linux {
         async fn captures_metadata_from_a_real_tcp_connection() {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            let bind_address = std::env::var("SHITSPEAK_CAPTURE_TEST_BIND")
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            let listener = tokio::net::TcpListener::bind(&bind_address)
                 .await
                 .expect("bind TCP listener");
+            println!(
+                "capture test listening on {}",
+                listener.local_addr().expect("listener address")
+            );
             let listener_address = listener.local_addr().expect("listener address");
-            let collector = start(&["ebpf".to_owned()], &[listener_address]);
-            assert_eq!(collector.active_backend(), Some("ebpf"));
+            let filter_addresses = std::env::var("SHITSPEAK_CAPTURE_TEST_FILTER")
+                .map(|addresses| {
+                    addresses
+                        .split(',')
+                        .map(|address| address.parse().expect("filter address"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|_| vec![listener_address]);
+            println!("capture test filter addresses: {filter_addresses:?}");
+            println!(
+                "capture test resolved addresses: {:?}",
+                resolve_capture_addresses(&filter_addresses.iter().copied().collect())
+                    .expect("resolve filter addresses")
+            );
+            let collector = start(
+                &["ebpf".to_owned(), "af_packet".to_owned()],
+                &filter_addresses,
+            );
+            println!("capture test backend: {:?}", collector.active_backend());
+            assert!(collector.active_backend().is_some());
 
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.expect("accept connection");
+            let external_client = std::env::var_os("SHITSPEAK_CAPTURE_TEST_EXTERNAL").is_some();
+            let (client_address, server_address) = if external_client {
+                let (mut stream, client_address) =
+                    tokio::time::timeout(Duration::from_secs(30), listener.accept())
+                        .await
+                        .expect("external connection timeout")
+                        .expect("accept external connection");
+                let server_address = stream.local_addr().expect("accepted local address");
                 let mut byte = [0];
                 stream.read_exact(&mut byte).await.expect("read byte");
-            });
-            let mut client = tokio::net::TcpStream::connect(listener_address)
-                .await
-                .expect("connect to listener");
-            let client_address = client.local_addr().expect("client address");
-            client.write_all(&[1]).await.expect("write byte");
-            server.await.expect("server task");
+                (client_address, server_address)
+            } else {
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.expect("accept connection");
+                    let server_address = stream.local_addr().expect("accepted local address");
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.expect("read byte");
+                    server_address
+                });
+                let mut client = tokio::net::TcpStream::connect(listener_address)
+                    .await
+                    .expect("connect to listener");
+                let client_address = client.local_addr().expect("client address");
+                client.write_all(&[1]).await.expect("write byte");
+                let server_address = server.await.expect("server task");
+                (client_address, server_address)
+            };
 
             let metadata = collector
-                .lookup_after_capture(client_address, listener_address)
+                .lookup_after_capture(client_address, server_address)
                 .await
                 .expect("captured TCP metadata");
             assert!(!metadata.ja4t().is_empty());
