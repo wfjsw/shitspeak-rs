@@ -197,8 +197,6 @@ mod linux {
     const BPF_JMP_EXIT: u8 = 0x95;
     const SO_ATTACH_BPF: libc::c_int = 50;
     const SO_ATTACH_FILTER: libc::c_int = 26;
-    const SKF_AD_OFF: i32 = -0x1000;
-    const SKF_AD_PKTTYPE: i32 = 4;
     const CAPTURE_SNAPSHOT_LEN: usize = 256;
 
     #[repr(C)]
@@ -461,15 +459,6 @@ mod linux {
             });
         }
 
-        fn load_metadata_byte(&mut self, offset: i32) {
-            self.instructions.push(BpfInsn {
-                code: BPF_LD_ABS_B,
-                dst_src: 0,
-                off: 0,
-                imm: offset,
-            });
-        }
-
         fn load_half(&mut self, offset: usize) {
             self.instructions.push(BpfInsn {
                 code: BPF_LD_ABS_H,
@@ -539,48 +528,12 @@ mod linux {
         }
     }
 
-    #[derive(Clone, Copy)]
-    enum PacketDirection {
-        Incoming,
-        Outgoing,
-    }
-
     fn build_socket_filter(
         listener_addresses: &BTreeSet<SocketAddr>,
     ) -> std::io::Result<Vec<BpfInsn>> {
         let mut builder = FilterBuilder::new();
-        let incoming = builder.new_label();
-        let outgoing = builder.new_label();
         let accept = builder.new_label();
-        builder.load_metadata_byte(SKF_AD_OFF + SKF_AD_PKTTYPE);
-        builder.jump_equal(i32::from(libc::PACKET_HOST), incoming);
-        // On some physical interfaces the kernel classifies locally
-        // delivered frames as OTHERHOST (for example when the interface MAC
-        // is shared). They are still valid inbound traffic for our listener.
-        builder.jump_equal(i32::from(libc::PACKET_OTHERHOST), incoming);
-        builder.jump_equal(i32::from(libc::PACKET_OUTGOING), outgoing);
-        builder.return_value(0);
-
-        builder.mark(incoming);
-        append_ethernet_dispatch(
-            &mut builder,
-            12,
-            14,
-            0,
-            listener_addresses,
-            PacketDirection::Incoming,
-            accept,
-        );
-        builder.mark(outgoing);
-        append_ethernet_dispatch(
-            &mut builder,
-            12,
-            14,
-            0,
-            listener_addresses,
-            PacketDirection::Outgoing,
-            accept,
-        );
+        append_ethernet_dispatch(&mut builder, 12, 14, 0, listener_addresses, accept);
         builder.mark(accept);
         builder.return_value(CAPTURE_SNAPSHOT_LEN as i32);
         builder.finish()
@@ -592,7 +545,6 @@ mod linux {
         ip_offset: usize,
         vlan_depth: usize,
         listener_addresses: &BTreeSet<SocketAddr>,
-        direction: PacketDirection,
         accept: usize,
     ) {
         let ipv4 = builder.new_label();
@@ -609,9 +561,9 @@ mod linux {
         builder.return_value(0);
 
         builder.mark(ipv4);
-        append_ipv4_filter(builder, ip_offset, listener_addresses, direction, accept);
+        append_ipv4_filter(builder, ip_offset, listener_addresses, accept);
         builder.mark(ipv6);
-        append_ipv6_filter(builder, ip_offset, listener_addresses, direction, accept);
+        append_ipv6_filter(builder, ip_offset, listener_addresses, accept);
 
         if vlan_depth < 2 {
             builder.mark(vlan);
@@ -621,7 +573,6 @@ mod linux {
                 ip_offset + 4,
                 vlan_depth + 1,
                 listener_addresses,
-                direction,
                 accept,
             );
         }
@@ -631,7 +582,6 @@ mod linux {
         builder: &mut FilterBuilder,
         ip_offset: usize,
         listener_addresses: &BTreeSet<SocketAddr>,
-        direction: PacketDirection,
         accept: usize,
     ) {
         let tcp = builder.new_label();
@@ -662,7 +612,6 @@ mod linux {
                 ip_offset,
                 ip_offset + words * 4,
                 listener_addresses,
-                direction,
                 accept,
                 false,
             );
@@ -673,7 +622,6 @@ mod linux {
         builder: &mut FilterBuilder,
         ip_offset: usize,
         listener_addresses: &BTreeSet<SocketAddr>,
-        direction: PacketDirection,
         accept: usize,
     ) {
         let tcp = builder.new_label();
@@ -686,7 +634,6 @@ mod linux {
             ip_offset,
             ip_offset + 40,
             listener_addresses,
-            direction,
             accept,
             true,
         );
@@ -697,28 +644,47 @@ mod linux {
         ip_offset: usize,
         tcp_offset: usize,
         listener_addresses: &BTreeSet<SocketAddr>,
-        direction: PacketDirection,
         accept: usize,
         ipv6: bool,
     ) {
-        if matches!(direction, PacketDirection::Outgoing) {
-            builder.load_byte(tcp_offset + 13);
-            builder.and(0x12);
-            let syn_ack = builder.new_label();
-            builder.jump_equal(0x12, syn_ack);
-            builder.return_value(0);
-            builder.mark(syn_ack);
-        }
+        append_endpoint_matches(
+            builder,
+            ip_offset + if ipv6 { 24 } else { 16 },
+            tcp_offset + 2,
+            listener_addresses,
+            accept,
+            ipv6,
+        );
+        builder.load_byte(tcp_offset + 13);
+        builder.and(0x12);
+        let syn_ack = builder.new_label();
+        builder.jump_equal(0x12, syn_ack);
+        builder.return_value(0);
+        builder.mark(syn_ack);
+        append_endpoint_matches(
+            builder,
+            ip_offset + if ipv6 { 8 } else { 12 },
+            tcp_offset,
+            listener_addresses,
+            accept,
+            ipv6,
+        );
+        builder.return_value(0);
+    }
 
+    fn append_endpoint_matches(
+        builder: &mut FilterBuilder,
+        address_offset: usize,
+        port_offset: usize,
+        listener_addresses: &BTreeSet<SocketAddr>,
+        accept: usize,
+        ipv6: bool,
+    ) {
         for listener in listener_addresses {
             if listener.is_ipv6() != ipv6 {
                 continue;
             }
             let next = builder.new_label();
-            let address_offset = match direction {
-                PacketDirection::Incoming => ip_offset + if ipv6 { 24 } else { 16 },
-                PacketDirection::Outgoing => ip_offset + if ipv6 { 8 } else { 12 },
-            };
             match listener.ip() {
                 IpAddr::V4(address) => {
                     for (index, word) in address.octets().chunks_exact(2).enumerate() {
@@ -739,15 +705,10 @@ mod linux {
                     }
                 }
             }
-            let port_offset = match direction {
-                PacketDirection::Incoming => tcp_offset + 2,
-                PacketDirection::Outgoing => tcp_offset,
-            };
             builder.load_half(port_offset);
             builder.jump_equal(i32::from(listener.port()), accept);
             builder.mark(next);
         }
-        builder.return_value(0);
     }
 
     fn attach_ebpf_socket_filter(
@@ -1304,7 +1265,7 @@ mod linux {
                 .collect()
         }
 
-        fn run_socket_filter(instructions: &[BpfInsn], packet: &[u8], packet_type: u8) -> u32 {
+        fn run_socket_filter(instructions: &[BpfInsn], packet: &[u8], _packet_type: u8) -> u32 {
             let mut accumulator = 0i32;
             let mut instruction = 0usize;
             loop {
@@ -1313,11 +1274,6 @@ mod linux {
                     BPF_ALU64_MOV_X => {}
                     BPF_ALU64_MOV_K => accumulator = current.imm,
                     BPF_LD_ABS_B => {
-                        if current.imm == -0x1000 + 4 {
-                            accumulator = i32::from(packet_type);
-                            instruction += 1;
-                            continue;
-                        }
                         let Some(value) = packet.get(current.imm as usize) else {
                             return 0;
                         };
@@ -1355,7 +1311,7 @@ mod linux {
         fn run_classic_socket_filter(
             instructions: &[ClassicBpfInsn],
             packet: &[u8],
-            packet_type: u8,
+            _packet_type: u8,
         ) -> u32 {
             let mut accumulator = 0u32;
             let mut instruction = 0usize;
@@ -1363,14 +1319,10 @@ mod linux {
                 let current = &instructions[instruction];
                 match current.code {
                     0x30 => {
-                        if current.k == (SKF_AD_OFF + SKF_AD_PKTTYPE) as u32 {
-                            accumulator = u32::from(packet_type);
-                        } else {
-                            let Some(value) = packet.get(current.k as usize) else {
-                                return 0;
-                            };
-                            accumulator = u32::from(*value);
-                        }
+                        let Some(value) = packet.get(current.k as usize) else {
+                            return 0;
+                        };
+                        accumulator = u32::from(*value);
                     }
                     0x28 => {
                         let offset = current.k as usize;
@@ -1876,6 +1828,38 @@ mod linux {
                 .expect("published flow metadata");
             assert_eq!(metadata.ja4t(), "64240_2-1-3-4_1460_8");
             assert_eq!(metadata.ja4l(), Some("125_57_150"));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Linux CAP_NET_RAW and CAP_BPF"]
+        async fn captures_metadata_from_a_real_tcp_connection() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind TCP listener");
+            let listener_address = listener.local_addr().expect("listener address");
+            let collector = start(&["ebpf".to_owned()], &[listener_address]);
+            assert_eq!(collector.active_backend(), Some("ebpf"));
+
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept connection");
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.expect("read byte");
+            });
+            let mut client = tokio::net::TcpStream::connect(listener_address)
+                .await
+                .expect("connect to listener");
+            let client_address = client.local_addr().expect("client address");
+            client.write_all(&[1]).await.expect("write byte");
+            server.await.expect("server task");
+
+            let metadata = collector
+                .lookup_after_capture(client_address, listener_address)
+                .await
+                .expect("captured TCP metadata");
+            assert!(!metadata.ja4t().is_empty());
+            assert!(metadata.ja4l().is_some());
         }
     }
 }
