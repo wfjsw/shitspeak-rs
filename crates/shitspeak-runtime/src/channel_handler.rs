@@ -89,6 +89,7 @@ impl ChannelPermissionShadow {
 pub struct SessionChannelShadow {
     session_channel: HashMap<PackedSessionId, u32>,
     sessions_by_channel: HashMap<u32, HashSet<PackedSessionId>>,
+    temporary_relocations: HashSet<PackedSessionId>,
 }
 
 fn unpack_session_entry(
@@ -104,6 +105,7 @@ impl SessionChannelShadow {
 
     pub fn insert(&mut self, session: ClientSessionIdentifier, channel_id: u32) -> Option<u32> {
         let packed_session = u32::from(session);
+        self.temporary_relocations.remove(&packed_session);
         let old_channel_id = self.session_channel.insert(packed_session, channel_id);
         if old_channel_id == Some(channel_id) {
             return old_channel_id;
@@ -118,8 +120,18 @@ impl SessionChannelShadow {
         old_channel_id
     }
 
+    pub(crate) fn insert_temporary(&mut self, session: ClientSessionIdentifier, channel_id: u32) {
+        self.insert(session, channel_id);
+        self.temporary_relocations.insert(u32::from(session));
+    }
+
+    pub(crate) fn is_temporarily_relocated(&self, session: ClientSessionIdentifier) -> bool {
+        self.temporary_relocations.contains(&u32::from(session))
+    }
+
     pub fn remove(&mut self, session: &ClientSessionIdentifier) -> Option<u32> {
         let packed_session = u32::from(*session);
+        self.temporary_relocations.remove(&packed_session);
         let old_channel_id = self.session_channel.remove(&packed_session)?;
         self.remove_index_entry(packed_session, old_channel_id);
         Some(old_channel_id)
@@ -128,6 +140,7 @@ impl SessionChannelShadow {
     pub fn clear(&mut self) {
         self.session_channel.clear();
         self.sessions_by_channel.clear();
+        self.temporary_relocations.clear();
     }
 
     pub fn extend(&mut self, sessions: impl IntoIterator<Item = (ClientSessionIdentifier, u32)>) {
@@ -2065,6 +2078,7 @@ pub async fn convert_channel_operation_to_messages_with_acl_context_options(
                     shadow,
                     *id,
                     *nonce,
+                    None,
                     false,
                     None,
                     &server_id,
@@ -2084,7 +2098,8 @@ pub async fn convert_channel_operation_to_messages_with_acl_context_options(
                         channels,
                         shadow,
                         *id,
-                        *nonce,
+                        nonce.unwrap_or_default(),
+                        channels.delete_fallback_for_operation(op),
                         true,
                         deleted_channel_ids.as_ref(),
                         &server_id,
@@ -2116,6 +2131,19 @@ pub async fn convert_channel_operation_to_messages_with_acl_context_options(
                 messages.push(state.into());
             }
             messages.extend(deferred_links.into_iter().map(Message::from));
+            if let Some(shadow) = session_channel_shadow.as_deref_mut() {
+                messages.extend(
+                    evacuate_removed_channel_users(
+                        server,
+                        server.get_channels(),
+                        shadow,
+                        &server_id,
+                        &removed.iter().copied().collect(),
+                        0,
+                    )
+                    .await,
+                );
+            }
             for channel_id in removed {
                 messages.push(
                     shitspeak_messages::messages::encoder::ChannelRemove {
@@ -2148,10 +2176,10 @@ pub async fn convert_channel_operation_to_messages_with_acl_context_options(
 }
 
 pub async fn sync_shadow_for_client_message(
-    server: &Arc<Box<Server>>,
-    channels: &Arc<ChannelRepository>,
+    _server: &Arc<Box<Server>>,
+    _channels: &Arc<ChannelRepository>,
     shadow: &mut SessionChannelShadow,
-    server_id: &str,
+    _server_id: &str,
     message: &Message,
 ) -> Vec<Message> {
     match message {
@@ -2164,10 +2192,7 @@ pub async fn sync_shadow_for_client_message(
             };
 
             shadow.insert(session, channel_id);
-            synthetic_move_if_pending_delete(
-                server, channels, shadow, session, channel_id, server_id,
-            )
-            .await
+            Vec::new()
         }
         Message::UserRemove(user_remove) => {
             shadow.remove(&ClientSessionIdentifier::from(user_remove.session));
@@ -2177,40 +2202,139 @@ pub async fn sync_shadow_for_client_message(
     }
 }
 
-async fn synthetic_move_if_pending_delete(
+/// Rewrite a late owner message before it reaches the socket. The owner
+/// repository is unchanged; temporary locations belong only to this viewer.
+pub(crate) async fn normalize_projected_user_location(
+    server: &Arc<Box<Server>>,
+    channels: &Arc<ChannelRepository>,
+    shadow: &SessionChannelShadow,
+    server_id: &str,
+    message: &mut Message,
+) -> bool {
+    let Message::UserState(state) = message else {
+        return false;
+    };
+    let Some(session) = state.session.map(ClientSessionIdentifier::from) else {
+        return false;
+    };
+    let temporary = shadow.is_temporarily_relocated(session);
+    let requested = state.channel_id;
+    let invalid = match requested {
+        Some(id) => !projected_channel_available(channels, server_id, id).await,
+        None => false,
+    };
+    if !invalid && !temporary {
+        return false;
+    }
+    let target = server
+        .get_clients()
+        .get_client_in_server(server_id, session)
+        .await;
+    if let Some(target) = &target {
+        let canonical = target.get_current_channel_id();
+        if projected_channel_available(channels, server_id, canonical).await {
+            state.channel_id = Some(canonical);
+            return false;
+        }
+    }
+    if invalid {
+        let previous = shadow.get(&session).copied();
+        let fallback = if let Some(previous) = previous
+            && projected_channel_available(channels, server_id, previous).await
+        {
+            previous
+        } else if let Some(target) = &target {
+            let suggested = channels
+                .redirect_pending_delete_target_in_server(server_id, requested.unwrap_or(0))
+                .await;
+            crate::user_channel_cache::resolve_forced_move_channel(server, target, suggested).await
+        } else {
+            0
+        };
+        state.channel_id = Some(
+            if projected_channel_available(channels, server_id, fallback).await {
+                fallback
+            } else {
+                0
+            },
+        );
+    }
+    true
+}
+
+async fn projected_channel_available(
+    channels: &ChannelRepository,
+    server_id: &str,
+    id: u32,
+) -> bool {
+    channels
+        .get_channel_in_server(server_id, id)
+        .await
+        .is_some_and(|ch| !ch.is_pending_delete())
+}
+
+/// Evacuate every socket-known occupant, including users whose repository
+/// removal has already applied while their UserRemove is still queued.
+pub(crate) async fn evacuate_removed_channel_users(
     server: &Arc<Box<Server>>,
     channels: &Arc<ChannelRepository>,
     shadow: &mut SessionChannelShadow,
-    session: ClientSessionIdentifier,
-    channel_id: u32,
     server_id: &str,
+    removed: &HashSet<u32>,
+    fallback: u32,
 ) -> Vec<Message> {
-    if !channels
-        .is_pending_delete_subtree_in_server(server_id, channel_id)
-        .await
-    {
-        return Vec::new();
-    }
-
-    let target = channels
-        .redirect_pending_delete_target_in_server(server_id, channel_id)
-        .await;
-    let Some(target_client) = server
-        .get_clients()
-        .get_client_in_server(server_id, session)
-        .await
-    else {
-        return Vec::new();
-    };
-    let target =
-        crate::user_channel_cache::resolve_forced_move_channel(server, &target_client, target)
+    let mut messages = Vec::new();
+    for session in shadow.sessions_in_channels(removed) {
+        let Some(current) = shadow.get(&session).copied() else {
+            continue;
+        };
+        let Some(target_client) = server
+            .get_clients()
+            .get_client_in_server(server_id, session)
+            .await
+        else {
+            // Retain the socket evidence until visibility projection accepts removal.
+            messages.push(
+                shitspeak_messages::messages::encoder::UserRemove {
+                    session: u32::from(session),
+                    actor: None,
+                    reason: None,
+                    ban: Some(false),
+                    ban_certificate: None,
+                    ban_ip: None,
+                }
+                .into(),
+            );
+            continue;
+        };
+        let canonical = target_client.get_current_channel_id();
+        let canonical_valid = !removed.contains(&canonical)
+            && projected_channel_available(channels, server_id, canonical).await;
+        let target = if canonical_valid {
+            canonical
+        } else {
+            let resolved = crate::user_channel_cache::resolve_forced_move_channel(
+                server,
+                &target_client,
+                fallback,
+            )
             .await;
-    if target == channel_id {
-        return Vec::new();
+            if !removed.contains(&resolved)
+                && projected_channel_available(channels, server_id, resolved).await
+            {
+                resolved
+            } else {
+                0
+            }
+        };
+        if let Some(message) = synthetic_user_move(server, shadow, session, current, target) {
+            if canonical_valid {
+                shadow.insert(session, target);
+            }
+            messages.push(message);
+        }
     }
-
-    let message = synthetic_user_move(server, shadow, session, channel_id, target);
-    message.into_iter().collect()
+    messages
 }
 
 async fn append_pending_delete_synthetic_moves(
@@ -2219,6 +2343,7 @@ async fn append_pending_delete_synthetic_moves(
     shadow: &mut SessionChannelShadow,
     id: u32,
     nonce: u64,
+    fallback_channel_id: Option<u32>,
     include_deleted_snapshot: bool,
     deleted_channel_ids: Option<&HashSet<u32>>,
     server_id: &str,
@@ -2241,32 +2366,25 @@ async fn append_pending_delete_synthetic_moves(
         return;
     }
 
-    let initial_target = channels
-        .redirect_pending_delete_target_in_server(server_id, id)
-        .await;
-    let sessions = shadow.sessions_in_channels(&subtree);
-
-    for session in sessions {
-        let Some(current) = shadow.get(&session).copied() else {
-            continue;
-        };
-        let Some(target_client) = server
-            .get_clients()
-            .get_client_in_server(server_id, session)
-            .await
-        else {
-            continue;
-        };
-        let target = crate::user_channel_cache::resolve_forced_move_channel(
+    let initial_target = match fallback_channel_id {
+        Some(id) => id,
+        None => {
+            channels
+                .redirect_pending_delete_target_in_server(server_id, id)
+                .await
+        }
+    };
+    messages.extend(
+        evacuate_removed_channel_users(
             server,
-            &target_client,
+            channels,
+            shadow,
+            server_id,
+            &subtree,
             initial_target,
         )
-        .await;
-        if let Some(message) = synthetic_user_move(server, shadow, session, current, target) {
-            messages.push(message);
-        }
-    }
+        .await,
+    );
 }
 
 async fn deleted_subtree_from_shadow(
@@ -2322,7 +2440,7 @@ fn synthetic_user_move(
     if current_channel == target_channel {
         return None;
     }
-    shadow.insert(session, target_channel);
+    shadow.insert_temporary(session, target_channel);
     Some(
         shitspeak_messages::messages::encoder::UserState {
             session: Some(session),
@@ -2638,6 +2756,30 @@ async fn replay_channel_snapshot(
         shadow.sync_messages(visibility_messages.iter());
     }
     outbound.extend(visibility_messages);
+
+    for message in evacuate_removed_channel_users(
+        server,
+        channels,
+        session_channel_shadow,
+        server_id,
+        &removed_channel_ids,
+        0,
+    )
+    .await
+    {
+        outbound.extend(
+            project_message_with_visibility_shadows(
+                server,
+                client,
+                channel_tree_shadow,
+                user_visibility,
+                session_channel_shadow,
+                server_id,
+                &message,
+            )
+            .await,
+        );
+    }
 
     for channel_id in removed {
         let message = shitspeak_messages::messages::encoder::ChannelRemove { channel_id }.into();

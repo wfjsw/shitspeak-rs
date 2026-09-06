@@ -97,6 +97,19 @@ impl ClientGlobalState {
         self.pending_delta = ClientGlobalStateDelta::default();
     }
 
+    pub(crate) fn has_pending_channel_admission(&self) -> bool {
+        self.pending_delta.current_channel_id.is_some()
+            || self.pending_delta.listening_channel_add.is_some()
+    }
+
+    pub(crate) fn pending_listener_additions(&self) -> impl Iterator<Item = u32> + '_ {
+        self.pending_delta
+            .listening_channel_add
+            .iter()
+            .flatten()
+            .copied()
+    }
+
     pub(crate) fn finish_delta_recording(&mut self) -> ClientGlobalStateDelta {
         self.delta_recording = false;
         std::mem::take(&mut self.pending_delta)

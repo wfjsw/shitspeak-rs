@@ -20,6 +20,7 @@ This directory is the main documentation set for ShitSpeak. The top-level [READM
 
 - [Development](development.md): build/test/bench commands, repository conventions, generated code, and feature flags.
 - [Architecture](architecture.md): source layout and how the major subsystems fit together.
+- [Channel deletion](channel-deletion.md): single-operation deletion, local cleanup, recovery, and compatibility.
 
 ## Existing Specialized Docs
 

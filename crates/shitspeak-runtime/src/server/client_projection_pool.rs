@@ -237,7 +237,7 @@ mod tests {
             emits_client_message: true,
             op: ChannelOp::DeleteChannel {
                 id: version as u32,
-                nonce: 1,
+                nonce: Some(1),
             },
         })
     }

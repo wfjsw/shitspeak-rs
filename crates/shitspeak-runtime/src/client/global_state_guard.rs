@@ -37,6 +37,7 @@ pub struct GlobalStateWriteGuard<'a> {
     channel_version_dep: Option<u64>,
     /// Whether the guard has already been committed (or rolled back).
     committed: bool,
+    original_channel_id: u32,
 }
 
 impl<'a> GlobalStateWriteGuard<'a> {
@@ -49,6 +50,7 @@ impl<'a> GlobalStateWriteGuard<'a> {
         sender_session_id: Option<ClientSessionIdentifier>,
         channel_version_dep: Option<u64>,
     ) -> Self {
+        let original_channel_id = inner.get_current_channel_id();
         inner.begin_delta_recording();
         Self {
             inner,
@@ -59,6 +61,7 @@ impl<'a> GlobalStateWriteGuard<'a> {
             sender_session_id,
             channel_version_dep,
             committed: false,
+            original_channel_id,
         }
     }
 
@@ -69,6 +72,13 @@ impl<'a> GlobalStateWriteGuard<'a> {
     /// Returns the version number that was assigned.
     pub fn commit(mut self) -> u64 {
         self.committed = true;
+        if let Some(version) = self.repo.reconcile_channel_membership(
+            &self.server_id,
+            &mut self.inner,
+            self.original_channel_id,
+        ) {
+            self.channel_version_dep = Some(self.channel_version_dep.unwrap_or(0).max(version));
+        }
         let delta = self.inner.finish_delta_recording();
         if delta.is_empty() {
             return self.repo.current_version();
@@ -116,6 +126,13 @@ impl<'a> DerefMut for GlobalStateWriteGuard<'a> {
 impl<'a> Drop for GlobalStateWriteGuard<'a> {
     fn drop(&mut self) {
         if !self.committed {
+            if let Some(version) = self.repo.reconcile_channel_membership(
+                &self.server_id,
+                &mut self.inner,
+                self.original_channel_id,
+            ) {
+                self.channel_version_dep = Some(self.channel_version_dep.unwrap_or(0).max(version));
+            }
             let delta = self.inner.finish_delta_recording();
             if delta.is_empty() {
                 return;

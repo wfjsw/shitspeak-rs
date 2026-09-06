@@ -511,7 +511,18 @@ pub async fn handle_authenticate(
                     client.get_current_channel_id(),
                     client.get_listening_channel_ids(),
                 );
-                push_burst(client.build_user_state_for_broadcast().into());
+                for message in crate::client::visibility::sync_projected_message_with_shadow(
+                    server,
+                    sender,
+                    &mut user_visibility,
+                    &mut session_channel_shadow,
+                    &server_id,
+                    client.build_user_state_for_broadcast().into(),
+                )
+                .await
+                {
+                    push_burst(message);
+                }
             } else {
                 let us: Message = client.build_user_state_for_broadcast().into();
                 let projected = crate::client::visibility::project_message_with_shadow(
@@ -539,7 +550,18 @@ pub async fn handle_authenticate(
                 sender.get_current_channel_id(),
                 sender.get_listening_channel_ids(),
             );
-            push_burst(sender.build_user_state_for_broadcast().into());
+            for message in crate::client::visibility::sync_projected_message_with_shadow(
+                server,
+                sender,
+                &mut user_visibility,
+                &mut session_channel_shadow,
+                &server_id,
+                sender.build_user_state_for_broadcast().into(),
+            )
+            .await
+            {
+                push_burst(message);
+            }
         } else {
             let self_us: Message = sender.build_user_state_for_broadcast().into();
             let projected = crate::client::visibility::project_message_with_shadow(

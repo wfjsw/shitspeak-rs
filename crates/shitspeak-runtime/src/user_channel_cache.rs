@@ -1044,10 +1044,26 @@ pub async fn move_local_clients_out_of_pending_delete(
         .get_channels()
         .pending_delete_subtree_set_in_server(server_id, channel_id, nonce)
         .await;
+    move_local_clients_out_of_deleted_channels(
+        server,
+        server_id,
+        &subtree,
+        fallback_channel_id,
+        channel_version,
+    )
+    .await
+}
+
+pub async fn move_local_clients_out_of_deleted_channels(
+    server: &Arc<Box<Server>>,
+    server_id: &str,
+    subtree: &std::collections::HashSet<u32>,
+    fallback_channel_id: u32,
+    channel_version: u64,
+) -> usize {
     if subtree.is_empty() {
         return 0;
     }
-
     let mut moved = 0;
     for client in server
         .get_clients()
@@ -1055,6 +1071,15 @@ pub async fn move_local_clients_out_of_pending_delete(
         .await
     {
         if !subtree.contains(&client.get_current_channel_id()) {
+            continue;
+        }
+
+        if server
+            .get_channels()
+            .get_channel_in_server(server_id, client.get_current_channel_id())
+            .await
+            .is_some_and(|channel| !channel.is_pending_delete())
+        {
             continue;
         }
 
@@ -1086,6 +1111,55 @@ pub async fn move_local_clients_out_of_pending_delete(
     }
 
     moved
+}
+
+/// Clear deleted listener references without moving occupants of another
+/// subtree whose own cleanup may still be queued.
+pub async fn remove_local_listeners_from_deleted_channels(
+    server: &Arc<Box<Server>>,
+    server_id: &str,
+    deleted_ids: &std::collections::HashSet<u32>,
+    channel_version: u64,
+) {
+    for client in server
+        .get_clients()
+        .get_local_clients_in_server(server_id)
+        .await
+    {
+        if client.get_listening_channel_ids().is_disjoint(deleted_ids) {
+            continue;
+        }
+        let remaining = {
+            let mut state = client.write_global_state_as(
+                server.get_clients(),
+                Some(client.get_session_id()),
+                Some(channel_version),
+            );
+            server
+                .get_channels()
+                .with_channel_membership_in_server(server_id, |exists, _| {
+                    for id in deleted_ids {
+                        if !exists(*id) {
+                            state.unlisten_channel(*id);
+                        }
+                    }
+                });
+            state
+                .get_listening_channel_id()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        if let Some(key) = cache_key_for_client(server.as_ref(), client.as_ref()).await {
+            if let Err(error) = server
+                .get_user_channel_cache()
+                .remember_listening_channels(&key, remaining)
+                .await
+            {
+                tracing::warn!(%error, "failed to stage listener cache after channel deletion");
+            }
+        }
+    }
 }
 
 async fn resolve_current_channel(

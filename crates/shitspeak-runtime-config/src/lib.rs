@@ -1289,7 +1289,8 @@ pub struct Config {
     /// root(active CPU count)), minimum 1.
     #[serde(default = "default_auth_finalization_concurrency")]
     pub auth_finalization_concurrency: usize,
-    /// Milliseconds before a pending two-phase channel delete is rolled back.
+    /// Milliseconds before retrying completion of a legacy pending channel delete.
+    /// New single-operation deletions do not use this timer.
     /// Default: 5000.
     #[serde(default = "default_pending_delete_timeout_ms")]
     pub pending_delete_timeout_ms: u64,

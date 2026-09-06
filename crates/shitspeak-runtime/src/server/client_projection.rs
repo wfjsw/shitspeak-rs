@@ -431,6 +431,29 @@ impl ClientProjectionState {
         self.channel_permission_shadow
             .sync_messages(visibility_messages.iter());
         outbound.extend(visibility_messages);
+        for message in crate::channel_handler::evacuate_removed_channel_users(
+            server,
+            &server.channels,
+            &mut self.session_channel_shadow,
+            server_id,
+            &removed_channel_ids,
+            0,
+        )
+        .await
+        {
+            outbound.extend(
+                crate::channel_handler::project_message_with_visibility_shadows(
+                    server,
+                    &self.client,
+                    &mut self.channel_tree_shadow,
+                    &mut self.user_visibility,
+                    &mut self.session_channel_shadow,
+                    server_id,
+                    &message,
+                )
+                .await,
+            );
+        }
         for channel_id in removed {
             let message =
                 shitspeak_messages::messages::encoder::ChannelRemove { channel_id }.into();
@@ -1062,5 +1085,392 @@ mod tests {
             fast_rx.try_recv(),
             Ok(Message::Ping(message)) if message.timestamp == Some(2)
         ));
+    }
+    async fn deleted_view_fixture() -> (
+        crate::integration_tests::harness::TestServer,
+        ClientProjectionState,
+        Arc<Box<Client>>,
+    ) {
+        deleted_view_fixture_with_filtering(false).await
+    }
+
+    async fn deleted_view_fixture_with_filtering(
+        filtering: bool,
+    ) -> (
+        crate::integration_tests::harness::TestServer,
+        ClientProjectionState,
+        Arc<Box<Client>>,
+    ) {
+        use crate::integration_tests::harness::{TestServerOpts, spawn_test_server};
+        use shitspeak_state::Channel;
+        let server = spawn_test_server(TestServerOpts {
+            hide_users_without_traverse: filtering,
+            hide_channels_without_traverse: filtering,
+            ..TestServerOpts::default()
+        })
+        .await;
+        tokio::task::yield_now().await;
+        for (id, parent) in [(7, 0), (8, 7), (9, 0)] {
+            server
+                .server
+                .channels
+                .create_channel_in_server(
+                    "default",
+                    Channel::new(id, format!("ch-{id}"), 0, 0, Some(parent)),
+                )
+                .await
+                .unwrap();
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let viewer = server
+            .server
+            .clients
+            .allocate_web_client_in_server(
+                "default",
+                server.addr.ip(),
+                server.addr,
+                server.addr,
+                tx,
+            )
+            .await;
+        viewer.set_authenticated(true);
+        let session = ClientSessionIdentifier::new(2, 7).unwrap();
+        let remote = Arc::new(Client::new_remote_in_server(
+            "default".to_owned(),
+            session,
+            server.addr.ip(),
+            server.addr,
+            None,
+            server.addr,
+            None,
+            chrono::Utc::now(),
+            99,
+        ));
+        remote.write_global_state_direct().set_current_channel_id(8);
+        server
+            .server
+            .clients
+            .add_remote_client(session, Arc::clone(&remote))
+            .await;
+        let mut projection = ClientProjectionState::new(
+            Arc::downgrade(&server.server),
+            viewer,
+            [0, 7, 8, 9].into_iter().collect(),
+            SessionChannelShadow::new(),
+            UserVisibilityState::default(),
+            HashMap::new(),
+            HashMap::new(),
+            3,
+        );
+        // Establish the same visibility state as a user snapshot sent to a socket.
+        crate::client::visibility::project_message_with_shadow(
+            &server.server,
+            &projection.client,
+            &mut projection.user_visibility,
+            &mut projection.session_channel_shadow,
+            "default",
+            &remote.build_user_state_for_broadcast().into(),
+        )
+        .await;
+        (server, projection, remote)
+    }
+
+    fn assert_empty_when_removed(
+        messages: &[Message],
+        session: ClientSessionIdentifier,
+        initial: u32,
+    ) -> Option<u32> {
+        let mut current = Some(initial);
+        let mut removed = false;
+        for message in messages {
+            match message {
+                Message::UserState(state) if state.session == Some(u32::from(session)) => {
+                    if let Some(channel) = state.channel_id {
+                        current = Some(channel);
+                    }
+                }
+                Message::UserRemove(remove) if remove.session == u32::from(session) => {
+                    current = None
+                }
+                Message::ChannelRemove(remove) if [7, 8].contains(&remove.channel_id) => {
+                    assert!(
+                        !current.is_some_and(|id| [7, 8].contains(&id)),
+                        "channel removed with a visible occupant: {messages:?}"
+                    );
+                    removed = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(removed, "expected channel removal");
+        current
+    }
+
+    #[tokio::test]
+    async fn deleted_view_snapshot_evacuates_remote_users_before_removing_channels() {
+        let (server, mut projection, remote) = deleted_view_fixture().await;
+        server
+            .server
+            .channels
+            .delete_channel_in_server("default", 7)
+            .await
+            .unwrap();
+        let mut messages = Vec::new();
+        projection
+            .append_channel_snapshot(&server.server, "default", &mut messages)
+            .await;
+        assert_empty_when_removed(&messages, remote.get_session_id(), 8);
+        assert_eq!(
+            remote.get_current_channel_id(),
+            8,
+            "projection must not mutate owner state"
+        );
+        server.shutdown_gracefully().await;
+    }
+
+    #[tokio::test]
+    async fn deleted_view_does_not_skip_a_user_whose_removal_is_still_queued() {
+        let (server, mut projection, remote) = deleted_view_fixture_with_filtering(true).await;
+        let ghost = ClientSessionIdentifier::new(3, 9).unwrap();
+        projection.session_channel_shadow.insert(ghost, 8);
+        server
+            .server
+            .channels
+            .delete_channel_in_server("default", 7)
+            .await
+            .unwrap();
+        let operation = server
+            .server
+            .channels
+            .get_log_since_in_server("default", 3)
+            .await
+            .pop()
+            .unwrap();
+        let mut messages = Vec::new();
+        projection
+            .append_projected_channel_operation(&server.server, &operation, &mut messages)
+            .await;
+        assert_empty_when_removed(&messages, ghost, 8);
+        assert_empty_when_removed(&messages, remote.get_session_id(), 8);
+        server.shutdown_gracefully().await;
+    }
+
+    #[tokio::test]
+    async fn deleted_view_preserves_owner_location_that_already_arrived() {
+        let (server, mut projection, remote) = deleted_view_fixture().await;
+        server
+            .server
+            .channels
+            .delete_channel_in_server("default", 7)
+            .await
+            .unwrap();
+        remote.write_global_state_direct().set_current_channel_id(9);
+        let operation = server
+            .server
+            .channels
+            .get_log_since_in_server("default", 3)
+            .await
+            .pop()
+            .unwrap();
+        let mut messages = Vec::new();
+        projection
+            .append_projected_channel_operation(&server.server, &operation, &mut messages)
+            .await;
+        assert_eq!(
+            assert_empty_when_removed(&messages, remote.get_session_id(), 8),
+            Some(9)
+        );
+        server.shutdown_gracefully().await;
+    }
+
+    #[tokio::test]
+    async fn deleted_view_rejects_late_missing_destination_and_converges_on_owner_update() {
+        let (server, mut projection, remote) = deleted_view_fixture().await;
+        let session = remote.get_session_id();
+        server
+            .server
+            .channels
+            .delete_channel_in_server("default", 7)
+            .await
+            .unwrap();
+        let operation = server
+            .server
+            .channels
+            .get_log_since_in_server("default", 3)
+            .await
+            .pop()
+            .unwrap();
+        let mut removal = Vec::new();
+        projection
+            .append_projected_channel_operation(&server.server, &operation, &mut removal)
+            .await;
+        assert_empty_when_removed(&removal, session, 8);
+        let late: Message = shitspeak_messages::messages::encoder::UserState {
+            session: Some(session),
+            channel_id: Some(8),
+            ..Default::default()
+        }
+        .into();
+        let messages = crate::client::visibility::project_message_with_shadow(
+            &server.server,
+            &projection.client,
+            &mut projection.user_visibility,
+            &mut projection.session_channel_shadow,
+            "default",
+            &late,
+        )
+        .await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, Message::UserState(s) if s.channel_id == Some(8))),
+            "late message referenced removed channel: {messages:?}"
+        );
+        remote.write_global_state_direct().set_current_channel_id(9);
+        let update: Message = shitspeak_messages::messages::encoder::UserState {
+            session: Some(session),
+            self_mute: Some(true),
+            ..Default::default()
+        }
+        .into();
+        let messages = crate::client::visibility::project_message_with_shadow(
+            &server.server,
+            &projection.client,
+            &mut projection.user_visibility,
+            &mut projection.session_channel_shadow,
+            "default",
+            &update,
+        )
+        .await;
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, Message::UserState(s) if s.channel_id == Some(9))),
+            "temporary relocation never reconciled: {messages:?}"
+        );
+        assert_eq!(projection.session_channel_shadow.get(&session), Some(&9));
+        server.shutdown_gracefully().await;
+    }
+    #[tokio::test]
+    async fn deleted_view_snapshot_install_evacuates_before_subtree_removal() {
+        let (server, mut projection, remote) = deleted_view_fixture().await;
+        server
+            .server
+            .channels
+            .delete_channel_in_server("default", 7)
+            .await
+            .unwrap();
+        let operation = ChannelOperation {
+            server_id: "default".to_owned(),
+            version: 5,
+            node_id: 1,
+            timestamp: 0,
+            emits_client_message: true,
+            op: shitspeak_state::ChannelOp::InstallSnapshot {
+                channels: server
+                    .server
+                    .channels
+                    .get_all_in_server("default")
+                    .await
+                    .iter()
+                    .map(|ch| ch.as_ref().clone())
+                    .collect(),
+                removed: vec![8, 7],
+            },
+        };
+        let mut messages = Vec::new();
+        projection
+            .append_projected_channel_operation(&server.server, &operation, &mut messages)
+            .await;
+        assert_empty_when_removed(&messages, remote.get_session_id(), 8);
+        server.shutdown_gracefully().await;
+    }
+
+    #[tokio::test]
+    async fn deleted_view_initial_snapshot_uses_temporary_location_until_owner_catches_up() {
+        let (server, mut projection, remote) = deleted_view_fixture().await;
+        projection.session_channel_shadow.clear();
+        projection.user_visibility.clear();
+        server
+            .server
+            .channels
+            .delete_channel_in_server("default", 7)
+            .await
+            .unwrap();
+        let messages = crate::client::visibility::sync_projected_message_with_shadow(
+            &server.server,
+            &projection.client,
+            &mut projection.user_visibility,
+            &mut projection.session_channel_shadow,
+            "default",
+            remote.build_user_state_for_broadcast().into(),
+        )
+        .await;
+        assert!(messages.iter().any(
+            |message| matches!(message, Message::UserState(state) if state.channel_id == Some(0))
+        ));
+        assert!(
+            projection
+                .session_channel_shadow
+                .is_temporarily_relocated(remote.get_session_id())
+        );
+        assert_eq!(remote.get_current_channel_id(), 8);
+        remote.write_global_state_direct().set_current_channel_id(9);
+        let messages = crate::client::visibility::project_message_with_shadow(
+            &server.server,
+            &projection.client,
+            &mut projection.user_visibility,
+            &mut projection.session_channel_shadow,
+            "default",
+            &remote.build_user_state_for_broadcast().into(),
+        )
+        .await;
+        assert!(messages.iter().any(
+            |message| matches!(message, Message::UserState(state) if state.channel_id == Some(9))
+        ));
+        assert!(
+            !projection
+                .session_channel_shadow
+                .is_temporarily_relocated(remote.get_session_id())
+        );
+        server.shutdown_gracefully().await;
+    }
+
+    #[tokio::test]
+    async fn deleted_view_filtered_snapshot_never_removes_an_occupied_channel() {
+        let (server, mut projection, remote) = deleted_view_fixture_with_filtering(true).await;
+        server
+            .server
+            .channels
+            .delete_channel_in_server("default", 7)
+            .await
+            .unwrap();
+        let mut messages = Vec::new();
+        projection
+            .append_channel_snapshot(&server.server, "default", &mut messages)
+            .await;
+        assert_empty_when_removed(&messages, remote.get_session_id(), 8);
+        server.shutdown_gracefully().await;
+    }
+
+    #[tokio::test]
+    async fn deleted_view_config_reload_evacuates_before_removal() {
+        let (server, mut projection, remote) = deleted_view_fixture().await;
+        server
+            .server
+            .channels
+            .delete_channel_in_server("default", 7)
+            .await
+            .unwrap();
+        let messages = crate::client::visibility::visibility_config_reload_messages(
+            &server.server,
+            &projection.client,
+            &mut projection.user_visibility,
+            &mut projection.channel_tree_shadow,
+            &mut projection.session_channel_shadow,
+        )
+        .await;
+        assert_empty_when_removed(&messages, remote.get_session_id(), 8);
+        server.shutdown_gracefully().await;
     }
 }

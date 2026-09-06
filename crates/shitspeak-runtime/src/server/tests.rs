@@ -2372,6 +2372,15 @@ async fn sharded_and_legacy_activation_match_for_missed_target_move() {
         .await
         .expect("server");
 
+    server
+        .channels
+        .create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            shitspeak_state::Channel::new(42, "destination", 0, 0, Some(0)),
+        )
+        .await
+        .expect("move destination");
+
     let target_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 31101);
     let target_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 64801);
     let (target_tx, _target_rx) = tokio::sync::mpsc::channel(1);

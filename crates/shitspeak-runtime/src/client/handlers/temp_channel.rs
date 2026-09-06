@@ -1,64 +1,32 @@
+use crate::{client_repository::ClientRepository, server::Server};
+use shitspeak_state::{ChannelOp, ChannelRepository};
 use std::sync::Arc;
 
-use shitspeak_state::{ChannelOp, ChannelRepository};
-
-use crate::{client_repository::ClientRepository, server::Server};
-
-/// Deletes `channel_id` if it is a temporary channel with no known occupants.
-/// Returns `true` if the channel was deleted.
-///
-/// Uses a two-phase delete: `mark_pending_delete` acts as an atomic gate that
-/// causes the join path (`redirect_pending_delete_target_in_server`) to steer
-/// any concurrent join attempt to the parent channel before we read occupancy.
-/// If we observe non-zero occupancy after setting the gate, we cancel and bail.
+/// Commit deletion when a temporary channel has no known occupants.
+/// A user racing this decision is relocated when the deletion is applied.
 pub async fn reap_if_empty_temporary(
     channels: &Arc<ChannelRepository>,
     clients: &Arc<ClientRepository>,
     server_id: &str,
     channel_id: u32,
 ) -> bool {
-    let Some(ch) = channels.get_channel_in_server(server_id, channel_id).await else {
-        return false;
-    };
-    if !ch.is_temporary() {
-        return false;
-    }
-    if clients
-        .has_client_in_channel_in_server(server_id, channel_id)
+    if !channels
+        .get_channel_in_server(server_id, channel_id)
         .await
+        .is_some_and(|ch| ch.is_temporary())
+        || clients
+            .has_client_in_channel_in_server(server_id, channel_id)
+            .await
     {
         return false;
     }
-
-    let nonce = rand::random::<u64>();
-    if channels
-        .mark_pending_delete_in_server_with_evict_clients(server_id, channel_id, nonce, false)
-        .await
-        .is_err()
-    {
-        return false;
-    }
-
-    if clients
-        .has_client_in_channel_in_server(server_id, channel_id)
-        .await
-    {
-        let _ = channels
-            .cancel_pending_delete_in_server(server_id, channel_id, nonce)
-            .await;
-        return false;
-    }
-
     match channels
-        .apply_delete_channel_in_server(server_id, channel_id, nonce)
+        .delete_channel_in_server(server_id, channel_id)
         .await
     {
-        Ok(_) => {
-            tracing::debug!(channel_id, "reaped empty temporary channel");
-            true
-        }
-        Err(e) => {
-            tracing::warn!(channel_id, error = %e, "failed to reap empty temporary channel");
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(channel_id, %error, "failed to reap empty temporary channel");
             false
         }
     }
@@ -71,124 +39,33 @@ pub async fn reap_if_empty_temporary_on_server(
 ) -> bool {
     let channels = server.get_channels();
     let clients = server.get_clients();
-
-    let Some(ch) = channels.get_channel_in_server(server_id, channel_id).await else {
-        return false;
-    };
-    if !ch.is_temporary() {
-        return false;
-    }
-
-    let nonce = rand::random::<u64>();
-    let mark = ChannelOp::MarkPendingDelete {
-        id: channel_id,
-        nonce,
-        evict_clients: false,
-    };
-    if clients
-        .has_client_in_channel_in_server(server_id, channel_id)
+    if !channels
+        .get_channel_in_server(server_id, channel_id)
         .await
+        .is_some_and(|ch| ch.is_temporary())
+        || clients
+            .has_client_in_channel_in_server(server_id, channel_id)
+            .await
     {
         return false;
     }
-    if channels
-        .validate_s2s_op_in_server(server_id, &mark)
-        .await
-        .is_err()
-    {
-        return false;
-    }
-
-    let s2s_marked = server
+    let result = server
         .s2s_manager()
-        .propose_channel_op(server_id, mark)
+        .propose_channel_op(
+            server_id,
+            ChannelOp::DeleteChannel {
+                id: channel_id,
+                nonce: None,
+            },
+        )
         .await;
-    let marked_locally = if s2s_marked.should_apply_locally() {
-        if channels
-            .mark_pending_delete_in_server_with_evict_clients(server_id, channel_id, nonce, false)
+    if result.should_apply_locally() {
+        channels
+            .delete_channel_in_server(server_id, channel_id)
             .await
-            .is_err()
-        {
-            return false;
-        }
-        true
-    } else if s2s_marked.is_proposed() {
-        false
+            .is_ok()
     } else {
-        return false;
-    };
-
-    if clients
-        .has_client_in_channel_in_server(server_id, channel_id)
-        .await
-    {
-        let cancel = ChannelOp::CancelPendingDelete {
-            id: channel_id,
-            nonce,
-        };
-        if server
-            .s2s_manager()
-            .propose_channel_op(server_id, cancel)
-            .await
-            .should_apply_locally()
-            || marked_locally
-        {
-            let _ = channels
-                .cancel_pending_delete_in_server(server_id, channel_id, nonce)
-                .await;
-        }
-        return false;
-    }
-
-    let delete = ChannelOp::DeleteChannel {
-        id: channel_id,
-        nonce,
-    };
-    if channels
-        .validate_s2s_op_in_server(server_id, &delete)
-        .await
-        .is_err()
-    {
-        let cancel = ChannelOp::CancelPendingDelete {
-            id: channel_id,
-            nonce,
-        };
-        if server
-            .s2s_manager()
-            .propose_channel_op(server_id, cancel)
-            .await
-            .should_apply_locally()
-            || marked_locally
-        {
-            let _ = channels
-                .cancel_pending_delete_in_server(server_id, channel_id, nonce)
-                .await;
-        }
-        return false;
-    }
-
-    let s2s_deleted = server
-        .s2s_manager()
-        .propose_channel_op(server_id, delete)
-        .await;
-    if s2s_deleted.is_proposed() {
-        true
-    } else if s2s_deleted.should_apply_locally() || marked_locally {
-        match channels
-            .apply_delete_channel_in_server(server_id, channel_id, nonce)
-            .await
-        {
-            Ok(_) => {
-                tracing::debug!(channel_id, "reaped empty temporary channel");
-                true
-            }
-            Err(e) => {
-                tracing::warn!(channel_id, error = %e, "failed to reap empty temporary channel");
-                false
-            }
-        }
-    } else {
-        false
+        result.is_proposed()
     }
 }
 

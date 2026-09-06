@@ -54,6 +54,7 @@ impl UdpBindingKey {
 
 pub struct ClientRepository {
     local_node_id: u16,
+    channels: std::sync::OnceLock<std::sync::Weak<shitspeak_state::ChannelRepository>>,
     log_max_entries: usize,
 
     /// Locally-owned clients, local log state, and local voice-routing
@@ -683,6 +684,7 @@ impl ClientRepository {
         });
         ClientRepository {
             local_node_id,
+            channels: std::sync::OnceLock::new(),
             log_max_entries,
             register,
             remote_registers,
@@ -696,6 +698,44 @@ impl ClientRepository {
             versions,
             authenticated_client_counts: AuthenticatedClientCounts::default(),
         }
+    }
+
+    pub(crate) fn bind_channels(&self, channels: &Arc<shitspeak_state::ChannelRepository>) {
+        assert!(
+            self.channels.set(Arc::downgrade(channels)).is_ok(),
+            "channel repository already bound"
+        );
+    }
+
+    pub(crate) fn reconcile_channel_membership(
+        &self,
+        server_id: &str,
+        state: &mut crate::client::client_global_state::ClientGlobalState,
+        original_channel_id: u32,
+    ) -> Option<u64> {
+        if !state.has_pending_channel_admission() {
+            return None;
+        }
+        let channels = self.channels.get()?.upgrade()?;
+        Some(
+            channels.with_channel_membership_in_server(server_id, |exists, version| {
+                if state.get_current_channel_id() != original_channel_id
+                    && !exists(state.get_current_channel_id())
+                {
+                    // Reject a late move. An existing occupant of a deleted
+                    // subtree is relocated by the independently queued cleanup.
+                    state.set_current_channel_id(original_channel_id);
+                }
+                let stale = state
+                    .pending_listener_additions()
+                    .filter(|id| !exists(*id))
+                    .collect::<Vec<_>>();
+                for id in stale {
+                    state.unlisten_channel(id);
+                }
+                version
+            }),
+        )
     }
 
     /// The node ID of this repository.

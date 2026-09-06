@@ -92,6 +92,16 @@ pub type ChannelStateSubscription = broadcast::Receiver<Arc<ChannelOperation>>;
 pub trait ChannelRepositoryObserver: Send + Sync {
     async fn channel_version_advanced(&self, server_id: &str, channel_version: u64);
 
+    /// Reconcile node-local occupants after a durable subtree deletion.
+    async fn channels_deleted(
+        &self,
+        _server_id: &str,
+        _deleted_ids: &[u32],
+        _fallback_channel_id: u32,
+        _channel_version: u64,
+    ) {
+    }
+
     async fn repair_missing_channels(
         &self,
         server_id: &str,
@@ -266,6 +276,9 @@ impl ChannelOperation {
     /// sent to a subscriber.  Only changed/delta fields are populated;
     /// Mumble clients merge deltas with their existing state.
     pub fn to_message(&self) -> Option<Message> {
+        if !self.emits_client_message {
+            return None;
+        }
         match &self.op {
             ChannelOp::CreateChannel { channel } => Some(channel_to_proto_full(channel)),
             ChannelOp::EditChannel {
@@ -434,9 +447,12 @@ pub enum ChannelOp {
         #[serde(default = "default_mark_pending_delete_evict_clients")]
         evict_clients: bool,
     },
+    /// A missing nonce commits irreversible subtree removal. A nonce is
+    /// retained only for replay and completion of the legacy two-phase flow.
     DeleteChannel {
         id: u32,
-        nonce: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nonce: Option<u64>,
     },
     CancelPendingDelete {
         id: u32,
@@ -1114,6 +1130,7 @@ enum LinkTopologyEffect {
 
 struct DeleteChannelApplied {
     deleted_ids: Vec<u32>,
+    fallback_channel_id: u32,
     link_topology_effect: LinkTopologyEffect,
 }
 
@@ -1157,6 +1174,7 @@ pub struct ChannelRepository {
     log: ParkingRwLock<std::collections::VecDeque<ChannelLogEntry>>,
     log_max_entries: usize,
     delete_visibility_hints: ParkingRwLock<HashMap<(String, u64), Arc<[u32]>>>,
+    delete_fallback_hints: ParkingRwLock<HashMap<(String, u64), u32>>,
     acl_change_hints: ParkingRwLock<HashMap<(String, u64), Arc<AclChangeHint>>>,
     /// Bumped whenever channel state can change effective ACL results.
     channel_acl_generation: AtomicU64,
@@ -1230,6 +1248,7 @@ impl ChannelRepository {
             log: ParkingRwLock::new(std::collections::VecDeque::new()),
             log_max_entries: tuning.log_max_entries,
             delete_visibility_hints: ParkingRwLock::new(HashMap::new()),
+            delete_fallback_hints: ParkingRwLock::new(HashMap::new()),
             acl_change_hints: ParkingRwLock::new(HashMap::new()),
             channel_acl_generation: AtomicU64::new(0),
             channel_acl_generations: ParkingRwLock::new(HashMap::new()),
@@ -1422,6 +1441,7 @@ impl ChannelRepository {
             log: ParkingRwLock::new(log_entries),
             log_max_entries: tuning.log_max_entries,
             delete_visibility_hints: ParkingRwLock::new(HashMap::new()),
+            delete_fallback_hints: ParkingRwLock::new(HashMap::new()),
             acl_change_hints: ParkingRwLock::new(HashMap::new()),
             channel_acl_generation: AtomicU64::new(0),
             channel_acl_generations: ParkingRwLock::new(HashMap::new()),
@@ -1816,6 +1836,31 @@ impl ChannelRepository {
             .read()
             .get(&(op.server_id.clone(), op.version))
             .cloned()
+    }
+
+    pub fn delete_fallback_for_operation(&self, op: &ChannelOperation) -> Option<u32> {
+        self.delete_fallback_hints
+            .read()
+            .get(&(op.server_id.clone(), op.version))
+            .copied()
+    }
+
+    /// Keep channel removal mutually exclusive with the final membership check.
+    /// The callback must be synchronous and must not mutate this repository.
+    pub fn with_channel_membership_in_server<R>(
+        &self,
+        server_id: &str,
+        inspect: impl FnOnce(&dyn Fn(u32) -> bool, u64) -> R,
+    ) -> R {
+        let channels = self.channels.read();
+        let exists = |id| {
+            id == 0
+                || channels
+                    .get(server_id)
+                    .and_then(|map| map.get(&id))
+                    .is_some()
+        };
+        inspect(&exists, self.current_version_in_server(server_id))
     }
 
     /// Return transient before/after context for a retained ACL operation.
@@ -2471,13 +2516,19 @@ impl ChannelRepository {
             return Err(ChannelRepoError::CannotDeleteRoot);
         }
 
-        let nonce = rand::random::<u64>();
-        let to_delete = self
-            .mark_pending_delete_in_server(server_id, id, nonce)
+        let _write_transaction = self.strict_apply_lock.lock().await;
+        if self.get_channel_in_server(server_id, id).await.is_none() {
+            return Err(ChannelRepoError::NotFound(id));
+        }
+        let deleted_ids = self.subtree_ids_in_server(server_id, id).await;
+        let mut op =
+            self.make_op_in_server(server_id, ChannelOp::DeleteChannel { id, nonce: None });
+        op.version = self.current_version_in_server(server_id) + 1;
+        let op = self.prepare_strict_operation_for_wal(op);
+        self.append_wal_record(&op, None, false).await?;
+        self.apply_committed_operation_inner(op, None, None, true)
             .await?;
-        self.apply_delete_channel_in_server(server_id, id, nonce)
-            .await?;
-        Ok(to_delete)
+        Ok(deleted_ids)
     }
 
     pub async fn mark_pending_delete_in_server(
@@ -2555,7 +2606,7 @@ impl ChannelRepository {
             if !channels.contains_key(&id) {
                 return Err(ChannelRepoError::NotFound(id));
             };
-            let applied_delete = apply_delete_channel_to_map(channels, id, nonce);
+            let applied_delete = apply_delete_channel_to_map(channels, id, Some(nonce));
             if let Some(applied_delete) = &applied_delete {
                 self.rebuild_ordered_channel_view_in_server(server_id, channels);
                 apply_link_topology_effect(
@@ -2567,7 +2618,13 @@ impl ChannelRepository {
             }
             applied_delete
         };
-        let mut op = self.make_op_in_server(server_id, ChannelOp::DeleteChannel { id, nonce });
+        let mut op = self.make_op_in_server(
+            server_id,
+            ChannelOp::DeleteChannel {
+                id,
+                nonce: Some(nonce),
+            },
+        );
         op.emits_client_message = applied_delete.is_some();
         if let Some(applied_delete) = &applied_delete {
             self.invalidate_acl_cache_for_op_scope(
@@ -3486,6 +3543,7 @@ impl ChannelRepository {
         let mut should_invalidate_acl = channel_op_invalidates_acl_cache(&op.op);
         let server_id = op.server_id.clone();
         let mut deleted_channel_hint = None;
+        let mut deleted_cleanup = None;
         let (evicting_pending_delete, affected_acl_channels, acl_change_hint) = {
             let mut all_channels = self.channels.write();
             let channels = all_channels.entry(server_id.clone()).or_default();
@@ -3493,6 +3551,9 @@ impl ChannelRepository {
             ensure_root_channel(channels, &root_config);
             self.ensure_ordered_channel_view_in_server(&server_id, channels);
             op.op = normalize_op_for_root(&op.op, &root_config);
+            if !channel_op_references_exist(channels, &op.op) {
+                op.emits_client_message = false;
+            }
             let old_acl_state = match &op.op {
                 ChannelOp::SetAcls { channel_id, .. } => channels
                     .get(channel_id)
@@ -3518,6 +3579,14 @@ impl ChannelRepository {
                     op.emits_client_message = applied_delete.is_some();
                     should_invalidate_acl = applied_delete.is_some();
                     if let Some(applied_delete) = applied_delete {
+                        deleted_cleanup = Some((
+                            applied_delete.deleted_ids.clone(),
+                            applied_delete.fallback_channel_id,
+                        ));
+                        self.delete_fallback_hints.write().insert(
+                            (server_id.clone(), op.version),
+                            applied_delete.fallback_channel_id,
+                        );
                         deleted_channel_hint = Some(applied_delete.deleted_ids.clone());
                         deleted_subtree =
                             Some(applied_delete.deleted_ids.iter().copied().collect());
@@ -3593,6 +3662,15 @@ impl ChannelRepository {
                 wal_already_persisted,
             )
             .await?;
+
+        if let Some((deleted_ids, fallback)) = deleted_cleanup {
+            let observer = { self.observer.lock().clone() };
+            if let Some(observer) = observer {
+                observer
+                    .channels_deleted(&server_id, &deleted_ids, fallback, committed.version)
+                    .await;
+            }
+        }
 
         if let Some((id, nonce)) = evicting_pending_delete {
             let subtree = self
@@ -4056,6 +4134,14 @@ impl ChannelRepository {
         let root_config = self.root_config.read().clone();
         op.op = normalize_op_for_root(&op.op, &root_config);
 
+        if self
+            .channels
+            .read()
+            .get(&op.server_id)
+            .is_some_and(|channels| !channel_op_references_exist(channels, &op.op))
+        {
+            op.emits_client_message = false;
+        }
         if let ChannelOp::DeleteChannel { id, nonce } = &op.op {
             let mut channels = self
                 .channels
@@ -4178,6 +4264,9 @@ impl ChannelRepository {
             while log.len() > self.log_max_entries {
                 if let Some(evicted) = log.pop_front() {
                     self.delete_visibility_hints
+                        .write()
+                        .remove(&(evicted.op.server_id.clone(), evicted.op.version));
+                    self.delete_fallback_hints
                         .write()
                         .remove(&(evicted.op.server_id.clone(), evicted.op.version));
                     self.acl_change_hints
@@ -4675,6 +4764,38 @@ fn ancestor_channels_in_map(channels: &ChannelMap, channel_id: u32) -> Vec<Arc<C
     ancestors
 }
 
+// Admission and delivery can be separated by another ordered deletion.
+// Resolve these races against the tree at the operation's final log position.
+fn channel_op_references_exist(channels: &ChannelMap, op: &ChannelOp) -> bool {
+    match op {
+        ChannelOp::CreateChannel { channel } => channel
+            .parent_id
+            .is_none_or(|id| channels.contains_key(&id)),
+        ChannelOp::UpdateChannel { id, patch } => {
+            channels.contains_key(id)
+                && patch
+                    .parent_id
+                    .flatten()
+                    .is_none_or(|parent| channels.contains_key(&parent))
+        }
+        ChannelOp::EditChannel {
+            id,
+            patch,
+            links_add,
+            ..
+        } => {
+            channels.contains_key(id)
+                && patch
+                    .parent_id
+                    .flatten()
+                    .is_none_or(|parent| channels.contains_key(&parent))
+                && links_add.iter().all(|id| channels.contains_key(id))
+        }
+        ChannelOp::AddLink { a, b } => channels.contains_key(a) && channels.contains_key(b),
+        _ => true,
+    }
+}
+
 /// Apply a `ChannelOp` to the in-memory channel map.
 fn apply_op_to_map(
     channels: &mut ChannelMap,
@@ -4683,6 +4804,9 @@ fn apply_op_to_map(
     root_config: &ChannelRootConfig,
 ) {
     let op = normalize_op_for_root(op, root_config);
+    if !channel_op_references_exist(channels, &op) {
+        return;
+    }
     match &op {
         ChannelOp::CreateChannel { channel } => {
             channels.insert(channel.id, Arc::new(channel.clone()));
@@ -4815,16 +4939,22 @@ fn apply_patch(ch: &mut Channel, patch: &ChannelPatch) {
 fn apply_delete_channel_to_map(
     channels: &mut ChannelMap,
     id: u32,
-    nonce: u64,
+    nonce: Option<u64>,
 ) -> Option<DeleteChannelApplied> {
-    let channel = channels.get(&id)?;
-    if !channel
-        .pending_delete
-        .as_ref()
-        .is_some_and(|pending| pending.nonce == nonce)
-    {
+    if id == 0 {
         return None;
     }
+    let channel = channels.get(&id)?;
+    if let Some(nonce) = nonce {
+        if !channel
+            .pending_delete
+            .as_ref()
+            .is_some_and(|pending| pending.nonce == nonce)
+        {
+            return None;
+        }
+    }
+    let fallback_channel_id = channel.parent_id.unwrap_or(0);
 
     let to_delete = collect_subtree(channels, id);
     let link_topology_effect = if deleted_channels_have_links(channels, &to_delete) {
@@ -4841,6 +4971,7 @@ fn apply_delete_channel_to_map(
 
     Some(DeleteChannelApplied {
         deleted_ids: to_delete,
+        fallback_channel_id,
         link_topology_effect,
     })
 }
@@ -6593,7 +6724,10 @@ mod tests {
             node_id: 1,
             timestamp: 0,
             emits_client_message: true,
-            op: ChannelOp::DeleteChannel { id: 2, nonce: 99 },
+            op: ChannelOp::DeleteChannel {
+                id: 2,
+                nonce: Some(99),
+            },
         };
 
         assert!(
@@ -8267,6 +8401,244 @@ mod tests {
                 StrictOperationId::new(71, 72),
                 StrictOperationId::new(73, 74)
             ]
+        );
+    }
+    #[tokio::test]
+    async fn irreversible_delete_uses_one_durable_operation() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(7, "parent", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(8, "child", 0, 0, Some(7)))
+            .await
+            .unwrap();
+        let before = repo.current_version_in_server(DEFAULT_SERVER_ID);
+        let deleted = repo
+            .delete_channel_in_server(DEFAULT_SERVER_ID, 7)
+            .await
+            .unwrap();
+        assert_eq!(deleted.len(), 2);
+        let operations = repo
+            .get_log_since_in_server(DEFAULT_SERVER_ID, before)
+            .await;
+        assert_eq!(
+            operations.len(),
+            1,
+            "deletion must need only one ordered decision"
+        );
+        assert!(matches!(operations[0].op, ChannelOp::DeleteChannel { .. }));
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .is_none()
+        );
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 8)
+                .await
+                .is_none()
+        );
+        let reopened = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .get_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .is_none()
+        );
+        assert!(
+            reopened
+                .get_channel_in_server(DEFAULT_SERVER_ID, 8)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn irreversible_delete_failed_sync_keeps_live_tree_and_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(7, "keep", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        let before = repo.current_version_in_server(DEFAULT_SERVER_ID);
+        repo.force_next_wal_sync_failure_for_test();
+        assert!(
+            repo.delete_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .is_err()
+        );
+        assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), before);
+        assert!(
+            !repo
+                .get_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .unwrap()
+                .is_pending_delete()
+        );
+        assert!(
+            repo.get_log_since_in_server(DEFAULT_SERVER_ID, before)
+                .await
+                .is_empty()
+        );
+    }
+    #[tokio::test]
+    async fn irreversible_delete_missing_channel_has_no_wal_effect() {
+        let repo = repo();
+        let before = repo.current_version_in_server(DEFAULT_SERVER_ID);
+        assert!(matches!(
+            repo.delete_channel_in_server(DEFAULT_SERVER_ID, 999).await,
+            Err(ChannelRepoError::NotFound(999))
+        ));
+        assert_eq!(repo.current_version_in_server(DEFAULT_SERVER_ID), before);
+    }
+
+    #[tokio::test]
+    async fn irreversible_delete_duplicate_after_restart_preserves_recreated_channel() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(7, "old", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        let metadata = StrictReplicationMetadata::new(101, 102, 103);
+        let delete = ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 2,
+            node_id: 1,
+            timestamp: 1,
+            emits_client_message: true,
+            op: ChannelOp::DeleteChannel { id: 7, nonce: None },
+        };
+        assert_eq!(
+            repo.apply_strict_operation_once(delete.clone(), metadata)
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::Applied
+        );
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(7, "replacement", 0, 0, Some(0)),
+        )
+        .await
+        .unwrap();
+        repo.save_snapshot().await.unwrap();
+        let reopened = ChannelRepository::open(1, temp.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .apply_strict_operation_once(delete, metadata)
+                .await
+                .unwrap(),
+            StrictOperationApplyOutcome::AlreadyApplied
+        );
+        assert_eq!(
+            reopened
+                .get_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .unwrap()
+                .name,
+            "replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn irreversible_delete_legacy_nonce_and_cancellation_keep_replay_meaning() {
+        let repo = repo();
+        repo.create_channel_in_server(
+            DEFAULT_SERVER_ID,
+            Channel::new(7, "survivor", 0, 0, Some(0)),
+        )
+        .await
+        .unwrap();
+        for (version, raw) in [
+            (2, r#"{"type":"MarkPendingDelete","id":7,"nonce":42}"#),
+            (3, r#"{"type":"CancelPendingDelete","id":7,"nonce":42}"#),
+            (4, r#"{"type":"DeleteChannel","id":7,"nonce":42}"#),
+        ] {
+            repo.apply_committed_operation(ChannelOperation {
+                server_id: DEFAULT_SERVER_ID.to_owned(),
+                version,
+                node_id: 1,
+                timestamp: 1,
+                emits_client_message: true,
+                op: serde_json::from_str(raw).unwrap(),
+            })
+            .await
+            .unwrap();
+        }
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .is_some()
+        );
+        let op = serde_json::from_str(r#"{"type":"DeleteChannel","id":7}"#).unwrap();
+        repo.apply_committed_operation(ChannelOperation {
+            server_id: DEFAULT_SERVER_ID.to_owned(),
+            version: 5,
+            node_id: 1,
+            timestamp: 1,
+            emits_client_message: true,
+            op,
+        })
+        .await
+        .unwrap();
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .is_none()
+        );
+        repo.cancel_pending_delete_in_server(DEFAULT_SERVER_ID, 7, 42)
+            .await
+            .unwrap();
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 7)
+                .await
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn irreversible_delete_rejects_prevalidated_child_creation_after_parent_removal() {
+        let repo = repo();
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(7, "parent", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        let create = ChannelOp::CreateChannel {
+            channel: Channel::new(8, "late-child", 0, 0, Some(7)),
+        };
+        repo.validate_s2s_op_in_server(DEFAULT_SERVER_ID, &create)
+            .await
+            .unwrap();
+        repo.delete_channel_in_server(DEFAULT_SERVER_ID, 7)
+            .await
+            .unwrap();
+        let applied = repo
+            .apply_committed_operation(ChannelOperation {
+                server_id: DEFAULT_SERVER_ID.to_owned(),
+                version: 3,
+                node_id: 2,
+                timestamp: 1,
+                emits_client_message: true,
+                op: create,
+            })
+            .await
+            .unwrap();
+        assert!(
+            repo.get_channel_in_server(DEFAULT_SERVER_ID, 8)
+                .await
+                .is_none(),
+            "an admitted create must not resurrect a deleted subtree"
+        );
+        assert!(
+            applied.to_message().is_none(),
+            "a skipped create must not be announced to clients"
         );
     }
 }

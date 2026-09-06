@@ -1284,24 +1284,12 @@ pub async fn visibility_config_reload_messages(
                 );
             }
             messages.push(hidden_user_remove(session));
+            session_channel_shadow.remove(&session);
+            visibility.remove(session);
         }
     }
 
     messages.extend(link_updates_before_removals);
-
-    let removed_channel_ids = crate::channel_handler::channel_removal_ids_descendant_first(
-        &channels,
-        &removed_channel_id_set,
-    );
-    for channel_id in &removed_channel_ids {
-        channel_tree_shadow.remove(channel_id);
-        messages.push(
-            shitspeak_messages::messages::encoder::ChannelRemove {
-                channel_id: *channel_id,
-            }
-            .into(),
-        );
-    }
 
     let final_visible_channel_ids = visible_channel_ids.clone();
     for channel in &ordered_channels {
@@ -1330,6 +1318,43 @@ pub async fn visibility_config_reload_messages(
 
     messages.extend(link_updates_after_additions);
 
+    let evacuations = crate::channel_handler::evacuate_removed_channel_users(
+        server,
+        server.get_channels(),
+        session_channel_shadow,
+        &server_id,
+        &removed_channel_id_set,
+        0,
+    )
+    .await;
+    for message in evacuations {
+        messages.extend(
+            project_message_with_shadow(
+                server,
+                viewer,
+                visibility,
+                session_channel_shadow,
+                &server_id,
+                &message,
+            )
+            .await,
+        );
+    }
+
+    let removed_channel_ids = crate::channel_handler::channel_removal_ids_descendant_first(
+        &channels,
+        &removed_channel_id_set,
+    );
+    for channel_id in &removed_channel_ids {
+        channel_tree_shadow.remove(channel_id);
+        messages.push(
+            shitspeak_messages::messages::encoder::ChannelRemove {
+                channel_id: *channel_id,
+            }
+            .into(),
+        );
+    }
+
     if users_mode_changed {
         visibility.clear();
         if !user_filtering_enabled {
@@ -1355,7 +1380,17 @@ pub async fn visibility_config_reload_messages(
             session_channel_shadow.insert(session, target.get_current_channel_id());
             let mut state = build_visible_user_state(server, viewer, &target).await;
             state.listening_channel_remove.clear();
-            messages.push(state.into());
+            messages.extend(
+                sync_projected_message_with_shadow(
+                    server,
+                    viewer,
+                    visibility,
+                    session_channel_shadow,
+                    &server_id,
+                    state.into(),
+                )
+                .await,
+            );
         }
     }
 
@@ -1520,11 +1555,14 @@ pub(crate) async fn project_message_with_shadow_at_home(
     message: &Message,
     effective_home_channel_id: Option<u32>,
 ) -> Vec<Message> {
-    if let Message::UserRemove(user_remove) = message {
-        channel_shadow.remove(&ClientSessionIdentifier::from(user_remove.session));
-    }
+    let socket_knows_removed_user = match message {
+        Message::UserRemove(remove) => channel_shadow
+            .get(&ClientSessionIdentifier::from(remove.session))
+            .is_some(),
+        _ => false,
+    };
 
-    let projected = project_message_at_home(
+    let mut projected = project_message_at_home(
         server,
         viewer,
         visibility,
@@ -1532,6 +1570,14 @@ pub(crate) async fn project_message_with_shadow_at_home(
         effective_home_channel_id,
     )
     .await;
+    if socket_knows_removed_user
+        && projected.is_empty()
+        && let Message::UserRemove(remove) = message
+    {
+        projected.push(hidden_user_remove(ClientSessionIdentifier::from(
+            remove.session,
+        )));
+    }
     let mut out = Vec::new();
     for message in projected {
         out.extend(
@@ -1572,15 +1618,23 @@ pub async fn sync_projected_message_with_shadow(
 
 async fn sync_projected_message_with_shadow_at_home(
     server: &Arc<Box<Server>>,
-    viewer: &Arc<Box<Client>>,
+    _viewer: &Arc<Box<Client>>,
     visibility: &mut UserVisibilityState,
     channel_shadow: &mut SessionChannelShadow,
     server_id: &str,
     message: Message,
-    effective_home_channel_id: Option<u32>,
+    _effective_home_channel_id: Option<u32>,
 ) -> Vec<Message> {
-    let mut out = vec![message.clone()];
-    let synthetic = crate::channel_handler::sync_shadow_for_client_message(
+    let mut message = message;
+    let temporary = crate::channel_handler::normalize_projected_user_location(
+        server,
+        server.get_channels(),
+        channel_shadow,
+        server_id,
+        &mut message,
+    )
+    .await;
+    let _ = crate::channel_handler::sync_shadow_for_client_message(
         server,
         server.get_channels(),
         channel_shadow,
@@ -1588,28 +1642,20 @@ async fn sync_projected_message_with_shadow_at_home(
         &message,
     )
     .await;
-    for synthetic_message in synthetic {
-        let projected_synthetic = project_message_at_home(
-            server,
-            viewer,
-            visibility,
-            &synthetic_message,
-            effective_home_channel_id,
-        )
-        .await;
-        for projected in projected_synthetic {
-            let _ = crate::channel_handler::sync_shadow_for_client_message(
-                server,
-                server.get_channels(),
-                channel_shadow,
-                server_id,
-                &projected,
-            )
-            .await;
-            out.push(projected);
+    if let Message::UserState(state) = &message
+        && let Some(session) = state.session.map(ClientSessionIdentifier::from)
+        && let Some(channel) = state.channel_id
+    {
+        if temporary {
+            channel_shadow.insert_temporary(session, channel);
         }
+        let listeners = visibility
+            .get(session)
+            .map(|known| known.listener_channels.clone())
+            .unwrap_or_default();
+        visibility.insert(session, channel, listeners);
     }
-    out
+    vec![message]
 }
 
 pub async fn visibility_refresh_messages(

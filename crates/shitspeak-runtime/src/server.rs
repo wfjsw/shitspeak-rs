@@ -138,6 +138,38 @@ impl ChannelRepositoryObserver for ClientRepositoryChannelObserver {
         }
     }
 
+    async fn channels_deleted(
+        &self,
+        server_id: &str,
+        deleted_ids: &[u32],
+        fallback: u32,
+        version: u64,
+    ) {
+        let Some(server) = self.server.upgrade() else {
+            return;
+        };
+        let server_id = server_id.to_owned();
+        let deleted_ids = deleted_ids.iter().copied().collect();
+        // Cleanup survives cancellation of the request that committed deletion.
+        tokio::spawn(async move {
+            crate::user_channel_cache::move_local_clients_out_of_deleted_channels(
+                &server,
+                &server_id,
+                &deleted_ids,
+                fallback,
+                version,
+            )
+            .await;
+            crate::user_channel_cache::remove_local_listeners_from_deleted_channels(
+                &server,
+                &server_id,
+                &deleted_ids,
+                version,
+            )
+            .await;
+        });
+    }
+
     async fn repair_missing_channels(
         &self,
         server_id: &str,
@@ -512,6 +544,8 @@ impl Server {
             .client_projection_pool
             .set(projection_pool)
             .map_err(|_| std::io::Error::other("client projection pool initialized twice"))?;
+
+        server.clients.bind_channels(&server.channels);
 
         // Wire cross-repo causal notification: ChannelRepository notifies
         // ClientRepository to drain pending ops after remote channel ops.
@@ -2065,7 +2099,7 @@ impl Server {
         .await;
     }
 
-    /// Spawn a periodic task that rolls back stale pending channel deletes.
+    /// Complete abandoned deletes left by the legacy two-phase protocol.
     fn spawn_pending_delete_watchdog(
         server: Arc<Box<Self>>,
         timeout_ms: u64,
@@ -2087,9 +2121,9 @@ impl Server {
                         .expired_pending_deletes_in_server(&server_id, timeout_ms as i64)
                         .await;
                     for (channel_id, nonce) in expired {
-                        let op = shitspeak_state::ChannelOp::CancelPendingDelete {
+                        let op = shitspeak_state::ChannelOp::DeleteChannel {
                             id: channel_id,
-                            nonce,
+                            nonce: Some(nonce),
                         };
                         if server
                             .s2s_manager()
@@ -2099,7 +2133,7 @@ impl Server {
                         {
                             if let Err(e) = server
                                 .channels
-                                .cancel_pending_delete_in_server(&server_id, channel_id, nonce)
+                                .apply_delete_channel_in_server(&server_id, channel_id, nonce)
                                 .await
                             {
                                 tracing::trace!(
@@ -2107,7 +2141,7 @@ impl Server {
                                     channel_id,
                                     nonce,
                                     error = ?e,
-                                    "pending delete rollback failed"
+                                    "legacy pending delete completion failed"
                                 );
                             }
                         }
