@@ -1923,6 +1923,7 @@ mod tests {
     use shitspeak_runtime::client::ClientTransportKind;
     use shitspeak_runtime::localization::Language;
     use shitspeak_runtime::messages::encoder::AudioContext;
+    use shitspeak_runtime::types::DEFAULT_SERVER_ID;
     use shitspeak_runtime_config::{Config, UdpPingUserCountScope, WebAuthConfig, WebAuthMode};
 
     #[test]
@@ -2096,7 +2097,7 @@ mod tests {
 
         let client = server
             .get_clients()
-            .get_client(ClientSessionIdentifier::from(session))
+            .get_client_in_server(DEFAULT_SERVER_ID, ClientSessionIdentifier::from(session))
             .await
             .expect("allocated client");
         assert_eq!(client.transport_kind(), ClientTransportKind::Moq);
@@ -2162,7 +2163,7 @@ mod tests {
 
         let client = server
             .get_clients()
-            .get_client(ClientSessionIdentifier::from(session))
+            .get_client_in_server(DEFAULT_SERVER_ID, ClientSessionIdentifier::from(session))
             .await
             .expect("allocated client");
         assert_eq!(client.get_current_channel_id(), 1);
@@ -2299,7 +2300,7 @@ mod tests {
                 .await
                 .expect("routed terminator before timeout")
                 .expect("routed terminator"),
-            crate::session::WebTlsMetadata::default(),
+            None,
         )
         .expect("decode routed terminator");
         let AudioPayload::Opus(opus) = routed.audio_payload else {
@@ -2388,7 +2389,10 @@ mod tests {
             .expect("authenticated event");
         let moq_client = server
             .get_clients()
-            .get_client(ClientSessionIdentifier::from(moq_session))
+            .get_client_in_server(
+                DEFAULT_SERVER_ID,
+                ClientSessionIdentifier::from(moq_session),
+            )
             .await
             .expect("allocated client");
         let tracks = vec![(0, moq::Track::new("audio/down/slot/0").produce())];
