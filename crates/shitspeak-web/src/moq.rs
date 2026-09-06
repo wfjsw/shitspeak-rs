@@ -548,7 +548,7 @@ impl MoqServer {
             fallback.ip(),
             fallback,
             self.config.moq.listen.unwrap_or(fallback),
-            None,
+            crate::session::WebTlsMetadata::default(),
             false,
         )
     }
@@ -1807,6 +1807,8 @@ async fn client_origin_reset_events(
             actor: None,
             reason: None,
             ban: Some(false),
+            ban_certificate: None,
+            ban_ip: None,
         }
         .into();
         events.extend(

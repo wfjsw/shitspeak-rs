@@ -74,18 +74,19 @@ struct ClientCachedAclPermissions {
     permissions: enumflags2::BitFlags<shitspeak_state::ACLPermissions>,
 }
 
-/// Coherent point-in-time copy of the client state used by ACL evaluation.
+/// Coherent point-in-time view of the client state used by ACL evaluation.
 ///
 /// Keep the fields private so callers cannot couple themselves to the
 /// snapshot representation. Constructing this value takes the global-state
 /// read lock once, preventing an ACL evaluation from combining identity or
-/// home-channel values from different state revisions.
+/// home-channel values from different state revisions. Group and token sets
+/// share immutable storage until the client identity changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClientAclStateSnapshot {
     current_channel_id: u32,
     user_id: Option<u32>,
-    groups: HashSet<String>,
-    tokens: HashSet<String>,
+    groups: Arc<HashSet<String>>,
+    tokens: Arc<HashSet<String>>,
     is_superuser: bool,
     acl_subject_generation: u64,
     acl_home_generation: u64,
@@ -1169,8 +1170,8 @@ impl Client {
         ClientAclStateSnapshot {
             current_channel_id: state.get_current_channel_id(),
             user_id: state.get_user_id(),
-            groups: state.get_groups().clone(),
-            tokens: state.get_tokens().clone(),
+            groups: state.groups_snapshot(),
+            tokens: state.tokens_snapshot(),
             is_superuser: state.is_superuser(),
             acl_subject_generation,
             acl_home_generation,
@@ -2898,6 +2899,63 @@ mod tests {
                 .get_cached_acl_permissions(0, 3, 5, 7, false)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn acl_state_snapshots_reuse_identity_storage_until_mutation() {
+        let client = Client::new_remote_in_server(
+            DEFAULT_SERVER_ID.to_owned(),
+            ClientSessionIdentifier::from(0x0002_0001),
+            Ipv4Addr::LOCALHOST.into(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            None,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+            None,
+            Utc::now(),
+            7,
+        );
+        {
+            let mut state = client.write_global_state_direct();
+            state.set_groups(HashSet::from(["member".to_owned()]));
+            state.set_tokens(HashSet::from(["ACCESS".to_owned()]));
+        }
+
+        let first = client.acl_state_snapshot();
+        let repeated = client.acl_state_snapshot();
+        assert!(
+            std::ptr::eq(first.groups(), repeated.groups()),
+            "unchanged ACL snapshots must reuse the group set and its strings"
+        );
+        assert!(
+            std::ptr::eq(first.tokens(), repeated.tokens()),
+            "unchanged ACL snapshots must reuse the token set and its strings"
+        );
+
+        {
+            let mut state = client.write_global_state_direct();
+            state.add_group("moderator".to_owned());
+        }
+        let group_changed = client.acl_state_snapshot();
+        assert_eq!(first.groups(), &HashSet::from(["member".to_owned()]));
+        assert!(group_changed.groups().contains("moderator"));
+        assert!(std::ptr::eq(first.tokens(), group_changed.tokens()));
+        assert_ne!(
+            first.acl_cache_generations(),
+            group_changed.acl_cache_generations()
+        );
+
+        {
+            let mut state = client.write_global_state_direct();
+            state.add_token("SECOND".to_owned());
+            state.del_group("member");
+            state.del_token("ACCESS");
+        }
+        let changed = client.acl_state_snapshot();
+        assert_eq!(first.tokens(), &HashSet::from(["access".to_owned()]));
+        assert!(group_changed.groups().contains("member"));
+        assert!(group_changed.tokens().contains("access"));
+        assert_eq!(changed.groups(), &HashSet::from(["moderator".to_owned()]));
+        assert_eq!(changed.tokens(), &HashSet::from(["second".to_owned()]));
     }
 
     #[test]

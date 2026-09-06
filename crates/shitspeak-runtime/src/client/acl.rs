@@ -6,7 +6,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use crate::client::Client;
+use crate::client::{Client, client::ClientAclStateSnapshot};
 use crate::server::Server;
 
 use shitspeak_state::{ACL, ACLPermissions, AclViewerScope, Channel, ChannelTreeSnapshot};
@@ -98,9 +98,7 @@ impl ChannelAclOverride {
 pub(crate) struct ClientAclEvaluationContext {
     snapshot: Arc<ChannelTreeSnapshot>,
     session: u32,
-    user_id: Option<u32>,
-    groups: HashSet<String>,
-    tokens: HashSet<String>,
+    client_state: ClientAclStateSnapshot,
     certificate_hash: Option<Vec<u8>>,
     verified: bool,
     real_ip_address: std::net::IpAddr,
@@ -108,7 +106,6 @@ pub(crate) struct ClientAclEvaluationContext {
     ip_geo_country: Option<String>,
     home_channel_id: u32,
     home_ancestor_ids: Vec<u32>,
-    is_superuser: bool,
     debug_acl_enter: bool,
     explicit_enter_deny_overrides_write: bool,
 }
@@ -133,9 +130,7 @@ impl ClientAclEvaluationContext {
         Self {
             snapshot,
             session: u32::from(client.get_session_id()),
-            user_id: client_state.user_id(),
-            groups: client_state.groups().clone(),
-            tokens: client_state.tokens().clone(),
+            client_state,
             certificate_hash: client.get_certificate_hash().map(<[u8]>::to_vec),
             verified: client.is_verified(),
             real_ip_address,
@@ -146,7 +141,6 @@ impl ClientAclEvaluationContext {
                 .map(str::to_owned),
             home_channel_id,
             home_ancestor_ids,
-            is_superuser: client_state.is_superuser(),
             debug_acl_enter: server.get_debug_acl_enter(),
             explicit_enter_deny_overrides_write: server.get_explicit_enter_deny_overrides_write(),
         }
@@ -266,11 +260,11 @@ impl ClientAclEvaluationContext {
                 .collect::<Vec<_>>()
         };
 
-        let group_refs = BorrowedStrs::<8>::from_strings(&self.groups);
-        let token_refs = BorrowedStrs::<8>::from_strings(&self.tokens);
+        let group_refs = BorrowedStrs::<8>::from_strings(self.client_state.groups());
+        let token_refs = BorrowedStrs::<8>::from_strings(self.client_state.tokens());
         let membership = shitspeak_state::ClientMembershipQuery::new(
             group_refs.as_slice(),
-            self.user_id.is_some(),
+            self.client_state.user_id().is_some(),
             token_refs.as_slice(),
             self.certificate_hash.as_deref(),
             self.verified,
@@ -285,23 +279,23 @@ impl ClientAclEvaluationContext {
         let permissions = shitspeak_state::evaluate_permission_with_behavior(
             channel,
             &ancestors,
-            self.user_id,
+            self.client_state.user_id(),
             &membership,
             self.explicit_enter_deny_overrides_write,
         );
         let permissions = elevate_superuser_permissions(
             permissions,
             channel_id,
-            self.is_superuser,
+            self.client_state.is_superuser(),
             self.debug_acl_enter,
         );
 
         tracing::trace!(
             session = self.session,
             channel_id,
-            user_id = self.user_id,
+            user_id = self.client_state.user_id(),
             home_channel_id = self.home_channel_id,
-            is_superuser = self.is_superuser,
+            is_superuser = self.client_state.is_superuser(),
             debug_acl_enter = self.debug_acl_enter,
             explicit_enter_deny_overrides_write = self.explicit_enter_deny_overrides_write,
             has_acl_override = acl_override.is_some(),
@@ -529,9 +523,8 @@ async fn compute_permissions_for_client_inner(
         )
     };
 
-    // The cache-hit path above only needs two generations and a superuser
-    // bit. Clone the larger identity sets only when an ACL evaluation is
-    // actually required.
+    // The cache-hit path only needs generations and a superuser bit. Keep
+    // the shared identity revision alive when an ACL evaluation is required.
     let client_state = client.acl_state_snapshot();
     let (client_acl_subject_generation, client_acl_home_generation) =
         client_state.acl_cache_generations();
@@ -539,11 +532,11 @@ async fn compute_permissions_for_client_inner(
         .as_ref()
         .map_or_else(|| client_state.is_superuser(), |(_, _, value)| *value);
 
-    let (user_id, groups) = match identity_override {
-        Some((user_id, groups, _)) => (user_id, groups),
-        None => (client_state.user_id(), client_state.groups().clone()),
+    let (user_id, groups) = match identity_override.as_ref() {
+        Some((user_id, groups, _)) => (*user_id, groups),
+        None => (client_state.user_id(), client_state.groups()),
     };
-    let group_refs = BorrowedStrs::<8>::from_strings(&groups);
+    let group_refs = BorrowedStrs::<8>::from_strings(groups);
     let token_refs = BorrowedStrs::<8>::from_strings(client_state.tokens());
     let home_channel_id =
         home_channel_override.unwrap_or_else(|| client_state.current_channel_id());

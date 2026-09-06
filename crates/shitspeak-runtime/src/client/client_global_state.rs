@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use bytes::Bytes;
 
@@ -34,10 +34,10 @@ pub struct ClientGlobalState {
     // ── User identity ─────────────────────────────────────────────────────
     user_id: Option<u32>,
     fqdn: Option<String>,
-    groups: HashSet<String>,
+    groups: Arc<HashSet<String>>,
     is_superuser: bool,
     invisible: bool,
-    tokens: HashSet<String>,
+    tokens: Arc<HashSet<String>>,
     display_name: Option<String>,
     /// Broad generation retained for voice-routing caches, which depend on
     /// both the client's ACL subjects and current channel.
@@ -78,10 +78,10 @@ impl ClientGlobalState {
 
             user_id: None,
             fqdn: None,
-            groups: HashSet::new(),
+            groups: Arc::default(),
             is_superuser: false,
             invisible: false,
-            tokens: HashSet::new(),
+            tokens: Arc::default(),
             display_name: None,
             acl_generation: 0,
             acl_subject_generation: 0,
@@ -453,12 +453,16 @@ impl ClientGlobalState {
         &self.groups
     }
 
+    pub(crate) fn groups_snapshot(&self) -> Arc<HashSet<String>> {
+        Arc::clone(&self.groups)
+    }
+
     pub fn get_groups_mut(&mut self) -> &mut HashSet<String> {
-        &mut self.groups
+        Arc::make_mut(&mut self.groups)
     }
 
     pub fn has_group(&self, group: &str) -> bool {
-        self.groups.contains(&group.to_string())
+        self.groups.contains(group)
     }
 
     pub fn is_superuser(&self) -> bool {
@@ -494,31 +498,33 @@ impl ClientGlobalState {
     }
 
     pub fn add_group(&mut self, group: String) {
-        if self.groups.insert(group) {
+        if !self.groups.contains(&group) {
+            Arc::make_mut(&mut self.groups).insert(group);
             self.bump_acl_subject_generation();
             if self.delta_recording {
-                self.pending_delta.groups = Some(self.groups.clone());
+                self.pending_delta.groups = Some(self.groups.as_ref().clone());
             }
         }
     }
 
     pub fn del_group(&mut self, group: &str) {
-        if self.groups.remove(&group.to_string()) {
+        if self.groups.contains(group) {
+            Arc::make_mut(&mut self.groups).remove(group);
             self.bump_acl_subject_generation();
             if self.delta_recording {
-                self.pending_delta.groups = Some(self.groups.clone());
+                self.pending_delta.groups = Some(self.groups.as_ref().clone());
             }
         }
     }
 
     pub fn set_groups(&mut self, groups: HashSet<String>) {
-        if self.groups == groups {
+        if *self.groups == groups {
             return;
         }
-        self.groups = groups;
+        self.groups = Arc::new(groups);
         self.bump_acl_subject_generation();
         if self.delta_recording {
-            self.pending_delta.groups = Some(self.groups.clone());
+            self.pending_delta.groups = Some(self.groups.as_ref().clone());
         }
     }
 
@@ -526,20 +532,28 @@ impl ClientGlobalState {
         &self.tokens
     }
 
+    pub(crate) fn tokens_snapshot(&self) -> Arc<HashSet<String>> {
+        Arc::clone(&self.tokens)
+    }
+
     pub fn add_token(&mut self, token: String) {
-        if self.tokens.insert(token.to_ascii_lowercase()) {
+        let token = token.to_ascii_lowercase();
+        if !self.tokens.contains(&token) {
+            Arc::make_mut(&mut self.tokens).insert(token);
             self.bump_acl_subject_generation();
             if self.delta_recording {
-                self.pending_delta.tokens = Some(self.tokens.clone());
+                self.pending_delta.tokens = Some(self.tokens.as_ref().clone());
             }
         }
     }
 
     pub fn del_token(&mut self, token: &str) {
-        if self.tokens.remove(&token.to_ascii_lowercase()) {
+        let token = token.to_ascii_lowercase();
+        if self.tokens.contains(&token) {
+            Arc::make_mut(&mut self.tokens).remove(&token);
             self.bump_acl_subject_generation();
             if self.delta_recording {
-                self.pending_delta.tokens = Some(self.tokens.clone());
+                self.pending_delta.tokens = Some(self.tokens.as_ref().clone());
             }
         }
     }
@@ -550,13 +564,13 @@ impl ClientGlobalState {
             .map(|token| token.to_ascii_lowercase())
             .collect();
 
-        if self.tokens == tokens {
+        if *self.tokens == tokens {
             return;
         }
-        self.tokens = tokens;
+        self.tokens = Arc::new(tokens);
         self.bump_acl_subject_generation();
         if self.delta_recording {
-            self.pending_delta.tokens = Some(self.tokens.clone());
+            self.pending_delta.tokens = Some(self.tokens.as_ref().clone());
         }
     }
 
@@ -594,6 +608,67 @@ impl Default for ClientGlobalState {
 #[cfg(test)]
 mod tests {
     use super::ClientGlobalState;
+    use std::{collections::HashSet, sync::Arc};
+
+    #[test]
+    fn identity_mutations_preserve_shared_snapshots_and_record_deltas() {
+        let mut state = ClientGlobalState::new();
+        state.set_groups(HashSet::from(["member".to_owned()]));
+        state.set_tokens(HashSet::from(["ACCESS".to_owned()]));
+        let groups = state.groups_snapshot();
+        let tokens = state.tokens_snapshot();
+
+        state.begin_delta_recording();
+        state.add_group("moderator".to_owned());
+        state.del_group("member");
+        state.add_token("SECOND".to_owned());
+        state.del_token("ACCESS");
+        let delta = state.finish_delta_recording();
+
+        assert_eq!(*groups, HashSet::from(["member".to_owned()]));
+        assert_eq!(*tokens, HashSet::from(["access".to_owned()]));
+        assert_eq!(delta.groups.as_ref(), Some(state.get_groups()));
+        assert_eq!(delta.tokens.as_ref(), Some(state.get_tokens()));
+        assert_eq!(delta.groups, Some(HashSet::from(["moderator".to_owned()])));
+        assert_eq!(delta.tokens, Some(HashSet::from(["second".to_owned()])));
+        assert_eq!(state.get_acl_cache_generations(), (6, 0));
+    }
+
+    #[test]
+    fn unchanged_identity_mutations_reuse_shared_storage() {
+        let mut state = ClientGlobalState::new();
+        state.set_groups(HashSet::from(["member".to_owned()]));
+        state.set_tokens(HashSet::from(["ACCESS".to_owned()]));
+        let groups = state.groups_snapshot();
+        let tokens = state.tokens_snapshot();
+        let generations = state.get_acl_cache_generations();
+
+        state.begin_delta_recording();
+        state.add_group("member".to_owned());
+        state.del_group("absent");
+        state.set_groups(HashSet::from(["member".to_owned()]));
+        state.add_token("ACCESS".to_owned());
+        state.del_token("absent");
+        state.set_tokens(HashSet::from(["ACCESS".to_owned()]));
+
+        assert!(state.finish_delta_recording().is_empty());
+        assert!(Arc::ptr_eq(&groups, &state.groups_snapshot()));
+        assert!(Arc::ptr_eq(&tokens, &state.tokens_snapshot()));
+        assert_eq!(state.get_acl_cache_generations(), generations);
+    }
+
+    #[test]
+    fn mutable_group_access_preserves_existing_shared_snapshot() {
+        let mut state = ClientGlobalState::new();
+        state.set_groups(HashSet::from(["member".to_owned()]));
+        let groups = state.groups_snapshot();
+
+        state.get_groups_mut().insert("moderator".to_owned());
+
+        assert_eq!(*groups, HashSet::from(["member".to_owned()]));
+        assert!(state.has_group("member"));
+        assert!(state.has_group("moderator"));
+    }
 
     #[test]
     fn channel_move_only_bumps_home_acl_generation() {
