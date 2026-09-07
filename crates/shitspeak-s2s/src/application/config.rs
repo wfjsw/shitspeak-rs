@@ -38,11 +38,9 @@ pub struct VoiceConfig {
     /// Idle time after which an inactive speaker's reorder state is pruned.
     pub reorder_idle_reset_ms: u64,
 
-    /// When a gap's in-order skew tolerance (`reorder_max_delay_ms` / the
-    /// adaptive delay) expires unfilled, how much longer the receiver keeps
-    /// the whole buffered chunk held so a late repair can close the hole
-    /// without a clip. Bounded delay beats a permanent hole. Set to 0 to
-    /// flush at the skew tolerance as before.
+    /// Optional extra repair wait after the initial gap deadline. The initial
+    /// wait and this hold together cannot exceed `adaptive_jitter_max_delay_ms`.
+    /// Defaults to 0 so missing packets do not stall newer audio unnecessarily.
     pub chunk_hold_budget_ms: u64,
 
     /// Fast-path bypass — receivers emit frames in arrival order without
@@ -57,7 +55,8 @@ pub struct VoiceConfig {
     /// Lower bound for the adaptive per-sender reorder delay.
     pub adaptive_jitter_min_delay_ms: u64,
 
-    /// Upper bound for the adaptive per-sender reorder delay.
+    /// Total per-gap waiting limit, including route hints and optional extra
+    /// hold, even when adaptation is disabled. Raised to the minimum if lower.
     pub adaptive_jitter_max_delay_ms: u64,
 
     /// Amount added after observed jitter/loss pressure.
@@ -368,12 +367,7 @@ fn default_reorder_idle_reset_ms() -> u64 {
     2_000
 }
 fn default_chunk_hold_budget_ms() -> u64 {
-    // Allow enough time for a reactive repair to traverse a longer voice
-    // path (the common 4-to-8-node case can need more than one 150 ms repair
-    // round trip), while keeping the hold far below the old multi-second
-    // stall. A missed frame therefore waits for a late repair instead of
-    // becoming an audible clip in the normal case.
-    600
+    0
 }
 fn default_adaptive_jitter_enabled() -> bool {
     true
@@ -453,7 +447,7 @@ mod tests {
         assert_eq!(cfg.voice.reorder_max_buffered_frames, 48);
         assert_eq!(cfg.voice.reorder_max_total_buffer, 4_096);
         assert_eq!(cfg.voice.reorder_idle_reset_ms, 2_000);
-        assert_eq!(cfg.voice.chunk_hold_budget_ms, 600);
+        assert_eq!(cfg.voice.chunk_hold_budget_ms, 0);
         assert_eq!(cfg.voice.adaptive_jitter_min_delay_ms, 40);
         assert_eq!(cfg.voice.adaptive_jitter_max_delay_ms, 120);
         assert_eq!(cfg.voice.adaptive_jitter_growth_step_ms, 20);

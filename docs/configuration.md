@@ -704,8 +704,8 @@ delivery_strategy = "broadcast"
 # resolved recipient-node set changes.
 tree_delivery_enabled = true
 reorder_max_delay_ms = 40
-# After the gap deadline, retain the buffered suffix for late repair.
-chunk_hold_budget_ms = 600
+# Optional extra repair wait, sharing the total adaptive_jitter_max_delay_ms cap.
+chunk_hold_budget_ms = 0
 reorder_max_buffered_frames = 48
 reorder_max_total_buffer = 4096
 reorder_idle_reset_ms = 2000
@@ -971,8 +971,13 @@ the remote S2S voice delivery budget. They are not a local listener playout
 delay. Set all three explicitly when the deployment includes long-haul links;
 the tracked long-haul profile uses `1500` ms. `repair_cache_ms` must cover that
 delivery window and the time needed to request a repair; it is `3000` ms in the
-deployment configuration. `chunk_hold_budget_ms` is the additional receiver
-hold after the initial gap deadline while a repair is still actionable.
+deployment configuration. Receiver waiting is capped separately by
+`adaptive_jitter_max_delay_ms` (120 ms by default), including route-quality
+extensions and `chunk_hold_budget_ms`. This cap applies even with adaptation
+disabled and is raised to `adaptive_jitter_min_delay_ms` if configured lower.
+The optional extra hold defaults to zero. Older configurations with a 600 ms
+extra hold are also subject to the total cap. Increasing transport TTLs or
+repair-cache retention does not extend receiver waiting.
 
 Remote voice is released immediately after S2S sequence ordering. The server
 buffers only an observed sequence gap for its short per-speaker repair window;

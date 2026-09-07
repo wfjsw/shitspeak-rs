@@ -7028,10 +7028,9 @@ mod tests {
             crate::overlay::VoiceRouteQuality::new(11, TransportKind::Tcp, 237_000, 0, 0),
         );
         let mut cfg = VoiceConfig::default();
-        // Keep the chunk-hold window short: this test exercises the origin
-        // quality extension of the skew deadline, not the (default 1600 ms)
-        // hold-first budget. With the hint the skew deadline is ~257 ms; a
-        // 50 ms hold then flushes the whole buffered chunk at ~307 ms.
+        // Explicitly allow 400 ms to test the origin-quality extension.
+        // The 257 ms initial wait plus 50 ms hold fits inside that budget.
+        cfg.adaptive_jitter_max_delay_ms = 400;
         cfg.chunk_hold_budget_ms = 50;
         let svc = VoiceService::new_with_transport(transport, cfg, CancellationToken::new(), 42);
         let sink = RecordingSink::new();

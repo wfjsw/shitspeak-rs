@@ -608,6 +608,99 @@ async fn two_node_voice_drops_when_sink_missing() {
     cluster.shutdown_all().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2s_music_stream_continues_across_unrepaired_long_haul_gaps() {
+    let cluster = Cluster::build(&[13, 14], seed_pair).await;
+    let source = cluster.node(13);
+    let destination = cluster.node(14);
+    assert!(wait_for_full_alive_mesh(&cluster, Duration::from_secs(8)).await);
+    assert!(wait_for_full_routing(&cluster, Duration::from_secs(8)).await);
+    destination.chaos.set_delay(
+        FaultSelector::new(13, TransportKind::Tcp, MessageType::DistributionData),
+        LONG_HAUL_ONE_WAY_LATENCY,
+        LONG_HAUL_JITTER,
+    );
+    let source_app = ApplicationLayer::new(source.overlay.clone(), ApplicationConfig::default());
+    let mut config = ApplicationConfig::default();
+    // Existing deployments may still carry the old extra hold setting.
+    config.voice.chunk_hold_budget_ms = 600;
+    let destination_app = ApplicationLayer::new(destination.overlay.clone(), config);
+    wait_for_tree_voice_forwarding(source_app.as_ref(), 13, 14).await;
+    let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel();
+    destination_app
+        .voice()
+        .set_audio_sink(Arc::new(TimedVoiceSink { tx: sink_tx }));
+
+    let session = ClientSessionIdentifier::new(13, 80_003).unwrap().to_u32();
+    let frames = (0..120)
+        .map(|seq| Bytes::from(format!("music-{seq}")))
+        .collect::<Vec<_>>();
+    let missing = |offset: usize| offset % 40 == 1;
+    let expected = frames
+        .iter()
+        .enumerate()
+        .filter(|(offset, _)| !missing(*offset))
+        .map(|(offset, payload)| (payload.clone(), offset + 1 == frames.len()))
+        .collect::<Vec<_>>();
+    let send = async {
+        let mut sent_at = Vec::new();
+        for (offset, payload) in frames.iter().enumerate() {
+            if missing(offset) {
+                // Reserve a lost sequence without caching a recoverable copy.
+                source_app.voice().next_seq(session);
+            } else {
+                sent_at.push(Instant::now());
+                source_app
+                    .voice()
+                    .send_for_channel(
+                        session,
+                        default_server_id(),
+                        0,
+                        offset + 1 == frames.len(),
+                        payload.clone(),
+                    )
+                    .await
+                    .expect("send continuous music frame");
+            }
+            tokio::time::sleep(SHOUT_FRAME_INTERVAL).await;
+        }
+        sent_at
+    };
+    let (sent_at, deliveries) = tokio::join!(
+        send,
+        receive_timed_voice_stream(&mut sink_rx, session, &expected, Duration::from_secs(6)),
+    );
+    let max_latency = deliveries
+        .iter()
+        .zip(&sent_at)
+        .map(|(delivery, sent)| delivery.delivered_at.saturating_duration_since(*sent))
+        .max()
+        .unwrap_or_default();
+    let max_gap = deliveries
+        .windows(2)
+        .map(|pair| {
+            pair[1]
+                .delivered_at
+                .saturating_duration_since(pair[0].delivered_at)
+        })
+        .max()
+        .unwrap_or_default();
+    // Allow transport latency and scheduler variation around the 120 ms
+    // receiver budget, while rejecting the old 640+ ms pauses.
+    assert!(
+        max_latency <= LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET,
+        "healthy music frames delayed by {max_latency:?}"
+    );
+    assert!(
+        max_gap <= LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET,
+        "continuous music interrupted for {max_gap:?}"
+    );
+    assert_eq!(deliveries.len(), expected.len());
+    source_app.shutdown().await;
+    destination_app.shutdown().await;
+    cluster.shutdown_all().await;
+}
+
 /// Exercises a marked repair over the long-haul distribution-tree path. The
 /// receiver must emit the repaired gap and its following suffix immediately,
 /// without adding application-level media pacing.

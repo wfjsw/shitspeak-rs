@@ -296,12 +296,10 @@ struct SenderState {
     next_seq: u64,
     pending: BTreeMap<u64, ReorderEmission>,
     deadline: Option<Instant>,
-    /// The instant the open gap's in-order skew tolerance expires. When the
-    /// deadline fires unfilled the chunk enters hold-first mode: it is held
-    /// (rather than flushed around the hole) until this instant plus
-    /// `chunk_hold_budget_ms`, and the whole chunk then emits at once.
-    /// `None` when no gap is open.
+    /// End of the initial reorder wait, before any optional extra hold.
     hold_started_at: Option<Instant>,
+    /// Fixed when the gap opens; partial repairs cannot extend this expiry.
+    gap_expires_at: Option<Instant>,
     adaptive_delay_ms: u64,
     in_order_run: u32,
     last_activity: Instant,
@@ -455,7 +453,7 @@ impl Reorderer {
             return base;
         };
         base.max(self.route_repair_delay_ms(hint))
-            .min(self.cfg.repair_cache_ms.max(base))
+            .min(self.adaptive_delay_bounds_ms().1)
     }
 
     fn arm_gap(
@@ -468,12 +466,14 @@ impl Reorderer {
         route_hint: Option<VoiceRouteHint>,
         now: Instant,
     ) -> GapReport {
-        let deadline =
-            now + Duration::from_millis(self.effective_route_delay_ms(entry, route_hint));
+        let delay_ms = self.effective_route_delay_ms(entry, route_hint);
+        let total_delay_ms = delay_ms
+            .saturating_add(self.cfg.chunk_hold_budget_ms)
+            .min(self.adaptive_delay_bounds_ms().1);
+        let deadline = now + Duration::from_millis(delay_ms);
         entry.deadline = Some(deadline);
-        // The chunk enters hold-first mode when this skew deadline passes
-        // unfilled; it stays held until `hold_started_at + chunk_hold_budget_ms`.
         entry.hold_started_at = Some(deadline);
+        entry.gap_expires_at = Some(now + Duration::from_millis(total_delay_ms));
         state.deadlines.push(Reverse((deadline, session)));
         self.deadline_notify.notify_one();
         let first_pending = entry
@@ -492,19 +492,12 @@ impl Reorderer {
     }
 
     /// The absolute instant beyond which an open gap is permanently missed.
-    /// This is the chunk-hold deadline: the in-order skew tolerance plus the
-    /// hold budget. Zero hold budget collapses it to the skew deadline (the
-    /// legacy flush behavior).
+    /// The initial wait and optional hold share one total jitter budget.
     fn gap_hold_deadline(&self, entry: &SenderState) -> Option<Instant> {
-        entry
-            .hold_started_at
-            .map(|start| start + Duration::from_millis(self.cfg.chunk_hold_budget_ms))
+        entry.gap_expires_at
     }
 
-    /// Whether the sender's open gap is still repairable. The gap stays live
-    /// through the in-order skew tolerance AND the chunk-hold window, so a
-    /// late repair can still close the hole and emit the whole chunk
-    /// contiguously (delayed) instead of clipping.
+    /// Whether a repair can still fill the gap within the receiver budget.
     fn gap_is_live(&self, entry: &SenderState, now: Instant) -> bool {
         if entry.pending.is_empty() {
             return false;
@@ -608,9 +601,8 @@ impl Reorderer {
         self.push_with_route_hint(from, frame, None)
     }
 
-    /// Push an inbound delivery with an optional route-quality hint. When
-    /// present, the hint raises the per-sender deadline enough to leave room
-    /// for a NACK round trip and repair copy on farther or lossier paths.
+    /// Push an inbound delivery with an optional route-quality hint. The hint
+    /// can extend the initial repair wait up to the total jitter budget.
     pub fn push_with_route_hint(
         &self,
         from: NodeIdentifier,
@@ -661,6 +653,29 @@ impl Reorderer {
         route_hint: Option<VoiceRouteHint>,
         copy_kind: VoiceCopyKind,
     ) -> ReorderReport {
+        self.push_with_clock(from, frame, route_hint, copy_kind, Instant::now)
+    }
+
+    #[cfg(test)]
+    fn push_at(
+        &self,
+        from: NodeIdentifier,
+        frame: VoiceFrame,
+        route_hint: Option<VoiceRouteHint>,
+        copy_kind: VoiceCopyKind,
+        now: Instant,
+    ) -> ReorderReport {
+        self.push_with_clock(from, frame, route_hint, copy_kind, || now)
+    }
+
+    fn push_with_clock(
+        &self,
+        from: NodeIdentifier,
+        frame: VoiceFrame,
+        route_hint: Option<VoiceRouteHint>,
+        copy_kind: VoiceCopyKind,
+        clock: impl FnOnce() -> Instant,
+    ) -> ReorderReport {
         if self.cfg.reorder_disabled {
             return ReorderReport::new(
                 vec![ReorderEmission::new(from, frame, copy_kind)],
@@ -676,7 +691,7 @@ impl Reorderer {
         let session = frame.sender_session;
         let frame_seq = frame.s2s_seq;
         let sender_epoch = frame.sender_epoch;
-        let now = Instant::now();
+        let now = clock();
         self.prune_idle(&mut state, now);
 
         // A reactive repair cannot create a speaker stream. An original or
@@ -711,6 +726,7 @@ impl Reorderer {
                     pending: BTreeMap::new(),
                     deadline: None,
                     hold_started_at: None,
+                    gap_expires_at: None,
                     adaptive_delay_ms: initial_adaptive_delay_ms,
                     in_order_run: 0,
                     last_activity: now,
@@ -746,6 +762,7 @@ impl Reorderer {
             entry.next_seq = frame_seq;
             entry.deadline = None;
             entry.hold_started_at = None;
+            entry.gap_expires_at = None;
             entry.adaptive_delay_ms = initial_adaptive_delay_ms;
             entry.in_order_run = 0;
         }
@@ -796,6 +813,7 @@ impl Reorderer {
             if entry.pending.is_empty() {
                 entry.deadline = None;
                 entry.hold_started_at = None;
+                entry.gap_expires_at = None;
             }
             // A live armed gap was just closed by whichever copy kind delivered
             // the missing first frame. `duplicate` conflates a delayed primary
@@ -940,11 +958,20 @@ impl Reorderer {
     }
 
     pub(crate) fn drain_expired_report(&self) -> ReorderReport {
+        self.drain_expired_with_clock(Instant::now)
+    }
+
+    #[cfg(test)]
+    fn drain_expired_at(&self, now: Instant) -> ReorderReport {
+        self.drain_expired_with_clock(|| now)
+    }
+
+    fn drain_expired_with_clock(&self, clock: impl FnOnce() -> Instant) -> ReorderReport {
         let mut emit: Vec<ReorderEmission> = Vec::new();
         let mut results: Vec<ReorderResultCount> = Vec::new();
         let mut flushes_by_peer: Vec<FlushByPeer> = Vec::new();
         let mut state = self.state.lock();
-        let now = Instant::now();
+        let now = clock();
         self.prune_idle(&mut state, now);
         loop {
             let next = state.deadlines.peek().copied();
@@ -964,15 +991,9 @@ impl Reorderer {
                 continue;
             }
 
-            // Hold-first gap policy: when the in-order skew tolerance (the
-            // armed deadline) expires with the hole still open, the chunk is
-            // HELD rather than flushed around the hole. Only the chunk-hold
-            // budget is the point of no return; until then a late repair can
-            // still emit the whole chunk contiguously (delayed) rather than
-            // clip.
-            if let Some(hold_started) = entry.hold_started_at {
-                let hold_until =
-                    hold_started + Duration::from_millis(self.cfg.chunk_hold_budget_ms);
+            // An optional repair hold must fit inside the original gap budget.
+            // Retaining newer audio beyond it turns one loss into a long stall.
+            if let Some(hold_until) = self.gap_hold_deadline(entry) {
                 if now < hold_until {
                     // Re-arm the deadline task for the hold-budget expiry and
                     // keep the whole buffered chunk.
@@ -1002,6 +1023,7 @@ impl Reorderer {
                     std::mem::take(&mut entry.pending).into_iter().collect();
                 entry.deadline = None;
                 entry.hold_started_at = None;
+                entry.gap_expires_at = None;
                 if !drained.is_empty() {
                     self.grow_adaptive_delay(entry);
                 }
@@ -1279,6 +1301,66 @@ mod tests {
             assert_eq!(emits[0].1.s2s_seq, s);
         }
         assert_eq!(r.pending_total(), 0);
+    }
+
+    #[test]
+    fn music_stream_loss_does_not_stall_healthy_frames_past_jitter_budget() {
+        for hint in [None, Some(VoiceRouteHint::new(237_000, 80_000, 30_000))] {
+            for extra_hold_ms in [0, 600] {
+                let mut c = cfg();
+                c.chunk_hold_budget_ms = extra_hold_ms;
+                let maximum_wait = Duration::from_millis(c.adaptive_jitter_max_delay_ms);
+                let r = Reorderer::new(c);
+                let start = Instant::now();
+                let interval = Duration::from_millis(10);
+                let mut delivered = Vec::new();
+                let mut buffer_drops = 0;
+                let mut last_delivery = start;
+                let mut longest_silence = Duration::ZERO;
+                // Ten seconds of uninterrupted source audio, with one missing
+                // packet per second. Every received packet must remain usable.
+                for tick in 0..1_020u64 {
+                    let now = start + interval * tick as u32;
+                    let mut reports = vec![r.drain_expired_at(now)];
+                    if tick < 1_000 && tick % 100 != 1 {
+                        reports.push(r.push_at(
+                            11,
+                            frame(0xABC, 1, tick, false),
+                            hint,
+                            VoiceCopyKind::Original,
+                            now,
+                        ));
+                    }
+                    for report in reports {
+                        for result in report.result_counts() {
+                            if result.result() == VoiceReceiveResult::BufferDrop {
+                                buffer_drops += result.count();
+                            }
+                        }
+                        for (_, frame) in report.into_emissions() {
+                            let arrival = start + interval * frame.s2s_seq as u32;
+                            assert!(
+                                now.duration_since(arrival) <= maximum_wait,
+                                "frame {} waited {:?}, hint={hint:?}, extra_hold={extra_hold_ms}",
+                                frame.s2s_seq,
+                                now.duration_since(arrival),
+                            );
+                            longest_silence =
+                                longest_silence.max(now.duration_since(last_delivery));
+                            last_delivery = now;
+                            delivered.push(frame.s2s_seq);
+                        }
+                    }
+                }
+                assert_eq!(buffer_drops, 0);
+                assert_eq!(
+                    delivered,
+                    (0..1_000).filter(|seq| seq % 100 != 1).collect::<Vec<_>>()
+                );
+                assert!(longest_silence <= maximum_wait + interval * 2);
+                assert_eq!(r.pending_total(), 0);
+            }
+        }
     }
 
     #[test]
@@ -1610,7 +1692,8 @@ mod tests {
         let mut c = cfg();
         c.reorder_max_delay_ms = 40;
         c.adaptive_jitter_min_delay_ms = 40;
-        c.adaptive_jitter_max_delay_ms = 40;
+        c.adaptive_jitter_max_delay_ms = 120;
+        c.chunk_hold_budget_ms = 60;
         let r = Reorderer::new(c);
         // 0 emits, 2 buffers (gap at 1). The 40ms in-order skew tolerance
         // expires but the chunk is HELD instead of flushed around the hole.
@@ -2042,38 +2125,114 @@ mod tests {
     }
 
     #[test]
-    fn route_hint_extends_gap_deadline_and_chunk_is_held_for_repair() {
+    fn route_hint_and_legacy_hold_share_the_total_gap_budget() {
         let mut c = cfg();
         c.reorder_max_delay_ms = 5;
         c.adaptive_jitter_enabled = false;
         c.adaptive_jitter_min_delay_ms = 40;
         c.adaptive_jitter_max_delay_ms = 120;
+        c.chunk_hold_budget_ms = 600;
         let r = Reorderer::new(c);
-
-        r.push(11, frame(0xABC, 1, 0, false));
+        let start = Instant::now();
+        r.push_at(
+            11,
+            frame(0xABC, 1, 0, false),
+            None,
+            VoiceCopyKind::Original,
+            start,
+        );
         let hint = VoiceRouteHint::new(237_000, 0, 0);
         assert!(
-            r.push_with_route_hint(11, frame(0xABC, 1, 2, false), Some(hint))
+            r.push_at(
+                11,
+                frame(0xABC, 1, 2, false),
+                Some(hint),
+                VoiceCopyKind::Original,
+                start
+            )
+            .into_emissions()
+            .is_empty()
+        );
+        let gap = r
+            .current_actionable_gap(11, 0xABC, 1)
+            .expect("the repair worker sees the bounded deadline");
+        assert_eq!(gap.deadline(), start + Duration::from_millis(120));
+        assert!(
+            r.drain_expired_at(start + Duration::from_millis(119))
+                .into_emissions()
                 .is_empty()
         );
+        let emits = r
+            .drain_expired_at(start + Duration::from_millis(120))
+            .into_emissions();
+        assert_eq!(
+            emits.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(
+            r.push_at(
+                11,
+                frame(0xABC, 1, 1, false),
+                None,
+                VoiceCopyKind::ReactiveRepair,
+                start + Duration::from_millis(121)
+            )
+            .into_emissions()
+            .is_empty()
+        );
+    }
 
-        // Past the adaptive max (120ms) but before the route-extended skew
-        // tolerance (≈257ms): nothing is drained yet.
-        std::thread::sleep(Duration::from_millis(130));
-        assert!(r.drain_expired().is_empty());
-        // Past the skew tolerance: the chunk is HELD, not flushed around the
-        // hole, so the gap stays actionable for a late repair.
-        std::thread::sleep(Duration::from_millis(150));
-        assert!(r.drain_expired().is_empty());
-        assert_eq!(r.held_state().0, 1);
-        let gap = r
-            .gap_for_frame(11, &frame(0xABC, 1, 2, false))
-            .expect("gap stays open during the hold");
-        assert!(r.gap_still_missing(gap));
-        // A late fill still emits the whole chunk contiguously (delayed).
-        let emits = r.push(11, frame(0xABC, 1, 1, false));
-        let seqs: Vec<u64> = emits.iter().map(|(_, f)| f.s2s_seq).collect();
-        assert_eq!(seqs, vec![1, 2]);
+    #[test]
+    fn partial_music_repair_does_not_extend_remaining_audio_deadline() {
+        let mut c = cfg();
+        c.chunk_hold_budget_ms = 600;
+        let r = Reorderer::new(c);
+        let start = Instant::now();
+        for (ms, seq) in [(0, 0), (20, 2), (40, 4)] {
+            r.push_at(
+                11,
+                frame(0xABC, 1, seq, false),
+                None,
+                VoiceCopyKind::Original,
+                start + Duration::from_millis(ms),
+            );
+        }
+        let repaired = r
+            .push_at(
+                11,
+                frame(0xABC, 1, 1, false),
+                None,
+                VoiceCopyKind::ReactiveRepair,
+                start + Duration::from_millis(110),
+            )
+            .into_emissions();
+        assert_eq!(
+            repaired.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let expiry = start + Duration::from_millis(140);
+        assert_eq!(
+            r.current_actionable_gap(11, 0xABC, 1).unwrap().deadline(),
+            expiry
+        );
+        // Even before the deadline task runs, expired repairs cannot prolong audio.
+        assert!(
+            r.push_at(
+                11,
+                frame(0xABC, 1, 3, false),
+                None,
+                VoiceCopyKind::ReactiveRepair,
+                expiry
+            )
+            .into_emissions()
+            .is_empty()
+        );
+        let emitted = r.drain_expired_at(expiry).into_emissions();
+        assert_eq!(
+            emitted.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert_eq!(r.pending_total(), 0);
     }
 
     #[test]
