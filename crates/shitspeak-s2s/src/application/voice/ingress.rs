@@ -2893,14 +2893,16 @@ async fn send_tail_repair_frame(
         body.len(),
     );
     let quality = transport.voice_route_quality(key.destination);
-    let avoid_first_hop = quality.map(|quality| quality.next_hop());
-    let first_hop = quality
-        .and_then(|quality| quality.alternate_next_hop())
-        .unwrap_or(key.destination);
-    let credit_reservation = voice_budget.reserve_link_reactive_credit_scheduled(
-        first_hop,
-        u32::from(key.destination),
+    let avoid_first_hop = quality
+        .filter(|quality| quality.alternate_next_hop().is_some())
+        .map(|quality| quality.next_hop());
+    let credit_reservation = reserve_repair_route_credit(
+        transport.local_node_id(),
+        voice_budget,
+        key.destination,
+        quality,
         body.len(),
+        avoid_first_hop,
         repair_deadline,
         next_attempt > 1,
     );
@@ -2910,7 +2912,7 @@ async fn send_tail_repair_frame(
         _ = cancel.cancelled() => return TailFrameResult::Cancelled,
         permit = credit_reservation => permit,
     };
-    let Some(credit_permit) = credit_permit else {
+    let Some((credit_permit, avoid_first_hop)) = credit_permit else {
         metrics::record_repair_destination_bytes(
             key.destination,
             RepairDestinationStage::Shed,
@@ -3682,6 +3684,63 @@ async fn send_repair_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn reserve_repair_route_credit(
+    source: NodeIdentifier,
+    voice_budget: &AdaptiveVoiceBudget,
+    destination: NodeIdentifier,
+    quality: Option<VoiceRouteQuality>,
+    bytes: usize,
+    avoid_first_hop: Option<NodeIdentifier>,
+    deadline: Instant,
+    retry: bool,
+) -> Option<(ProactiveCreditPermit, Option<NodeIdentifier>)> {
+    let primary_hop = quality
+        .map(|quality| quality.next_hop())
+        .unwrap_or(destination);
+    let alternate_hop = quality
+        .filter(|quality| avoid_first_hop == Some(quality.next_hop()))
+        .and_then(|quality| quality.alternate_next_hop())
+        .filter(|hop| *hop != primary_hop);
+    let (credit_permit, avoid_first_hop) = if let Some(alternate_hop) = alternate_hop {
+        // Originals may fund only the primary hop. Race admission so an idle
+        // alternate cannot consume the entire response deadline. Cancelling
+        // the losing reservation refunds any granted permit; only one send runs.
+        tokio::select! {
+            biased;
+            Some(permit) = voice_budget.reserve_link_reactive_credit_scheduled(
+                alternate_hop, u32::from(destination), bytes, deadline, retry,
+            ) => {
+                metrics::record_repair(source, destination,
+                    VoiceRepairResult::AlternateCreditSelected, 1);
+                (Some(permit), avoid_first_hop)
+            }
+            Some(permit) = voice_budget.reserve_link_reactive_credit_scheduled(
+                primary_hop, u32::from(destination), bytes, deadline, retry,
+            ) => {
+                metrics::record_repair(source, destination,
+                    VoiceRepairResult::PrimaryCreditSelected, 1);
+                (Some(permit), None)
+            }
+            else => (None, None),
+        }
+    } else {
+        (
+            voice_budget
+                .reserve_link_reactive_credit_scheduled(
+                    primary_hop,
+                    u32::from(destination),
+                    bytes,
+                    deadline,
+                    retry,
+                )
+                .await,
+            avoid_first_hop,
+        )
+    };
+    credit_permit.map(|permit| (permit, avoid_first_hop))
+}
+
 async fn send_budgeted_repair_frame(
     transport: &dyn VoiceTransport,
     voice_budget: &AdaptiveVoiceBudget,
@@ -3698,25 +3757,17 @@ async fn send_budgeted_repair_frame(
         RepairDestinationStage::Requested,
         body.len(),
     );
-    let first_hop = transport
-        .voice_route_quality(destination)
-        .map(|quality| {
-            if avoid_first_hop == Some(quality.next_hop()) {
-                quality.alternate_next_hop().unwrap_or(quality.next_hop())
-            } else {
-                quality.next_hop()
-            }
-        })
-        .unwrap_or(destination);
-    let Some(credit_permit) = voice_budget
-        .reserve_link_reactive_credit_scheduled(
-            first_hop,
-            u32::from(destination),
-            body.len(),
-            deadline,
-            retry,
-        )
-        .await
+    let Some((credit_permit, avoid_first_hop)) = reserve_repair_route_credit(
+        transport.local_node_id(),
+        voice_budget,
+        destination,
+        transport.voice_route_quality(destination),
+        body.len(),
+        avoid_first_hop,
+        deadline,
+        retry,
+    )
+    .await
     else {
         metrics::record_repair_destination_bytes(
             destination,
@@ -4997,6 +5048,55 @@ mod tests {
             budget.mint_link_credit(first_hop, 0, 0, usize::MAX);
         }
         budget
+    }
+
+    #[tokio::test]
+    async fn tail_repair_uses_funded_primary_hop_without_alternate_credit() {
+        for quality in [
+            VoiceRouteQuality::new(2, TransportKind::Udp, 20_000, 0, 0)
+                .with_alternate_route_quality(3, 25_000, TransportKind::Quic, 0, 0),
+            VoiceRouteQuality::new(3, TransportKind::Tcp, 20_000, 0, 0),
+        ] {
+            let transport = FakeVoiceTransport::new(7, vec![2, 3]);
+            transport.set_voice_route_quality(2, quality);
+            let repairs: TailRepairState = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+            let cache = RepairCache::new(Duration::from_secs(1));
+            cache_single_tail_frame(&cache, 0xABC, 42);
+            let key = due_tail_key(&repairs, 2, 0xABC, 42, Instant::now());
+            let original = cache.lookup_range(0xABC, 42, 0, 0);
+            let marked = send::mark_proactive_copy(original[0].body()).unwrap();
+            let budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
+            budget.mint_link_credit(quality.next_hop(), 0xABC, 42, marked.len() * 4);
+            let before = budget.link_credit_balance_quarters(quality.next_hop());
+            let result = send_tail_repair_frame(
+                &repairs,
+                transport.as_ref(),
+                &cache,
+                &VoiceConfig::default(),
+                &budget,
+                &CancellationToken::new(),
+                key,
+                0,
+                1,
+                Instant::now() + Duration::from_millis(120),
+                CancellationToken::new(),
+                Arc::new(Semaphore::new(1)),
+            )
+            .await;
+            assert!(
+                matches!(result, TailFrameResult::Sent),
+                "funded primary tail repair must send"
+            );
+            let calls = transport.calls();
+            assert_eq!(calls.len(), 1);
+            assert!(matches!(&calls[0], FakeCall::RepairFrame {
+                dst: 2, body, avoid_first_hop: None, is_repair: false, ..
+            } if body == &marked));
+            assert_eq!(
+                budget.link_credit_balance_quarters(quality.next_hop()),
+                before - marked.len() * 4
+            );
+        }
     }
 
     #[tokio::test]
@@ -7798,6 +7898,131 @@ mod tests {
                 );
             }
             other => panic!("expected RepairFrame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_response_uses_funded_primary_when_alternate_credit_is_empty() {
+        let transport = FakeVoiceTransport::new(7, vec![2, 3]);
+        transport.set_voice_route_quality(
+            2,
+            VoiceRouteQuality::new(2, TransportKind::Udp, 20_000, 0, 0)
+                .with_alternate_route_quality(3, 25_000, TransportKind::Quic, 0, 0),
+        );
+        let svc = make_legacy_service(transport.clone());
+        // Normal accepted audio funds hop 2. No originals have used hop 3.
+        for _ in 0..4 {
+            svc.send_unicast(
+                0xABC,
+                default_server_id(),
+                0,
+                false,
+                Bytes::from_static(b"cached-music-frame"),
+                normal_intent(5),
+                2,
+            )
+            .await
+            .unwrap();
+        }
+        let original = match &transport.calls()[0] {
+            FakeCall::Unicast { body, .. } => body.clone(),
+            other => panic!("expected original audio, got {other:?}"),
+        };
+        let primary_credit = svc.voice_budget.link_credit_balance_quarters(2);
+        assert!(primary_credit >= original.len() * 4);
+        assert_eq!(svc.voice_budget.link_credit_balance_quarters(3), 0);
+        send_repair_response(
+            RepairResponseRequest {
+                from: 2,
+                request: VoiceRepairRequest {
+                    sender_session: 0xABC,
+                    sender_epoch: 42,
+                    first_seq: 0,
+                    last_seq: 0,
+                    request_sent_unix_ms: 0,
+                    request_ttl_ms: 120,
+                    tail_ack: false,
+                },
+                deadline: Instant::now() + Duration::from_millis(120),
+            },
+            transport.clone(),
+            svc.repair_cache.clone(),
+            &svc.voice_budget,
+            Arc::new(Semaphore::new(1)),
+            Duration::from_millis(120),
+        )
+        .await;
+        let calls = transport.calls();
+        assert_eq!(
+            calls.len(),
+            5,
+            "a funded primary must repair the cached packet before expiry"
+        );
+        assert!(matches!(&calls[4], FakeCall::RepairFrame {
+            dst: 2, body, avoid_first_hop: None, is_repair: true, ..
+        } if body == &original));
+        assert_eq!(
+            svc.voice_budget.link_credit_balance_quarters(2),
+            primary_credit - original.len() * 4
+        );
+        assert_eq!(svc.voice_budget.link_credit_balance_quarters(3), 0);
+    }
+
+    #[tokio::test]
+    async fn repair_credit_route_race_charges_only_the_selected_link() {
+        for (fund_primary, fund_alternate) in
+            [(true, false), (false, true), (true, true), (false, false)]
+        {
+            let transport = FakeVoiceTransport::new(7, vec![2, 3]);
+            transport.set_voice_route_quality(
+                2,
+                VoiceRouteQuality::new(2, TransportKind::Udp, 20_000, 0, 0)
+                    .with_alternate_route_quality(3, 25_000, TransportKind::Quic, 0, 0),
+            );
+            let budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
+            let body = Bytes::from_static(b"music-repair-credit");
+            for (hop, funded) in [(2, fund_primary), (3, fund_alternate)] {
+                if funded {
+                    budget.mint_link_credit(hop, 0xABC, 42, body.len() * 4);
+                }
+            }
+            let before_primary = budget.link_credit_balance_quarters(2);
+            let before_alternate = budget.link_credit_balance_quarters(3);
+            let accepted = send_budgeted_repair_frame(
+                transport.as_ref(),
+                &budget,
+                2,
+                body.clone(),
+                Some(2),
+                Duration::from_millis(100),
+                Instant::now() + Duration::from_millis(100),
+                false,
+                &Semaphore::new(1),
+            )
+            .await;
+            tokio::task::yield_now().await;
+            let calls = transport.calls();
+            assert_eq!(accepted, fund_primary || fund_alternate);
+            assert_eq!(calls.len(), usize::from(accepted));
+            let selected = calls.first().map(|call| match call {
+                FakeCall::RepairFrame {
+                    avoid_first_hop,
+                    body: sent,
+                    ..
+                } => {
+                    assert_eq!(sent, &body);
+                    if avoid_first_hop.is_some() { 3 } else { 2 }
+                }
+                other => panic!("expected one repair, got {other:?}"),
+            });
+            assert_eq!(
+                budget.link_credit_balance_quarters(2),
+                before_primary - usize::from(selected == Some(2)) * body.len() * 4
+            );
+            assert_eq!(
+                budget.link_credit_balance_quarters(3),
+                before_alternate - usize::from(selected == Some(3)) * body.len() * 4
+            );
         }
     }
 

@@ -609,6 +609,87 @@ async fn two_node_voice_drops_when_sink_missing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2s_cached_music_packet_is_recovered_by_network_nack() {
+    let cluster = Cluster::build(&[15, 16], seed_pair).await;
+    let source = cluster.node(15);
+    let destination = cluster.node(16);
+    assert!(wait_for_full_alive_mesh(&cluster, Duration::from_secs(8)).await);
+    assert!(wait_for_full_routing(&cluster, Duration::from_secs(8)).await);
+    let source_app = ApplicationLayer::new(source.overlay.clone(), ApplicationConfig::default());
+    let mut config = ApplicationConfig::default();
+    config.voice.reorder_max_delay_ms = 120;
+    config.voice.adaptive_jitter_min_delay_ms = 120;
+    let destination_app = ApplicationLayer::new(destination.overlay.clone(), config);
+    wait_for_tree_voice_forwarding(source_app.as_ref(), 15, 16).await;
+    // Exercise an actual request/response round trip as well as original data.
+    for (node, peer) in [(source, 16), (destination, 15)] {
+        node.chaos.set_delay(
+            FaultSelector::new(peer, TransportKind::Tcp, MessageType::Data),
+            Duration::from_millis(20),
+            Duration::from_millis(2),
+        );
+    }
+    let originals = FaultSelector::new(15, TransportKind::Tcp, MessageType::DistributionData);
+    destination.chaos.set_delay(
+        originals,
+        Duration::from_millis(20),
+        Duration::from_millis(2),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    destination_app
+        .voice()
+        .set_audio_sink(Arc::new(TimedVoiceSink { tx }));
+    let session = ClientSessionIdentifier::new(15, 80_004).unwrap().to_u32();
+    let expected = (0..16)
+        .map(|seq| (Bytes::from(format!("cached-music-{seq}")), seq == 15))
+        .collect::<Vec<_>>();
+    // Confirm initial delivery and let accepted originals earn repair credit.
+    for frame in &expected[..4] {
+        source_app
+            .voice()
+            .send_for_channel(session, default_server_id(), 0, frame.1, frame.0.clone())
+            .await
+            .unwrap();
+        receive_timed_voice_stream(
+            &mut rx,
+            session,
+            std::slice::from_ref(frame),
+            Duration::from_secs(2),
+        )
+        .await;
+    }
+    destination.chaos.drop_next(originals, 1);
+    let lost_sent_at = Instant::now();
+    let send = async {
+        for frame in &expected[4..] {
+            source_app
+                .voice()
+                .send_for_channel(session, default_server_id(), 0, frame.1, frame.0.clone())
+                .await
+                .unwrap();
+            tokio::time::sleep(SHOUT_FRAME_INTERVAL).await;
+        }
+    };
+    let (_, deliveries) = tokio::join!(
+        send,
+        receive_timed_voice_stream(&mut rx, session, &expected[4..], Duration::from_secs(3)),
+    );
+    assert_eq!(destination.chaos.remaining_drops(originals), 0);
+    assert!(
+        deliveries[0].is_repair,
+        "the dropped original must arrive through the repair responder"
+    );
+    assert_eq!(deliveries[0].frame.s2s_seq, 4);
+    assert!(
+        deliveries[0].delivered_at.duration_since(lost_sent_at) < Duration::from_millis(250),
+        "the cached music packet was not repaired promptly"
+    );
+    source_app.shutdown().await;
+    destination_app.shutdown().await;
+    cluster.shutdown_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s2s_music_stream_continues_across_unrepaired_long_haul_gaps() {
     let cluster = Cluster::build(&[13, 14], seed_pair).await;
     let source = cluster.node(13);

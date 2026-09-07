@@ -979,6 +979,15 @@ The optional extra hold defaults to zero. Older configurations with a 600 ms
 extra hold are also subject to the total cap. Increasing transport TTLs or
 repair-cache retention does not extend receiver waiting.
 
+Reactive repair responses and terminal retries compete for credit on the primary and
+alternate first hops when an alternate is available. An unfunded alternate
+does not block a funded primary until the response expires. Only the selected
+route sends a copy; unused reservations are refunded. Relayed terminal retries
+charge the selected first hop's bucket. The
+`shitspeak_s2s_voice_repair_events_total` results `primary_credit_selected` and
+`alternate_credit_selected` expose this choice. `frame_served` records send
+acceptance; receiver `reactive` gap resolutions confirm useful recovery.
+
 Remote voice is released immediately after S2S sequence ordering. The server
 buffers only an observed sequence gap for its short per-speaker repair window;
 clients own media pacing and jitter buffering. Legacy
