@@ -1425,6 +1425,54 @@ impl BackoffState {
     }
 }
 
+/// Cache keys only: every lookup checks the selected stream's current liveness.
+#[derive(Default)]
+struct StreamRegistry {
+    entries: HashMap<StreamKey, ActiveStream>,
+    newest: [Option<StreamKey>; 4],
+    #[cfg(test)]
+    lookup_scans: usize,
+}
+
+impl StreamRegistry {
+    fn newest_live(&mut self, kind: TransportKind) -> Option<&ActiveStream> {
+        let slot = match kind {
+            TransportKind::Tcp => 0,
+            TransportKind::Kcp => 1,
+            TransportKind::Quic => 2,
+            TransportKind::Udp => 3,
+        };
+        loop {
+            let key = match self.newest[slot] {
+                Some(key) => key,
+                None => {
+                    #[cfg(test)]
+                    {
+                        self.lookup_scans += 1;
+                    }
+                    // Remove a disconnected group together before rebuilding the index.
+                    prune_dead_streams(&mut self.entries);
+                    let key = self
+                        .entries
+                        .iter()
+                        .filter(|(_, stream)| stream.transport() == kind)
+                        .max_by_key(|(_, stream)| stream.installed_at())
+                        .map(|(key, _)| *key)?;
+                    self.newest[slot] = Some(key);
+                    key
+                }
+            };
+            if self.entries.get(&key).is_some_and(ActiveStream::is_alive) {
+                return self.entries.get(&key);
+            }
+            if let Some(stream) = self.entries.remove(&key) {
+                stream.cancel();
+            }
+            self.newest[slot] = None;
+        }
+    }
+}
+
 fn nonzero_or(value: Duration, fallback: Duration) -> Duration {
     if value.is_zero() { fallback } else { value }
 }
@@ -1457,7 +1505,7 @@ pub(crate) struct PeerState {
     node_id: NodeIdentifier,
     addresses: Mutex<Vec<PeerAddress>>,
     advertised_addresses: Mutex<HashSet<PeerAddress>>,
-    streams: Mutex<HashMap<StreamKey, ActiveStream>>,
+    streams: Mutex<StreamRegistry>,
     outbound_sender: PeerOutboundSender,
     outbound_receiver: Mutex<Option<PeerOutboundReceiver>>,
     udp_seen_at: Mutex<Option<Instant>>,
@@ -1528,7 +1576,7 @@ impl PeerState {
             node_id,
             addresses: Mutex::new(Vec::new()),
             advertised_addresses: Mutex::new(HashSet::new()),
-            streams: Mutex::new(HashMap::new()),
+            streams: Mutex::new(StreamRegistry::default()),
             outbound_sender,
             outbound_receiver: Mutex::new(Some(outbound_receiver)),
             udp_seen_at: Mutex::new(None),
@@ -1589,7 +1637,7 @@ impl PeerState {
     pub(crate) fn retire(&self) {
         self.retired.cancel();
         {
-            let mut streams = self.streams.lock();
+            let mut streams = self.stream_entries();
             for stream in streams.values() {
                 stream.cancel();
             }
@@ -1876,7 +1924,7 @@ impl PeerState {
 
     pub fn address_matches_live_remote_ip(&self, addr: PeerAddress) -> bool {
         let ip = canonical_ip(addr.addr().ip());
-        let mut streams = self.streams.lock();
+        let mut streams = self.stream_entries();
         prune_dead_streams(&mut streams);
         streams.values().any(|stream| {
             stream.is_alive()
@@ -1970,9 +2018,26 @@ impl PeerState {
             .unwrap_or(0)
     }
 
+    fn stream_entries(
+        &self,
+    ) -> parking_lot::MappedMutexGuard<'_, HashMap<StreamKey, ActiveStream>> {
+        parking_lot::MutexGuard::map(self.streams.lock(), |registry| &mut registry.entries)
+    }
+
+    // Installations can replace a cached key or introduce a newer stream.
+    // Removals are detected by newest_live under this same mutex.
+    fn stream_entries_for_install(
+        &self,
+    ) -> parking_lot::MappedMutexGuard<'_, HashMap<StreamKey, ActiveStream>> {
+        parking_lot::MutexGuard::map(self.streams.lock(), |registry| {
+            registry.newest.fill(None);
+            &mut registry.entries
+        })
+    }
+
     pub fn install_stream(&self, stream: ActiveStream) {
         let key = stream.key();
-        let mut g = self.streams.lock();
+        let mut g = self.stream_entries_for_install();
         if self.retired.is_cancelled() {
             stream.cancel();
             return;
@@ -1991,7 +2056,7 @@ impl PeerState {
     /// Install a stream unless the exact same connection key is already live.
     pub fn try_install_stream(&self, new_stream: ActiveStream) -> Result<(), ActiveStream> {
         let key = new_stream.key();
-        let mut g = self.streams.lock();
+        let mut g = self.stream_entries_for_install();
         if self.retired.is_cancelled() {
             new_stream.cancel();
             return Err(new_stream);
@@ -2012,7 +2077,7 @@ impl PeerState {
     }
 
     pub fn drop_stream(&self, kind: TransportKind) {
-        let mut g = self.streams.lock();
+        let mut g = self.stream_entries();
         g.retain(|key, stream| {
             if key.transport() == kind {
                 stream.cancel();
@@ -2026,7 +2091,7 @@ impl PeerState {
 
     pub fn has_live_outgoing_to(&self, addr: PeerAddress) -> bool {
         let key = StreamKey::new(addr.transport(), Some(addr.addr()), true);
-        let mut g = self.streams.lock();
+        let mut g = self.stream_entries();
         prune_dead_streams(&mut g);
         if addr.transport() == TransportKind::Udp {
             return g
@@ -2037,7 +2102,7 @@ impl PeerState {
     }
 
     pub fn live_kinds(&self) -> Vec<TransportKind> {
-        let mut g = self.streams.lock();
+        let mut g = self.stream_entries();
         prune_dead_streams(&mut g);
         let mut kinds = Vec::new();
         for stream in g.values() {
@@ -2053,7 +2118,7 @@ impl PeerState {
         configured_send_buffer_bytes: usize,
         configured_receive_buffer_bytes: usize,
     ) -> Vec<QuicSessionStatusSnapshot> {
-        let mut streams = self.streams.lock();
+        let mut streams = self.stream_entries();
         prune_dead_streams(&mut streams);
         let mut out = streams
             .values()
@@ -2078,19 +2143,17 @@ impl PeerState {
     /// Attempt to obtain a sender for any stream of the requested transport.
     /// Drops the stream if it has died.
     pub fn try_get_stream(&self, kind: TransportKind) -> Option<SessionSender> {
-        let mut g = self.streams.lock();
-        prune_dead_streams(&mut g);
-        g.values()
-            .filter(|s| s.transport() == kind && s.is_alive())
-            .max_by_key(|s| s.installed_at())
-            .map(|s| s.sender.clone())
+        self.streams
+            .lock()
+            .newest_live(kind)
+            .map(|stream| stream.sender.clone())
     }
 
     /// Obtain the newest live QUIC v2 sender. QUIC DATAGRAM is a delivery
     /// path of an s2s/2 session, not a separate physical transport, so callers
     /// selecting that path must not let a newer legacy s2s/1 stream mask it.
     pub(crate) fn try_get_quic_v2_stream(&self) -> Option<SessionSender> {
-        let mut streams = self.streams.lock();
+        let mut streams = self.stream_entries();
         prune_dead_streams(&mut streams);
         streams
             .values()
@@ -2107,7 +2170,7 @@ impl PeerState {
     /// single reliable stream negotiated by s2s/1, but strict s2s/2 class
     /// streams accept only reliable service levels.
     pub(crate) fn try_get_legacy_quic_stream(&self) -> Option<SessionSender> {
-        let mut streams = self.streams.lock();
+        let mut streams = self.stream_entries();
         prune_dead_streams(&mut streams);
         streams
             .values()
@@ -2229,7 +2292,7 @@ impl PeerState {
         ));
 
         let current_by_transport = {
-            let mut streams = self.streams.lock();
+            let mut streams = self.stream_entries();
             prune_dead_streams(&mut streams);
             let mut current = HashMap::<TransportKind, (usize, usize)>::new();
             for stream in streams.values().filter(|stream| stream.is_alive()) {
@@ -2268,15 +2331,11 @@ impl PeerState {
         &self,
         transport: TransportKind,
     ) -> Option<QueueStatusSnapshot> {
-        let current = {
-            let mut streams = self.streams.lock();
-            prune_dead_streams(&mut streams);
-            streams
-                .values()
-                .filter(|stream| stream.is_alive() && stream.transport() == transport)
-                .max_by_key(|stream| stream.installed_at())
-                .map(|stream| (stream.sender.depth_bytes(), stream.sender.capacity_bytes()))
-        };
+        let current = self
+            .streams
+            .lock()
+            .newest_live(transport)
+            .map(|stream| (stream.sender.depth_bytes(), stream.sender.capacity_bytes()));
 
         let mut status = self
             .outbound_stream_queue_watermarks
@@ -2296,16 +2355,10 @@ impl PeerState {
         level: ServiceLevel,
         class: MessageClass,
     ) -> Option<QueueStatusSnapshot> {
-        let mut streams = self.streams.lock();
-        prune_dead_streams(&mut streams);
-        streams
-            .values()
-            .filter(|stream| stream.is_alive() && stream.transport() == transport)
-            .max_by_key(|stream| stream.installed_at())
-            .map(|stream| {
-                let (depth, capacity) = stream.sender.depth_capacity(level, class);
-                QueueStatusSnapshot::default().with_current(depth, capacity)
-            })
+        self.streams.lock().newest_live(transport).map(|stream| {
+            let (depth, capacity) = stream.sender.depth_capacity(level, class);
+            QueueStatusSnapshot::default().with_current(depth, capacity)
+        })
     }
 
     pub(crate) fn record_expired_outbound_drop(
@@ -3166,13 +3219,13 @@ impl PeerState {
     }
 
     pub fn has_any_live_stream(&self) -> bool {
-        let mut g = self.streams.lock();
+        let mut g = self.stream_entries();
         prune_dead_streams(&mut g);
         g.values().any(ActiveStream::is_alive)
     }
 
     pub(crate) fn has_live_reliable_stream(&self) -> bool {
-        let mut streams = self.streams.lock();
+        let mut streams = self.stream_entries();
         prune_dead_streams(&mut streams);
         streams.values().any(|stream| {
             stream.is_alive() && stream.transport().is_acceptable_for(ServiceLevel::Reliable)
@@ -3180,13 +3233,13 @@ impl PeerState {
     }
 
     pub fn outgoing_live_count(&self) -> usize {
-        let mut g = self.streams.lock();
+        let mut g = self.stream_entries();
         prune_dead_streams(&mut g);
         g.values().filter(|s| s.is_alive() && s.is_dialer()).count()
     }
 
     pub fn outgoing_live_keys(&self) -> Vec<StreamKey> {
-        let mut g = self.streams.lock();
+        let mut g = self.stream_entries();
         prune_dead_streams(&mut g);
         g.iter()
             .filter_map(|(key, stream)| {
@@ -3200,7 +3253,7 @@ impl PeerState {
     }
 
     pub fn drop_outgoing_stream(&self, key: StreamKey) -> bool {
-        let mut g = self.streams.lock();
+        let mut g = self.stream_entries();
         if let Some(prev) = g.remove(&key) {
             prev.closed.cancel();
             self.notify_outbound_dispatch();
@@ -4240,6 +4293,168 @@ mod tests {
             new_rx.try_recv().unwrap().payload(),
             &Bytes::from_static(b"new")
         );
+    }
+
+    #[test]
+    fn lookup_prunes_a_disconnected_group_in_one_scan() {
+        let peer = peer_for_address_tests();
+        let mut receivers = Vec::new();
+        let mut closed = Vec::new();
+        for port in 10000..10032 {
+            let (stream, receiver) = active_stream_for_test(
+                TransportKind::Tcp,
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                true,
+            );
+            closed.push(stream.closed.clone());
+            receivers.push(receiver);
+            peer.install_stream(stream);
+        }
+        assert!(peer.try_get_stream(TransportKind::Tcp).is_some());
+        let scans = peer.streams.lock().lookup_scans;
+        for token in closed {
+            token.cancel();
+        }
+        assert!(peer.try_get_stream(TransportKind::Tcp).is_none());
+        assert_eq!(peer.streams.lock().lookup_scans - scans, 1);
+    }
+
+    #[test]
+    fn warm_transport_lookups_do_not_rescan_streams() {
+        let peer = peer_for_address_tests();
+        let (stream, _rx) =
+            active_stream_for_test(TransportKind::Tcp, "10.1.2.3:64739".parse().unwrap(), true);
+        peer.install_stream(stream);
+        assert!(peer.try_get_stream(TransportKind::Tcp).is_some());
+        let scans = peer.streams.lock().lookup_scans;
+        for _ in 0..10 {
+            assert!(peer.try_get_stream(TransportKind::Tcp).is_some());
+            assert!(
+                peer.outbound_stream_queue_status(TransportKind::Tcp)
+                    .is_some()
+            );
+            assert!(
+                peer.outbound_lane_queue_status(
+                    TransportKind::Tcp,
+                    ServiceLevel::Reliable,
+                    MessageClass::Regular
+                )
+                .is_some()
+            );
+        }
+        assert_eq!(peer.streams.lock().lookup_scans, scans);
+    }
+
+    #[test]
+    fn queue_lookup_tracks_replacement_cancellation_and_removal() {
+        let peer = peer_for_address_tests();
+        let addr = "10.1.2.3:64739".parse().unwrap();
+        let (old, _old_rx) = active_stream_for_test(TransportKind::Tcp, addr, true);
+        let old_closed = old.closed.clone();
+        peer.install_stream(old);
+        let old_sender = peer.try_get_stream(TransportKind::Tcp).unwrap();
+        old_sender
+            .try_send(OutboundFrame::new(
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+                Bytes::from_static(b"old"),
+            ))
+            .unwrap();
+        assert!(
+            peer.outbound_stream_queue_status(TransportKind::Tcp)
+                .unwrap()
+                .depth()
+                > 0
+        );
+
+        let (replacement, replacement_rx) = active_stream_for_test(TransportKind::Tcp, addr, true);
+        peer.install_stream(replacement);
+        assert_eq!(
+            peer.outbound_stream_queue_status(TransportKind::Tcp)
+                .unwrap()
+                .depth(),
+            0
+        );
+        assert!(old_closed.is_cancelled());
+
+        let (mut newest, _newest_rx) =
+            active_stream_for_test(TransportKind::Tcp, "10.1.2.4:64739".parse().unwrap(), false);
+        newest.installed_at += Duration::from_secs(1);
+        let closed = newest.closed.clone();
+        let key = newest.key();
+        peer.install_stream(newest);
+        peer.try_get_stream(TransportKind::Tcp)
+            .unwrap()
+            .try_send(OutboundFrame::new(
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+                Bytes::from_static(b"newest"),
+            ))
+            .unwrap();
+        assert!(
+            peer.outbound_lane_queue_status(
+                TransportKind::Tcp,
+                ServiceLevel::Reliable,
+                MessageClass::Regular
+            )
+            .unwrap()
+            .depth()
+                > 0
+        );
+        closed.cancel();
+        assert_eq!(
+            peer.outbound_stream_queue_status(TransportKind::Tcp)
+                .unwrap()
+                .depth(),
+            0
+        );
+        peer.drop_outgoing_stream(key);
+        assert!(peer.try_get_stream(TransportKind::Tcp).is_some());
+        {
+            let _receiver = replacement_rx;
+        }
+        assert!(peer.try_get_stream(TransportKind::Tcp).is_none());
+        assert!(
+            peer.outbound_lane_queue_status(
+                TransportKind::Tcp,
+                ServiceLevel::Reliable,
+                MessageClass::Regular
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cached_stream_removal_and_retirement_invalidate_lookups() {
+        for remove_kind in [false, true] {
+            let peer = peer_for_address_tests();
+            let (stream, _rx) =
+                active_stream_for_test(TransportKind::Tcp, "10.1.2.3:64739".parse().unwrap(), true);
+            let key = stream.key();
+            peer.install_stream(stream);
+            assert!(peer.try_get_stream(TransportKind::Tcp).is_some());
+            if remove_kind {
+                peer.drop_stream(TransportKind::Tcp);
+            } else {
+                assert!(peer.drop_outgoing_stream(key));
+            }
+            assert!(peer.try_get_stream(TransportKind::Tcp).is_none());
+            assert!(
+                peer.outbound_lane_queue_status(
+                    TransportKind::Tcp,
+                    ServiceLevel::Reliable,
+                    MessageClass::Regular
+                )
+                .is_none()
+            );
+
+            let (replacement, _replacement_rx) =
+                active_stream_for_test(TransportKind::Tcp, "10.1.2.3:64739".parse().unwrap(), true);
+            peer.install_stream(replacement);
+            assert!(peer.try_get_stream(TransportKind::Tcp).is_some());
+            peer.retire();
+            assert!(peer.try_get_stream(TransportKind::Tcp).is_none());
+        }
     }
 
     #[test]

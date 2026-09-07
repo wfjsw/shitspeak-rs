@@ -1776,7 +1776,8 @@ impl ConnectionManager {
         let peer = self.inner.get_peer(node)?;
         let now = Instant::now();
         let policy = self.inner.cfg().routing_policy();
-        let mut ranked = pick_transports(
+        let snapshot = peer.metrics().snapshot_per_transport();
+        let mut ranked = pick_transports_with_snapshot(
             &peer,
             level,
             routing_metric,
@@ -1784,8 +1785,9 @@ impl ConnectionManager {
             options,
             0,
             TransportSelectionConfig::from_config(self.inner.cfg()),
+            &snapshot,
         );
-        apply_voice_transport_stickiness(
+        apply_voice_transport_stickiness_with_snapshot(
             &peer,
             &mut ranked,
             level,
@@ -1794,12 +1796,15 @@ impl ConnectionManager {
             options,
             policy,
             now,
+            None,
             false,
+            &snapshot,
         );
-        ranked
-            .first()
-            .copied()
-            .map(|transport| send_queue_penalty(&peer, transport, level, class, options, now))
+        ranked.first().copied().map(|transport| {
+            send_queue_penalty_with_snapshot(
+                &peer, transport, level, class, options, now, &snapshot,
+            )
+        })
     }
 
     /// Return the pressure for a conversational path. In addition to local
@@ -1816,7 +1821,8 @@ impl ConnectionManager {
         let peer = self.inner.get_peer(node)?;
         let now = Instant::now();
         let policy = self.inner.cfg().routing_policy();
-        let mut ranked = pick_transports(
+        let snapshot = peer.metrics().snapshot_per_transport();
+        let mut ranked = pick_transports_with_snapshot(
             &peer,
             level,
             routing_metric,
@@ -1824,8 +1830,9 @@ impl ConnectionManager {
             options,
             0,
             TransportSelectionConfig::from_config(self.inner.cfg()),
+            &snapshot,
         );
-        apply_voice_transport_stickiness(
+        apply_voice_transport_stickiness_with_snapshot(
             &peer,
             &mut ranked,
             level,
@@ -1834,15 +1841,18 @@ impl ConnectionManager {
             options,
             policy,
             now,
+            None,
             false,
+            &snapshot,
         );
         let selected = ranked.first().copied()?;
-        let queue_pressure = send_queue_penalty(&peer, selected, level, class, options, now);
+        let queue_pressure = send_queue_penalty_with_snapshot(
+            &peer, selected, level, class, options, now, &snapshot,
+        );
         if routing_metric != RoutingMetric::ConversationalQuality {
             return Some(queue_pressure);
         }
 
-        let snapshot = peer.metrics().snapshot_per_transport();
         let quality_transport = if level == ServiceLevel::BestEffort {
             preferred_conversational_datagram_path(&peer, &ranked, &snapshot, policy)
                 .map(DeliveryPath::transport)
@@ -2597,6 +2607,7 @@ fn adjusted_routing_cost(
     cost * (1.0 + f64::from(policy.best_effort_kcp_cost_penalty_pct()) / 100.0)
 }
 
+#[cfg(test)]
 fn apply_voice_transport_stickiness(
     peer: &PeerState,
     ranked: &mut Vec<TransportKind>,
@@ -2622,6 +2633,7 @@ fn apply_voice_transport_stickiness(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn apply_voice_transport_stickiness_with_pressure(
     peer: &PeerState,
@@ -2635,13 +2647,42 @@ fn apply_voice_transport_stickiness_with_pressure(
     pressure_overrides: Option<&HashMap<TransportKind, u8>>,
     observe: bool,
 ) -> Option<super::connection::VoiceTransportDecision> {
+    let snapshot = peer.metrics().snapshot_per_transport();
+    apply_voice_transport_stickiness_with_snapshot(
+        peer,
+        ranked,
+        level,
+        routing_metric,
+        class,
+        options,
+        policy,
+        now,
+        pressure_overrides,
+        observe,
+        &snapshot,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_voice_transport_stickiness_with_snapshot(
+    peer: &PeerState,
+    ranked: &mut Vec<TransportKind>,
+    level: ServiceLevel,
+    routing_metric: RoutingMetric,
+    class: MessageClass,
+    options: SendOptions,
+    policy: TransportRoutingPolicy,
+    now: Instant,
+    pressure_overrides: Option<&HashMap<TransportKind, u8>>,
+    observe: bool,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+) -> Option<super::connection::VoiceTransportDecision> {
     if !policy.voice_path_stickiness_enabled()
         || !is_expiring_conversational_voice(level, routing_metric, class, options)
         || ranked.is_empty()
     {
         return None;
     }
-    let snapshot = peer.metrics().snapshot_per_transport();
     let candidates = ranked
         .iter()
         .copied()
@@ -2651,12 +2692,14 @@ fn apply_voice_transport_stickiness_with_pressure(
                 pressure_overrides
                     .and_then(|pressures| pressures.get(&transport).copied())
                     .unwrap_or_else(|| {
-                        deadline_queue_penalty(peer, transport, level, class, options, now)
+                        deadline_queue_penalty_with_snapshot(
+                            peer, transport, level, class, options, now, snapshot,
+                        )
                     }),
                 snapshot
                     .get(&transport)
                     .map(|_| {
-                        adjusted_routing_cost(transport, level, routing_metric, policy, &snapshot)
+                        adjusted_routing_cost(transport, level, routing_metric, policy, snapshot)
                     })
                     .filter(|cost| cost.is_finite()),
             )
@@ -2681,7 +2724,10 @@ fn apply_voice_transport_stickiness_with_pressure(
                 .is_some_and(|status| status.capacity() > 0 && status.depth() >= status.capacity())
             {
                 Some(VoiceTransportBindingEventReason::QueueFull)
-            } else if deadline_queue_penalty(peer, incumbent, level, class, options, now) >= 3 {
+            } else if deadline_queue_penalty_with_snapshot(
+                peer, incumbent, level, class, options, now, snapshot,
+            ) >= 3
+            {
                 Some(VoiceTransportBindingEventReason::DeadlineImpossible)
             } else {
                 None
@@ -2707,6 +2753,7 @@ fn record_voice_transport_no_alternate(
     class: MessageClass,
     options: SendOptions,
     now: Instant,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
 ) {
     if !peer.record_voice_transport_no_alternate() {
         return;
@@ -2714,8 +2761,9 @@ fn record_voice_transport_no_alternate(
     let incumbent = peer
         .voice_transport_binding_status()
         .map(|binding| binding.transport());
-    let incumbent_pressure = incumbent
-        .map(|transport| deadline_queue_penalty(peer, transport, level, class, options, now));
+    let incumbent_pressure = incumbent.map(|transport| {
+        deadline_queue_penalty_with_snapshot(peer, transport, level, class, options, now, snapshot)
+    });
     let (held_for, confirmation_for) = peer.voice_transport_binding_ages(now);
     debug!(
         peer = %peer.node_id(),
@@ -2885,6 +2933,7 @@ fn move_transport_to_front(ranked: &mut Vec<TransportKind>, pos: usize) {
     ranked.insert(0, transport);
 }
 
+#[cfg(test)]
 fn send_queue_penalty(
     peer: &PeerState,
     transport: TransportKind,
@@ -2893,8 +2942,23 @@ fn send_queue_penalty(
     options: SendOptions,
     now: Instant,
 ) -> u8 {
+    let snapshot = peer.metrics().snapshot_per_transport();
+    send_queue_penalty_with_snapshot(peer, transport, level, class, options, now, &snapshot)
+}
+
+fn send_queue_penalty_with_snapshot(
+    peer: &PeerState,
+    transport: TransportKind,
+    level: ServiceLevel,
+    class: MessageClass,
+    options: SendOptions,
+    now: Instant,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+) -> u8 {
     if options.expires_at().is_some() {
-        route_deadline_queue_penalty(peer, transport, level, class, options, now)
+        route_deadline_queue_penalty_with_snapshot(
+            peer, transport, level, class, options, now, snapshot,
+        )
     } else {
         non_deadline_queue_penalty(peer, transport, level, class)
             .max(peer_queue_fill_penalty(peer, class))
@@ -2905,19 +2969,19 @@ fn send_queue_penalty(
 /// routed peer queue as well as the selected transport's handoff queue. A
 /// saturated peer dispatcher otherwise looks healthy until after routing has
 /// already selected it and enqueue reports backpressure.
-fn route_deadline_queue_penalty(
+fn route_deadline_queue_penalty_with_snapshot(
     peer: &PeerState,
     transport: TransportKind,
     level: ServiceLevel,
     class: MessageClass,
     options: SendOptions,
     now: Instant,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
 ) -> u8 {
     let (peer_depth, peer_fill_penalty, peer_queue_full) = peer_queue_pressure(peer, class);
     if peer_queue_full {
         return 3;
     }
-    let snapshot = peer.metrics().snapshot_per_transport();
     deadline_queue_penalty_with_additional_depth_and_snapshot(
         peer,
         transport,
@@ -2927,10 +2991,11 @@ fn route_deadline_queue_penalty(
         now,
         peer_depth,
         peer_fill_penalty,
-        &snapshot,
+        snapshot,
     )
 }
 
+#[cfg(test)]
 fn deadline_queue_penalty(
     peer: &PeerState,
     transport: TransportKind,
@@ -3564,17 +3629,28 @@ fn delivery_candidates(
     (candidates, no_fit_quic_sender)
 }
 
+#[cfg(test)]
 fn prefer_best_effort_datagram_paths(
     peer: &PeerState,
     candidates: &mut Vec<DeliveryCandidate>,
     envelope: &OutboundEnvelope,
     policy: TransportRoutingPolicy,
 ) {
+    let snapshot = peer.metrics().snapshot_per_transport();
+    prefer_best_effort_datagram_paths_with_snapshot(peer, candidates, envelope, policy, &snapshot);
+}
+
+fn prefer_best_effort_datagram_paths_with_snapshot(
+    peer: &PeerState,
+    candidates: &mut Vec<DeliveryCandidate>,
+    envelope: &OutboundEnvelope,
+    policy: TransportRoutingPolicy,
+    snapshot: &HashMap<TransportKind, LinkMetrics>,
+) {
     if envelope.level() != ServiceLevel::BestEffort {
         return;
     }
 
-    let snapshot = peer.metrics().snapshot_per_transport();
     let now = Instant::now();
     let expiring_voice = is_expiring_conversational_voice(
         envelope.level(),
@@ -3589,21 +3665,21 @@ fn prefer_best_effort_datagram_paths(
         .iter()
         .find(|candidate| candidate.path == DeliveryPath::QuicDatagram)
         .map(|candidate| {
-            observe_best_effort_datagram_path_health(peer, candidate.path, &snapshot, policy, now)
+            observe_best_effort_datagram_path_health(peer, candidate.path, snapshot, policy, now)
         });
     candidates.retain(|candidate| {
         if !candidate.path.is_datagram() {
             return true;
         }
         let physical_health =
-            udp_family_health(peer, &[candidate.path.transport()], &snapshot, policy);
+            udp_family_health(peer, &[candidate.path.transport()], snapshot, policy);
         let datagram_health = if candidate.path == DeliveryPath::QuicDatagram {
             quic_datagram_health
         } else {
             Some(observe_best_effort_datagram_path_health(
                 peer,
                 candidate.path,
-                &snapshot,
+                snapshot,
                 policy,
                 now,
             ))
@@ -3625,7 +3701,7 @@ fn prefer_best_effort_datagram_paths(
     if expiring_voice {
         candidates.retain(|candidate| {
             candidate.path.is_datagram()
-                || delivery_candidate_lane_penalty(candidate, envelope, &snapshot, now) < 3
+                || delivery_candidate_lane_penalty(candidate, envelope, snapshot, now) < 3
         });
     }
     candidates.sort_by(|left, right| {
@@ -3635,8 +3711,8 @@ fn prefer_best_effort_datagram_paths(
                 if left.path.is_datagram() {
                     std::cmp::Ordering::Equal
                 } else {
-                    delivery_candidate_lane_penalty(left, envelope, &snapshot, now).cmp(
-                        &delivery_candidate_lane_penalty(right, envelope, &snapshot, now),
+                    delivery_candidate_lane_penalty(left, envelope, snapshot, now).cmp(
+                        &delivery_candidate_lane_penalty(right, envelope, snapshot, now),
                     )
                 }
             })
@@ -3773,8 +3849,8 @@ fn try_dispatch_envelope_with_policy(
         return Ok(());
     }
     let class = envelope.class();
+    let snapshot = peer.metrics().snapshot_per_transport();
     let choices = if let Some(transport) = envelope.target_transport() {
-        let snapshot = peer.metrics().snapshot_per_transport();
         let live = peer.live_kinds();
         let has_viable_alternative = live.iter().copied().any(|candidate| {
             candidate != transport
@@ -3806,7 +3882,7 @@ fn try_dispatch_envelope_with_policy(
             vec![transport]
         }
     } else {
-        pick_transports(
+        pick_transports_with_snapshot(
             peer,
             envelope.level(),
             envelope.routing_metric(),
@@ -3814,6 +3890,7 @@ fn try_dispatch_envelope_with_policy(
             envelope.options(),
             envelope.payload().len(),
             selection,
+            &snapshot,
         )
     };
 
@@ -3834,6 +3911,7 @@ fn try_dispatch_envelope_with_policy(
                 class,
                 envelope.options(),
                 now,
+                &snapshot,
             );
         }
         if envelope.level() == ServiceLevel::BestEffort {
@@ -3845,9 +3923,14 @@ fn try_dispatch_envelope_with_policy(
     let attempted_transports = choices.clone();
     let (mut delivery_candidates, no_fit_quic_sender) =
         delivery_candidates(peer, &envelope, choices, selection.max_frame_bytes);
-    prefer_best_effort_datagram_paths(peer, &mut delivery_candidates, &envelope, selection.routing);
+    prefer_best_effort_datagram_paths_with_snapshot(
+        peer,
+        &mut delivery_candidates,
+        &envelope,
+        selection.routing,
+        &snapshot,
+    );
     let voice_decision = if sticky_voice {
-        let snapshot = peer.metrics().snapshot_per_transport();
         let mut path_pressures = HashMap::new();
         let mut path_transports = Vec::new();
         for candidate in &delivery_candidates {
@@ -3861,7 +3944,7 @@ fn try_dispatch_envelope_with_policy(
                 path_transports.push(transport);
             }
         }
-        let decision = apply_voice_transport_stickiness_with_pressure(
+        let decision = apply_voice_transport_stickiness_with_snapshot(
             peer,
             &mut path_transports,
             envelope.level(),
@@ -3872,6 +3955,7 @@ fn try_dispatch_envelope_with_policy(
             now,
             Some(&path_pressures),
             true,
+            &snapshot,
         );
         delivery_candidates.sort_by_key(|candidate| {
             (
@@ -4011,10 +4095,13 @@ fn try_dispatch_envelope_with_policy(
                     "selected outbound delivery path"
                 );
                 if let Some(decision) = voice_decision {
-                    let selected_pressure =
-                        deadline_queue_penalty(peer, transport, level, class, options, now);
+                    let selected_pressure = deadline_queue_penalty_with_snapshot(
+                        peer, transport, level, class, options, now, &snapshot,
+                    );
                     let incumbent_pressure = decision.incumbent().map(|incumbent| {
-                        deadline_queue_penalty(peer, incumbent, level, class, options, now)
+                        deadline_queue_penalty_with_snapshot(
+                            peer, incumbent, level, class, options, now, &snapshot,
+                        )
                     });
                     peer.record_voice_transport_success(
                         transport,
@@ -4099,6 +4186,7 @@ fn try_dispatch_envelope_with_policy(
             class,
             envelope.options(),
             now,
+            &snapshot,
         );
     }
     if envelope.level() == ServiceLevel::BestEffort {
@@ -5680,6 +5768,61 @@ mod tests {
         assert_eq!(link.samples(), 0, "the fallback remains unranked");
         assert_eq!(link.sent_bytes(), 128);
         assert_eq!(link.probe_packets(), 1);
+    }
+
+    #[tokio::test]
+    async fn voice_routing_decisions_capture_metrics_once() {
+        let (transport, _receivers) = ConnectionManager::test_with_live_streams(
+            1,
+            2,
+            &[TransportKind::Tcp, TransportKind::Udp],
+        );
+        let peer = transport.inner.get_peer(2).expect("peer");
+        for kind in [TransportKind::Tcp, TransportKind::Udp] {
+            peer.metrics().record_rtt(kind, Duration::from_millis(20));
+        }
+        let envelope = expiring_voice(b"snapshot");
+        peer.metrics().reset_snapshot_count();
+        assert_eq!(
+            transport.best_send_queue_pressure(
+                2,
+                envelope.level(),
+                envelope.routing_metric(),
+                envelope.class(),
+                envelope.options(),
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            peer.metrics().snapshot_count(),
+            1,
+            "queue pressure snapshot count"
+        );
+
+        peer.metrics().reset_snapshot_count();
+        assert_eq!(
+            transport.best_conversational_path_pressure(
+                2,
+                envelope.level(),
+                envelope.routing_metric(),
+                envelope.class(),
+                envelope.options(),
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            peer.metrics().snapshot_count(),
+            1,
+            "path pressure snapshot count"
+        );
+
+        peer.metrics().reset_snapshot_count();
+        try_dispatch_envelope(&peer, envelope, TransportRoutingPolicy::default()).unwrap();
+        assert_eq!(
+            peer.metrics().snapshot_count(),
+            1,
+            "dispatch snapshot count"
+        );
     }
 
     #[tokio::test]
