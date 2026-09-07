@@ -66,7 +66,7 @@ impl RoutingMetric {
 }
 
 /// Wire transport flavor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(enum_map::Enum, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TransportKind {
     Tcp,
     Kcp,

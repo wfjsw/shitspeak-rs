@@ -83,6 +83,9 @@ pub mod testing;
 #[cfg(test)]
 mod integration_tests;
 
+#[cfg(test)]
+mod allocation_test;
+
 pub use adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
 pub use compression::SendOptions;
 pub use config::{KcpTuning, TransportConfig, TransportRoutingPolicy, TransportTuning};

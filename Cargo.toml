@@ -24,6 +24,7 @@ version = "3.0.0"
 edition = "2024"
 
 [workspace.dependencies]
+enum-map = "2.7"
 arc-swap = "1"
 async-trait = "0"
 aws-lc-rs = "1"

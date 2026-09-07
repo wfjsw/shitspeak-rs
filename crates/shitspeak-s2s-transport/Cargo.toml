@@ -8,6 +8,7 @@ default = []
 test-support = ["dep:tempfile"]
 
 [dependencies]
+enum-map = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 aws-lc-rs = { workspace = true }

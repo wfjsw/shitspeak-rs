@@ -2515,6 +2515,39 @@ pub struct PeerMetrics {
     snapshot_count: AtomicU64,
 }
 
+/// Inline metrics for the transport variants present at one snapshot instant.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TransportMetricsSnapshot {
+    links: enum_map::EnumMap<TransportKind, Option<LinkMetrics>>,
+}
+
+impl TransportMetricsSnapshot {
+    pub(crate) fn get(&self, transport: &TransportKind) -> Option<&LinkMetrics> {
+        self.links[*transport].as_ref()
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &LinkMetrics> {
+        self.links.values().filter_map(Option::as_ref)
+    }
+
+    fn into_map(self) -> HashMap<TransportKind, LinkMetrics> {
+        self.links
+            .into_iter()
+            .filter_map(|(kind, link)| link.map(|link| (kind, link)))
+            .collect()
+    }
+}
+
+impl FromIterator<(TransportKind, LinkMetrics)> for TransportMetricsSnapshot {
+    fn from_iter<T: IntoIterator<Item = (TransportKind, LinkMetrics)>>(iter: T) -> Self {
+        let mut snapshot = Self::default();
+        for (kind, link) in iter {
+            snapshot.links[kind] = Some(link);
+        }
+        snapshot
+    }
+}
+
 impl PeerMetrics {
     pub fn new(window: Duration, tuning: MetricsTuning) -> Self {
         Self {
@@ -2772,7 +2805,7 @@ impl PeerMetrics {
         entry.last_update = Some(Instant::now());
     }
 
-    pub fn snapshot_per_transport(&self) -> HashMap<TransportKind, LinkMetrics> {
+    pub(crate) fn snapshot_per_transport(&self) -> TransportMetricsSnapshot {
         let g = self.inner.lock();
         #[cfg(test)]
         self.snapshot_count.fetch_add(1, Ordering::Relaxed);
@@ -2781,10 +2814,7 @@ impl PeerMetrics {
     }
 
     #[cfg(test)]
-    pub(crate) fn snapshot_per_transport_at(
-        &self,
-        now: Instant,
-    ) -> HashMap<TransportKind, LinkMetrics> {
+    pub(crate) fn snapshot_per_transport_at(&self, now: Instant) -> TransportMetricsSnapshot {
         let g = self.inner.lock();
         #[cfg(test)]
         self.snapshot_count.fetch_add(1, Ordering::Relaxed);
@@ -2805,7 +2835,7 @@ impl PeerMetrics {
         &self,
         inner_by_transport: &HashMap<TransportKind, LinkInner>,
         now: Instant,
-    ) -> HashMap<TransportKind, LinkMetrics> {
+    ) -> TransportMetricsSnapshot {
         inner_by_transport
             .iter()
             .map(|(t, inner)| {
@@ -2914,7 +2944,7 @@ impl PeerMetrics {
         requested: ServiceLevel,
         metric: RoutingMetric,
         candidates: &[TransportKind],
-        snapshot: &HashMap<TransportKind, LinkMetrics>,
+        snapshot: &TransportMetricsSnapshot,
     ) -> Vec<TransportKind> {
         let mut ranked: Vec<(TransportKind, f64)> = candidates
             .iter()
@@ -3494,7 +3524,7 @@ where
 {
     let mut per_node = HashMap::new();
     for (node, m) in iter {
-        per_node.insert(node, m.snapshot_per_transport());
+        per_node.insert(node, m.snapshot_per_transport().into_map());
     }
     MetricsSnapshot {
         per_node,
@@ -3869,10 +3899,46 @@ mod tests {
     }
 
     #[test]
+    fn transport_snapshots_do_not_allocate() {
+        let metrics = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+        for (transport, ()) in enum_map::EnumMap::<TransportKind, ()>::default() {
+            metrics.record_rtt(transport, Duration::from_millis(10));
+        }
+        let allocations = crate::allocation_test::count_allocations(|| {
+            for _ in 0..100 {
+                let snapshot = std::hint::black_box(metrics.snapshot_per_transport());
+                std::hint::black_box(snapshot.clone());
+            }
+        });
+        assert_eq!(
+            allocations, 0,
+            "snapshots must store transport metrics inline"
+        );
+    }
+
+    #[test]
+    fn inline_snapshot_preserves_missing_entries_and_captured_values() {
+        let metrics = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
+        assert_eq!(metrics.snapshot_per_transport().values().count(), 0);
+        metrics.record_rtt(TransportKind::Tcp, Duration::from_millis(10));
+        let snapshot = metrics.snapshot_per_transport();
+        metrics.record_rtt(TransportKind::Udp, Duration::from_millis(20));
+        metrics.record_rtt(TransportKind::Tcp, Duration::from_millis(50));
+        for (kind, ()) in enum_map::EnumMap::<TransportKind, ()>::default() {
+            assert_eq!(snapshot.get(&kind).is_some(), kind == TransportKind::Tcp);
+        }
+        assert_eq!(snapshot.values().count(), 1);
+        assert_eq!(snapshot.get(&TransportKind::Tcp).unwrap().rtt_us, 10_000.0);
+        let exported = snapshot.into_map();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[&TransportKind::Tcp].rtt_us, 10_000.0);
+    }
+
+    #[test]
     fn transport_ranking_reuses_the_supplied_snapshot() {
         let metrics = PeerMetrics::new(Duration::from_secs(60), MetricsTuning::default());
         let candidates = [TransportKind::Tcp, TransportKind::Udp];
-        let snapshot = HashMap::from([
+        let snapshot: TransportMetricsSnapshot = [
             (
                 TransportKind::Tcp,
                 LinkMetrics {
@@ -3889,7 +3955,9 @@ mod tests {
                     ..LinkMetrics::default()
                 },
             ),
-        ]);
+        ]
+        .into_iter()
+        .collect();
 
         metrics.record_rtt(TransportKind::Tcp, Duration::from_millis(1));
         metrics.record_rtt(TransportKind::Udp, Duration::from_millis(100));

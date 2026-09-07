@@ -52,7 +52,8 @@ use super::metrics::{
     DatagramPathEvidenceEvent, DatagramPathHealthSnapshot, DatagramPathHealthState,
     ExpiredOutboundDropStage, InboundQueueStatusSnapshot, LinkMetrics, MetricsSnapshot,
     MetricsTuning, QueueWatermark, QueueWatermarkReport, TransportHealthExclusionReason,
-    VoiceTransportBindingEventReason, assemble_snapshot, record_delivery_path_selection,
+    TransportMetricsSnapshot, VoiceTransportBindingEventReason, assemble_snapshot,
+    record_delivery_path_selection,
 };
 use super::service_level::{
     DeliveryPath, MessageClass, PeerAddress, RoutingMetric, SeedAddress, ServiceLevel,
@@ -2016,7 +2017,7 @@ fn pick_transports_with_snapshot(
     options: SendOptions,
     payload_len: usize,
     selection: impl Into<TransportSelectionConfig>,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
 ) -> Vec<TransportKind> {
     rank_transports_with_snapshot(
         peer,
@@ -2040,7 +2041,7 @@ fn observe_transports_with_snapshot(
     options: SendOptions,
     payload_len: usize,
     selection: impl Into<TransportSelectionConfig>,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
 ) -> Vec<TransportKind> {
     rank_transports_with_snapshot(
         peer,
@@ -2064,7 +2065,7 @@ fn rank_transports_with_snapshot(
     options: SendOptions,
     payload_len: usize,
     selection: impl Into<TransportSelectionConfig>,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
     record_health_effects: bool,
 ) -> Vec<TransportKind> {
     let selection = selection.into();
@@ -2225,7 +2226,7 @@ fn transport_candidate_health_allows(
     routing_metric: RoutingMetric,
     class: MessageClass,
     options: SendOptions,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
     selection: TransportSelectionConfig,
     has_viable_kcp_alternative: bool,
     now: Instant,
@@ -2252,7 +2253,7 @@ fn transport_candidate_exclusion_reason(
     routing_metric: RoutingMetric,
     class: MessageClass,
     options: SendOptions,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
     selection: TransportSelectionConfig,
     has_viable_kcp_alternative: bool,
     now: Instant,
@@ -2283,7 +2284,7 @@ fn transport_candidate_exclusion_reason_read_only(
     routing_metric: RoutingMetric,
     class: MessageClass,
     options: SendOptions,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
     selection: TransportSelectionConfig,
     has_viable_kcp_alternative: bool,
     now: Instant,
@@ -2338,7 +2339,7 @@ fn transport_candidate_exclusion_reason_read_only(
 fn transport_is_viable_alternative(
     peer: &PeerState,
     transport: TransportKind,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
     policy: TransportRoutingPolicy,
     now: Instant,
 ) -> bool {
@@ -2448,7 +2449,7 @@ fn apply_transport_routing_policy(
     options: SendOptions,
     payload_len: usize,
     policy: TransportRoutingPolicy,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
 ) {
     // BestEffort is ranked by logical delivery path.
     // Physical UDP-family promotion cannot distinguish QUIC DATAGRAM from a
@@ -2518,7 +2519,7 @@ fn is_expiring_conversational_voice(
 fn preferred_conversational_datagram_path(
     peer: &PeerState,
     ranked: &[TransportKind],
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
     policy: TransportRoutingPolicy,
 ) -> Option<DeliveryPath> {
     for transport in ranked {
@@ -2592,7 +2593,7 @@ fn adjusted_routing_cost(
     level: ServiceLevel,
     routing_metric: RoutingMetric,
     policy: TransportRoutingPolicy,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
 ) -> f64 {
     let Some(cost) = snapshot
         .get(&transport)
@@ -2675,7 +2676,7 @@ fn apply_voice_transport_stickiness_with_snapshot(
     now: Instant,
     pressure_overrides: Option<&HashMap<TransportKind, u8>>,
     observe: bool,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
 ) -> Option<super::connection::VoiceTransportDecision> {
     if !policy.voice_path_stickiness_enabled()
         || !is_expiring_conversational_voice(level, routing_metric, class, options)
@@ -2753,7 +2754,7 @@ fn record_voice_transport_no_alternate(
     class: MessageClass,
     options: SendOptions,
     now: Instant,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
 ) {
     if !peer.record_voice_transport_no_alternate() {
         return;
@@ -2792,7 +2793,7 @@ fn peer_bulk_backlog_bytes(peer: &PeerState) -> usize {
 fn udp_family_health(
     peer: &PeerState,
     ranked: &[TransportKind],
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
     policy: TransportRoutingPolicy,
 ) -> UdpFamilyHealth {
     const UDP_FAMILY: [TransportKind; 2] = [TransportKind::Quic, TransportKind::Udp];
@@ -2878,7 +2879,7 @@ fn tcp_transport_usable(
 
 fn udp_family_promotion_position(
     ranked: &[TransportKind],
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
     routing_metric: RoutingMetric,
     health: UdpFamilyHealth,
     policy: TransportRoutingPolicy,
@@ -2953,7 +2954,7 @@ fn send_queue_penalty_with_snapshot(
     class: MessageClass,
     options: SendOptions,
     now: Instant,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
 ) -> u8 {
     if options.expires_at().is_some() {
         route_deadline_queue_penalty_with_snapshot(
@@ -2976,7 +2977,7 @@ fn route_deadline_queue_penalty_with_snapshot(
     class: MessageClass,
     options: SendOptions,
     now: Instant,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
 ) -> u8 {
     let (peer_depth, peer_fill_penalty, peer_queue_full) = peer_queue_pressure(peer, class);
     if peer_queue_full {
@@ -3015,7 +3016,7 @@ fn deadline_queue_penalty_with_snapshot(
     class: MessageClass,
     options: SendOptions,
     now: Instant,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
 ) -> u8 {
     deadline_queue_penalty_with_additional_depth_and_snapshot(
         peer, transport, level, class, options, now, 0, 0, snapshot,
@@ -3032,7 +3033,7 @@ fn deadline_queue_penalty_with_additional_depth_and_snapshot(
     now: Instant,
     additional_depth: usize,
     additional_fill_penalty: u8,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
 ) -> u8 {
     let Some(expires_at) = options.expires_at() else {
         return 0;
@@ -3645,7 +3646,7 @@ fn prefer_best_effort_datagram_paths_with_snapshot(
     candidates: &mut Vec<DeliveryCandidate>,
     envelope: &OutboundEnvelope,
     policy: TransportRoutingPolicy,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
 ) {
     if envelope.level() != ServiceLevel::BestEffort {
         return;
@@ -3722,7 +3723,7 @@ fn prefer_best_effort_datagram_paths_with_snapshot(
 fn observe_best_effort_datagram_path_health(
     peer: &PeerState,
     path: DeliveryPath,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
     policy: TransportRoutingPolicy,
     now: Instant,
 ) -> DatagramPathHealthState {
@@ -3789,7 +3790,7 @@ fn delivery_candidate_allowed_after_datagram_failure(
 fn delivery_candidate_lane_penalty(
     candidate: &DeliveryCandidate,
     envelope: &OutboundEnvelope,
-    snapshot: &HashMap<TransportKind, LinkMetrics>,
+    snapshot: &TransportMetricsSnapshot,
     now: Instant,
 ) -> u8 {
     if candidate.path.is_datagram() {
@@ -6278,13 +6279,17 @@ mod tests {
             peer.metrics().record_probe_delivered(TransportKind::Quic);
         }
         let snapshot = peer.metrics().snapshot_per_transport();
-        let tcp_cost = snapshot[&TransportKind::Tcp]
+        let tcp_cost = snapshot
+            .get(&TransportKind::Tcp)
+            .unwrap()
             .routing_cost(
                 ServiceLevel::BestEffort,
                 RoutingMetric::ConversationalQuality,
             )
             .unwrap();
-        let quic_cost = snapshot[&TransportKind::Quic]
+        let quic_cost = snapshot
+            .get(&TransportKind::Quic)
+            .unwrap()
             .routing_cost(
                 ServiceLevel::BestEffort,
                 RoutingMetric::ConversationalQuality,
@@ -6772,13 +6777,17 @@ mod tests {
             peer.metrics().record_probe_delivered(TransportKind::Quic);
         }
         let snapshot = peer.metrics().snapshot_per_transport();
-        let tcp_cost = snapshot[&TransportKind::Tcp]
+        let tcp_cost = snapshot
+            .get(&TransportKind::Tcp)
+            .unwrap()
             .routing_cost(
                 ServiceLevel::BestEffort,
                 RoutingMetric::ConversationalQuality,
             )
             .unwrap();
-        let quic_cost = snapshot[&TransportKind::Quic]
+        let quic_cost = snapshot
+            .get(&TransportKind::Quic)
+            .unwrap()
             .routing_cost(
                 ServiceLevel::BestEffort,
                 RoutingMetric::ConversationalQuality,
@@ -7017,10 +7026,14 @@ mod tests {
         peer.metrics()
             .record_rtt(TransportKind::Kcp, Duration::from_millis(45));
         let snapshot = peer.metrics().snapshot_per_transport();
-        let raw_tcp = snapshot[&TransportKind::Tcp]
+        let raw_tcp = snapshot
+            .get(&TransportKind::Tcp)
+            .unwrap()
             .routing_cost(ServiceLevel::BestEffort, RoutingMetric::BestEffortCost)
             .unwrap();
-        let raw_kcp = snapshot[&TransportKind::Kcp]
+        let raw_kcp = snapshot
+            .get(&TransportKind::Kcp)
+            .unwrap()
             .routing_cost(ServiceLevel::BestEffort, RoutingMetric::BestEffortCost)
             .unwrap();
         assert!(raw_kcp < raw_tcp);
@@ -7218,7 +7231,9 @@ mod tests {
             .record_rtt(TransportKind::Kcp, Duration::from_millis(10));
 
         let snapshot = peer.metrics().snapshot_per_transport();
-        let raw = snapshot[&TransportKind::Kcp]
+        let raw = snapshot
+            .get(&TransportKind::Kcp)
+            .unwrap()
             .routing_cost(
                 ServiceLevel::Reliable,
                 RoutingMetric::ReliableLowLatencyCost,
@@ -7309,13 +7324,17 @@ mod tests {
             peer.metrics().record_probe_delivered(TransportKind::Quic);
         }
         let snapshot = peer.metrics().snapshot_per_transport();
-        let udp_cost = snapshot[&TransportKind::Udp]
+        let udp_cost = snapshot
+            .get(&TransportKind::Udp)
+            .unwrap()
             .routing_cost(
                 ServiceLevel::BestEffort,
                 RoutingMetric::ConversationalQuality,
             )
             .unwrap();
-        let quic_cost = snapshot[&TransportKind::Quic]
+        let quic_cost = snapshot
+            .get(&TransportKind::Quic)
+            .unwrap()
             .routing_cost(
                 ServiceLevel::BestEffort,
                 RoutingMetric::ConversationalQuality,
@@ -7967,7 +7986,9 @@ mod tests {
             .record_rtt(TransportKind::Kcp, Duration::from_millis(40));
         let snapshot = peer.metrics().snapshot_per_transport();
         let selection = TransportSelectionConfig::from(TransportRoutingPolicy::default());
-        let now = snapshot[&TransportKind::Kcp]
+        let now = snapshot
+            .get(&TransportKind::Kcp)
+            .unwrap()
             .last_update()
             .expect("KCP metric timestamp")
             + selection.kcp.failaway_with_alternative();
