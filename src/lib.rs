@@ -1,13 +1,9 @@
 pub use shitspeak_runtime::*;
 
-// The main and S2S runtimes otherwise contend on musl's shared malloc lock.
-#[cfg(all(
-    target_os = "linux",
-    target_env = "musl",
-    not(feature = "memory-profile")
-))]
+// Linux uses jemalloc; other platforms keep Rust's default allocator.
+#[cfg(all(target_os = "linux", not(feature = "memory-profile")))]
 #[global_allocator]
-static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(all(target_os = "linux", feature = "memory-profile"))]
 #[global_allocator]
