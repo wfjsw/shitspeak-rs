@@ -120,9 +120,7 @@ tracing = { workspace = true }
 mimalloc = "0.1.52"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-shitspeak-memory-profile = { path = "crates/shitspeak-memory-profile", optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.7"
 shitspeak-memory-profile = { path = "crates/shitspeak-memory-profile", optional = true }
 
 [dev-dependencies]
