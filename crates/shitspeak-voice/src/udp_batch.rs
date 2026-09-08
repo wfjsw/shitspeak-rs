@@ -9,6 +9,8 @@
 
 use std::net::SocketAddr;
 use std::time::Duration;
+use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 
 #[cfg(target_os = "linux")]
 use std::io;
@@ -30,6 +32,10 @@ struct QueuedDatagram {
 pub struct DatagramBatch {
     chunks: Vec<Vec<u8>>,
     datagrams: Vec<QueuedDatagram>,
+}
+
+thread_local! {
+    static BATCH_POOL: RefCell<Vec<ManuallyDrop<DatagramBatch>>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -60,26 +66,25 @@ impl FlushStats {
 
 impl DatagramBatch {
     pub fn new() -> Self {
-        Self {
-            chunks: Vec::new(),
-            datagrams: Vec::new(),
-        }
+        BATCH_POOL.with(|pool| pool.borrow_mut().pop().map(|mut b| {
+            let batch = unsafe { ManuallyDrop::take(&mut b) };
+            batch
+        })).unwrap_or_else(|| Self { chunks: Vec::new(), datagrams: Vec::new() })
     }
 
     pub fn with_capacity(datagram_capacity: usize) -> Self {
-        let mut chunks = Vec::new();
+        let mut batch = Self::new();
+        batch.datagrams.reserve(datagram_capacity);
         if datagram_capacity > 0 {
             let first_chunk_bytes = CHUNK_BYTES
                 .min(datagram_capacity.saturating_mul(MTU))
                 .max(MTU);
-            chunks.push(Vec::with_capacity(first_chunk_bytes));
+            if batch.chunks.is_empty() { batch.chunks.push(Vec::with_capacity(first_chunk_bytes)); }
         }
-
-        Self {
-            chunks,
-            datagrams: Vec::with_capacity(datagram_capacity),
-        }
+        batch
     }
+
+    pub fn clear(&mut self) { self.chunks.iter_mut().for_each(Vec::clear); self.datagrams.clear(); }
 
     pub fn is_empty(&self) -> bool {
         self.datagrams.is_empty()
@@ -155,6 +160,14 @@ impl DatagramBatch {
     fn data(&self, datagram: &QueuedDatagram) -> &[u8] {
         let chunk = &self.chunks[datagram.chunk];
         &chunk[datagram.offset..datagram.offset + datagram.len]
+    }
+}
+
+impl Drop for DatagramBatch {
+    fn drop(&mut self) {
+        self.clear();
+        let batch = unsafe { std::ptr::read(self) };
+        BATCH_POOL.with(|pool| pool.borrow_mut().push(ManuallyDrop::new(batch)));
     }
 }
 
