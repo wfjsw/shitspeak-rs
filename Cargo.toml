@@ -13,6 +13,7 @@ members = [
     "crates/shitspeak-s2s-transport",
     "crates/shitspeak-voice",
     "crates/shitspeak-web",
+    "crates/shitspeak-memory-profile",
     "crates/message_macro",
     "vendor/kcp",
     "vendor/tokio_kcp",
@@ -118,6 +119,9 @@ tracing = { workspace = true }
 [target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
 mimalloc = "0.1.52"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+shitspeak-memory-profile = { path = "crates/shitspeak-memory-profile", optional = true }
+
 [dev-dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }
@@ -137,6 +141,7 @@ zstd = { workspace = true }
 
 [features]
 default = []
+memory-profile = ["dep:shitspeak-memory-profile"]
 web = ["dep:shitspeak-web"]
 moq = ["web", "shitspeak-web/moq"]
 pre-release-workload = ["shitspeak-runtime/pre-release-workload"]
@@ -187,3 +192,8 @@ incremental = false
 
 [profile.bench]
 incremental = false
+
+[profile.diagnostic]
+inherits = "release"
+debug = 1
+strip = false
