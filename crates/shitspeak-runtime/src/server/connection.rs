@@ -1409,6 +1409,50 @@ mod client_snapshot_boundary_tests {
     use crate::client::state_log::ClientGlobalStateDelta;
     use crate::client_repository::ClientRepository;
 
+    #[tokio::test]
+    async fn idle_writer_retains_client_until_aborted() {
+        // The gateway fixture has the same outbound queues as a native client.
+        // No messages are sent, so this exercises the real writer's idle path
+        // without needing a TLS connection.
+        let (weak, abort) = {
+            let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+            let client = Arc::new(Client::new_web_gateway_in_server(
+                "default".to_owned(),
+                ClientSessionIdentifier::new(1, 1).unwrap(),
+                ip,
+                SocketAddr::new(ip, 30001),
+                SocketAddr::new(ip, 64738),
+                tx,
+            ));
+            let weak = Arc::downgrade(&client);
+            let writer = spawn_native_client_writer_task(&client).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while Arc::strong_count(&client) == 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("writer should acquire client and wait on empty queues");
+            // Leaving scope also detaches the JoinHandle, as cancellation of
+            // its owning future would. Keep only a cleanup abort handle.
+            (weak, writer.abort_handle())
+        };
+
+        tokio::task::yield_now().await;
+        let retained = weak.strong_count();
+        abort.abort();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborting writer should release the final client owner");
+        assert_eq!(retained, 1, "idle writer retains the sole client owner");
+        assert!(weak.upgrade().is_none());
+    }
+
     #[test]
     fn global_snapshot_start_clears_non_default_shadow_and_allows_reused_session_add() {
         let old_session = ClientSessionIdentifier::new(1, 7).unwrap();

@@ -1,6 +1,11 @@
 use clap::Parser;
 
 fn main() {
+    #[cfg(all(target_os = "linux", feature = "memory-profile"))]
+    let _memory_profile = shitspeak_rs::start_memory_profile().unwrap_or_else(|error| {
+        eprintln!("error starting memory profile: {error}");
+        std::process::exit(1);
+    });
     let worker_threads = shitspeak_runtime::runtime_workers::runtime_worker_allocation().main();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)

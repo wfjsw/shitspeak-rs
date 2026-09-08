@@ -1,0 +1,15 @@
+[package]
+name = "shitspeak-memory-profile"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mimalloc = { version = "=0.1.52", features = ["extended"] }
+backtrace = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = { workspace = true }
