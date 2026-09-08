@@ -191,20 +191,32 @@ async fn recvmmsg_linux(socket: &UdpSocket, batch: &mut RecvDatagramBatch) -> io
 
 #[cfg(target_os = "linux")]
 fn recvmmsg_chunk(fd: std::os::fd::RawFd, batch: &mut RecvDatagramBatch) -> io::Result<usize> {
+    RECV_MMSG_BUFFERS.with(|scratch| match scratch.try_borrow_mut() {
+        Ok(mut scratch) => recvmmsg_with_scratch(fd, batch, &mut scratch),
+        Err(_) => recvmmsg_with_scratch(fd, batch, &mut RecvMmsgBuffers::new()),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn recvmmsg_with_scratch(
+    fd: std::os::fd::RawFd,
+    batch: &mut RecvDatagramBatch,
+    scratch: &mut RecvMmsgBuffers,
+) -> io::Result<usize> {
     batch.clear();
 
     let cap = batch.capacity();
-    let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(cap);
-    let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(cap);
-    let mut sockaddrs: Vec<SocketAddrStorage> = (0..cap)
-        .map(|_| SocketAddrStorage {
-            storage: unsafe { std::mem::zeroed() },
-            len: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-        })
-        .collect();
+    scratch.msgs.clear();
+    scratch.iovecs.clear();
+    scratch.sockaddrs.clear();
+    scratch.sockaddrs.resize_with(cap, || SocketAddrStorage {
+        storage: unsafe { std::mem::zeroed() },
+        len: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+    });
 
+    // Refresh all pointers after resizing, even when a different batch uses this worker.
     for buffer in &mut batch.buffers {
-        iovecs.push(libc::iovec {
+        scratch.iovecs.push(libc::iovec {
             iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
             iov_len: buffer.len(),
         });
@@ -212,21 +224,21 @@ fn recvmmsg_chunk(fd: std::os::fd::RawFd, batch: &mut RecvDatagramBatch) -> io::
 
     for index in 0..cap {
         let mut msg: libc::mmsghdr = unsafe { std::mem::zeroed() };
-        msg.msg_hdr.msg_name = &mut sockaddrs[index].storage as *mut _ as *mut libc::c_void;
-        msg.msg_hdr.msg_namelen = sockaddrs[index].len;
-        msg.msg_hdr.msg_iov = &mut iovecs[index] as *mut libc::iovec;
+        msg.msg_hdr.msg_name = &mut scratch.sockaddrs[index].storage as *mut _ as *mut libc::c_void;
+        msg.msg_hdr.msg_namelen = scratch.sockaddrs[index].len;
+        msg.msg_hdr.msg_iov = &mut scratch.iovecs[index] as *mut libc::iovec;
         msg.msg_hdr.msg_iovlen = 1;
         msg.msg_hdr.msg_control = std::ptr::null_mut();
         msg.msg_hdr.msg_controllen = 0;
         msg.msg_hdr.msg_flags = 0;
-        msgs.push(msg);
+        scratch.msgs.push(msg);
     }
 
     let ret = unsafe {
         libc::recvmmsg(
             fd,
-            msgs.as_mut_ptr(),
-            msgs.len() as u32,
+            scratch.msgs.as_mut_ptr(),
+            scratch.msgs.len() as u32,
             libc::MSG_DONTWAIT as _,
             std::ptr::null_mut(),
         )
@@ -237,12 +249,36 @@ fn recvmmsg_chunk(fd: std::os::fd::RawFd, batch: &mut RecvDatagramBatch) -> io::
 
     let received = ret as usize;
     for index in 0..received {
-        sockaddrs[index].len = msgs[index].msg_hdr.msg_namelen;
-        let peer_addr = socket_addr_from_storage(&sockaddrs[index])?;
-        batch.push_received(index, msgs[index].msg_len as usize, peer_addr);
+        scratch.sockaddrs[index].len = scratch.msgs[index].msg_hdr.msg_namelen;
+        let peer_addr = socket_addr_from_storage(&scratch.sockaddrs[index])?;
+        batch.push_received(index, scratch.msgs[index].msg_len as usize, peer_addr);
     }
 
     Ok(received)
+}
+
+#[cfg(target_os = "linux")]
+struct RecvMmsgBuffers {
+    msgs: Vec<libc::mmsghdr>,
+    iovecs: Vec<libc::iovec>,
+    sockaddrs: Vec<SocketAddrStorage>,
+}
+
+#[cfg(target_os = "linux")]
+impl RecvMmsgBuffers {
+    const fn new() -> Self {
+        Self {
+            msgs: Vec::new(),
+            iovecs: Vec::new(),
+            sockaddrs: Vec::new(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    static RECV_MMSG_BUFFERS: std::cell::RefCell<RecvMmsgBuffers> =
+        const { std::cell::RefCell::new(RecvMmsgBuffers::new()) };
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -354,6 +390,32 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allocation_churn_receive_metadata_is_reused() {
+        use std::os::fd::AsRawFd;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut batch = RecvDatagramBatch::new(32, 64);
+        assert_eq!(
+            recvmmsg_chunk(socket.as_raw_fd(), &mut batch)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let allocations = shitspeak_test_support::count_allocations(|| {
+            for _ in 0..10 {
+                assert_eq!(
+                    recvmmsg_chunk(socket.as_raw_fd(), &mut batch)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::WouldBlock
+                );
+            }
+        });
+        assert_eq!(allocations, 0);
+    }
 
     #[tokio::test]
     async fn empty_batch_returns_zero_stats() {

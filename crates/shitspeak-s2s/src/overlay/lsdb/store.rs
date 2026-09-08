@@ -1017,6 +1017,7 @@ fn floor_path(dir: &Path) -> PathBuf {
 pub struct LinkStateDb {
     inner: RwLock<HashMap<NodeIdentifier, LsaEntry>>,
     revision: AtomicU64,
+    distribution_epoch_cache: RwLock<Option<(u64, u64)>>,
     floor: Arc<LsaFloor>,
     change_signal: Notify,
     dirty_origins: RwLock<HashSet<NodeIdentifier>>,
@@ -1032,6 +1033,7 @@ impl LinkStateDb {
         Self {
             inner: RwLock::new(HashMap::new()),
             revision: AtomicU64::new(0),
+            distribution_epoch_cache: RwLock::new(None),
             floor,
             change_signal: Notify::new(),
             dirty_origins: RwLock::new(HashSet::new()),
@@ -1145,6 +1147,14 @@ impl LinkStateDb {
         self.inner.read().get(&origin).cloned()
     }
 
+    pub(crate) fn with_entry<R>(
+        &self,
+        origin: NodeIdentifier,
+        f: impl FnOnce(&LsaEntry) -> R,
+    ) -> Option<R> {
+        self.inner.read().get(&origin).map(f)
+    }
+
     pub fn snapshot(&self) -> Vec<LsaEntry> {
         let mut out: Vec<LsaEntry> = self.inner.read().values().cloned().collect();
         out.sort_by_key(|e| e.origin);
@@ -1183,6 +1193,12 @@ impl LinkStateDb {
     /// route-quality changes remain subject to distribution hysteresis.
     pub fn distribution_epoch(&self) -> u64 {
         let entries = self.inner.read();
+        let revision = self.revision.load(Ordering::Relaxed);
+        if let Some((cached_revision, epoch)) = *self.distribution_epoch_cache.read() {
+            if cached_revision == revision {
+                return epoch;
+            }
+        }
         let mut active: Vec<_> = entries.values().filter(|entry| !entry.tombstone).collect();
         active.sort_by_key(|entry| entry.origin);
         let active_origins: HashSet<_> = active.iter().map(|entry| entry.origin).collect();
@@ -1222,7 +1238,9 @@ impl LinkStateDb {
                 distribution_epoch_hash_value(&mut hash, u64::from(link.neighbor));
             }
         }
-        hash.max(1)
+        let epoch = hash.max(1);
+        *self.distribution_epoch_cache.write() = Some((revision, epoch));
+        epoch
     }
 
     pub(crate) fn with_entries<R>(
@@ -1492,6 +1510,19 @@ mod tests {
         assert_eq!(db.admit(source), AdmissionResult::Accepted);
 
         assert_eq!(db.distribution_epoch(), before);
+    }
+
+    #[test]
+    fn allocation_churn_distribution_epoch_reuses_unchanged_revision() {
+        let db = LinkStateDb::new(Arc::new(LsaFloor::new(0, None)));
+        db.admit(entry(1, 100, 1, false));
+        let expected = db.distribution_epoch();
+        let allocations = shitspeak_test_support::count_allocations(|| {
+            for _ in 0..10 {
+                assert_eq!(db.distribution_epoch(), expected);
+            }
+        });
+        assert_eq!(allocations, 0);
     }
 
     #[test]

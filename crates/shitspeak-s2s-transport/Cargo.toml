@@ -44,6 +44,7 @@ x509-parser = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+shitspeak-test-support = { path = "../shitspeak-test-support" }
 tempfile = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

@@ -4514,6 +4514,7 @@ dependencies = [
  "shitspeak-s2s",
  "shitspeak-s2s-transport",
  "shitspeak-state",
+ "shitspeak-test-support",
  "shitspeak-voice",
  "socket2 0.6.4",
  "tempfile",
@@ -4571,6 +4572,7 @@ dependencies = [
  "shitspeak-proto",
  "shitspeak-s2s-transport",
  "shitspeak-state",
+ "shitspeak-test-support",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4605,6 +4607,7 @@ dependencies = [
  "serde_json",
  "shitspeak-core",
  "shitspeak-proto",
+ "shitspeak-test-support",
  "socket2 0.6.4",
  "tempfile",
  "thiserror 2.0.18",
@@ -4644,6 +4647,10 @@ dependencies = [
  "tokio",
  "tracing",
 ]
+
+[[package]]
+name = "shitspeak-test-support"
+version = "3.0.0"
 
 [[package]]
 name = "shitspeak-voice"

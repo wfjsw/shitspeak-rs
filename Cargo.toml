@@ -8,6 +8,7 @@ members = [
     "crates/shitspeak-proto",
     "crates/shitspeak-runtime-config",
     "crates/shitspeak-runtime",
+    "crates/shitspeak-test-support",
     "crates/shitspeak-state",
     "crates/shitspeak-s2s",
     "crates/shitspeak-s2s-transport",

@@ -230,7 +230,12 @@ impl MembershipTable {
     }
 
     pub fn snapshot_one(&self, node: NodeIdentifier) -> Option<MemberSnapshot> {
-        self.lsdb.get(node).map(|e| MemberSnapshot {
+        self.lsdb.with_entry(node, Self::member_snapshot)
+    }
+
+    /// Build the public member view while the LSDB entry is borrowed.
+    fn member_snapshot(e: &super::lsdb::LsaEntry) -> MemberSnapshot {
+        MemberSnapshot {
             node_id: e.origin,
             status: if e.tombstone {
                 MemberStatus::Left
@@ -247,7 +252,7 @@ impl MembershipTable {
             strict_replication_transit_protocol_version: e
                 .strict_replication_transit_protocol_version(),
             upper_layer_capabilities: e.upper_layer_capabilities().map(<[u8]>::to_vec),
-        })
+        }
     }
 
     /// IDs of every origin with a current non-tombstone LSA.
@@ -411,6 +416,20 @@ mod tests {
 
         assert_eq!(table.alive_max_users(), 300);
         assert_eq!(table.snapshot_one(1).unwrap().max_users(), 100);
+    }
+
+    #[test]
+    fn allocation_churn_member_projection_copies_capabilities_once() {
+        let lsdb = Arc::new(LinkStateDb::new(Arc::new(LsaFloor::new(0, None))));
+        let (table, _) = new_table(1, lsdb.clone(), 8);
+        let mut lsa = entry(2, 1, false, 100);
+        lsa.upper_layer_capabilities = Some(vec![7; 4096]);
+        lsdb.admit(lsa);
+        let allocations = shitspeak_test_support::count_allocations(|| {
+            let member = table.snapshot_one(2).unwrap();
+            assert_eq!(member.upper_layer_capabilities().unwrap().len(), 4096);
+        });
+        assert_eq!(allocations, 1);
     }
 
     #[test]

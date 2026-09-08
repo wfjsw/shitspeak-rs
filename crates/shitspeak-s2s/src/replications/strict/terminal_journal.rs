@@ -1866,12 +1866,13 @@ impl TerminalJournal {
         if self.is_retired(op_id) {
             return Ok(DeliveryDisposition::AlreadyApplied);
         }
-        let previous = self.records.get(&op_id).cloned().ok_or(
-            TerminalJournalError::DeliveryRequiresCommit {
-                op_id_hi: op_id.0,
-                op_id_lo: op_id.1,
-            },
-        )?;
+        let previous =
+            self.records
+                .get(&op_id)
+                .ok_or(TerminalJournalError::DeliveryRequiresCommit {
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                })?;
         if !matches!(
             previous.terminal_decision(),
             Some(TerminalDecision::Commit { .. })
@@ -1903,7 +1904,7 @@ impl TerminalJournal {
         }
         let mut next = previous.clone();
         next.delivery_version = Some(repository_version);
-        self.persist_record_replacement(op_id, previous, next)?;
+        self.persist_record_replacement(op_id, next)?;
         Ok(DeliveryDisposition::Apply)
     }
 
@@ -1915,12 +1916,13 @@ impl TerminalJournal {
         if self.is_retired(op_id) {
             return Ok(());
         }
-        let previous = self.records.get(&op_id).cloned().ok_or(
-            TerminalJournalError::DeliveryRequiresCommit {
-                op_id_hi: op_id.0,
-                op_id_lo: op_id.1,
-            },
-        )?;
+        let previous =
+            self.records
+                .get(&op_id)
+                .ok_or(TerminalJournalError::DeliveryRequiresCommit {
+                    op_id_hi: op_id.0,
+                    op_id_lo: op_id.1,
+                })?;
         if previous.delivery_version() != Some(repository_version) {
             return Err(TerminalJournalError::ConflictingDeliveryVersion {
                 op_id_hi: op_id.0,
@@ -1932,7 +1934,7 @@ impl TerminalJournal {
         }
         let mut next = previous.clone();
         next.delivered = true;
-        self.persist_record_replacement(op_id, previous, next)
+        self.persist_record_replacement(op_id, next)
     }
 
     /// Resolve intents immediately after loading the repository and before
@@ -2035,7 +2037,6 @@ impl TerminalJournal {
     fn persist_record_replacement(
         &mut self,
         op_id: TerminalJournalOpId,
-        previous: TerminalJournalRecord,
         next: TerminalJournalRecord,
     ) -> Result<(), TerminalJournalError> {
         let cut = self.terminal_cut();
@@ -2043,7 +2044,10 @@ impl TerminalJournal {
             store.upsert_record(op_id, &next, &cut)?;
         }
         debug_assert_eq!(
-            canonical_terminal_decision_digest(op_id, &previous),
+            canonical_terminal_decision_digest(
+                op_id,
+                self.records.get(&op_id).expect("delivery record exists")
+            ),
             canonical_terminal_decision_digest(op_id, &next)
         );
         self.records.insert(op_id, next);
@@ -3708,6 +3712,23 @@ mod tests {
     use bytes::Bytes;
     use rusqlite::{Connection, params};
     use tempfile::TempDir;
+
+    #[test]
+    fn allocation_churn_idempotent_delivery_does_not_clone_payloads() {
+        let mut journal = super::TerminalJournal::in_memory("channels".to_owned());
+        journal
+            .upsert_commit_decision((1, 1), 1, 1, vec![7; 65536])
+            .unwrap();
+        journal.begin_delivery((1, 1), 1).unwrap();
+        journal.finish_delivery((1, 1), 1).unwrap();
+        let allocations = shitspeak_test_support::count_allocations(|| {
+            for _ in 0..10 {
+                journal.begin_delivery((1, 1), 1).unwrap();
+                journal.finish_delivery((1, 1), 1).unwrap();
+            }
+        });
+        assert_eq!(allocations, 0);
+    }
 
     use super::{
         FrozenTarget, RepositoryImageInstallIntent, StagedTerminalDecision, TerminalDecision,

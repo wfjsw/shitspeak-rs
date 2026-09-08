@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use prost::Message;
 use reqwest::header::{HeaderMap, HeaderValue};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1053,7 +1053,7 @@ pub fn spawn_remote_write(
                 .await
             {
                 for bytes in bodies {
-                    retry_cache.push_back(bytes);
+                    retry_cache.push_back(Bytes::from(bytes));
                     trim_retry_cache(&mut retry_cache, config.retry_cache_capacity.max(1));
                 }
             }
@@ -1216,7 +1216,7 @@ async fn send_remote_write(
     client: &reqwest::Client,
     config: &RemoteWriteConfig,
     url: &str,
-    body: Vec<u8>,
+    body: Bytes,
 ) -> RemoteWriteSendResult {
     let headers = match remote_write_headers(config) {
         Ok(headers) => headers,
@@ -1365,7 +1365,7 @@ pub fn now_unix_ms() -> i64 {
         .unwrap_or_default()
 }
 
-fn trim_retry_cache(cache: &mut VecDeque<Vec<u8>>, capacity: usize) {
+fn trim_retry_cache(cache: &mut VecDeque<Bytes>, capacity: usize) {
     while cache.len() > capacity {
         cache.pop_front();
     }
@@ -1388,7 +1388,11 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 fn snappy_compress_block(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len() + 16);
+    let mut out = Vec::with_capacity(
+        input.len()
+            + input.len().div_ceil(60)
+            + prost::encoding::encoded_len_varint(input.len() as u64),
+    );
     write_varint(input.len() as u64, &mut out);
     let mut offset = 0usize;
     while offset < input.len() {
@@ -1464,6 +1468,22 @@ mod tests {
         let body = b"abc";
         let compressed = snappy_compress_block(body);
         assert_eq!(compressed, vec![3, 8, b'a', b'b', b'c']);
+    }
+
+    #[test]
+    fn allocation_churn_snappy_reserves_the_complete_literal_block() {
+        for len in [0usize, 60, 61, 127, 128, 1024, 65537] {
+            let input = vec![7; len];
+            let allocations = shitspeak_test_support::count_allocations(|| {
+                let encoded = snappy_compress_block(&input);
+                assert_eq!(
+                    encoded.len(),
+                    len + len.div_ceil(60) + prost::encoding::encoded_len_varint(len as u64)
+                );
+                std::hint::black_box(encoded);
+            });
+            assert_eq!(allocations, 1, "literal block size {len}");
+        }
     }
 
     #[test]

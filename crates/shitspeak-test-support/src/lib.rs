@@ -39,7 +39,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-pub(crate) fn count_allocations(run: impl FnOnce()) -> usize {
+pub fn count_allocations(run: impl FnOnce()) -> usize {
     struct Reset;
 
     impl Drop for Reset {

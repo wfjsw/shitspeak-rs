@@ -72,6 +72,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+shitspeak-test-support = { path = "../shitspeak-test-support" }
 criterion = { workspace = true }
 rcgen = { workspace = true }
 shitspeak-s2s = { workspace = true, features = ["test-support"] }

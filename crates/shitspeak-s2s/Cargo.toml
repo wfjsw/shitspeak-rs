@@ -41,6 +41,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+shitspeak-test-support = { path = "../shitspeak-test-support" }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 shitspeak-s2s-transport = { workspace = true, features = ["test-support"] }

@@ -86,6 +86,7 @@ mod integration_tests;
 #[cfg(test)]
 mod allocation_test;
 
+#[cfg(any(test, feature = "test-support"))]
 pub use adaptive_queue::{AdaptiveQueueBudget, AdaptiveQueueReceiver, AdaptiveQueueSender};
 pub use compression::SendOptions;
 pub use config::{KcpTuning, TransportConfig, TransportRoutingPolicy, TransportTuning};
