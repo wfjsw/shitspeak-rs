@@ -1789,6 +1789,10 @@ async fn route_voice_inner(
         return;
     }
 
+    // Enqueue the S2S copy before handing the packet to the local fan-out
+    // queue.  The local queue is asynchronous and may begin delivery as soon
+    // as it is populated, so keep this ordering adjacent to the two enqueue
+    // operations to preserve S2S-first delivery for every packet.
     if send_s2s && has_authorized_s2s_target {
         let encode_started_at = Instant::now();
         let payload = encode_s2s_voice_payload(audio);
