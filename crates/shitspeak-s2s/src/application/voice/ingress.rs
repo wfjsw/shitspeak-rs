@@ -99,6 +99,7 @@ struct RepairRequestState {
     requested_page_last: Option<u64>,
     retry_interval: Duration,
     next_attempt: Instant,
+    deadline: Instant,
     send_cancel: CancellationToken,
     in_flight_generation: Option<u64>,
 }
@@ -546,7 +547,7 @@ pub struct VoiceService {
     /// by composite `ClientSessionIdentifier::to_u32()`.
     seq_counters: Arc<SccMap<u32, AtomicU64>>,
 
-    /// Sender-side FEC block windows per (sender_session, sender_epoch).
+    /// Sender-side FEC windows per speaker, link, and recipient set.
     fec_sender: Arc<fec::FecSenderState>,
 
     /// Receiver-side delivery callback. Hot-swappable so the `Server`
@@ -623,6 +624,11 @@ impl VoiceService {
         sender_epoch: u64,
         max_users: Arc<AtomicU64>,
     ) -> Arc<Self> {
+        let transport: Arc<dyn VoiceTransport> = Arc::new(send::FecVoiceTransport::new(
+            transport,
+            &cfg,
+            shutdown.clone(),
+        ));
         let voice_budget = AdaptiveVoiceBudget::with_repair_reservations(
             max_users.clone(),
             cfg.repair_reactive_reserve_pct,
@@ -701,7 +707,6 @@ impl VoiceService {
         });
         let delivery_strategy = DeliveryStrategy::parse(&cfg.delivery_strategy);
         let fec_sender = Arc::new(fec::FecSenderState::new(
-            cfg.voice_fec_enabled,
             cfg.voice_fec_block_size,
             cfg.voice_fec_parity_blocks,
         ));
@@ -1409,23 +1414,9 @@ impl VoiceService {
     }
 
     /// Feed the just-sent frame into the sender FEC window and, when a block
-    /// completes, emit one parity copy per first hop whose live voice-lane
-    /// loss clears the `voice_fec_loss_gate_ppm` gate. The gate fires on the
-    /// effective loss of the routing-selected transport
-    /// (`VoiceRouteQuality::loss_ppm`) — the lane that actually carries the
-    /// best-effort voice and its parity copies. Keying FEC on a separate
-    /// "datagram lane" (UDP) instead is wrong: that lane degrades
-    /// independently of the voice transport, so it fires FEC at times the
-    /// voice lane has no loss to recover (production 4->8: the UDP-degradation
-    /// windows did not align with the listener's reorder gaps, and FEC
-    /// recovered ~nothing). KCP is never a voice lane. Parity copies are
-    /// bounded by the per-first-hop `voice_overlap` lane-headroom budget
-    /// inside the transport, so a healthy lane pays nothing and a lossy lane
-    /// gets bounded redundancy. A second, send-path pressure gate skips a
-    /// first hop while its datagram lane is evicting at the write path
-    /// (`VoiceRouteQuality::datagram_lane_shedding`): under sustained
-    /// offered > drain the parity would be shed before the wire, so emitting
-    /// it only adds load to the lane already failing to drain.
+    /// completes, emit parity per first hop using an unreliable voice
+    /// transport. Measured loss does not gate protection. Send-path pressure
+    /// and the transport's lane-headroom budget still bound redundancy.
     async fn emit_fec_if_due(
         &self,
         sender_session: u32,
@@ -1438,19 +1429,10 @@ impl VoiceService {
         if !self.cfg.voice_fec_enabled {
             return;
         }
-        let Some(block) = self.fec_sender.push(
-            sender_session,
-            self.sender_epoch,
-            seq,
-            payload.clone(),
-            is_terminator,
-        ) else {
-            return;
-        };
         // Group destinations by first hop. The parity copy uses the same
         // first hop its block's data frames used, so the receiver's FEC
         // mirror keys `(sender_session, sender_epoch, from)` align.
-        let mut hops: HashMap<NodeIdentifier, (Vec<NodeIdentifier>, u32, bool)> = HashMap::new();
+        let mut hops: HashMap<NodeIdentifier, (Vec<NodeIdentifier>, bool)> = HashMap::new();
         let qualities = repair_context
             .map(|context| context.route_qualities.as_slice())
             .unwrap_or(&[]);
@@ -1458,13 +1440,26 @@ impl VoiceService {
             let Some(quality) = qualities.get(index).copied().flatten() else {
                 continue;
             };
+            if quality.reliable() {
+                continue;
+            }
             let entry = hops.entry(quality.next_hop()).or_default();
             entry.0.push(dst);
-            entry.1 = entry.1.max(Self::fec_gate_loss_ppm(quality));
-            entry.2 |= quality.datagram_lane_shedding();
+            entry.1 |= quality.datagram_lane_shedding();
         }
         let ttl = self.cfg.transport_ttl();
-        for (&first_hop, (hop_dsts, gate_loss_ppm, shedding)) in &hops {
+        for (&first_hop, (hop_dsts, shedding)) in &hops {
+            let Some(block) = self.fec_sender.push(
+                first_hop,
+                hop_dsts,
+                sender_session,
+                self.sender_epoch,
+                seq,
+                payload.clone(),
+                is_terminator,
+            ) else {
+                continue;
+            };
             // Send-path pressure gate: while the first-hop datagram lane is
             // evicting (frames shed before the wire), parity sent over it would
             // be shed too — emitting it only adds offered load to the lane
@@ -1472,22 +1467,19 @@ impl VoiceService {
             if *shedding {
                 continue;
             }
-            if u64::from(*gate_loss_ppm) < u64::from(self.cfg.voice_fec_loss_gate_ppm) {
-                continue;
-            }
             // Emit every configured parity index (0 = XOR sum, and with
             // `voice_fec_parity_blocks = 2`, 1 = GF-weighted sum) to each
             // first hop that cleared the gate. A `None` encode (index not
             // built into this block) skips silently.
             for index in 0..self.cfg.voice_fec_parity_blocks {
-                let Some(parity_body) = self.encode_fec_parity(sender_session, index, &block)
+                let Some(parity_body) = block.encode(sender_session, self.sender_epoch, index)
                 else {
                     continue;
                 };
                 let parity_len = parity_body.len();
                 let outcome = self
                     .transport
-                    .send_fec_frame(hop_dsts, Some(first_hop), parity_body, ttl)
+                    .send_fec_frame(hop_dsts, Some(first_hop), None, parity_body, ttl)
                     .await;
                 metrics::record_fec_send(
                     self.transport.local_node_id(),
@@ -1497,61 +1489,6 @@ impl VoiceService {
                 );
             }
         }
-    }
-
-    /// Encode a FEC parity frame from a completed block for one parity index.
-    /// Index 0 is the plain XOR sum, index 1 the GF(2^8) weighted sum (present
-    /// only when the block was built with `voice_fec_parity_blocks = 2`). The
-    /// frame carries the block's member seqs and terminator mask; its own
-    /// `s2s_seq` is the completing member's seq (debug only, not part of the
-    /// data sequence). `None` when the block has no payload for that index or
-    /// the frame cannot be encoded.
-    fn encode_fec_parity(
-        &self,
-        sender_session: u32,
-        index: usize,
-        block: &fec::FecBlockToSend,
-    ) -> Option<Bytes> {
-        let payload = match index {
-            0 => block.parity.clone(),
-            1 => block.parity2.clone()?,
-            _ => return None,
-        };
-        let frame = VoiceFrame {
-            sender_session,
-            server_id: String::new(),
-            sender_epoch: self.sender_epoch,
-            s2s_seq: block.member_seqs.last().copied().unwrap_or(0),
-            target_kind: 0,
-            is_terminator: false,
-            payload,
-            intent: None,
-            proactive_copy: false,
-            fec_parity: true,
-            fec_member_seqs: block.member_seqs.clone(),
-            fec_terminator_mask: block.terminator_mask,
-            fec_parity_index: index as u32,
-        };
-        Some(Bytes::from(proto::encode_voice(&frame).ok()?))
-    }
-
-    /// Effective loss the FEC gate should fire on for a first hop: the
-    /// routing-selected transport's effective loss — the lane that best-effort
-    /// voice and its parity copies actually ride (`voice_transport_binding`).
-    /// On QUIC that lane is the transport's unreliable *datagram* sub-lane
-    /// (RFC 9221; voice is never retransmitted), and `loss_ppm()` reflects it:
-    /// the QUIC native-loss sampler reads quinn path stats, which count
-    /// datagram-bearing packets lost on the path. The send never leaves that
-    /// lane: `deadline_queue_penalty` is hard zero for BestEffort on a QUIC
-    /// v2 datagram lane, so queue pressure does not redirect voice off the
-    /// routing-selected transport. So the gate keys on the real voice lane on
-    /// every transport kind — a QUIC voice lane that starts dropping crosses
-    /// the gate and gets parity. A degraded UDP datagram lane is not a signal
-    /// the voice lane is degrading: it moves independently (4->8:
-    /// UDP-degradation windows did not align with the listener's reorder
-    /// gaps, and FEC recovered ~nothing), and KCP is never a voice lane.
-    fn fec_gate_loss_ppm(quality: VoiceRouteQuality) -> u32 {
-        quality.loss_ppm()
     }
 
     fn remote_voice_members(&self) -> Vec<NodeIdentifier> {
@@ -1734,7 +1671,9 @@ impl VoiceService {
                 continue;
             };
             let extra_copies = proactive_repair_extra_copy_count(
-                self.cfg.repair_max_extra_copies_per_frame.min(2),
+                // Route quality exposes one alternate, so at most one extra
+                // copy can use a distinct link.
+                self.cfg.repair_max_extra_copies_per_frame.min(1),
                 original_need_micros,
                 proactive_repair_sample(dst, s2s_seq),
             );
@@ -1744,6 +1683,12 @@ impl VoiceService {
                 .unwrap_or(repair_context.deadline_origin);
             let remaining = expires_at.saturating_duration_since(allocation_now);
             let Some(quality) = quality else {
+                continue;
+            };
+            let Some(repair_first_hop) = quality
+                .alternate_next_hop()
+                .filter(|hop| *hop != quality.next_hop())
+            else {
                 continue;
             };
             for copy_index in 0..extra_copies {
@@ -1759,7 +1704,7 @@ impl VoiceService {
                 }
                 candidates.push(ProactiveRepairCandidate {
                     dst,
-                    repair_first_hop: quality.alternate_next_hop().unwrap_or(dst),
+                    repair_first_hop,
                     avoid_first_hop,
                     expires_at,
                     marginal_utility_micros,
@@ -1851,7 +1796,7 @@ impl VoiceService {
     }
 
     fn capture_repair_frame_context(&self, dsts: &[NodeIdentifier]) -> Option<RepairFrameContext> {
-        if !self.cfg.repair_enabled {
+        if !self.cfg.repair_enabled && !self.cfg.voice_fec_enabled {
             return None;
         }
         let deadline_origin = Instant::now();
@@ -2255,9 +2200,7 @@ fn spawn_dispatch_task(
                                 ));
                         }
                         report
-                    } else if !fec_enabled && is_parity {
-                        // FEC disabled on this receiver but a parity frame
-                        // arrived (mixed fleet): it is not audio, drop it.
+                    } else if is_parity {
                         reorder::ReorderReport::empty()
                     } else {
                         if fec_enabled {
@@ -2892,10 +2835,8 @@ async fn send_tail_repair_frame(
         RepairDestinationStage::Requested,
         body.len(),
     );
-    let quality = transport.voice_route_quality(key.destination);
-    let avoid_first_hop = quality
-        .filter(|quality| quality.alternate_next_hop().is_some())
-        .map(|quality| quality.next_hop());
+    let quality = transport.voice_repair_route_quality(key.destination);
+    let avoid_first_hop = quality.map(|quality| quality.next_hop());
     let credit_reservation = reserve_repair_route_credit(
         transport.local_node_id(),
         voice_budget,
@@ -3124,190 +3065,213 @@ fn tail_repair_lifetime(cfg: &VoiceConfig) -> Duration {
 }
 
 fn spawn_repair_request_worker(
+    rx: mpsc::Receiver<GapReport>,
+    reorderer: Arc<Reorderer>,
+    transport: Arc<dyn VoiceTransport>,
+    request_ttl_ms: u64,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(run_repair_request_worker(
+        rx,
+        reorderer,
+        transport,
+        request_ttl_ms,
+        shutdown,
+    ));
+}
+
+async fn run_repair_request_worker(
     mut rx: mpsc::Receiver<GapReport>,
     reorderer: Arc<Reorderer>,
     transport: Arc<dyn VoiceTransport>,
     request_ttl_ms: u64,
     shutdown: CancellationToken,
 ) {
-    tokio::spawn(async move {
-        let source = transport.local_node_id();
-        let mut active = HashMap::<RepairRequestKey, RepairRequestState>::new();
-        let mut jobs = tokio::task::JoinSet::<(RepairRequestKey, u64, u64, bool)>::new();
-        let mut next_generation = 0_u64;
-        let mut ticker = tokio::time::interval(REPAIR_REQUEST_POLL_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                gap = rx.recv() => {
-                    let Some(gap) = gap else { return; };
-                    let key = RepairRequestKey::new(gap);
-                    let stale = active
-                        .iter()
-                        .filter_map(|(key, state)| {
-                            reorderer
-                                .current_actionable_gap(
-                                    state.from,
-                                    key.sender_session,
-                                    key.sender_epoch,
-                                )
-                                .is_none()
-                                .then_some(*key)
-                        })
-                        .collect::<Vec<_>>();
-                    for stale_key in stale {
-                        if let Some(state) = active.remove(&stale_key) {
-                            state.send_cancel.cancel();
-                        }
-                    }
-                    if let Some(state) = active.get_mut(&key) {
-                        state.from = gap.from;
-                    } else if active.len() >= REPAIR_REQUEST_MAX_STREAMS {
-                        metrics::record_repair(
-                            source,
-                            key.destination,
-                            VoiceRepairResult::RequestSuppressed,
-                            1,
-                        );
-                    } else if let Some(actionable) = reorderer.current_actionable_gap(
-                        gap.from,
-                        gap.sender_session,
-                        gap.sender_epoch,
-                    ) {
-                        let now = Instant::now();
-                        let current = actionable.gap();
-                        let remaining = actionable.deadline().saturating_duration_since(now);
-                        active.insert(
-                            key,
-                            RepairRequestState {
-                                from: gap.from,
-                                tracked_first_seq: current.first_seq,
-                                attempts: 0,
-                                requested_page_last: None,
-                                retry_interval: repair_request_retry_interval(remaining),
-                                next_attempt: now,
-                                send_cancel: CancellationToken::new(),
-                                in_flight_generation: None,
-                            },
-                        );
-                    } else {
-                        metrics::record_repair(
-                            source,
-                            key.destination,
-                            VoiceRepairResult::RequestSuppressed,
-                            1,
-                        );
+    let source = transport.local_node_id();
+    let mut active = HashMap::<RepairRequestKey, RepairRequestState>::new();
+    let mut jobs = tokio::task::JoinSet::<(RepairRequestKey, u64, u64, bool)>::new();
+    let mut next_generation = 0_u64;
+    loop {
+        let wake_at = active
+            .values()
+            .map(|state| state.next_attempt.min(state.deadline))
+            .min();
+        let sleep = tokio::time::sleep_until(
+            wake_at
+                .map(tokio::time::Instant::from_std)
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600)),
+        );
+        tokio::pin!(sleep);
+        let repair_notify = reorderer.repair_notify();
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            gap = rx.recv() => {
+                let Some(gap) = gap else { return; };
+                let key = RepairRequestKey::new(gap);
+                let stale = active
+                    .iter()
+                    .filter_map(|(key, state)| {
+                        reorderer
+                            .current_actionable_gap(
+                                state.from,
+                                key.sender_session,
+                                key.sender_epoch,
+                            )
+                            .is_none()
+                            .then_some(*key)
+                    })
+                    .collect::<Vec<_>>();
+                for stale_key in stale {
+                    if let Some(state) = active.remove(&stale_key) {
+                        state.send_cancel.cancel();
                     }
                 }
-                result = jobs.join_next(), if !jobs.is_empty() => {
-                    match result {
-                        Some(Ok((key, generation, first_seq, sent))) => {
-                            if let Some(state) = active.get_mut(&key)
-                                && state.in_flight_generation == Some(generation)
-                            {
-                                state.in_flight_generation = None;
-                                if sent && state.tracked_first_seq == first_seq {
-                                    state.attempts = state.attempts.saturating_add(1);
-                                }
+                if let Some(state) = active.get_mut(&key) {
+                    state.from = gap.from;
+                } else if active.len() >= REPAIR_REQUEST_MAX_STREAMS {
+                    metrics::record_repair(
+                        source,
+                        key.destination,
+                        VoiceRepairResult::RequestSuppressed,
+                        1,
+                    );
+                } else if let Some(actionable) = reorderer.current_actionable_gap(
+                    gap.from,
+                    gap.sender_session,
+                    gap.sender_epoch,
+                ) {
+                    let now = Instant::now();
+                    let current = actionable.gap();
+                    let remaining = actionable.deadline().saturating_duration_since(now);
+                    active.insert(
+                        key,
+                        RepairRequestState {
+                            from: gap.from,
+                            tracked_first_seq: current.first_seq,
+                            attempts: 0,
+                            requested_page_last: None,
+                            retry_interval: repair_request_retry_interval(remaining),
+                            next_attempt: now,
+                            deadline: actionable.deadline(),
+                            send_cancel: CancellationToken::new(),
+                            in_flight_generation: None,
+                        },
+                    );
+                } else {
+                    metrics::record_repair(
+                        source,
+                        key.destination,
+                        VoiceRepairResult::RequestSuppressed,
+                        1,
+                    );
+                }
+            }
+            result = jobs.join_next(), if !jobs.is_empty() => {
+                match result {
+                    Some(Ok((key, generation, first_seq, sent))) => {
+                        if let Some(state) = active.get_mut(&key)
+                            && state.in_flight_generation == Some(generation)
+                        {
+                            state.in_flight_generation = None;
+                            if sent && state.tracked_first_seq == first_seq {
+                                state.attempts = state.attempts.saturating_add(1);
                             }
                         }
-                        Some(Err(error)) => {
-                            trace!(%error, "voice repair: request job failed");
-                        }
-                        None => {}
                     }
+                    Some(Err(error)) => {
+                        trace!(%error, "voice repair: request job failed");
+                    }
+                    None => {}
                 }
-                _ = ticker.tick() => {}
             }
+            _ = repair_notify.notified() => {}
+            _ = &mut sleep => {}
+        }
 
-            let now = Instant::now();
-            let mut remove = Vec::new();
-            let mut due = Vec::new();
-            let mut slots = REPAIR_REQUEST_MAX_CONCURRENCY.saturating_sub(jobs.len());
-            let keys = active.keys().copied().collect::<Vec<_>>();
-            for key in keys {
-                let Some(state) = active.get_mut(&key) else {
-                    continue;
-                };
-                let Some(actionable) = reorderer.current_actionable_gap(
-                    state.from,
-                    key.sender_session,
-                    key.sender_epoch,
-                ) else {
-                    remove.push(key);
-                    continue;
-                };
-                let gap = actionable.gap();
-                let deadline = actionable.deadline();
-                if gap.first_seq != state.tracked_first_seq {
-                    state.tracked_first_seq = gap.first_seq;
-                    state.attempts = 0;
-                    let remaining = deadline.saturating_duration_since(now);
-                    state.retry_interval = repair_request_retry_interval(remaining);
-                    if state
-                        .requested_page_last
-                        .is_some_and(|last| gap.first_seq > last)
-                    {
-                        state.requested_page_last = None;
-                    }
-                    state.next_attempt = now + REPAIR_REQUEST_POLL_INTERVAL.min(remaining);
-                }
-                if slots == 0
-                    || state.in_flight_generation.is_some()
-                    || state.attempts >= REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE
-                    || state.next_attempt > now
+        let now = Instant::now();
+        let mut remove = Vec::new();
+        let mut due = Vec::new();
+        let mut slots = REPAIR_REQUEST_MAX_CONCURRENCY.saturating_sub(jobs.len());
+        let keys = active.keys().copied().collect::<Vec<_>>();
+        for key in keys {
+            let Some(state) = active.get_mut(&key) else {
+                continue;
+            };
+            let Some(actionable) =
+                reorderer.current_actionable_gap(state.from, key.sender_session, key.sender_epoch)
+            else {
+                remove.push(key);
+                continue;
+            };
+            let gap = actionable.gap();
+            let deadline = actionable.deadline();
+            if gap.first_seq != state.tracked_first_seq {
+                state.tracked_first_seq = gap.first_seq;
+                state.attempts = 0;
+                let remaining = deadline.saturating_duration_since(now);
+                state.retry_interval = repair_request_retry_interval(remaining);
+                if state
+                    .requested_page_last
+                    .is_some_and(|last| gap.first_seq > last)
                 {
-                    continue;
+                    state.requested_page_last = None;
                 }
-                let page_last = state.requested_page_last.unwrap_or_else(|| {
-                    gap.last_seq.min(
-                        gap.first_seq
-                            .saturating_add(REPAIR_RESPONSE_PAGE_SEQUENCES.saturating_sub(1)),
-                    )
-                });
-                state.requested_page_last = Some(page_last);
-                state.next_attempt = now + state.retry_interval;
-                let generation = next_generation;
-                next_generation = next_generation.wrapping_add(1);
-                state.in_flight_generation = Some(generation);
-                due.push((
-                    key,
-                    key.destination,
-                    GapReport {
-                        last_seq: gap.last_seq.min(page_last),
-                        ..gap
-                    },
-                    state.send_cancel.clone(),
-                    generation,
-                    deadline,
-                ));
-                slots -= 1;
+                state.next_attempt = now + REPAIR_REQUEST_POLL_INTERVAL.min(remaining);
             }
-            for key in remove {
-                if let Some(state) = active.remove(&key) {
-                    state.send_cancel.cancel();
-                }
+            if slots == 0
+                || state.in_flight_generation.is_some()
+                || state.attempts >= REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE
+                || state.next_attempt > now
+            {
+                continue;
             }
-            for (key, destination, gap, send_cancel, generation, deadline) in due {
-                let transport = transport.clone();
-                jobs.spawn(async move {
-                    let sent = tokio::select! {
-                        _ = send_cancel.cancelled() => false,
-                        sent = send_repair_request_attempt(
-                            source,
-                            destination,
-                            gap,
-                            transport,
-                            request_ttl_ms,
-                            deadline,
-                        ) => sent,
-                    };
-                    (key, generation, gap.first_seq, sent)
-                });
+            let page_last = state.requested_page_last.unwrap_or_else(|| {
+                gap.last_seq.min(
+                    gap.first_seq
+                        .saturating_add(REPAIR_RESPONSE_PAGE_SEQUENCES.saturating_sub(1)),
+                )
+            });
+            state.requested_page_last = Some(page_last);
+            state.next_attempt = now + state.retry_interval;
+            let generation = next_generation;
+            next_generation = next_generation.wrapping_add(1);
+            state.in_flight_generation = Some(generation);
+            due.push((
+                key,
+                key.destination,
+                GapReport {
+                    last_seq: gap.last_seq.min(page_last),
+                    ..gap
+                },
+                state.send_cancel.clone(),
+                generation,
+                deadline,
+            ));
+            slots -= 1;
+        }
+        for key in remove {
+            if let Some(state) = active.remove(&key) {
+                state.send_cancel.cancel();
             }
         }
-    });
+        for (key, destination, gap, send_cancel, generation, deadline) in due {
+            let transport = transport.clone();
+            jobs.spawn(async move {
+                let sent = tokio::select! {
+                    _ = send_cancel.cancelled() => false,
+                    sent = send_repair_request_attempt(
+                        source,
+                        destination,
+                        gap,
+                        transport,
+                        request_ttl_ms,
+                        deadline,
+                    ) => sent,
+                };
+                (key, generation, gap.first_seq, sent)
+            });
+        }
+    }
 }
 
 fn repair_request_retry_interval(remaining: Duration) -> Duration {
@@ -3628,8 +3592,7 @@ async fn send_repair_response(
     let destination = work.from;
     let repair_deadline = work.deadline;
     let avoid_first_hop = transport
-        .voice_route_quality(destination)
-        .filter(|quality| quality.transport() == TransportKind::Udp)
+        .voice_repair_route_quality(destination)
         .map(|quality| quality.next_hop());
     let body = frame.body().clone();
     let mut accepted = send_budgeted_repair_frame(
@@ -3644,20 +3607,6 @@ async fn send_repair_response(
         transport_slots.as_ref(),
     )
     .await;
-    if !accepted && avoid_first_hop.is_some() {
-        accepted = send_budgeted_repair_frame(
-            transport.as_ref(),
-            voice_budget,
-            destination,
-            body.clone(),
-            None,
-            ttl,
-            repair_deadline,
-            true,
-            transport_slots.as_ref(),
-        )
-        .await;
-    }
     if !accepted {
         tokio::task::yield_now().await;
         accepted = send_budgeted_repair_frame(
@@ -3665,7 +3614,7 @@ async fn send_repair_response(
             voice_budget,
             destination,
             body,
-            None,
+            avoid_first_hop,
             ttl,
             repair_deadline,
             true,
@@ -3695,50 +3644,30 @@ async fn reserve_repair_route_credit(
     deadline: Instant,
     retry: bool,
 ) -> Option<(ProactiveCreditPermit, Option<NodeIdentifier>)> {
-    let primary_hop = quality
-        .map(|quality| quality.next_hop())
-        .unwrap_or(destination);
+    let quality = quality?;
+    let primary_hop = avoid_first_hop?;
+    if quality.next_hop() != primary_hop {
+        return None;
+    }
     let alternate_hop = quality
-        .filter(|quality| avoid_first_hop == Some(quality.next_hop()))
-        .and_then(|quality| quality.alternate_next_hop())
-        .filter(|hop| *hop != primary_hop);
-    let (credit_permit, avoid_first_hop) = if let Some(alternate_hop) = alternate_hop {
-        // Originals may fund only the primary hop. Race admission so an idle
-        // alternate cannot consume the entire response deadline. Cancelling
-        // the losing reservation refunds any granted permit; only one send runs.
-        tokio::select! {
-            biased;
-            Some(permit) = voice_budget.reserve_link_reactive_credit_scheduled(
-                alternate_hop, u32::from(destination), bytes, deadline, retry,
-            ) => {
-                metrics::record_repair(source, destination,
-                    VoiceRepairResult::AlternateCreditSelected, 1);
-                (Some(permit), avoid_first_hop)
-            }
-            Some(permit) = voice_budget.reserve_link_reactive_credit_scheduled(
-                primary_hop, u32::from(destination), bytes, deadline, retry,
-            ) => {
-                metrics::record_repair(source, destination,
-                    VoiceRepairResult::PrimaryCreditSelected, 1);
-                (Some(permit), None)
-            }
-            else => (None, None),
-        }
-    } else {
-        (
-            voice_budget
-                .reserve_link_reactive_credit_scheduled(
-                    primary_hop,
-                    u32::from(destination),
-                    bytes,
-                    deadline,
-                    retry,
-                )
-                .await,
-            avoid_first_hop,
+        .alternate_next_hop()
+        .filter(|hop| *hop != primary_hop)?;
+    let permit = voice_budget
+        .reserve_link_reactive_credit_scheduled(
+            alternate_hop,
+            u32::from(destination),
+            bytes,
+            deadline,
+            retry,
         )
-    };
-    credit_permit.map(|permit| (permit, avoid_first_hop))
+        .await?;
+    metrics::record_repair(
+        source,
+        destination,
+        VoiceRepairResult::AlternateCreditSelected,
+        1,
+    );
+    Some((permit, Some(primary_hop)))
 }
 
 async fn send_budgeted_repair_frame(
@@ -3761,7 +3690,7 @@ async fn send_budgeted_repair_frame(
         transport.local_node_id(),
         voice_budget,
         destination,
-        transport.voice_route_quality(destination),
+        transport.voice_repair_route_quality(destination),
         body.len(),
         avoid_first_hop,
         deadline,
@@ -3824,6 +3753,19 @@ mod tests {
     };
     use crate::application::voice::sink::testing::RecordingSink;
 
+    fn repair_transport(destinations: Vec<NodeIdentifier>) -> Arc<FakeVoiceTransport> {
+        let transport = FakeVoiceTransport::new(7, destinations.clone());
+        for destination in destinations {
+            // Originals use a relay; repair uses the independently funded direct link.
+            transport.set_voice_route_quality(
+                destination,
+                VoiceRouteQuality::new(destination + 100, TransportKind::Tcp, 0, 0, 0)
+                    .with_alternate_route(destination, 0),
+            );
+        }
+        transport
+    }
+
     struct ControlledUnicastTransport {
         inner: Arc<FakeVoiceTransport>,
         primary_entered: Semaphore,
@@ -3836,7 +3778,7 @@ mod tests {
     impl ControlledUnicastTransport {
         fn new(fail_primary: bool) -> Arc<Self> {
             Arc::new(Self {
-                inner: FakeVoiceTransport::new(7, vec![2, 3]),
+                inner: repair_transport(vec![2, 3]),
                 primary_entered: Semaphore::new(0),
                 primary_release: Semaphore::new(0),
                 proactive_entered: Semaphore::new(0),
@@ -3957,7 +3899,7 @@ mod tests {
     impl PressuredProactiveTransport {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                inner: FakeVoiceTransport::new(7, vec![2]),
+                inner: repair_transport(vec![2]),
                 proactive_attempts: AtomicU64::new(0),
             })
         }
@@ -4050,7 +3992,7 @@ mod tests {
     impl SelectivelyHungProactiveTransport {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                inner: FakeVoiceTransport::new(7, vec![2, 3]),
+                inner: repair_transport(vec![2, 3]),
                 hung_entered: Semaphore::new(0),
             })
         }
@@ -4127,9 +4069,9 @@ mod tests {
 
         fn voice_route_quality(
             &self,
-            _dst: NodeIdentifier,
+            dst: NodeIdentifier,
         ) -> Option<crate::overlay::VoiceRouteQuality> {
-            None
+            self.inner.voice_route_quality(dst)
         }
     }
 
@@ -4149,7 +4091,7 @@ mod tests {
 
         fn with_failures(failures: u64) -> Arc<Self> {
             Arc::new(Self {
-                inner: FakeVoiceTransport::new(7, vec![2, 3, 4]),
+                inner: repair_transport(vec![2, 3, 4]),
                 repair_entered: Semaphore::new(0),
                 repair_release: Semaphore::new(0),
                 active_repairs: AtomicU64::new(0),
@@ -4941,7 +4883,7 @@ mod tests {
 
     #[tokio::test]
     async fn tail_retry_stops_when_destination_acknowledges() {
-        let transport = FakeVoiceTransport::new(7, vec![2]);
+        let transport = repair_transport(vec![2]);
         let mut cfg = VoiceConfig::default();
         cfg.repair_cache_ms = 1;
         let svc =
@@ -5051,7 +4993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tail_repair_uses_funded_primary_hop_without_alternate_credit() {
+    async fn tail_repair_never_uses_funded_primary_hop() {
         for quality in [
             VoiceRouteQuality::new(2, TransportKind::Udp, 20_000, 0, 0)
                 .with_alternate_route_quality(3, 25_000, TransportKind::Quic, 0, 0),
@@ -5084,24 +5026,21 @@ mod tests {
             )
             .await;
             assert!(
-                matches!(result, TailFrameResult::Sent),
-                "funded primary tail repair must send"
+                matches!(result, TailFrameResult::CreditUnavailable),
+                "tail repair must not use the original link"
             );
             let calls = transport.calls();
-            assert_eq!(calls.len(), 1);
-            assert!(matches!(&calls[0], FakeCall::RepairFrame {
-                dst: 2, body, avoid_first_hop: None, is_repair: false, ..
-            } if body == &marked));
+            assert!(calls.is_empty());
             assert_eq!(
                 budget.link_credit_balance_quarters(quality.next_hop()),
-                before - marked.len() * 4
+                before
             );
         }
     }
 
     #[tokio::test]
     async fn tail_repairs_charge_full_reactive_credit() {
-        let transport = FakeVoiceTransport::new(7, vec![2]);
+        let transport = repair_transport(vec![2]);
         let repairs: TailRepairState = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let repair_cache = RepairCache::new(Duration::from_secs(10));
         cache_single_tail_frame(&repair_cache, 0xABB, 42);
@@ -5148,7 +5087,7 @@ mod tests {
 
     #[tokio::test]
     async fn tail_removal_cancels_credit_wait_without_sending_or_charging() {
-        let transport = FakeVoiceTransport::new(7, vec![2]);
+        let transport = repair_transport(vec![2]);
         let repairs: TailRepairState = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let repair_cache = RepairCache::new(Duration::from_secs(10));
         cache_single_tail_frame(&repair_cache, 0xABC, 42);
@@ -5335,7 +5274,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_tail_without_ack_exponentially_backs_off() {
-        let transport = FakeVoiceTransport::new(7, vec![2]);
+        let transport = repair_transport(vec![2]);
         let repairs: TailRepairState = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let repair_cache = RepairCache::new(Duration::from_secs(10));
         let sender_session = 0xABC;
@@ -5419,7 +5358,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_unacked_tails_do_not_block_other_utterances() {
-        let transport = FakeVoiceTransport::new(7, vec![2]);
+        let transport = repair_transport(vec![2]);
         let repairs: TailRepairState = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let repair_cache = RepairCache::new(Duration::from_secs(10));
         let now = Instant::now();
@@ -5631,6 +5570,40 @@ mod tests {
         let second = RepairRequestKey::new(restarted);
         assert_eq!(first, same_stream);
         assert_ne!(first, second);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repair_request_coordinator_does_not_wake_while_idle() {
+        use std::future::Future;
+
+        let transport = FakeVoiceTransport::new(7, vec![12]);
+        let cfg = VoiceConfig::default();
+        let reorderer = Reorderer::new(cfg.clone());
+        let (_tx, rx) = mpsc::channel(REPAIR_REQUEST_QUEUE_CAPACITY);
+        let shutdown = CancellationToken::new();
+        let mut worker = Box::pin(run_repair_request_worker(
+            rx,
+            reorderer,
+            transport,
+            cfg.repair_request_ttl_ms,
+            shutdown.clone(),
+        ));
+        let polls = Arc::new(AtomicU64::new(0));
+        let task_polls = polls.clone();
+        let task = tokio::spawn(std::future::poll_fn(move |cx| {
+            task_polls.fetch_add(1, Ordering::SeqCst);
+            worker.as_mut().poll(cx)
+        }));
+        tokio::task::yield_now().await;
+        // Let any immediate startup timer finish before measuring idle work.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        let idle_polls = polls.load(Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(polls.load(Ordering::SeqCst), idle_polls);
+        shutdown.cancel();
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -6037,6 +6010,10 @@ mod tests {
             other => panic!("expected proactive repair frame, got {other:?}"),
         }
 
+        transport.set_voice_route_quality(
+            3,
+            VoiceRouteQuality::new(103, TransportKind::Tcp, 0, 0, 0).with_alternate_route(3, 0),
+        );
         let request = VoiceRepairRequest {
             sender_session: 0xABC,
             sender_epoch: 42,
@@ -7428,19 +7405,280 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fec_send_emits_parity_only_when_loss_gate_is_met() {
+    async fn fec_send_is_always_on_without_reactive_repair() {
+        for transport_kind in [TransportKind::Udp, TransportKind::Quic] {
+            for tree_delivery_enabled in [false, true] {
+                let transport = FakeVoiceTransport::new(7, vec![1]);
+                transport.set_voice_route_quality(
+                    1,
+                    VoiceRouteQuality::new(1, transport_kind, 1_000, 0, 0),
+                );
+                let mut cfg: VoiceConfig = serde_json::from_str(
+                    r#"{"voice_fec_enabled":true,"voice_fec_loss_gate_ppm":1000000,"repair_enabled":false}"#,
+                )
+                .unwrap();
+                cfg.tree_delivery_enabled = tree_delivery_enabled;
+                let parity_count = cfg.voice_fec_parity_blocks;
+                let svc = VoiceService::new_with_transport(
+                    transport.clone(),
+                    cfg,
+                    CancellationToken::new(),
+                    42,
+                );
+                for _ in 0..4 {
+                    svc.send_broadcast(
+                        0xABC,
+                        shitspeak_core::default_server_id(),
+                        0,
+                        false,
+                        Bytes::from_static(b"abcd"),
+                        normal_intent(5),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let parities = transport
+                    .calls()
+                    .iter()
+                    .filter_map(|call| {
+                        let FakeCall::Multicast { body, .. } = call else {
+                            return None;
+                        };
+                        let frame = proto::decode_voice(body).unwrap();
+                        frame.fec_parity.then_some(frame)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    parities.len(),
+                    parity_count,
+                    "{transport_kind:?}, tree={tree_delivery_enabled}"
+                );
+                assert_eq!(parities[0].fec_member_seqs, vec![0, 1, 2, 3]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_copy_does_not_wait_for_parity() {
+        let transport = ControlledUnicastTransport::new(false);
+        transport.proactive_release.add_permits(4);
+        let svc = VoiceService::new_with_transport(
+            transport.clone(),
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        for seq in 0..4 {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                svc.transport.send_proactive_repair_frame(
+                    2,
+                    fec_data_frame(seq, b"abcd"),
+                    Some(102),
+                    Duration::from_secs(1),
+                ),
+            )
+            .await
+            .expect("accepted data must not wait for parity admission")
+            .unwrap();
+        }
+        transport.proactive_release.add_permits(1);
+        wait_for_call_count(&transport.inner, 5).await;
+    }
+
+    #[tokio::test]
+    async fn extra_copies_receive_fec_on_unreliable_alternate_links() {
+        for enabled in [false, true] {
+            for reactive in [false, true] {
+                for (kind, reliable) in [
+                    (TransportKind::Udp, false),
+                    (TransportKind::Quic, false),
+                    (TransportKind::Tcp, true),
+                    (TransportKind::Kcp, true),
+                    (TransportKind::Quic, true),
+                ] {
+                    let transport = FakeVoiceTransport::new(7, vec![2, 3]);
+                    transport.set_voice_route_quality(
+                        2,
+                        VoiceRouteQuality::new(2, TransportKind::Tcp, 0, 0, 0)
+                            .with_alternate_route_quality(3, 0, kind, 0, 0)
+                            .with_alternate_reliable_transport(reliable),
+                    );
+                    let mut cfg = VoiceConfig::default();
+                    cfg.voice_fec_enabled = enabled;
+                    cfg.voice_fec_parity_blocks = 2;
+                    let svc = VoiceService::new_with_transport(
+                        transport.clone(),
+                        cfg,
+                        CancellationToken::new(),
+                        42,
+                    );
+                    for seq in 0..4 {
+                        let body = fec_data_frame(seq, b"abcd");
+                        if reactive {
+                            svc.transport
+                                .send_repair_frame(2, body, Some(2), Duration::from_secs(1))
+                                .await
+                                .unwrap();
+                        } else {
+                            svc.transport
+                                .send_proactive_repair_frame(
+                                    2,
+                                    send::mark_proactive_copy(&body).unwrap(),
+                                    Some(2),
+                                    Duration::from_secs(1),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    let expected = if enabled && !reliable { 2 } else { 0 };
+                    let calls = wait_for_call_count(&transport, 4 + expected).await;
+                    let parities = calls
+                        .iter()
+                        .filter_map(|call| {
+                            let FakeCall::RepairFrame {
+                                body,
+                                avoid_first_hop,
+                                ..
+                            } = call
+                            else {
+                                panic!("copy and parity must use the alternate: {call:?}");
+                            };
+                            assert_eq!(*avoid_first_hop, Some(2));
+                            let frame = proto::decode_voice(body).unwrap();
+                            frame.fec_parity.then_some(frame)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        parities.len(),
+                        expected,
+                        "enabled={enabled}, reactive={reactive}, {kind:?}, reliable={reliable}"
+                    );
+                    assert_eq!(calls.len(), 4 + expected);
+                    for parity in parities {
+                        assert_eq!(parity.fec_member_seqs, vec![0, 1, 2, 3]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn proactive_copies_require_an_alternate_and_do_not_repeat_on_it() {
+        for has_alternate in [false, true] {
+            let transport = FakeVoiceTransport::new(7, vec![2, 3]);
+            let mut quality = VoiceRouteQuality::new(2, TransportKind::Udp, 1_000, 1_000_000, 0);
+            if has_alternate {
+                quality = quality.with_alternate_route_quality(3, 500, TransportKind::Quic, 0, 0);
+            }
+            transport.set_voice_route_quality(2, quality);
+            let mut cfg = VoiceConfig::default();
+            cfg.repair_max_extra_copies_per_frame = 2;
+            let svc = VoiceService::new_with_transport(
+                transport.clone(),
+                cfg,
+                CancellationToken::new(),
+                42,
+            );
+            for hop in [2, 3] {
+                svc.voice_budget
+                    .mint_link_credit(hop, 0xABC, 42, usize::MAX);
+            }
+            svc.send_unicast(
+                0xABC,
+                default_server_id(),
+                0,
+                false,
+                Bytes::from_static(b"abcd"),
+                normal_intent(5),
+                2,
+            )
+            .await
+            .unwrap();
+            if has_alternate {
+                wait_for_call_count(&transport, 2).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let calls = transport.calls();
+            assert_eq!(calls.len(), if has_alternate { 2 } else { 1 });
+            for call in calls.iter().skip(1) {
+                assert!(matches!(
+                    call,
+                    FakeCall::RepairFrame {
+                        avoid_first_hop: Some(2),
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fec_send_skips_disabled_and_reliable_links() {
+        for (enabled, quality) in [
+            (
+                false,
+                VoiceRouteQuality::new(1, TransportKind::Udp, 1_000, 50_000, 0),
+            ),
+            (
+                false,
+                VoiceRouteQuality::new(1, TransportKind::Quic, 1_000, 50_000, 0),
+            ),
+            (
+                true,
+                VoiceRouteQuality::new(1, TransportKind::Tcp, 1_000, 50_000, 0),
+            ),
+            (
+                true,
+                VoiceRouteQuality::new(1, TransportKind::Kcp, 1_000, 50_000, 0),
+            ),
+            (
+                true,
+                VoiceRouteQuality::new(1, TransportKind::Quic, 1_000, 50_000, 0)
+                    .with_reliable_transport(true),
+            ),
+        ] {
+            let transport = FakeVoiceTransport::new(7, vec![1]);
+            transport.set_voice_route_quality(1, quality);
+            let mut cfg = VoiceConfig::default();
+            cfg.voice_fec_enabled = enabled;
+            cfg.repair_enabled = false;
+            let svc = VoiceService::new_with_transport(
+                transport.clone(),
+                cfg,
+                CancellationToken::new(),
+                42,
+            );
+            for _ in 0..4 {
+                svc.send_broadcast(
+                    0xABC,
+                    default_server_id(),
+                    0,
+                    false,
+                    Bytes::from_static(b"abcd"),
+                    normal_intent(5),
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(transport.calls().len(), 4, "enabled={enabled}, {quality:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fec_send_protects_unreliable_transports_with_pressure_limits() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
-        // Loss below the gate (0.1% < 1%): no parity may ever leave.
+        // Reliable TCP links need no parity.
         for &dst in &[1u16, 2, 3] {
             transport.set_voice_route_quality(
                 dst,
-                VoiceRouteQuality::new(dst, TransportKind::Udp, 1_000, 1_000, 100),
+                VoiceRouteQuality::new(dst, TransportKind::Tcp, 1_000, 1_000, 100),
             );
         }
         let mut cfg = VoiceConfig::default();
         cfg.voice_fec_enabled = true;
         cfg.voice_fec_block_size = 4;
-        cfg.voice_fec_loss_gate_ppm = 10_000;
         cfg.tree_delivery_enabled = false;
         let svc =
             VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
@@ -7459,11 +7697,11 @@ mod tests {
         for call in transport.calls() {
             if let FakeCall::Multicast { body, .. } = call {
                 let frame = proto::decode_voice(&body).unwrap();
-                assert!(!frame.fec_parity, "parity emitted below the loss gate");
+                assert!(!frame.fec_parity, "parity emitted over a reliable link");
             }
         }
 
-        // Loss above the gate (5% >= 1%): the next block emits parity.
+        // Unreliable UDP links get parity.
         for &dst in &[1u16, 2, 3] {
             transport.set_voice_route_quality(
                 dst,
@@ -7490,18 +7728,12 @@ mod tests {
             }
             None
         });
-        let parity = parity.expect("parity frame should be emitted above the loss gate");
+        let parity = parity.expect("UDP should receive parity");
         assert_eq!(parity.fec_member_seqs, vec![4, 5, 6, 7]);
         assert_eq!(parity.payload.len(), 4);
         assert_eq!(parity.s2s_seq, 7);
 
-        // Selected transport loss below the gate (0.005% < 1%) even though the
-        // UDP datagram lane is degraded (5% >= 1%): NO parity. Voice rides the
-        // routing-selected transport (QUIC on 4->8, binding stable), so the
-        // datagram lane's loss is not a signal the voice lane has loss to
-        // recover. This was the Phase 1 regression: gating on the datagram
-        // lane fired FEC at times the listener had no recoverable gaps, and
-        // the 2-parity flood rode a lossless QUIC stream doing ~nothing.
+        // Healthy QUIC datagrams also receive parity, independent of UDP loss.
         for &dst in &[1u16, 2, 3] {
             transport.set_voice_route_quality(
                 dst,
@@ -7522,20 +7754,18 @@ mod tests {
             .await
             .unwrap();
         }
-        for call in &transport.calls()[calls_before..] {
-            if let FakeCall::Multicast { body, .. } = call {
-                let frame = proto::decode_voice(body).unwrap();
-                assert!(
-                    !frame.fec_parity,
-                    "parity emitted when only the datagram lane is degraded"
-                );
-            }
-        }
+        assert_eq!(
+            transport.calls()[calls_before..]
+                .iter()
+                .filter(|call| {
+                    matches!(call, FakeCall::Multicast { body, .. }
+                if proto::decode_voice(body).unwrap().fec_parity)
+                })
+                .count(),
+            3
+        );
 
-        // Selected transport loss above the gate (5% >= 1%) on a QUIC-bound
-        // lane: parity still emits. The gate keys on the lane voice actually
-        // rides, not on the transport kind — a genuinely lossy voice lane gets
-        // redundancy regardless of whether it is QUIC or UDP.
+        // Lossy QUIC datagrams keep receiving parity.
         for &dst in &[1u16, 2, 3] {
             transport.set_voice_route_quality(
                 dst,
@@ -7562,16 +7792,12 @@ mod tests {
             }
             None
         });
-        let parity = parity
-            .expect("parity frame should be emitted when the selected transport clears the gate");
+        let parity = parity.expect("QUIC datagrams should receive parity");
         assert_eq!(parity.fec_member_seqs, vec![12, 13, 14, 15]);
         assert_eq!(parity.payload.len(), 4);
         assert_eq!(parity.s2s_seq, 15);
 
-        // Send-path pressure gate (Gap C): selected transport loss above the
-        // gate (5% >= 1%) BUT the first-hop datagram lane is evicting — frames
-        // shed at the write path before the wire. Parity sent now would be
-        // shed too, so FEC must skip even though the loss gate is clear.
+        // Send-path shedding still suppresses parity until the lane recovers.
         for &dst in &[1u16, 2, 3] {
             transport.set_voice_route_quality(
                 dst,
@@ -7606,8 +7832,8 @@ mod tests {
     #[tokio::test]
     async fn fec_receiver_reconstructs_missing_frame() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
-        let mut cfg = VoiceConfig::default();
-        cfg.voice_fec_enabled = true;
+        let mut cfg: VoiceConfig =
+            serde_json::from_str(r#"{"voice_fec_enabled":true,"repair_enabled":false}"#).unwrap();
         cfg.voice_fec_receiver_window = 8;
         let svc = VoiceService::new_with_transport(transport, cfg, CancellationToken::new(), 42);
         let sink = Arc::new(FecProbeSink::default());
@@ -7842,7 +8068,7 @@ mod tests {
 
     #[tokio::test]
     async fn repair_handler_replays_cached_exact_frame() {
-        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let transport = repair_transport(vec![1, 2, 3]);
         let svc = make_legacy_service(transport.clone());
         svc.send_unicast(
             0xABC,
@@ -7902,7 +8128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repair_response_uses_funded_primary_when_alternate_credit_is_empty() {
+    async fn repair_response_does_not_use_primary_when_alternate_credit_is_empty() {
         let transport = FakeVoiceTransport::new(7, vec![2, 3]);
         transport.set_voice_route_quality(
             2,
@@ -7931,6 +8157,7 @@ mod tests {
         let primary_credit = svc.voice_budget.link_credit_balance_quarters(2);
         assert!(primary_credit >= original.len() * 4);
         assert_eq!(svc.voice_budget.link_credit_balance_quarters(3), 0);
+        let calls_before = transport.calls().len();
         send_repair_response(
             RepairResponseRequest {
                 from: 2,
@@ -7955,21 +8182,18 @@ mod tests {
         let calls = transport.calls();
         assert_eq!(
             calls.len(),
-            5,
-            "a funded primary must repair the cached packet before expiry"
+            calls_before,
+            "repair must not use the original link when alternate credit is empty"
         );
-        assert!(matches!(&calls[4], FakeCall::RepairFrame {
-            dst: 2, body, avoid_first_hop: None, is_repair: true, ..
-        } if body == &original));
         assert_eq!(
             svc.voice_budget.link_credit_balance_quarters(2),
-            primary_credit - original.len() * 4
+            primary_credit
         );
         assert_eq!(svc.voice_budget.link_credit_balance_quarters(3), 0);
     }
 
     #[tokio::test]
-    async fn repair_credit_route_race_charges_only_the_selected_link() {
+    async fn repair_credit_uses_only_the_alternate_link() {
         for (fund_primary, fund_alternate) in
             [(true, false), (false, true), (true, true), (false, false)]
         {
@@ -8002,7 +8226,7 @@ mod tests {
             .await;
             tokio::task::yield_now().await;
             let calls = transport.calls();
-            assert_eq!(accepted, fund_primary || fund_alternate);
+            assert_eq!(accepted, fund_alternate);
             assert_eq!(calls.len(), usize::from(accepted));
             let selected = calls.first().map(|call| match call {
                 FakeCall::RepairFrame {
@@ -8011,7 +8235,8 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(sent, &body);
-                    if avoid_first_hop.is_some() { 3 } else { 2 }
+                    assert_eq!(*avoid_first_hop, Some(2));
+                    3
                 }
                 other => panic!("expected one repair, got {other:?}"),
             });
@@ -8027,11 +8252,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repair_response_falls_back_when_alternate_first_hop_fails() {
+    async fn repair_response_does_not_fall_back_when_alternate_first_hop_fails() {
         let inner = FakeVoiceTransport::new(7, vec![2]);
         inner.set_voice_route_quality(
             2,
-            crate::overlay::VoiceRouteQuality::new(2, TransportKind::Udp, 0, 0, 0),
+            crate::overlay::VoiceRouteQuality::new(2, TransportKind::Udp, 0, 0, 0)
+                .with_alternate_route(3, 1_000),
         );
         let transport: Arc<dyn VoiceTransport> = Arc::new(AlternateFailRepairTransport {
             inner: inner.clone(),
@@ -8050,10 +8276,10 @@ mod tests {
         )
         .unwrap();
         cache.insert(RepairFrame::new(sender_session, 42, 7, body.clone()));
-        // The repair response reserves from the link bucket for the first hop
-        // the original took (destination 2; its alternate fails on purpose).
+        // Both links have credit, but the alternate transport rejects repair.
         let voice_budget = AdaptiveVoiceBudget::new(Arc::new(AtomicU64::new(5_000)));
         voice_budget.mint_link_credit(2, 0xABC, 42, usize::MAX);
+        voice_budget.mint_link_credit(3, 0xABC, 42, usize::MAX);
 
         send_repair_response(
             RepairResponseRequest {
@@ -8078,17 +8304,10 @@ mod tests {
         .await;
 
         let calls = inner.calls();
-        assert_eq!(calls.len(), 1);
-        assert!(matches!(
-            &calls[0],
-            FakeCall::RepairFrame {
-                dst: 2,
-                body: sent,
-                avoid_first_hop: None,
-                is_repair: true,
-                ..
-            } if sent == &body
-        ));
+        assert!(
+            calls.is_empty(),
+            "failed alternate must not fall back to the original link"
+        );
     }
 
     #[tokio::test]
@@ -8510,7 +8729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repair_disabled_send_captures_no_route_quality() {
+    async fn repair_and_fec_disabled_send_captures_no_route_quality() {
         let transport = FakeVoiceTransport::new(7, vec![2]);
         transport.set_voice_route_quality(
             2,
@@ -8518,6 +8737,7 @@ mod tests {
         );
         let mut cfg = VoiceConfig::default();
         cfg.repair_enabled = false;
+        cfg.voice_fec_enabled = false;
         cfg.tree_delivery_enabled = false;
         let svc =
             VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
@@ -8616,7 +8836,11 @@ mod tests {
         .forget();
         transport.proactive_release.add_permits(1);
         assert_eq!(transport.inner.route_quality_batches(), vec![vec![2]]);
-        assert_eq!(transport.inner.route_quality_scalar_calls(), 0);
+        assert_eq!(
+            transport.inner.route_quality_scalar_calls(),
+            1,
+            "FEC checks the copy link without changing the captured duplicate decision"
+        );
     }
 
     #[tokio::test]
@@ -8703,7 +8927,7 @@ mod tests {
 
     #[tokio::test]
     async fn repair_handler_accepts_timestamped_request_without_clock_agreement() {
-        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let transport = repair_transport(vec![1, 2, 3]);
         let svc = make_legacy_service(transport.clone());
         svc.send_unicast(
             0xABC,

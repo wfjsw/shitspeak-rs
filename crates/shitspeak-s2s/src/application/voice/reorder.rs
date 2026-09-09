@@ -280,6 +280,7 @@ pub struct Reorderer {
     max_users: Arc<AtomicU64>,
     state: Mutex<ReorderInner>,
     deadline_notify: Arc<Notify>,
+    repair_notify: Arc<Notify>,
     deadline_wake_pending: AtomicBool,
     deadline_wake_ack: Notify,
 }
@@ -327,6 +328,7 @@ impl Reorderer {
                 total_pending: 0,
             }),
             deadline_notify: Arc::new(Notify::new()),
+            repair_notify: Arc::new(Notify::new()),
             deadline_wake_pending: AtomicBool::new(false),
             deadline_wake_ack: Notify::new(),
         })
@@ -334,6 +336,10 @@ impl Reorderer {
 
     pub fn deadline_notify(&self) -> Arc<Notify> {
         self.deadline_notify.clone()
+    }
+
+    pub(crate) fn repair_notify(&self) -> Arc<Notify> {
+        self.repair_notify.clone()
     }
 
     pub fn config(&self) -> &VoiceConfig {
@@ -692,6 +698,10 @@ impl Reorderer {
         let frame_seq = frame.s2s_seq;
         let sender_epoch = frame.sender_epoch;
         let now = clock();
+        // Wake the repair coordinator for every inbound frame. It will
+        // cheaply ignore healthy streams, while an open gap can be re-read
+        // immediately instead of waiting for a polling tick.
+        self.repair_notify.notify_one();
         self.prune_idle(&mut state, now);
 
         // A reactive repair cannot create a speaker stream. An original or

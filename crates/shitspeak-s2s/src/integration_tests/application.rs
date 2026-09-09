@@ -610,17 +610,62 @@ async fn two_node_voice_drops_when_sink_missing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s2s_cached_music_packet_is_recovered_by_network_nack() {
-    let cluster = Cluster::build(&[15, 16], seed_pair).await;
+    let cluster = Cluster::build(&[15, 16, 17], full_mesh_seeds).await;
     let source = cluster.node(15);
     let destination = cluster.node(16);
     assert!(wait_for_full_alive_mesh(&cluster, Duration::from_secs(8)).await);
     assert!(wait_for_full_routing(&cluster, Duration::from_secs(8)).await);
+    for node in &cluster.nodes {
+        for peer in cluster.ids().into_iter().filter(|peer| *peer != node.id) {
+            let rtt_ms = if [node.id, peer].contains(&15) && [node.id, peer].contains(&17) {
+                30
+            } else {
+                10
+            };
+            node.transport
+                .record_peer_rtt(peer, TransportKind::Tcp, Duration::from_millis(rtt_ms));
+        }
+    }
     let source_app = ApplicationLayer::new(source.overlay.clone(), ApplicationConfig::default());
+    let relay_app = ApplicationLayer::new(
+        cluster.node(17).overlay.clone(),
+        ApplicationConfig::default(),
+    );
     let mut config = ApplicationConfig::default();
     config.voice.reorder_max_delay_ms = 120;
     config.voice.adaptive_jitter_min_delay_ms = 120;
     let destination_app = ApplicationLayer::new(destination.overlay.clone(), config);
     wait_for_tree_voice_forwarding(source_app.as_ref(), 15, 16).await;
+    assert!(
+        wait_until(Duration::from_secs(8), || {
+            source
+                .overlay
+                .voice_repair_route_quality(16)
+                .is_some_and(|quality| {
+                    quality.next_hop() == 16 && quality.alternate_next_hop() == Some(17)
+                })
+        })
+        .await,
+        "repair needs a distinct first hop through node 17: {:?}",
+        source.overlay.voice_repair_route_quality(16)
+    );
+    // Fund the alternate's own repair budget with accepted traffic on that link.
+    let warmup_session = ClientSessionIdentifier::new(15, 80_005).unwrap().to_u32();
+    for _ in 0..8 {
+        source_app
+            .voice()
+            .send_unicast(
+                warmup_session,
+                default_server_id(),
+                0,
+                false,
+                Bytes::from_static(b"alternate-link-credit"),
+                normal_voice_intent(0),
+                17,
+            )
+            .await
+            .unwrap();
+    }
     // Exercise an actual request/response round trip as well as original data.
     for (node, peer) in [(source, 16), (destination, 15)] {
         node.chaos.set_delay(
@@ -630,6 +675,13 @@ async fn s2s_cached_music_packet_is_recovered_by_network_nack() {
         );
     }
     let originals = FaultSelector::new(15, TransportKind::Tcp, MessageType::DistributionData);
+    // Ordinary repair data from the original first hop cannot reach the sink.
+    // Recovery therefore requires the relay, while tree originals still flow.
+    destination.chaos.set_burst_loss(
+        FaultSelector::new(15, TransportKind::Tcp, MessageType::Data),
+        1,
+        0,
+    );
     destination.chaos.set_delay(
         originals,
         Duration::from_millis(20),
@@ -686,6 +738,7 @@ async fn s2s_cached_music_packet_is_recovered_by_network_nack() {
     );
     source_app.shutdown().await;
     destination_app.shutdown().await;
+    relay_app.shutdown().await;
     cluster.shutdown_all().await;
 }
 

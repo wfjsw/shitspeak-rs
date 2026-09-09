@@ -180,14 +180,14 @@ pub use routing::{RouteEntry, RoutingMetric};
 pub struct VoiceRouteQuality {
     next_hop: NodeIdentifier,
     transport: TransportKind,
+    reliable: bool,
     path_latency_us: u64,
     loss_ppm: u32,
     jitter_us: u64,
     alternate: Option<VoiceRouteAlternative>,
     /// Effective loss of the datagram lane (worst of live UDP/KCP) to the
-    /// next hop. `None` when no datagram transport is live. The FEC gate keys
-    /// on this — the lane FEC parity actually protects — which can be lossier
-    /// than the routing-selected transport.
+    /// next hop. `None` when no datagram transport is live. This can differ
+    /// from the routing-selected transport's loss.
     datagram_loss_ppm: Option<u32>,
     /// Whether the datagram lane to the next hop is currently evicting
     /// (best-effort frames shed at the send path within the recent window).
@@ -199,6 +199,7 @@ pub struct VoiceRouteQuality {
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct VoiceRouteAlternative {
     next_hop: NodeIdentifier,
+    reliable: bool,
     path_latency_us: u64,
     transport: Option<TransportKind>,
     loss_ppm: Option<u32>,
@@ -216,6 +217,7 @@ impl VoiceRouteQuality {
         Self {
             next_hop,
             transport,
+            reliable: matches!(transport, TransportKind::Tcp | TransportKind::Kcp),
             path_latency_us,
             loss_ppm,
             jitter_us,
@@ -247,6 +249,7 @@ impl VoiceRouteQuality {
         );
         self.alternate = Some(VoiceRouteAlternative {
             next_hop,
+            reliable: false,
             path_latency_us,
             transport: None,
             loss_ppm: None,
@@ -271,6 +274,7 @@ impl VoiceRouteQuality {
         );
         self.alternate = Some(VoiceRouteAlternative {
             next_hop,
+            reliable: matches!(transport, TransportKind::Tcp | TransportKind::Kcp),
             path_latency_us,
             transport: Some(transport),
             loss_ppm: Some(loss_ppm),
@@ -285,6 +289,16 @@ impl VoiceRouteQuality {
 
     pub fn transport(self) -> TransportKind {
         self.transport
+    }
+
+    /// Record the selected session's reliability, including legacy QUIC streams.
+    pub fn with_reliable_transport(mut self, reliable: bool) -> Self {
+        self.reliable = reliable;
+        self
+    }
+
+    pub fn reliable(self) -> bool {
+        self.reliable
     }
 
     pub fn path_latency_us(self) -> u64 {
@@ -321,6 +335,17 @@ impl VoiceRouteQuality {
 
     pub fn alternate_transport(self) -> Option<TransportKind> {
         self.alternate.and_then(|alternate| alternate.transport)
+    }
+
+    pub fn with_alternate_reliable_transport(mut self, reliable: bool) -> Self {
+        if let Some(alternate) = self.alternate.as_mut() {
+            alternate.reliable = reliable;
+        }
+        self
+    }
+
+    pub fn alternate_reliable(self) -> bool {
+        self.alternate.is_some_and(|alternate| alternate.reliable)
     }
 
     pub fn alternate_loss_ppm(self) -> Option<u32> {
@@ -2216,6 +2241,51 @@ impl OverlayNetwork {
             .flatten()
     }
 
+    /// Resolve a repair alternate on demand when deferred precomputation has
+    /// not populated the current routing generation. Foreground voice keeps
+    /// using the cached batch lookup.
+    pub fn voice_repair_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
+        let mut quality = self.voice_route_quality(dst)?;
+        if quality.has_alternate_first_hop() {
+            return Some(quality);
+        }
+        let alternate = self
+            .inner
+            .routing
+            .load()
+            .lookup_avoiding_first_hop_with_metric(
+                self.local_node_id(),
+                dst,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+                &HashSet::new(),
+                quality.next_hop(),
+            );
+        if let Some(alternate) = alternate {
+            quality = match self.selected_voice_transport_metrics(
+                alternate.next_hop,
+                ServiceLevel::BestEffort,
+                RoutingMetric::ConversationalQuality,
+            ) {
+                Some((transport, link)) => quality
+                    .with_alternate_route_quality(
+                        alternate.next_hop,
+                        alternate.latency_us,
+                        transport,
+                        link.effective_packet_loss_ppm(),
+                        link.jitter_us().max(0.0) as u64,
+                    )
+                    .with_alternate_reliable_transport(
+                        self.inner
+                            .transport
+                            .best_effort_transport_is_reliable(alternate.next_hop, transport),
+                    ),
+                None => quality.with_alternate_route(alternate.next_hop, alternate.latency_us),
+            };
+        }
+        Some(quality)
+    }
+
     /// Return destination-aligned voice route qualities from one immutable
     /// routing-table snapshot while snapshotting a direct peer at most once.
     /// Multiple routed destinations commonly share next hops, especially for
@@ -2236,6 +2306,7 @@ impl OverlayNetwork {
         let mut next_hop_metrics = HashMap::new();
         let mut next_hop_datagram_loss = HashMap::new();
         let mut next_hop_shedding = HashMap::new();
+        let mut next_hop_reliability = HashMap::new();
 
         routes
             .into_iter()
@@ -2245,6 +2316,13 @@ impl OverlayNetwork {
                     self.selected_voice_transport_metrics(primary.next_hop, level, routing_metric)
                 });
                 let (transport, link) = selected.as_ref()?;
+                let reliable = next_hop_reliability
+                    .entry(primary.next_hop)
+                    .or_insert_with(|| {
+                        self.inner
+                            .transport
+                            .best_effort_transport_is_reliable(primary.next_hop, *transport)
+                    });
                 let datagram_loss = next_hop_datagram_loss
                     .entry(primary.next_hop)
                     .or_insert_with(|| self.datagram_lane_loss_ppm(primary.next_hop));
@@ -2258,6 +2336,7 @@ impl OverlayNetwork {
                     link.effective_packet_loss_ppm(),
                     link.jitter_us().max(0.0) as u64,
                 )
+                .with_reliable_transport(*reliable)
                 .with_datagram_loss_ppm(*datagram_loss)
                 .with_datagram_lane_shedding(*shedding);
 
@@ -2273,13 +2352,23 @@ impl OverlayNetwork {
                         });
                     if let Some((alternate_transport, alternate_link)) = alternate_selected.as_ref()
                     {
-                        quality = quality.with_alternate_route_quality(
-                            alternate.next_hop,
-                            alternate.latency_us,
-                            *alternate_transport,
-                            alternate_link.effective_packet_loss_ppm(),
-                            alternate_link.jitter_us().max(0.0) as u64,
-                        );
+                        let alternate_reliable = next_hop_reliability
+                            .entry(alternate.next_hop)
+                            .or_insert_with(|| {
+                                self.inner.transport.best_effort_transport_is_reliable(
+                                    alternate.next_hop,
+                                    *alternate_transport,
+                                )
+                            });
+                        quality = quality
+                            .with_alternate_route_quality(
+                                alternate.next_hop,
+                                alternate.latency_us,
+                                *alternate_transport,
+                                alternate_link.effective_packet_loss_ppm(),
+                                alternate_link.jitter_us().max(0.0) as u64,
+                            )
+                            .with_alternate_reliable_transport(*alternate_reliable);
                     } else {
                         quality =
                             quality.with_alternate_route(alternate.next_hop, alternate.latency_us);
@@ -2319,8 +2408,7 @@ impl OverlayNetwork {
 
     /// Effective packet loss of the datagram lane to `next_hop` (worst among
     /// live UDP/KCP transports), or `None` when no datagram transport is
-    /// live. The FEC gate keys on this — the lane FEC parity actually protects
-    /// — rather than the routing-selected best transport.
+    /// live. This diagnostic is independent of the selected voice transport.
     pub fn datagram_lane_loss_ppm(&self, next_hop: NodeIdentifier) -> Option<u32> {
         self.inner
             .transport
@@ -2609,6 +2697,45 @@ mod tests {
             .is_err(),
             "a measured alternate must use another first hop",
         );
+    }
+
+    #[tokio::test]
+    async fn voice_repair_resolves_alternate_before_background_precomputation() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        let _alternate_rx = transport.test_install_live_stream(3, TransportKind::Tcp);
+        transport.record_peer_rtt(2, TransportKind::Tcp, Duration::from_millis(17));
+        transport.record_peer_rtt(3, TransportKind::Tcp, Duration::from_millis(29));
+        let inner = runtime::OverlayInner::new(
+            transport,
+            OverlayConfig::new(Vec::new()),
+            Arc::new(AtomicU64::new(0)),
+            ReplicationServices::ALL,
+            ApplicationServices::ALL,
+            None,
+            Vec::new(),
+        );
+        let tables = voice_tables_with_alternate(3, 400, 500);
+        tables.install_voice_alternates(HashMap::new());
+        inner.routing.store(Arc::new(tables));
+        let network = OverlayNetwork {
+            inner: Arc::new(inner),
+            voice_route_quality_selections: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        };
+        assert_eq!(
+            network
+                .voice_route_quality(10)
+                .unwrap()
+                .alternate_next_hop(),
+            None
+        );
+        let voice = crate::application::voice::send::OverlayVoiceTransport { overlay: network };
+        let quality =
+            crate::application::voice::send::VoiceTransport::voice_repair_route_quality(&voice, 10)
+                .unwrap();
+        assert_eq!(quality.next_hop(), 2);
+        assert_eq!(quality.alternate_next_hop(), Some(3));
+        assert!(quality.alternate_reliable());
     }
 
     #[tokio::test]

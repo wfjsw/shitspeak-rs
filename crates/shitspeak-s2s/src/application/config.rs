@@ -91,6 +91,7 @@ pub struct VoiceConfig {
     pub repair_jitter_start_ms: u64,
 
     /// Extra proactive copies allowed per voice frame (0 through 2).
+    /// Each copy needs a distinct alternate link; current routing exposes one.
     pub repair_max_extra_copies_per_frame: usize,
 
     /// Percentage of the repair mint reserved for reactive/tail repair.
@@ -99,17 +100,13 @@ pub struct VoiceConfig {
     /// Percentage of the repair mint that proactive work may never borrow.
     pub repair_reactive_hard_reserve_pct: u8,
 
-    /// Change-set C3: enable best-effort block FEC over the datagram voice
-    /// lane. The sender XORs the last `voice_fec_block_size` equal-length
-    /// payloads of a speaker into one parity frame, sent unicast to each
-    /// first hop that carried the block. Parity frames are rate-limited by
-    /// the per-first-hop `voice_overlap` lane-headroom budget (capacity ∝
-    /// accepted original bytes) and only emitted when the first hop's live
-    /// loss reaches `voice_fec_loss_gate_ppm`, so healthy lanes pay nothing.
+    /// Enable block FEC for unreliable voice transports. Defaults to true.
     pub voice_fec_enabled: bool,
 
     /// Number of consecutive equal-length payloads covered by one parity
-    /// frame. A block whose members are not all the same length is dropped
+    /// frame. Enabled FEC protects unreliable voice transports, within
+    /// the per-first-hop congestion and headroom limits.
+    /// A block whose members are not all the same length is dropped
     /// (no redundancy) rather than sent with length ambiguity.
     pub voice_fec_block_size: usize,
 
@@ -124,11 +121,6 @@ pub struct VoiceConfig {
     /// the receiver caches to XOR against a parity block, and how many
     /// received parity blocks it retains.
     pub voice_fec_receiver_window: usize,
-
-    /// Emit FEC parity for a first hop only when its live lane loss reaches
-    /// this many ppm (derived from the datagram-lane loss metric). Defaults
-    /// to `repair_loss_start_ppm` semantics.
-    pub voice_fec_loss_gate_ppm: u32,
 }
 
 impl Default for VoiceConfig {
@@ -162,7 +154,6 @@ impl Default for VoiceConfig {
             voice_fec_block_size: default_voice_fec_block_size(),
             voice_fec_parity_blocks: default_voice_fec_parity_blocks(),
             voice_fec_receiver_window: default_voice_fec_receiver_window(),
-            voice_fec_loss_gate_ppm: default_voice_fec_loss_gate_ppm(),
         }
     }
 }
@@ -239,8 +230,9 @@ struct VoiceConfigWire {
     voice_fec_parity_blocks: usize,
     #[serde(default = "default_voice_fec_receiver_window")]
     voice_fec_receiver_window: usize,
-    #[serde(default = "default_voice_fec_loss_gate_ppm")]
-    voice_fec_loss_gate_ppm: u32,
+    // Accepted for compatibility; enabled FEC no longer waits for loss.
+    #[serde(default)]
+    voice_fec_loss_gate_ppm: Option<IgnoredAny>,
 }
 
 impl<'de> Deserialize<'de> for VoiceConfig {
@@ -281,6 +273,7 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             raw.remote_playout_idle_reset_ms.as_ref(),
             raw.reorder_max_drop_lag_frames.as_ref(),
             raw.repair_nack_delay_ms.as_ref(),
+            raw.voice_fec_loss_gate_ppm.as_ref(),
         );
         Ok(Self {
             delivery_strategy: raw.delivery_strategy,
@@ -313,7 +306,6 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             voice_fec_block_size: raw.voice_fec_block_size,
             voice_fec_parity_blocks: raw.voice_fec_parity_blocks,
             voice_fec_receiver_window: raw.voice_fec_receiver_window,
-            voice_fec_loss_gate_ppm: raw.voice_fec_loss_gate_ppm,
         })
     }
 }
@@ -415,7 +407,7 @@ fn default_repair_reactive_hard_reserve_pct() -> u8 {
     10
 }
 fn default_voice_fec_enabled() -> bool {
-    false
+    true
 }
 fn default_voice_fec_block_size() -> usize {
     4
@@ -426,13 +418,22 @@ fn default_voice_fec_parity_blocks() -> usize {
 fn default_voice_fec_receiver_window() -> usize {
     8
 }
-fn default_voice_fec_loss_gate_ppm() -> u32 {
-    10_000
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_fec_defaults_on_and_can_be_disabled() {
+        assert!(VoiceConfig::default().voice_fec_enabled);
+        let default: VoiceConfig = serde_json::from_str("{}").unwrap();
+        assert!(default.voice_fec_enabled);
+        let disabled: VoiceConfig = serde_json::from_str(
+            r#"{"voice_fec_enabled":false,"voice_fec_loss_gate_ppm":1000000}"#,
+        )
+        .unwrap();
+        assert!(!disabled.voice_fec_enabled);
+    }
 
     #[test]
     fn voice_repair_defaults_deserialize_enabled() {

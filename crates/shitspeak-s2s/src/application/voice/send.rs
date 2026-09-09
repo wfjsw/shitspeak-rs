@@ -7,14 +7,17 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::application::config::VoiceConfig;
 use crate::application::error::ApplicationError;
 use crate::application::proto::{
     self, VOICE_PATH_FEEDBACK_SERVICE_TAG, VOICE_REPAIR_SERVICE_TAG, VOICE_SERVICE_TAG,
     VoiceIntent, VoicePathFeedback,
 };
 use crate::application::voice::fec::FecSendOutcome;
+use crate::application::voice::{fec::FecSenderState, metrics};
 use crate::overlay::{OverlayNetwork, OverlaySendOptions, RoutingMetric, VoiceRouteQuality};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
@@ -207,10 +210,23 @@ pub trait VoiceTransport: Send + Sync + 'static {
         &self,
         dsts: &[NodeIdentifier],
         first_hop: Option<NodeIdentifier>,
+        avoid_first_hop: Option<NodeIdentifier>,
         body: Bytes,
         ttl: Duration,
     ) -> FecSendOutcome {
         let _ = first_hop;
+        if avoid_first_hop.is_some() {
+            for &dst in dsts {
+                if self
+                    .send_proactive_repair_frame(dst, body.clone(), avoid_first_hop, ttl)
+                    .await
+                    .is_err()
+                {
+                    return FecSendOutcome::Shed;
+                }
+            }
+            return FecSendOutcome::Sent;
+        }
         match self.send_multicast(dsts, body, ttl).await {
             Ok(()) => FecSendOutcome::Sent,
             Err(_) => FecSendOutcome::Shed,
@@ -226,6 +242,11 @@ pub trait VoiceTransport: Send + Sync + 'static {
     fn local_node_id(&self) -> NodeIdentifier;
 
     fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality>;
+
+    /// Resolve repair routes even while the foreground route cache rebuilds.
+    fn voice_repair_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
+        self.voice_route_quality(dst)
+    }
 
     /// Return route quality for each destination in the same order as
     /// `dsts`. Production transports can override this to share work across
@@ -246,9 +267,266 @@ pub trait VoiceTransport: Send + Sync + 'static {
     }
 }
 
+/// Protect successfully sent repair and proactive copies at their shared
+/// transport boundary. Originals are grouped by the foreground voice sender.
+pub(crate) struct FecVoiceTransport {
+    inner: Arc<dyn VoiceTransport>,
+    sender: Option<FecSenderState>,
+    parity_slots: Arc<tokio::sync::Semaphore>,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl FecVoiceTransport {
+    pub(crate) fn new(
+        inner: Arc<dyn VoiceTransport>,
+        cfg: &VoiceConfig,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            inner,
+            sender: cfg.voice_fec_enabled.then(|| {
+                FecSenderState::new(cfg.voice_fec_block_size, cfg.voice_fec_parity_blocks)
+            }),
+            parity_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            shutdown,
+        }
+    }
+
+    async fn send_copy(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+        avoid_first_hop: Option<NodeIdentifier>,
+        ttl: Duration,
+        reactive: bool,
+    ) -> Result<(), ApplicationError> {
+        let started = std::time::Instant::now();
+        let avoid = avoid_first_hop.ok_or(ApplicationError::Unavailable)?;
+        let fec_route = self
+            .sender
+            .as_ref()
+            .and_then(|_| self.inner.voice_repair_route_quality(dst))
+            .and_then(|quality| {
+                if quality.next_hop() == avoid {
+                    quality
+                        .alternate_next_hop()
+                        .filter(|hop| *hop != avoid)
+                        .map(|hop| (hop, quality.alternate_reliable()))
+                } else {
+                    Some((quality.next_hop(), quality.reliable()))
+                }
+            });
+        let frame = self
+            .sender
+            .as_ref()
+            .filter(|_| fec_route.is_some_and(|(_, reliable)| !reliable))
+            .and_then(|_| proto::decode_voice(&body).ok())
+            .filter(|frame| !frame.fec_parity);
+        if reactive {
+            self.inner
+                .send_repair_frame(dst, body, Some(avoid), ttl)
+                .await?;
+        } else {
+            self.inner
+                .send_proactive_repair_frame(dst, body, Some(avoid), ttl)
+                .await?;
+        }
+        if let (Some(sender), Some(frame), Some((first_hop, _))) = (&self.sender, frame, fec_route)
+        {
+            let Some(block) = sender.push(
+                first_hop,
+                &[dst],
+                frame.sender_session,
+                frame.sender_epoch,
+                frame.s2s_seq,
+                frame.payload,
+                frame.is_terminator,
+            ) else {
+                return Ok(());
+            };
+            if self.inner.datagram_lane_shedding(first_hop) {
+                return Ok(());
+            }
+            let Ok(slot) = self.parity_slots.clone().try_acquire_owned() else {
+                for index in 0..2 {
+                    if let Some(body) =
+                        block.encode(frame.sender_session, frame.sender_epoch, index)
+                    {
+                        metrics::record_fec_send(
+                            self.inner.local_node_id(),
+                            first_hop,
+                            body.len(),
+                            FecSendOutcome::Shed,
+                        );
+                    }
+                }
+                return Ok(());
+            };
+            let transport = self.inner.clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let _slot = slot;
+                let destinations = [dst];
+                for index in 0..2 {
+                    let Some(body) = block.encode(frame.sender_session, frame.sender_epoch, index)
+                    else {
+                        continue;
+                    };
+                    let remaining = ttl.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let bytes = body.len();
+                    let outcome = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return,
+                        outcome = tokio::time::timeout(
+                        remaining,
+                        transport.send_fec_frame(
+                            &destinations,
+                            Some(first_hop),
+                            Some(avoid),
+                            body,
+                            remaining,
+                        ),
+                    ) => outcome.unwrap_or(FecSendOutcome::Shed),
+                    };
+                    metrics::record_fec_send(transport.local_node_id(), first_hop, bytes, outcome);
+                }
+            });
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl VoiceTransport for FecVoiceTransport {
+    async fn send_unicast(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError> {
+        self.inner.send_unicast(dst, body, ttl).await
+    }
+
+    async fn send_multicast(
+        &self,
+        dsts: &[NodeIdentifier],
+        body: Bytes,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError> {
+        self.inner.send_multicast(dsts, body, ttl).await
+    }
+
+    async fn send_tree_multicast(
+        &self,
+        dsts: &[NodeIdentifier],
+        group: DistributionGroup,
+        body: Bytes,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError> {
+        self.inner.send_tree_multicast(dsts, group, body, ttl).await
+    }
+
+    async fn send_broadcast(&self, body: Bytes, ttl: Duration) -> Result<(), ApplicationError> {
+        self.inner.send_broadcast(body, ttl).await
+    }
+
+    async fn send_repair_request(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError> {
+        self.inner.send_repair_request(dst, body, ttl).await
+    }
+
+    async fn send_path_feedback(
+        &self,
+        dst: NodeIdentifier,
+        feedback: VoicePathFeedback,
+    ) -> Result<(), ApplicationError> {
+        self.inner.send_path_feedback(dst, feedback).await
+    }
+
+    fn record_path_feedback(&self, from: NodeIdentifier, feedback: VoicePathFeedback) {
+        self.inner.record_path_feedback(from, feedback);
+    }
+
+    async fn send_repair_frame(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+        avoid_first_hop: Option<NodeIdentifier>,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError> {
+        self.send_copy(dst, body, avoid_first_hop, ttl, true).await
+    }
+
+    async fn send_proactive_repair_frame(
+        &self,
+        dst: NodeIdentifier,
+        body: Bytes,
+        avoid_first_hop: Option<NodeIdentifier>,
+        ttl: Duration,
+    ) -> Result<(), ApplicationError> {
+        self.send_copy(dst, body, avoid_first_hop, ttl, false).await
+    }
+
+    async fn send_fec_frame(
+        &self,
+        dsts: &[NodeIdentifier],
+        first_hop: Option<NodeIdentifier>,
+        avoid_first_hop: Option<NodeIdentifier>,
+        body: Bytes,
+        ttl: Duration,
+    ) -> FecSendOutcome {
+        self.inner
+            .send_fec_frame(dsts, first_hop, avoid_first_hop, body, ttl)
+            .await
+    }
+
+    fn alive_members(&self) -> Vec<NodeIdentifier> {
+        self.inner.alive_members()
+    }
+    fn voice_members(&self) -> Vec<NodeIdentifier> {
+        self.inner.voice_members()
+    }
+    fn local_node_id(&self) -> NodeIdentifier {
+        self.inner.local_node_id()
+    }
+    fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
+        self.inner.voice_route_quality(dst)
+    }
+    fn voice_repair_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
+        self.inner.voice_repair_route_quality(dst)
+    }
+    fn voice_route_qualities(&self, dsts: &[NodeIdentifier]) -> Vec<Option<VoiceRouteQuality>> {
+        self.inner.voice_route_qualities(dsts)
+    }
+    fn datagram_lane_shedding(&self, first_hop: NodeIdentifier) -> bool {
+        self.inner.datagram_lane_shedding(first_hop)
+    }
+}
+
 /// Production `VoiceTransport` impl backed by the overlay network.
 pub struct OverlayVoiceTransport {
     pub overlay: OverlayNetwork,
+}
+
+struct FecHeadroomReservation<'a> {
+    overlay: &'a OverlayNetwork,
+    first_hop: NodeIdentifier,
+    bytes: usize,
+    sent: bool,
+}
+
+impl Drop for FecHeadroomReservation<'_> {
+    fn drop(&mut self) {
+        self.overlay
+            .release_fec_headroom(self.first_hop, self.bytes, self.sent);
+    }
 }
 
 #[async_trait]
@@ -406,9 +684,8 @@ impl VoiceTransport for OverlayVoiceTransport {
         let mut options = OverlaySendOptions::default()
             .expire_after(ttl)
             .as_distribution_repair();
-        if let Some(first_hop) = avoid_first_hop {
-            options = options.avoid_first_hop(first_hop);
-        }
+        let first_hop = avoid_first_hop.ok_or(ApplicationError::Unavailable)?;
+        options = options.avoid_first_hop(first_hop);
         self.overlay
             .send_unicast_unordered_with_routing_metric_and_options(
                 dst,
@@ -431,9 +708,8 @@ impl VoiceTransport for OverlayVoiceTransport {
         ttl: Duration,
     ) -> Result<(), ApplicationError> {
         let mut options = OverlaySendOptions::default().expire_after(ttl);
-        if let Some(first_hop) = avoid_first_hop {
-            options = options.avoid_first_hop(first_hop);
-        }
+        let first_hop = avoid_first_hop.ok_or(ApplicationError::Unavailable)?;
+        options = options.avoid_first_hop(first_hop);
         self.overlay
             .send_unicast_unordered_with_routing_metric_and_options(
                 dst,
@@ -452,6 +728,7 @@ impl VoiceTransport for OverlayVoiceTransport {
         &self,
         dsts: &[NodeIdentifier],
         first_hop: Option<NodeIdentifier>,
+        avoid_first_hop: Option<NodeIdentifier>,
         body: Bytes,
         ttl: Duration,
     ) -> FecSendOutcome {
@@ -461,6 +738,9 @@ impl VoiceTransport for OverlayVoiceTransport {
         // Without a known first hop there is no lane budget to hold the
         // parity against; fall back to the plain multicast path.
         let Some(first_hop) = first_hop else {
+            if avoid_first_hop.is_some() {
+                return FecSendOutcome::Shed;
+            }
             return match self.send_multicast(dsts, body, ttl).await {
                 Ok(()) => FecSendOutcome::Sent,
                 Err(_) => FecSendOutcome::Shed,
@@ -470,7 +750,16 @@ impl VoiceTransport for OverlayVoiceTransport {
         if !self.overlay.try_reserve_fec_headroom(first_hop, bytes) {
             return FecSendOutcome::Shed;
         }
-        let options = OverlaySendOptions::default().expire_after(ttl);
+        let mut reservation = FecHeadroomReservation {
+            overlay: &self.overlay,
+            first_hop,
+            bytes,
+            sent: false,
+        };
+        let mut options = OverlaySendOptions::default().expire_after(ttl);
+        if let Some(avoid) = avoid_first_hop {
+            options = options.avoid_first_hop(avoid);
+        }
         let result = self
             .overlay
             .send_multicast_unordered_with_routing_metric_and_options(
@@ -483,8 +772,7 @@ impl VoiceTransport for OverlayVoiceTransport {
                 options,
             )
             .await;
-        self.overlay
-            .release_fec_headroom(first_hop, bytes, result.is_ok());
+        reservation.sent = result.is_ok();
         match result {
             Ok(()) => FecSendOutcome::Sent,
             Err(_) => FecSendOutcome::Shed,
@@ -505,6 +793,10 @@ impl VoiceTransport for OverlayVoiceTransport {
 
     fn voice_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
         self.overlay.voice_route_quality(dst)
+    }
+
+    fn voice_repair_route_quality(&self, dst: NodeIdentifier) -> Option<VoiceRouteQuality> {
+        self.overlay.voice_repair_route_quality(dst)
     }
 
     fn voice_route_qualities(&self, dsts: &[NodeIdentifier]) -> Vec<Option<VoiceRouteQuality>> {

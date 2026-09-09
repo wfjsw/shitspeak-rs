@@ -7,9 +7,9 @@
 //! coefficient 2^member_index) that together with the first recovers two
 //! missing members. Parity frames are rate-limited per first hop by the
 //! overlay's `voice_overlap` lane-headroom budget (capacity ∝ accepted
-//! original bytes, i.e. the lane's own load) and only emitted once the
-//! first hop's live datagram loss reaches `voice_fec_loss_gate_ppm` — so a
-//! healthy lane pays nothing and a lossy lane gets bounded redundancy.
+//! original bytes, i.e. the lane's own load). Every unreliable voice link
+//! gets parity regardless of measured loss, subject to send-path pressure
+//! and headroom limits. Reliable stream links need no parity.
 //!
 //! A parity block is emitted only when every member payload has the same
 //! length: reconstruction is then unambiguous (the recovered payload length
@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use bytes::Bytes;
 use shitspeak_core::NodeIdentifier;
 
-use crate::application::proto::VoiceFrame;
+use crate::application::proto::{self, VoiceFrame};
 
 /// Whether a FEC parity frame was admitted onto the lane or shed by the
 /// first-hop headroom budget.
@@ -52,6 +52,37 @@ pub(crate) struct FecBlockToSend {
     pub(crate) parity2: Option<Bytes>,
     /// Bit `i` set when block member `i` was an utterance terminator.
     pub(crate) terminator_mask: u32,
+}
+
+impl FecBlockToSend {
+    pub(crate) fn encode(
+        &self,
+        sender_session: u32,
+        sender_epoch: u64,
+        index: usize,
+    ) -> Option<Bytes> {
+        let payload = match index {
+            0 => self.parity.clone(),
+            1 => self.parity2.clone()?,
+            _ => return None,
+        };
+        let frame = VoiceFrame {
+            sender_session,
+            server_id: String::new(),
+            sender_epoch,
+            s2s_seq: self.member_seqs.last().copied().unwrap_or(0),
+            target_kind: 0,
+            is_terminator: false,
+            payload,
+            intent: None,
+            proactive_copy: false,
+            fec_parity: true,
+            fec_member_seqs: self.member_seqs.clone(),
+            fec_terminator_mask: self.terminator_mask,
+            fec_parity_index: index as u32,
+        };
+        Some(Bytes::from(proto::encode_voice(&frame).ok()?))
+    }
 }
 
 /// XOR of equal-length payloads, zero-padding shorter members to the longest.
@@ -165,6 +196,9 @@ impl SenderFecWindow {
     ) -> Option<FecBlockToSend> {
         if self.block_size < 2 || payload.is_empty() {
             self.pending.clear();
+            return None;
+        }
+        if self.pending.iter().any(|member| member.seq == seq) {
             return None;
         }
         if self
@@ -456,25 +490,31 @@ fn recovered_frame(
 }
 
 /// Sender-side FEC state shared by the voice service's send paths. Each
-/// `(sender_session, sender_epoch)` gets its own block window, matching the
-/// per-session `s2s_seq` space.
+/// speaker, first hop, and recipient set gets its own block window. A partial
+/// block cannot span links or include frames sent to different recipients.
 #[derive(Debug)]
 pub(crate) struct FecSenderState {
-    enabled: bool,
     block_size: usize,
     parity_blocks: usize,
-    inner: std::sync::Mutex<HashMap<(u32, u64), SenderFecWindow>>,
+    inner: std::sync::Mutex<HashMap<FecStreamKey, SenderFecWindow>>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct FecStreamKey {
+    sender_session: u32,
+    sender_epoch: u64,
+    first_hop: NodeIdentifier,
+    destinations: Vec<NodeIdentifier>,
 }
 
 impl FecSenderState {
-    pub(crate) fn new(enabled: bool, block_size: usize, parity_blocks: usize) -> Self {
+    pub(crate) fn new(block_size: usize, parity_blocks: usize) -> Self {
         // Never more parity than data: the receiver can only recover as many
         // missing members as parity frames it holds, and a block needs at
         // least one surviving data member to copy routing metadata from. Two
         // is the hard ceiling this implementation supports.
         let parity_blocks = parity_blocks.min(block_size.saturating_sub(1)).min(2);
         Self {
-            enabled,
             block_size,
             parity_blocks,
             inner: std::sync::Mutex::new(HashMap::new()),
@@ -485,18 +525,25 @@ impl FecSenderState {
     /// block when a full equal-length block finishes; otherwise `None`.
     pub(crate) fn push(
         &self,
+        first_hop: NodeIdentifier,
+        destinations: &[NodeIdentifier],
         sender_session: u32,
         sender_epoch: u64,
         seq: u64,
         payload: Bytes,
         terminator: bool,
     ) -> Option<FecBlockToSend> {
-        if !self.enabled {
-            return None;
-        }
+        let mut destinations = destinations.to_vec();
+        destinations.sort_unstable();
+        destinations.dedup();
         let mut inner = self.inner.lock().unwrap();
         inner
-            .entry((sender_session, sender_epoch))
+            .entry(FecStreamKey {
+                sender_session,
+                sender_epoch,
+                first_hop,
+                destinations,
+            })
             .or_insert_with(|| SenderFecWindow::new(self.block_size, self.parity_blocks))
             .push(seq, payload, terminator)
     }
@@ -635,6 +682,42 @@ impl ReceiverFecState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_windows_are_isolated_by_link_and_recipients() {
+        let sender = FecSenderState::new(2, 1);
+        for (hop, dst, seq) in [(2, 9, 0), (3, 9, 1), (2, 10, 2)] {
+            assert!(
+                sender
+                    .push(hop, &[dst], 7, 42, seq, Bytes::from_static(b"abcd"), false)
+                    .is_none()
+            );
+        }
+        for (hop, dst, seq, members) in [
+            (2, 9, 3, vec![0, 3]),
+            (3, 9, 4, vec![1, 4]),
+            (2, 10, 5, vec![2, 5]),
+        ] {
+            let block = sender
+                .push(hop, &[dst], 7, 42, seq, Bytes::from_static(b"abcd"), false)
+                .unwrap();
+            assert_eq!(block.member_seqs, members);
+        }
+    }
+
+    #[test]
+    fn repeated_copy_does_not_duplicate_a_parity_member() {
+        let mut window = SenderFecWindow::new(2, 1);
+        assert!(window.push(1, Bytes::from_static(b"abcd"), false).is_none());
+        assert!(window.push(1, Bytes::from_static(b"abcd"), false).is_none());
+        assert_eq!(
+            window
+                .push(2, Bytes::from_static(b"efgh"), false)
+                .unwrap()
+                .member_seqs,
+            vec![1, 2]
+        );
+    }
 
     fn frame(seq: u64, payload: &[u8], terminator: bool) -> VoiceFrame {
         VoiceFrame {

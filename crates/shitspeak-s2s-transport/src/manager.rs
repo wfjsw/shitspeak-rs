@@ -666,6 +666,23 @@ impl ConnectionManager {
         self.inner.cfg().max_frame_bytes()
     }
 
+    /// Whether best-effort traffic on this transport uses a reliable stream.
+    /// QUIC v2 prefers DATAGRAMs; legacy QUIC carries traffic on a stream.
+    pub fn best_effort_transport_is_reliable(
+        &self,
+        node: NodeIdentifier,
+        transport: TransportKind,
+    ) -> bool {
+        match transport {
+            TransportKind::Tcp | TransportKind::Kcp => true,
+            TransportKind::Udp => false,
+            TransportKind::Quic => self.inner.get_peer(node).is_some_and(|peer| {
+                peer.try_get_quic_v2_stream().is_none()
+                    && peer.try_get_legacy_quic_stream().is_some()
+            }),
+        }
+    }
+
     /// Check whether an identity-encoded data payload fits as one frame on a
     /// selected transport. Strict QUIC v2 carries BestEffort only as a
     /// DATAGRAM; a legacy QUIC stream remains an eligible fallback.
@@ -7398,6 +7415,24 @@ mod tests {
             .expect("legacy QUIC receiver");
         assert_eq!(forwarded.payload().len(), 1200);
         assert_eq!(quic_datagram.depth_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn best_effort_reliability_distinguishes_datagrams_and_streams() {
+        let (manager, _receivers) = ConnectionManager::test_with_live_streams(
+            1,
+            2,
+            &[TransportKind::Tcp, TransportKind::Kcp, TransportKind::Quic],
+        );
+        assert!(manager.best_effort_transport_is_reliable(2, TransportKind::Tcp));
+        assert!(manager.best_effort_transport_is_reliable(2, TransportKind::Kcp));
+        assert!(manager.best_effort_transport_is_reliable(2, TransportKind::Quic));
+        assert!(!manager.best_effort_transport_is_reliable(2, TransportKind::Udp));
+        assert!(!manager.best_effort_transport_is_reliable(3, TransportKind::Quic));
+
+        let peer = manager.inner.get_peer(2).expect("test peer");
+        let _datagram_receivers = install_test_quic_v2(&peer, socket("127.0.0.1:64741"), 1200);
+        assert!(!manager.best_effort_transport_is_reliable(2, TransportKind::Quic));
     }
 
     #[tokio::test]
