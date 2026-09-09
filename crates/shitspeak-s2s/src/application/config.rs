@@ -26,7 +26,7 @@ pub struct VoiceConfig {
     pub tree_delivery_enabled: bool,
 
     /// Per-speaker max wait before emitting `pending` past a gap.
-    /// Higher = more reorder tolerance, more glass-to-glass latency.
+    /// Also bounded by 90% of the last emitted voice packet duration.
     pub reorder_max_delay_ms: u64,
 
     /// Per-sender pending cap (drop oldest pending when exceeded).
@@ -39,7 +39,7 @@ pub struct VoiceConfig {
     pub reorder_idle_reset_ms: u64,
 
     /// Optional extra repair wait after the initial gap deadline. The initial
-    /// wait and this hold together cannot exceed `adaptive_jitter_max_delay_ms`.
+    /// wait and this hold share the jitter cap and the next voice delivery deadline.
     /// Defaults to 0 so missing packets do not stall newer audio unnecessarily.
     pub chunk_hold_budget_ms: u64,
 

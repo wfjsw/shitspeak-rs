@@ -1,11 +1,11 @@
 //! Per-speaker reorder buffer for inbound voice frames.
 //!
 //! Sits between the dispatch task (which decodes inbound `OverlayData`
-//! frames) and the [`AudioSink`] (which runs local fan-out). Holds back
-//! Holds only frames that arrived after an actual S2S sequence gap. In-order
+//! frames) and the [`AudioSink`] (which runs local fan-out). Holds only frames that arrived after an actual S2S sequence gap. In-order
 //! frames emit immediately; a per-speaker deadline gives a repair copy a short
 //! opportunity to close the gap before the buffered suffix emits in sequence
-//! order.
+//! order. After each delivery, the next drain is due within 90% of that
+//! packet's encoded duration, including across losses and empty buffers.
 //!
 //! All emit decisions are made under a single `parking_lot::Mutex`;
 //! the lock is never held across an `await`. The dispatch task and the
@@ -34,6 +34,7 @@ use crate::application::voice::metrics::{
     self, GapResolution, VoiceDeadlineWakeResult, VoiceReceiveResult,
 };
 use shitspeak_core::NodeIdentifier;
+use shitspeak_voice::codec::{Audio, AudioPayload};
 
 const ADAPTIVE_JITTER_IN_ORDER_DECAY_RUN: u32 = 16;
 const DEFAULT_MAX_USERS: u64 = 5_000;
@@ -161,11 +162,6 @@ impl ReorderReport {
             opened_gap,
             flushes_by_peer: Vec::new(),
         }
-    }
-
-    fn with_flushes(mut self, flushes_by_peer: Vec<FlushByPeer>) -> Self {
-        self.flushes_by_peer = flushes_by_peer;
-        self
     }
 
     /// Deadline flushes attributed per immediate peer, including the held
@@ -304,6 +300,8 @@ struct SenderState {
     adaptive_delay_ms: u64,
     in_order_run: u32,
     last_activity: Instant,
+    /// Delivery cadence survives an empty buffer until the speaker is pruned.
+    next_flush_at: Option<Instant>,
 }
 
 impl Reorderer {
@@ -370,7 +368,7 @@ impl Reorderer {
             return false;
         };
         if entry.sender_epoch != frame.sender_epoch
-            || entry.deadline.is_some()
+            || entry.gap_expires_at.is_some()
             || frame.s2s_seq <= entry.next_seq
         {
             return false;
@@ -500,7 +498,7 @@ impl Reorderer {
     /// The absolute instant beyond which an open gap is permanently missed.
     /// The initial wait and optional hold share one total jitter budget.
     fn gap_hold_deadline(&self, entry: &SenderState) -> Option<Instant> {
-        entry.gap_expires_at
+        entry.gap_expires_at.or(entry.deadline)
     }
 
     /// Whether a repair can still fill the gap within the receiver budget.
@@ -508,7 +506,7 @@ impl Reorderer {
         if entry.pending.is_empty() {
             return false;
         }
-        matches!(self.gap_hold_deadline(entry), Some(deadline) if deadline > now)
+        matches!(entry.gap_expires_at, Some(deadline) if deadline > now)
     }
 
     /// Whether the chunk is currently being held beyond the in-order skew
@@ -691,8 +689,7 @@ impl Reorderer {
             );
         }
 
-        let mut emit: Vec<ReorderEmission> = Vec::new();
-        let mut results: Vec<ReorderResultCount> = Vec::new();
+        let mut report = ReorderReport::empty();
         let mut state = self.state.lock();
         let session = frame.sender_session;
         let frame_seq = frame.s2s_seq;
@@ -707,21 +704,23 @@ impl Reorderer {
         // A reactive repair cannot create a speaker stream. An original or
         // proactive copy may bootstrap when it wins the race to the receiver.
         if !state.per_sender.contains_key(&session) && copy_kind.is_reactive_repair() {
-            results.push(ReorderResultCount::new(
+            report.results.push(ReorderResultCount::new(
                 VoiceReceiveResult::DuplicateOrLate,
                 1,
             ));
-            return ReorderReport::new(emit, results, state.total_pending, None);
+            report.pending_total = state.total_pending;
+            return report;
         }
 
         if !state.per_sender.contains_key(&session)
             && state.per_sender.len() >= self.tracked_speaker_capacity()
         {
-            results.push(ReorderResultCount::new(
+            report.results.push(ReorderResultCount::new(
                 VoiceReceiveResult::SpeakerStateDrop,
                 1,
             ));
-            return ReorderReport::new(emit, results, state.total_pending, None);
+            report.pending_total = state.total_pending;
+            return report;
         }
 
         // Bootstrap from the first original or proactive sequence instead of
@@ -740,6 +739,7 @@ impl Reorderer {
                     adaptive_delay_ms: initial_adaptive_delay_ms,
                     in_order_run: 0,
                     last_activity: now,
+                    next_flush_at: None,
                 },
             );
             self.enqueue_idle_deadline(&mut state, session, now);
@@ -758,12 +758,11 @@ impl Reorderer {
         // and a delayed frame from an older epoch cannot be useful anymore.
         if sender_epoch != entry.sender_epoch {
             if sender_epoch < entry.sender_epoch || copy_kind != VoiceCopyKind::Original {
-                results.push(ReorderResultCount::new(
+                report.results.push(ReorderResultCount::new(
                     VoiceReceiveResult::DuplicateOrLate,
                     1,
                 ));
-                state.per_sender.insert(session, entry);
-                return ReorderReport::new(emit, results, state.total_pending, None);
+                return self.finish_push(&mut state, session, entry, report, now);
             }
 
             let dropped = std::mem::take(&mut entry.pending).len();
@@ -775,19 +774,27 @@ impl Reorderer {
             entry.gap_expires_at = None;
             entry.adaptive_delay_ms = initial_adaptive_delay_ms;
             entry.in_order_run = 0;
+            entry.next_flush_at = None;
         }
         entry.last_activity = now;
+
+        if self
+            .gap_hold_deadline(&entry)
+            .is_some_and(|deadline| deadline <= now)
+        {
+            let drained = self.flush_pending(&mut entry, now, &mut report);
+            state.total_pending = state.total_pending.saturating_sub(drained);
+        }
 
         // Once a stream has advanced, every lower same-epoch sequence is a
         // duplicate or late arrival. Rewinding here re-emits audio and breaks
         // the receiver's monotonic stream contract.
         if frame_seq < entry.next_seq {
-            results.push(ReorderResultCount::new(
+            report.results.push(ReorderResultCount::new(
                 VoiceReceiveResult::DuplicateOrLate,
                 1,
             ));
-            state.per_sender.insert(session, entry);
-            return ReorderReport::new(emit, results, state.total_pending, None);
+            return self.finish_push(&mut state, session, entry, report, now);
         }
 
         // In-order frames emit immediately and drain a contiguous buffered
@@ -797,15 +804,18 @@ impl Reorderer {
             // cannot advance a healthy stream by itself.
             let gap_open = self.gap_is_live(&entry, now);
             if copy_kind.is_reactive_repair() && !gap_open {
-                results.push(ReorderResultCount::new(
+                report.results.push(ReorderResultCount::new(
                     VoiceReceiveResult::DuplicateOrLate,
                     1,
                 ));
-                state.per_sender.insert(session, entry);
-                return ReorderReport::new(emit, results, state.total_pending, None);
+                return self.finish_push(&mut state, session, entry, report, now);
             }
-            results.push(ReorderResultCount::new(VoiceReceiveResult::InOrder, 1));
-            emit.push(ReorderEmission::new(from, frame, copy_kind));
+            report
+                .results
+                .push(ReorderResultCount::new(VoiceReceiveResult::InOrder, 1));
+            report
+                .emissions
+                .push(ReorderEmission::new(from, frame, copy_kind));
             entry.next_seq = entry.next_seq.saturating_add(1);
             let mut drained_count: usize = 0;
             loop {
@@ -814,7 +824,7 @@ impl Reorderer {
                     Some(seq) if seq == entry.next_seq => {
                         let pair = entry.pending.remove(&seq).unwrap();
                         entry.next_seq = entry.next_seq.saturating_add(1);
-                        emit.push(pair);
+                        report.emissions.push(pair);
                         drained_count += 1;
                     }
                     _ => break,
@@ -839,7 +849,7 @@ impl Reorderer {
                 metrics::record_gap_resolution(resolution);
             }
             if drained_count > 0 {
-                results.push(ReorderResultCount::new(
+                report.results.push(ReorderResultCount::new(
                     VoiceReceiveResult::GapFilled,
                     drained_count,
                 ));
@@ -853,12 +863,11 @@ impl Reorderer {
             // existing suffix opened by an original or proactive copy.
             let gap_open = self.gap_is_live(&entry, now);
             if copy_kind.is_reactive_repair() && !gap_open {
-                results.push(ReorderResultCount::new(
+                report.results.push(ReorderResultCount::new(
                     VoiceReceiveResult::DuplicateOrLate,
                     1,
                 ));
-                state.per_sender.insert(session, entry);
-                return ReorderReport::new(emit, results, state.total_pending, None);
+                return self.finish_push(&mut state, session, entry, report, now);
             }
 
             // A real gap: retain the nearest pending suffix, not the oldest
@@ -869,38 +878,41 @@ impl Reorderer {
                     entry
                         .pending
                         .insert(frame_seq, ReorderEmission::new(from, frame, copy_kind));
-                    results.push(ReorderResultCount::new(VoiceReceiveResult::GapBuffered, 1));
+                    report
+                        .results
+                        .push(ReorderResultCount::new(VoiceReceiveResult::GapBuffered, 1));
 
-                    let gap = if entry.deadline.is_none() && copy_kind == VoiceCopyKind::Original {
-                        Some(self.arm_gap(
-                            &mut state,
-                            &mut entry,
-                            session,
-                            from,
-                            sender_epoch,
-                            route_hint,
-                            now,
-                        ))
-                    } else {
-                        None
-                    };
-                    state.per_sender.insert(session, entry);
-                    return ReorderReport::new(emit, results, state.total_pending, gap);
+                    let gap =
+                        if entry.gap_expires_at.is_none() && copy_kind == VoiceCopyKind::Original {
+                            Some(self.arm_gap(
+                                &mut state,
+                                &mut entry,
+                                session,
+                                from,
+                                sender_epoch,
+                                route_hint,
+                                now,
+                            ))
+                        } else {
+                            None
+                        };
+                    report.opened_gap = gap;
+                    return self.finish_push(&mut state, session, entry, report, now);
                 } else {
-                    results.push(ReorderResultCount::new(
+                    report.results.push(ReorderResultCount::new(
                         VoiceReceiveResult::DuplicateOrLate,
                         1,
                     ));
                 }
-                state.per_sender.insert(session, entry);
-                return ReorderReport::new(emit, results, state.total_pending, None);
+                return self.finish_push(&mut state, session, entry, report, now);
             }
 
             let per_sender_cap = self.cfg.reorder_max_buffered_frames;
             if per_sender_cap == 0 {
-                results.push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
-                state.per_sender.insert(session, entry);
-                return ReorderReport::new(emit, results, state.total_pending, None);
+                report
+                    .results
+                    .push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
+                return self.finish_push(&mut state, session, entry, report, now);
             }
             if entry.pending.len() >= per_sender_cap {
                 let farthest_seq = *entry
@@ -909,13 +921,16 @@ impl Reorderer {
                     .next_back()
                     .expect("nonempty pending buffer at capacity");
                 if frame_seq > farthest_seq {
-                    results.push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
-                    state.per_sender.insert(session, entry);
-                    return ReorderReport::new(emit, results, state.total_pending, None);
+                    report
+                        .results
+                        .push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
+                    return self.finish_push(&mut state, session, entry, report, now);
                 }
                 entry.pending.remove(&farthest_seq);
                 state.total_pending = state.total_pending.saturating_sub(1);
-                results.push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
+                report
+                    .results
+                    .push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
             }
 
             // Node-wide cap is an emergency guard. Do not evict another
@@ -926,19 +941,22 @@ impl Reorderer {
                     seq = frame_seq,
                     "voice reorder: node-wide buffer full; dropping"
                 );
-                results.push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
-                state.per_sender.insert(session, entry);
-                return ReorderReport::new(emit, results, state.total_pending, None);
+                report
+                    .results
+                    .push(ReorderResultCount::new(VoiceReceiveResult::BufferDrop, 1));
+                return self.finish_push(&mut state, session, entry, report, now);
             }
 
             entry
                 .pending
                 .insert(frame_seq, ReorderEmission::new(from, frame, copy_kind));
             entry.in_order_run = 0;
-            results.push(ReorderResultCount::new(VoiceReceiveResult::GapBuffered, 1));
+            report
+                .results
+                .push(ReorderResultCount::new(VoiceReceiveResult::GapBuffered, 1));
             state.total_pending = state.total_pending.saturating_add(1);
 
-            let gap = if entry.deadline.is_none() && copy_kind == VoiceCopyKind::Original {
+            let gap = if entry.gap_expires_at.is_none() && copy_kind == VoiceCopyKind::Original {
                 Some(self.arm_gap(
                     &mut state,
                     &mut entry,
@@ -951,14 +969,121 @@ impl Reorderer {
             } else {
                 None
             };
-            state.per_sender.insert(session, entry);
-            return ReorderReport::new(emit, results, state.total_pending, gap);
+            report.opened_gap = gap;
+            return self.finish_push(&mut state, session, entry, report, now);
         }
 
         // Terminators take the same ordered path as all other frames. They do
         // not flush a noncontiguous suffix early.
+        self.finish_push(&mut state, session, entry, report, now)
+    }
+
+    /// Keep enough headroom for client processing before its current packet ends.
+    fn delivery_interval(frame: &VoiceFrame) -> Duration {
+        let duration = Audio::decode(&frame.payload, Some(frame.sender_session.into()))
+            .ok()
+            .and_then(|audio| match audio.audio_payload {
+                AudioPayload::Opus(opus) => opus.packet_duration(),
+                _ => None,
+            })
+            // An empty terminator or malformed payload provides no media clock.
+            // Use the shortest Opus period so it cannot lengthen a voice stall.
+            .unwrap_or(Duration::from_micros(2_500));
+        duration * 9 / 10
+    }
+
+    fn finish_push(
+        &self,
+        state: &mut ReorderInner,
+        session: u32,
+        mut entry: SenderState,
+        mut report: ReorderReport,
+        now: Instant,
+    ) -> ReorderReport {
+        if let Some(last) = report.emissions.last() {
+            entry.next_flush_at = Some(now + Self::delivery_interval(last.frame()));
+        }
+        if !entry.pending.is_empty() {
+            // All buffered copies share the previous delivery's deadline.
+            // Originals can confirm a gap without restarting this timer.
+            let limit = entry
+                .next_flush_at
+                .expect("a speaker emits before buffering");
+            let deadline = entry.deadline.map_or(limit, |deadline| deadline.min(limit));
+            if let Some(expiry) = entry.gap_expires_at.as_mut() {
+                *expiry = (*expiry).min(limit);
+            }
+            if let Some(start) = entry.hold_started_at.as_mut() {
+                // An overdue cadence can release a newly arrived packet
+                // immediately; it has spent no time waiting in the buffer.
+                *start = (*start).min(limit.max(now));
+            }
+            if entry.deadline != Some(deadline) {
+                entry.deadline = Some(deadline);
+                state.deadlines.push(Reverse((deadline, session)));
+                self.deadline_notify.notify_one();
+            }
+            if self
+                .gap_hold_deadline(&entry)
+                .is_some_and(|expiry| expiry <= now)
+            {
+                let drained = self.flush_pending(&mut entry, now, &mut report);
+                state.total_pending = state.total_pending.saturating_sub(drained);
+                report.opened_gap = None;
+            }
+        }
+        report.pending_total = state.total_pending;
         state.per_sender.insert(session, entry);
-        ReorderReport::new(emit, results, state.total_pending, None)
+        report
+    }
+
+    fn flush_pending(
+        &self,
+        entry: &mut SenderState,
+        now: Instant,
+        report: &mut ReorderReport,
+    ) -> usize {
+        let held_delay_us = entry.hold_started_at.map_or(0, |start| {
+            u64::try_from(now.saturating_duration_since(start).as_micros()).unwrap_or(u64::MAX)
+        });
+        let confirmed = entry.gap_expires_at.is_some();
+        let pending = std::mem::take(&mut entry.pending);
+        let count = pending.len();
+        entry.deadline = None;
+        entry.hold_started_at = None;
+        entry.gap_expires_at = None;
+        if let Some((seq, last)) = pending.last_key_value() {
+            entry.next_seq = seq.saturating_add(1);
+            entry.next_flush_at = Some(now + Self::delivery_interval(last.frame()));
+            self.grow_adaptive_delay(entry);
+            if confirmed {
+                metrics::record_gap_resolution(GapResolution::Timeout);
+            }
+            report.results.push(ReorderResultCount::new(
+                VoiceReceiveResult::DeadlineFlush,
+                count,
+            ));
+        }
+        for (_, emission) in pending {
+            let from = emission.from();
+            match report
+                .flushes_by_peer
+                .iter_mut()
+                .find(|flush| flush.from == from)
+            {
+                Some(flush) => {
+                    flush.count = flush.count.saturating_add(1);
+                    flush.max_held_delay_us = flush.max_held_delay_us.max(held_delay_us);
+                }
+                None => report.flushes_by_peer.push(FlushByPeer {
+                    from,
+                    count: 1,
+                    max_held_delay_us: held_delay_us,
+                }),
+            }
+            report.emissions.push(emission);
+        }
+        count
     }
 
     /// Drain every deadline that has expired. Returns frames in
@@ -977,105 +1102,53 @@ impl Reorderer {
     }
 
     fn drain_expired_with_clock(&self, clock: impl FnOnce() -> Instant) -> ReorderReport {
-        let mut emit: Vec<ReorderEmission> = Vec::new();
-        let mut results: Vec<ReorderResultCount> = Vec::new();
-        let mut flushes_by_peer: Vec<FlushByPeer> = Vec::new();
-        let mut state = self.state.lock();
-        let now = clock();
-        self.prune_idle(&mut state, now);
-        loop {
-            let next = state.deadlines.peek().copied();
-            let Some(Reverse((deadline, session))) = next else {
-                break;
-            };
-            if deadline > now {
-                break;
-            }
-            state.deadlines.pop();
-            // Stale heap entry? The gap may have been filled, rebased, or
-            // the speaker may have been pruned.
-            let Some(entry) = state.per_sender.get(&session) else {
-                continue;
-            };
-            if entry.deadline != Some(deadline) {
-                continue;
-            }
-
-            // An optional repair hold must fit inside the original gap budget.
-            // Retaining newer audio beyond it turns one loss into a long stall.
-            if let Some(hold_until) = self.gap_hold_deadline(entry) {
-                if now < hold_until {
-                    // Re-arm the deadline task for the hold-budget expiry and
-                    // keep the whole buffered chunk.
-                    let entry = state.per_sender.get_mut(&session).unwrap();
-                    entry.deadline = Some(hold_until);
-                    state.deadlines.push(Reverse((hold_until, session)));
+        let report = {
+            let mut report = ReorderReport::empty();
+            let mut state = self.state.lock();
+            let now = clock();
+            self.prune_idle(&mut state, now);
+            loop {
+                let next = state.deadlines.peek().copied();
+                let Some(Reverse((deadline, session))) = next else {
+                    break;
+                };
+                if deadline > now {
+                    break;
+                }
+                state.deadlines.pop();
+                // Stale heap entry? The gap may have been filled, rebased, or
+                // the speaker may have been pruned.
+                let Some(entry) = state.per_sender.get(&session) else {
+                    continue;
+                };
+                if entry.deadline != Some(deadline) {
                     continue;
                 }
-            }
 
-            // Drain in seq order, jump next_seq past the highest seq
-            // we drained. This is the whole buffered chunk at once: a
-            // contiguous, delayed emit rather than a per-frame skip.
-            let drained: Vec<(u64, ReorderEmission)> = {
-                let entry = state.per_sender.get_mut(&session).unwrap();
-                // Sample the held delay BEFORE clearing `hold_started_at`:
-                // this is the exact UX cost the receiver just imposed (the
-                // chunk played out late, after the whole hold window).
-                let held_delay_us = entry
-                    .hold_started_at
-                    .map(|start| {
-                        u64::try_from(now.saturating_duration_since(start).as_micros())
-                            .unwrap_or(u64::MAX)
-                    })
-                    .unwrap_or(0);
-                let drained: Vec<(u64, ReorderEmission)> =
-                    std::mem::take(&mut entry.pending).into_iter().collect();
-                entry.deadline = None;
-                entry.hold_started_at = None;
-                entry.gap_expires_at = None;
-                if !drained.is_empty() {
-                    self.grow_adaptive_delay(entry);
-                }
-                if let Some((max_seq, _)) = drained.last() {
-                    entry.next_seq = max_seq.saturating_add(1);
-                }
-                for (_, emission) in &drained {
-                    let from = emission.from();
-                    match flushes_by_peer.iter_mut().find(|flush| flush.from == from) {
-                        Some(flush) => {
-                            flush.count = flush.count.saturating_add(1);
-                            flush.max_held_delay_us = flush.max_held_delay_us.max(held_delay_us);
-                        }
-                        None => flushes_by_peer.push(FlushByPeer {
-                            from,
-                            count: 1,
-                            max_held_delay_us: held_delay_us,
-                        }),
+                // An optional repair hold must fit inside the original gap budget.
+                // Retaining newer audio beyond it turns one loss into a long stall.
+                if let Some(hold_until) = self.gap_hold_deadline(entry) {
+                    if now < hold_until {
+                        // Re-arm the deadline task for the hold-budget expiry and
+                        // keep the whole buffered chunk.
+                        let entry = state.per_sender.get_mut(&session).unwrap();
+                        entry.deadline = Some(hold_until);
+                        state.deadlines.push(Reverse((hold_until, session)));
+                        continue;
                     }
                 }
-                drained
-            };
-            state.total_pending = state.total_pending.saturating_sub(drained.len());
-            if !drained.is_empty() {
-                // An armed gap reached its point of no return and was flushed
-                // with the hole still open: the missing frame(s) were never
-                // covered by any copy.
-                metrics::record_gap_resolution(GapResolution::Timeout);
-                results.push(ReorderResultCount::new(
-                    VoiceReceiveResult::DeadlineFlush,
-                    drained.len(),
-                ));
+
+                let entry = state.per_sender.get_mut(&session).unwrap();
+                let drained = self.flush_pending(entry, now, &mut report);
+                state.total_pending = state.total_pending.saturating_sub(drained);
             }
-            for (_, emission) in drained {
-                emit.push(emission);
-            }
-        }
-        self.prune_idle(&mut state, now);
-        let pending_total = state.total_pending;
-        drop(state);
+            self.prune_idle(&mut state, now);
+            let pending_total = state.total_pending;
+            report.pending_total = pending_total;
+            report
+        };
         self.acknowledge_deadline_wake();
-        ReorderReport::new(emit, results, pending_total, None).with_flushes(flushes_by_peer)
+        report
     }
 
     fn acknowledge_deadline_wake(&self) {
@@ -1135,7 +1208,7 @@ impl Reorderer {
         let entry = state.per_sender.get(&sender_session)?;
         // The repair coordinator should keep repairing until the chunk-hold
         // deadline, not just the in-order skew tolerance.
-        let deadline = self.gap_hold_deadline(entry)?;
+        let deadline = entry.gap_expires_at?;
         if entry.sender_epoch != sender_epoch || deadline <= Instant::now() {
             return None;
         }
@@ -1287,7 +1360,8 @@ mod tests {
             s2s_seq: seq,
             target_kind: 0,
             is_terminator: terminator,
-            payload: Bytes::from(format!("p-{seq}").into_bytes()),
+            // Two 60 ms SILK frames in a protobuf audio envelope.
+            payload: Bytes::from_static(&[0, 0x2a, 1, 0x19]),
             intent: Some(VoiceIntent {
                 kind: Some(VoiceIntentKind::Normal(VoiceIntentNormal {
                     source_channel: 0,
@@ -1298,6 +1372,246 @@ mod tests {
             fec_member_seqs: Vec::new(),
             fec_terminator_mask: 0,
             fec_parity_index: 0,
+        }
+    }
+
+    fn timed_frame(session: u32, seq: u64, toc: u8) -> VoiceFrame {
+        use prost::Message;
+        let mut f = frame(session, 1, seq, false);
+        let audio = shitspeak_proto::mumble_udp::Audio {
+            opus_data: Bytes::from(vec![toc]),
+            ..Default::default()
+        };
+        let mut payload = vec![0];
+        audio.encode(&mut payload).unwrap();
+        f.payload = Bytes::from(payload);
+        f
+    }
+
+    #[test]
+    fn active_stream_drains_before_previous_packet_finishes() {
+        for (toc, micros) in [
+            (0x80, 2_500),
+            (0x88, 5_000),
+            (0, 10_000),
+            (8, 20_000),
+            (16, 40_000),
+            (24, 60_000),
+        ] {
+            for kind in [
+                VoiceCopyKind::Original,
+                VoiceCopyKind::Proactive,
+                VoiceCopyKind::Fec,
+            ] {
+                let mut c = cfg();
+                c.chunk_hold_budget_ms = 600;
+                let r = Reorderer::new(c);
+                let start = Instant::now();
+                let interval = Duration::from_micros(micros) * 9 / 10;
+                assert_eq!(
+                    r.push_at(
+                        11,
+                        timed_frame(0xABC, 0, toc),
+                        None,
+                        VoiceCopyKind::Original,
+                        start
+                    )
+                    .into_emissions()
+                    .len(),
+                    1
+                );
+                // Every flush starts the next delivery deadline. An empty
+                // buffer and repeated losses must not restore a long wait.
+                for (tick, seq) in [(1, 2), (2, 4), (3, 6)] {
+                    let deadline = start + interval * tick;
+                    let arrival = deadline - interval / 2;
+                    assert!(
+                        r.push_at(
+                            11,
+                            timed_frame(0xABC, seq, toc),
+                            Some(VoiceRouteHint::new(237_000, 80_000, 30_000)),
+                            kind,
+                            arrival
+                        )
+                        .into_emissions()
+                        .is_empty()
+                    );
+                    assert!(
+                        r.drain_expired_at(deadline - Duration::from_nanos(1))
+                            .into_emissions()
+                            .is_empty()
+                    );
+                    let emitted = r.drain_expired_at(deadline).into_emissions();
+                    assert_eq!(
+                        emitted.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
+                        vec![seq],
+                        "period={interval:?}, copy={kind:?}"
+                    );
+                }
+                // After an actual outage there is no remaining playback
+                // budget to spend waiting for another missing packet.
+                let report = r.push_at(
+                    11,
+                    timed_frame(0xABC, 8, toc),
+                    None,
+                    kind,
+                    start + interval * 5,
+                );
+                assert_eq!(
+                    report.flushes_by_peer()[0].max_held_delay_us,
+                    0,
+                    "a newly arrived packet was never held during the outage"
+                );
+                let emitted = report.into_emissions();
+                assert_eq!(
+                    emitted.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
+                    vec![8]
+                );
+                assert_eq!(r.pending_total(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_deadline_survives_confirmation_and_partial_repair() {
+        let mut c = cfg();
+        c.chunk_hold_budget_ms = 600;
+        let r = Reorderer::new(c);
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        r.push_at(
+            11,
+            timed_frame(1, 0, 8),
+            None,
+            VoiceCopyKind::Original,
+            at(0),
+        );
+        let proactive = r.push_at(
+            12,
+            timed_frame(1, 2, 8),
+            None,
+            VoiceCopyKind::Proactive,
+            at(5),
+        );
+        assert!(proactive.opened_gap().is_none());
+        assert_eq!(r.next_deadline(), Some(at(18)));
+        let original = r.push_at(
+            11,
+            timed_frame(1, 2, 8),
+            Some(VoiceRouteHint::new(999_000, 99_000, 30_000)),
+            VoiceCopyKind::Original,
+            at(10),
+        );
+        assert!(original.opened_gap().is_some());
+        r.push_at(
+            11,
+            timed_frame(1, 4, 8),
+            None,
+            VoiceCopyKind::Original,
+            at(11),
+        );
+        let repair = r
+            .push_at(
+                12,
+                timed_frame(1, 1, 8),
+                None,
+                VoiceCopyKind::ReactiveRepair,
+                at(12),
+            )
+            .into_emissions();
+        assert_eq!(
+            repair.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(r.next_deadline(), Some(at(18)));
+        // Expiry on an ingress call must flush before considering late repair.
+        let expired = r.push_at(
+            12,
+            timed_frame(1, 3, 8),
+            None,
+            VoiceCopyKind::ReactiveRepair,
+            at(18),
+        );
+        assert_eq!(expired.flushes_by_peer()[0].from, 11);
+        assert_eq!(
+            expired
+                .into_emissions()
+                .iter()
+                .map(|(_, f)| f.s2s_seq)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert_eq!(r.pending_total(), 0);
+    }
+
+    #[test]
+    fn continuous_deadlines_are_per_speaker_and_reset_after_major_silence() {
+        let mut c = cfg();
+        c.chunk_hold_budget_ms = 600;
+        let r = Reorderer::new(c);
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        for (session, toc) in [(1, 8), (2, 16)] {
+            r.push_at(
+                11,
+                timed_frame(session, 0, toc),
+                None,
+                VoiceCopyKind::Original,
+                at(0),
+            );
+            r.push_at(
+                11,
+                timed_frame(session, 2, toc),
+                None,
+                VoiceCopyKind::Original,
+                at(5),
+            );
+        }
+        let first = r.drain_expired_at(at(18)).into_emissions();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].1.sender_session, 1);
+        let second = r.drain_expired_at(at(36)).into_emissions();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].1.sender_session, 2);
+        // A fresh talkspurt bootstraps at its own sequence and packet duration.
+        r.drain_expired_at(at(2_006));
+        assert_eq!(r.tracked_speaker_count(), 0);
+        assert_eq!(
+            r.push_at(
+                11,
+                timed_frame(1, 100, 0),
+                None,
+                VoiceCopyKind::Original,
+                at(2_010)
+            )
+            .into_emissions()
+            .len(),
+            1
+        );
+        r.push_at(
+            11,
+            timed_frame(1, 102, 0),
+            None,
+            VoiceCopyKind::Proactive,
+            at(2_012),
+        );
+        assert_eq!(r.next_deadline(), Some(at(2_019)));
+        assert_eq!(r.drain_expired_at(at(2_019)).into_emissions().len(), 1);
+    }
+
+    #[test]
+    fn delivery_interval_reads_legacy_and_multiframe_packets() {
+        let mut f = frame(1, 1, 0, false);
+        assert_eq!(Reorderer::delivery_interval(&f), Duration::from_millis(108));
+        // Legacy Opus: header, sequence, size, and a single 20 ms TOC.
+        f.payload = Bytes::from_static(&[0x80, 0, 1, 8]);
+        assert_eq!(Reorderer::delivery_interval(&f), Duration::from_millis(18));
+        for payload in [Bytes::new(), Bytes::from_static(&[0, 0x2a, 2, 3, 0])] {
+            f.payload = payload;
+            assert_eq!(
+                Reorderer::delivery_interval(&f),
+                Duration::from_micros(2_250)
+            );
         }
     }
 
@@ -1831,13 +2145,16 @@ mod tests {
                 VoiceCopyKind::ReactiveRepair,
             )
             .into_marked_emissions();
-        assert!(repair.is_empty());
+        assert_eq!(
+            repair.iter().map(|e| e.frame().s2s_seq).collect::<Vec<_>>(),
+            vec![2]
+        );
         assert_eq!(
             r.drain_expired()
                 .iter()
                 .map(|(_, frame)| frame.s2s_seq)
                 .collect::<Vec<_>>(),
-            vec![2]
+            Vec::<u64>::new()
         );
     }
 
@@ -2166,14 +2483,14 @@ mod tests {
         let gap = r
             .current_actionable_gap(11, 0xABC, 1)
             .expect("the repair worker sees the bounded deadline");
-        assert_eq!(gap.deadline(), start + Duration::from_millis(120));
+        assert_eq!(gap.deadline(), start + Duration::from_millis(108));
         assert!(
-            r.drain_expired_at(start + Duration::from_millis(119))
+            r.drain_expired_at(start + Duration::from_millis(107))
                 .into_emissions()
                 .is_empty()
         );
         let emits = r
-            .drain_expired_at(start + Duration::from_millis(120))
+            .drain_expired_at(start + Duration::from_millis(108))
             .into_emissions();
         assert_eq!(
             emits.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
@@ -2185,7 +2502,7 @@ mod tests {
                 frame(0xABC, 1, 1, false),
                 None,
                 VoiceCopyKind::ReactiveRepair,
-                start + Duration::from_millis(121)
+                start + Duration::from_millis(109)
             )
             .into_emissions()
             .is_empty()
@@ -2213,35 +2530,34 @@ mod tests {
                 frame(0xABC, 1, 1, false),
                 None,
                 VoiceCopyKind::ReactiveRepair,
-                start + Duration::from_millis(110),
+                start + Duration::from_millis(90),
             )
             .into_emissions();
         assert_eq!(
             repaired.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
             vec![1, 2]
         );
-        let expiry = start + Duration::from_millis(140);
+        let expiry = start + Duration::from_millis(108);
         assert_eq!(
             r.current_actionable_gap(11, 0xABC, 1).unwrap().deadline(),
             expiry
         );
-        // Even before the deadline task runs, expired repairs cannot prolong audio.
-        assert!(
-            r.push_at(
+        // An expired repair triggers delivery of the remaining suffix, but
+        // the missing packet itself can no longer join the stream.
+        let emitted = r
+            .push_at(
                 11,
                 frame(0xABC, 1, 3, false),
                 None,
                 VoiceCopyKind::ReactiveRepair,
-                expiry
+                expiry,
             )
-            .into_emissions()
-            .is_empty()
-        );
-        let emitted = r.drain_expired_at(expiry).into_emissions();
+            .into_emissions();
         assert_eq!(
             emitted.iter().map(|(_, f)| f.s2s_seq).collect::<Vec<_>>(),
             vec![4]
         );
+        assert!(r.drain_expired_at(expiry).into_emissions().is_empty());
         assert_eq!(r.pending_total(), 0);
     }
 

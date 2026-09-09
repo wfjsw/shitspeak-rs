@@ -33,7 +33,7 @@ use crate::application::voice::metrics::{
 };
 use crate::application::voice::proactive_utility::proactive_marginal_utility_micros;
 use crate::application::voice::reorder::{
-    self, FlushByPeer, GapReport, Reorderer, VoiceCopyKind, VoiceRouteHint,
+    self, GapReport, Reorderer, VoiceCopyKind, VoiceRouteHint,
 };
 use crate::application::voice::repair::{REPAIR_RESPONSE_PAGE_SEQUENCES, RepairCache, RepairFrame};
 use crate::application::voice::send::{
@@ -102,6 +102,35 @@ struct RepairRequestState {
     deadline: Instant,
     send_cancel: CancellationToken,
     in_flight_generation: Option<u64>,
+}
+
+impl RepairRequestState {
+    fn observe_cursor(&mut self, first_seq: u64, deadline: Instant, now: Instant) {
+        if first_seq == self.tracked_first_seq {
+            return;
+        }
+        self.tracked_first_seq = first_seq;
+        self.attempts = 0;
+        let remaining = deadline.saturating_duration_since(now);
+        self.retry_interval = repair_request_retry_interval(remaining);
+        if self
+            .requested_page_last
+            .is_some_and(|last| first_seq > last)
+        {
+            self.requested_page_last = None;
+        }
+        self.next_attempt = now + REPAIR_REQUEST_POLL_INTERVAL.min(remaining);
+    }
+
+    fn complete_attempt(&mut self, generation: u64, first_seq: u64, sent: bool) {
+        if self.in_flight_generation != Some(generation) {
+            return;
+        }
+        self.in_flight_generation = None;
+        if sent && self.tracked_first_seq == first_seq {
+            self.attempts = self.attempts.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2272,6 +2301,9 @@ fn spawn_dispatch_task(
             );
             if let Some((origin_node, from_immediate)) = inbound_labels {
                 for result in report.result_counts() {
+                    if result.result() == VoiceReceiveResult::DeadlineFlush {
+                        continue;
+                    }
                     metrics::record_receive(
                         source,
                         origin_node,
@@ -2289,14 +2321,20 @@ fn spawn_dispatch_task(
                     }
                 }
             }
-            // Captured before `into_marked_emissions` moves `report`: the
-            // per-peer flush attribution is needed to feed the path-feedback
-            // accumulator on the deadline path.
-            let deadline_flushes: Vec<FlushByPeer> = if inbound_labels.is_none() {
-                report.flushes_by_peer().to_vec()
-            } else {
-                Vec::new()
-            };
+            // Ingress can flush an expired suffix carried by a different
+            // immediate peer. Attribute it to the peers that buffered it.
+            let deadline_flushes = report.flushes_by_peer().to_vec();
+            if let Some((origin_node, _)) = inbound_labels {
+                for flush in &deadline_flushes {
+                    metrics::record_receive(
+                        source,
+                        origin_node,
+                        flush.from,
+                        VoiceReceiveResult::DeadlineFlush,
+                        flush.count,
+                    );
+                }
+            }
             let emits = report.into_marked_emissions();
             if inbound_labels.is_none() {
                 for emission in &emits {
@@ -2313,30 +2351,25 @@ fn spawn_dispatch_task(
                         1,
                     );
                 }
-                // Path feedback on the deadline path. This is the previous
-                // dead path: deadline events never reached the accumulator
-                // (it was only fed from push events), so `deadline_flush`
-                // was always zero in the receiver's report. A flushed chunk
-                // is reported to the immediate peer that carried it, along
-                // with the held delay the chunk absorbed before release.
-                for flush in deadline_flushes {
-                    let from = flush.from;
-                    if let Some(feedback) =
-                        path_feedback.record(from, VoiceReceiveResult::DeadlineFlush, flush.count)
-                    {
-                        let transport = transport.clone();
-                        tokio::spawn(async move {
-                            let _ = transport.send_path_feedback(from, feedback).await;
-                        });
-                    }
-                    if let Some(feedback) =
-                        path_feedback.record_held_delay(from, flush.max_held_delay_us)
-                    {
-                        let transport = transport.clone();
-                        tokio::spawn(async move {
-                            let _ = transport.send_path_feedback(from, feedback).await;
-                        });
-                    }
+            }
+            // Deadline and ingress flushes share peer feedback and held delay.
+            for flush in deadline_flushes {
+                let from = flush.from;
+                if let Some(feedback) =
+                    path_feedback.record(from, VoiceReceiveResult::DeadlineFlush, flush.count)
+                {
+                    let transport = transport.clone();
+                    tokio::spawn(async move {
+                        let _ = transport.send_path_feedback(from, feedback).await;
+                    });
+                }
+                if let Some(feedback) =
+                    path_feedback.record_held_delay(from, flush.max_held_delay_us)
+                {
+                    let transport = transport.clone();
+                    tokio::spawn(async move {
+                        let _ = transport.send_path_feedback(from, feedback).await;
+                    });
                 }
             }
             if emits.is_empty() {
@@ -3169,13 +3202,8 @@ async fn run_repair_request_worker(
             result = jobs.join_next(), if !jobs.is_empty() => {
                 match result {
                     Some(Ok((key, generation, first_seq, sent))) => {
-                        if let Some(state) = active.get_mut(&key)
-                            && state.in_flight_generation == Some(generation)
-                        {
-                            state.in_flight_generation = None;
-                            if sent && state.tracked_first_seq == first_seq {
-                                state.attempts = state.attempts.saturating_add(1);
-                            }
+                        if let Some(state) = active.get_mut(&key) {
+                            state.complete_attempt(generation, first_seq, sent);
                         }
                     }
                     Some(Err(error)) => {
@@ -3205,19 +3233,7 @@ async fn run_repair_request_worker(
             };
             let gap = actionable.gap();
             let deadline = actionable.deadline();
-            if gap.first_seq != state.tracked_first_seq {
-                state.tracked_first_seq = gap.first_seq;
-                state.attempts = 0;
-                let remaining = deadline.saturating_duration_since(now);
-                state.retry_interval = repair_request_retry_interval(remaining);
-                if state
-                    .requested_page_last
-                    .is_some_and(|last| gap.first_seq > last)
-                {
-                    state.requested_page_last = None;
-                }
-                state.next_attempt = now + REPAIR_REQUEST_POLL_INTERVAL.min(remaining);
-            }
+            state.observe_cursor(gap.first_seq, deadline, now);
             if slots == 0
                 || state.in_flight_generation.is_some()
                 || state.attempts >= REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE
@@ -5525,7 +5541,8 @@ mod tests {
             s2s_seq,
             target_kind: 0,
             is_terminator: false,
-            payload: Bytes::from(format!("repair-{s2s_seq}").into_bytes()),
+            // Protobuf audio containing two 60 ms Opus frames.
+            payload: Bytes::from_static(&[0, 0x2a, 1, 0x19]),
             intent: Some(VoiceIntent {
                 kind: Some(VoiceIntentKind::Normal(VoiceIntentNormal {
                     source_channel: 0,
@@ -5756,8 +5773,53 @@ mod tests {
         shutdown.cancel();
     }
 
+    #[test]
+    fn repair_request_rejection_does_not_consume_the_three_send_budget() {
+        let now = Instant::now();
+        let mut state = RepairRequestState {
+            from: 11,
+            tracked_first_seq: 1,
+            attempts: 0,
+            requested_page_last: Some(2),
+            retry_interval: Duration::from_millis(5),
+            next_attempt: now,
+            deadline: now + Duration::from_millis(18),
+            send_cancel: CancellationToken::new(),
+            in_flight_generation: None,
+        };
+        for generation in 0..3 {
+            state.in_flight_generation = Some(generation);
+            state.complete_attempt(generation, 1, false);
+            assert_eq!(state.attempts, 0);
+            assert!(state.in_flight_generation.is_none());
+        }
+        for generation in 3..6 {
+            state.in_flight_generation = Some(generation);
+            // A stale completion must leave the active request untouched.
+            state.complete_attempt(generation - 1, 1, true);
+            assert_eq!(state.in_flight_generation, Some(generation));
+            state.complete_attempt(generation, 1, true);
+        }
+        assert_eq!(state.attempts, REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE);
+        // Cursor progress restores the page budget without moving expiry.
+        let expiry = state.deadline;
+        state.observe_cursor(2, expiry, now);
+        assert_eq!(state.attempts, 0);
+        assert_eq!(state.deadline, expiry);
+        assert_eq!(state.requested_page_last, Some(2));
+        assert_eq!(state.next_attempt, now + REPAIR_REQUEST_POLL_INTERVAL);
+        state.in_flight_generation = Some(6);
+        state.complete_attempt(6, 1, true);
+        assert_eq!(
+            state.attempts, 0,
+            "the old cursor's completion cannot consume the new budget"
+        );
+        state.observe_cursor(3, expiry, now);
+        assert_eq!(state.requested_page_last, None);
+    }
+
     #[tokio::test]
-    async fn repair_request_rejection_does_not_consume_the_three_send_budget() {
+    async fn repair_request_rejections_stop_at_the_packet_deadline() {
         let transport = ControlledRepairRequestTransport::with_failures(3);
         let mut cfg = VoiceConfig::default();
         cfg.adaptive_jitter_enabled = false;
@@ -5788,22 +5850,11 @@ mod tests {
             .await
             .unwrap();
 
-        let completed = tokio::time::timeout(Duration::from_millis(700), async {
-            while transport.inner.calls().len() < REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE as usize {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await;
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        assert_eq!(transport.request_attempts.load(Ordering::SeqCst), 3);
         assert!(
-            completed.is_ok(),
-            "three accepted sends should follow transient admission failures; attempts={} accepted={}",
-            transport.request_attempts.load(Ordering::SeqCst),
-            transport.inner.calls().len()
-        );
-
-        assert_eq!(
-            transport.request_attempts.load(Ordering::SeqCst),
-            3 + u64::from(REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE)
+            transport.inner.calls().is_empty(),
+            "expired audio must not keep retrying rejected requests"
         );
         shutdown.cancel();
     }
@@ -5838,14 +5889,14 @@ mod tests {
             shutdown.clone(),
         );
         tx.send(gap).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(180)).await;
+        wait_for_call_count(&transport, 1).await;
         assert_eq!(
             transport
                 .calls()
                 .iter()
                 .filter(|call| matches!(call, FakeCall::RepairRequest { .. }))
                 .count(),
-            REPAIR_REQUEST_MAX_ATTEMPTS_PER_PAGE as usize
+            1
         );
 
         reorderer.push_with_route_hint_report_with_repair(
@@ -5918,7 +5969,7 @@ mod tests {
                 None,
                 true,
             );
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::task::yield_now().await;
             assert_eq!(
                 transport
                     .calls()
@@ -7094,7 +7145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingress_uses_origin_route_quality_for_reorder_deadline() {
+    async fn ingress_caps_origin_route_quality_at_the_continuous_delivery_deadline() {
         let transport = FakeVoiceTransport::new(7, vec![11, 12]);
         transport.set_voice_route_quality(
             11,
@@ -7105,8 +7156,8 @@ mod tests {
             crate::overlay::VoiceRouteQuality::new(11, TransportKind::Tcp, 237_000, 0, 0),
         );
         let mut cfg = VoiceConfig::default();
-        // Explicitly allow 400 ms to test the origin-quality extension.
-        // The 257 ms initial wait plus 50 ms hold fits inside that budget.
+        // A 257 ms route estimate and extra hold must fit inside the
+        // 18 ms delivery cadence established by the first 20 ms packet.
         cfg.adaptive_jitter_max_delay_ms = 400;
         cfg.chunk_hold_budget_ms = 50;
         let svc = VoiceService::new_with_transport(transport, cfg, CancellationToken::new(), 42);
@@ -7125,7 +7176,7 @@ mod tests {
                 seq,
                 0,
                 false,
-                Bytes::from_static(b"opus"),
+                Bytes::from_static(&[0, 0x2a, 1, 8]),
                 normal_intent(5),
             )
             .unwrap();
@@ -7140,21 +7191,20 @@ mod tests {
             });
         }
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(
-            sink.len(),
-            1,
-            "relay RTT must not shorten the origin deadline"
-        );
-        // The chunk-hold window ends at ~307 ms, after which the whole
-        // buffered chunk [0, 2] flushes contiguously.
-        for _ in 0..300 {
-            if sink.len() == 2 {
-                break;
+        tokio::time::timeout(Duration::from_millis(80), async {
+            while sink.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        assert_eq!(sink.len(), 2);
+        })
+        .await
+        .expect("route quality must not delay audio beyond the packet cadence");
+        assert_eq!(
+            sink.snapshot()
+                .iter()
+                .map(|(_, f)| f.s2s_seq)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
     }
 
     #[tokio::test]

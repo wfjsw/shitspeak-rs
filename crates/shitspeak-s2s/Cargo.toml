@@ -34,6 +34,7 @@ serde_json = { workspace = true }
 shitspeak-core = { workspace = true }
 shitspeak-proto = { workspace = true }
 shitspeak-s2s-transport = { workspace = true }
+shitspeak-voice = { workspace = true }
 tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -979,6 +979,15 @@ The optional extra hold defaults to zero. Older configurations with a 600 ms
 extra hold are also subject to the total cap. Increasing transport TTLs or
 repair-cache retention does not extend receiver waiting.
 
+Once a speaker starts delivering, the next buffer drain is due within 90% of
+the last emitted Opus packet's duration (18 ms for a 20 ms packet), leaving
+headroom for client processing. This deadline survives an empty buffer and
+caps route hints, adaptive delay, and extra repair hold. If audio arrives past
+the deadline, the receiver immediately releases it past missing sequences.
+Proactive and FEC copies also receive this deadline without needing a later
+original. The speaker state resets after `reorder_idle_reset_ms` of inactivity
+(2000 ms by default) or a newer sender epoch. In-order audio emits immediately.
+
 Reactive repair responses and terminal retries compete for credit on the primary and
 alternate first hops when an alternate is available. An unfunded alternate
 does not block a funded primary until the response expires. Only the selected

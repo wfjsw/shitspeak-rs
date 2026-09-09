@@ -34,6 +34,18 @@ const LOW_RTT_GAP_OBSERVE_BUDGET: Duration = Duration::from_millis(300);
 const LOW_RTT_REPAIR_RELEASE_BUDGET: Duration = Duration::from_millis(40);
 const LOW_RTT_SUFFIX_BURST_BUDGET: Duration = Duration::from_millis(20);
 
+fn encoded_voice_packet(sequence: u64, toc: u8) -> Bytes {
+    use prost::Message;
+    let audio = shitspeak_proto::mumble_udp::Audio {
+        frame_number: sequence,
+        opus_data: Bytes::from(vec![toc]),
+        ..Default::default()
+    };
+    let mut payload = vec![0];
+    audio.encode(&mut payload).unwrap();
+    Bytes::from(payload)
+}
+
 fn normal_voice_intent(channel_id: u32) -> VoiceIntent {
     VoiceIntent {
         kind: Some(VoiceIntentKind::Normal(VoiceIntentNormal {
@@ -693,7 +705,7 @@ async fn s2s_cached_music_packet_is_recovered_by_network_nack() {
         .set_audio_sink(Arc::new(TimedVoiceSink { tx }));
     let session = ClientSessionIdentifier::new(15, 80_004).unwrap().to_u32();
     let expected = (0..16)
-        .map(|seq| (Bytes::from(format!("cached-music-{seq}")), seq == 15))
+        .map(|seq| (encoded_voice_packet(seq, 0x19), seq == 15))
         .collect::<Vec<_>>();
     // Confirm initial delivery and let accepted originals earn repair credit.
     for frame in &expected[..4] {
@@ -767,7 +779,7 @@ async fn s2s_music_stream_continues_across_unrepaired_long_haul_gaps() {
 
     let session = ClientSessionIdentifier::new(13, 80_003).unwrap().to_u32();
     let frames = (0..120)
-        .map(|seq| Bytes::from(format!("music-{seq}")))
+        .map(|seq| encoded_voice_packet(seq, 8))
         .collect::<Vec<_>>();
     let missing = |offset: usize| offset % 40 == 1;
     let expected = frames
@@ -819,8 +831,8 @@ async fn s2s_music_stream_continues_across_unrepaired_long_haul_gaps() {
         })
         .max()
         .unwrap_or_default();
-    // Allow transport latency and scheduler variation around the 120 ms
-    // receiver budget, while rejecting the old 640+ ms pauses.
+    // Allow transport latency and scheduler variation around the 18 ms
+    // delivery cadence, while rejecting prolonged receiver stalls.
     assert!(
         max_latency <= LONG_HAUL_IMMEDIATE_DELIVERY_BUDGET,
         "healthy music frames delayed by {max_latency:?}"
@@ -886,7 +898,7 @@ async fn s2s_tree_voice_long_haul_repair_is_delivered_without_server_pacing() {
         .expect("valid long-haul speaker session")
         .to_u32();
     let frames = (0..LONG_HAUL_FRAME_COUNT)
-        .map(|offset| Bytes::from(format!("long-haul-repair-frame-{offset}").into_bytes()))
+        .map(|offset| encoded_voice_packet(offset as u64, 0x19))
         .collect::<Vec<_>>();
     let expected = frames
         .iter()
@@ -1036,8 +1048,8 @@ async fn s2s_tree_voice_long_haul_repair_is_delivered_without_server_pacing() {
 }
 
 /// A healthy nearby tree path must release a complete buffered suffix as soon
-/// as a marked S2S repair fills its sole missing sequence, not on a media
-/// timeline derived from the arbitrary application payloads.
+/// as a marked S2S repair fills its sole missing sequence within the
+/// current packet's playback window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_media_pacing() {
     let cluster = Cluster::build(&[8, 3], seed_pair).await;
@@ -1072,13 +1084,9 @@ async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_med
     let sender_session = ClientSessionIdentifier::new(8, 80_003)
         .expect("valid low-RTT speaker session")
         .to_u32();
-    let frames = vec![
-        Bytes::from_static(b"nearby-frame-a"),
-        Bytes::from_static(b"nearby-frame-b"),
-        Bytes::from_static(b"nearby-frame-c"),
-        Bytes::from_static(b"nearby-frame-d"),
-        Bytes::from_static(b"nearby-frame-e"),
-    ];
+    let frames = (0..5)
+        .map(|seq| encoded_voice_packet(seq, 0x19))
+        .collect::<Vec<_>>();
     let expected = frames
         .iter()
         .enumerate()
@@ -1127,8 +1135,7 @@ async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_med
             .expect("send low-RTT first voice frame");
 
         // Reserve sequence one, then let the remaining tree originals open a
-        // real receiver-side gap. Payload contents are deliberately unrelated
-        // to a media clock.
+        // real receiver-side gap within the first packet's playback window.
         let missing_s2s_seq = source_voice.next_seq(sender_session);
         for (offset, payload) in frames.iter().enumerate().skip(2) {
             source_voice
