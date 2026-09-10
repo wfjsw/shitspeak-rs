@@ -33,6 +33,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use arc_swap::ArcSwap;
 use parking_lot::RwLock;
 use scc::HashCache;
 
@@ -142,72 +143,34 @@ impl RemoteNodeLookupChannels {
 }
 
 struct RemoteNodeLookupCache {
-    state: RwLock<RemoteNodeLookupCacheState>,
-}
-
-struct RemoteNodeLookupCacheState {
-    cache: Arc<HashCache<RemoteNodeLookupCacheKey, RemoteNodeLookup>>,
-    current_max_capacity: usize,
+    cache: ArcSwap<HashCache<RemoteNodeLookupCacheKey, RemoteNodeLookup>>,
 }
 
 impl RemoteNodeLookupCache {
     fn new(channel_count: usize) -> Self {
-        let current_max_capacity = remote_node_lookup_cache_capacity(channel_count);
         Self {
-            state: RwLock::new(RemoteNodeLookupCacheState {
-                cache: Arc::new(HashCache::with_capacity(0, current_max_capacity)),
-                current_max_capacity,
-            }),
+            cache: ArcSwap::from_pointee(HashCache::with_capacity(
+                0,
+                remote_node_lookup_cache_capacity(channel_count),
+            )),
         }
-    }
-
-    fn read(&self, key: &RemoteNodeLookupCacheKey) -> Option<RemoteNodeLookup> {
-        let cache = self.cache();
-        cache.read_sync(key, |_, lookup| lookup.clone())
-    }
-
-    fn put(&self, key: RemoteNodeLookupCacheKey, value: RemoteNodeLookup) {
-        let mut state = self.state.write();
-        if state.current_max_capacity < REMOTE_NODE_LOOKUP_CACHE_MAX_CAPACITY
-            && state.cache.len().saturating_mul(4) >= state.current_max_capacity.saturating_mul(3)
-        {
-            let next_capacity = state
-                .current_max_capacity
-                .saturating_mul(2)
-                .min(REMOTE_NODE_LOOKUP_CACHE_MAX_CAPACITY);
-            let next_cache = Arc::new(HashCache::with_capacity(0, next_capacity));
-            state.cache.iter_sync(|key, value| {
-                next_cache.entry_sync(key.clone()).put_entry(value.clone());
-                true
-            });
-            *state = RemoteNodeLookupCacheState {
-                cache: next_cache,
-                current_max_capacity: next_capacity,
-            };
-        }
-        state.cache.entry_sync(key).put_entry(value);
     }
 
     fn reset_for_channel_count(&self, channel_count: usize) {
-        let desired_capacity = remote_node_lookup_cache_capacity(channel_count);
-        let mut state = self.state.write();
-        if state.current_max_capacity == desired_capacity {
-            state.cache.clear_sync();
-            return;
-        }
-        *state = RemoteNodeLookupCacheState {
-            cache: Arc::new(HashCache::with_capacity(0, desired_capacity)),
-            current_max_capacity: desired_capacity,
-        };
+        // In-flight lookups keep their cache while new lookups use the replacement.
+        self.cache.store(Arc::new(HashCache::with_capacity(
+            0,
+            remote_node_lookup_cache_capacity(channel_count),
+        )));
     }
 
     #[cfg(test)]
     fn current_max_capacity(&self) -> usize {
-        self.state.read().current_max_capacity
+        *self.cache.load().capacity_range().end()
     }
 
     fn cache(&self) -> Arc<HashCache<RemoteNodeLookupCacheKey, RemoteNodeLookup>> {
-        self.state.read().cache.clone()
+        self.cache.load_full()
     }
 }
 
@@ -478,7 +441,8 @@ impl RecipientIndex {
             local_node_id,
         };
 
-        if let Some(lookup) = self.remote_node_lookup_cache.read(&cache_key) {
+        let cache = self.remote_node_lookup_cache.cache();
+        if let Some(lookup) = cache.read_sync(&cache_key, |_, lookup| lookup.clone()) {
             return lookup;
         }
 
@@ -488,7 +452,7 @@ impl RecipientIndex {
             local_node_id,
             complete,
         );
-        self.remote_node_lookup_cache.put(cache_key, lookup.clone());
+        cache.entry_sync(cache_key).put_entry(lookup.clone());
         lookup
     }
 
@@ -774,6 +738,38 @@ mod tests {
             self_only,
             RemoteNodeLookup::Nodes(nodes) if nodes.is_empty()
         ));
+    }
+
+    #[test]
+    fn remote_lookup_cache_reset_preserves_in_flight_cache() {
+        let cache = RemoteNodeLookupCache::new(1);
+        let key = RemoteNodeLookupCacheKey {
+            generation: 0,
+            server_id: "alpha".to_owned(),
+            channels: RemoteNodeLookupChannels::Single(5),
+            complete: false,
+            local_node_id: 7,
+        };
+        let lookup = RemoteNodeLookup::Nodes(Arc::from([1, 2]));
+        let in_flight = cache.cache();
+        in_flight.entry_sync(key.clone()).put_entry(lookup.clone());
+
+        cache.reset_for_channel_count(1);
+        let current = cache.cache();
+        assert_eq!(
+            in_flight.read_sync(&key, |_, value| value.clone()),
+            Some(lookup.clone()),
+            "refresh must preserve the cache held by an in-flight lookup"
+        );
+        assert!(current.read_sync(&key, |_, _| ()).is_none());
+
+        // A lookup completing after refresh must populate only its original cache.
+        let late_key = RemoteNodeLookupCacheKey {
+            channels: RemoteNodeLookupChannels::Single(6),
+            ..key
+        };
+        in_flight.entry_sync(late_key.clone()).put_entry(lookup);
+        assert!(current.read_sync(&late_key, |_, _| ()).is_none());
     }
 
     #[test]
