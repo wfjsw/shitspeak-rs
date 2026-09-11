@@ -25,9 +25,20 @@ pub async fn handle_permission_query(
     );
 
     if let Some(channel_id) = msg.channel_id {
+        let channel_name = server
+            .get_channels()
+            .get_channel_in_server(&sender.server_id(), channel_id)
+            .await
+            .map(|channel| channel.name.clone());
         if !crate::channel_handler::can_view_channel_with_ancestors(server, sender, channel_id)
             .await
         {
+            tracing::warn!(
+                session = u32::from(sender.get_session_id()),
+                channel_id,
+                channel_name = ?channel_name,
+                "PermissionQuery requested channel is not visible"
+            );
             return Ok(());
         }
 

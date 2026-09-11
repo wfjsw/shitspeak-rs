@@ -260,7 +260,14 @@ pub async fn handle_channel_state(
         Some(channel_id) => {
             let channel = match channels.get_channel_in_server(&server_id, channel_id).await {
                 Some(ch) => ch,
-                None => return Ok(()),
+                None => {
+                    tracing::warn!(
+                        session = u32::from(sender.get_session_id()),
+                        channel_id,
+                        "ChannelState requested channel is not present on server"
+                    );
+                    return Ok(());
+                }
             };
 
             let perms =

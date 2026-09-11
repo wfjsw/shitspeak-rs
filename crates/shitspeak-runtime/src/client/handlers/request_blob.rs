@@ -333,9 +333,20 @@ async fn handle_request_blob_inner(
 
     // ── Channel descriptions ─────────────────────────────────────────────
     for channel_id in &msg.channel_description {
+        let requested_channel_name = server
+            .get_channels()
+            .get_channel_in_server(&server_id, *channel_id)
+            .await
+            .map(|channel| channel.name.clone());
         if !crate::channel_handler::can_view_channel_with_ancestors(server, sender, *channel_id)
             .await
         {
+            tracing::warn!(
+                session = u32::from(sender.get_session_id()),
+                channel_id,
+                channel_name = ?requested_channel_name,
+                "RequestBlob requested channel is not visible"
+            );
             continue;
         }
         let Some(ch) = server
@@ -343,6 +354,12 @@ async fn handle_request_blob_inner(
             .get_channel_in_server(&server_id, *channel_id)
             .await
         else {
+            tracing::warn!(
+                session = u32::from(sender.get_session_id()),
+                channel_id,
+                channel_name = ?requested_channel_name,
+                "RequestBlob requested channel is not present on server"
+            );
             continue;
         };
         let desc_data = match ch.description_hash.as_ref() {

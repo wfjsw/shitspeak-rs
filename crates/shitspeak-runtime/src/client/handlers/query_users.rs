@@ -39,12 +39,21 @@ pub async fn handle_query_users(
             if let Some(user) = users_by_id.get(id) {
                 ids.push(user.user_id);
                 names.push(user.name.clone());
+            } else {
+                tracing::warn!(
+                    session = u32::from(sender.get_session_id()),
+                    user_id = *id,
+                    "QueryUsers requested user is not registered"
+                );
             }
         }
     } else if !msg.names.is_empty() {
         // Look up by name
         for name in &msg.names {
             let results = authenticator.get_registered_users(name).await;
+            if results.is_empty() {
+                tracing::warn!(session = u32::from(sender.get_session_id()), name = %name, "QueryUsers requested user name is not registered");
+            }
             for user in results {
                 ids.push(user.user_id);
                 names.push(user.name);

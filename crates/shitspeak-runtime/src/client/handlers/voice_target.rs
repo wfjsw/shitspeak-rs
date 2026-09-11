@@ -23,6 +23,11 @@ pub async fn handle_voice_target(
         "VoiceTarget handler"
     );
     if target_id == 0 || target_id > 30 {
+        tracing::warn!(
+            session = u32::from(sender.get_session_id()),
+            target_id,
+            "VoiceTarget id is outside the supported range"
+        );
         return Ok(());
     }
 
@@ -41,7 +46,21 @@ pub async fn handle_voice_target(
             {
                 if crate::client::visibility::can_view_user(server, sender, &target).await {
                     valid_sessions.push(*session);
+                } else {
+                    tracing::warn!(
+                        session = u32::from(sender.get_session_id()),
+                        target_session = *session,
+                        target_instance_id = target.client_instance_id(),
+                        target_name = ?target.display_name_opt(),
+                        "VoiceTarget user is not visible"
+                    );
                 }
+            } else {
+                tracing::warn!(
+                    session = u32::from(sender.get_session_id()),
+                    target_session = *session,
+                    "VoiceTarget user is not present on server"
+                );
             }
         }
         if let Some(channel_id) = t.channel_id {
@@ -57,6 +76,12 @@ pub async fn handle_voice_target(
                     t.links.unwrap_or(false),
                     t.group.clone().unwrap_or_default(),
                 ));
+            } else {
+                tracing::warn!(
+                    session = u32::from(sender.get_session_id()),
+                    channel_id,
+                    "VoiceTarget channel is not present on server"
+                );
             }
         }
     }

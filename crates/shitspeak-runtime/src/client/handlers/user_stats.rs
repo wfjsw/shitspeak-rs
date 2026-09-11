@@ -54,6 +54,13 @@ pub async fn handle_user_stats(
             .await
         {
             if !crate::client::visibility::can_view_user(server, sender, &target_state).await {
+                tracing::warn!(
+                    session = sender_raw,
+                    target = target_session_raw,
+                    target_instance_id = target_state.client_instance_id(),
+                    target_name = ?target_state.display_name_opt(),
+                    "UserStats target is not visible"
+                );
                 return Ok(());
             }
             let target_channel = target_state.get_current_channel_id();
@@ -114,7 +121,13 @@ pub async fn handle_user_stats(
                 let outbound: Message = user_stats.into();
                 sender.write_proto_message(&outbound).await?;
             }
-            Ok(_) => {}
+            Ok(_) => {
+                tracing::warn!(
+                    session = sender_raw,
+                    target = target_session_raw,
+                    "UserStats target was not found on remote server"
+                );
+            }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -133,7 +146,14 @@ pub async fn handle_user_stats(
             .await
         {
             Some(c) => c,
-            None => return Ok(()),
+            None => {
+                tracing::warn!(
+                    session = sender_raw,
+                    target = target_session_raw,
+                    "UserStats target is not present on server"
+                );
+                return Ok(());
+            }
         }
     } else {
         sender.clone()
