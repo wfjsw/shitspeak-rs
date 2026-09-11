@@ -8,6 +8,7 @@ pub struct ServerConfig {
     pub message_length: Option<u32>,
     pub image_message_length: Option<u32>,
     pub max_users: Option<u32>,
+    pub recording_allowed: Option<bool>,
 }
 
 impl From<shitspeak_proto::mumble_proto::ServerConfig> for ServerConfig {
@@ -19,6 +20,7 @@ impl From<shitspeak_proto::mumble_proto::ServerConfig> for ServerConfig {
             message_length: proto.message_length,
             image_message_length: proto.image_message_length,
             max_users: proto.max_users,
+            recording_allowed: proto.recording_allowed,
         }
     }
 }
@@ -32,7 +34,7 @@ impl From<ServerConfig> for shitspeak_proto::mumble_proto::ServerConfig {
             message_length: value.message_length,
             image_message_length: value.image_message_length,
             max_users: value.max_users,
-            recording_allowed: None,
+            recording_allowed: value.recording_allowed,
         }
     }
 }

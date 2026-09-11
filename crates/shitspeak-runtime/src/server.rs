@@ -2192,12 +2192,14 @@ impl Server {
                     invalidate_acl_cache,
                     visibility_reload,
                     max_bandwidth_changed,
+                    max_users_changed,
                 ) = {
                     let mut invalidate_acl_cache = false;
                     let mut root_channel_config_update = None;
                     let mut visibility_reload = false;
                     let current = self.config.load_full();
                     let max_bandwidth_changed = current.max_bandwidth != new_config.max_bandwidth;
+                    let max_users_changed = current.max_users != new_config.max_users;
                     // Log notable changes
                     if current.welcome_text != new_config.welcome_text {
                         tracing::info!("config reload: welcome_text changed");
@@ -2435,6 +2437,7 @@ impl Server {
                         invalidate_acl_cache,
                         visibility_reload,
                         max_bandwidth_changed,
+                        max_users_changed,
                     )
                 };
                 if let Some(root_channel_config) = root_channel_config_update {
@@ -2449,8 +2452,9 @@ impl Server {
                     self.visibility_generation.fetch_add(1, Ordering::SeqCst);
                     let _ = self.visibility_reload_tx.send(());
                 }
-                if max_bandwidth_changed {
-                    self.update_inherited_client_max_bandwidth().await;
+                if max_bandwidth_changed || max_users_changed {
+                    self.push_server_config_update(max_bandwidth_changed, max_users_changed)
+                        .await;
                 }
                 self.auth_finalization_queue
                     .apply_prepared_authenticator_reload(prepared_authenticator);
@@ -2862,29 +2866,56 @@ impl Server {
         self.read_config().max_bandwidth
     }
 
-    async fn update_inherited_client_max_bandwidth(&self) {
-        let max_bandwidth = self.get_max_bandwidth();
+    async fn push_server_config_update(
+        &self,
+        max_bandwidth_changed: bool,
+        max_users_changed: bool,
+    ) {
+        let (max_bandwidth, max_users) = {
+            let config = self.read_config();
+            (
+                max_bandwidth_changed.then_some(config.max_bandwidth),
+                max_users_changed.then_some(config.max_users as u32),
+            )
+        };
         for client in self.clients.get_local_clients().await {
-            if !client.is_authenticated() || client.max_bandwidth_override().is_some() {
+            if !client.is_authenticated() {
                 continue;
             }
-            self.send_max_bandwidth_update(&client, max_bandwidth).await;
+            let max_bandwidth = max_bandwidth.filter(|_| client.max_bandwidth_override().is_none());
+            if max_bandwidth.is_none() && max_users.is_none() {
+                continue;
+            }
+            self.send_server_config_update(&client, max_bandwidth, max_users)
+                .await;
         }
     }
 
     async fn send_max_bandwidth_update(&self, client: &Client, max_bandwidth: u32) {
+        self.send_server_config_update(client, Some(max_bandwidth), None)
+            .await;
+    }
+
+    async fn send_server_config_update(
+        &self,
+        client: &Client,
+        max_bandwidth: Option<u32>,
+        max_users: Option<u32>,
+    ) {
         let message: shitspeak_messages::messages::Message =
-            shitspeak_messages::messages::encoder::ServerSync {
-                session: None,
-                max_bandwidth: Some(max_bandwidth),
+            shitspeak_messages::messages::encoder::ServerConfig {
+                max_bandwidth,
                 welcome_text: None,
-                permissions: None,
+                allow_html: None,
+                message_length: None,
+                image_message_length: None,
+                max_users,
+                recording_allowed: None,
             }
             .into();
         if let Err(error) = client.enqueue_proto_message(&message).await {
-            client.in_tracing_scope(
-                || tracing::debug!(%error, "failed to send max_bandwidth update"),
-            );
+            client
+                .in_tracing_scope(|| tracing::debug!(%error, "failed to send ServerConfig update"));
         }
     }
 

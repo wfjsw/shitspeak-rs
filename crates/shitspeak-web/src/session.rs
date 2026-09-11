@@ -881,6 +881,7 @@ pub async fn initial_server_events_with_channel_snapshot(
             message_length: Some(server.get_max_text_message_length()),
             image_message_length: Some(server.get_max_image_message_length()),
             max_users: Some(server.get_max_users() as u32),
+            recording_allowed: None,
         }
         .into(),
     );

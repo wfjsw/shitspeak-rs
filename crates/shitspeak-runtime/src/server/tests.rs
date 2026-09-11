@@ -1129,11 +1129,91 @@ send_build_info = false\n\
 send_os_info = false\n\
 allowed_proxies = []\n\
 min_client_version = 0\n\
-max_users = 100\n\
+max_users = {}\n\
 max_bandwidth = {max_bandwidth}\n",
-        config.cert_path, config.key_path,
+        config.cert_path, config.key_path, config.max_users,
     );
     std::fs::write(path, contents).expect("write reload config");
+}
+
+#[tokio::test]
+async fn config_reload_pushes_max_users_to_authenticated_clients() {
+    let mut config = test_config(Vec::new());
+    let server = Server::new(config.clone(), TestAuthenticator)
+        .await
+        .expect("server");
+    let mut receivers = Vec::new();
+    for (server_id, authenticated, bandwidth_override) in [
+        (DEFAULT_SERVER_ID, true, None),
+        ("other-server", true, Some(24_000)),
+        (DEFAULT_SERVER_ID, false, None),
+    ] {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let client = server
+            .clients
+            .allocate_web_client_in_server(
+                server_id,
+                "127.0.0.1".parse().unwrap(),
+                "127.0.0.1:52000".parse().unwrap(),
+                "127.0.0.1:52001".parse().unwrap(),
+                tx,
+            )
+            .await;
+        client.set_authenticated(authenticated);
+        client.set_max_bandwidth(bandwidth_override);
+        receivers.push((authenticated, bandwidth_override, rx));
+    }
+    let temp = tempfile::tempdir().expect("reload config tempdir");
+    let config_path = temp.path().join("config.toml");
+    for (max_users, max_bandwidth) in [(250, None), (50, None), (300, Some(96_000))] {
+        config.max_users = max_users;
+        if let Some(max_bandwidth) = max_bandwidth {
+            config.max_bandwidth = max_bandwidth;
+        }
+        write_max_bandwidth_reload_config(&config, &config_path, config.max_bandwidth);
+        server
+            .reload_config_from(&config_path)
+            .await
+            .expect("reload config");
+        assert_eq!(server.get_max_users(), max_users);
+        for (authenticated, bandwidth_override, rx) in &mut receivers {
+            if *authenticated {
+                let message = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("max_users update timeout")
+                    .expect("max_users update");
+                match message {
+                    Message::ServerConfig(update) => {
+                        assert_eq!(update.max_users, Some(max_users as u32));
+                        assert_eq!(
+                            update.max_bandwidth,
+                            max_bandwidth.filter(|_| bandwidth_override.is_none())
+                        );
+                        assert_eq!(update.welcome_text, None);
+                        assert_eq!(update.allow_html, None);
+                        assert_eq!(update.message_length, None);
+                        assert_eq!(update.image_message_length, None);
+                        assert_eq!(update.recording_allowed, None);
+                    }
+                    other => panic!("expected ServerConfig max_users update, got {other:?}"),
+                }
+            }
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        server
+            .reload_config_from(&config_path)
+            .await
+            .expect("reload unchanged config");
+        for (_, _, rx) in &mut receivers {
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
 }
 
 #[tokio::test]
@@ -1183,13 +1263,12 @@ async fn config_reload_updates_inherited_bandwidth_without_updating_overrides() 
         .expect("inherited bandwidth update timeout")
         .expect("inherited bandwidth update")
     {
-        Message::ServerSync(sync) => {
+        Message::ServerConfig(sync) => {
             assert_eq!(sync.max_bandwidth, Some(96_000));
-            assert_eq!(sync.session, None);
             assert_eq!(sync.welcome_text, None);
-            assert_eq!(sync.permissions, None);
+            assert_eq!(sync.max_users, None);
         }
-        other => panic!("expected inherited ServerSync bandwidth update, got {other:?}"),
+        other => panic!("expected inherited ServerConfig bandwidth update, got {other:?}"),
     }
     assert!(matches!(
         overridden_gateway_rx.try_recv(),
@@ -1343,13 +1422,12 @@ async fn reauthentication_sends_new_authenticator_bandwidth_to_client() {
         .expect("authenticator bandwidth update timeout")
         .expect("authenticator bandwidth update")
     {
-        Message::ServerSync(sync) => {
+        Message::ServerConfig(sync) => {
             assert_eq!(sync.max_bandwidth, Some(24_000));
-            assert_eq!(sync.session, None);
             assert_eq!(sync.welcome_text, None);
-            assert_eq!(sync.permissions, None);
+            assert_eq!(sync.max_users, None);
         }
-        other => panic!("expected reauthentication ServerSync bandwidth update, got {other:?}"),
+        other => panic!("expected reauthentication ServerConfig bandwidth update, got {other:?}"),
     }
 }
 
@@ -1403,13 +1481,12 @@ async fn reauthentication_clearing_bandwidth_override_follows_config() {
         .expect("cleared override bandwidth update timeout")
         .expect("cleared override bandwidth update")
     {
-        Message::ServerSync(sync) => {
+        Message::ServerConfig(sync) => {
             assert_eq!(sync.max_bandwidth, Some(72_000));
-            assert_eq!(sync.session, None);
             assert_eq!(sync.welcome_text, None);
-            assert_eq!(sync.permissions, None);
+            assert_eq!(sync.max_users, None);
         }
-        other => panic!("expected cleared override ServerSync update, got {other:?}"),
+        other => panic!("expected cleared override ServerConfig update, got {other:?}"),
     }
 }
 

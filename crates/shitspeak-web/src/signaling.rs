@@ -1666,6 +1666,7 @@ async fn send_initial_server_state(
             message_length: Some(server.get_max_text_message_length()),
             image_message_length: Some(server.get_max_image_message_length()),
             max_users: Some(server.get_max_users() as u32),
+            recording_allowed: None,
         }
         .into(),
     )
