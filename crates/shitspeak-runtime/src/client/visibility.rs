@@ -2495,6 +2495,10 @@ fn protect_user_state_hash_for_viewer(
         viewer.is_superuser(),
         viewer.get_session_id(),
         protection,
+        server
+            .read_config()
+            .privacy
+            .protect_certificate_hashes_for_superusers(),
     ) {
         return;
     }
@@ -2509,6 +2513,10 @@ fn protect_user_state_hash_for_viewer(
             viewer.get_session_id(),
             protection,
             Some(secret.as_str()),
+            server
+                .read_config()
+                .privacy
+                .protect_certificate_hashes_for_superusers(),
         );
     }
 }

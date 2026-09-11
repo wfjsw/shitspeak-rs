@@ -1139,6 +1139,7 @@ impl PrivacyConfig {
         Self {
             protect_certificate_hashes,
             protect_certificate_hashes_for_superusers: false,
+            hide_client_ips_in_user_stats: false,
             certificate_hash_secret,
             certificate: PrivacyCertificateConfig::default(),
         }
