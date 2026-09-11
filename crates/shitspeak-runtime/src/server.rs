@@ -1762,6 +1762,12 @@ impl Server {
         .await;
         drop(permit);
 
+        tracing::info!(
+            username = %credential.username,
+            result = ?result,
+            "authenticator returned reauthentication result"
+        );
+
         let result = match result {
             Ok(Ok(result)) => result,
             Ok(Err(AuthenticationRejection::RetryLater)) | Err(_) => {

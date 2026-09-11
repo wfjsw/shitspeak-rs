@@ -162,6 +162,11 @@ pub async fn handle_authenticate(
         .authenticate(&username, password.as_deref(), &auth_auxiliary)
         .await;
 
+    tracing::info!(
+        username = %username,
+        result = ?auth_result,
+        "authenticator returned authentication result"
+    );
     let mut result = match auth_result {
         Ok(r) => r,
         Err(AuthenticationRejection::NoSuchUser) => {
