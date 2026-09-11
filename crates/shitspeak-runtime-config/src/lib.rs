@@ -1092,10 +1092,16 @@ impl<'de> Deserialize<'de> for CertificateHashProtection {
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct PrivacyConfig {
+    /// Hide client IP addresses in UserStats responses.
+    #[serde(default)]
+    hide_client_ips_in_user_stats: bool,
     /// Controls remapping of other users' UserState.hash values before
     /// delivery to non-superuser clients. The viewer's own hash remains raw.
     #[serde(default)]
     protect_certificate_hashes: CertificateHashProtection,
+    /// Apply certificate-hash protection to superuser viewers as well.
+    #[serde(default)]
+    protect_certificate_hashes_for_superusers: bool,
     /// Shared cluster secret for certificate-hash remapping. Configure the
     /// same value on every node when protection is enabled.
     #[serde(default)]
@@ -1132,6 +1138,7 @@ impl PrivacyConfig {
     ) -> Self {
         Self {
             protect_certificate_hashes,
+            protect_certificate_hashes_for_superusers: false,
             certificate_hash_secret,
             certificate: PrivacyCertificateConfig::default(),
         }
@@ -1149,6 +1156,14 @@ impl PrivacyConfig {
         self.certificate_hash_secret
             .as_deref()
             .or(self.certificate.hash.secret.as_deref())
+    }
+
+    pub fn protect_certificate_hashes_for_superusers(&self) -> bool {
+        self.protect_certificate_hashes_for_superusers
+    }
+
+    pub fn hide_client_ips_in_user_stats(&self) -> bool {
+        self.hide_client_ips_in_user_stats
     }
 }
 

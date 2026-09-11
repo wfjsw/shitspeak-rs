@@ -70,6 +70,10 @@ pub async fn handle_user_stats(
             details = has_root_ban;
             local = has_root_ban || target_channel == sender.get_current_channel_id();
             expose_certificate_identity = sender_is_superuser
+                && !server
+                    .read_config()
+                    .privacy
+                    .protect_certificate_hashes_for_superusers()
                 || (has_root_ban && server.get_certificate_hash_privacy().is_none());
             if !has_root_ban {
                 let target_channel_perms = crate::client::acl::compute_permissions_for_client(
@@ -164,7 +168,8 @@ pub async fn handle_user_stats(
         effective_stats_only,
         details,
         local,
-        expose_certificate_identity,
+        expose_certificate_identity
+            && !server.read_config().privacy.hide_client_ips_in_user_stats(),
     )
     .await;
     let reply: Message = user_stats.into();
@@ -374,6 +379,10 @@ impl UserStatsResponder for ServerUserStatsResponder {
             details = has_root_ban;
             local = has_root_ban || target_channel == actor.get_current_channel_id();
             expose_certificate_identity = actor.is_superuser()
+                && !server
+                    .read_config()
+                    .privacy
+                    .protect_certificate_hashes_for_superusers()
                 || (has_root_ban && server.get_certificate_hash_privacy().is_none());
             if !has_root_ban {
                 let target_channel_perms = crate::client::acl::compute_permissions_for_client(
@@ -396,7 +405,8 @@ impl UserStatsResponder for ServerUserStatsResponder {
             stats_only,
             details,
             local,
-            expose_certificate_identity,
+            expose_certificate_identity
+                && !server.read_config().privacy.hide_client_ips_in_user_stats(),
         )
         .await;
         let proto: shitspeak_proto::mumble_proto::UserStats = user_stats.into();

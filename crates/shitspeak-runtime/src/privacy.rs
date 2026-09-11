@@ -120,12 +120,14 @@ pub fn protect_user_state_certificate_hash(
     viewer_session: crate::client::client_session_identifier::ClientSessionIdentifier,
     protection: shitspeak_runtime_config::CertificateHashProtection,
     secret: Option<&str>,
+    protect_superusers: bool,
 ) {
     if !should_protect_user_state_certificate_hash(
         state,
         viewer_is_superuser,
         viewer_session,
         protection,
+        protect_superusers,
     ) {
         return;
     }
@@ -146,9 +148,10 @@ pub(crate) fn should_protect_user_state_certificate_hash(
     viewer_is_superuser: bool,
     viewer_session: crate::client::client_session_identifier::ClientSessionIdentifier,
     protection: shitspeak_runtime_config::CertificateHashProtection,
+    protect_superusers: bool,
 ) -> bool {
     protection.is_enabled()
-        && !viewer_is_superuser
+        && (!viewer_is_superuser || protect_superusers)
         && state.session != Some(viewer_session)
         && state.hash.is_some()
 }
