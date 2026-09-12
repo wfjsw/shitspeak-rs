@@ -337,6 +337,9 @@ impl RecipientIndex {
                 .insert(node);
             g.len()
         };
+        if self.complete_servers.read().contains(server_id) {
+            self.covered_nodes.write().insert(node);
+        }
         self.invalidate_remote_node_lookup_cache(channel_count);
     }
 
@@ -712,6 +715,35 @@ mod tests {
             7,
         );
         assert_eq!(multi, RemoteNodeLookup::Missing { channel_id: 6 });
+    }
+
+    #[test]
+    fn complete_snapshot_coverage_becomes_stale_after_incremental_node_update() {
+        let idx = RecipientIndex::new();
+        let server_id = default_server_id();
+        let mut snapshot = RecipientIndexSnapshot::new();
+        snapshot.insert(
+            RecipientIndexKey::new(server_id.as_str(), 5),
+            [1, 7].into_iter().collect(),
+        );
+        idx.replace_all_complete(RecipientIndexUpdate::new(
+            snapshot,
+            [server_id.clone()].into_iter().collect(),
+            [1, 7].into_iter().collect(),
+        ));
+
+        idx.add_in_server(server_id.as_str(), 5, 8);
+
+        assert!(idx.covers_voice_members(server_id.as_str(), &[1, 7, 8]));
+        assert_eq!(
+            idx.lookup_remote_nodes_for_complete_shared_channels_in_server(
+                server_id.as_str(),
+                Arc::from([5]),
+                1,
+                &[1, 7, 8],
+            ),
+            RemoteNodeLookup::Nodes(Arc::from([7, 8]))
+        );
     }
 
     #[test]
