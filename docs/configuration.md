@@ -276,7 +276,7 @@ to observe the age limits. UDP retry exhaustion is reported by
 ### Dispatch Calibration
 
 The server calibrates UDP voice encryption fan-out before it starts accepting
-connections. It chooses independent Rayon thresholds and recipient-run sizes
+connections. It learns independent cost models and partition policies
 for payloads up to and including 512 bytes and payloads above 512 bytes.
 
 ```toml
@@ -290,17 +290,25 @@ large_payload_rayon_threshold = 512
 large_payload_rayon_min_len = 256
 ```
 
-`startup_calibrated` takes a small set of production-shaped sequential and
-Rayon probes at startup. It fits separate cost models for both payload classes,
-validates each model against a held-out probe, then derives a bounded ordered
-schedule of fan-out breakpoints. Each breakpoint jointly caps the number of
-Rayon chunks and sets a minimum recipient-run size, allowing larger fan-outs to
-use fewer workers with larger, balanced batches when that reduces dispatch and
-merge overhead. Every selected breakpoint is measured before the schedule is
-accepted. An invalid model, failed validation, or failed confirmation selects
-sequential dispatch. If Rayon has fewer than two workers, the server also
-selects sequential dispatch; an operational calibration failure logs a warning
-and uses a conservative fallback.
+`startup_calibrated` measures sequential execution and every available Rayon
+partition count at representative fanouts from 8 to 8192 listeners, with
+geometric coverage through 512. It fits
+nonnegative cost models for both payload classes, including dispatch, encryption,
+working-set growth, partition, and merge costs. For each actual fanout, it
+minimizes predicted latency over all usable integer partition counts and selects
+Rayon only when that minimum beats sequential by at least 5%. The optimal
+partition count can therefore change with fanout. Larger counts extrapolate the
+fitted costs.
+
+Independent fanouts validate the selected action against measured alternatives.
+Validation errors contribute additional fitting samples for up to two refinement
+rounds, rather than disabling Rayon for the whole payload class. Startup logs
+include the model, validation error, and calibration duration. Existing breakpoint
+metrics summarize the first model transitions; they do not restrict dispatch.
+If Rayon has fewer than two workers, the server selects sequential dispatch.
+An operational calibration failure logs a warning and uses a conservative fallback.
+See [the standalone benchmark](../benches/voice_dispatch_model.md) for the model
+equations, measurement scope, and timing report.
 
 `sequential` disables Rayon voice fan-out. `fixed` is an operational override
 for controlled experiments or recovery. In fixed mode, each

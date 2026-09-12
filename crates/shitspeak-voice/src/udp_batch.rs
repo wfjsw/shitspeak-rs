@@ -20,6 +20,8 @@ use crate::constants::MTU;
 
 const DATAGRAMS_PER_CHUNK: usize = 64;
 const CHUNK_BYTES: usize = MTU * DATAGRAMS_PER_CHUNK;
+const MAX_POOLED_BATCHES: usize = 8;
+const MAX_POOLED_DATAGRAMS: usize = 2048;
 
 struct QueuedDatagram {
     addr: SocketAddr,
@@ -41,6 +43,51 @@ struct BatchBuffers {
 
 thread_local! {
     static BATCH_POOL: RefCell<Vec<BatchBuffers>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+mod pool_regression_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_merge_and_clear_does_not_accumulate_empty_chunks() {
+        let mut batch = DatagramBatch::new();
+        let addr = SocketAddr::from(([127, 0, 0, 1], 1234));
+        for _ in 0..32 {
+            batch
+                .try_push_zeroed(addr, 32, |_| Ok::<_, ()>(()))
+                .unwrap();
+            let mut other = DatagramBatch::new();
+            other
+                .try_push_zeroed(addr, 32, |_| Ok::<_, ()>(()))
+                .unwrap();
+            batch.append(other);
+            assert_eq!(batch.len(), 2);
+            batch.clear();
+            assert!(
+                batch.chunks.len() <= 1,
+                "cleared batch retains unused merged chunks"
+            );
+        }
+    }
+
+    #[test]
+    fn batches_returned_from_other_threads_have_a_bounded_pool() {
+        BATCH_POOL.with(|pool| pool.borrow_mut().clear());
+        for _ in 0..32 {
+            let _batch = std::thread::spawn(|| {
+                let mut batch = DatagramBatch::new();
+                let addr = SocketAddr::from(([127, 0, 0, 1], 1234));
+                batch
+                    .try_push_zeroed(addr, 32, |_| Ok::<_, ()>(()))
+                    .unwrap();
+                batch
+            })
+            .join()
+            .unwrap();
+        }
+        BATCH_POOL.with(|pool| assert!(pool.borrow().len() <= 8));
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +144,9 @@ impl DatagramBatch {
     }
 
     pub fn clear(&mut self) {
+        // Appended batches can contain many arenas. New writes use the last
+        // arena, so retaining earlier empty arenas only accumulates memory.
+        self.chunks.truncate(1);
         self.chunks.iter_mut().for_each(Vec::clear);
         self.datagrams.clear();
     }
@@ -181,6 +231,14 @@ impl DatagramBatch {
 impl Drop for DatagramBatch {
     fn drop(&mut self) {
         self.clear();
+        if self.datagrams.capacity() > MAX_POOLED_DATAGRAMS
+            || self
+                .chunks
+                .first()
+                .is_some_and(|chunk| chunk.capacity() > CHUNK_BYTES)
+        {
+            return;
+        }
         // Transfer ownership before automatic field destruction runs. Pool entries
         // contain only buffers, so thread teardown frees them without re-pooling.
         let buffers = BatchBuffers {
@@ -188,7 +246,12 @@ impl Drop for DatagramBatch {
             datagrams: std::mem::take(&mut self.datagrams),
         };
         // Another thread-local destructor may drop a batch after the pool is gone.
-        let _ = BATCH_POOL.try_with(|pool| pool.borrow_mut().push(buffers));
+        let _ = BATCH_POOL.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < MAX_POOLED_BATCHES {
+                pool.push(buffers);
+            }
+        });
     }
 }
 
