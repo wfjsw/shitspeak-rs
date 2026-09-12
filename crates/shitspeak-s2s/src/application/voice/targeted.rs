@@ -226,6 +226,7 @@ impl RecipientIndex {
             }
             g.len()
         };
+        *self.nodes_by_server.write() = nodes_by_server(&self.inner.read());
         self.invalidate_remote_node_lookup_cache(channel_count);
     }
 
@@ -260,8 +261,16 @@ impl RecipientIndex {
             return false;
         }
         let covered_nodes = self.covered_nodes.read();
+        let recipient_nodes = self
+            .nodes_by_server
+            .read()
+            .get(server_id)
+            .into_iter()
+            .flat_map(|nodes| nodes.iter().copied())
+            .collect::<BTreeSet<_>>();
         voice_members
             .iter()
+            .filter(|node| recipient_nodes.contains(node))
             .all(|node| covered_nodes.contains(node))
     }
 
@@ -337,6 +346,7 @@ impl RecipientIndex {
                 .insert(node);
             g.len()
         };
+        *self.nodes_by_server.write() = nodes_by_server(&self.inner.read());
         if self.complete_servers.read().contains(server_id) {
             self.covered_nodes.write().insert(node);
         }
@@ -361,6 +371,7 @@ impl RecipientIndex {
             let g = self.inner.read();
             g.values().flat_map(|nodes| nodes.iter().copied()).collect()
         };
+        *self.nodes_by_server.write() = nodes_by_server(&self.inner.read());
         *self.covered_nodes.write() = covered_nodes;
         self.invalidate_remote_node_lookup_cache(channel_count);
     }
@@ -580,7 +591,7 @@ mod tests {
         );
         assert_eq!(
             index.lookup_remote_nodes_for_server_in_server("alpha", 7, &[1, 2, 3]),
-            RemoteNodeLookup::Missing { channel_id: 0 }
+            RemoteNodeLookup::Nodes(Arc::from([1, 2]))
         );
     }
 
@@ -768,7 +779,7 @@ mod tests {
 
         idx.remove_in_server(server_id.as_str(), 5, 7);
 
-        assert!(!idx.covers_voice_members(server_id.as_str(), &[1, 7]));
+        assert!(idx.covers_voice_members(server_id.as_str(), &[1, 7]));
     }
 
     #[test]

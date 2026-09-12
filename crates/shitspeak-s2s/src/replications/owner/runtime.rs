@@ -1804,6 +1804,20 @@ mod tests {
         assert!(state.catchup_attempts.contains_key(&7));
     }
 
+    #[test]
+    fn delayed_catchup_response_cancels_retry_watchdog_after_gap_is_already_filled() {
+        let mut state = OwnerState::new();
+        state.known.insert(7, (100, 4));
+        state.record_catchup_attempt(7, 100, 4, Some(6), 0, 7);
+
+        // A response can arrive after ordinary replication has already filled
+        // the gap; the watchdog must not schedule another retry.
+        state.record_applied(7, 100, 6);
+
+        assert!(state.cancel_satisfied_catchup_attempt(7, 100));
+        assert!(!state.catchup_attempts.contains_key(&7));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn owner_runtime_does_not_emit_periodic_background_catchup() {
         let net = MockNet::new(1, vec![1]);
@@ -1889,6 +1903,54 @@ mod tests {
             })
             .count();
         assert_eq!(requests, 1, "satisfied watchdog must not retry");
+    }
+
+    #[tokio::test]
+    async fn relay_response_clears_stale_retry_before_followup() {
+        let net = MockNet::new(16, vec![1, 6, 16]);
+        net.set_epoch(1, 42);
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            16,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        {
+            let mut state = runtime.state.lock();
+            state.known.insert(1, (42, 9_873));
+            state.record_catchup_attempt(1, 42, 9_873, None, 0, 1);
+        }
+
+        runtime
+            .recv_catchup_resp(
+                6,
+                OwnerCatchupResp {
+                    origin_node: 1,
+                    origin_epoch: 42,
+                    snapshot_version: 0,
+                    snapshot_msgpack: Bytes::new(),
+                    ops: Vec::new(),
+                    has_more: false,
+                    next_chunk_token: 0,
+                    too_old_use_snapshot: false,
+                },
+            )
+            .await;
+
+        assert!(!runtime.state.lock().catchup_attempts.contains_key(&1));
+        let captured = net.captured.lock().clone();
+        let followups: Vec<_> = captured
+            .iter()
+            .filter_map(|frame| match frame {
+                CapturedFrame::OwnerUnicast { dst, body, .. }
+                    if *dst == 1 && matches!(body, OwnerBody::CatchupReq(_)) => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert!(followups.is_empty(), "empty relay response must not rearm follow-up");
     }
 
     #[tokio::test]

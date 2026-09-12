@@ -742,7 +742,11 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
         let s = rt.state.lock();
         s.known.get(&origin).map(|(_, v)| *v).unwrap_or(0)
     };
-    if from != origin && origin != rt.self_id && rt.net.alive_members().contains(&origin) {
+    if has_materialized_payload
+        && from != origin
+        && origin != rt.self_id
+        && rt.net.alive_members().contains(&origin)
+    {
         let known_epoch = rt.net.member_boot_epoch(origin).unwrap_or(resp_epoch);
         let _ = rt
             .send_catchup_req_to(

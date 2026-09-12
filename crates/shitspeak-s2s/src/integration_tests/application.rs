@@ -1269,3 +1269,22 @@ async fn s2s_tree_voice_low_rtt_node_8_to_node_3_releases_gap_suffix_without_med
     app_3.shutdown().await;
     cluster.shutdown_all().await;
 }
+
+/// Reproduces restart-time recipient-index convergence with an idle overlay member.
+/// A complete snapshot covering active recipient nodes must remain usable even when
+/// the transport membership also contains a node with no clients.
+#[tokio::test]
+async fn targeted_recipient_index_ignores_idle_overlay_member_after_restart() {
+    use crate::application::voice::targeted::{RecipientIndex, RecipientIndexKey, RecipientIndexSnapshot, RecipientIndexUpdate, RemoteNodeLookup};
+    let index = RecipientIndex::new();
+    let server = default_server_id();
+    let mut snapshot = RecipientIndexSnapshot::new();
+    snapshot.insert(RecipientIndexKey::new(server.as_str(), 5), [1, 7].into_iter().collect());
+    index.replace_all_complete(RecipientIndexUpdate::new(
+        snapshot,
+        [server.clone()].into_iter().collect(),
+        [1, 7].into_iter().collect(),
+    ));
+    let result = index.lookup_remote_nodes_for_server_in_server(server.as_str(), 1, &[1, 7, 4097]);
+    assert_eq!(result, RemoteNodeLookup::Nodes(Arc::from([7])));
+}
