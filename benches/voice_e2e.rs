@@ -187,7 +187,9 @@ impl Authenticator for AuthenticatorAdapter {
             .expect("auth users lock")
             .get(username)
             .cloned()
-            .ok_or(AuthenticationRejection::NoSuchUser)?;
+            .ok_or(AuthenticationRejection::new(
+                shitspeak_auth::AuthenticationRejectionKind::NoSuchUser,
+            ))?;
         Ok(AuthenticateResult {
             auth_session_id: None,
             authenticated_until: None,

@@ -315,11 +315,15 @@ impl Authenticator for AuthenticatorAdapter {
             users.get(username).cloned()
         };
         let Some(entry) = entry else {
-            return Err(AuthenticationRejection::NoSuchUser);
+            return Err(AuthenticationRejection::new(
+                shitspeak_auth::AuthenticationRejectionKind::NoSuchUser,
+            ));
         };
         if let Some(expected) = entry.password.as_deref() {
             if password != Some(expected) {
-                return Err(AuthenticationRejection::WrongPassword);
+                return Err(AuthenticationRejection::new(
+                    shitspeak_auth::AuthenticationRejectionKind::WrongPassword,
+                ));
             }
         }
         Ok(AuthenticateResult {

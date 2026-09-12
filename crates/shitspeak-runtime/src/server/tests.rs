@@ -1095,7 +1095,9 @@ async fn authentication_expiry_reauth_retries_after_transient_failure() {
     authentication_expiry_reaper(&server, deadline).await;
     calls.recv().await.expect("first reauthentication call");
     responses
-        .send(Err(AuthenticationRejection::RetryLater(None)))
+        .send(Err(AuthenticationRejection::new(
+            shitspeak_auth::AuthenticationRejectionKind::RetryLater,
+        )))
         .expect("send transient failure");
 
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -1131,9 +1133,10 @@ async fn authentication_expiry_reauth_sends_retry_message() {
     authentication_expiry_reaper(&server, deadline).await;
     calls.recv().await.expect("first reauthentication call");
     responses
-        .send(Err(AuthenticationRejection::RetryLater(Some(
-            "Please retry shortly.".to_owned(),
-        ))))
+        .send(Err(AuthenticationRejection::new(
+            shitspeak_auth::AuthenticationRejectionKind::RetryLater,
+        )
+        .with_message("Please retry shortly.".to_owned())))
         .expect("send transient failure");
 
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -1813,7 +1816,9 @@ async fn authentication_expiry_reauth_rejection_kicks_client() {
         .expect("reauthentication call");
     assert!(client.is_authenticated());
     responses
-        .send(Err(AuthenticationRejection::WrongPassword))
+        .send(Err(AuthenticationRejection::new(
+            shitspeak_auth::AuthenticationRejectionKind::WrongPassword,
+        )))
         .expect("send rejected reauthentication");
 
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -1902,7 +1907,9 @@ async fn authentication_expiry_reauth_budget_defers_excess_clients() {
     assert_eq!(local.authenticated_until(), Some(deadline));
 
     responses
-        .send(Err(AuthenticationRejection::WrongPassword))
+        .send(Err(AuthenticationRejection::new(
+            shitspeak_auth::AuthenticationRejectionKind::WrongPassword,
+        )))
         .expect("release first reauthentication");
 }
 
@@ -1931,7 +1938,9 @@ async fn authentication_expiry_reauth_is_unlimited_when_concurrency_is_zero() {
 
     for _ in 0..2 {
         responses
-            .send(Err(AuthenticationRejection::WrongPassword))
+            .send(Err(AuthenticationRejection::new(
+                shitspeak_auth::AuthenticationRejectionKind::WrongPassword,
+            )))
             .expect("release reauthentication");
     }
 }
@@ -2942,40 +2951,78 @@ async fn reload_root_channel_work_does_not_hold_config_write_lock() {
 }
 
 #[tokio::test]
-async fn authentication_retry_later_sends_private_message_before_rejection() {
+async fn authentication_rejections_preserve_reason_and_private_message() {
     use crate::client::handlers::AsyncMessageHandlerExt;
-    let (authenticator, _calls, responses) = controlled_authenticator();
-    let server = Server::new(test_config(Vec::new()), authenticator)
-        .await
-        .expect("server");
-    let (client, mut outbound) = auth_queue_test_client(1);
-    responses
-        .send(Err(AuthenticationRejection::RetryLater(Some(
-            "Please retry shortly.".to_owned(),
-        ))))
-        .unwrap();
-    let result = client
-        .handle_message(
-            &server,
-            Message::Authenticate(shitspeak_proto::mumble_proto::Authenticate {
-                username: Some("alice".to_owned()),
-                ..Default::default()
-            }),
-        )
-        .await;
-    assert!(matches!(
-        result,
-        Err(crate::errors::MessageHandlerError::AuthRejection(_))
-    ));
-    let Message::TextMessage(message) =
-        outbound.try_recv().expect("retry message before rejection")
-    else {
-        panic!("expected TextMessage");
-    };
-    assert_eq!(message.actor, None);
-    assert_eq!(message.session, vec![u32::from(client.get_session_id())]);
-    assert!(message.channel_id.is_empty());
-    assert!(message.tree_id.is_empty());
-    assert_eq!(message.message, "Please retry shortly.");
-    assert!(!client.is_authenticated());
+    use shitspeak_auth::AuthenticationRejectionKind;
+    use shitspeak_messages::messages::encoder::RejectType;
+    for (kind, reject_type) in [
+        (
+            AuthenticationRejectionKind::WrongPassword,
+            RejectType::WrongUserPw,
+        ),
+        (
+            AuthenticationRejectionKind::NoSuchUser,
+            RejectType::InvalidUsername,
+        ),
+        (
+            AuthenticationRejectionKind::RetryLater,
+            RejectType::AuthenticatorFail,
+        ),
+    ] {
+        for reason in [None, Some("Access denied."), Some("")] {
+            for message in [None, Some("Contact support."), Some("")] {
+                let (authenticator, _calls, responses) = controlled_authenticator();
+                let server = Server::new(test_config(Vec::new()), authenticator)
+                    .await
+                    .expect("server");
+                let (client, mut outbound) = auth_queue_test_client(1);
+                let mut rejection = AuthenticationRejection::new(kind);
+                if let Some(reason) = reason {
+                    rejection = rejection.with_reason(reason);
+                }
+                if let Some(message) = message {
+                    rejection = rejection.with_message(message);
+                }
+                responses.send(Err(rejection)).unwrap();
+                let result = client
+                    .handle_message(
+                        &server,
+                        Message::Authenticate(shitspeak_proto::mumble_proto::Authenticate {
+                            username: Some("alice".to_owned()),
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                assert!(matches!(
+                    result,
+                    Err(crate::errors::MessageHandlerError::AuthRejection(_))
+                ));
+                if let Some(expected) = message {
+                    let Message::TextMessage(message) = outbound
+                        .try_recv()
+                        .expect("private message before rejection")
+                    else {
+                        panic!("expected TextMessage");
+                    };
+                    assert_eq!(message.actor, None);
+                    assert_eq!(message.session, vec![u32::from(client.get_session_id())]);
+                    assert!(message.channel_id.is_empty());
+                    assert!(message.tree_id.is_empty());
+                    assert_eq!(message.message, expected);
+                }
+                let Message::Reject(reject) = outbound.try_recv().expect("rejection") else {
+                    panic!("expected Reject");
+                };
+                assert_eq!(reject.r#type, Some(reject_type as i32));
+                let default_reason =
+                    crate::localization::reject_reason(client.language(), reject_type);
+                assert_eq!(
+                    reject.reason.as_deref(),
+                    Some(reason.unwrap_or(&default_reason))
+                );
+                assert!(outbound.try_recv().is_err());
+                assert!(!client.is_authenticated());
+            }
+        }
+    }
 }

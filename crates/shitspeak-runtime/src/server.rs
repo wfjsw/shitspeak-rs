@@ -29,8 +29,7 @@ use crate::{
     types::{NodeIdentifier, default_server_id},
 };
 use shitspeak_auth::{
-    AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
-    ReloadableAuthenticator,
+    AuthenticateAuxiliaryData, AuthenticateResult, Authenticator, ReloadableAuthenticator,
 };
 use shitspeak_messages::messages::encoder::Version;
 use shitspeak_runtime_config::{CertificateHashProtection, Config, UdpPingUserCountScope};
@@ -1768,14 +1767,16 @@ impl Server {
             "authenticator returned reauthentication result"
         );
 
-        if let Ok(Err(AuthenticationRejection::RetryLater(Some(message)))) = &result {
+        if let Ok(Err(rejection)) = &result
+            && let Some(message) = rejection.message()
+        {
             let notice = crate::messages::Message::TextMessage(
                 crate::messages::encoder::TextMessage {
                     actor: None,
                     session: vec![u32::from(client.get_session_id())],
                     channel_id: Vec::new(),
                     tree_id: Vec::new(),
-                    message: message.clone(),
+                    message: message.to_owned(),
                 }
                 .into(),
             );
@@ -1786,7 +1787,9 @@ impl Server {
 
         let result = match result {
             Ok(Ok(result)) => result,
-            Ok(Err(AuthenticationRejection::RetryLater(_))) | Err(_) => {
+            Ok(Err(ref rejection))
+                if rejection.kind() == shitspeak_auth::AuthenticationRejectionKind::RetryLater =>
+            {
                 tracing::info!(
                     session = ?client.get_session_id(),
                     "deferring expired-client reauthentication after transient authentication failure"
@@ -1794,9 +1797,16 @@ impl Server {
                 client.defer_reauthentication();
                 return;
             }
-            Ok(Err(_)) => {
-                self.disconnect_local_client(&client, "reauthentication rejected")
-                    .await;
+            Err(_) => {
+                client.defer_reauthentication();
+                return;
+            }
+            Ok(Err(rejection)) => {
+                self.disconnect_local_client(
+                    &client,
+                    rejection.reason().unwrap_or("reauthentication rejected"),
+                )
+                .await;
                 return;
             }
         };
@@ -2087,7 +2097,7 @@ impl Server {
     async fn disconnect_local_client(
         self: &Arc<Box<Self>>,
         client: &Arc<Box<Client>>,
-        reason: &'static str,
+        reason: &str,
     ) {
         let session_id = client.get_session_id();
         let server_id = client.server_id();

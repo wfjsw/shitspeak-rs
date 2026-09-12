@@ -667,14 +667,14 @@ impl MoqSessionRuntime {
                         )
                         .await;
                 }
-                if let AuthenticationRejection::RetryLater(Some(message)) = &rejection {
+                if let Some(message) = rejection.message() {
                     return Ok(vec![
                         ServerEvent::TextMessage {
                             sender_session: 0,
                             target_sessions: vec![auth_session_id],
                             channel_ids: Vec::new(),
                             tree_ids: Vec::new(),
-                            text: message.clone(),
+                            text: message.to_owned(),
                         },
                         ServerEvent::Error {
                             message: authentication_rejection_reason(rejection),
@@ -1860,10 +1860,15 @@ struct MoqActiveSpeaker {
 }
 
 fn authentication_rejection_reason(rejection: AuthenticationRejection) -> String {
-    match rejection {
-        AuthenticationRejection::WrongPassword => "wrong password",
-        AuthenticationRejection::NoSuchUser => "no such user",
-        AuthenticationRejection::RetryLater(_) => "authenticator temporarily unavailable",
+    if let Some(reason) = rejection.reason() {
+        return reason.to_owned();
+    }
+    match rejection.kind() {
+        shitspeak_auth::AuthenticationRejectionKind::WrongPassword => "wrong password",
+        shitspeak_auth::AuthenticationRejectionKind::NoSuchUser => "no such user",
+        shitspeak_auth::AuthenticationRejectionKind::RetryLater => {
+            "authenticator temporarily unavailable"
+        }
     }
     .to_string()
 }
@@ -2084,26 +2089,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_auth_retry_later_sends_private_text() {
-        let server = test_server(TestAuthenticator).await;
-        let context = test_session_context(Arc::clone(&server));
-        let mut runtime = MoqSessionRuntime::new(context);
-        let events = runtime
-            .handle_control_command(ClientCommand::Authenticate {
-                auth: AuthRequest::Password {
-                    username: "retry".to_owned(),
-                    password: "secret".to_owned(),
-                },
-            })
-            .await
-            .expect("retry response");
-        assert_eq!(events.len(), 2);
-        assert!(
-            matches!(&events[0], ServerEvent::TextMessage { sender_session: 0, target_sessions, channel_ids, tree_ids, text }
-            if target_sessions.len() == 1 && channel_ids.is_empty() && tree_ids.is_empty() && text == "Please retry shortly.")
-        );
-        assert!(matches!(&events[1], ServerEvent::Error { .. }));
-        assert_eq!(server.get_clients().local_len().await, 0);
+    async fn control_auth_rejections_preserve_reason_and_private_text() {
+        for username in ["retry", "reject_user", "reject_password"] {
+            let server = test_server(TestAuthenticator).await;
+            let context = test_session_context(Arc::clone(&server));
+            let mut runtime = MoqSessionRuntime::new(context);
+            let events = runtime
+                .handle_control_command(ClientCommand::Authenticate {
+                    auth: AuthRequest::Password {
+                        username: username.to_owned(),
+                        password: "secret".to_owned(),
+                    },
+                })
+                .await
+                .expect("rejection response");
+            assert_eq!(events.len(), 2);
+            assert!(
+                matches!(&events[0], ServerEvent::TextMessage { sender_session: 0, target_sessions, channel_ids, tree_ids, text }
+                if target_sessions.len() == 1 && channel_ids.is_empty() && tree_ids.is_empty() && text == "Contact support.")
+            );
+            assert!(
+                matches!(&events[1], ServerEvent::Error { message } if message == "Access denied.")
+            );
+            assert_eq!(server.get_clients().local_len().await, 0);
+        }
     }
 
     #[tokio::test]
@@ -2556,16 +2565,28 @@ mod tests {
             auxiliary_data: &AuthenticateAuxiliaryData,
         ) -> Result<AuthenticateResult, AuthenticationRejection> {
             assert_eq!(auxiliary_data.ip_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
-            if username == "retry" {
-                return Err(AuthenticationRejection::RetryLater(Some(
-                    "Please retry shortly.".to_owned(),
-                )));
+            let rejection_kind = match username {
+                "retry" => Some(shitspeak_auth::AuthenticationRejectionKind::RetryLater),
+                "reject_user" => Some(shitspeak_auth::AuthenticationRejectionKind::NoSuchUser),
+                "reject_password" => {
+                    Some(shitspeak_auth::AuthenticationRejectionKind::WrongPassword)
+                }
+                _ => None,
+            };
+            if let Some(kind) = rejection_kind {
+                return Err(AuthenticationRejection::new(kind)
+                    .with_reason("Access denied.")
+                    .with_message("Contact support."));
             }
             if username != "alice" {
-                return Err(AuthenticationRejection::NoSuchUser);
+                return Err(AuthenticationRejection::new(
+                    shitspeak_auth::AuthenticationRejectionKind::NoSuchUser,
+                ));
             }
             if password != Some("secret") {
-                return Err(AuthenticationRejection::WrongPassword);
+                return Err(AuthenticationRejection::new(
+                    shitspeak_auth::AuthenticationRejectionKind::WrongPassword,
+                ));
             }
             Ok(AuthenticateResult {
                 auth_session_id: Some("web-auth-session".to_string()),

@@ -165,7 +165,9 @@ impl WebSessionContext {
         auth: AuthRequest,
     ) -> Result<(AuthenticateResult, Option<Credential>), AuthenticationRejection> {
         let Some(authenticator) = self.authenticator.as_ref() else {
-            return Err(AuthenticationRejection::RetryLater(None));
+            return Err(AuthenticationRejection::new(
+                shitspeak_auth::AuthenticationRejectionKind::RetryLater,
+            ));
         };
 
         match auth {
@@ -173,18 +175,24 @@ impl WebSessionContext {
                 if !self.config.auth.password_enabled
                     || !self.config.auth.modes.contains(&WebAuthMode::Password)
                 {
-                    return Err(AuthenticationRejection::RetryLater(None));
+                    return Err(AuthenticationRejection::new(
+                        shitspeak_auth::AuthenticationRejectionKind::RetryLater,
+                    ));
                 }
                 let auxiliary = self.auxiliary_data(session_id);
                 let result = authenticator
                     .authenticate(&username, Some(password.as_str()), &auxiliary)
                     .await?;
                 if result.user_id == Some(u32::MAX) {
-                    return Err(AuthenticationRejection::RetryLater(None));
+                    return Err(AuthenticationRejection::new(
+                        shitspeak_auth::AuthenticationRejectionKind::RetryLater,
+                    ));
                 }
                 Ok((result, Some(Credential::new(username, Some(password)))))
             }
-            AuthRequest::Sso { token: _ } => Err(AuthenticationRejection::RetryLater(None)),
+            AuthRequest::Sso { token: _ } => Err(AuthenticationRejection::new(
+                shitspeak_auth::AuthenticationRejectionKind::RetryLater,
+            )),
         }
     }
 

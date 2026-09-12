@@ -17,7 +17,7 @@ use crate::{
     server::Server,
 };
 use shitspeak_auth::{
-    AuthenticateAuxiliaryData, AuthenticationRejection, Authenticator, canonical_authenticator_ip,
+    AuthenticateAuxiliaryData, Authenticator, canonical_authenticator_ip,
     normalize_virtual_server_id,
 };
 
@@ -169,22 +169,8 @@ pub async fn handle_authenticate(
     );
     let mut result = match auth_result {
         Ok(r) => r,
-        Err(AuthenticationRejection::NoSuchUser) => {
-            return Err(AuthRejection::new_with_language(
-                RejectType::InvalidUsername,
-                sender.language(),
-            )
-            .into());
-        }
-        Err(AuthenticationRejection::WrongPassword) => {
-            return Err(AuthRejection::new_with_language(
-                RejectType::WrongUserPw,
-                sender.language(),
-            )
-            .into());
-        }
-        Err(AuthenticationRejection::RetryLater(message)) => {
-            if let Some(message) = message {
+        Err(rejection) => {
+            if let Some(message) = rejection.message() {
                 sender
                     .write_proto_message_direct(&Message::TextMessage(
                         TextMessage {
@@ -192,17 +178,28 @@ pub async fn handle_authenticate(
                             session: vec![u32::from(sender.get_session_id())],
                             channel_id: Vec::new(),
                             tree_id: Vec::new(),
-                            message,
+                            message: message.to_owned(),
                         }
                         .into(),
                     ))
                     .await?;
             }
-            return Err(AuthRejection::new_with_language(
-                RejectType::AuthenticatorFail,
-                sender.language(),
-            )
-            .into());
+            let reject_type = match rejection.kind() {
+                shitspeak_auth::AuthenticationRejectionKind::NoSuchUser => {
+                    RejectType::InvalidUsername
+                }
+                shitspeak_auth::AuthenticationRejectionKind::WrongPassword => {
+                    RejectType::WrongUserPw
+                }
+                shitspeak_auth::AuthenticationRejectionKind::RetryLater => {
+                    RejectType::AuthenticatorFail
+                }
+            };
+            let mut reject = AuthRejection::new_with_language(reject_type, sender.language());
+            if let Some(reason) = rejection.reason() {
+                reject = reject.because(reason.to_owned());
+            }
+            return Err(reject.into());
         }
     };
     if result.user_id == Some(u32::MAX) {

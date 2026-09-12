@@ -213,7 +213,11 @@ impl Authenticator for ScheduledAuthenticator {
                     .authenticate(&username, password.as_deref(), &auxiliary_data)
                     .await
             },
-            || Err(AuthenticationRejection::RetryLater(None)),
+            || {
+                Err(AuthenticationRejection::new(
+                    shitspeak_auth::AuthenticationRejectionKind::RetryLater,
+                ))
+            },
         )
         .await
     }
@@ -228,7 +232,11 @@ impl Authenticator for ScheduledAuthenticator {
         let auxiliary_data = auxiliary_data.clone();
         self.run_or(
             async move { inner.authenticate_external(&claims, &auxiliary_data).await },
-            || Err(AuthenticationRejection::RetryLater(None)),
+            || {
+                Err(AuthenticationRejection::new(
+                    shitspeak_auth::AuthenticationRejectionKind::RetryLater,
+                ))
+            },
         )
         .await
     }

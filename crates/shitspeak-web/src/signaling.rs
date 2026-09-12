@@ -1267,7 +1267,9 @@ async fn handle_signaling_authenticate(
                     );
                     send_authentication_rejection(
                         stream,
-                        AuthenticationRejection::RetryLater(None),
+                        AuthenticationRejection::new(
+                            shitspeak_auth::AuthenticationRejectionKind::RetryLater,
+                        ),
                     )
                     .await?;
                     return Ok(());
@@ -1324,8 +1326,13 @@ async fn handle_signaling_authenticate(
                             .await;
                         session.session_id = DEFAULT_WEB_SESSION_ID;
                     }
-                    send_authentication_rejection(stream, AuthenticationRejection::RetryLater(None))
-                        .await
+                    send_authentication_rejection(
+                        stream,
+                        AuthenticationRejection::new(
+                            shitspeak_auth::AuthenticationRejectionKind::RetryLater,
+                        ),
+                    )
+                    .await
                 }
                 Err(rejection) => {
                     if let Some((server, client, _)) = preallocated {
@@ -2383,7 +2390,7 @@ async fn send_authentication_rejection(
     stream: &mut (impl AsyncWrite + Unpin),
     rejection: AuthenticationRejection,
 ) -> io::Result<()> {
-    if let AuthenticationRejection::RetryLater(Some(message)) = &rejection {
+    if let Some(message) = rejection.message() {
         send_server_event(
             stream,
             &ServerEvent::TextMessage {
@@ -2391,20 +2398,22 @@ async fn send_authentication_rejection(
                 target_sessions: Vec::new(),
                 channel_ids: Vec::new(),
                 tree_ids: Vec::new(),
-                text: message.clone(),
+                text: message.to_owned(),
             },
         )
         .await?;
     }
-    let reason = match rejection {
-        AuthenticationRejection::WrongPassword => "wrong password",
-        AuthenticationRejection::NoSuchUser => "no such user",
-        AuthenticationRejection::RetryLater(_) => "authenticator temporarily unavailable",
+    let reason = match rejection.kind() {
+        shitspeak_auth::AuthenticationRejectionKind::WrongPassword => "wrong password",
+        shitspeak_auth::AuthenticationRejectionKind::NoSuchUser => "no such user",
+        shitspeak_auth::AuthenticationRejectionKind::RetryLater => {
+            "authenticator temporarily unavailable"
+        }
     };
     send_server_event(
         stream,
         &ServerEvent::AuthenticationRejected {
-            reason: reason.to_string(),
+            reason: rejection.reason().unwrap_or(reason).to_owned(),
         },
     )
     .await
@@ -2714,26 +2723,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_later_sends_text_before_rejection() {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        send_authentication_rejection(
-            &mut server,
-            AuthenticationRejection::RetryLater(Some("Please retry shortly.".to_owned())),
-        )
-        .await
-        .unwrap();
-        let WebSocketFrame::Text(payload) = read_server_frame(&mut client).await else {
-            panic!("text frame");
-        };
-        let event: ServerEvent = serde_json::from_str(&payload).unwrap();
-        assert!(
-            matches!(event, ServerEvent::TextMessage { sender_session: 0, text, .. } if text == "Please retry shortly.")
-        );
-        let WebSocketFrame::Text(payload) = read_server_frame(&mut client).await else {
-            panic!("rejection frame");
-        };
-        let event: ServerEvent = serde_json::from_str(&payload).unwrap();
-        assert!(matches!(event, ServerEvent::AuthenticationRejected { .. }));
+    async fn authentication_rejections_preserve_reason_and_message() {
+        use shitspeak_auth::AuthenticationRejectionKind;
+        for kind in [
+            AuthenticationRejectionKind::WrongPassword,
+            AuthenticationRejectionKind::NoSuchUser,
+            AuthenticationRejectionKind::RetryLater,
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            send_authentication_rejection(
+                &mut server,
+                AuthenticationRejection::new(kind)
+                    .with_reason("Access denied.")
+                    .with_message("Contact support."),
+            )
+            .await
+            .unwrap();
+            let WebSocketFrame::Text(payload) = read_server_frame(&mut client).await else {
+                panic!("text frame");
+            };
+            let event: ServerEvent = serde_json::from_str(&payload).unwrap();
+            assert!(
+                matches!(event, ServerEvent::TextMessage { sender_session: 0, text, .. } if text == "Contact support.")
+            );
+            let WebSocketFrame::Text(payload) = read_server_frame(&mut client).await else {
+                panic!("rejection frame");
+            };
+            let event: ServerEvent = serde_json::from_str(&payload).unwrap();
+            assert!(
+                matches!(event, ServerEvent::AuthenticationRejected { reason } if reason == "Access denied.")
+            );
+        }
     }
 
     #[tokio::test]
@@ -3366,10 +3386,14 @@ mod tests {
             }
             assert_eq!(auxiliary_data.ip_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
             if username != "alice" {
-                return Err(AuthenticationRejection::NoSuchUser);
+                return Err(AuthenticationRejection::new(
+                    shitspeak_auth::AuthenticationRejectionKind::NoSuchUser,
+                ));
             }
             if password != Some("secret") {
-                return Err(AuthenticationRejection::WrongPassword);
+                return Err(AuthenticationRejection::new(
+                    shitspeak_auth::AuthenticationRejectionKind::WrongPassword,
+                ));
             }
             Ok(AuthenticateResult {
                 auth_session_id: Some("web-auth-session".to_string()),

@@ -31,12 +31,50 @@ pub fn normalize_virtual_server_id(server_id: Option<String>) -> Option<String> 
     server_id.and_then(|server_id| (!server_id.trim().is_empty()).then_some(server_id))
 }
 
-#[derive(Debug)]
-pub enum AuthenticationRejection {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationRejectionKind {
     WrongPassword,
     NoSuchUser,
-    /// Optional server text message to send to the affected client.
-    RetryLater(Option<String>),
+    RetryLater,
+}
+
+#[derive(Debug)]
+pub struct AuthenticationRejection {
+    kind: AuthenticationRejectionKind,
+    reason: Option<String>,
+    message: Option<String>,
+}
+
+impl AuthenticationRejection {
+    pub fn new(kind: AuthenticationRejectionKind) -> Self {
+        Self {
+            kind,
+            reason: None,
+            message: None,
+        }
+    }
+
+    /// Sets the reason included in the client's rejection response.
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Sets a private server text message sent before the rejection response.
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    pub fn kind(&self) -> AuthenticationRejectionKind {
+        self.kind
+    }
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
 }
 
 #[derive(Debug)]

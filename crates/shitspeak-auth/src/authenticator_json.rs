@@ -10,7 +10,8 @@ use crate::Language;
 
 use super::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationExpiryAction,
-    AuthenticationRejection, ExternalAuthClaims, canonical_authenticator_ip,
+    AuthenticationRejection, AuthenticationRejectionKind, ExternalAuthClaims,
+    canonical_authenticator_ip,
 };
 
 #[derive(Serialize)]
@@ -190,6 +191,8 @@ pub(crate) struct AuthenticatorJsonAuthenticateResponse {
     #[serde(default)]
     message: Option<String>,
     #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
     user_id: Option<u32>,
     #[serde(default)]
     fqdn: Option<String>,
@@ -224,14 +227,21 @@ impl AuthenticatorJsonAuthenticateResponse {
         self,
     ) -> Result<AuthenticateResult, AuthenticationRejection> {
         if !self.accepted {
-            return Err(match self.rejection.as_deref() {
+            let kind = match self.rejection.as_deref() {
                 Some("no_such_user") | Some("invalid_username") => {
-                    AuthenticationRejection::NoSuchUser
+                    AuthenticationRejectionKind::NoSuchUser
                 }
-                Some("wrong_password") => AuthenticationRejection::WrongPassword,
-                Some("retry_later") => AuthenticationRejection::RetryLater(self.message),
-                _ => AuthenticationRejection::RetryLater(None),
-            });
+                Some("wrong_password") => AuthenticationRejectionKind::WrongPassword,
+                _ => AuthenticationRejectionKind::RetryLater,
+            };
+            let mut rejection = AuthenticationRejection::new(kind);
+            if let Some(reason) = self.reason {
+                rejection = rejection.with_reason(reason);
+            }
+            if let Some(message) = self.message {
+                rejection = rejection.with_message(message);
+            }
+            return Err(rejection);
         }
         Ok(AuthenticateResult {
             user_id: self.user_id,
@@ -289,61 +299,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retry_later_preserves_optional_message() {
-        for message in [None, Some("Please retry shortly."), Some("")] {
-            let response: AuthenticatorJsonAuthenticateResponse = serde_json::from_value(
-                serde_json::json!({"accepted": false, "rejection": "retry_later", "message": message})
-            ).unwrap();
-            let Err(AuthenticationRejection::RetryLater(actual)) =
-                response.into_authenticate_result()
-            else {
-                panic!("expected retry_later");
-            };
-            assert_eq!(actual.as_deref(), message);
+    fn all_rejections_preserve_independent_reason_and_message() {
+        for (name, kind) in [
+            ("wrong_password", AuthenticationRejectionKind::WrongPassword),
+            ("no_such_user", AuthenticationRejectionKind::NoSuchUser),
+            ("invalid_username", AuthenticationRejectionKind::NoSuchUser),
+            ("retry_later", AuthenticationRejectionKind::RetryLater),
+            ("unknown", AuthenticationRejectionKind::RetryLater),
+        ] {
+            for reason in [None, Some("Access denied."), Some("")] {
+                for message in [None, Some("Contact support."), Some("")] {
+                    let response: AuthenticatorJsonAuthenticateResponse = serde_json::from_value(
+                        serde_json::json!({"accepted": false, "rejection": name,
+                            "reason": reason, "message": message}),
+                    )
+                    .unwrap();
+                    let rejection = response.into_authenticate_result().unwrap_err();
+                    assert_eq!(rejection.kind(), kind);
+                    assert_eq!(rejection.reason(), reason);
+                    assert_eq!(rejection.message(), message);
+                }
+            }
         }
     }
 
     #[test]
-    fn authenticate_response_maps_rejection_reasons() {
-        let response: AuthenticatorJsonAuthenticateResponse =
-            serde_json::from_str(r#"{"accepted":false,"rejection":"wrong_password"}"#).unwrap();
-        assert!(matches!(
-            response.into_authenticate_result(),
-            Err(AuthenticationRejection::WrongPassword)
-        ));
-
-        let response: AuthenticatorJsonAuthenticateResponse =
-            serde_json::from_str(r#"{"accepted":false,"rejection":"invalid_username"}"#).unwrap();
-        assert!(matches!(
-            response.into_authenticate_result(),
-            Err(AuthenticationRejection::NoSuchUser)
-        ));
-
-        let response: AuthenticatorJsonAuthenticateResponse =
-            serde_json::from_str(r#"{"accepted":false,"rejection":"temporarily_down"}"#).unwrap();
-        assert!(matches!(
-            response.into_authenticate_result(),
-            Err(AuthenticationRejection::RetryLater(None))
-        ));
-    }
-
-    #[test]
     fn authenticate_response_defaults_to_reject() {
-        // Fail closed: a malformed/error-shaped backend response that omits
-        // `accepted` must never be treated as a successful login.
-        let response: AuthenticatorJsonAuthenticateResponse =
-            serde_json::from_str(r#"{"user_id":7,"display_name":"alice"}"#).unwrap();
-        assert!(matches!(
-            response.into_authenticate_result(),
-            Err(AuthenticationRejection::RetryLater(None))
-        ));
-
-        let response: AuthenticatorJsonAuthenticateResponse =
-            serde_json::from_str(r#"{"error":"db down"}"#).unwrap();
-        assert!(matches!(
-            response.into_authenticate_result(),
-            Err(AuthenticationRejection::RetryLater(None))
-        ));
+        for json in [
+            r#"{"user_id":7,"display_name":"alice"}"#,
+            r#"{"error":"db down"}"#,
+        ] {
+            let response: AuthenticatorJsonAuthenticateResponse =
+                serde_json::from_str(json).unwrap();
+            let rejection = response.into_authenticate_result().unwrap_err();
+            assert_eq!(rejection.kind(), AuthenticationRejectionKind::RetryLater);
+            assert_eq!(rejection.reason(), None);
+            assert_eq!(rejection.message(), None);
+        }
     }
 
     #[test]
