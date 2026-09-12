@@ -357,6 +357,11 @@ impl RecipientIndex {
             }
             g.len()
         };
+        let covered_nodes = {
+            let g = self.inner.read();
+            g.values().flat_map(|nodes| nodes.iter().copied()).collect()
+        };
+        *self.covered_nodes.write() = covered_nodes;
         self.invalidate_remote_node_lookup_cache(channel_count);
     }
 
@@ -744,6 +749,26 @@ mod tests {
             ),
             RemoteNodeLookup::Nodes(Arc::from([7, 8]))
         );
+    }
+
+    #[test]
+    fn removing_offline_node_clears_snapshot_coverage() {
+        let idx = RecipientIndex::new();
+        let server_id = default_server_id();
+        let mut snapshot = RecipientIndexSnapshot::new();
+        snapshot.insert(
+            RecipientIndexKey::new(server_id.as_str(), 5),
+            [1, 7].into_iter().collect(),
+        );
+        idx.replace_all_complete(RecipientIndexUpdate::new(
+            snapshot,
+            [server_id.clone()].into_iter().collect(),
+            [1, 7].into_iter().collect(),
+        ));
+
+        idx.remove_in_server(server_id.as_str(), 5, 7);
+
+        assert!(!idx.covers_voice_members(server_id.as_str(), &[1, 7]));
     }
 
     #[test]
