@@ -12,7 +12,7 @@ use crate::{
     localization::{TextKey, text},
     messages::{
         Message,
-        encoder::{Authenticate, CodecVersion, RejectType, ServerConfig, ServerSync},
+        encoder::{Authenticate, CodecVersion, RejectType, ServerConfig, ServerSync, TextMessage},
     },
     server::Server,
 };
@@ -183,7 +183,21 @@ pub async fn handle_authenticate(
             )
             .into());
         }
-        Err(AuthenticationRejection::RetryLater) => {
+        Err(AuthenticationRejection::RetryLater(message)) => {
+            if let Some(message) = message {
+                sender
+                    .write_proto_message_direct(&Message::TextMessage(
+                        TextMessage {
+                            actor: None,
+                            session: vec![u32::from(sender.get_session_id())],
+                            channel_id: Vec::new(),
+                            tree_id: Vec::new(),
+                            message,
+                        }
+                        .into(),
+                    ))
+                    .await?;
+            }
             return Err(AuthRejection::new_with_language(
                 RejectType::AuthenticatorFail,
                 sender.language(),

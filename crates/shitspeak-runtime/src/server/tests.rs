@@ -1095,7 +1095,7 @@ async fn authentication_expiry_reauth_retries_after_transient_failure() {
     authentication_expiry_reaper(&server, deadline).await;
     calls.recv().await.expect("first reauthentication call");
     responses
-        .send(Err(AuthenticationRejection::RetryLater))
+        .send(Err(AuthenticationRejection::RetryLater(None)))
         .expect("send transient failure");
 
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -1105,6 +1105,52 @@ async fn authentication_expiry_reauth_retries_after_transient_failure() {
     })
     .await
     .expect("transient reauthentication completed");
+    assert!(client.is_authenticated());
+    assert!(
+        server
+            .clients
+            .get_client_in_server(DEFAULT_SERVER_ID, client.get_session_id())
+            .await
+            .is_some()
+    );
+
+    authentication_expiry_reaper(&server, deadline + chrono::Duration::seconds(1)).await;
+    calls.recv().await.expect("retry reauthentication call");
+}
+
+#[tokio::test]
+async fn authentication_expiry_reauth_sends_retry_message() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let server = Server::new(test_config(Vec::new()), authenticator)
+        .await
+        .expect("server");
+    let (client, mut outbound) = authentication_expiry_test_client_with_outbound(&server).await;
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    calls.recv().await.expect("first reauthentication call");
+    responses
+        .send(Err(AuthenticationRejection::RetryLater(Some(
+            "Please retry shortly.".to_owned(),
+        ))))
+        .expect("send transient failure");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.is_reauthentication_in_progress() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("transient reauthentication completed");
+    let Message::TextMessage(message) = outbound.recv().await.expect("retry message") else {
+        panic!("expected TextMessage");
+    };
+    assert_eq!(message.actor, None);
+    assert_eq!(message.session, vec![u32::from(client.get_session_id())]);
+    assert!(message.channel_id.is_empty());
+    assert!(message.tree_id.is_empty());
+    assert_eq!(message.message, "Please retry shortly.");
     assert!(client.is_authenticated());
     assert!(
         server
@@ -2893,4 +2939,43 @@ async fn reload_root_channel_work_does_not_hold_config_write_lock() {
         .expect("server");
 
     assert_config_read_completes_during_root_channel_reload(&server, "Renamed Root").await;
+}
+
+#[tokio::test]
+async fn authentication_retry_later_sends_private_message_before_rejection() {
+    use crate::client::handlers::AsyncMessageHandlerExt;
+    let (authenticator, _calls, responses) = controlled_authenticator();
+    let server = Server::new(test_config(Vec::new()), authenticator)
+        .await
+        .expect("server");
+    let (client, mut outbound) = auth_queue_test_client(1);
+    responses
+        .send(Err(AuthenticationRejection::RetryLater(Some(
+            "Please retry shortly.".to_owned(),
+        ))))
+        .unwrap();
+    let result = client
+        .handle_message(
+            &server,
+            Message::Authenticate(shitspeak_proto::mumble_proto::Authenticate {
+                username: Some("alice".to_owned()),
+                ..Default::default()
+            }),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::errors::MessageHandlerError::AuthRejection(_))
+    ));
+    let Message::TextMessage(message) =
+        outbound.try_recv().expect("retry message before rejection")
+    else {
+        panic!("expected TextMessage");
+    };
+    assert_eq!(message.actor, None);
+    assert_eq!(message.session, vec![u32::from(client.get_session_id())]);
+    assert!(message.channel_id.is_empty());
+    assert!(message.tree_id.is_empty());
+    assert_eq!(message.message, "Please retry shortly.");
+    assert!(!client.is_authenticated());
 }

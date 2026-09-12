@@ -35,7 +35,8 @@ pub fn normalize_virtual_server_id(server_id: Option<String>) -> Option<String> 
 pub enum AuthenticationRejection {
     WrongPassword,
     NoSuchUser,
-    RetryLater,
+    /// Optional server text message to send to the affected client.
+    RetryLater(Option<String>),
 }
 
 #[derive(Debug)]

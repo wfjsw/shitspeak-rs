@@ -131,6 +131,16 @@ Successful authentication can provide identity, display name, groups, virtual se
 
 For rejection, return `accepted: false` and a `rejection` value such as `no_such_user`, `invalid_username`, `wrong_password`, or `retry_later`.
 
+For `retry_later`, an optional `message` is sent only to this client as a server `TextMessage`, before the login rejection. During expiry-triggered reauthentication, the message is sent while the existing session is preserved for retry. Omitting `message` keeps the existing behavior. Exec and WASM authenticators use the same format:
+
+```json
+{
+  "accepted": false,
+  "rejection": "retry_later",
+  "message": "Authentication is temporarily unavailable. Please try again shortly."
+}
+```
+
 ## Required Groups
 
 `required_groups` can enforce a coarse deployment-level group gate after authentication:

@@ -1265,8 +1265,11 @@ async fn handle_signaling_authenticate(
                         username = %username,
                         "web authentication rate limit exceeded"
                     );
-                    send_authentication_rejection(stream, AuthenticationRejection::RetryLater)
-                        .await?;
+                    send_authentication_rejection(
+                        stream,
+                        AuthenticationRejection::RetryLater(None),
+                    )
+                    .await?;
                     return Ok(());
                 }
             }
@@ -1321,7 +1324,8 @@ async fn handle_signaling_authenticate(
                             .await;
                         session.session_id = DEFAULT_WEB_SESSION_ID;
                     }
-                    send_authentication_rejection(stream, AuthenticationRejection::RetryLater).await
+                    send_authentication_rejection(stream, AuthenticationRejection::RetryLater(None))
+                        .await
                 }
                 Err(rejection) => {
                     if let Some((server, client, _)) = preallocated {
@@ -2379,10 +2383,23 @@ async fn send_authentication_rejection(
     stream: &mut (impl AsyncWrite + Unpin),
     rejection: AuthenticationRejection,
 ) -> io::Result<()> {
+    if let AuthenticationRejection::RetryLater(Some(message)) = &rejection {
+        send_server_event(
+            stream,
+            &ServerEvent::TextMessage {
+                sender_session: 0,
+                target_sessions: Vec::new(),
+                channel_ids: Vec::new(),
+                tree_ids: Vec::new(),
+                text: message.clone(),
+            },
+        )
+        .await?;
+    }
     let reason = match rejection {
         AuthenticationRejection::WrongPassword => "wrong password",
         AuthenticationRejection::NoSuchUser => "no such user",
-        AuthenticationRejection::RetryLater => "authenticator temporarily unavailable",
+        AuthenticationRejection::RetryLater(_) => "authenticator temporarily unavailable",
     };
     send_server_event(
         stream,
@@ -2694,6 +2711,29 @@ mod tests {
         drop(tx);
         assert!(!drain_visibility_reload_receiver(&mut rx));
         assert!(rx.is_none());
+    }
+
+    #[tokio::test]
+    async fn retry_later_sends_text_before_rejection() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        send_authentication_rejection(
+            &mut server,
+            AuthenticationRejection::RetryLater(Some("Please retry shortly.".to_owned())),
+        )
+        .await
+        .unwrap();
+        let WebSocketFrame::Text(payload) = read_server_frame(&mut client).await else {
+            panic!("text frame");
+        };
+        let event: ServerEvent = serde_json::from_str(&payload).unwrap();
+        assert!(
+            matches!(event, ServerEvent::TextMessage { sender_session: 0, text, .. } if text == "Please retry shortly.")
+        );
+        let WebSocketFrame::Text(payload) = read_server_frame(&mut client).await else {
+            panic!("rejection frame");
+        };
+        let event: ServerEvent = serde_json::from_str(&payload).unwrap();
+        assert!(matches!(event, ServerEvent::AuthenticationRejected { .. }));
     }
 
     #[tokio::test]

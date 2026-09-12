@@ -147,7 +147,7 @@ impl Authenticator for ExecAuthenticator {
             Ok(response) => response.into_authenticate_result(),
             Err(error) => {
                 tracing::warn!(error = %error, "exec authenticator failed");
-                Err(AuthenticationRejection::RetryLater)
+                Err(AuthenticationRejection::RetryLater(None))
             }
         }
     }
@@ -165,7 +165,7 @@ impl Authenticator for ExecAuthenticator {
             Ok(response) => response.into_authenticate_result(),
             Err(error) => {
                 tracing::warn!(error = %error, "exec external authenticator failed");
-                Err(AuthenticationRejection::RetryLater)
+                Err(AuthenticationRejection::RetryLater(None))
             }
         }
     }

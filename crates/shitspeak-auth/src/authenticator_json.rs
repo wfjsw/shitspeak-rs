@@ -188,6 +188,8 @@ pub(crate) struct AuthenticatorJsonAuthenticateResponse {
     #[serde(default)]
     rejection: Option<String>,
     #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
     user_id: Option<u32>,
     #[serde(default)]
     fqdn: Option<String>,
@@ -227,7 +229,8 @@ impl AuthenticatorJsonAuthenticateResponse {
                     AuthenticationRejection::NoSuchUser
                 }
                 Some("wrong_password") => AuthenticationRejection::WrongPassword,
-                _ => AuthenticationRejection::RetryLater,
+                Some("retry_later") => AuthenticationRejection::RetryLater(self.message),
+                _ => AuthenticationRejection::RetryLater(None),
             });
         }
         Ok(AuthenticateResult {
@@ -286,6 +289,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retry_later_preserves_optional_message() {
+        for message in [None, Some("Please retry shortly."), Some("")] {
+            let response: AuthenticatorJsonAuthenticateResponse = serde_json::from_value(
+                serde_json::json!({"accepted": false, "rejection": "retry_later", "message": message})
+            ).unwrap();
+            let Err(AuthenticationRejection::RetryLater(actual)) =
+                response.into_authenticate_result()
+            else {
+                panic!("expected retry_later");
+            };
+            assert_eq!(actual.as_deref(), message);
+        }
+    }
+
+    #[test]
     fn authenticate_response_maps_rejection_reasons() {
         let response: AuthenticatorJsonAuthenticateResponse =
             serde_json::from_str(r#"{"accepted":false,"rejection":"wrong_password"}"#).unwrap();
@@ -305,7 +323,7 @@ mod tests {
             serde_json::from_str(r#"{"accepted":false,"rejection":"temporarily_down"}"#).unwrap();
         assert!(matches!(
             response.into_authenticate_result(),
-            Err(AuthenticationRejection::RetryLater)
+            Err(AuthenticationRejection::RetryLater(None))
         ));
     }
 
@@ -317,14 +335,14 @@ mod tests {
             serde_json::from_str(r#"{"user_id":7,"display_name":"alice"}"#).unwrap();
         assert!(matches!(
             response.into_authenticate_result(),
-            Err(AuthenticationRejection::RetryLater)
+            Err(AuthenticationRejection::RetryLater(None))
         ));
 
         let response: AuthenticatorJsonAuthenticateResponse =
             serde_json::from_str(r#"{"error":"db down"}"#).unwrap();
         assert!(matches!(
             response.into_authenticate_result(),
-            Err(AuthenticationRejection::RetryLater)
+            Err(AuthenticationRejection::RetryLater(None))
         ));
     }
 

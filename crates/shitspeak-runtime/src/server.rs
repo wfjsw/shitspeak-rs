@@ -1768,9 +1768,25 @@ impl Server {
             "authenticator returned reauthentication result"
         );
 
+        if let Ok(Err(AuthenticationRejection::RetryLater(Some(message)))) = &result {
+            let notice = crate::messages::Message::TextMessage(
+                crate::messages::encoder::TextMessage {
+                    actor: None,
+                    session: vec![u32::from(client.get_session_id())],
+                    channel_id: Vec::new(),
+                    tree_id: Vec::new(),
+                    message: message.clone(),
+                }
+                .into(),
+            );
+            if let Err(error) = client.write_proto_message_direct(&notice).await {
+                tracing::warn!(%error, "failed to send reauthentication retry message");
+            }
+        }
+
         let result = match result {
             Ok(Ok(result)) => result,
-            Ok(Err(AuthenticationRejection::RetryLater)) | Err(_) => {
+            Ok(Err(AuthenticationRejection::RetryLater(_))) | Err(_) => {
                 tracing::info!(
                     session = ?client.get_session_id(),
                     "deferring expired-client reauthentication after transient authentication failure"

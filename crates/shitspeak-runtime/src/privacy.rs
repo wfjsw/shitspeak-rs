@@ -218,6 +218,7 @@ mod tests {
             viewer,
             CertificateHashProtection::Irreversible,
             Some("cluster-secret"),
+            false,
         );
 
         assert_eq!(state.hash.as_deref(), Some(source));

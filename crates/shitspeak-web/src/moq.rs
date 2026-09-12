@@ -667,6 +667,20 @@ impl MoqSessionRuntime {
                         )
                         .await;
                 }
+                if let AuthenticationRejection::RetryLater(Some(message)) = &rejection {
+                    return Ok(vec![
+                        ServerEvent::TextMessage {
+                            sender_session: 0,
+                            target_sessions: vec![auth_session_id],
+                            channel_ids: Vec::new(),
+                            tree_ids: Vec::new(),
+                            text: message.clone(),
+                        },
+                        ServerEvent::Error {
+                            message: authentication_rejection_reason(rejection),
+                        },
+                    ]);
+                }
                 return Err(authentication_rejection_reason(rejection));
             }
         };
@@ -1849,7 +1863,7 @@ fn authentication_rejection_reason(rejection: AuthenticationRejection) -> String
     match rejection {
         AuthenticationRejection::WrongPassword => "wrong password",
         AuthenticationRejection::NoSuchUser => "no such user",
-        AuthenticationRejection::RetryLater => "authenticator temporarily unavailable",
+        AuthenticationRejection::RetryLater(_) => "authenticator temporarily unavailable",
     }
     .to_string()
 }
@@ -2067,6 +2081,29 @@ mod tests {
         assert!(!opus.is_terminator);
 
         assert_eq!(MoqAudioFrame::from_audio(&audio), Some(frame));
+    }
+
+    #[tokio::test]
+    async fn control_auth_retry_later_sends_private_text() {
+        let server = test_server(TestAuthenticator).await;
+        let context = test_session_context(Arc::clone(&server));
+        let mut runtime = MoqSessionRuntime::new(context);
+        let events = runtime
+            .handle_control_command(ClientCommand::Authenticate {
+                auth: AuthRequest::Password {
+                    username: "retry".to_owned(),
+                    password: "secret".to_owned(),
+                },
+            })
+            .await
+            .expect("retry response");
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], ServerEvent::TextMessage { sender_session: 0, target_sessions, channel_ids, tree_ids, text }
+            if target_sessions.len() == 1 && channel_ids.is_empty() && tree_ids.is_empty() && text == "Please retry shortly.")
+        );
+        assert!(matches!(&events[1], ServerEvent::Error { .. }));
+        assert_eq!(server.get_clients().local_len().await, 0);
     }
 
     #[tokio::test]
@@ -2519,6 +2556,11 @@ mod tests {
             auxiliary_data: &AuthenticateAuxiliaryData,
         ) -> Result<AuthenticateResult, AuthenticationRejection> {
             assert_eq!(auxiliary_data.ip_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+            if username == "retry" {
+                return Err(AuthenticationRejection::RetryLater(Some(
+                    "Please retry shortly.".to_owned(),
+                )));
+            }
             if username != "alice" {
                 return Err(AuthenticationRejection::NoSuchUser);
             }

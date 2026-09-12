@@ -477,7 +477,7 @@ impl Authenticator for WasmAuthenticator {
             Ok(response) => response.into_authenticate_result(),
             Err(error) => {
                 tracing::warn!(error = %error, "WASM authenticator failed");
-                Err(AuthenticationRejection::RetryLater)
+                Err(AuthenticationRejection::RetryLater(None))
             }
         }
     }
@@ -499,7 +499,7 @@ impl Authenticator for WasmAuthenticator {
             Ok(None) => Ok(authenticate_result_from_external_claims(claims)),
             Err(error) => {
                 tracing::warn!(error = %error, "WASM external authenticator failed");
-                Err(AuthenticationRejection::RetryLater)
+                Err(AuthenticationRejection::RetryLater(None))
             }
         }
     }
