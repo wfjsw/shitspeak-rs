@@ -1093,20 +1093,42 @@ async fn authentication_expiry_reauth_retries_after_transient_failure() {
     set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
 
     authentication_expiry_reaper(&server, deadline).await;
-    calls.recv().await.expect("first reauthentication call");
-    responses
-        .send(Err(AuthenticationRejection::new(
-            shitspeak_auth::AuthenticationRejectionKind::RetryLater,
-        )))
-        .expect("send transient failure");
 
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while client.is_reauthentication_in_progress() {
-            tokio::task::yield_now().await;
+    for retry in 0..3 {
+        let call = tokio::time::timeout(Duration::from_secs(1), calls.recv())
+            .await
+            .expect("reauthentication call")
+            .expect("reauthentication call channel");
+        assert_eq!(call.username, "original-user");
+        assert_eq!(call.password.as_deref(), Some("original-password"));
+        assert_eq!(
+            call.auth_session_id.as_deref(),
+            Some("previous-auth-session")
+        );
+
+        responses
+            .send(Err(AuthenticationRejection::new(
+                shitspeak_auth::AuthenticationRejectionKind::RetryLater,
+            )))
+            .expect("send transient failure");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.is_reauthentication_in_progress() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transient reauthentication completed");
+
+        if retry < 2 {
+            authentication_expiry_reaper(
+                &server,
+                deadline + chrono::Duration::seconds(i64::from(retry + 1)),
+            )
+            .await;
         }
-    })
-    .await
-    .expect("transient reauthentication completed");
+    }
+
     assert!(client.is_authenticated());
     assert!(
         server
@@ -1116,8 +1138,38 @@ async fn authentication_expiry_reauth_retries_after_transient_failure() {
             .is_some()
     );
 
-    authentication_expiry_reaper(&server, deadline + chrono::Duration::seconds(1)).await;
-    calls.recv().await.expect("retry reauthentication call");
+    authentication_expiry_reaper(&server, deadline + chrono::Duration::seconds(3)).await;
+    let call = tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication after repeated transient failures")
+        .expect("reauthentication call channel");
+    assert_eq!(call.username, "original-user");
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("previous-auth-session".to_owned()),
+            authenticated_until: Some(deadline + chrono::Duration::hours(1)),
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
+            user_id: Some(7),
+            fqdn: None,
+            display_name: Some("Original Name".to_owned()),
+            groups: vec!["original-group".to_owned()],
+            is_superuser: false,
+            invisible: false,
+            virtual_server_id: None,
+            language: Language::default(),
+            max_bandwidth: None,
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send successful reauthentication");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while client.is_reauthentication_in_progress() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reauthentication completed after transient failures");
 }
 
 #[tokio::test]
