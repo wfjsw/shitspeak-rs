@@ -2,12 +2,17 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::io::Write;
 use std::panic;
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock, mpsc as std_mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use config::{Config as ConfigCrate, Environment, File};
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use prost::Message;
+use prost_types::Timestamp;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::field::{Field, Visit};
@@ -1045,14 +1050,7 @@ fn prepare_loki_push_batch(
     max_body_bytes: usize,
     prepared: &mut Vec<LokiPreparedPush>,
 ) {
-    let payload = build_push_request(base_labels, entries.iter().cloned());
-    let body = match serde_json::to_vec(&payload) {
-        Ok(body) => body,
-        Err(error) => {
-            eprintln!("loki logging: dropping log batch because it could not be encoded: {error}");
-            return;
-        }
-    };
+    let body = encode_loki_protobuf(base_labels, &entries);
     if body.len() <= max_body_bytes {
         prepared.push(LokiPreparedPush::Ready { entries, body });
     } else if entries.len() == 1 {
@@ -1069,12 +1067,14 @@ fn prepare_loki_push_batch(
 }
 
 async fn send_loki_body(sender: &LokiSender, body: Vec<u8>, entry_count: usize) -> LokiPushResult {
+    let body = snappy_compress_block(&body);
     let payload_bytes = body.len();
 
     let mut request = sender
         .client
         .post(&sender.push_url)
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/x-protobuf")
+        .header("Content-Encoding", "snappy")
         .body(body);
 
     if let Some(tenant_id) = sender
@@ -1129,6 +1129,112 @@ async fn send_loki_body(sender: &LokiSender, body: Vec<u8>, entry_count: usize) 
             payload_bytes,
         )),
     }
+}
+
+fn gzip_body(body: &[u8]) -> Result<Vec<u8>, io::Error> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body)?;
+    encoder.finish()
+}
+
+fn encode_loki_protobuf(base_labels: &BTreeMap<String, String>, entries: &[LokiEntry]) -> Vec<u8> {
+    let mut streams = BTreeMap::<BTreeMap<String, String>, Vec<&LokiEntry>>::new();
+    for entry in entries {
+        let mut labels = base_labels.clone();
+        labels.insert("level".into(), entry.level.to_ascii_lowercase());
+        streams.entry(labels).or_default().push(entry);
+    }
+    LokiProtoPushRequest {
+        streams: streams
+            .into_iter()
+            .map(|(labels, entries)| LokiProtoStream {
+                labels: format_loki_labels(&labels),
+                entries: entries
+                    .into_iter()
+                    .map(|entry| LokiProtoEntry {
+                        timestamp: Some(parse_loki_timestamp(&entry.timestamp_ns)),
+                        line: entry.line.clone(),
+                        structured_metadata: entry
+                            .metadata
+                            .iter()
+                            .map(|(name, value)| LokiProtoLabel {
+                                name: name.clone(),
+                                value: value.clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                hash: 0,
+            })
+            .collect(),
+        format: String::new(),
+    }
+    .encode_to_vec()
+}
+
+fn format_loki_labels(labels: &BTreeMap<String, String>) -> String {
+    let body = labels
+        .iter()
+        .map(|(k, v)| format!("{k}=\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
+fn parse_loki_timestamp(value: &str) -> Timestamp {
+    let nanos = value.parse::<i128>().unwrap_or_default();
+    Timestamp {
+        seconds: (nanos / 1_000_000_000) as i64,
+        nanos: (nanos % 1_000_000_000) as i32,
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LokiProtoPushRequest {
+    #[prost(message, repeated, tag = "1")]
+    streams: Vec<LokiProtoStream>,
+    #[prost(string, tag = "2")]
+    format: String,
+}
+#[derive(Clone, PartialEq, Message)]
+struct LokiProtoStream {
+    #[prost(string, tag = "1")]
+    labels: String,
+    #[prost(message, repeated, tag = "2")]
+    entries: Vec<LokiProtoEntry>,
+    #[prost(uint64, tag = "3")]
+    hash: u64,
+}
+#[derive(Clone, PartialEq, Message)]
+struct LokiProtoEntry {
+    #[prost(message, optional, tag = "1")]
+    timestamp: Option<Timestamp>,
+    #[prost(string, tag = "2")]
+    line: String,
+    #[prost(message, repeated, tag = "3")]
+    structured_metadata: Vec<LokiProtoLabel>,
+}
+#[derive(Clone, PartialEq, Message)]
+struct LokiProtoLabel {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(string, tag = "2")]
+    value: String,
+}
+
+fn snappy_compress_block(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() + input.len().div_ceil(60) + 10);
+    let mut value = input.len() as u64;
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+    for chunk in input.chunks(60) {
+        out.push(((chunk.len() - 1) as u8) << 2);
+        out.extend_from_slice(chunk);
+    }
+    out
 }
 
 fn format_loki_transport_error(
