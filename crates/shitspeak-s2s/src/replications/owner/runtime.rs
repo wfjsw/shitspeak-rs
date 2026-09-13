@@ -1946,11 +1946,17 @@ mod tests {
             .iter()
             .filter_map(|frame| match frame {
                 CapturedFrame::OwnerUnicast { dst, body, .. }
-                    if *dst == 1 && matches!(body, OwnerBody::CatchupReq(_)) => Some(body),
+                    if *dst == 1 && matches!(body, OwnerBody::CatchupReq(_)) =>
+                {
+                    Some(body)
+                }
                 _ => None,
             })
             .collect();
-        assert!(followups.is_empty(), "empty relay response must not rearm follow-up");
+        assert!(
+            followups.is_empty(),
+            "empty relay response must not rearm follow-up"
+        );
     }
 
     #[tokio::test]

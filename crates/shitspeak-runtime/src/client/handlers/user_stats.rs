@@ -197,7 +197,7 @@ async fn build_user_stats_payload(
     let login_time = target.get_login_time();
     let onlinesecs = (now - login_time).num_seconds().max(0) as u32;
     let idlesecs = target.idle_duration().num_seconds().max(0) as u32;
-    let bandwidth = average_bandwidth_bits_per_second(stats.total_volume(), onlinesecs);
+    let bandwidth = average_bandwidth_bytes_per_second(stats.total_volume(), onlinesecs);
     let (from_client, from_server) = udp_network_stats(target);
 
     let version = details
@@ -282,13 +282,22 @@ fn packet_stats_to_proto(
     }
 }
 
-fn average_bandwidth_bits_per_second(total_bytes: u64, onlinesecs: u32) -> u32 {
+fn average_bandwidth_bytes_per_second(total_bytes: u64, onlinesecs: u32) -> u32 {
     let elapsed = u64::from(onlinesecs.max(1));
     total_bytes
-        .saturating_mul(8)
         .checked_div(elapsed)
         .unwrap_or(0)
         .min(u64::from(u32::MAX)) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::average_bandwidth_bytes_per_second;
+
+    #[test]
+    fn user_stats_bandwidth_is_bytes_per_second() {
+        assert_eq!(average_bandwidth_bytes_per_second(125_000, 10), 12_500);
+    }
 }
 
 /// Owner-side responder for the cross-node UserStats RPC.
