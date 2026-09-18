@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -189,7 +189,7 @@ async fn build_user_stats_payload(
     local: bool,
     expose_certificate_identity: bool,
 ) -> UserStats {
-    let stats = *target.write_stats().await;
+    let mut stats = target.write_stats().await;
     let local_state = target.read_local_state();
     let local_state_ref = local_state.as_ref();
 
@@ -197,7 +197,7 @@ async fn build_user_stats_payload(
     let login_time = target.get_login_time();
     let onlinesecs = (now - login_time).num_seconds().max(0) as u32;
     let idlesecs = target.idle_duration().num_seconds().max(0) as u32;
-    let bandwidth = average_bandwidth_bytes_per_second(stats.total_volume(), onlinesecs);
+    let bandwidth = stats.bandwidth_bytes_per_second(Instant::now());
     let (from_client, from_server) = udp_network_stats(target);
 
     let version = details
@@ -279,24 +279,6 @@ fn packet_stats_to_proto(
         late: Some(late),
         lost: Some(lost),
         resync: Some(resync),
-    }
-}
-
-fn average_bandwidth_bytes_per_second(total_bytes: u64, onlinesecs: u32) -> u32 {
-    let elapsed = u64::from(onlinesecs.max(1));
-    total_bytes
-        .checked_div(elapsed)
-        .unwrap_or(0)
-        .min(u64::from(u32::MAX)) as u32
-}
-
-#[cfg(test)]
-mod tests {
-    use super::average_bandwidth_bytes_per_second;
-
-    #[test]
-    fn user_stats_bandwidth_is_bytes_per_second() {
-        assert_eq!(average_bandwidth_bytes_per_second(125_000, 10), 12_500);
     }
 }
 
