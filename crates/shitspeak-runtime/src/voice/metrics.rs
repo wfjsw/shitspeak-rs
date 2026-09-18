@@ -523,6 +523,9 @@ const VOICE_BATCH_BYTES_BUCKETS: [(&str, u64); 8] = [
     ("gt_65536", u64::MAX),
 ];
 
+static VOICE_BANDWIDTH_DROPS: AtomicU64 = AtomicU64::new(0);
+static VOICE_BANDWIDTH_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
+static VOICE_BANDWIDTH_DISCONNECTS: AtomicU64 = AtomicU64::new(0);
 static INGRESS_PACKETS: [AtomicU64; INGRESS_TRANSPORT_COUNT] = [const { AtomicU64::new(0) }; 2];
 static INGRESS_BYTES: [AtomicU64; INGRESS_TRANSPORT_COUNT] = [const { AtomicU64::new(0) }; 2];
 static NATIVE_INGRESS_EVENTS: [[AtomicU64; NATIVE_INGRESS_EVENT_COUNT]; INGRESS_TRANSPORT_COUNT] =
@@ -867,6 +870,14 @@ fn observe_bucket(buckets: &[AtomicU64], definitions: &[(&str, u64)], value: u64
     {
         increment(&buckets[index], 1);
     }
+}
+
+pub(crate) fn record_voice_bandwidth_drop() {
+    increment(&VOICE_BANDWIDTH_DROPS, 1);
+}
+pub(crate) fn record_voice_bandwidth_violation() {
+    increment(&VOICE_BANDWIDTH_VIOLATIONS, 1);
+    increment(&VOICE_BANDWIDTH_DISCONNECTS, 1);
 }
 
 pub(crate) fn record_ingress(transport: VoiceIngressTransport, bytes: usize) {
@@ -1271,6 +1282,27 @@ fn dispatch_tuning_source_label(value: u64) -> &'static str {
 
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
     let mut samples = Vec::new();
+
+    for (name, value) in [
+        (
+            "shitspeak_voice_bandwidth_drops_total",
+            &VOICE_BANDWIDTH_DROPS,
+        ),
+        (
+            "shitspeak_voice_bandwidth_violations_total",
+            &VOICE_BANDWIDTH_VIOLATIONS,
+        ),
+        (
+            "shitspeak_voice_bandwidth_disconnects_total",
+            &VOICE_BANDWIDTH_DISCONNECTS,
+        ),
+    ] {
+        samples.push(PrometheusSample::new(
+            name,
+            Vec::new(),
+            value.load(Ordering::Relaxed) as f64,
+        ));
+    }
 
     for transport in [VoiceIngressTransport::Udp, VoiceIngressTransport::TcpTunnel] {
         let index = transport_index(transport);

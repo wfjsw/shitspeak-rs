@@ -457,6 +457,7 @@ async fn configure_authenticated_client_inner(
     }
     client.set_language(result.language);
     client.set_max_bandwidth(result.max_bandwidth);
+    client.set_voice_bandwidth_limit(result.max_bandwidth.unwrap_or(server.get_max_bandwidth()));
     client.set_protocol_version(Some(
         shitspeak_runtime::protocol_version::ProtocolVersion::new(1, 5, 0),
     ));

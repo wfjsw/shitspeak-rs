@@ -289,6 +289,7 @@ pub async fn handle_authenticate(
     // ── Store identity on client ─────────────────────────────────────────
     {
         sender.set_max_bandwidth(result.max_bandwidth);
+        sender.set_voice_bandwidth_limit(result.max_bandwidth.unwrap_or(auth_config.max_bandwidth));
         let mut gs = sender.write_global_state_direct();
         gs.set_user_id(result.user_id);
         gs.set_fqdn(result.fqdn);

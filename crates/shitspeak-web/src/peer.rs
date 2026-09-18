@@ -407,7 +407,13 @@ fn spawn_inbound_audio_task(
             if !client_is_current(&server, &client).await {
                 break;
             }
-            client.push_voice_routing(audio);
+            if matches!(
+                client.push_voice_routing(audio),
+                shitspeak_runtime::client::VoiceIngressAdmission::ProtocolViolation
+            ) {
+                let _ = client.force_disconnect().await;
+                break;
+            }
         }
     });
 }

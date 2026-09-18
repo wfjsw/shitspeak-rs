@@ -40,8 +40,14 @@ pub(super) async fn handle_udp_tunnel(
                 ),
             );
             tracing::trace!(session = u32::from(sender.get_session_id()), target = %audio.target, frame = audio.frame_number, len = audio.audio_payload.len(), "UDPTunnel: routing voice");
-            sender.push_voice_routing(audio);
-            Ok(())
+            match sender.push_voice_routing(audio) {
+                crate::client::voice_ingress::VoiceIngressAdmission::ProtocolViolation => {
+                    Err(MessageHandlerError::protocol_violation(
+                        "protocol violation: excessive incoming voice bandwidth",
+                    ))
+                }
+                _ => Ok(()),
+            }
         }
         Err(e) => {
             if matches!(&e, DecodeError::NotVoice)

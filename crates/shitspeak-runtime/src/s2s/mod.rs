@@ -647,7 +647,12 @@ fn available_memory_bytes() -> Option<u64> {
 
 #[cfg(not(windows))]
 fn available_memory_bytes() -> Option<u64> {
-    parse_mem_available_from_proc().or_else(parse_cgroup_memory_available)
+    select_available_memory(parse_cgroup_memory_available(), parse_mem_available_from_proc())
+}
+
+#[cfg(not(windows))]
+fn select_available_memory(cgroup: Option<u64>, proc_meminfo: Option<u64>) -> Option<u64> {
+    cgroup.or(proc_meminfo)
 }
 
 #[cfg(not(windows))]
@@ -4805,6 +4810,14 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn cgroup_memory_limit_is_preferred_over_host_meminfo() {
+        assert_eq!(
+            select_available_memory(Some(64 * 1024 * 1024), Some(8 * 1024 * 1024 * 1024)),
+            Some(64 * 1024 * 1024)
+        );
+    }
     use shitspeak_state::{ChannelRepoTuning, ChannelRepository, ChannelRootConfig};
 
     #[test]

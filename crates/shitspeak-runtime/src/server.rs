@@ -1355,7 +1355,9 @@ impl Server {
                             decoded_audio.format,
                             decoded_audio.audio_payload.len()
                         );
-                        client.push_voice_routing(decoded_audio);
+                        if matches!(client.push_voice_routing(decoded_audio), crate::client::voice_ingress::VoiceIngressAdmission::ProtocolViolation) {
+                            client.request_disconnect();
+                        }
                     }
                     Err(e) => {
                         tracing::trace!("UDP packet decode failed from {}: {e}", src_addr);
@@ -1871,6 +1873,7 @@ impl Server {
 
         client.set_language(language);
         client.set_max_bandwidth(max_bandwidth);
+        client.set_voice_bandwidth_limit(max_bandwidth.unwrap_or(self.get_max_bandwidth()));
         let root_permissions = crate::client::acl::compute_permissions_for_client_with_identity(
             self,
             &client,
@@ -2911,6 +2914,9 @@ impl Server {
             let max_bandwidth = max_bandwidth.filter(|_| client.max_bandwidth_override().is_none());
             if max_bandwidth.is_none() && max_users.is_none() {
                 continue;
+            }
+            if let Some(max_bandwidth) = max_bandwidth {
+                client.set_voice_bandwidth_limit(max_bandwidth);
             }
             self.send_server_config_update(&client, max_bandwidth, max_users)
                 .await;

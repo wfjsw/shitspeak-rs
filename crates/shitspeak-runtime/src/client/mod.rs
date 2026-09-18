@@ -12,6 +12,7 @@ pub mod state_log;
 pub mod user_info;
 pub mod user_version;
 pub mod visibility;
+pub(crate) mod voice_ingress;
 pub mod voice_target;
 
 pub use client::{Client, ClientInstanceId, ClientTransportKind};
@@ -22,3 +23,5 @@ pub(crate) use client::{
 };
 pub(crate) use client_instance_id::next_client_instance_id;
 pub use handlers::AsyncMessageHandlerExt;
+
+pub use voice_ingress::VoiceIngressAdmission;

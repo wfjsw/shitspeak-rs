@@ -1219,6 +1219,7 @@ pub struct Config {
     // ── Mumble standard server config ──────────────────────────────────────
     #[serde(default)]
     pub welcome_text: Option<String>,
+    /// Maximum incoming voice bandwidth per client, in bits per second.
     #[serde(default = "default_max_bandwidth")]
     pub max_bandwidth: u32,
     #[serde(default = "default_true")]

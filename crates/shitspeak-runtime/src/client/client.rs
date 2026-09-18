@@ -36,6 +36,7 @@ use crate::{
         global_state_guard::GlobalStateWriteGuard,
         next_client_instance_id,
         user_info::UserInfoExtended,
+        voice_ingress::{VoiceIngressAdmission, VoiceIngressLimiter},
         voice_target::VoiceTarget,
     },
     client_repository::ClientRepository,
@@ -530,6 +531,7 @@ pub struct Client {
     acl_permission_cache: scc::HashMap<u32, ClientCachedAclPermissions>,
     crypt_state: ParkingMutex<Option<CryptState>>,
     voice_targets: ParkingMutex<HashMap<u32, VoiceTarget>>,
+    voice_ingress_limiter: VoiceIngressLimiter,
     voice_routing_tx: Option<mpsc::Sender<VoiceRoutingPayload>>,
     voice_routing_rx: ParkingMutex<Option<mpsc::Receiver<VoiceRoutingPayload>>>,
     /// Per-user outgoing TCP voice tunnel queue. The routing task pushes raw
@@ -737,6 +739,7 @@ impl Client {
             acl_permission_cache: scc::HashMap::new(),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
+            voice_ingress_limiter: VoiceIngressLimiter::default(),
             voice_routing_tx: Some(voice_routing_tx),
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
             voice_tcp_tx: Some(voice_tcp_tx),
@@ -904,6 +907,7 @@ impl Client {
             acl_permission_cache: scc::HashMap::new(),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
+            voice_ingress_limiter: VoiceIngressLimiter::default(),
             voice_routing_tx: Some(voice_routing_tx),
             voice_routing_rx: ParkingMutex::new(Some(voice_routing_rx)),
             voice_tcp_tx: Some(voice_tcp_tx),
@@ -988,6 +992,7 @@ impl Client {
             acl_permission_cache: scc::HashMap::new(),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
+            voice_ingress_limiter: VoiceIngressLimiter::default(),
             voice_routing_tx: None,
             voice_routing_rx: ParkingMutex::new(None),
             voice_tcp_tx: None,
@@ -2011,7 +2016,24 @@ impl Client {
         self.voice_targets.lock().get(&id).cloned()
     }
 
-    pub fn push_voice_routing(&self, decoded_audio: crate::voice::codec::Audio) -> bool {
+    pub fn push_voice_routing(
+        &self,
+        decoded_audio: crate::voice::codec::Audio,
+    ) -> VoiceIngressAdmission {
+        match self
+            .voice_ingress_limiter
+            .admit(decoded_audio.audio_payload.len())
+        {
+            VoiceIngressAdmission::Accepted => {}
+            VoiceIngressAdmission::Dropped => {
+                crate::voice::metrics::record_voice_bandwidth_drop();
+                return VoiceIngressAdmission::Dropped;
+            }
+            VoiceIngressAdmission::ProtocolViolation => {
+                crate::voice::metrics::record_voice_bandwidth_violation();
+                return VoiceIngressAdmission::ProtocolViolation;
+            }
+        }
         let payload = VoiceRoutingPayload::new(decoded_audio);
         let Some(voice_routing_tx) = self.voice_routing_tx.as_ref() else {
             crate::voice::metrics::record_queue_enqueue(
@@ -2025,7 +2047,7 @@ impl Client {
                 session = u32::from(self.get_session_id()),
                 "voice routing queue unavailable, dropping packet"
             );
-            return false;
+            return VoiceIngressAdmission::Dropped;
         };
         let capacity = voice_routing_tx.max_capacity();
         let depth = capacity.saturating_sub(voice_routing_tx.capacity());
@@ -2040,7 +2062,7 @@ impl Client {
                     crate::voice::metrics::VoiceQueueKind::Routing,
                     crate::voice::metrics::VoiceQueueEnqueueResult::Accepted,
                 );
-                true
+                VoiceIngressAdmission::Accepted
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 crate::voice::metrics::record_queue_enqueue(
@@ -2054,7 +2076,7 @@ impl Client {
                     session = u32::from(self.get_session_id()),
                     "voice routing queue full, dropping packet"
                 );
-                false
+                VoiceIngressAdmission::Dropped
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 crate::voice::metrics::record_queue_enqueue(
@@ -2068,7 +2090,7 @@ impl Client {
                     session = u32::from(self.get_session_id()),
                     "voice routing queue closed, dropping packet"
                 );
-                false
+                VoiceIngressAdmission::Dropped
             }
         }
     }
@@ -2429,6 +2451,13 @@ impl Client {
         if let Some(ref mut state) = *self.local_state.write() {
             state.set_max_bandwidth(max_bandwidth);
         }
+        if let Some(max_bandwidth) = max_bandwidth {
+            self.voice_ingress_limiter.update_limit(max_bandwidth);
+        }
+    }
+
+    pub fn set_voice_bandwidth_limit(&self, max_bandwidth: u32) {
+        self.voice_ingress_limiter.update_limit(max_bandwidth);
     }
 
     /// Record the negotiated client protocol version. Called once during

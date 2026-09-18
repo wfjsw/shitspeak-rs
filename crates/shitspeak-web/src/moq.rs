@@ -803,7 +803,13 @@ impl MoqSessionRuntime {
         if !client_is_current(server, client).await {
             return Err("MoQ client is no longer connected".to_string());
         }
-        client.push_voice_routing(audio);
+        if matches!(
+            client.push_voice_routing(audio),
+            shitspeak_runtime::client::VoiceIngressAdmission::ProtocolViolation
+        ) {
+            let _ = client.force_disconnect().await;
+            return Err("protocol violation: excessive incoming voice bandwidth".to_string());
+        }
         Ok(())
     }
 
