@@ -148,6 +148,7 @@ static ORDERED_INBOUND_GAP_STUCK: LazyLock<Mutex<BTreeMap<u32, u64>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 static ORDERED_INBOUND_GAP_HEALED: LazyLock<Mutex<BTreeMap<u32, u64>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static CONTROL_ROUTE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn record_no_route_drop(kind: NoRouteKind, dst: NodeIdentifier) {
     *NO_ROUTE_DROPS
@@ -246,6 +247,50 @@ pub(crate) fn record_inbound_gap_healed(lane: u32) {
         .unwrap()
         .entry(lane)
         .or_insert(0) += 1;
+}
+
+/// An end-to-end control frame found no admitted edge in the
+/// low-latency metric's tables and was routed through a reliable-metric
+/// fallback instead of being dropped.
+pub(crate) fn record_control_route_fallback() {
+    CONTROL_ROUTE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Bounded lifecycle events of the next-hop failure backoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NextHopBackoffEvent {
+    /// Consecutive send failures to an admitted first hop crossed the
+    /// threshold: the hop is skipped in favor of alternates until the
+    /// backoff expires.
+    Activated,
+    /// The backoff expired; the direct hop is retried.
+    Expired,
+}
+
+impl NextHopBackoffEvent {
+    const ALL: [Self; 2] = [Self::Activated, Self::Expired];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Activated => 0,
+            Self::Expired => 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Activated => "activated",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+const NEXT_HOP_BACKOFF_EVENT_COUNT: usize = 2;
+static NEXT_HOP_BACKOFF_EVENTS: [AtomicU64; NEXT_HOP_BACKOFF_EVENT_COUNT] =
+    [const { AtomicU64::new(0) }; NEXT_HOP_BACKOFF_EVENT_COUNT];
+
+pub(crate) fn record_next_hop_backoff(event: NextHopBackoffEvent) {
+    NEXT_HOP_BACKOFF_EVENTS[event.index()].fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
@@ -356,6 +401,24 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             ));
         }
     }
+    let control_fallbacks = CONTROL_ROUTE_FALLBACKS.load(Ordering::Relaxed);
+    if control_fallbacks > 0 {
+        samples.push(PrometheusSample::new(
+            "shitspeak_s2s_overlay_control_route_fallback_total",
+            Vec::new(),
+            control_fallbacks as f64,
+        ));
+    }
+    for event in NextHopBackoffEvent::ALL {
+        let events = NEXT_HOP_BACKOFF_EVENTS[event.index()].load(Ordering::Relaxed);
+        if events > 0 {
+            samples.push(PrometheusSample::new(
+                "shitspeak_s2s_overlay_next_hop_backoff_events_total",
+                vec![("reason".to_owned(), event.label().to_owned())],
+                events as f64,
+            ));
+        }
+    }
     samples
 }
 
@@ -381,6 +444,7 @@ mod tests {
         record_pending_starve_purged(12);
         record_inbound_gap_stuck(13);
         record_inbound_gap_healed(14);
+        record_next_hop_backoff(NextHopBackoffEvent::Activated);
 
         let samples = prometheus_samples();
         assert!(samples.iter().any(|sample| {
@@ -441,12 +505,18 @@ mod tests {
                 && sample.labels() == [("lane".to_owned(), "14".to_owned())]
                 && sample.value() >= 1.0
         }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_overlay_next_hop_backoff_events_total"
+                && sample.labels() == [("reason".to_owned(), "activated".to_owned())]
+                && sample.value() >= 1.0
+        }));
 
         // Bounded labels only.
         for sample in samples.iter().filter(|sample| {
             sample.name().contains("overlay_no_route")
                 || sample.name().contains("overlay_reliable_originate")
                 || sample.name().contains("overlay_ordered_")
+                || sample.name().contains("overlay_next_hop_backoff")
         }) {
             assert!(
                 sample.labels().iter().all(|(label, _)| {

@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -66,6 +67,170 @@ static RELIABLE_ORIGINATE_FAILURE_LOGS: AtomicU64 = AtomicU64::new(0);
 fn sampled_drop_count(counter: &AtomicU64) -> Option<u64> {
     let count = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
     count.is_power_of_two().then_some(count)
+}
+
+// ── Next-hop failure backoff ─────────────────────────────────────────────────
+//
+// Routing admission (LSDB link state, loss floors) and transport health
+// (per-transport exclusions, queue state) are decided independently, so a
+// route can be admitted through a first hop whose transports are all dead:
+// every physical send to that hop fails while the route keeps eclipsing the
+// multi-hop alternate. Consecutive NoSuitableTransport/UnknownNode send
+// failures to an admitted first hop back the hop off for a bounded window —
+// selects then prefer a loop-free alternate, exactly like
+// `avoid_first_hop` — and the direct hop is retried once the window
+// expires. Best-effort (voice) traffic is excluded: its deadline queue
+// already reroutes under pressure. Backpressure is excluded: it is
+// transient and retried.
+//
+// All state derives from observed send failures — nothing is keyed to a
+// peer or link identity.
+
+type NextHopBackoffKey = (NodeIdentifier, RoutingMetric, ServiceLevel);
+
+#[derive(Debug, Default)]
+struct NextHopBackoff {
+    consecutive: u32,
+    until: Option<Instant>,
+}
+
+static NEXT_HOP_BACKOFF: LazyLock<Mutex<HashMap<NextHopBackoffKey, NextHopBackoff>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Fast-path gate: `true` only while at least one hop is (or was) tracked,
+/// so the healthy routing path pays one relaxed load per select.
+static NEXT_HOP_BACKOFF_TRACKED: AtomicBool = AtomicBool::new(false);
+static NEXT_HOP_BACKOFF_MS: AtomicU64 = AtomicU64::new(5_000);
+static NEXT_HOP_BACKOFF_FAILURES: AtomicU32 = AtomicU32::new(4);
+
+/// Operator tuning from `OverlayConfig` (route_next_hop_backoff_ms /
+/// route_next_hop_backoff_failures).
+pub(crate) fn configure_next_hop_backoff(backoff_ms: u64, failures: u32) {
+    NEXT_HOP_BACKOFF_MS.store(backoff_ms, Ordering::Relaxed);
+    NEXT_HOP_BACKOFF_FAILURES.store(failures.max(1), Ordering::Relaxed);
+}
+
+fn record_next_hop_send_failure(
+    next_hop: NodeIdentifier,
+    metric: RoutingMetric,
+    level: ServiceLevel,
+    error: &SendError,
+) {
+    if level == ServiceLevel::BestEffort {
+        return;
+    }
+    match error {
+        SendError::NoSuitableTransport { .. } | SendError::UnknownNode { .. } => {}
+        _ => return,
+    }
+    let backoff_ms = NEXT_HOP_BACKOFF_MS.load(Ordering::Relaxed);
+    if backoff_ms == 0 {
+        return;
+    }
+    let now = Instant::now();
+    let mut backed_off = NEXT_HOP_BACKOFF.lock().unwrap();
+    let entry = backed_off.entry((next_hop, metric, level)).or_default();
+    NEXT_HOP_BACKOFF_TRACKED.store(true, Ordering::Relaxed);
+    if entry.until.is_some_and(|until| until > now) {
+        // Already in an active backoff window: physical sends to the
+        // backed-off hop are (should be) flowing via alternates, so a
+        // failure here is a different path. Do not extend the window.
+        return;
+    }
+    entry.consecutive += 1;
+    let failures = NEXT_HOP_BACKOFF_FAILURES.load(Ordering::Relaxed);
+    if entry.consecutive >= failures {
+        entry.until = Some(now + Duration::from_millis(backoff_ms));
+        entry.consecutive = 0;
+        drop(backed_off);
+        ordering_metrics::record_next_hop_backoff(
+            ordering_metrics::NextHopBackoffEvent::Activated,
+        );
+        debug!(
+            %next_hop,
+            ?metric,
+            ?level,
+            backoff_ms,
+            failures,
+            "backing off failed first hop; preferring alternates"
+        );
+    }
+}
+
+/// Whether `next_hop` is inside an active failure-backoff window for
+/// `(metric, level)`. Expiry is detected here (the direct hop is retried
+/// once the window has passed).
+fn next_hop_backed_off(
+    next_hop: NodeIdentifier,
+    metric: RoutingMetric,
+    level: ServiceLevel,
+) -> bool {
+    if !NEXT_HOP_BACKOFF_TRACKED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let now = Instant::now();
+    let mut backed_off = NEXT_HOP_BACKOFF.lock().unwrap();
+    match backed_off.get_mut(&(next_hop, metric, level)) {
+        Some(entry) => match entry.until {
+            Some(until) if until > now => true,
+            Some(_) => {
+                entry.until = None;
+                drop(backed_off);
+                ordering_metrics::record_next_hop_backoff(
+                    ordering_metrics::NextHopBackoffEvent::Expired,
+                );
+                debug!(
+                    %next_hop,
+                    ?metric,
+                    ?level,
+                    "next-hop failure backoff expired; retrying the direct hop"
+                );
+                false
+            }
+            None => false,
+        },
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod next_hop_backoff_test_support {
+    use super::*;
+
+    /// Serializes the backoff tests: the statics (knobs + map) are
+    /// process-wide, so two backoff tests racing an install would see
+    /// each other's failure thresholds. Unique hop ids keep the map keys
+    /// apart; this guard keeps the knobs apart.
+    static BACKOFF_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    pub(crate) fn backoff_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        BACKOFF_TEST_GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Replace the process-wide backoff state for one test. Must be
+    /// called while holding the backoff test guard.
+    pub(crate) fn install_next_hop_backoff_for_test(backoff_ms: u64, failures: u32) {
+        NEXT_HOP_BACKOFF_MS.store(backoff_ms, Ordering::Relaxed);
+        NEXT_HOP_BACKOFF_FAILURES.store(failures, Ordering::Relaxed);
+        NEXT_HOP_BACKOFF.lock().unwrap().clear();
+        NEXT_HOP_BACKOFF_TRACKED.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_next_hop_failure_for_test(
+        next_hop: NodeIdentifier,
+        metric: RoutingMetric,
+        level: ServiceLevel,
+        error: &SendError,
+    ) {
+        record_next_hop_send_failure(next_hop, metric, level, error);
+    }
+
+    pub(crate) fn next_hop_backed_off_for_test(
+        next_hop: NodeIdentifier,
+        metric: RoutingMetric,
+        level: ServiceLevel,
+    ) -> bool {
+        next_hop_backed_off(next_hop, metric, level)
+    }
 }
 
 fn unix_time_ms() -> u64 {
@@ -1453,24 +1618,63 @@ async fn send_control_to(
             return Ok(());
         }
         ForwardNextHop::DropNoRoute => {
-            // An end-to-end control frame (ACK/NACK/repair) was silently
-            // dropped because no route exists. Previously log-sampled only
-            // and never exported.
-            ordering_metrics::record_no_route_drop(NoRouteKind::Control, target);
-            if let Some(observed_drops) = sampled_drop_count(&CONTROL_NO_ROUTE_DROPS) {
-                debug!(
-                    self_id = %self_id,
-                    target = %target,
-                    origin = %NodeIdentifier::try_from(control.origin).unwrap_or(0),
-                    final_dst = %NodeIdentifier::try_from(control.final_dst).unwrap_or(0),
-                    requester = %NodeIdentifier::try_from(control.requester).unwrap_or(0),
-                    lane = control.lane_id,
-                    path_trace = ?control.path_trace,
-                    observed_drops,
-                    "dropping overlay control because no route exists"
-                );
+            // (E1) Control-plane metric fallback. Control (ACK/NACK/
+            // repair) is correctness-critical, and the low-latency
+            // metric's edge admission is independent of the reliable
+            // metric's: RLLCost keys on the best viable UDP transport
+            // or the aggregate link loss, ReliableCost keys on the TCP
+            // metric. A directionally degraded link can therefore leave
+            // the control plane without any admitted edge while the
+            // data plane still routes — silently dropping every ACK
+            // toward that origin (the 2026-09-19 incident). Fall back
+            // to the reliable metric's tables before concluding no
+            // route.
+            match select_forward_next_hop_for_send(
+                &tables,
+                self_id,
+                target,
+                ServiceLevel::Reliable,
+                RoutingMetric::ReliableCost,
+                &path_trace_set,
+                false,
+                Some(transport),
+                message_class,
+                TransportSendOptions::default(),
+                None,
+            )? {
+                ForwardNextHop::Send { next_hop } => {
+                    ordering_metrics::record_control_route_fallback();
+                    debug!(
+                        self_id = %self_id,
+                        target = %target,
+                        origin = %NodeIdentifier::try_from(control.origin).unwrap_or(0),
+                        lane = control.lane_id,
+                        "overlay control fell back to the reliable metric route"
+                    );
+                    next_hop
+                }
+                _ => {
+                    // No reliable edge either: the end-to-end control
+                    // frame was silently dropped because no route
+                    // exists. Previously log-sampled only and never
+                    // exported.
+                    ordering_metrics::record_no_route_drop(NoRouteKind::Control, target);
+                    if let Some(observed_drops) = sampled_drop_count(&CONTROL_NO_ROUTE_DROPS) {
+                        debug!(
+                            self_id = %self_id,
+                            target = %target,
+                            origin = %NodeIdentifier::try_from(control.origin).unwrap_or(0),
+                            final_dst = %NodeIdentifier::try_from(control.final_dst).unwrap_or(0),
+                            requester = %NodeIdentifier::try_from(control.requester).unwrap_or(0),
+                            lane = control.lane_id,
+                            path_trace = ?control.path_trace,
+                            observed_drops,
+                            "dropping overlay control because no route exists"
+                        );
+                    }
+                    return Ok(());
+                }
             }
-            return Ok(());
         }
         ForwardNextHop::DropLoop { next_hop } => {
             debug!(
@@ -2177,6 +2381,7 @@ async fn forward_pb_as(
                 trace!(%next_hop, ?level, "forwarded");
             }
             Err(e) => {
+                record_next_hop_send_failure(next_hop, routing_metric, level, &e);
                 if is_originator && first_err.is_none() {
                     first_err = Some(OverlayError::Send(e));
                 } else {
@@ -3597,6 +3802,27 @@ fn select_forward_next_hop_for_send(
         });
     }
 
+    // (E2) Failure backoff: an admitted first hop with consecutive
+    // NoSuitableTransport/UnknownNode send failures is skipped in favor
+    // of a loop-free alternate. Unlike `avoid_first_hop`, a backed-off
+    // hop with no alternate keeps carrying the route (a
+    // route-admitted-but-transport-dead edge is still better than
+    // dropping); the direct hop is retried once the backoff expires.
+    if next_hop_backed_off(entry.next_hop, routing_metric, level) {
+        if let Some(alternate) = tables.lookup_avoiding_first_hop_with_metric(
+            self_id,
+            dst,
+            level,
+            routing_metric,
+            path_trace_set,
+            entry.next_hop,
+        ) {
+            return Ok(ForwardNextHop::Send {
+                next_hop: alternate.next_hop,
+            });
+        }
+    }
+
     if Some(entry.next_hop) == avoid_first_hop {
         if let Some(alternate) = tables.lookup_avoiding_first_hop_with_metric(
             self_id,
@@ -4664,6 +4890,330 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, OverlayError::NoRoute { dst: 4, .. }));
+    }
+
+    fn tables_for_backoff_test() -> RoutingTables {
+        // Distinct node ids (dst/hop 9, alternate 8) so the process-wide
+        // failure-backoff statics cannot be polluted by parallel tests;
+        // every other backoff test uses its own unique hop id.
+        let mut tables = RoutingTables::empty();
+        tables.insert_table_with_adjacency(
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            HashMap::from([(
+                9,
+                RouteEntry {
+                    next_hop: 9,
+                    cost: 1,
+                    latency_us: 1,
+                },
+            )]),
+            HashMap::from([
+                (1, vec![(9, edge(1)), (8, edge(5))]),
+                (8, vec![(9, edge(1))]),
+            ]),
+        );
+        tables
+    }
+
+    #[test]
+    fn consecutive_no_suitable_transport_backs_off_to_alternate() {
+        let _guard = next_hop_backoff_test_support::backoff_test_guard();
+        next_hop_backoff_test_support::install_next_hop_backoff_for_test(10_000, 3);
+        let tables = tables_for_backoff_test();
+        let path_trace = HashSet::new();
+
+        let failure = SendError::NoSuitableTransport { node: 9 };
+        next_hop_backoff_test_support::record_next_hop_failure_for_test(
+            9,
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            &failure,
+        );
+        next_hop_backoff_test_support::record_next_hop_failure_for_test(
+            9,
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            &failure,
+        );
+
+        // Below the threshold the direct hop still carries the route.
+        let selected = select_forward_next_hop(
+            &tables,
+            1,
+            9,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &path_trace,
+            true,
+        )
+        .unwrap();
+        assert_eq!(selected, ForwardNextHop::Send { next_hop: 9 });
+
+        next_hop_backoff_test_support::record_next_hop_failure_for_test(
+            9,
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            &failure,
+        );
+
+        // At the threshold the failed hop is skipped in favor of the
+        // loop-free alternate (1 -> 8 -> 9).
+        let selected = select_forward_next_hop(
+            &tables,
+            1,
+            9,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &path_trace,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            ForwardNextHop::Send { next_hop: 8 },
+            "a backed-off first hop must not eclipse the multi-hop alternate"
+        );
+    }
+
+    #[test]
+    fn backed_off_hop_without_alternate_keeps_carrying_route() {
+        let _guard = next_hop_backoff_test_support::backoff_test_guard();
+        next_hop_backoff_test_support::install_next_hop_backoff_for_test(10_000, 1);
+        // A route table without adjacency: avoiding the failed hop finds
+        // no alternate at all. Unique hop id (39) for parallel isolation.
+        let mut tables = RoutingTables::empty();
+        tables.insert_table(
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            HashMap::from([(
+                39,
+                RouteEntry {
+                    next_hop: 39,
+                    cost: 1,
+                    latency_us: 1,
+                },
+            )]),
+        );
+        next_hop_backoff_test_support::record_next_hop_failure_for_test(
+            39,
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            &SendError::UnknownNode { node: 39 },
+        );
+
+        let selected = select_forward_next_hop(
+            &tables,
+            1,
+            39,
+            ServiceLevel::Reliable,
+            RoutingMetric::ReliableCost,
+            &HashSet::new(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            ForwardNextHop::Send { next_hop: 39 },
+            "unlike avoid_first_hop, a backed-off hop with no alternate keeps the route"
+        );
+    }
+
+    #[tokio::test]
+    async fn backoff_expires_and_retries_direct() {
+        let _guard = next_hop_backoff_test_support::backoff_test_guard();
+        next_hop_backoff_test_support::install_next_hop_backoff_for_test(15, 2);
+        let failure = SendError::NoSuitableTransport { node: 19 };
+        next_hop_backoff_test_support::record_next_hop_failure_for_test(
+            19,
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            &failure,
+        );
+        next_hop_backoff_test_support::record_next_hop_failure_for_test(
+            19,
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            &failure,
+        );
+        assert!(next_hop_backoff_test_support::next_hop_backed_off_for_test(
+            19,
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !next_hop_backoff_test_support::next_hop_backed_off_for_test(
+                19,
+                RoutingMetric::ReliableCost,
+                ServiceLevel::Reliable,
+            ),
+            "the backoff must expire and retry the direct hop"
+        );
+    }
+
+    #[test]
+    fn backpressure_and_best_effort_do_not_back_off() {
+        let _guard = next_hop_backoff_test_support::backoff_test_guard();
+        next_hop_backoff_test_support::install_next_hop_backoff_for_test(10_000, 1);
+        for _ in 0..8 {
+            next_hop_backoff_test_support::record_next_hop_failure_for_test(
+                29,
+                RoutingMetric::ReliableCost,
+                ServiceLevel::Reliable,
+                &SendError::Backpressure {
+                    node: 29,
+                    transport: TransportKind::Tcp,
+                },
+            );
+        }
+        for _ in 0..8 {
+            next_hop_backoff_test_support::record_next_hop_failure_for_test(
+                29,
+                RoutingMetric::ReliableCost,
+                ServiceLevel::BestEffort,
+                &SendError::NoSuitableTransport { node: 29 },
+            );
+        }
+        assert!(
+            !next_hop_backoff_test_support::next_hop_backed_off_for_test(
+                29,
+                RoutingMetric::ReliableCost,
+                ServiceLevel::Reliable,
+            ),
+            "transient backpressure and best-effort traffic must not back a hop off"
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_send_failures_back_off_the_failed_hop() {
+        let _guard = next_hop_backoff_test_support::backoff_test_guard();
+        // End-to-end through the data forward path: a route admitted
+        // through a hop with no transport fails every physical send;
+        // the consecutive UnknownNode failures back the hop off.
+        next_hop_backoff_test_support::install_next_hop_backoff_for_test(10_000, 4);
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 5, &[TransportKind::Tcp]);
+        let mut tables = RoutingTables::empty();
+        tables.insert_table(
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            HashMap::from([(
+                6,
+                RouteEntry {
+                    next_hop: 6,
+                    cost: 1,
+                    latency_us: 1,
+                },
+            )]),
+        );
+        let routing = new_handle();
+        routing.store(Arc::new(tables));
+
+        for _ in 0..4 {
+            let mut data = overlay_data_for_dsts(&[6]);
+            data.service_level = level_to_wire(ServiceLevel::Reliable);
+            data.route_metric = route_metric_to_wire(RoutingMetric::ReliableCost);
+            let err = forward_pb_as(
+                &transport,
+                &routing,
+                1,
+                data,
+                MessageClass::Regular,
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect_err("sends to an unknown hop must still be reported");
+            assert!(
+                matches!(err, OverlayError::Send(SendError::UnknownNode { node: 6 })),
+                "unexpected error: {err:?}"
+            );
+        }
+
+        assert!(
+            next_hop_backoff_test_support::next_hop_backed_off_for_test(
+                6,
+                RoutingMetric::ReliableCost,
+                ServiceLevel::Reliable,
+            ),
+            "consecutive physical send failures must back the failed hop off"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_falls_back_to_reliable_metric_when_rll_route_missing() {
+        // The 2026-09-19 control/data split: the low-latency metric's
+        // edge admission excluded the destination while the reliable
+        // metric still routes. Control (ACK/NACK/repair) must fall back
+        // instead of being silently dropped.
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(2, 4, &[TransportKind::Tcp]);
+        let mut to_four = receivers.pop().unwrap();
+        let routing = new_handle();
+        let mut tables = RoutingTables::empty();
+        tables.insert_table(
+            RoutingMetric::ReliableCost,
+            ServiceLevel::Reliable,
+            HashMap::from([(
+                4,
+                RouteEntry {
+                    next_hop: 4,
+                    cost: 1,
+                    latency_us: 1,
+                },
+            )]),
+        );
+        routing.store(Arc::new(tables));
+
+        send_control_to(
+            &transport,
+            &routing,
+            2,
+            4,
+            test_control(vec![node_to_wire(1)]),
+        )
+        .await
+        .expect("control should send via the reliable metric fallback");
+
+        let forwarded = timeout(Duration::from_millis(50), to_four.recv())
+            .await
+            .expect("destination 4 should receive the control via the fallback")
+            .expect("receiver should stay open");
+        let decoded = decode_message(forwarded.payload()).expect("overlay control");
+        assert!(matches!(decoded.body, Some(OverlayBody::Control(_))));
+
+        let samples = crate::overlay::ordering_metrics::prometheus_samples();
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_overlay_control_route_fallback_total"
+                && sample.value() >= 1.0
+        }));
+    }
+
+    #[tokio::test]
+    async fn control_no_route_when_both_metrics_missing() {
+        let (transport, mut receivers) =
+            ConnectionManager::test_with_live_streams(2, 4, &[TransportKind::Tcp]);
+        let mut to_four = receivers.pop().unwrap();
+        // Control routing only: no reliable-metric fallback exists either.
+        let routing = control_routing_with_route(9, 9);
+
+        send_control_to(
+            &transport,
+            &routing,
+            2,
+            4,
+            test_control(vec![node_to_wire(1)]),
+        )
+        .await
+        .expect("a no-route control drop is still Ok");
+
+        assert!(
+            timeout(Duration::from_millis(25), to_four.recv()).await.is_err(),
+            "no route in either metric: nothing may be sent"
+        );
     }
 
     #[test]

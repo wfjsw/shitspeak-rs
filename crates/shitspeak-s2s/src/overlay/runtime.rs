@@ -682,6 +682,10 @@ impl OverlayInner {
         let attachments = Arc::new(super::attachments::AttachmentCache::default());
         let services = Arc::new(ServiceRegistry::new());
         let ordering = Arc::new(OverlayOrdering::new(&cfg));
+        super::messaging::forward::configure_next_hop_backoff(
+            cfg.route_next_hop_backoff().as_millis().min(u64::MAX as u128) as u64,
+            cfg.route_next_hop_backoff_failures(),
+        );
 
         let emitter = Arc::new(LsaEmitter::new(
             self_id,

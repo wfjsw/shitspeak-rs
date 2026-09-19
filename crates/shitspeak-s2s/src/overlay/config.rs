@@ -128,6 +128,13 @@ pub struct OverlayConfig {
     /// is recovered through the replication layer's gap detection. Zero
     /// disables the heal.
     ordered_inbound_gap_heal_after: Duration,
+    /// How long an admitted first hop with consecutive
+    /// no-suitable-transport/unknown-node send failures is skipped in
+    /// favor of loop-free alternates. Zero disables the backoff.
+    route_next_hop_backoff: Duration,
+    /// Consecutive send failures to an admitted first hop before its
+    /// failure backoff activates.
+    route_next_hop_backoff_failures: u32,
 }
 
 impl OverlayConfig {
@@ -182,6 +189,8 @@ impl OverlayConfig {
             ordered_pending_starve_after: Duration::from_secs(60),
             ordered_pending_starve_purge_after: Duration::from_secs(15 * 60),
             ordered_inbound_gap_heal_after: Duration::from_secs(30),
+            route_next_hop_backoff: Duration::from_secs(5),
+            route_next_hop_backoff_failures: 4,
         }
     }
 
@@ -321,6 +330,12 @@ impl OverlayConfig {
     }
     pub fn ordered_inbound_gap_heal_after(&self) -> Duration {
         self.ordered_inbound_gap_heal_after
+    }
+    pub fn route_next_hop_backoff(&self) -> Duration {
+        self.route_next_hop_backoff
+    }
+    pub fn route_next_hop_backoff_failures(&self) -> u32 {
+        self.route_next_hop_backoff_failures
     }
 
     // ── Builder setters ──
@@ -490,6 +505,14 @@ impl OverlayConfig {
         self.ordered_inbound_gap_heal_after = d;
         self
     }
+    pub fn with_route_next_hop_backoff(mut self, d: Duration) -> Self {
+        self.route_next_hop_backoff = d;
+        self
+    }
+    pub fn with_route_next_hop_backoff_failures(mut self, n: u32) -> Self {
+        self.route_next_hop_backoff_failures = n;
+        self
+    }
 }
 
 /// Bootstrap peer entry from operator config. The node id is required so the
@@ -592,6 +615,15 @@ pub struct OverlayTuning {
     /// heal.
     #[serde(default = "default_ordered_inbound_gap_heal_after_ms")]
     pub ordered_inbound_gap_heal_after_ms: u64,
+    /// How long an admitted first hop with consecutive
+    /// no-suitable-transport/unknown-node send failures is skipped in
+    /// favor of loop-free alternates. Zero disables the backoff.
+    #[serde(default = "default_route_next_hop_backoff_ms")]
+    pub route_next_hop_backoff_ms: u64,
+    /// Consecutive send failures to an admitted first hop before its
+    /// failure backoff activates.
+    #[serde(default = "default_route_next_hop_backoff_failures")]
+    pub route_next_hop_backoff_failures: u32,
 }
 
 impl Default for OverlayTuning {
@@ -623,6 +655,8 @@ impl Default for OverlayTuning {
                 default_ordered_pending_starve_purge_after_ms(),
             ordered_inbound_gap_heal_after_ms:
                 default_ordered_inbound_gap_heal_after_ms(),
+            route_next_hop_backoff_ms: default_route_next_hop_backoff_ms(),
+            route_next_hop_backoff_failures: default_route_next_hop_backoff_failures(),
         }
     }
 }
@@ -668,6 +702,10 @@ impl OverlayTuning {
             .with_ordered_inbound_gap_heal_after(Duration::from_millis(
                 self.ordered_inbound_gap_heal_after_ms,
             ))
+            .with_route_next_hop_backoff(Duration::from_millis(
+                self.route_next_hop_backoff_ms,
+            ))
+            .with_route_next_hop_backoff_failures(self.route_next_hop_backoff_failures)
     }
 }
 
@@ -750,6 +788,12 @@ fn default_ordered_pending_starve_purge_after_ms() -> u64 {
 }
 fn default_ordered_inbound_gap_heal_after_ms() -> u64 {
     30_000
+}
+fn default_route_next_hop_backoff_ms() -> u64 {
+    5_000
+}
+fn default_route_next_hop_backoff_failures() -> u32 {
+    4
 }
 fn default_ordered_retry_max_attempts() -> u32 {
     16
