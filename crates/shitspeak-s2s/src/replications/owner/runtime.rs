@@ -243,6 +243,15 @@ fn replication_bulk_backpressure(error: &crate::overlay::OverlayError) -> bool {
     )
 }
 
+static OWNER_BROADCAST_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Logs on powers of two (1, 2, 4, …) so a persistently failing broadcast
+/// path becomes visible without per-op log spam.
+fn sampled_owner_send_failure(counter: &AtomicU64) -> Option<u64> {
+    let count = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    count.is_power_of_two().then_some(count)
+}
+
 /// One pending out-of-order op buffered until the gap fills (or a snapshot
 /// arrives via catchup).
 pub(crate) struct OwnerBufferedOp {
@@ -259,6 +268,61 @@ struct OwnerCatchupAttempt {
     dst: NodeIdentifier,
 }
 
+/// Per-origin staleness tracking for the owner anti-entropy scan.
+///
+/// `last_activity` is the last origin-sourced progress evidence: an
+/// origin-sourced op arrival, a catchup response from the origin itself, or
+/// a locally issued catchup request (the question was just asked). Relay
+/// responses do not count — they prove nothing about the origin→us path.
+#[derive(Clone, Copy)]
+pub(crate) struct OriginStaleness {
+    /// Last origin-sourced op arrival (the op-pace EWMA sample clock).
+    last_op_arrival: Instant,
+    /// EWMA of the origin-sourced op inter-arrival time. Zero means no
+    /// sample yet (first arrival only).
+    op_interval_ewma: Duration,
+    /// Last origin-sourced progress evidence.
+    last_activity: Instant,
+}
+
+impl OriginStaleness {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_op_arrival: now,
+            op_interval_ewma: Duration::ZERO,
+            last_activity: now,
+        }
+    }
+
+    /// Records an origin-sourced op arrival: refreshes activity evidence
+    /// and the op-pace EWMA.
+    fn record_op(&mut self, now: Instant) {
+        self.record_activity(now);
+        if self.last_op_arrival < now {
+            let interval = now - self.last_op_arrival;
+            // 1/4-EMA: continuous arrivals re-deflate the pace quickly
+            // after one slow sample.
+            self.op_interval_ewma = if self.op_interval_ewma.is_zero() {
+                interval
+            } else {
+                (interval + self.op_interval_ewma * 3) / 4
+            };
+        }
+        self.last_op_arrival = now;
+    }
+
+    /// Records origin-sourced progress evidence (origin op arrival, a
+    /// catchup response from the origin itself, or a locally issued catchup
+    /// request).
+    fn record_activity(&mut self, now: Instant) {
+        self.last_activity = now;
+    }
+
+    fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_activity)
+    }
+}
+
 pub(crate) struct OwnerState {
     /// `known[origin] = (epoch, last_applied_version)` for every origin
     /// we've ever seen.
@@ -270,6 +334,8 @@ pub(crate) struct OwnerState {
     /// historical name, this remains set after a response so periodic
     /// anti-entropy cannot retry faster than `CATCHUP_TIMEOUT`.
     pub catchup_in_flight: HashMap<NodeIdentifier, Instant>,
+    /// Per-origin staleness tracking for the anti-entropy scan.
+    pub origin_staleness: HashMap<NodeIdentifier, OriginStaleness>,
     /// Origins whose transient repository state was removed while offline.
     /// Their `known` entry remains as a non-regression floor until an atomic
     /// snapshot at the same or a newer epoch is installed.
@@ -289,11 +355,31 @@ impl OwnerState {
             known,
             pending_buffers: HashMap::new(),
             catchup_in_flight: HashMap::new(),
+            origin_staleness: HashMap::new(),
             inactive_origins: HashSet::new(),
             catchup_attempts: HashMap::new(),
             empty_confirmations: HashMap::new(),
             next_catchup_generation: 0,
         }
+    }
+
+    /// Records an origin-sourced op arrival: origin-path activity evidence
+    /// plus an op-pace sample.
+    pub fn record_origin_op(&mut self, origin: NodeIdentifier, now: Instant) {
+        self.origin_staleness
+            .entry(origin)
+            .or_insert_with(|| OriginStaleness::new(now))
+            .record_op(now);
+    }
+
+    /// Records origin-sourced progress evidence (origin op arrival, a catchup
+    /// response from the origin itself, or a locally issued catchup
+    /// request). See [`OriginStaleness`].
+    pub fn record_origin_activity(&mut self, origin: NodeIdentifier, now: Instant) {
+        self.origin_staleness
+            .entry(origin)
+            .or_insert_with(|| OriginStaleness::new(now))
+            .record_activity(now);
     }
 
     /// Handle a fresh `OwnerOp` or one drained from the buffer.
@@ -411,6 +497,7 @@ impl OwnerState {
         self.catchup_in_flight.remove(&origin);
         self.catchup_attempts.remove(&origin);
         self.empty_confirmations.remove(&origin);
+        self.origin_staleness.remove(&origin);
     }
 
     fn record_empty_confirmation(&mut self, origin: NodeIdentifier, epoch: u64) -> u8 {
@@ -527,6 +614,7 @@ pub(crate) struct OwnerRuntime<R: OwnerReplicable> {
     pub weak_self: Mutex<Option<Weak<Self>>>,
     pub shutdown: CancellationToken,
     pub cfg: Arc<ReplicationConfig>,
+    staleness_metrics: Arc<metrics::OwnerStalenessMetrics>,
     origin_locks: Mutex<HashMap<NodeIdentifier, Arc<AsyncMutex<()>>>>,
 }
 
@@ -558,6 +646,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             weak_self: Mutex::new(None),
             shutdown,
             cfg,
+            staleness_metrics: metrics::register_owner_staleness_metrics(),
             origin_locks: Mutex::new(HashMap::new()),
         });
         *arc.weak_self.lock() = Some(Arc::downgrade(&arc));
@@ -568,6 +657,17 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             runtime.bootstrap_catchup_alive_members().await;
+        });
+        self.spawn_staleness_scan();
+    }
+
+    /// Spawns the steady-state staleness scan. Split from [`Self::start`] so
+    /// the scan can be exercised in isolation from the bounded bootstrap
+    /// loop.
+    fn spawn_staleness_scan(self: &Arc<Self>) {
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            runtime.staleness_scan_loop().await;
         });
     }
 
@@ -618,6 +718,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
                     state.catchup_in_flight.remove(&origin);
                     state.catchup_attempts.remove(&origin);
                     state.empty_confirmations.remove(&origin);
+                    state.origin_staleness.remove(&origin);
                     state.inactive_origins.insert(origin);
                     return;
                 };
@@ -651,6 +752,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             state.catchup_in_flight.remove(&origin);
             state.catchup_attempts.remove(&origin);
             state.empty_confirmations.remove(&origin);
+            state.origin_staleness.remove(&origin);
             state.inactive_origins.insert(origin);
             return;
         }
@@ -687,6 +789,11 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         let generation = {
             let mut state = self.state.lock();
             state.catchup_in_flight.insert(origin, Instant::now());
+            // A successfully sent catchup request is origin-path progress
+            // evidence for the staleness scan: while requests are being
+            // answered (responses from the origin refresh it too), the
+            // origin is not treated as silently stale.
+            state.record_origin_activity(origin, Instant::now());
             let gap_target_version = state
                 .pending_buffers
                 .get(&origin)
@@ -900,6 +1007,155 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             .unwrap_or(0)
     }
 
+    async fn staleness_scan_loop(self: Arc<Self>) {
+        let interval = self.cfg.owner_anti_entropy_interval();
+        loop {
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return,
+                _ = sleep(interval) => {}
+            }
+            self.staleness_scan_once().await;
+        }
+    }
+
+    /// One staleness scan pass over the alive origins. Owner gap detection
+    /// is passive (it requires an arriving op), so a replica that stops
+    /// receiving one origin's traffic entirely — e.g. after a one-way path
+    /// breakage while both nodes stay alive members — would otherwise stay
+    /// frozen on that origin's state forever. The scan arms a catchup when
+    /// an alive origin has been silent longer than its own learned op pace
+    /// allows.
+    ///
+    /// A scan observation for one origin ends in exactly one outcome:
+    /// * `StaleArmed` — no origin-sourced progress evidence for longer than
+    ///   the threshold; the gap-catchup arm is bypassed (a stale origin is
+    ///   new gap evidence) and a catchup request is sent.
+    /// * `Fresh` — evidence is inside the threshold.
+    /// * `NotCurrent` / `Inactive` / `NoEvidence` — the origin is owned by
+    ///   the restart/bootstrap/offline machinery.
+    ///
+    /// The threshold is derived from the origin's own learned op pace (the
+    /// inter-arrival EWMA of origin-sourced ops) multiplied by
+    /// `owner_staleness_factor`, clamped to `[owner_staleness_min_age,
+    /// owner_staleness_max_age]`. A live origin at version zero (empty log)
+    /// uses the fixed `owner_staleness_max_age` threshold. Nothing here
+    /// hardcodes peers or links; every decision derives from observed
+    /// arrival evidence.
+    async fn staleness_scan_once(&self) {
+        enum ScanObservation {
+            Inactive,
+            NoEvidence,
+            Tracked {
+                known_epoch: u64,
+                known_version: u64,
+                age: Duration,
+                op_interval_ewma: Duration,
+            },
+        }
+
+        let now = Instant::now();
+        let min_age = self.cfg.owner_staleness_min_age();
+        let factor = self.cfg.owner_staleness_factor();
+        let max_age = self.cfg.owner_staleness_max_age();
+        let mut alive_scanned = 0usize;
+        let mut stale_armed = 0usize;
+        let mut max_age_seen = Duration::ZERO;
+        for origin in self.net.alive_members() {
+            if origin == self.self_id {
+                continue;
+            }
+            alive_scanned += 1;
+            let observation = {
+                let state = self.state.lock();
+                if state.inactive_origins.contains(&origin) {
+                    ScanObservation::Inactive
+                } else if let Some((known_epoch, known_version)) =
+                    state.known.get(&origin).copied()
+                {
+                    match state
+                        .origin_staleness
+                        .get(&origin)
+                        .map(|staleness| (staleness.age(now), staleness.op_interval_ewma))
+                    {
+                        None => ScanObservation::NoEvidence,
+                        Some((age, op_interval_ewma)) => ScanObservation::Tracked {
+                            known_epoch,
+                            known_version,
+                            age,
+                            op_interval_ewma,
+                        },
+                    }
+                } else {
+                    // Alive but never seen: the bootstrap loop and the
+                    // join/restart stabilization own this origin.
+                    ScanObservation::NoEvidence
+                }
+            };
+            match observation {
+                ScanObservation::Inactive => {
+                    metrics::record_owner_staleness_probe(
+                        metrics::OwnerStalenessProbeOutcome::Inactive,
+                    );
+                }
+                ScanObservation::NoEvidence => {
+                    metrics::record_owner_staleness_probe(
+                        metrics::OwnerStalenessProbeOutcome::NoEvidence,
+                    );
+                }
+                ScanObservation::Tracked {
+                    known_epoch,
+                    known_version,
+                    age,
+                    op_interval_ewma,
+                } => {
+                    max_age_seen = max_age_seen.max(age);
+                    if !self.epoch_is_current(origin, known_epoch) {
+                        metrics::record_owner_staleness_probe(
+                            metrics::OwnerStalenessProbeOutcome::NotCurrent,
+                        );
+                        continue;
+                    }
+                    // A version-zero origin has no op pace to learn; probe
+                    // at the fixed ceiling so an empty-but-alive origin
+                    // that goes fully silent is still eventually asked.
+                    let threshold = if known_version == 0 {
+                        max_age
+                    } else {
+                        (op_interval_ewma * factor).clamp(min_age, max_age)
+                    };
+                    if age > threshold {
+                        stale_armed += 1;
+                        metrics::record_owner_staleness_probe(
+                            metrics::OwnerStalenessProbeOutcome::StaleArmed,
+                        );
+                        {
+                            let mut state = self.state.lock();
+                            // A stale origin is new gap evidence: bypass the
+                            // catchup throttle the same way an
+                            // out-of-order op arrival does.
+                            state.arm_gap_catchup(origin, now);
+                        }
+                        debug!(
+                            origin = %origin,
+                            known_version,
+                            age_ms = age.as_millis() as u64,
+                            threshold_ms = threshold.as_millis() as u64,
+                            "owner staleness scan armed catchup"
+                        );
+                        self.send_catchup_req(origin, known_epoch, "staleness")
+                            .await;
+                    } else {
+                        metrics::record_owner_staleness_probe(
+                            metrics::OwnerStalenessProbeOutcome::Fresh,
+                        );
+                    }
+                }
+            }
+        }
+        self.staleness_metrics
+            .record_scan(alive_scanned, stale_armed, max_age_seen.as_millis().min(u64::MAX as u128) as u64);
+    }
+
     async fn request_catchup(
         &self,
         origin: NodeIdentifier,
@@ -948,6 +1204,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         state.catchup_in_flight.remove(&origin);
         state.catchup_attempts.remove(&origin);
         state.empty_confirmations.remove(&origin);
+        state.origin_staleness.remove(&origin);
     }
 
     async fn handle_origin_offline(&self, origin: NodeIdentifier, event_epoch: u64) {
@@ -971,6 +1228,7 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
             state.catchup_in_flight.remove(&origin);
             state.catchup_attempts.remove(&origin);
             state.empty_confirmations.remove(&origin);
+            state.origin_staleness.remove(&origin);
             state.inactive_origins.insert(origin);
         }
         self.repo.remove_origin(origin).await;
@@ -1074,8 +1332,14 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         });
         if let Err(e) = self.net.send_broadcast(&self.topic, body).await {
             // Broadcast failed; we still advance local state so a retry from
-            // the caller doesn't reuse the version.
-            trace!(error=%e, "owner broadcast failed");
+            // the caller doesn't reuse the version. The canonical failure is
+            // one destination's ordered pending window being full
+            // (`OrderedWindowFull`): every other destination still got the
+            // op, so this was previously a silent per-destination loss.
+            metrics::record_owner_send_failure(metrics::OwnerSendFailureKind::Broadcast);
+            if let Some(observed) = sampled_owner_send_failure(&OWNER_BROADCAST_FAILURES) {
+                warn!(error = %e, observed, "owner broadcast failed");
+            }
         }
         // Now apply locally. This anchors the chosen ordering: the network
         // commit precedes the local apply.
@@ -1117,6 +1381,13 @@ impl<R: OwnerReplicable> OwnerRuntime<R> {
         if from != origin {
             warn!(from=%from, origin=%origin, "owner op sender does not match origin; dropping");
             return;
+        }
+        {
+            let mut state = self.state.lock();
+            // Any origin-sourced op — including one later dropped as a
+            // duplicate — is origin-path progress evidence for the
+            // staleness scan, plus an op-pace sample.
+            state.record_origin_op(origin, Instant::now());
         }
         self.process_remote_op(origin, op).await;
     }
@@ -1839,6 +2110,15 @@ mod tests {
 
         net.set_epoch(2, 200);
         net.set_alive(vec![1, 2]);
+        {
+            // A live, non-empty origin whose last op just arrived: the
+            // staleness scan observes it as inside its threshold (the
+            // op-pace floor) and stays quiet. Steady state remains driven
+            // by broadcasts; the scan only asks silent origins.
+            let mut state = runtime.state.lock();
+            state.known.insert(2, (200, 5));
+            state.record_origin_op(2, Instant::now());
+        }
         tokio::time::advance(Duration::from_millis(500)).await;
         tokio::task::yield_now().await;
         assert!(
@@ -1846,6 +2126,287 @@ mod tests {
             "steady state must be driven by broadcasts rather than background catchup"
         );
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn stale_origin_probes_and_requests_relay() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_epoch(2, 200);
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            1,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(
+                ReplicationConfig::default()
+                    .with_owner_catchup_timeout(Duration::from_millis(30))
+                    .with_owner_anti_entropy_interval(Duration::from_millis(10))
+                    .with_owner_staleness_min_age(Duration::from_millis(30)),
+            ),
+        );
+        {
+            let mut state = runtime.state.lock();
+            state.known.insert(2, (200, 5));
+            // Origin 2's last op arrived 200ms ago and nothing has been
+            // heard from it since — long past the 30ms floor.
+            state.record_origin_op(2, Instant::now() - Duration::from_millis(200));
+        }
+        runtime.spawn_staleness_scan();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let request = loop {
+            if let Some(found) = net
+                .captured
+                .lock()
+                .iter()
+                .find_map(|frame| match frame {
+                    CapturedFrame::OwnerUnicast {
+                        dst,
+                        body: OwnerBody::CatchupReq(req),
+                        ..
+                    } => Some((*dst, req.clone())),
+                    _ => None,
+                })
+            {
+                break Some(found);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "staleness scan never probed the silent origin"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        .expect("staleness probe request");
+        let (dst, req) = request;
+        // Incremental catchup prefers relays; the origin is the fallback.
+        assert_eq!(dst, 3);
+        assert_eq!(req.origin_node, 2);
+        assert_eq!(req.since_version, 5);
+
+        // The probe bypasses the catchup throttle (a stale origin is new
+        // gap evidence), so catchup_in_flight carries the probe's instant.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let armed = loop {
+            if runtime.state.lock().catchup_in_flight.contains_key(&2) {
+                break true;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "staleness probe never armed gap catchup"
+            );
+            tokio::task::yield_now().await;
+        };
+        assert!(armed, "staleness probe must bypass the catchup throttle");
+    }
+
+    #[tokio::test]
+    async fn v0_origin_probes_at_the_max_age_ceiling() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_epoch(2, 200);
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            1,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(
+                ReplicationConfig::default()
+                    .with_owner_anti_entropy_interval(Duration::from_millis(10))
+                    .with_owner_staleness_min_age(Duration::from_millis(30))
+                    .with_owner_staleness_max_age(Duration::from_millis(60)),
+            ),
+        );
+        {
+            let mut state = runtime.state.lock();
+            // An empty (version-zero) origin has no op pace to learn; its
+            // threshold is the fixed max-age ceiling.
+            state.known.insert(2, (200, 0));
+            state.record_origin_activity(2, Instant::now() - Duration::from_millis(80));
+        }
+        runtime.spawn_staleness_scan();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let request = loop {
+            if let Some(found) = net
+                .captured
+                .lock()
+                .iter()
+                .find_map(|frame| match frame {
+                    CapturedFrame::OwnerUnicast {
+                        dst,
+                        body: OwnerBody::CatchupReq(req),
+                        ..
+                    } => Some((*dst, req.clone())),
+                    _ => None,
+                })
+            {
+                break Some(found);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "staleness scan never probed the silent v0 origin"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        .expect("staleness probe request");
+        let (dst, req) = request;
+        // A cold (since-zero) catchup consults the origin first.
+        assert_eq!(dst, 2);
+        assert_eq!(req.origin_node, 2);
+        assert_eq!(req.since_version, 0);
+    }
+
+    #[tokio::test]
+    async fn fresh_origin_stays_quiet_under_staleness_scan() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_epoch(2, 200);
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            1,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(
+                ReplicationConfig::default()
+                    .with_owner_anti_entropy_interval(Duration::from_millis(10))
+                    .with_owner_staleness_min_age(Duration::from_millis(500)),
+            ),
+        );
+        {
+            let mut state = runtime.state.lock();
+            state.known.insert(2, (200, 5));
+            state.record_origin_op(2, Instant::now());
+        }
+        runtime.spawn_staleness_scan();
+        // A dozen scans while the origin is well inside its threshold.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            net.captured.lock().is_empty(),
+            "fresh origin must not be probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_probe_skips_origins_without_evidence() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_epoch(2, 200);
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            1,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(
+                ReplicationConfig::default()
+                    .with_owner_anti_entropy_interval(Duration::from_millis(10))
+                    .with_owner_staleness_min_age(Duration::from_millis(30)),
+            ),
+        );
+        {
+            let mut state = runtime.state.lock();
+            // Origin 2 is known but has no staleness clock (no op, no
+            // catchup exchange); origin 3 is not known at all. The
+            // bootstrap/join machinery owns both.
+            state.known.insert(2, (200, 5));
+        }
+        runtime.spawn_staleness_scan();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            net.captured.lock().is_empty(),
+            "origins without staleness evidence must not be probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_probe_skips_inactive_origins() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_epoch(2, 200);
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            1,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(
+                ReplicationConfig::default()
+                    .with_owner_anti_entropy_interval(Duration::from_millis(10))
+                    .with_owner_staleness_min_age(Duration::from_millis(30)),
+            ),
+        );
+        {
+            let mut state = runtime.state.lock();
+            state.known.insert(2, (200, 5));
+            // Long stale, but its transient repository state is already
+            // being removed — the offline path owns it.
+            state.record_origin_op(2, Instant::now() - Duration::from_millis(200));
+            state.inactive_origins.insert(2);
+        }
+        runtime.spawn_staleness_scan();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            net.captured.lock().is_empty(),
+            "inactive origins must not be probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_response_does_not_reset_origin_activity() {
+        let net = MockNet::new(1, vec![1, 2, 3]);
+        net.set_epoch(2, 200);
+        let runtime = OwnerRuntime::new(
+            CountingOwnerRepo::new(),
+            1,
+            100,
+            "clients".into(),
+            net.clone() as Arc<dyn OwnerNet>,
+            CancellationToken::new(),
+            Arc::new(ReplicationConfig::default()),
+        );
+        {
+            let mut state = runtime.state.lock();
+            state.known.insert(2, (200, 5));
+            state.record_origin_op(2, Instant::now() - Duration::from_millis(200));
+        }
+        let resp = OwnerCatchupResp {
+            origin_node: 2,
+            origin_epoch: 200,
+            snapshot_version: 0,
+            snapshot_msgpack: Bytes::new(),
+            ops: vec![],
+            has_more: false,
+            next_chunk_token: 0,
+            too_old_use_snapshot: false,
+        };
+        runtime.recv_catchup_resp(3, resp.clone()).await;
+        let age_after_relay = runtime
+            .state
+            .lock()
+            .origin_staleness
+            .get(&2)
+            .expect("origin staleness record")
+            .age(Instant::now());
+        assert!(
+            age_after_relay >= Duration::from_millis(150),
+            "a relay response must not count as origin-path evidence"
+        );
+        runtime.recv_catchup_resp(2, resp).await;
+        let age_after_origin = runtime
+            .state
+            .lock()
+            .origin_staleness
+            .get(&2)
+            .expect("origin staleness record")
+            .age(Instant::now());
+        assert!(
+            age_after_origin < Duration::from_millis(150),
+            "an origin-sourced response is origin-path evidence"
+        );
     }
 
     #[tokio::test(start_paused = true)]

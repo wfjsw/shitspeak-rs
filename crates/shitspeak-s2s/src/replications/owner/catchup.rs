@@ -3,6 +3,8 @@
 //! Same chunking model as strict catchup: stateless server-side, client
 //! re-issues with `since_version = repo.known_versions()[origin].1`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::Bytes;
 use rand::seq::SliceRandom;
 use tracing::{debug, warn};
@@ -12,6 +14,16 @@ use super::super::proto::{CatchupOp, OwnerBody, OwnerCatchupReq, OwnerCatchupRes
 use super::runtime::OwnerRuntime;
 use super::{LogSlice, OwnerReplicable, OwnerSnapshotInstallOutcome};
 use shitspeak_core::NodeIdentifier;
+
+static OWNER_FOLLOWUP_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Logs on powers of two (1, 2, 4, …): a relay followup fires once per
+/// relay-served response, so a persistently failing origin path would
+/// otherwise log once per arriving op.
+fn sampled_owner_followup_failure(counter: &AtomicU64) -> Option<u64> {
+    let count = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    count.is_power_of_two().then_some(count)
+}
 
 fn catchup_response_payload_len<R: OwnerReplicable>(
     rt: &OwnerRuntime<R>,
@@ -69,6 +81,11 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
         .cfg
         .try_begin_catchup(CatchupMode::Owner, &rt.topic, from)
     else {
+        debug!(
+            origin=%origin,
+            from=%from,
+            "owner catchup response suppressed by catchup admission limiter"
+        );
         return;
     };
     let build_started_at = std::time::Instant::now();
@@ -107,10 +124,21 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
                 too_old_use_snapshot: false,
             };
             if catchup_response_fits(rt, &response) {
-                let _ = rt
+                if let Err(e) = rt
                     .net
                     .send_unicast(from, &rt.topic, OwnerBody::CatchupResp(response))
-                    .await;
+                    .await
+                {
+                    metrics::record_owner_send_failure(
+                        metrics::OwnerSendFailureKind::CatchupResp,
+                    );
+                    warn!(
+                        from=%from,
+                        origin=%origin,
+                        error=%e,
+                        "owner catchup response send failed"
+                    );
+                }
             } else {
                 warn!(
                     max_bytes = rt.net.max_replication_payload_bytes(),
@@ -346,7 +374,7 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
         );
         return;
     }
-    let _ = rt
+    if let Err(e) = rt
         .net
         .send_bulk_unicast(
             from,
@@ -354,7 +382,16 @@ pub(crate) async fn respond_to_request<R: OwnerReplicable>(
             OwnerBody::CatchupResp(resp),
             rt.cfg.bulk_retry_delay(),
         )
-        .await;
+        .await
+    {
+        metrics::record_owner_send_failure(metrics::OwnerSendFailureKind::CatchupResp);
+        warn!(
+            from=%from,
+            origin=%origin,
+            error=%e,
+            "owner catchup response send failed"
+        );
+    }
 }
 
 pub(crate) async fn apply_response<R: OwnerReplicable>(
@@ -380,6 +417,13 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
             apply_started_at.elapsed(),
         );
         return;
+    }
+    if from == origin {
+        // A catchup response from the origin itself is origin-path progress
+        // evidence for the staleness scan; relay responses are not.
+        rt.state
+            .lock()
+            .record_origin_activity(origin, std::time::Instant::now());
     }
 
     let _origin_guard = rt.lock_origin(origin).await;
@@ -748,7 +792,7 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
         && rt.net.alive_members().contains(&origin)
     {
         let known_epoch = rt.net.member_boot_epoch(origin).unwrap_or(resp_epoch);
-        let _ = rt
+        if let Err(e) = rt
             .send_catchup_req_to(
                 origin,
                 origin,
@@ -757,7 +801,20 @@ pub(crate) async fn apply_response<R: OwnerReplicable>(
                 0,
                 "apply_relay_followup",
             )
-            .await;
+            .await
+        {
+            metrics::record_owner_send_failure(metrics::OwnerSendFailureKind::Followup);
+            if let Some(observed) =
+                sampled_owner_followup_failure(&OWNER_FOLLOWUP_FAILURES)
+            {
+                warn!(
+                    origin=%origin,
+                    error=%e,
+                    observed,
+                    "owner catchup relay followup send failed"
+                );
+            }
+        }
     }
     debug!(
         origin=%origin,

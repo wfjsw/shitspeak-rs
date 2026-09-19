@@ -2809,3 +2809,72 @@ async fn owner_gap_triggers_catchup() {
     );
     cluster.shutdown().await;
 }
+
+/// Checks owner-mode recovery from a one-way silent origin.
+/// Expected: when B silently stops receiving every replication frame from A
+/// (ops AND catchup responses) while A remains a live overlay member, B still
+/// converges to A's later ops through a relay. This is the regression for the
+/// 2026-09-19 production incident where a replica's origin-1 client
+/// repository froze silently for hours after a one-way path breakage: owner
+/// gap detection is passive (it needs an arriving op) and the bounded
+/// bootstrap anti-entropy loop had already exited, so nothing ever re-armed.
+/// A staleness probe must notice the alive origin's silence and pull via a
+/// relay.
+#[tokio::test]
+async fn owner_silent_origin_recovers_via_relays() {
+    let cfg = ReplicationConfig::default()
+        .with_owner_catchup_timeout(Duration::from_millis(30))
+        .with_owner_anti_entropy_interval(Duration::from_millis(100))
+        .with_owner_staleness_min_age(Duration::from_millis(300));
+    let cluster = ReplCluster::build_full_mesh_with_config(&[1, 2, 3], cfg).await;
+    let a_id = cluster.cluster.nodes[0].overlay.local_node_id();
+    let epoch_a = cluster.cluster.nodes[0].overlay.local_boot_epoch();
+
+    let repos: Vec<Arc<CountingOwnerRepo>> = (0..3).map(|_| CountingOwnerRepo::new()).collect();
+    let mut handles = Vec::new();
+    for (i, repo) in repos.iter().enumerate() {
+        handles.push(cluster.register_owner(i, "clients", repo.clone()).unwrap());
+    }
+
+    let h_a = handles[0].clone();
+    for k in 0..10u64 {
+        h_a.propose(500 + k).await.unwrap();
+    }
+    let ok = wait_until(Duration::from_secs(10), || {
+        repos[1].applied_for(1).len() == 10 && repos[2].applied_for(1).len() == 10
+    })
+    .await;
+    assert!(ok, "B and C must converge to A's first 10 ops");
+
+    // Let the bounded bootstrap anti-entropy loop reach its stabilization
+    // window and exit, so no event-driven repair covers the coming silence
+    // (the incident's precondition).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // The incident: B goes deaf to A in one direction. Drop every
+    // replication frame from A — both its op broadcasts and its catchup
+    // responses — while A stays a live overlay member (LSA/Hello traffic is
+    // unaffected). B's own requests to A still flow, as in the incident.
+    cluster
+        .managers[1]
+        .set_inbound_filter(move |frame| frame.from != a_id);
+
+    // A keeps generating ops; none of them reach B's owner runtime.
+    for k in 0..20u64 {
+        h_a.propose(1000 + k).await.unwrap();
+    }
+
+    let ok = wait_until(Duration::from_secs(10), || {
+        repos[1].applied_for(1).len() == 30
+    })
+    .await;
+    assert!(
+        ok,
+        "B stayed frozen on a silently-dead origin path: applied_for(A) = {}, known = {:?}",
+        repos[1].applied_for(1).len(),
+        repos[1].known_versions().get(&1)
+    );
+    assert_eq!(repos[1].known_versions().get(&1), Some(&(epoch_a, 30)));
+    cluster.shutdown().await;
+}
+

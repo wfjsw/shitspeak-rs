@@ -92,6 +92,16 @@ pub struct ReplicationConfig {
     owner_anti_entropy_interval: Duration,
     /// Cap on `CatchupOp`s returned per `OwnerCatchupResp` chunk.
     owner_max_catchup_ops: usize,
+    /// Multiplier applied to the learned per-origin op inter-arrival EWMA
+    /// when deciding whether an alive origin has gone silently stale.
+    owner_staleness_factor: u32,
+    /// Floor for the staleness threshold: an alive origin is only probed
+    /// after at least this long without origin-sourced progress.
+    owner_staleness_min_age: Duration,
+    /// Ceiling for the staleness threshold (also the fixed threshold for
+    /// alive origins at version zero). Bounds the probe rate on origins
+    /// whose learned op pace is slower than the ceiling.
+    owner_staleness_max_age: Duration,
 
     // ── Shared catchup / gateway protection ──
     /// Maximum catchup responses that may be built/sent concurrently across
@@ -156,6 +166,9 @@ impl Default for ReplicationConfig {
             owner_catchup_timeout: Duration::from_secs(5),
             owner_anti_entropy_interval: Duration::from_secs(30),
             owner_max_catchup_ops: 256,
+            owner_staleness_factor: 8,
+            owner_staleness_min_age: Duration::from_secs(60),
+            owner_staleness_max_age: Duration::from_secs(30 * 60),
             catchup_max_in_flight_total: 8,
             catchup_max_in_flight_per_peer: 1,
             client_replication_max_in_flight: 32,
@@ -252,6 +265,15 @@ impl ReplicationConfig {
     }
     pub fn owner_max_catchup_ops(&self) -> usize {
         self.owner_max_catchup_ops
+    }
+    pub fn owner_staleness_factor(&self) -> u32 {
+        self.owner_staleness_factor
+    }
+    pub fn owner_staleness_min_age(&self) -> Duration {
+        self.owner_staleness_min_age
+    }
+    pub fn owner_staleness_max_age(&self) -> Duration {
+        self.owner_staleness_max_age
     }
     pub fn catchup_max_in_flight_total(&self) -> usize {
         self.catchup_max_in_flight_total
@@ -400,6 +422,18 @@ impl ReplicationConfig {
     }
     pub fn with_owner_max_catchup_ops(mut self, n: usize) -> Self {
         self.owner_max_catchup_ops = n;
+        self
+    }
+    pub fn with_owner_staleness_factor(mut self, n: u32) -> Self {
+        self.owner_staleness_factor = n;
+        self
+    }
+    pub fn with_owner_staleness_min_age(mut self, d: Duration) -> Self {
+        self.owner_staleness_min_age = d;
+        self
+    }
+    pub fn with_owner_staleness_max_age(mut self, d: Duration) -> Self {
+        self.owner_staleness_max_age = d;
         self
     }
     pub fn with_catchup_max_in_flight_total(mut self, n: usize) -> Self {
@@ -583,6 +617,12 @@ pub struct ReplicationTuning {
     pub owner_anti_entropy_interval_ms: u64,
     #[serde(default = "default_owner_max_catchup_ops")]
     pub owner_max_catchup_ops: usize,
+    #[serde(default = "default_owner_staleness_factor")]
+    pub owner_staleness_factor: u32,
+    #[serde(default = "default_owner_staleness_min_age_ms")]
+    pub owner_staleness_min_age_ms: u64,
+    #[serde(default = "default_owner_staleness_max_age_ms")]
+    pub owner_staleness_max_age_ms: u64,
     #[serde(default = "default_catchup_max_in_flight_total")]
     pub catchup_max_in_flight_total: usize,
     #[serde(default = "default_catchup_max_in_flight_per_peer")]
@@ -641,6 +681,9 @@ impl Default for ReplicationTuning {
             owner_catchup_timeout_ms: default_owner_catchup_timeout_ms(),
             owner_anti_entropy_interval_ms: default_owner_anti_entropy_interval_ms(),
             owner_max_catchup_ops: default_owner_max_catchup_ops(),
+            owner_staleness_factor: default_owner_staleness_factor(),
+            owner_staleness_min_age_ms: default_owner_staleness_min_age_ms(),
+            owner_staleness_max_age_ms: default_owner_staleness_max_age_ms(),
             catchup_max_in_flight_total: default_catchup_max_in_flight_total(),
             catchup_max_in_flight_per_peer: default_catchup_max_in_flight_per_peer(),
             client_replication_max_in_flight: default_client_replication_max_in_flight(),
@@ -732,6 +775,24 @@ impl ReplicationTuning {
                     .to_owned(),
             );
         }
+        // Owner staleness probing. A zero factor would make every origin with
+        // no learned op pace immediately stale; a min above the max can never
+        // be satisfied.
+        if self.owner_staleness_factor == 0 {
+            return Err("s2s.replications.owner_staleness_factor must be greater than zero".to_owned());
+        }
+        if self.owner_staleness_min_age_ms == 0 || self.owner_staleness_max_age_ms == 0 {
+            return Err(
+                "s2s.replications.owner_staleness_min_age_ms and owner_staleness_max_age_ms must be greater than zero"
+                    .to_owned(),
+            );
+        }
+        if self.owner_staleness_min_age_ms > self.owner_staleness_max_age_ms {
+            return Err(
+                "s2s.replications.owner_staleness_min_age_ms must not exceed owner_staleness_max_age_ms"
+                    .to_owned(),
+            );
+        }
         Ok(())
     }
 }
@@ -779,6 +840,13 @@ impl From<ReplicationTuning> for ReplicationConfig {
                 t.owner_anti_entropy_interval_ms,
             ))
             .with_owner_max_catchup_ops(t.owner_max_catchup_ops)
+            .with_owner_staleness_factor(t.owner_staleness_factor)
+            .with_owner_staleness_min_age(Duration::from_millis(
+                t.owner_staleness_min_age_ms,
+            ))
+            .with_owner_staleness_max_age(Duration::from_millis(
+                t.owner_staleness_max_age_ms,
+            ))
             .with_catchup_max_in_flight_total(t.catchup_max_in_flight_total)
             .with_catchup_max_in_flight_per_peer(t.catchup_max_in_flight_per_peer)
             .with_client_replication_max_in_flight(t.client_replication_max_in_flight)
@@ -871,6 +939,15 @@ fn default_owner_anti_entropy_interval_ms() -> u64 {
 }
 fn default_owner_max_catchup_ops() -> usize {
     256
+}
+fn default_owner_staleness_factor() -> u32 {
+    8
+}
+fn default_owner_staleness_min_age_ms() -> u64 {
+    60_000
+}
+fn default_owner_staleness_max_age_ms() -> u64 {
+    1_800_000
 }
 fn default_catchup_max_in_flight_total() -> usize {
     8

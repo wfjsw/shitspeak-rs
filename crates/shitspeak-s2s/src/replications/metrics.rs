@@ -95,6 +95,95 @@ impl CatchupReason {
     }
 }
 
+/// Bounded outcomes of an owner staleness scan observation for one alive
+/// origin.
+///
+/// Never replace these labels with topic, peer, transfer, or operation data:
+/// those values are deliberately excluded from the Prometheus surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerStalenessProbeOutcome {
+    /// No origin-sourced progress evidence for longer than the staleness
+    /// threshold; a catchup request was armed and sent.
+    StaleArmed,
+    /// Progress evidence is inside the learned staleness threshold.
+    Fresh,
+    /// The origin's LSDB epoch no longer matches the tracked epoch; the
+    /// restart/bootstrap paths own it.
+    NotCurrent,
+    /// The origin is in the inactive set (offline removal pending).
+    Inactive,
+    /// No staleness clock exists (never seen an op, a catchup response, or a
+    /// catchup attempt for this origin).
+    NoEvidence,
+}
+
+impl OwnerStalenessProbeOutcome {
+    const ALL: [Self; 5] = [
+        Self::StaleArmed,
+        Self::Fresh,
+        Self::NotCurrent,
+        Self::Inactive,
+        Self::NoEvidence,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Self::StaleArmed => 0,
+            Self::Fresh => 1,
+            Self::NotCurrent => 2,
+            Self::Inactive => 3,
+            Self::NoEvidence => 4,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::StaleArmed => "stale_armed",
+            Self::Fresh => "fresh",
+            Self::NotCurrent => "not_current",
+            Self::Inactive => "inactive",
+            Self::NoEvidence => "no_evidence",
+        }
+    }
+}
+
+const OWNER_STALENESS_PROBE_OUTCOME_COUNT: usize = 5;
+
+/// Bounded kinds of owner-replication send failures that were previously
+/// swallowed silently (trace or `let _ =`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerSendFailureKind {
+    /// `propose_local`'s per-op broadcast (e.g. an ordered window full for
+    /// one destination).
+    Broadcast,
+    /// A catchup response the responder failed to deliver.
+    CatchupResp,
+    /// The origin followup after a relay-served catchup response.
+    Followup,
+}
+
+impl OwnerSendFailureKind {
+    const ALL: [Self; 3] = [Self::Broadcast, Self::CatchupResp, Self::Followup];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Broadcast => 0,
+            Self::CatchupResp => 1,
+            Self::Followup => 2,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Broadcast => "broadcast",
+            Self::CatchupResp => "catchup_resp",
+            Self::Followup => "followup",
+        }
+    }
+}
+
+const OWNER_SEND_FAILURE_KIND_COUNT: usize = 3;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CatchupPhase {
     Metadata,
@@ -1272,6 +1361,13 @@ static CATCHUP_SUPPRESSED: [AtomicU64; CATCHUP_LOGICAL_METRIC_COUNT] =
     [const { AtomicU64::new(0) }; CATCHUP_LOGICAL_METRIC_COUNT];
 static CATCHUP_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
+static OWNER_STALENESS_PROBES: [AtomicU64; OWNER_STALENESS_PROBE_OUTCOME_COUNT] =
+    [const { AtomicU64::new(0) }; OWNER_STALENESS_PROBE_OUTCOME_COUNT];
+static OWNER_SEND_FAILURES: [AtomicU64; OWNER_SEND_FAILURE_KIND_COUNT] =
+    [const { AtomicU64::new(0) }; OWNER_SEND_FAILURE_KIND_COUNT];
+static OWNER_STALENESS_METRIC_SOURCES: LazyLock<Mutex<Vec<Weak<OwnerStalenessMetrics>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
 static STRICT_CATCHUP_SESSION_STARTS: [AtomicU64; CATCHUP_REASON_COUNT] =
     [const { AtomicU64::new(0) }; CATCHUP_REASON_COUNT];
 static STRICT_CATCHUP_SESSION_COMPLETIONS: [AtomicU64;
@@ -1722,6 +1818,100 @@ pub(crate) fn record_catchup_active_delta(delta: isize) {
     }
 }
 
+pub(crate) fn record_owner_staleness_probe(outcome: OwnerStalenessProbeOutcome) {
+    increment(&OWNER_STALENESS_PROBES[outcome.index()], 1);
+}
+
+pub(crate) fn record_owner_send_failure(kind: OwnerSendFailureKind) {
+    increment(&OWNER_SEND_FAILURES[kind.index()], 1);
+}
+
+/// Per-owner-runtime staleness scan gauges, aggregated at scrape time
+/// without exposing origin cardinality.
+///
+/// Mirrors [`StrictRecoveryMetrics`]: weak sources combine every live owner
+/// runtime and disappear with it. `staleness_max_age_ms` is the largest
+/// observed origin-progress age of the last scan; `stale_origins` counts the
+/// origins the last scan found beyond their threshold.
+pub(crate) struct OwnerStalenessMetrics {
+    last_scan_max_age_ms: AtomicU64,
+    last_scan_stale_origins: AtomicUsize,
+    last_scan_alive_origins: AtomicUsize,
+}
+
+impl Default for OwnerStalenessMetrics {
+    fn default() -> Self {
+        Self {
+            last_scan_max_age_ms: AtomicU64::new(0),
+            last_scan_stale_origins: AtomicUsize::new(0),
+            last_scan_alive_origins: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl OwnerStalenessMetrics {
+    pub(crate) fn record_scan(&self, alive: usize, stale: usize, max_age_ms: u64) {
+        self.last_scan_alive_origins
+            .store(alive, Ordering::Relaxed);
+        self.last_scan_stale_origins
+            .store(stale, Ordering::Relaxed);
+        self.last_scan_max_age_ms.store(max_age_ms, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (usize, usize, u64) {
+        (
+            self.last_scan_alive_origins.load(Ordering::Relaxed),
+            self.last_scan_stale_origins.load(Ordering::Relaxed),
+            self.last_scan_max_age_ms.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub(crate) fn register_owner_staleness_metrics() -> Arc<OwnerStalenessMetrics> {
+    let source = Arc::new(OwnerStalenessMetrics::default());
+    OWNER_STALENESS_METRIC_SOURCES
+        .lock()
+        .unwrap()
+        .push(Arc::downgrade(&source));
+    source
+}
+
+/// Live owner staleness scan gauges aggregated without runtime cardinality:
+/// max age and alive counts are maxima, stale origins sum.
+fn owner_staleness_metric_samples() -> Vec<PrometheusSample> {
+    let mut samples = Vec::new();
+    let mut sources = OWNER_STALENESS_METRIC_SOURCES.lock().unwrap();
+    sources.retain(|weak| weak.strong_count() > 0);
+    if sources.is_empty() {
+        return samples;
+    }
+    let mut max_age_ms = 0u64;
+    let mut stale_origins = 0usize;
+    let mut alive_origins = 0usize;
+    for source in sources.iter().filter_map(Weak::upgrade) {
+        let (alive, stale, age_ms) = source.snapshot();
+        alive_origins = alive_origins.max(alive);
+        stale_origins += stale;
+        max_age_ms = max_age_ms.max(age_ms);
+    }
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_replication_owner_staleness_scan_alive_origins",
+        Vec::new(),
+        alive_origins as f64,
+    ));
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_replication_owner_staleness_stale_origins",
+        Vec::new(),
+        stale_origins as f64,
+    ));
+    samples.push(PrometheusSample::new(
+        "shitspeak_s2s_replication_owner_staleness_max_age_ms",
+        Vec::new(),
+        max_age_ms as f64,
+    ));
+    samples
+}
+
 pub(crate) fn record_strict_catchup_session_start(reason: CatchupReason) {
     increment(&STRICT_CATCHUP_SESSION_STARTS[reason.index()], 1);
     STRICT_CATCHUP_SESSION_ACTIVE[reason.index()].fetch_add(1, Ordering::Relaxed);
@@ -2110,6 +2300,27 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         Vec::new(),
         CATCHUP_ACTIVE.load(Ordering::Relaxed) as f64,
     ));
+    for outcome in OwnerStalenessProbeOutcome::ALL {
+        let probes = OWNER_STALENESS_PROBES[outcome.index()].load(Ordering::Relaxed);
+        if probes > 0 {
+            samples.push(PrometheusSample::new(
+                "shitspeak_s2s_replication_owner_staleness_probe_events_total",
+                vec![("outcome".to_owned(), outcome.label().to_owned())],
+                probes as f64,
+            ));
+        }
+    }
+    for kind in OwnerSendFailureKind::ALL {
+        let failures = OWNER_SEND_FAILURES[kind.index()].load(Ordering::Relaxed);
+        if failures > 0 {
+            samples.push(PrometheusSample::new(
+                "shitspeak_s2s_replication_owner_send_failures_total",
+                vec![("kind".to_owned(), kind.label().to_owned())],
+                failures as f64,
+            ));
+        }
+    }
+    samples.extend(owner_staleness_metric_samples());
     samples.extend(strict_catchup_v3_metric_samples());
     for kind in REPLICATION_PIPELINE_KINDS {
         for stage in REPLICATION_PIPELINE_STAGES {
@@ -2842,6 +3053,44 @@ mod tests {
                     .labels()
                     .iter()
                     .all(|(label, _)| allowed_labels.contains(&label.as_str()))
+            );
+        }
+    }
+
+    #[test]
+    fn owner_staleness_and_send_failure_metrics_use_bounded_labels() {
+        let before_stale = OWNER_STALENESS_PROBES[OwnerStalenessProbeOutcome::StaleArmed.index()]
+            .load(Ordering::Relaxed);
+        let before_followup = OWNER_SEND_FAILURES[OwnerSendFailureKind::Followup.index()]
+            .load(Ordering::Relaxed);
+        record_owner_staleness_probe(OwnerStalenessProbeOutcome::StaleArmed);
+        record_owner_staleness_probe(OwnerStalenessProbeOutcome::NoEvidence);
+        record_owner_send_failure(OwnerSendFailureKind::Followup);
+
+        let samples = prometheus_samples();
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_replication_owner_staleness_probe_events_total"
+                && sample.labels() == [("outcome".to_owned(), "stale_armed".to_owned())]
+                && sample.value() >= before_stale as f64 + 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_replication_owner_send_failures_total"
+                && sample.labels() == [("kind".to_owned(), "followup".to_owned())]
+                && sample.value() >= before_followup as f64 + 1.0
+        }));
+
+        // Bounded labels only; no origin/peer/topic cardinality.
+        for sample in samples.iter().filter(|sample| {
+            sample.name().contains("owner_staleness")
+                || sample.name().contains("owner_send_failures")
+        }) {
+            assert!(
+                sample
+                    .labels()
+                    .iter()
+                    .all(|(label, _)| ["outcome", "kind"].contains(&label.as_str())),
+                "unexpected label on {}",
+                sample.name()
             );
         }
     }
