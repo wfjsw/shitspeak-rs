@@ -4812,6 +4812,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(windows))]
     fn cgroup_memory_limit_is_preferred_over_host_meminfo() {
         assert_eq!(
             select_available_memory(Some(64 * 1024 * 1024), Some(8 * 1024 * 1024 * 1024)),
