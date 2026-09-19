@@ -113,6 +113,21 @@ pub struct OverlayConfig {
     ordered_retry_max: Duration,
     ordered_retry_max_age: Duration,
     ordered_retry_max_attempts: u32,
+    /// A Reliable pending window whose oldest packet is older than this is
+    /// considered starved: the destination has neither acknowledged nor
+    /// been reset while the retain-until-ACK contract holds it. Zero
+    /// disables starvation detection.
+    ordered_pending_starve_after: Duration,
+    /// A starved Reliable pending window older than this is purged while
+    /// keeping its sequence continuity (the destination recovers the
+    /// skipped range through the replication layer's gap detection).
+    /// Zero disables the give-up purge.
+    ordered_pending_starve_purge_after: Duration,
+    /// An inbound lane stuck in the same reorder gap for longer than this
+    /// is healed by rebasing onto the current sequence; the skipped range
+    /// is recovered through the replication layer's gap detection. Zero
+    /// disables the heal.
+    ordered_inbound_gap_heal_after: Duration,
 }
 
 impl OverlayConfig {
@@ -164,6 +179,9 @@ impl OverlayConfig {
             ordered_retry_max: Duration::from_secs(2),
             ordered_retry_max_age: Duration::from_secs(30),
             ordered_retry_max_attempts: 16,
+            ordered_pending_starve_after: Duration::from_secs(60),
+            ordered_pending_starve_purge_after: Duration::from_secs(15 * 60),
+            ordered_inbound_gap_heal_after: Duration::from_secs(30),
         }
     }
 
@@ -294,6 +312,15 @@ impl OverlayConfig {
     }
     pub fn ordered_retry_max_attempts(&self) -> u32 {
         self.ordered_retry_max_attempts
+    }
+    pub fn ordered_pending_starve_after(&self) -> Duration {
+        self.ordered_pending_starve_after
+    }
+    pub fn ordered_pending_starve_purge_after(&self) -> Duration {
+        self.ordered_pending_starve_purge_after
+    }
+    pub fn ordered_inbound_gap_heal_after(&self) -> Duration {
+        self.ordered_inbound_gap_heal_after
     }
 
     // ── Builder setters ──
@@ -451,6 +478,18 @@ impl OverlayConfig {
         self.ordered_retry_max_attempts = n;
         self
     }
+    pub fn with_ordered_pending_starve_after(mut self, d: Duration) -> Self {
+        self.ordered_pending_starve_after = d;
+        self
+    }
+    pub fn with_ordered_pending_starve_purge_after(mut self, d: Duration) -> Self {
+        self.ordered_pending_starve_purge_after = d;
+        self
+    }
+    pub fn with_ordered_inbound_gap_heal_after(mut self, d: Duration) -> Self {
+        self.ordered_inbound_gap_heal_after = d;
+        self
+    }
 }
 
 /// Bootstrap peer entry from operator config. The node id is required so the
@@ -539,6 +578,20 @@ pub struct OverlayTuning {
     pub ordered_retry_max_age_ms: u64,
     #[serde(default = "default_ordered_retry_max_attempts")]
     pub ordered_retry_max_attempts: u32,
+    /// A Reliable pending window whose oldest packet is older than this is
+    /// starved (destination neither acknowledged nor was reset). Zero
+    /// disables starvation detection. See `OverlayConfig` for the contract.
+    #[serde(default = "default_ordered_pending_starve_after_ms")]
+    pub ordered_pending_starve_after_ms: u64,
+    /// A starved Reliable pending window older than this is purged while
+    /// keeping its sequence continuity. Zero disables the give-up purge.
+    #[serde(default = "default_ordered_pending_starve_purge_after_ms")]
+    pub ordered_pending_starve_purge_after_ms: u64,
+    /// An inbound lane stuck in the same reorder gap for longer than this
+    /// is healed by rebasing onto the current sequence. Zero disables the
+    /// heal.
+    #[serde(default = "default_ordered_inbound_gap_heal_after_ms")]
+    pub ordered_inbound_gap_heal_after_ms: u64,
 }
 
 impl Default for OverlayTuning {
@@ -565,6 +618,11 @@ impl Default for OverlayTuning {
             ordered_retry_max_ms: default_ordered_retry_max_ms(),
             ordered_retry_max_age_ms: default_ordered_retry_max_age_ms(),
             ordered_retry_max_attempts: default_ordered_retry_max_attempts(),
+            ordered_pending_starve_after_ms: default_ordered_pending_starve_after_ms(),
+            ordered_pending_starve_purge_after_ms:
+                default_ordered_pending_starve_purge_after_ms(),
+            ordered_inbound_gap_heal_after_ms:
+                default_ordered_inbound_gap_heal_after_ms(),
         }
     }
 }
@@ -601,6 +659,15 @@ impl OverlayTuning {
             .with_ordered_retry_max(Duration::from_millis(self.ordered_retry_max_ms))
             .with_ordered_retry_max_age(Duration::from_millis(self.ordered_retry_max_age_ms))
             .with_ordered_retry_max_attempts(self.ordered_retry_max_attempts)
+            .with_ordered_pending_starve_after(Duration::from_millis(
+                self.ordered_pending_starve_after_ms,
+            ))
+            .with_ordered_pending_starve_purge_after(Duration::from_millis(
+                self.ordered_pending_starve_purge_after_ms,
+            ))
+            .with_ordered_inbound_gap_heal_after(Duration::from_millis(
+                self.ordered_inbound_gap_heal_after_ms,
+            ))
     }
 }
 
@@ -673,6 +740,15 @@ fn default_ordered_retry_max_ms() -> u64 {
     2_000
 }
 fn default_ordered_retry_max_age_ms() -> u64 {
+    30_000
+}
+fn default_ordered_pending_starve_after_ms() -> u64 {
+    60_000
+}
+fn default_ordered_pending_starve_purge_after_ms() -> u64 {
+    900_000
+}
+fn default_ordered_inbound_gap_heal_after_ms() -> u64 {
     30_000
 }
 fn default_ordered_retry_max_attempts() -> u32 {

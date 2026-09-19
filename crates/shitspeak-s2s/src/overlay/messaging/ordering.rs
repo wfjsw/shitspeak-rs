@@ -85,6 +85,10 @@ struct InboundState {
     next_seq: u64,
     buffered: BTreeMap<u64, OrderedDelivery>,
     last_nack: Option<PendingNack>,
+    /// When the current reorder gap was first observed. Stuck-gap healing
+    /// rebases onto the current sequence once the gap has been unresolved
+    /// for `ordered_inbound_gap_heal_after`. `None` while in order.
+    gap_stuck_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -219,6 +223,10 @@ pub(crate) struct OverlayOrdering {
     outbound_send: Mutex<()>,
     outbound_next: Mutex<HashMap<OutboundKey, u64>>,
     pending: Mutex<HashMap<OutboundKey, BTreeMap<u64, PendingPacket>>>,
+    /// Reliable pending windows currently in starvation (key → when the
+    /// oldest retained packet crossed `ordered_pending_starve_after`).
+    /// Used to warn and count once per starvation episode.
+    starving: Mutex<HashMap<OutboundKey, Instant>>,
     inbound: Mutex<HashMap<InboundKey, InboundState>>,
     local_lanes: Mutex<HashSet<LaneId>>,
     remote_lanes: Mutex<HashMap<RemoteLaneKey, HashSet<LaneId>>>,
@@ -234,6 +242,9 @@ pub(crate) struct OverlayOrdering {
     retry_max: Duration,
     retry_max_age: Duration,
     retry_max_attempts: u32,
+    pending_starve_after: Duration,
+    pending_starve_purge_after: Duration,
+    inbound_gap_heal_after: Duration,
 }
 
 impl OverlayOrdering {
@@ -242,6 +253,7 @@ impl OverlayOrdering {
             outbound_send: Mutex::new(()),
             outbound_next: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            starving: Mutex::new(HashMap::new()),
             inbound: Mutex::new(HashMap::new()),
             local_lanes: Mutex::new(HashSet::new()),
             remote_lanes: Mutex::new(HashMap::new()),
@@ -257,6 +269,9 @@ impl OverlayOrdering {
             retry_max: cfg.ordered_retry_max(),
             retry_max_age: cfg.ordered_retry_max_age(),
             retry_max_attempts: cfg.ordered_retry_max_attempts(),
+            pending_starve_after: cfg.ordered_pending_starve_after(),
+            pending_starve_purge_after: cfg.ordered_pending_starve_purge_after(),
+            inbound_gap_heal_after: cfg.ordered_inbound_gap_heal_after(),
         }
     }
 
@@ -495,24 +510,71 @@ impl OverlayOrdering {
             }
             if packets.is_empty() {
                 empty_keys.push(*key);
-            } else {
-                // Snapshot the retain-until-ACK window state per (dst,
-                // lane) while the retransmit pass already holds the lock.
-                let oldest_age_ms = packets
-                    .values()
-                    .next()
-                    .map(|packet| {
-                        now.saturating_duration_since(packet.first_sent_at)
-                            .as_millis()
-                            .min(u64::MAX as u128) as u64
-                    })
-                    .unwrap_or(0);
-                ordering_metrics::record_ordered_pending(
-                    key.dst,
-                    key.lane.get(),
-                    packets.len() as u64,
-                    oldest_age_ms,
+                continue;
+            }
+            let oldest = packets
+                .values()
+                .next()
+                .expect("a non-empty pending window has an oldest packet");
+            let oldest_age = now.saturating_duration_since(oldest.first_sent_at);
+            let oldest_reliable = matches!(
+                level_from_wire(oldest.data.service_level),
+                Some(ServiceLevel::Reliable | ServiceLevel::ReliableLowLatency)
+            );
+            // A starved Reliable pending window whose oldest packet has
+            // been retained past the give-up threshold is purged while
+            // keeping its sequence continuity: `outbound_next` is left
+            // intact (a full `reset_peer` would rewind the destination's
+            // sequence space), so new traffic continues the sequence and
+            // the destination recovers the skipped range through the
+            // replication layer's gap detection.
+            if oldest_reliable
+                && self.pending_starve_purge_after > Duration::ZERO
+                && oldest_age >= self.pending_starve_purge_after
+            {
+                warn!(
+                    dst = %key.dst,
+                    lane = key.lane.get(),
+                    packets = packets.len(),
+                    oldest_age_ms = oldest_age.as_millis() as u64,
+                    "ordered reliable pending starved past give-up; purging window (sequence continuity kept)"
                 );
+                ordering_metrics::record_pending_starve_purged(key.lane.get());
+                self.starving.lock().await.remove(&*key);
+                empty_keys.push(*key);
+                continue;
+            }
+            // Snapshot the retain-until-ACK window state per (dst,
+            // lane) while the retransmit pass already holds the lock.
+            ordering_metrics::record_ordered_pending(
+                key.dst,
+                key.lane.get(),
+                packets.len() as u64,
+                oldest_age.as_millis().min(u64::MAX as u128) as u64,
+            );
+            // Starvation detection: the destination has neither
+            // acknowledged the retained Reliable window nor been reset
+            // while the retain-until-ACK contract holds it (the
+            // 2026-09-19 incident: three hours of un-acknowledged
+            // pending, invisible). Warn and count once per episode.
+            if oldest_reliable
+                && self.pending_starve_after > Duration::ZERO
+                && oldest_age >= self.pending_starve_after
+            {
+                let mut starving = self.starving.lock().await;
+                if starving.insert(*key, now).is_none() {
+                    drop(starving);
+                    ordering_metrics::record_pending_starve(key.lane.get());
+                    warn!(
+                        dst = %key.dst,
+                        lane = key.lane.get(),
+                        packets = packets.len(),
+                        oldest_age_ms = oldest_age.as_millis() as u64,
+                        "ordered reliable pending starved: destination has not acknowledged the retained window"
+                    );
+                }
+            } else {
+                self.starving.lock().await.remove(&*key);
             }
         }
         for key in empty_keys {
@@ -595,19 +657,59 @@ impl OverlayOrdering {
             data.payload.clone(),
         );
         let mut inbound = self.inbound.lock().await;
-        let fresh_lane = !inbound.contains_key(&key);
+        let now = Instant::now();
+        let mut fresh_lane = !inbound.contains_key(&key);
+        let mut rebase_to_current = false;
+        if !fresh_lane {
+            // (B3) Stuck-lane heal: this lane has been in the same reorder
+            // gap for longer than the repair machinery (NACK retries +
+            // repair cache) could plausibly need, which on an established
+            // lane means the missing range is no longer arriving. Rebase
+            // onto the current sequence: the skipped range is recovered by
+            // the replication layer's gap detection, which is gap-active
+            // (unlike this ordering-level gap).
+            let heal = self.inbound_gap_heal_after > Duration::ZERO
+                && inbound
+                    .get(&key)
+                    .and_then(|state| state.gap_stuck_since)
+                    .is_some_and(|stuck| {
+                        now.saturating_duration_since(stuck) >= self.inbound_gap_heal_after
+                    });
+            if heal {
+                ordering_metrics::record_inbound_gap_healed(lane.get());
+                warn!(
+                    src = %src,
+                    lane = lane.get(),
+                    stuck_for_ms = now
+                        .saturating_duration_since(
+                            inbound
+                                .get(&key)
+                                .and_then(|state| state.gap_stuck_since)
+                                .map(|stuck| stuck)
+                                .unwrap_or(now)
+                        )
+                        .as_millis() as u64,
+                    "ordered inbound lane stuck in reorder gap; rebasing to current sequence"
+                );
+                inbound.remove(&key);
+                fresh_lane = true;
+                rebase_to_current = true;
+            }
+        }
         let state = inbound.entry(key).or_default();
 
         if fresh_lane
-            && usize::try_from(data.ordering_seq)
-                .map_or(true, |seq| seq > self.reorder_buffer_packets)
+            && (rebase_to_current
+                || usize::try_from(data.ordering_seq)
+                    .map_or(true, |seq| seq > self.reorder_buffer_packets))
         {
             // A sender cannot normally advance beyond the bounded pending
             // window without ACKs from this destination. On a fresh receiver
             // lane, such a sequence therefore follows history accepted by the
             // receiver's prior process/incarnation. Establish a baseline so
             // current catch-up traffic is not trapped behind unavailable
-            // overlay history.
+            // overlay history. A stuck-lane heal rebases unconditionally:
+            // the gap has been unresolved past the repair window.
             state.next_seq = data.ordering_seq;
         }
 
@@ -620,6 +722,10 @@ impl OverlayOrdering {
         }
 
         if data.ordering_seq > state.next_seq {
+            if state.gap_stuck_since.is_none() {
+                state.gap_stuck_since = Some(now);
+                ordering_metrics::record_inbound_gap_stuck(lane.get());
+            }
             let gap = data.ordering_seq.saturating_sub(state.next_seq);
             if gap as usize > self.reorder_buffer_packets || self.reorder_buffer_packets == 0 {
                 // The frame is further ahead than the reorder buffer on an
@@ -644,7 +750,6 @@ impl OverlayOrdering {
                 .first_key_value()
                 .map_or(data.ordering_seq, |(seq, _)| *seq)
                 .saturating_sub(1);
-            let now = Instant::now();
             let emit_nack = state.last_nack.is_none_or(|last| {
                 last.first_seq != first_seq
                     || last.last_seq != last_seq
@@ -668,6 +773,7 @@ impl OverlayOrdering {
         let mut ready = vec![delivery];
         state.next_seq = state.next_seq.saturating_add(1);
         state.last_nack = None;
+        state.gap_stuck_since = None;
         while let Some(delivery) = state.buffered.remove(&state.next_seq) {
             ready.push(delivery);
             state.next_seq = state.next_seq.saturating_add(1);
@@ -758,6 +864,7 @@ impl OverlayOrdering {
                 .await
                 .retain(|key, _| key.dst != peer);
             self.pending.lock().await.retain(|key, _| key.dst != peer);
+            self.starving.lock().await.retain(|key, _| key.dst != peer);
             ordering_metrics::remove_ordered_pending_dst(peer);
             self.repair_cache.lock().await.retain_peer(peer);
         }
@@ -1501,6 +1608,210 @@ mod tests {
                 "shitspeak_s2s_overlay_ordered_inbound_drops_total",
                 &[("reason", "gap_beyond_reorder"), ("lane", "7")],
             ) >= gap_drops_before + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn stuck_inbound_gap_heals_by_rebasing_to_current() {
+        let cfg = OverlayConfig::new(Vec::new())
+            .with_ordered_reorder_buffer_packets(2)
+            .with_ordered_inbound_gap_heal_after(Duration::from_millis(15));
+        let ordering = OverlayOrdering::new(&cfg);
+        let healed_before = metric_value(
+            "shitspeak_s2s_overlay_ordered_inbound_gap_healed_total",
+            &[("lane", "7")],
+        );
+
+        let first = ordering
+            .accept_inbound(
+                1,
+                &data(0, b"first"),
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.ack_next_seq, 1);
+
+        let far = ordering
+            .accept_inbound(
+                1,
+                &data(10, b"far"),
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert!(far.ready.is_empty());
+        assert_eq!(far.nack, None);
+
+        // The gap has been stuck past the heal window: the next arriving
+        // frame rebases the lane onto its sequence and is delivered
+        // instead of being dropped forever (the skipped range is
+        // recovered by the replication layer's gap detection).
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let healed = ordering
+            .accept_inbound(
+                1,
+                &data(11, b"next"),
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            healed.ready.len(),
+            1,
+            "the stuck lane must rebase and deliver"
+        );
+        assert_eq!(healed.ack_next_seq, 12);
+        assert_eq!(healed.nack, None);
+        assert!(
+            metric_value(
+                "shitspeak_s2s_overlay_ordered_inbound_gap_healed_total",
+                &[("lane", "7")],
+            ) >= healed_before + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_gap_stuck_heals_by_rebasing_onto_current() {
+        let cfg = OverlayConfig::new(Vec::new())
+            .with_ordered_retry_initial(Duration::from_millis(10))
+            .with_ordered_inbound_gap_heal_after(Duration::from_millis(15));
+        let ordering = OverlayOrdering::new(&cfg);
+
+        let gap = ordering
+            .accept_inbound(
+                1,
+                &data(2, b"gap"),
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert_eq!(gap.nack, Some((0, 1)));
+        assert!(gap.ready.is_empty());
+
+        // The gap is inside the reorder buffer (repairable), so even a
+        // fresh lane would wait for the missing prefix; but it has been
+        // stuck past the heal window, so the next arriving frame rebases
+        // onto its own sequence instead.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let healed = ordering
+            .accept_inbound(
+                1,
+                &data(3, b"next"),
+                ServiceLevel::Reliable,
+                MessageClass::Regular,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            healed.ready.len(),
+            1,
+            "the stuck buffered gap must rebase and deliver"
+        );
+        assert_eq!(healed.ack_next_seq, 4);
+        assert_eq!(healed.nack, None);
+    }
+
+    #[tokio::test]
+    async fn starved_reliable_pending_warns_once_and_counts() {
+        let cfg = OverlayConfig::new(Vec::new())
+            .with_ordered_retry_initial(Duration::from_millis(1))
+            .with_ordered_retry_max(Duration::from_millis(1))
+            .with_ordered_pending_starve_after(Duration::from_millis(10));
+        let ordering = OverlayOrdering::new(&cfg);
+        let starve_before = metric_value(
+            "shitspeak_s2s_overlay_ordered_pending_starve_events_total",
+            &[("lane", "4")],
+        );
+        let mut starved = data(0, b"starved");
+        starved.ordering_dst = 84;
+        starved.dsts = vec![84];
+        ordering.store_pending(lane_with(4), starved).await;
+
+        // Two retransmit passes past the starvation threshold: the warn
+        // and the counter fire once per episode, not per pass.
+        let _ = ordering
+            .due_retransmits(Instant::now() + Duration::from_millis(15))
+            .await;
+        let _ = ordering
+            .due_retransmits(Instant::now() + Duration::from_millis(25))
+            .await;
+
+        assert_eq!(
+            metric_value(
+                "shitspeak_s2s_overlay_ordered_pending_starve_events_total",
+                &[("lane", "4")],
+            ),
+            starve_before + 1,
+            "starvation must be counted once per episode"
+        );
+        // Reliable windows are never expired by the retry caps; only the
+        // give-up purge can release them.
+        assert_eq!(
+            ordering.pending_range(84, lane_with(4), 0, 0).await.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn starved_pending_purges_after_giveup_keeping_sequence() {
+        let cfg = OverlayConfig::new(Vec::new())
+            .with_ordered_retry_initial(Duration::from_millis(1))
+            .with_ordered_retry_max(Duration::from_millis(1))
+            .with_ordered_pending_starve_after(Duration::from_millis(10))
+            .with_ordered_pending_starve_purge_after(Duration::from_millis(20));
+        let ordering = OverlayOrdering::new(&cfg);
+        let purged_before = metric_value(
+            "shitspeak_s2s_overlay_ordered_pending_starve_purged_total",
+            &[("lane", "5")],
+        );
+        let mut starved = data(0, b"starved");
+        starved.ordering_dst = 85;
+        starved.dsts = vec![85];
+        // Allocate the sequence the way the originate loop does; the
+        // store_pending helper itself never touches outbound_next.
+        assert_eq!(
+            ordering.next_outbound_seq(85, lane_with(5)).await,
+            0
+        );
+        ordering.store_pending(lane_with(5), starved).await;
+
+        let _ = ordering
+            .due_retransmits(Instant::now() + Duration::from_millis(25))
+            .await;
+
+        assert_eq!(
+            metric_value(
+                "shitspeak_s2s_overlay_ordered_pending_starve_purged_total",
+                &[("lane", "5")],
+            ),
+            purged_before + 1
+        );
+        assert!(
+            ordering
+                .pending_range(85, lane_with(5), 0, 0)
+                .await
+                .is_empty(),
+            "the give-up purge must release the starved window"
+        );
+        assert_eq!(
+            ordering.can_store_pending(&[85], lane_with(5)).await,
+            Ok(()),
+            "the purged window must be reclaimable"
+        );
+        // Sequence continuity is kept: the next sequence continues past
+        // the allocated one (a full reset_peer would rewind it to zero).
+        assert_eq!(
+            ordering.next_outbound_seq(85, lane_with(5)).await,
+            1
+        );
+        assert!(
+            !has_pending_gauge(85, 5),
+            "the purged window must release its exported gauge"
         );
     }
 

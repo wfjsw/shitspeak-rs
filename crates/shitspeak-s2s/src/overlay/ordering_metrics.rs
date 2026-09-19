@@ -140,6 +140,14 @@ static ORDERED_INBOUND_DROPS: LazyLock<Mutex<BTreeMap<(InboundDropReason, u32), 
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 static ORDERED_PENDING: LazyLock<Mutex<BTreeMap<(NodeIdentifier, u32), PendingGauges>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static ORDERED_PENDING_STARVE_EVENTS: LazyLock<Mutex<BTreeMap<u32, u64>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static ORDERED_PENDING_STARVE_PURGED: LazyLock<Mutex<BTreeMap<u32, u64>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static ORDERED_INBOUND_GAP_STUCK: LazyLock<Mutex<BTreeMap<u32, u64>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static ORDERED_INBOUND_GAP_HEALED: LazyLock<Mutex<BTreeMap<u32, u64>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 pub(crate) fn record_no_route_drop(kind: NoRouteKind, dst: NodeIdentifier) {
     *NO_ROUTE_DROPS
@@ -196,6 +204,48 @@ pub(crate) fn remove_ordered_pending_dst(dst: NodeIdentifier) {
         .lock()
         .unwrap()
         .retain(|(pending_dst, _), _| *pending_dst != dst);
+}
+
+/// A Reliable pending window entered starvation: the oldest retained
+/// packet is older than `ordered_pending_starve_after` while the
+/// retain-until-ACK contract still holds it.
+pub(crate) fn record_pending_starve(lane: u32) {
+    *ORDERED_PENDING_STARVE_EVENTS
+        .lock()
+        .unwrap()
+        .entry(lane)
+        .or_insert(0) += 1;
+}
+
+/// A starved Reliable pending window was purged past the give-up
+/// threshold. Sequence continuity is kept; the destination recovers the
+/// skipped range through the replication layer's gap detection.
+pub(crate) fn record_pending_starve_purged(lane: u32) {
+    *ORDERED_PENDING_STARVE_PURGED
+        .lock()
+        .unwrap()
+        .entry(lane)
+        .or_insert(0) += 1;
+}
+
+/// An inbound lane entered a stuck reorder gap (recorded when the gap is
+/// first observed).
+pub(crate) fn record_inbound_gap_stuck(lane: u32) {
+    *ORDERED_INBOUND_GAP_STUCK
+        .lock()
+        .unwrap()
+        .entry(lane)
+        .or_insert(0) += 1;
+}
+
+/// A stuck inbound lane was healed by rebasing onto the current
+/// sequence.
+pub(crate) fn record_inbound_gap_healed(lane: u32) {
+    *ORDERED_INBOUND_GAP_HEALED
+        .lock()
+        .unwrap()
+        .entry(lane)
+        .or_insert(0) += 1;
 }
 
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
@@ -270,6 +320,42 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             gauges.oldest_age_ms as f64,
         ));
     }
+    for (lane, starved) in ORDERED_PENDING_STARVE_EVENTS.lock().unwrap().iter() {
+        if *starved > 0 {
+            samples.push(PrometheusSample::new(
+                "shitspeak_s2s_overlay_ordered_pending_starve_events_total",
+                vec![("lane".to_owned(), lane.to_string())],
+                *starved as f64,
+            ));
+        }
+    }
+    for (lane, purged) in ORDERED_PENDING_STARVE_PURGED.lock().unwrap().iter() {
+        if *purged > 0 {
+            samples.push(PrometheusSample::new(
+                "shitspeak_s2s_overlay_ordered_pending_starve_purged_total",
+                vec![("lane".to_owned(), lane.to_string())],
+                *purged as f64,
+            ));
+        }
+    }
+    for (lane, stuck) in ORDERED_INBOUND_GAP_STUCK.lock().unwrap().iter() {
+        if *stuck > 0 {
+            samples.push(PrometheusSample::new(
+                "shitspeak_s2s_overlay_ordered_inbound_gap_stuck_total",
+                vec![("lane".to_owned(), lane.to_string())],
+                *stuck as f64,
+            ));
+        }
+    }
+    for (lane, healed) in ORDERED_INBOUND_GAP_HEALED.lock().unwrap().iter() {
+        if *healed > 0 {
+            samples.push(PrometheusSample::new(
+                "shitspeak_s2s_overlay_ordered_inbound_gap_healed_total",
+                vec![("lane".to_owned(), lane.to_string())],
+                *healed as f64,
+            ));
+        }
+    }
     samples
 }
 
@@ -291,6 +377,10 @@ mod tests {
         record_nack(7);
         record_inbound_drop(InboundDropReason::GapBeyondReorder, 8);
         record_ordered_pending(9, 8, 4, 250);
+        record_pending_starve(11);
+        record_pending_starve_purged(12);
+        record_inbound_gap_stuck(13);
+        record_inbound_gap_healed(14);
 
         let samples = prometheus_samples();
         assert!(samples.iter().any(|sample| {
@@ -330,6 +420,26 @@ mod tests {
                         ("lane".to_owned(), "8".to_owned()),
                     ]
                 && sample.value() == 4.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_overlay_ordered_pending_starve_events_total"
+                && sample.labels() == [("lane".to_owned(), "11".to_owned())]
+                && sample.value() >= 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_overlay_ordered_pending_starve_purged_total"
+                && sample.labels() == [("lane".to_owned(), "12".to_owned())]
+                && sample.value() >= 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_overlay_ordered_inbound_gap_stuck_total"
+                && sample.labels() == [("lane".to_owned(), "13".to_owned())]
+                && sample.value() >= 1.0
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_overlay_ordered_inbound_gap_healed_total"
+                && sample.labels() == [("lane".to_owned(), "14".to_owned())]
+                && sample.value() >= 1.0
         }));
 
         // Bounded labels only.
