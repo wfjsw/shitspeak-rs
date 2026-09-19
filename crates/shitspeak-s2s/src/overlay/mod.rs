@@ -36,6 +36,7 @@ pub mod lsdb;
 pub mod membership;
 pub mod messaging;
 pub mod neighbor;
+pub(crate) mod ordering_metrics;
 pub(crate) mod proto;
 pub mod routing;
 mod runtime;

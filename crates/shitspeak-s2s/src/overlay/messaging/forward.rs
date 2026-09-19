@@ -25,6 +25,7 @@ use crate::overlay::distribution::{
 };
 use crate::overlay::lsdb::advert::VOICE_UDP_FULL_DUP_LOSS_PPM;
 use crate::overlay::neighbor::NeighborMonitor;
+use crate::overlay::ordering_metrics::{self, NoRouteKind, ReliableOriginateFailure};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_s2s_transport::{
@@ -60,6 +61,7 @@ pub(crate) const MAX_PATH_TRACE_NODES: usize = 256;
 
 static CONTROL_NO_ROUTE_DROPS: AtomicU64 = AtomicU64::new(0);
 static DATA_NO_ROUTE_DROPS: AtomicU64 = AtomicU64::new(0);
+static RELIABLE_ORIGINATE_FAILURE_LOGS: AtomicU64 = AtomicU64::new(0);
 
 fn sampled_drop_count(counter: &AtomicU64) -> Option<u64> {
     let count = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
@@ -370,6 +372,10 @@ pub(crate) async fn originate_with_attachments(
             continue;
         }
         if let Err((dst, lane)) = ordering.can_store_pending(&[dst], lane).await {
+            // The per-destination pending window is full: this one
+            // destination is skipped while the remaining multicast copies
+            // transfer into ownership. Previously metric-invisible.
+            ordering_metrics::record_window_full(lane.get());
             if ownership_err.is_none() {
                 ownership_err = Some(OverlayError::OrderedWindowFull {
                     dst,
@@ -429,6 +435,27 @@ pub(crate) async fn originate_with_attachments(
         )
         .await
         {
+            if level == ServiceLevel::Reliable {
+                // A Reliable first physical forward failure is deliberately
+                // not a rejection (the packet is already retained in
+                // `ordering.pending`), so it would otherwise be completely
+                // invisible at the sender. Count it; warn on powers of two
+                // so a permanently unrouted destination becomes visible
+                // without per-packet log spam.
+                ordering_metrics::record_reliable_originate_failure(
+                    ReliableOriginateFailure::from_error(&err),
+                );
+                if let Some(observed) = sampled_drop_count(&RELIABLE_ORIGINATE_FAILURE_LOGS)
+                {
+                    warn!(
+                        dst = %dst,
+                        lane = lane.get(),
+                        error = %err,
+                        observed,
+                        "ordered reliable originate physical forward failed; retained pending"
+                    );
+                }
+            }
             if physical_err.is_none() {
                 physical_err = Some(err);
             }
@@ -1426,6 +1453,10 @@ async fn send_control_to(
             return Ok(());
         }
         ForwardNextHop::DropNoRoute => {
+            // An end-to-end control frame (ACK/NACK/repair) was silently
+            // dropped because no route exists. Previously log-sampled only
+            // and never exported.
+            ordering_metrics::record_no_route_drop(NoRouteKind::Control, target);
             if let Some(observed_drops) = sampled_drop_count(&CONTROL_NO_ROUTE_DROPS) {
                 debug!(
                     self_id = %self_id,
@@ -2020,6 +2051,9 @@ async fn forward_pb_as(
                 );
             }
             ForwardNextHop::DropNoRoute => {
+                // A transit data frame was silently dropped because no route
+                // exists. Previously log-sampled only and never exported.
+                ordering_metrics::record_no_route_drop(NoRouteKind::Data, dst);
                 if let Some(observed_drops) = sampled_drop_count(&DATA_NO_ROUTE_DROPS) {
                     debug!(
                         self_id = %self_id,
@@ -3767,6 +3801,22 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(sampled, vec![1, 2, 4, 8]);
+
+        // Every no-route drop is also counted on the exported metric
+        // surface, not only in the power-of-two sampled log.
+        crate::overlay::ordering_metrics::record_no_route_drop(
+            crate::overlay::ordering_metrics::NoRouteKind::Control,
+            42,
+        );
+        let samples = crate::overlay::ordering_metrics::prometheus_samples();
+        assert!(samples.iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_overlay_no_route_drops_total"
+                && sample.labels()
+                    == [
+                        ("kind".to_owned(), "control".to_owned()),
+                        ("dst".to_owned(), "42".to_owned()),
+                    ]
+        }));
     }
 
     #[test]
@@ -5347,6 +5397,15 @@ mod tests {
             error,
             OverlayError::OrderedWindowFull { dst: 4, .. }
         ));
+        // The per-destination rejection is exported on the window-full
+        // counter (previously metric-invisible).
+        {
+            let samples = crate::overlay::ordering_metrics::prometheus_samples();
+            assert!(samples.iter().any(|sample| {
+                sample.name() == "shitspeak_s2s_overlay_ordered_window_full_total"
+                    && sample.labels() == [("lane".to_owned(), lane.get().to_string())]
+            }));
+        }
 
         let forwarded = timeout(Duration::from_millis(50), healthy_rx.recv())
             .await

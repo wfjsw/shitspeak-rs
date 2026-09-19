@@ -12,6 +12,7 @@ use tracing::warn;
 
 use crate::overlay::LaneId;
 use crate::overlay::config::OverlayConfig;
+use crate::overlay::ordering_metrics::{self, InboundDropReason};
 use shitspeak_core::NodeIdentifier;
 use shitspeak_proto::s2s_overlay_proto as pb;
 use shitspeak_s2s_transport::{MessageClass, ServiceLevel};
@@ -414,6 +415,7 @@ impl OverlayOrdering {
             }
             if packets.is_empty() {
                 pending.remove(&key);
+                ordering_metrics::remove_ordered_pending(final_dst, lane.get());
             }
         }
     }
@@ -493,10 +495,29 @@ impl OverlayOrdering {
             }
             if packets.is_empty() {
                 empty_keys.push(*key);
+            } else {
+                // Snapshot the retain-until-ACK window state per (dst,
+                // lane) while the retransmit pass already holds the lock.
+                let oldest_age_ms = packets
+                    .values()
+                    .next()
+                    .map(|packet| {
+                        now.saturating_duration_since(packet.first_sent_at)
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64
+                    })
+                    .unwrap_or(0);
+                ordering_metrics::record_ordered_pending(
+                    key.dst,
+                    key.lane.get(),
+                    packets.len() as u64,
+                    oldest_age_ms,
+                );
             }
         }
         for key in empty_keys {
             pending.remove(&key);
+            ordering_metrics::remove_ordered_pending(key.dst, key.lane.get());
         }
         due
     }
@@ -547,12 +568,16 @@ impl OverlayOrdering {
         let src = NodeIdentifier::try_from(data.src).ok()?;
         let final_dst = NodeIdentifier::try_from(data.ordering_dst).ok()?;
         if final_dst != self_id {
+            ordering_metrics::record_inbound_drop(InboundDropReason::DstMismatch, lane.get());
             return None;
         }
         if !self
             .activate_remote_lane(src, data.origin_boot_epoch, self_id, lane)
             .await
         {
+            // The (src, boot_epoch, dst) remote-lane cap is exhausted:
+            // a silent, previously uncounted drop.
+            ordering_metrics::record_inbound_drop(InboundDropReason::RemoteLaneCap, lane.get());
             return None;
         }
         let key = InboundKey {
@@ -597,6 +622,13 @@ impl OverlayOrdering {
         if data.ordering_seq > state.next_seq {
             let gap = data.ordering_seq.saturating_sub(state.next_seq);
             if gap as usize > self.reorder_buffer_packets || self.reorder_buffer_packets == 0 {
+                // The frame is further ahead than the reorder buffer on an
+                // established lane: dropped without a NACK (an established
+                // lane never rebases). Previously a silent forever-drop.
+                ordering_metrics::record_inbound_drop(
+                    InboundDropReason::GapBeyondReorder,
+                    lane.get(),
+                );
                 return Some(AcceptOutcome {
                     ready: Vec::new(),
                     ack_next_seq: state.next_seq,
@@ -624,6 +656,7 @@ impl OverlayOrdering {
                     last_seq,
                     emitted_at: now,
                 });
+                ordering_metrics::record_nack(lane.get());
             }
             return Some(AcceptOutcome {
                 ready: Vec::new(),
@@ -725,6 +758,7 @@ impl OverlayOrdering {
                 .await
                 .retain(|key, _| key.dst != peer);
             self.pending.lock().await.retain(|key, _| key.dst != peer);
+            ordering_metrics::remove_ordered_pending_dst(peer);
             self.repair_cache.lock().await.retain_peer(peer);
         }
         self.inbound
@@ -817,6 +851,32 @@ mod tests {
 
     fn lane_with(id: u32) -> LaneId {
         LaneId::new(NonZeroU32::new(id).unwrap())
+    }
+
+    /// Process-wide metric value for `(name, labels)`. The ordering metrics
+    /// are statics shared by parallel tests, so assertions must be written
+    /// as before/after deltas.
+    fn metric_value(name: &str, labels: &[(&str, &str)]) -> u64 {
+        let wanted = labels
+            .iter()
+            .map(|(label, value)| (label.to_string(), value.to_string()))
+            .collect::<Vec<_>>();
+        ordering_metrics::prometheus_samples()
+            .iter()
+            .find(|sample| sample.name() == name && sample.labels() == wanted)
+            .map(|sample| sample.value() as u64)
+            .unwrap_or(0)
+    }
+
+    fn has_pending_gauge(dst: NodeIdentifier, lane: u32) -> bool {
+        let labels = vec![
+            ("dst".to_owned(), dst.to_string()),
+            ("lane".to_owned(), lane.to_string()),
+        ];
+        ordering_metrics::prometheus_samples().iter().any(|sample| {
+            sample.name() == "shitspeak_s2s_overlay_ordered_pending_packets"
+                && sample.labels() == labels
+        })
     }
 
     fn data_on_lane(seq: u64, body: &'static [u8], lane: LaneId) -> pb::OverlayData {
@@ -917,6 +977,8 @@ mod tests {
             &OverlayConfig::new(Vec::new()).with_ordered_retry_initial(Duration::from_millis(10)),
         );
         let out_of_order = data(2, b"third");
+        let nacks_before =
+            metric_value("shitspeak_s2s_overlay_ordered_nacks_total", &[("lane", "7")]);
 
         let first = ordering
             .accept_inbound(
@@ -959,6 +1021,12 @@ mod tests {
             retry.nack,
             Some((0, 1)),
             "a lost repair request must be retried after the bounded interval"
+        );
+
+        // Every emitted (non-coalesced) NACK is exported on the counter.
+        assert!(
+            metric_value("shitspeak_s2s_overlay_ordered_nacks_total", &[("lane", "7")])
+                >= nacks_before + 2
         );
     }
 
@@ -1017,6 +1085,10 @@ mod tests {
         let cfg =
             OverlayConfig::new(Vec::new()).with_ordered_lane_cap(NonZeroUsize::new(1).unwrap());
         let ordering = OverlayOrdering::new(&cfg);
+        let cap_drops_before = metric_value(
+            "shitspeak_s2s_overlay_ordered_inbound_drops_total",
+            &[("reason", "remote_lane_cap"), ("lane", "2")],
+        );
 
         let first = ordering
             .accept_inbound(
@@ -1037,6 +1109,13 @@ mod tests {
 
         assert!(first.is_some());
         assert!(second.is_none());
+        // The remote-lane-cap drop is exported (previously silent).
+        assert!(
+            metric_value(
+                "shitspeak_s2s_overlay_ordered_inbound_drops_total",
+                &[("reason", "remote_lane_cap"), ("lane", "2")],
+            ) >= cap_drops_before + 1
+        );
     }
 
     #[tokio::test]
@@ -1085,6 +1164,38 @@ mod tests {
                 .is_empty()
         );
         assert!(ordering.pending_range(1, lane(), 0, 0).await.is_empty());
+
+        // A non-expired due pass snapshots the window gauge (unique (dst,
+        // lane) so parallel tests cannot race); the non-Reliable retry-cap
+        // expiry then releases both the window and the exported gauge.
+        let mut gauged = best_effort_data(0, b"gauged");
+        gauged.ordering_dst = 87;
+        gauged.dsts = vec![87];
+        ordering.store_pending(lane_with(8), gauged).await;
+        assert_eq!(
+            ordering
+                .due_retransmits(Instant::now() + Duration::from_millis(1))
+                .await
+                .len(),
+            1
+        );
+        assert!(has_pending_gauge(87, 8));
+        for attempt in 1..16 {
+            let _ = ordering
+                .due_retransmits(Instant::now() + Duration::from_millis(1 + attempt))
+                .await;
+        }
+        assert!(
+            ordering
+                .due_retransmits(Instant::now() + Duration::from_millis(32))
+                .await
+                .is_empty()
+        );
+        assert!(ordering.pending_range(87, lane_with(8), 0, 0).await.is_empty());
+        assert!(
+            !has_pending_gauge(87, 8),
+            "retry-cap expiry must release the exported gauge"
+        );
     }
 
     #[tokio::test]
@@ -1218,6 +1329,24 @@ mod tests {
         assert_eq!(ordering.pending_range(1, lane(), 0, 0).await.len(), 1);
         assert_eq!(ordering.pending_range(1, lane_with(2), 0, 0).await.len(), 1);
 
+        // The retain-until-ACK window state is exported per (dst, lane)
+        // while the pending map is non-empty. A peer reset purges every
+        // lane of that destination and with it the exported gauge. Unique
+        // (dst, lane) so parallel tests cannot race the removal.
+        let mut gauged = data(0, b"gauged");
+        gauged.ordering_dst = 88;
+        gauged.dsts = vec![88];
+        ordering.store_pending(lane_with(9), gauged).await;
+        let _ = ordering
+            .due_retransmits(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(has_pending_gauge(88, 9));
+        ordering.reset_peer(88).await;
+        assert!(
+            !has_pending_gauge(88, 9),
+            "a peer reset must release the exported gauge"
+        );
+
         // Terminal membership decisions and boot-epoch replacement both end
         // retention for the affected destination state.
         ordering.reset_peer(1).await;
@@ -1337,6 +1466,10 @@ mod tests {
     async fn established_lane_never_rebases_across_an_oversized_gap() {
         let cfg = OverlayConfig::new(Vec::new()).with_ordered_reorder_buffer_packets(2);
         let ordering = OverlayOrdering::new(&cfg);
+        let gap_drops_before = metric_value(
+            "shitspeak_s2s_overlay_ordered_inbound_drops_total",
+            &[("reason", "gap_beyond_reorder"), ("lane", "7")],
+        );
         let first = ordering
             .accept_inbound(
                 1,
@@ -1360,6 +1493,15 @@ mod tests {
         assert!(far.ready.is_empty());
         assert_eq!(far.ack_next_seq, 1);
         assert_eq!(far.nack, None);
+
+        // The oversized-gap drop without a NACK is exported (previously a
+        // silent forever-drop on an established lane).
+        assert!(
+            metric_value(
+                "shitspeak_s2s_overlay_ordered_inbound_drops_total",
+                &[("reason", "gap_beyond_reorder"), ("lane", "7")],
+            ) >= gap_drops_before + 1
+        );
     }
 
     #[tokio::test]

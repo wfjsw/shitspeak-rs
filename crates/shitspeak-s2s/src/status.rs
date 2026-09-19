@@ -1954,6 +1954,7 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
         snapshot.local_node,
     ));
     out.extend(crate::overlay::attachment_metrics::prometheus_samples());
+    out.extend(crate::overlay::ordering_metrics::prometheus_samples());
     let local_node = snapshot.local_node.to_string();
     for node in snapshot
         .nodes
