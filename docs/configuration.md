@@ -181,7 +181,7 @@ max_text_message_length = 5000
 max_image_message_length = 131072
 ```
 
-`max_bandwidth` is the default per-client bandwidth value advertised to clients. Authenticators can override it per user by returning `max_bandwidth`.
+`max_bandwidth` is the default per-client bandwidth value advertised to clients, in bits per second. Authenticators can override it per user by returning `max_bandwidth`. When the value changes, the server resets each client limiter and allows a five-second grace period before enforcing the new cap. The limiter also permits short bursts up to twice the configured rate, while protocol-violation detection requires sustained traffic above three times the rate.
 
 ### Channel Defaults
 
