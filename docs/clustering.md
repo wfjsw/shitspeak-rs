@@ -207,6 +207,39 @@ admitting it again. An eligible datagram path may replace a reliable incumbent
 immediately. Voice min-hold and challenger confirmation continue to govern
 other path changes.
 
+Voice tree edges also react to congestion that has not yet caused loss. Each
+first hop's conversational pressure includes three signals from its best-effort
+datagram lane:
+
+- Frames shed at the send path because they expired before the wire. Two or
+  more in the last second mark the lane congested; ten or more mark it failed.
+- The send queue's standing delay: the minimum time any frame waited during
+  the last 100 ms, which stays near zero through transient bursts and rises
+  only when the queue never drains. 20 ms is degraded, 60 ms congested, and
+  200 ms failed. For the QUIC DATAGRAM lane this also replaces the queue-fill
+  estimate in transport ranking, since that lane has no byte ceiling to fill.
+- Path queueing delay: the smoothed RTT above its empty-queue baseline, a
+  windowed minimum over the last two to four minutes. It is degraded at 30 ms
+  or a quarter of the baseline, whichever is larger, and congested at 60 ms or
+  half the baseline. RTT inflation alone never marks a hop failed, because the
+  frames still arrive.
+
+A failed hop escapes immediately. A congested incumbent lets a cheaper
+challenger take over on its first observation (like hard loss and sink-reported
+gaps), and the congested hop is then excluded from winning the load back. So is
+a challenger whose split transition aborts. Each exclusion lasts 10 seconds,
+doubling with every further exclusion of the same hop on the same edge within
+10 minutes, up to 160 seconds. That stops a route that congests whenever it
+carries the load from flapping.
+
+The signals are exported per peer and transport as
+`shitspeak_s2s_datagram_lane_{sheds,standing_delay_us,queueing_delay_us,rtt_baseline_us,congestion_pressure}`.
+`shitspeak_s2s_voice_datagram_lane_signal_total{signal="congested"}` counts
+tree-edge decisions made while a first hop was congested, and
+`shitspeak_s2s_voice_tree_edge_route_exclusions_total{reason}` with
+`shitspeak_s2s_voice_tree_edge_route_exclusion_seconds` show `split_abort` and
+`congested_exit` exclusions.
+
 ## Transport Compression
 
 S2S transport supports selective payload compression:

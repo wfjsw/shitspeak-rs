@@ -16,7 +16,7 @@ use crate::application::proto::{
     self, VOICE_PATH_FEEDBACK_SERVICE_TAG, VOICE_REPAIR_SERVICE_TAG, VOICE_SERVICE_TAG,
     VoiceIntent, VoicePathFeedback,
 };
-use crate::application::voice::fec::FecSendOutcome;
+use crate::application::voice::fec::{FecParityPath, FecSendOutcome};
 use crate::application::voice::{fec::FecSenderState, metrics};
 use crate::overlay::{OverlayNetwork, OverlaySendOptions, RoutingMetric, VoiceRouteQuality};
 use shitspeak_core::NodeIdentifier;
@@ -201,11 +201,10 @@ pub trait VoiceTransport: Send + Sync + 'static {
     ) -> Result<(), ApplicationError>;
 
     /// Emit one FEC parity frame toward every receiver in `dsts`, all of
-    /// which share `first_hop`. The production transport rate-limits per
-    /// `first_hop` against the overlay's lane-headroom budget and reports
-    /// whether the frame was admitted (`Sent`) or shed (`Shed`) before
-    /// leaving. The default keeps test transports on the plain multicast
-    /// path.
+    /// which share `first_hop`. Parity is not charged to a byte budget; the
+    /// outcome reports whether the frame left (`Sent`) or failed before the
+    /// wire (`Shed`). The default keeps test transports on the plain
+    /// multicast path.
     async fn send_fec_frame(
         &self,
         dsts: &[NodeIdentifier],
@@ -285,7 +284,11 @@ impl FecVoiceTransport {
         Self {
             inner,
             sender: cfg.voice_fec_enabled.then(|| {
-                FecSenderState::new(cfg.voice_fec_block_size, cfg.voice_fec_parity_blocks)
+                FecSenderState::new(
+                    cfg.voice_fec_block_size,
+                    cfg.voice_fec_parity_blocks,
+                    cfg.voice_fec_interleave_depth,
+                )
             }),
             parity_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             shutdown,
@@ -333,7 +336,7 @@ impl FecVoiceTransport {
         }
         if let (Some(sender), Some(frame), Some((first_hop, _))) = (&self.sender, frame, fec_route)
         {
-            let Some(block) = sender.push(
+            let emissions = sender.push(
                 first_hop,
                 &[dst],
                 frame.sender_session,
@@ -341,22 +344,19 @@ impl FecVoiceTransport {
                 frame.s2s_seq,
                 frame.payload,
                 frame.is_terminator,
-            ) else {
-                return Ok(());
-            };
-            if self.inner.datagram_lane_shedding(first_hop) {
+            );
+            if emissions.is_empty() || self.inner.datagram_lane_shedding(first_hop) {
                 return Ok(());
             }
             let Ok(slot) = self.parity_slots.clone().try_acquire_owned() else {
-                for index in 0..2 {
-                    if let Some(body) =
-                        block.encode(frame.sender_session, frame.sender_epoch, index)
-                    {
+                for emission in &emissions {
+                    if let Some(body) = emission.encode(frame.sender_session, frame.sender_epoch) {
                         metrics::record_fec_send(
                             self.inner.local_node_id(),
                             first_hop,
                             body.len(),
                             FecSendOutcome::Shed,
+                            FecParityPath::Primary,
                         );
                     }
                 }
@@ -367,14 +367,20 @@ impl FecVoiceTransport {
             tokio::spawn(async move {
                 let _slot = slot;
                 let destinations = [dst];
-                for index in 0..2 {
-                    let Some(body) = block.encode(frame.sender_session, frame.sender_epoch, index)
+                let paced_from = tokio::time::Instant::now();
+                for emission in emissions {
+                    let Some(body) = emission.encode(frame.sender_session, frame.sender_epoch)
                     else {
                         continue;
                     };
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep_until(paced_from + emission.delay()) => {}
+                    }
                     let remaining = ttl.saturating_sub(started.elapsed());
                     if remaining.is_zero() {
-                        break;
+                        return;
                     }
                     let bytes = body.len();
                     let outcome = tokio::select! {
@@ -391,7 +397,15 @@ impl FecVoiceTransport {
                         ),
                     ) => outcome.unwrap_or(FecSendOutcome::Shed),
                     };
-                    metrics::record_fec_send(transport.local_node_id(), first_hop, bytes, outcome);
+                    // The copy already rides the alternate; its parity shares
+                    // the copy's own first hop.
+                    metrics::record_fec_send(
+                        transport.local_node_id(),
+                        first_hop,
+                        bytes,
+                        outcome,
+                        FecParityPath::Primary,
+                    );
                 }
             });
         }
@@ -513,20 +527,6 @@ impl VoiceTransport for FecVoiceTransport {
 /// Production `VoiceTransport` impl backed by the overlay network.
 pub struct OverlayVoiceTransport {
     pub overlay: OverlayNetwork,
-}
-
-struct FecHeadroomReservation<'a> {
-    overlay: &'a OverlayNetwork,
-    first_hop: NodeIdentifier,
-    bytes: usize,
-    sent: bool,
-}
-
-impl Drop for FecHeadroomReservation<'_> {
-    fn drop(&mut self) {
-        self.overlay
-            .release_fec_headroom(self.first_hop, self.bytes, self.sent);
-    }
 }
 
 #[async_trait]
@@ -735,9 +735,7 @@ impl VoiceTransport for OverlayVoiceTransport {
         if dsts.is_empty() {
             return FecSendOutcome::Shed;
         }
-        // Without a known first hop there is no lane budget to hold the
-        // parity against; fall back to the plain multicast path.
-        let Some(first_hop) = first_hop else {
+        if first_hop.is_none() {
             if avoid_first_hop.is_some() {
                 return FecSendOutcome::Shed;
             }
@@ -745,17 +743,7 @@ impl VoiceTransport for OverlayVoiceTransport {
                 Ok(()) => FecSendOutcome::Sent,
                 Err(_) => FecSendOutcome::Shed,
             };
-        };
-        let bytes = body.len();
-        if !self.overlay.try_reserve_fec_headroom(first_hop, bytes) {
-            return FecSendOutcome::Shed;
         }
-        let mut reservation = FecHeadroomReservation {
-            overlay: &self.overlay,
-            first_hop,
-            bytes,
-            sent: false,
-        };
         let mut options = OverlaySendOptions::default().expire_after(ttl);
         if let Some(avoid) = avoid_first_hop {
             options = options.avoid_first_hop(avoid);
@@ -772,7 +760,6 @@ impl VoiceTransport for OverlayVoiceTransport {
                 options,
             )
             .await;
-        reservation.sent = result.is_ok();
         match result {
             Ok(()) => FecSendOutcome::Sent,
             Err(_) => FecSendOutcome::Shed,

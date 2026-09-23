@@ -32,6 +32,7 @@ use super::connection::{
     PeerState, QuicSessionStatusSnapshot, SessionSender, SessionTrySendError,
     VoiceTransportCandidateScore,
 };
+use super::connection::{DATAGRAM_LANE_SHED_HARD_THRESHOLD, DATAGRAM_LANE_SHED_THRESHOLD};
 use super::connection::{OutboundEnvelope, TransportPayloadPlan};
 use super::endpoint::{
     EndpointRegistry,
@@ -648,6 +649,129 @@ pub struct BestEffortSinkFeedback {
     /// flushes, or over-budget held delay) within the staleness window.
     /// `false` with no live feedback: absence of a report is not a suspicion.
     pub suspect: bool,
+}
+
+/// Congestion evidence on the best-effort datagram lane voice rides to one
+/// peer, from three signals that need no packet loss: frames shed at the send
+/// path, the lane's standing queue delay (the send queue never drains), and
+/// path queueing delay (smoothed RTT above its empty-queue baseline, i.e. a
+/// queue building somewhere along the path).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DatagramLaneCongestion {
+    sheds: usize,
+    standing_delay: Duration,
+    queueing_delay: Option<Duration>,
+    rtt_baseline: Option<Duration>,
+}
+
+/// Standing send-queue delay grades: degraded, congested, failed.
+const STANDING_DELAY_DEGRADED: Duration = Duration::from_millis(20);
+const STANDING_DELAY_CONGESTED: Duration = Duration::from_millis(60);
+const STANDING_DELAY_FAILED: Duration = Duration::from_millis(200);
+/// Path queueing delay grades: at least this much, and at least this share of
+/// the baseline RTT (a long path tolerates proportionally more variation).
+const QUEUEING_DELAY_DEGRADED: Duration = Duration::from_millis(30);
+const QUEUEING_DELAY_CONGESTED: Duration = Duration::from_millis(60);
+const QUEUEING_DELAY_DEGRADED_BASELINE_DIVISOR: u32 = 4;
+const QUEUEING_DELAY_CONGESTED_BASELINE_DIVISOR: u32 = 2;
+
+impl DatagramLaneCongestion {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        sheds: usize,
+        standing_delay: Duration,
+        queueing_delay: Option<Duration>,
+        rtt_baseline: Option<Duration>,
+    ) -> Self {
+        Self {
+            sheds,
+            standing_delay,
+            queueing_delay,
+            rtt_baseline,
+        }
+    }
+
+    /// Frames shed at the send path within the shed window.
+    pub fn sheds(&self) -> usize {
+        self.sheds
+    }
+
+    /// Standing queue delay of the lane's send queue.
+    pub fn standing_delay(&self) -> Duration {
+        self.standing_delay
+    }
+
+    /// Smoothed RTT above its empty-queue baseline, when both are known.
+    pub fn queueing_delay(&self) -> Option<Duration> {
+        self.queueing_delay
+    }
+
+    pub fn rtt_baseline(&self) -> Option<Duration> {
+        self.rtt_baseline
+    }
+
+    /// Conversational pressure (0-3) the congestion alone warrants: 3 when
+    /// the lane drops voice outright (sustained heavy sheds or a stalled send
+    /// queue), 2 when it is congested, 1 when it is building a queue. RTT
+    /// inflation alone never reaches 3; the frames still arrive.
+    pub fn pressure(&self) -> u8 {
+        let shed_pressure = if self.sheds >= DATAGRAM_LANE_SHED_HARD_THRESHOLD {
+            3
+        } else if self.sheds >= DATAGRAM_LANE_SHED_THRESHOLD {
+            2
+        } else {
+            0
+        };
+        let standing_pressure = if self.standing_delay >= STANDING_DELAY_FAILED {
+            3
+        } else if self.standing_delay >= STANDING_DELAY_CONGESTED {
+            2
+        } else if self.standing_delay >= STANDING_DELAY_DEGRADED {
+            1
+        } else {
+            0
+        };
+        let queueing_pressure = match (self.queueing_delay, self.rtt_baseline) {
+            (Some(queueing), Some(baseline)) => {
+                let congested = QUEUEING_DELAY_CONGESTED
+                    .max(baseline / QUEUEING_DELAY_CONGESTED_BASELINE_DIVISOR);
+                let degraded = QUEUEING_DELAY_DEGRADED
+                    .max(baseline / QUEUEING_DELAY_DEGRADED_BASELINE_DIVISOR);
+                if queueing >= congested {
+                    2
+                } else if queueing >= degraded {
+                    1
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        shed_pressure.max(standing_pressure).max(queueing_pressure)
+    }
+
+    /// Congested enough that routing should treat the lane as degraded.
+    pub fn congested(&self) -> bool {
+        self.pressure() >= 2
+    }
+}
+
+fn datagram_lane_congestion(
+    peer: &PeerState,
+    transport: TransportKind,
+    snapshot: &TransportMetricsSnapshot,
+    now: Instant,
+) -> DatagramLaneCongestion {
+    let link = snapshot.get(&transport);
+    let micros = |us: f64| Duration::from_micros(us.max(0.0) as u64);
+    DatagramLaneCongestion {
+        sheds: peer.datagram_lane_shed_count(now),
+        standing_delay: peer
+            .datagram_lane_standing_delay(transport)
+            .unwrap_or_default(),
+        queueing_delay: link.and_then(LinkMetrics::queueing_delay_us).map(micros),
+        rtt_baseline: link.and_then(LinkMetrics::rtt_baseline_us).map(micros),
+    }
 }
 
 /// Public handle.
@@ -1836,6 +1960,22 @@ impl ConnectionManager {
         class: MessageClass,
         options: SendOptions,
     ) -> Option<u8> {
+        self.conversational_path_assessment(node, level, routing_metric, class, options)
+            .map(|(pressure, _)| pressure)
+    }
+
+    /// Conversational pressure of the path to `node` together with the
+    /// congestion evidence on the best-effort datagram lane it rides (default
+    /// when the level or metric is not conversational best effort). The
+    /// pressure already folds the congestion in.
+    pub fn conversational_path_assessment(
+        &self,
+        node: NodeIdentifier,
+        level: ServiceLevel,
+        routing_metric: RoutingMetric,
+        class: MessageClass,
+        options: SendOptions,
+    ) -> Option<(u8, DatagramLaneCongestion)> {
         let peer = self.inner.get_peer(node)?;
         let now = Instant::now();
         let policy = self.inner.cfg().routing_policy();
@@ -1868,7 +2008,7 @@ impl ConnectionManager {
             &peer, selected, level, class, options, now, &snapshot,
         );
         if routing_metric != RoutingMetric::ConversationalQuality {
-            return Some(queue_pressure);
+            return Some((queue_pressure, DatagramLaneCongestion::default()));
         }
 
         let quality_transport = if level == ServiceLevel::BestEffort {
@@ -1893,12 +2033,42 @@ impl ConnectionManager {
             snapshot.get(&quality_transport),
         )) * 2;
         let feedback_pressure = u8::from(peer.conversational_feedback_suspect(now)) * 2;
-        Some(
+        let congestion = if level == ServiceLevel::BestEffort {
+            datagram_lane_congestion(&peer, quality_transport, &snapshot, now)
+        } else {
+            DatagramLaneCongestion::default()
+        };
+        Some((
             queue_pressure
                 .max(quality_pressure)
                 .max(playout_pressure)
-                .max(feedback_pressure),
-        )
+                .max(feedback_pressure)
+                .max(congestion.pressure()),
+            congestion,
+        ))
+    }
+
+    /// Congestion evidence on each live datagram lane to `node`, for export:
+    /// `(transport, congestion)` for the UDP and QUIC lanes that exist.
+    pub fn datagram_lane_congestion_snapshots(
+        &self,
+        node: NodeIdentifier,
+    ) -> Vec<(TransportKind, DatagramLaneCongestion)> {
+        let Some(peer) = self.inner.get_peer(node) else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let snapshot = peer.metrics().snapshot_per_transport();
+        [TransportKind::Udp, TransportKind::Quic]
+            .into_iter()
+            .filter(|transport| peer.datagram_lane_standing_delay(*transport).is_some())
+            .map(|transport| {
+                (
+                    transport,
+                    datagram_lane_congestion(&peer, transport, &snapshot, now),
+                )
+            })
+            .collect()
     }
 
     /// Health of the best-effort datagram lane for `node` — the lane voice
@@ -3066,7 +3236,21 @@ fn deadline_queue_penalty_with_additional_depth_and_snapshot(
             .and_then(|sender| sender.quic_v2_max_datagram_size())
             .is_some()
     {
-        return additional_fill_penalty;
+        // The DATAGRAM lane is unbounded, so its fill says nothing; its
+        // standing queue delay against the frame's remaining deadline does.
+        let standing = peer
+            .datagram_lane_standing_delay(TransportKind::Quic)
+            .unwrap_or_default();
+        let standing_penalty = if standing <= remaining / 4 {
+            0
+        } else if standing <= remaining / 2 {
+            1
+        } else if standing <= remaining * 9 / 10 {
+            2
+        } else {
+            3
+        };
+        return additional_fill_penalty.max(standing_penalty);
     }
 
     let Some(status) = peer.outbound_lane_queue_status(transport, level, class) else {
@@ -5867,6 +6051,89 @@ mod tests {
             1,
             "selection and returned metrics must share one peer snapshot"
         );
+    }
+
+    #[tokio::test]
+    async fn conversational_path_pressure_sees_congestion_without_loss() {
+        let (transport, _receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Udp]);
+        let peer = transport.inner.get_peer(2).expect("peer");
+        let assess = || {
+            transport
+                .conversational_path_assessment(
+                    2,
+                    ServiceLevel::BestEffort,
+                    RoutingMetric::ConversationalQuality,
+                    MessageClass::HighPriority,
+                    SendOptions::default(),
+                )
+                .expect("live peer")
+        };
+        transport.record_peer_rtt(2, TransportKind::Udp, Duration::from_millis(40));
+        assert_eq!(assess().0, 0);
+
+        // A queue building along the path: RTT far above its 40 ms floor.
+        for _ in 0..64 {
+            transport.record_peer_rtt(2, TransportKind::Udp, Duration::from_millis(140));
+        }
+        let (pressure, congestion) = assess();
+        assert_eq!(congestion.rtt_baseline(), Some(Duration::from_millis(40)));
+        assert!(congestion.queueing_delay().unwrap() >= Duration::from_millis(90));
+        assert_eq!(pressure, 2, "RTT inflation alone marks the path congested");
+        assert!(congestion.congested());
+
+        // Frames shed at the send path escalate to a failed first hop.
+        for _ in 0..DATAGRAM_LANE_SHED_HARD_THRESHOLD {
+            peer.record_datagram_lane_shed();
+        }
+        let (pressure, congestion) = assess();
+        assert_eq!(congestion.sheds(), DATAGRAM_LANE_SHED_HARD_THRESHOLD);
+        assert_eq!(pressure, 3);
+
+        // Reliable service levels ride no datagram lane.
+        let (reliable_transport, _reliable_receivers) =
+            ConnectionManager::test_with_live_streams(1, 2, &[TransportKind::Tcp]);
+        reliable_transport.record_peer_rtt(2, TransportKind::Tcp, Duration::from_millis(40));
+        let (_, reliable) = reliable_transport
+            .conversational_path_assessment(
+                2,
+                ServiceLevel::Reliable,
+                RoutingMetric::ConversationalQuality,
+                MessageClass::HighPriority,
+                SendOptions::default(),
+            )
+            .expect("live peer");
+        assert_eq!(reliable, DatagramLaneCongestion::default());
+    }
+
+    #[test]
+    fn datagram_lane_congestion_grades_each_signal() {
+        let ms = Duration::from_millis;
+        let grade = |sheds, standing, queueing: Option<u64>, baseline: Option<u64>| {
+            DatagramLaneCongestion::for_test(
+                sheds,
+                ms(standing),
+                queueing.map(ms),
+                baseline.map(ms),
+            )
+            .pressure()
+        };
+        assert_eq!(grade(0, 0, None, None), 0);
+        assert_eq!(grade(1, 0, None, None), 0, "one shed is noise");
+        assert_eq!(grade(DATAGRAM_LANE_SHED_THRESHOLD, 0, None, None), 2);
+        assert_eq!(grade(DATAGRAM_LANE_SHED_HARD_THRESHOLD, 0, None, None), 3);
+        assert_eq!(grade(0, 19, None, None), 0);
+        assert_eq!(grade(0, 20, None, None), 1);
+        assert_eq!(grade(0, 60, None, None), 2);
+        assert_eq!(grade(0, 200, None, None), 3);
+        // Queueing delay needs a baseline and scales with it.
+        assert_eq!(grade(0, 0, Some(50), None), 0);
+        assert_eq!(grade(0, 0, Some(29), Some(20)), 0);
+        assert_eq!(grade(0, 0, Some(30), Some(20)), 1);
+        assert_eq!(grade(0, 0, Some(60), Some(20)), 2);
+        assert_eq!(grade(0, 0, Some(60), Some(300)), 0, "25% of a 300 ms path");
+        assert_eq!(grade(0, 0, Some(150), Some(300)), 2);
+        assert_eq!(grade(0, 0, Some(10_000), Some(20)), 2, "never a failed hop");
     }
 
     #[tokio::test]

@@ -32,6 +32,7 @@ pub(crate) struct TopologySnapshot {
     expired_outbound_drops: Vec<ExpiredOutboundDropMetric>,
     transport_health_exclusions: Vec<TransportHealthExclusionMetric>,
     datagram_path_health: Vec<DatagramPathHealthMetric>,
+    datagram_lane_congestion: Vec<DatagramLaneCongestionMetric>,
     delivery_path_selections: Vec<DeliveryPathSelectionMetric>,
     voice_transport_bindings: Vec<VoiceTransportBindingMetric>,
     voice_transport_binding_events: Vec<VoiceTransportBindingEventMetric>,
@@ -42,6 +43,19 @@ pub(crate) struct TopologySnapshot {
     quic_protocol_errors: Vec<QuicProtocolErrorMetric>,
     quic_sessions: Vec<QuicSessionMetric>,
     debug_packet_io: Vec<crate::debug_io::PacketIoSnapshot>,
+}
+
+/// Congestion evidence on one live datagram lane: the loss-free signals the
+/// voice tree-edge controller folds into conversational pressure.
+#[derive(Debug, Serialize)]
+pub(crate) struct DatagramLaneCongestionMetric {
+    peer: NodeIdentifier,
+    transport: &'static str,
+    sheds: usize,
+    standing_delay_us: u128,
+    queueing_delay_us: Option<u128>,
+    rtt_baseline_us: Option<u128>,
+    pressure: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -822,6 +836,25 @@ pub(crate) fn build_topology_snapshot(
             errors: entry.errors(),
         })
         .collect();
+    let mut datagram_lane_congestion = transport
+        .live_peers()
+        .into_iter()
+        .flat_map(|(peer, _)| {
+            transport
+                .datagram_lane_congestion_snapshots(peer)
+                .into_iter()
+                .map(move |(kind, congestion)| DatagramLaneCongestionMetric {
+                    peer,
+                    transport: transport_kind_name(kind),
+                    sheds: congestion.sheds(),
+                    standing_delay_us: congestion.standing_delay().as_micros(),
+                    queueing_delay_us: congestion.queueing_delay().map(|delay| delay.as_micros()),
+                    rtt_baseline_us: congestion.rtt_baseline().map(|delay| delay.as_micros()),
+                    pressure: congestion.pressure(),
+                })
+        })
+        .collect::<Vec<_>>();
+    datagram_lane_congestion.sort_by_key(|entry| (entry.peer, entry.transport));
     let quic_sessions = transport
         .quic_session_status()
         .into_iter()
@@ -853,6 +886,7 @@ pub(crate) fn build_topology_snapshot(
         expired_outbound_drops,
         transport_health_exclusions,
         datagram_path_health,
+        datagram_lane_congestion,
         delivery_path_selections,
         voice_transport_bindings,
         voice_transport_binding_events,
@@ -1123,6 +1157,31 @@ impl<'a> PrometheusWriter<'a> {
         self.header(
             "shitspeak_s2s_datagram_path_health",
             "Current shadow health state for each local BestEffort datagram delivery path.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_lane_sheds",
+            "Best-effort datagram frames shed at the send path to a peer in the last second.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_lane_standing_delay_us",
+            "Standing queue delay of a peer's datagram send lane: the minimum wait over the last 100 ms.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_lane_queueing_delay_us",
+            "Smoothed RTT above its empty-queue baseline on a peer's datagram transport.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_lane_rtt_baseline_us",
+            "Windowed minimum RTT on a peer's datagram transport.",
+            "gauge",
+        );
+        self.header(
+            "shitspeak_s2s_datagram_lane_congestion_pressure",
+            "Conversational pressure (0-3) a peer's datagram lane congestion alone contributes.",
             "gauge",
         );
         self.header(
@@ -2331,6 +2390,48 @@ fn samples_from_snapshot(snapshot: &TopologySnapshot) -> Vec<PrometheusSample> {
         ));
     }
 
+    let mut shed_peers = std::collections::HashSet::new();
+    for entry in &snapshot.datagram_lane_congestion {
+        let source = local_node.clone();
+        let peer = entry.peer.to_string();
+        if shed_peers.insert(entry.peer) {
+            out.push(sample(
+                "shitspeak_s2s_datagram_lane_sheds",
+                vec![("source", source.as_str()), ("peer", peer.as_str())],
+                entry.sheds as f64,
+            ));
+        }
+        let labels = vec![
+            ("source", source.as_str()),
+            ("peer", peer.as_str()),
+            ("transport", entry.transport),
+        ];
+        out.push(sample(
+            "shitspeak_s2s_datagram_lane_standing_delay_us",
+            labels.clone(),
+            entry.standing_delay_us as f64,
+        ));
+        if let Some(delay) = entry.queueing_delay_us {
+            out.push(sample(
+                "shitspeak_s2s_datagram_lane_queueing_delay_us",
+                labels.clone(),
+                delay as f64,
+            ));
+        }
+        if let Some(baseline) = entry.rtt_baseline_us {
+            out.push(sample(
+                "shitspeak_s2s_datagram_lane_rtt_baseline_us",
+                labels.clone(),
+                baseline as f64,
+            ));
+        }
+        out.push(sample(
+            "shitspeak_s2s_datagram_lane_congestion_pressure",
+            labels,
+            f64::from(entry.pressure),
+        ));
+    }
+
     for entry in &snapshot.datagram_path_health {
         let source = local_node.clone();
         let peer = entry.peer.to_string();
@@ -3501,6 +3602,15 @@ mod tests {
                 observation_age_ms: 25,
                 diagnostic_observation_age_ms: Some(10),
             }],
+            datagram_lane_congestion: vec![DatagramLaneCongestionMetric {
+                peer: 2,
+                transport: "quic",
+                sheds: 3,
+                standing_delay_us: 70_000,
+                queueing_delay_us: Some(45_000),
+                rtt_baseline_us: Some(80_000),
+                pressure: 2,
+            }],
             delivery_path_selections: vec![DeliveryPathSelectionMetric {
                 path: "quic_datagram",
                 selections: 13,
@@ -3618,6 +3728,27 @@ mod tests {
         );
 
         assert!(rendered.contains("# TYPE shitspeak_s2s_node_info gauge\n"));
+        for metric in [
+            "shitspeak_s2s_datagram_lane_standing_delay_us",
+            "shitspeak_s2s_datagram_lane_queueing_delay_us",
+            "shitspeak_s2s_datagram_lane_rtt_baseline_us",
+            "shitspeak_s2s_datagram_lane_congestion_pressure",
+        ] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{metric}{{"))
+                        && line.contains("peer=\"2\",transport=\"quic\"")),
+                "{metric} exported per peer and transport"
+            );
+        }
+        assert!(
+            rendered.lines().any(
+                |line| line.starts_with("shitspeak_s2s_datagram_lane_sheds{")
+                    && line.contains("peer=\"2\"}")
+            ),
+            "sheds exported once per peer"
+        );
         assert!(
             rendered
                 .contains("# TYPE shitspeak_s2s_node_strict_replication_protocol_version gauge\n")

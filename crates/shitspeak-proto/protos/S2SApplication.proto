@@ -148,15 +148,16 @@ message VoiceFrame {
 
   // Change-set C3 best-effort block FEC. When set, this frame is NOT part of
   // the data sequence: `payload` is a parity frame for the block named by
-  // `fec_member_seqs` (all members have equal length, so reconstruction is
-  // unambiguous), and receivers route it to the FEC window, never the
+  // `fec_member_seqs`, and receivers route it to the FEC window, never the
   // reorder. `s2s_seq` is the seq of the frame that completed the block
-  // (correlation/debug only). `fec_parity_index` selects which parity equation
-  // the payload carries: 0 is the plain XOR sum (recovers one missing member),
-  // 1 is the GF(2^8) weighted sum with Vandermonde coefficient 2^index
-  // (together with index 0, recovers two missing members). A peer that only
-  // sends index 0 interoperates with receivers expecting either. Absent/false
-  // for peers predating this field.
+  // (correlation/debug only). `fec_parity_index` selects the parity equation.
+  // Indices 0 and 1 belonged to the retired XOR / 2^i scheme. Index 2 + j is
+  // row j of a systematic Cauchy Reed-Solomon code over GF(2^8)
+  // (x^8+x^4+x^3+x^2+1), with coefficient 1 / ((32 + j) ^ member_index). Each
+  // member is coded as its big-endian u16 length followed by its payload,
+  // zero-padded to the parity length. Any `fec_member_seqs.len()` of a
+  // block's members and parities recover the block. Absent/false for peers
+  // predating this field.
   bool fec_parity           = 10;
   repeated uint64 fec_member_seqs = 11;
   // Bit `i` set when member `i` of the block was an utterance terminator, so

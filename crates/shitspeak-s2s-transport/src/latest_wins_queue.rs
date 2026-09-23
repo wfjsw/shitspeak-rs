@@ -11,12 +11,19 @@
 //!   time, so the lane's footprint stays bounded by offered rate × deadline
 //!   rather than an arbitrary byte ceiling. Because the lane is never full, it
 //!   reports a "no ceiling" capacity.
+//!
+//! Both flavors measure the lane's standing queue delay the way CoDel does:
+//! the minimum time any item waited during the last [`SOJOURN_INTERVAL`]. A
+//! transient burst leaves the minimum near zero; a queue that never drains —
+//! the drain side (socket or QUIC congestion window) cannot keep up — raises
+//! it. That is a congestion signal that needs no loss and no byte ceiling.
 
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -26,9 +33,13 @@ pub(crate) trait LatestWinsQueueItem {
     fn estimated_queue_bytes(&self) -> usize;
 }
 
+/// Window over which the minimum item wait is taken as the standing delay.
+pub(crate) const SOJOURN_INTERVAL: Duration = Duration::from_millis(100);
+
 struct Entry<T> {
     item: T,
     bytes: usize,
+    enqueued_at: Instant,
 }
 
 struct State<T> {
@@ -36,6 +47,88 @@ struct State<T> {
     depth_bytes: usize,
     closed: bool,
     cancelled: bool,
+    sojourn: SojournTracker,
+}
+
+/// Minimum-wait tracker over consecutive [`SOJOURN_INTERVAL`]s.
+struct SojournTracker {
+    interval_start: Instant,
+    interval_min: Option<Duration>,
+    /// The queue drained empty at some point this interval: no standing queue.
+    drained: bool,
+    /// Minimum wait over the last completed interval.
+    standing: Duration,
+}
+
+impl SojournTracker {
+    fn new(now: Instant) -> Self {
+        Self {
+            interval_start: now,
+            interval_min: None,
+            drained: false,
+            standing: Duration::ZERO,
+        }
+    }
+
+    fn roll(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.interval_start) < SOJOURN_INTERVAL {
+            return;
+        }
+        self.standing = match (self.drained, self.interval_min) {
+            (false, Some(min)) => min,
+            _ => Duration::ZERO,
+        };
+        self.interval_start = now;
+        self.interval_min = None;
+        self.drained = false;
+    }
+
+    fn observe(&mut self, waited: Duration, drained: bool, now: Instant) {
+        self.roll(now);
+        self.interval_min = Some(self.interval_min.map_or(waited, |min| min.min(waited)));
+        self.drained |= drained;
+    }
+}
+
+impl<T> State<T> {
+    fn new(now: Instant) -> Self {
+        Self {
+            items: VecDeque::new(),
+            depth_bytes: 0,
+            closed: false,
+            cancelled: false,
+            sojourn: SojournTracker::new(now),
+        }
+    }
+
+    fn pop(&mut self, now: Instant) -> Option<T> {
+        let entry = self.items.pop_front()?;
+        self.depth_bytes = self.depth_bytes.saturating_sub(entry.bytes);
+        let drained = self.items.is_empty();
+        self.sojourn.observe(
+            now.saturating_duration_since(entry.enqueued_at),
+            drained,
+            now,
+        );
+        Some(entry.item)
+    }
+
+    /// The standing queue delay: the last interval's minimum wait, or the
+    /// head item's age once it has waited a whole interval (a stalled drain
+    /// dequeues nothing, so it produces no wait samples at all).
+    fn standing_delay(&mut self, now: Instant) -> Duration {
+        self.sojourn.roll(now);
+        let head_age = self
+            .items
+            .front()
+            .map(|entry| now.saturating_duration_since(entry.enqueued_at))
+            .unwrap_or_default();
+        if head_age >= SOJOURN_INTERVAL {
+            self.sojourn.standing.max(head_age)
+        } else {
+            self.sojourn.standing
+        }
+    }
 }
 
 struct Inner<T> {
@@ -136,12 +229,7 @@ pub(crate) fn latest_wins_queue<T>(
     capacity_bytes: usize,
 ) -> (LatestWinsSender<T>, LatestWinsReceiver<T>) {
     let inner = Arc::new(Inner {
-        state: Mutex::new(State {
-            items: VecDeque::new(),
-            depth_bytes: 0,
-            closed: false,
-            cancelled: false,
-        }),
+        state: Mutex::new(State::new(Instant::now())),
         // A zero-byte queue cannot make progress. Keeping the normalization
         // here also makes zero-size item accounting deterministic.
         capacity_bytes: Some(capacity_bytes.max(1)),
@@ -168,12 +256,7 @@ pub(crate) fn latest_wins_queue<T>(
 /// datagram size is bounded by the transport, not the lane).
 pub(crate) fn latest_wins_queue_unbounded<T>() -> (LatestWinsSender<T>, LatestWinsReceiver<T>) {
     let inner = Arc::new(Inner {
-        state: Mutex::new(State {
-            items: VecDeque::new(),
-            depth_bytes: 0,
-            closed: false,
-            cancelled: false,
-        }),
+        state: Mutex::new(State::new(Instant::now())),
         capacity_bytes: None,
         sender_count: AtomicUsize::new(1),
         receiver_alive: AtomicUsize::new(1),
@@ -219,6 +302,7 @@ where
                 state.items.push_back(Entry {
                     item,
                     bytes: item_bytes,
+                    enqueued_at: Instant::now(),
                 });
                 LatestWinsSendResult {
                     evicted_items: 0,
@@ -262,6 +346,7 @@ where
             state.items.push_back(Entry {
                 item,
                 bytes: item_bytes,
+                enqueued_at: Instant::now(),
             });
             LatestWinsSendResult {
                 evicted_items,
@@ -302,6 +387,11 @@ where
     pub(crate) fn depth_bytes(&self) -> usize {
         self.inner.state.lock().depth_bytes
     }
+
+    /// The lane's standing queue delay (see the module docs).
+    pub(crate) fn standing_delay(&self) -> Duration {
+        self.inner.state.lock().standing_delay(Instant::now())
+    }
 }
 
 impl<T> Drop for LatestWinsSender<T> {
@@ -325,9 +415,8 @@ impl<T> LatestWinsReceiver<T> {
                 if state.cancelled {
                     return None;
                 }
-                if let Some(entry) = state.items.pop_front() {
-                    state.depth_bytes = state.depth_bytes.saturating_sub(entry.bytes);
-                    return Some(entry.item);
+                if let Some(item) = state.pop(Instant::now()) {
+                    return Some(item);
                 }
                 if state.closed {
                     return None;
@@ -353,9 +442,8 @@ impl<T> LatestWinsReceiver<T> {
         if state.cancelled {
             return Err(TryRecvLatestWinsError::Closed);
         }
-        if let Some(entry) = state.items.pop_front() {
-            state.depth_bytes = state.depth_bytes.saturating_sub(entry.bytes);
-            return Ok(entry.item);
+        if let Some(item) = state.pop(Instant::now()) {
+            return Ok(item);
         }
         if state.closed {
             Err(TryRecvLatestWinsError::Closed)
@@ -423,6 +511,54 @@ mod tests {
         fn estimated_queue_bytes(&self) -> usize {
             self.bytes
         }
+    }
+
+    fn enqueue_at(state: &mut State<Item>, id: u8, at: Instant) {
+        state.items.push_back(Entry {
+            item: Item::new(id, 1),
+            bytes: 1,
+            enqueued_at: at,
+        });
+        state.depth_bytes += 1;
+    }
+
+    #[test]
+    fn standing_delay_is_the_minimum_wait_of_the_last_interval() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut state = State::new(t0);
+
+        // A transient burst that drains empty leaves no standing queue.
+        enqueue_at(&mut state, 1, ms(0));
+        enqueue_at(&mut state, 2, ms(0));
+        state.pop(ms(40));
+        state.pop(ms(50));
+        assert_eq!(state.standing_delay(ms(100)), Duration::ZERO);
+
+        // A queue that never empties: every item waits at least 35 ms.
+        enqueue_at(&mut state, 3, ms(95));
+        enqueue_at(&mut state, 4, ms(110));
+        state.pop(ms(130));
+        enqueue_at(&mut state, 5, ms(140));
+        state.pop(ms(150));
+        enqueue_at(&mut state, 6, ms(185));
+        state.pop(ms(190));
+        assert_eq!(state.standing_delay(ms(200)), Duration::from_millis(35));
+    }
+
+    #[test]
+    fn a_stalled_drain_reports_the_head_items_age() {
+        let t0 = Instant::now();
+        let mut state = State::new(t0);
+        enqueue_at(&mut state, 1, t0);
+        assert_eq!(
+            state.standing_delay(t0 + Duration::from_millis(50)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            state.standing_delay(t0 + Duration::from_millis(250)),
+            Duration::from_millis(250)
+        );
     }
 
     #[tokio::test]

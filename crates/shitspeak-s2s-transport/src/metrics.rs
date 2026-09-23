@@ -1674,6 +1674,10 @@ impl KcpRuntimeMetricsSnapshot {
 pub struct LinkMetrics {
     /// Smoothed round-trip time in microseconds.
     rtt_us: f64,
+    /// Lowest raw RTT sample over the last one to two [`RTT_FLOOR_BUCKET`]s:
+    /// the path's propagation delay with empty queues. `None` until a sample
+    /// lands, or when no sample arrived for two buckets.
+    rtt_baseline_us: Option<f64>,
     /// Smoothed |Δrtt| in microseconds (jitter).
     jitter_us: f64,
     /// Data payload bytes received since the window started.
@@ -1831,6 +1835,18 @@ impl LossBreakdown {
 impl LinkMetrics {
     pub fn rtt_us(&self) -> f64 {
         self.rtt_us
+    }
+
+    pub fn rtt_baseline_us(&self) -> Option<f64> {
+        self.rtt_baseline_us
+    }
+
+    /// Queueing delay along the path: how far the smoothed RTT sits above
+    /// the empty-queue baseline. Rises with congestion before any loss does.
+    /// `None` without both an RTT and a baseline.
+    pub fn queueing_delay_us(&self) -> Option<f64> {
+        let baseline = self.rtt_baseline_us?;
+        (self.rtt_us > 0.0).then(|| (self.rtt_us - baseline).max(0.0))
     }
 
     pub fn jitter_us(&self) -> f64 {
@@ -2280,9 +2296,58 @@ impl LossWindow {
     }
 }
 
+/// Width of one RTT-floor bucket. The baseline is the minimum over the
+/// current and previous buckets, so it forgets a path that got permanently
+/// slower after at most two buckets, while a congested period must hold every
+/// sample high for a whole bucket before it is mistaken for the baseline.
+pub(crate) const RTT_FLOOR_BUCKET: Duration = Duration::from_secs(120);
+
+/// Two-bucket windowed minimum of raw RTT samples.
+#[derive(Debug, Default)]
+struct RttFloor {
+    bucket_start: Option<Instant>,
+    current_min: Option<f64>,
+    previous_min: Option<f64>,
+}
+
+impl RttFloor {
+    fn record(&mut self, sample: f64, now: Instant) {
+        match self.bucket_start {
+            None => self.bucket_start = Some(now),
+            Some(start) => {
+                let age = now.saturating_duration_since(start);
+                if age >= RTT_FLOOR_BUCKET * 2 {
+                    self.previous_min = None;
+                    self.current_min = None;
+                    self.bucket_start = Some(now);
+                } else if age >= RTT_FLOOR_BUCKET {
+                    self.previous_min = self.current_min.take();
+                    self.bucket_start = Some(now);
+                }
+            }
+        }
+        self.current_min = Some(self.current_min.map_or(sample, |min| min.min(sample)));
+    }
+
+    fn baseline(&self, now: Instant) -> Option<f64> {
+        let age = now.saturating_duration_since(self.bucket_start?);
+        if age >= RTT_FLOOR_BUCKET * 2 {
+            None
+        } else if age >= RTT_FLOOR_BUCKET {
+            self.current_min
+        } else {
+            match (self.current_min, self.previous_min) {
+                (Some(current), Some(previous)) => Some(current.min(previous)),
+                (current, previous) => current.or(previous),
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LinkInner {
     rtt_us: Option<f64>,
+    rtt_floor: RttFloor,
     jitter_us: f64,
     last_rtt_sample_us: Option<f64>,
     samples: u64,
@@ -2311,6 +2376,7 @@ impl LinkInner {
     fn new(window: Duration) -> Self {
         Self {
             rtt_us: None,
+            rtt_floor: RttFloor::default(),
             jitter_us: 0.0,
             last_rtt_sample_us: None,
             samples: 0,
@@ -2622,12 +2688,14 @@ impl PeerMetrics {
 
     fn record_rtt_sample(&self, transport: TransportKind, rtt: Duration) {
         let sample = rtt.as_micros() as f64;
+        let now = Instant::now();
         let mut g = self.inner.lock();
         let entry = g
             .entry(transport)
             .or_insert_with(|| LinkInner::new(self.window));
         entry.samples += 1;
-        entry.last_update = Some(Instant::now());
+        entry.last_update = Some(now);
+        entry.rtt_floor.record(sample, now);
         entry.rtt_us = Some(match entry.rtt_us {
             None => sample,
             Some(prev) => prev + self.tuning.latency_alpha * (sample - prev),
@@ -2902,6 +2970,7 @@ impl PeerMetrics {
                     throughput_confidence_ppm(sent_bytes, recv_bytes, sent_age, recv_age);
                 let m = LinkMetrics {
                     rtt_us: inner.rtt_us.unwrap_or(0.0),
+                    rtt_baseline_us: inner.rtt_floor.baseline(now),
                     jitter_us: inner.jitter_us,
                     sent_bytes,
                     recv_bytes,
@@ -4262,6 +4331,38 @@ mod tests {
                 .consecutive_probe_losses(),
             0
         );
+    }
+
+    #[test]
+    fn rtt_floor_is_a_two_bucket_windowed_minimum() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut floor = RttFloor::default();
+        assert_eq!(floor.baseline(t0), None);
+        floor.record(40_000.0, at(0));
+        floor.record(90_000.0, at(10));
+        assert_eq!(floor.baseline(at(10)), Some(40_000.0));
+        // The next bucket keeps the previous bucket's minimum in view.
+        floor.record(70_000.0, at(130));
+        assert_eq!(floor.baseline(at(130)), Some(40_000.0));
+        // A path that stays slower is re-learned after two buckets.
+        floor.record(70_000.0, at(260));
+        assert_eq!(floor.baseline(at(260)), Some(70_000.0));
+        // Without fresh samples the baseline goes stale.
+        assert_eq!(floor.baseline(at(260) + RTT_FLOOR_BUCKET * 2), None);
+
+        let link = LinkMetrics {
+            rtt_us: 100_000.0,
+            rtt_baseline_us: Some(40_000.0),
+            ..LinkMetrics::default()
+        };
+        assert_eq!(link.queueing_delay_us(), Some(60_000.0));
+        let below_floor = LinkMetrics {
+            rtt_us: 30_000.0,
+            ..link.clone()
+        };
+        assert_eq!(below_floor.queueing_delay_us(), Some(0.0));
+        assert_eq!(LinkMetrics::default().queueing_delay_us(), None);
     }
 
     #[test]

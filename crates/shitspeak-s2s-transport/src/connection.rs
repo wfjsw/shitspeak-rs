@@ -1243,6 +1243,17 @@ impl SessionSender {
         }
     }
 
+    /// Standing queue delay of this session's real-time datagram lane (the
+    /// UDP latest-wins lane or the QUIC-v2 DATAGRAM lane). `None` for legacy
+    /// sessions, which have no such lane.
+    pub(crate) fn datagram_standing_delay(&self) -> Option<Duration> {
+        match self {
+            Self::LatestWins(sender) => Some(sender.standing_delay()),
+            Self::QuicV2(sender) => Some(sender.datagram.standing_delay()),
+            Self::Legacy(_) => None,
+        }
+    }
+
     pub(crate) fn record_quic_datagram_drop(&self) {
         if let Self::QuicV2(sender) = self {
             sender.record_datagram_drop();
@@ -1498,6 +1509,9 @@ pub(crate) const DATAGRAM_LANE_SHED_WINDOW: Duration = Duration::from_secs(1);
 /// datagram lane — a single occasional expired frame is noise, but repeated
 /// sheds mean redundancy sent over the lane would be shed before the wire.
 pub(crate) const DATAGRAM_LANE_SHED_THRESHOLD: usize = 2;
+/// Sheds within the window that mean the lane is dropping voice outright —
+/// routing treats it as a failed first hop rather than a degraded one.
+pub(crate) const DATAGRAM_LANE_SHED_HARD_THRESHOLD: usize = 10;
 
 /// Aggregate state for one peer. The supervisor mutates this through `Mutex`
 /// guards held briefly across non-blocking work.
@@ -2401,6 +2415,12 @@ impl PeerState {
     /// The FEC sender skips parity while this is true — the parity would be
     /// shed before the wire too.
     pub(crate) fn datagram_lane_shedding(&self, now: Instant) -> bool {
+        self.datagram_lane_shed_count(now) >= DATAGRAM_LANE_SHED_THRESHOLD
+    }
+
+    /// Best-effort datagram frames shed at the send path within the last
+    /// [`DATAGRAM_LANE_SHED_WINDOW`].
+    pub(crate) fn datagram_lane_shed_count(&self, now: Instant) -> usize {
         let mut sheds = self.datagram_lane_sheds.lock();
         while sheds
             .front()
@@ -2408,7 +2428,19 @@ impl PeerState {
         {
             sheds.pop_front();
         }
-        sheds.len() >= DATAGRAM_LANE_SHED_THRESHOLD
+        sheds.len()
+    }
+
+    /// Standing queue delay of the newest live `transport` session's datagram
+    /// lane, or `None` when that session has no datagram lane.
+    pub(crate) fn datagram_lane_standing_delay(
+        &self,
+        transport: TransportKind,
+    ) -> Option<Duration> {
+        self.streams
+            .lock()
+            .newest_live(transport)
+            .and_then(|stream| stream.sender.datagram_standing_delay())
     }
 
     pub(crate) fn expired_outbound_drop_status(&self) -> Vec<ExpiredOutboundDropSnapshot> {

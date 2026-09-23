@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use shitspeak_core::NodeIdentifier;
 
-use crate::application::voice::fec::FecSendOutcome;
+use crate::application::voice::fec::{FecParityPath, FecSendOutcome};
+use crate::application::voice::reorder::ReorderResultCount;
 use crate::status::PrometheusSample;
 
 const COUNT_BUCKETS: [(&str, u64); 8] = [
@@ -119,6 +120,9 @@ pub(crate) enum VoiceReceiveResult {
     BufferDrop,
     NoSinkDrop,
     SpeakerStateDrop,
+    /// A FEC reconstruction emitted out of order into a hole the reorder had
+    /// already released past.
+    FecLate,
 }
 
 impl VoiceReceiveResult {
@@ -132,6 +136,28 @@ impl VoiceReceiveResult {
             Self::BufferDrop => "buffer_drop",
             Self::NoSinkDrop => "no_sink_drop",
             Self::SpeakerStateDrop => "speaker_state_drop",
+            Self::FecLate => "fec_late",
+        }
+    }
+}
+
+/// Where a FEC-reconstructed frame ended up in the reorder.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum FecRecoveryOutcome {
+    /// Emitted or buffered before the reorder released past its sequence.
+    InTime,
+    /// Emitted out of order into an already released hole.
+    Late,
+    /// Rejected by the reorder (duplicate, too late, or buffer limits).
+    Discarded,
+}
+
+impl FecRecoveryOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InTime => "in_time",
+            Self::Late => "late",
+            Self::Discarded => "discarded",
         }
     }
 }
@@ -411,6 +437,7 @@ struct FecSendKey {
     source: NodeIdentifier,
     first_hop: NodeIdentifier,
     outcome: FecSendOutcome,
+    path: FecParityPath,
 }
 
 #[derive(Debug, Default)]
@@ -467,7 +494,9 @@ struct VoiceAppMetrics {
     deadline_wakes: HashMap<VoiceDeadlineWakeResult, u64>,
     gap_resolutions: HashMap<GapResolution, u64>,
     fec_sends: HashMap<FecSendKey, u64>,
-    fec_send_bytes: HashMap<(NodeIdentifier, FecSendOutcome), u64>,
+    fec_send_bytes: HashMap<(NodeIdentifier, FecSendOutcome, FecParityPath), u64>,
+    fec_recoveries: HashMap<FecRecoveryOutcome, u64>,
+    gaps_opened: HashMap<&'static str, u64>,
     proactive_budget: ProactiveBudget,
     proactive_outcomes: HashMap<(VoiceProactiveKind, VoiceProactiveResult), u64>,
     repair_cache: RepairCacheTelemetry,
@@ -535,20 +564,52 @@ pub(crate) fn record_repair(
     *metrics.repairs.entry(key).or_default() += count as u64;
 }
 
+/// Record one parity send. `first_hop` is the data frames' first hop; `path`
+/// says whether the parity rode it or the route's alternate.
 pub(crate) fn record_fec_send(
     source: NodeIdentifier,
     first_hop: NodeIdentifier,
     bytes: usize,
     outcome: FecSendOutcome,
+    path: FecParityPath,
 ) {
     let mut metrics = METRICS.lock().unwrap();
     let key = FecSendKey {
         source,
         first_hop,
         outcome,
+        path,
     };
     *metrics.fec_sends.entry(key).or_default() += 1;
-    *metrics.fec_send_bytes.entry((source, outcome)).or_default() += bytes as u64;
+    *metrics
+        .fec_send_bytes
+        .entry((source, outcome, path))
+        .or_default() += bytes as u64;
+}
+
+/// Record a receiver reorder gap opening over `missing_frames` consecutive
+/// sequences: the loss-run length seen on arrival, the burstiness signal
+/// behind the FEC's pacing and path diversity.
+pub(crate) fn record_gap_opened(missing_frames: u64) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics
+        .gaps_opened
+        .entry(bucket(&COUNT_BUCKETS, missing_frames))
+        .or_default() += 1;
+}
+
+/// Classify one reconstructed frame by the reorder results its push produced.
+pub(crate) fn record_fec_recovery(results: &[ReorderResultCount]) {
+    let has = |wanted: VoiceReceiveResult| results.iter().any(|r| r.result() == wanted);
+    let outcome = if has(VoiceReceiveResult::FecLate) {
+        FecRecoveryOutcome::Late
+    } else if has(VoiceReceiveResult::InOrder) || has(VoiceReceiveResult::GapBuffered) {
+        FecRecoveryOutcome::InTime
+    } else {
+        FecRecoveryOutcome::Discarded
+    };
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics.fec_recoveries.entry(outcome).or_default() += 1;
 }
 
 pub(crate) fn set_reorder_pending(source: NodeIdentifier, pending: usize) {
@@ -851,11 +912,12 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
                         FecSendOutcome::Shed => "shed".to_owned(),
                     },
                 ),
+                ("path".to_owned(), key.path.label().to_owned()),
             ],
             *count as f64,
         ));
     }
-    for ((source, outcome), bytes) in &metrics.fec_send_bytes {
+    for ((source, outcome, path), bytes) in &metrics.fec_send_bytes {
         out.push(PrometheusSample::new(
             "shitspeak_s2s_voice_fec_send_bytes_total",
             vec![
@@ -867,8 +929,23 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
                         FecSendOutcome::Shed => "shed".to_owned(),
                     },
                 ),
+                ("path".to_owned(), path.label().to_owned()),
             ],
             *bytes as f64,
+        ));
+    }
+    for (missing_frames, count) in &metrics.gaps_opened {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_reorder_gaps_opened_total",
+            vec![("missing_frames".to_owned(), (*missing_frames).to_owned())],
+            *count as f64,
+        ));
+    }
+    for (outcome, count) in &metrics.fec_recoveries {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_fec_recovered_frames_total",
+            vec![("outcome".to_owned(), outcome.label().to_owned())],
+            *count as f64,
         ));
     }
     out.push(PrometheusSample::new(

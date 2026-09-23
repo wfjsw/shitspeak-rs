@@ -418,10 +418,12 @@ impl RepairResponseKey {
 }
 
 /// Work whose byte reservation remains live until serialized dispatch has
-/// processed the frame. The unbounded lane is therefore still byte bounded.
+/// processed the frame. The unbounded lane is therefore still byte bounded,
+/// except for FEC parity, which is exempt from the byte budget and bounded by
+/// the sender's parity rate instead.
 struct InboundVoiceWork {
     delivery: VoiceDelivery,
-    _permit: VoiceBytePermit,
+    _permit: Option<VoiceBytePermit>,
 }
 
 /// The dispatch task drains primary work before proactive copies. Deadline
@@ -558,7 +560,7 @@ struct RepairFrameContext {
 pub struct VoiceService {
     transport: Arc<dyn VoiceTransport>,
     cfg: VoiceConfig,
-    _shutdown: CancellationToken,
+    shutdown: CancellationToken,
     primary_inbox_tx: mpsc::UnboundedSender<InboundVoiceWork>,
     proactive_inbox_tx: mpsc::UnboundedSender<InboundVoiceWork>,
     proactive_send_tx: mpsc::UnboundedSender<ProactiveSendWork>,
@@ -700,7 +702,11 @@ impl VoiceService {
             voice_budget.clone(),
             shutdown.clone(),
         );
-        let fec_state = Arc::new(fec::ReceiverFecState::new(cfg.voice_fec_receiver_window));
+        let fec_state = Arc::new(fec::ReceiverFecState::new(fec::receiver_window_for(
+            cfg.voice_fec_receiver_window,
+            cfg.voice_fec_block_size,
+            cfg.voice_fec_interleave_depth,
+        )));
         spawn_dispatch_task(
             primary_inbox_rx,
             proactive_inbox_rx,
@@ -738,11 +744,12 @@ impl VoiceService {
         let fec_sender = Arc::new(fec::FecSenderState::new(
             cfg.voice_fec_block_size,
             cfg.voice_fec_parity_blocks,
+            cfg.voice_fec_interleave_depth,
         ));
         Arc::new(Self {
             transport,
             cfg,
-            _shutdown: shutdown,
+            shutdown,
             primary_inbox_tx,
             proactive_inbox_tx,
             proactive_send_tx,
@@ -1442,10 +1449,15 @@ impl VoiceService {
         Ok((envelope, seq))
     }
 
-    /// Feed the just-sent frame into the sender FEC window and, when a block
-    /// completes, emit parity per first hop using an unreliable voice
-    /// transport. Measured loss does not gate protection. Send-path pressure
-    /// and the transport's lane-headroom budget still bound redundancy.
+    /// Feed the just-sent frame into the sender FEC streams and emit the
+    /// parity it made due, per first hop using an unreliable voice transport.
+    /// Parity for a destination rides the route's alternate first hop when
+    /// that path's metrics can carry it (a burst on the data path cannot then
+    /// take the parity too), otherwise the data's own first hop. Measured loss
+    /// does not gate protection and parity is not charged to a byte budget;
+    /// only a first hop whose datagram lane is shedding at the send path skips
+    /// the parity it would carry. Rows owed after a terminator are paced out
+    /// by a background task.
     async fn emit_fec_if_due(
         &self,
         sender_session: u32,
@@ -1458,10 +1470,10 @@ impl VoiceService {
         if !self.cfg.voice_fec_enabled {
             return;
         }
-        // Group destinations by first hop. The parity copy uses the same
-        // first hop its block's data frames used, so the receiver's FEC
-        // mirror keys `(sender_session, sender_epoch, from)` align.
-        let mut hops: HashMap<NodeIdentifier, (Vec<NodeIdentifier>, bool)> = HashMap::new();
+        // Group destinations by the data's first hop: a block holds only
+        // frames that took one link to one recipient set.
+        let mut hops: HashMap<NodeIdentifier, FecHopGroup> = HashMap::new();
+        let mut alternate_shedding: HashMap<NodeIdentifier, bool> = HashMap::new();
         let qualities = repair_context
             .map(|context| context.route_qualities.as_slice())
             .unwrap_or(&[]);
@@ -1472,51 +1484,92 @@ impl VoiceService {
             if quality.reliable() {
                 continue;
             }
-            let entry = hops.entry(quality.next_hop()).or_default();
-            entry.0.push(dst);
-            entry.1 |= quality.datagram_lane_shedding();
+            let diverse = quality.alternate_next_hop().is_some_and(|alternate| {
+                let shedding = *alternate_shedding
+                    .entry(alternate)
+                    .or_insert_with(|| self.transport.datagram_lane_shedding(alternate));
+                fec::parity_alternate_usable(quality, shedding)
+            });
+            let group = hops.entry(quality.next_hop()).or_default();
+            group.dsts.push(dst);
+            group.primary_shedding |= quality.datagram_lane_shedding();
+            if diverse {
+                group.alternate_dsts.push(dst);
+            } else {
+                group.primary_dsts.push(dst);
+            }
         }
         let ttl = self.cfg.transport_ttl();
-        for (&first_hop, (hop_dsts, shedding)) in &hops {
-            let Some(block) = self.fec_sender.push(
+        for (&first_hop, group) in &hops {
+            let emissions = self.fec_sender.push(
                 first_hop,
-                hop_dsts,
+                &group.dsts,
                 sender_session,
                 self.sender_epoch,
                 seq,
                 payload.clone(),
                 is_terminator,
-            ) else {
+            );
+            if emissions.is_empty() {
                 continue;
-            };
+            }
             // Send-path pressure gate: while the first-hop datagram lane is
             // evicting (frames shed before the wire), parity sent over it would
             // be shed too — emitting it only adds offered load to the lane
-            // already failing to drain. Skip until the lane recovers.
-            if *shedding {
+            // already failing to drain. Alternate-path parity avoids that lane.
+            let primary_dsts = if group.primary_shedding {
+                Vec::new()
+            } else {
+                group.primary_dsts.clone()
+            };
+            let targets = FecParityTargets {
+                first_hop,
+                primary_dsts,
+                alternate_dsts: group.alternate_dsts.clone(),
+            };
+            let (now, tail): (Vec<_>, Vec<_>) = emissions
+                .into_iter()
+                .partition(|emission| emission.tail_step == 0);
+            for emission in now {
+                send_parity_emission(
+                    self.transport.as_ref(),
+                    &targets,
+                    &emission,
+                    sender_session,
+                    self.sender_epoch,
+                    ttl,
+                )
+                .await;
+            }
+            if tail.is_empty() {
                 continue;
             }
-            // Emit every configured parity index (0 = XOR sum, and with
-            // `voice_fec_parity_blocks = 2`, 1 = GF-weighted sum) to each
-            // first hop that cleared the gate. A `None` encode (index not
-            // built into this block) skips silently.
-            for index in 0..self.cfg.voice_fec_parity_blocks {
-                let Some(parity_body) = block.encode(sender_session, self.sender_epoch, index)
-                else {
-                    continue;
-                };
-                let parity_len = parity_body.len();
-                let outcome = self
-                    .transport
-                    .send_fec_frame(hop_dsts, Some(first_hop), None, parity_body, ttl)
+            let transport = self.transport.clone();
+            let shutdown = self.shutdown.clone();
+            let sender_epoch = self.sender_epoch;
+            tokio::spawn(async move {
+                let started = tokio::time::Instant::now();
+                for emission in tail {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep_until(started + emission.delay()) => {}
+                    }
+                    let remaining = ttl.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return;
+                    }
+                    send_parity_emission(
+                        transport.as_ref(),
+                        &targets,
+                        &emission,
+                        sender_session,
+                        sender_epoch,
+                        remaining,
+                    )
                     .await;
-                metrics::record_fec_send(
-                    self.transport.local_node_id(),
-                    first_hop,
-                    parity_len,
-                    outcome,
-                );
-            }
+                }
+            });
         }
     }
 
@@ -2006,10 +2059,9 @@ impl ServiceInbound for VoiceInbound {
                 let copy_kind = if msg.is_distribution_repair {
                     VoiceCopyKind::ReactiveRepair
                 } else if frame.fec_parity {
-                    // A FEC parity frame is never audio. Classify it as
-                    // proactive-class so it draws from the repair reserve
-                    // rather than primary audio admission; the dispatch task
-                    // intercepts it before the reorder.
+                    // A FEC parity frame is never audio. It rides the
+                    // low-priority lane so it cannot preempt originals, and
+                    // the dispatch task intercepts it before the reorder.
                     VoiceCopyKind::Fec
                 } else if frame.proactive_copy {
                     VoiceCopyKind::Proactive
@@ -2021,18 +2073,27 @@ impl ServiceInbound for VoiceInbound {
                 } else {
                     VoiceIngressClass::Primary
                 };
-                let permit = match class {
-                    VoiceIngressClass::Primary => {
-                        self.voice_budget.try_reserve_primary(msg.body.len())
+                let permit = match copy_kind {
+                    // Parity is exempt from the ingress byte budget: shedding
+                    // it under queue pressure would discard the redundancy
+                    // exactly when loss is highest.
+                    VoiceCopyKind::Fec => None,
+                    _ => {
+                        let permit = match class {
+                            VoiceIngressClass::Primary => {
+                                self.voice_budget.try_reserve_primary(msg.body.len())
+                            }
+                            VoiceIngressClass::Proactive => {
+                                self.voice_budget.try_reserve_proactive(msg.body.len())
+                            }
+                        };
+                        let Some(permit) = permit else {
+                            metrics::record_ingress_admission_drop(class);
+                            publish_ingress_budget(&self.voice_budget);
+                            return;
+                        };
+                        Some(permit)
                     }
-                    VoiceIngressClass::Proactive => {
-                        self.voice_budget.try_reserve_proactive(msg.body.len())
-                    }
-                };
-                let Some(permit) = permit else {
-                    metrics::record_ingress_admission_drop(class);
-                    publish_ingress_budget(&self.voice_budget);
-                    return;
                 };
                 let work = InboundVoiceWork {
                     delivery: VoiceDelivery {
@@ -2203,37 +2264,33 @@ fn spawn_dispatch_task(
                     let fec_enabled = cfg.voice_fec_enabled;
                     let is_parity = delivery.frame.fec_parity;
                     let report = if fec_enabled && is_parity {
-                        // Parity frame: never audio. Record the block and try
-                        // to reconstruct against the current reorder gap
-                        // (None recovers anything the mirror can).
-                        fec_state.record_parity(
-                            from,
+                        // Parity frame: never audio. Record the block and
+                        // recover whatever the reorder still wants.
+                        let recorded = fec_state.record_parity(
                             sender_session,
                             sender_epoch,
                             delivery.frame.fec_member_seqs.clone(),
                             delivery.frame.payload.clone(),
-                            delivery.frame.fec_parity_index as usize,
+                            delivery.frame.fec_parity_index,
                             delivery.frame.fec_terminator_mask,
                         );
-                        let mut report = reorder::ReorderReport::empty();
-                        let gap = reorderer.live_missing_range(sender_session, sender_epoch);
-                        for recovered in
-                            fec_state.try_reconstruct(from, sender_session, sender_epoch, gap)
-                        {
-                            report =
-                                report.merge(reorderer.push_with_route_hint_report_with_copy_kind(
-                                    from,
-                                    recovered,
-                                    None,
-                                    VoiceCopyKind::Fec,
-                                ));
+                        if recorded {
+                            push_fec_recovered(
+                                &reorderer,
+                                &fec_state,
+                                from,
+                                sender_session,
+                                sender_epoch,
+                            )
+                            .unwrap_or_else(|| reorderer.idle_report())
+                        } else {
+                            reorderer.idle_report()
                         }
-                        report
                     } else if is_parity {
-                        reorder::ReorderReport::empty()
+                        reorderer.idle_report()
                     } else {
                         if fec_enabled {
-                            fec_state.record_frame(from, delivery.frame.clone());
+                            fec_state.record_frame(delivery.frame.clone());
                         }
                         let route_hint = reorderer
                             .may_arm_gap(&delivery.frame, delivery.copy_kind)
@@ -2243,32 +2300,35 @@ fn spawn_dispatch_task(
                                     .map(route_hint_from_quality)
                             })
                             .flatten();
-                        let mut report = reorderer.push_with_route_hint_report_with_copy_kind(
+                        let report = reorderer.push_with_route_hint_report_with_copy_kind(
                             from,
                             delivery.frame,
                             route_hint,
                             delivery.copy_kind,
                         );
-                        // A data push just opened a gap: the parity block for
-                        // it may already be in the mirror. Reconstruct the
-                        // live range now.
-                        if fec_enabled && report.opened_gap().is_some() {
-                            let gap = reorderer.live_missing_range(sender_session, sender_epoch);
-                            for recovered in
-                                fec_state.try_reconstruct(from, sender_session, sender_epoch, gap)
-                            {
-                                report = report.merge(
-                                    reorderer.push_with_route_hint_report_with_copy_kind(
-                                        from,
-                                        recovered,
-                                        None,
-                                        VoiceCopyKind::Fec,
-                                    ),
-                                );
-                            }
+                        // A data frame can complete the `k` symbols a parity
+                        // block needs, or open a gap a mirrored block covers.
+                        let recovered = fec_enabled
+                            .then(|| {
+                                push_fec_recovered(
+                                    &reorderer,
+                                    &fec_state,
+                                    from,
+                                    sender_session,
+                                    sender_epoch,
+                                )
+                            })
+                            .flatten();
+                        match recovered {
+                            Some(recovered) => report.merge(recovered),
+                            None => report,
                         }
-                        report
                     };
+                    if let Some(gap) = report.opened_gap() {
+                        metrics::record_gap_opened(
+                            gap.last_seq.saturating_sub(gap.first_seq).saturating_add(1),
+                        );
+                    }
                     if cfg.repair_enabled
                         && let Some(gap) = report.opened_gap()
                     {
@@ -2280,7 +2340,7 @@ fn spawn_dispatch_task(
                         );
                         repair_request_scheduler.schedule(source, gap);
                     }
-                    (report, Some((origin_node, from)), Some(_permit))
+                    (report, Some((origin_node, from)), _permit)
                 }
                 DispatchEvent::DeadlineFired => {
                     // Sample the held-delay state BEFORE the drain: flushing a
@@ -2424,6 +2484,88 @@ fn spawn_dispatch_task(
             publish_ingress_budget(&voice_budget);
         }
     });
+}
+
+/// Destinations sharing one data first hop, split by which path their parity
+/// rides.
+#[derive(Default)]
+struct FecHopGroup {
+    dsts: Vec<NodeIdentifier>,
+    primary_dsts: Vec<NodeIdentifier>,
+    alternate_dsts: Vec<NodeIdentifier>,
+    primary_shedding: bool,
+}
+
+/// Where one first hop's parity goes: `primary_dsts` over the data's own first
+/// hop, `alternate_dsts` over each route's alternate (avoiding `first_hop`).
+struct FecParityTargets {
+    first_hop: NodeIdentifier,
+    primary_dsts: Vec<NodeIdentifier>,
+    alternate_dsts: Vec<NodeIdentifier>,
+}
+
+async fn send_parity_emission(
+    transport: &dyn VoiceTransport,
+    targets: &FecParityTargets,
+    emission: &fec::ParityEmission,
+    sender_session: u32,
+    sender_epoch: u64,
+    ttl: Duration,
+) {
+    let Some(body) = emission.encode(sender_session, sender_epoch) else {
+        return;
+    };
+    for (dsts, avoid, path) in [
+        (&targets.primary_dsts, None, fec::FecParityPath::Primary),
+        (
+            &targets.alternate_dsts,
+            Some(targets.first_hop),
+            fec::FecParityPath::Alternate,
+        ),
+    ] {
+        if dsts.is_empty() {
+            continue;
+        }
+        let outcome = transport
+            .send_fec_frame(dsts, Some(targets.first_hop), avoid, body.clone(), ttl)
+            .await;
+        metrics::record_fec_send(
+            transport.local_node_id(),
+            targets.first_hop,
+            body.len(),
+            outcome,
+            path,
+        );
+    }
+}
+
+/// Recover the FEC block members the reorder still wants for one mirror and
+/// push them into the reorder, recording whether each landed in time, late
+/// (a hole the reorder already released past), or was discarded. `None` when
+/// nothing was recovered.
+fn push_fec_recovered(
+    reorderer: &Reorderer,
+    fec_state: &fec::ReceiverFecState,
+    from: NodeIdentifier,
+    sender_session: u32,
+    sender_epoch: u64,
+) -> Option<reorder::ReorderReport> {
+    let wanted = |seq: u64| reorderer.fec_wants(sender_session, sender_epoch, seq);
+    let mut report: Option<reorder::ReorderReport> = None;
+    for recovered in fec_state.try_reconstruct(sender_session, sender_epoch, &wanted) {
+        let pushed = reorderer.push_with_route_hint_report_with_copy_kind(
+            from,
+            recovered,
+            None,
+            VoiceCopyKind::Fec,
+        );
+        metrics::record_fec_recovery(pushed.result_counts());
+        report = Some(match report {
+            Some(report) => report.merge(pushed),
+            None => pushed,
+        });
+    }
+    report
 }
 
 fn publish_ingress_budget(budget: &AdaptiveVoiceBudget) {
@@ -4902,6 +5044,8 @@ mod tests {
         let transport = repair_transport(vec![2]);
         let mut cfg = VoiceConfig::default();
         cfg.repair_cache_ms = 1;
+        // The terminator would flush FEC parity; this test counts repair sends.
+        cfg.voice_fec_enabled = false;
         let svc =
             VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
         svc.send_unicast(
@@ -7398,7 +7542,7 @@ mod tests {
         sender_epoch: u64,
         member_seqs: Vec<u64>,
         parity: &[u8],
-        parity_index: u32,
+        row: u32,
         terminator_mask: u32,
     ) -> Bytes {
         let frame = VoiceFrame {
@@ -7414,32 +7558,13 @@ mod tests {
             fec_parity: true,
             fec_member_seqs: member_seqs,
             fec_terminator_mask: terminator_mask,
-            fec_parity_index: parity_index,
+            fec_parity_index: fec::RS_PARITY_INDEX_BASE + row,
         };
         Bytes::from(proto::encode_voice(&frame).unwrap())
     }
 
-    fn fec_xor(payloads: &[&[u8]]) -> Vec<u8> {
-        let mut acc = vec![0u8; payloads[0].len()];
-        for payload in payloads {
-            for (index, byte) in payload.iter().copied().enumerate() {
-                acc[index] ^= byte;
-            }
-        }
-        acc
-    }
-
-    /// GF(2^8)-weighted parity (parity index 1) for the test helper's payloads:
-    /// byte-wise `2^member_index · payload`, XORed across members.
-    fn fec_gf_parity(payloads: &[&[u8]]) -> Vec<u8> {
-        let mut acc = vec![0u8; payloads[0].len()];
-        for (index, payload) in payloads.iter().enumerate() {
-            let coefficient = fec::gf_pow2(index as u8);
-            for (byte, &value) in payload.iter().enumerate() {
-                acc[byte] ^= fec::gf_mul(coefficient, value);
-            }
-        }
-        acc
+    fn fec_rs_parity(payloads: &[&[u8]], row: usize) -> Vec<u8> {
+        fec::tests::rs_parity(payloads, row)
     }
 
     fn inject_voice_inbound(svc: &VoiceService, from: NodeIdentifier, body: Bytes) {
@@ -7464,7 +7589,7 @@ mod tests {
                     VoiceRouteQuality::new(1, transport_kind, 1_000, 0, 0),
                 );
                 let mut cfg: VoiceConfig = serde_json::from_str(
-                    r#"{"voice_fec_enabled":true,"voice_fec_loss_gate_ppm":1000000,"repair_enabled":false}"#,
+                    r#"{"voice_fec_enabled":true,"voice_fec_loss_gate_ppm":1000000,"repair_enabled":false,"voice_fec_block_size":4,"voice_fec_interleave_depth":1}"#,
                 )
                 .unwrap();
                 cfg.tree_delivery_enabled = tree_delivery_enabled;
@@ -7475,7 +7600,9 @@ mod tests {
                     CancellationToken::new(),
                     42,
                 );
-                for _ in 0..4 {
+                // The block completes on the fourth frame; its rows are paced
+                // out one per frame from there.
+                for _ in 0..(3 + parity_count) {
                     svc.send_broadcast(
                         0xABC,
                         shitspeak_core::default_server_id(),
@@ -7487,7 +7614,7 @@ mod tests {
                     .await
                     .unwrap();
                 }
-                let parities = transport
+                let rows = transport
                     .calls()
                     .iter()
                     .filter_map(|call| {
@@ -7495,15 +7622,19 @@ mod tests {
                             return None;
                         };
                         let frame = proto::decode_voice(body).unwrap();
-                        frame.fec_parity.then_some(frame)
+                        frame.fec_parity.then(|| {
+                            assert_eq!(frame.fec_member_seqs, vec![0, 1, 2, 3]);
+                            frame.fec_parity_index
+                        })
                     })
                     .collect::<Vec<_>>();
                 assert_eq!(
-                    parities.len(),
-                    parity_count,
+                    rows,
+                    (0..parity_count as u32)
+                        .map(|row| fec::RS_PARITY_INDEX_BASE + row)
+                        .collect::<Vec<_>>(),
                     "{transport_kind:?}, tree={tree_delivery_enabled}"
                 );
-                assert_eq!(parities[0].fec_member_seqs, vec![0, 1, 2, 3]);
             }
         }
     }
@@ -7512,12 +7643,12 @@ mod tests {
     async fn accepted_copy_does_not_wait_for_parity() {
         let transport = ControlledUnicastTransport::new(false);
         transport.proactive_release.add_permits(4);
-        let svc = VoiceService::new_with_transport(
-            transport.clone(),
-            VoiceConfig::default(),
-            CancellationToken::new(),
-            42,
-        );
+        let mut cfg = VoiceConfig::default();
+        cfg.voice_fec_block_size = 4;
+        cfg.voice_fec_parity_blocks = 1;
+        cfg.voice_fec_interleave_depth = 1;
+        let svc =
+            VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
         for seq in 0..4 {
             tokio::time::timeout(
                 Duration::from_millis(100),
@@ -7556,14 +7687,18 @@ mod tests {
                     );
                     let mut cfg = VoiceConfig::default();
                     cfg.voice_fec_enabled = enabled;
+                    cfg.voice_fec_block_size = 4;
                     cfg.voice_fec_parity_blocks = 2;
+                    cfg.voice_fec_interleave_depth = 1;
                     let svc = VoiceService::new_with_transport(
                         transport.clone(),
                         cfg,
                         CancellationToken::new(),
                         42,
                     );
-                    for seq in 0..4 {
+                    // Four frames complete the block; the fifth carries its
+                    // second, paced parity row.
+                    for seq in 0..5 {
                         let body = fec_data_frame(seq, b"abcd");
                         if reactive {
                             svc.transport
@@ -7583,7 +7718,7 @@ mod tests {
                         }
                     }
                     let expected = if enabled && !reliable { 2 } else { 0 };
-                    let calls = wait_for_call_count(&transport, 4 + expected).await;
+                    let calls = wait_for_call_count(&transport, 5 + expected).await;
                     let parities = calls
                         .iter()
                         .filter_map(|call| {
@@ -7605,7 +7740,7 @@ mod tests {
                         expected,
                         "enabled={enabled}, reactive={reactive}, {kind:?}, reliable={reliable}"
                     );
-                    assert_eq!(calls.len(), 4 + expected);
+                    assert_eq!(calls.len(), 5 + expected);
                     for parity in parities {
                         assert_eq!(parity.fec_member_seqs, vec![0, 1, 2, 3]);
                     }
@@ -7729,6 +7864,8 @@ mod tests {
         let mut cfg = VoiceConfig::default();
         cfg.voice_fec_enabled = true;
         cfg.voice_fec_block_size = 4;
+        cfg.voice_fec_parity_blocks = 1;
+        cfg.voice_fec_interleave_depth = 1;
         cfg.tree_delivery_enabled = false;
         let svc =
             VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
@@ -7780,7 +7917,8 @@ mod tests {
         });
         let parity = parity.expect("UDP should receive parity");
         assert_eq!(parity.fec_member_seqs, vec![4, 5, 6, 7]);
-        assert_eq!(parity.payload.len(), 4);
+        // Length prefix + the 4-byte member payload.
+        assert_eq!(parity.payload.len(), 6);
         assert_eq!(parity.s2s_seq, 7);
 
         // Healthy QUIC datagrams also receive parity, independent of UDP loss.
@@ -7844,7 +7982,8 @@ mod tests {
         });
         let parity = parity.expect("QUIC datagrams should receive parity");
         assert_eq!(parity.fec_member_seqs, vec![12, 13, 14, 15]);
-        assert_eq!(parity.payload.len(), 4);
+        // Length prefix + the 4-byte member payload.
+        assert_eq!(parity.payload.len(), 6);
         assert_eq!(parity.s2s_seq, 15);
 
         // Send-path shedding still suppresses parity until the lane recovers.
@@ -7880,6 +8019,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fec_parity_rides_a_usable_alternate_even_while_the_primary_sheds() {
+        for (alternate_loss, primary_shedding, parity_on_alternate) in [
+            (0, false, true),
+            (0, true, true),
+            // A far lossier alternate cannot carry the parity; the primary
+            // does unless it is shedding.
+            (500_000, false, false),
+        ] {
+            let transport = FakeVoiceTransport::new(7, vec![1]);
+            transport.set_voice_route_quality(
+                1,
+                VoiceRouteQuality::new(1, TransportKind::Udp, 1_000, 0, 0)
+                    .with_alternate_route_quality(5, 2_000, TransportKind::Udp, alternate_loss, 0)
+                    .with_datagram_lane_shedding(primary_shedding),
+            );
+            let mut cfg = VoiceConfig::default();
+            cfg.repair_enabled = false;
+            cfg.tree_delivery_enabled = false;
+            cfg.voice_fec_block_size = 2;
+            cfg.voice_fec_parity_blocks = 1;
+            cfg.voice_fec_interleave_depth = 1;
+            let svc = VoiceService::new_with_transport(
+                transport.clone(),
+                cfg,
+                CancellationToken::new(),
+                42,
+            );
+            for _ in 0..2 {
+                svc.send_broadcast(
+                    0xABC,
+                    default_server_id(),
+                    0,
+                    false,
+                    Bytes::from_static(b"abcd"),
+                    normal_intent(5),
+                )
+                .await
+                .unwrap();
+            }
+            let parity_calls: Vec<Option<NodeIdentifier>> = transport
+                .calls()
+                .iter()
+                .filter_map(|call| match call {
+                    FakeCall::Multicast { body, .. }
+                        if proto::decode_voice(body).unwrap().fec_parity =>
+                    {
+                        Some(None)
+                    }
+                    FakeCall::RepairFrame {
+                        body,
+                        avoid_first_hop,
+                        ..
+                    } if proto::decode_voice(body).unwrap().fec_parity => Some(*avoid_first_hop),
+                    _ => None,
+                })
+                .collect();
+            let expected = match (parity_on_alternate, primary_shedding) {
+                (true, _) => vec![Some(1)],
+                (false, false) => vec![None],
+                (false, true) => vec![],
+            };
+            assert_eq!(
+                parity_calls, expected,
+                "alternate_loss={alternate_loss}, primary_shedding={primary_shedding}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fec_receiver_solves_parity_that_arrived_over_a_different_peer() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = VoiceService::new_with_transport(
+            transport,
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        let sink = Arc::new(FecProbeSink::default());
+        svc.set_audio_sink(sink.clone());
+        // Data rides peer 11; the block's parity rides the alternate, peer 12.
+        inject_voice_inbound(&svc, 11, fec_data_frame(1, b"aaaa"));
+        inject_voice_inbound(&svc, 11, fec_data_frame(2, b"bbbb"));
+        wait_for_fec_sink(&sink, 2).await;
+        let parity = fec_rs_parity(&[b"aaaa", b"bbbb", b"cc"], 0);
+        inject_voice_inbound(
+            &svc,
+            12,
+            fec_parity_frame(0xABC, 42, vec![1, 2, 3], &parity, 0, 0),
+        );
+        let frames = wait_for_fec_sink(&sink, 3).await;
+        assert_eq!(frames[2].0, 3);
+        assert_eq!(frames[2].1.as_ref(), b"cc");
+    }
+
+    #[tokio::test]
     async fn fec_receiver_reconstructs_missing_frame() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let mut cfg: VoiceConfig =
@@ -7895,8 +8129,9 @@ mod tests {
         inject_voice_inbound(&svc, 11, fec_data_frame(3, b"cccc"));
         wait_for_fec_sink(&sink, 3).await;
 
-        // Parity block {1,2,3,4}: recovered 4 = parity ^ a ^ b ^ c = d.
-        let parity = fec_xor(&[b"aaaa", b"bbbb", b"cccc", b"dddd"]);
+        // One parity row of block {1,2,3,4} recovers the single loss, whose
+        // length differs from its siblings'.
+        let parity = fec_rs_parity(&[b"aaaa", b"bbbb", b"cccc", b"ddd"], 0);
         inject_voice_inbound(
             &svc,
             11,
@@ -7905,11 +8140,46 @@ mod tests {
 
         let frames = wait_for_fec_sink(&sink, 4).await;
         assert_eq!(frames[3].0, 4);
-        assert_eq!(frames[3].1.as_ref(), b"dddd");
+        assert_eq!(frames[3].1.as_ref(), b"ddd");
     }
 
     #[tokio::test]
-    async fn fec_receiver_reconstructs_gap_frame_on_gap_open() {
+    async fn fec_receiver_ignores_retired_xor_parity() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = VoiceService::new_with_transport(
+            transport,
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        let sink = Arc::new(FecProbeSink::default());
+        svc.set_audio_sink(sink.clone());
+        inject_voice_inbound(&svc, 11, fec_data_frame(1, b"aaaa"));
+        wait_for_fec_sink(&sink, 1).await;
+        // A pre-Reed-Solomon peer's XOR parity (wire index 0) must not be
+        // solved as a Reed-Solomon row.
+        let frame = VoiceFrame {
+            sender_session: 0xABC,
+            server_id: shitspeak_core::default_server_id(),
+            sender_epoch: 42,
+            s2s_seq: 2,
+            target_kind: 0,
+            is_terminator: false,
+            payload: Bytes::from_static(&[3, 3, 3, 3]),
+            intent: None,
+            proactive_copy: false,
+            fec_parity: true,
+            fec_member_seqs: vec![1, 2],
+            fec_terminator_mask: 0,
+            fec_parity_index: 0,
+        };
+        inject_voice_inbound(&svc, 11, proto::encode_voice(&frame).unwrap());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(sink.snapshot().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fec_receiver_reconstructs_gap_frame_before_the_gap_opens() {
         let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
         let mut cfg = VoiceConfig::default();
         cfg.voice_fec_enabled = true;
@@ -7918,20 +8188,18 @@ mod tests {
         let sink = Arc::new(FecProbeSink::default());
         svc.set_audio_sink(sink.clone());
 
-        // Frames 1,2,3 deliver; frame 5 arrives before frame 4, opening the
-        // gap [4,4]. The gap-open trigger must reconstruct 4 immediately
-        // from the already-cached parity block.
+        // Frames 1,2,3 deliver and the block's parity outruns frame 4, which
+        // is lost: the parity alone recovers 4 in order, and 5 follows it.
         inject_voice_inbound(&svc, 11, fec_data_frame(1, b"aaaa"));
         inject_voice_inbound(&svc, 11, fec_data_frame(2, b"bbbb"));
         inject_voice_inbound(&svc, 11, fec_data_frame(3, b"cccc"));
         wait_for_fec_sink(&sink, 3).await;
-        let parity = fec_xor(&[b"aaaa", b"bbbb", b"cccc", b"dddd"]);
+        let parity = fec_rs_parity(&[b"aaaa", b"bbbb", b"cccc", b"dddd"], 0);
         inject_voice_inbound(
             &svc,
             11,
             fec_parity_frame(0xABC, 42, vec![1, 2, 3, 4], &parity, 0, 0),
         );
-        // Let the parity arrival settle into the mirror before the gap opens.
         tokio::time::sleep(Duration::from_millis(10)).await;
         inject_voice_inbound(&svc, 11, fec_data_frame(5, b"eeee"));
 
@@ -7939,6 +8207,82 @@ mod tests {
         assert_eq!(frames[3].0, 4);
         assert_eq!(frames[3].1.as_ref(), b"dddd");
         assert_eq!(frames[4].0, 5);
+    }
+
+    #[tokio::test]
+    async fn fec_receiver_late_fills_a_hole_the_reorder_released() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = VoiceService::new_with_transport(
+            transport,
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        let sink = Arc::new(FecProbeSink::default());
+        svc.set_audio_sink(sink.clone());
+
+        // Block {1,2,3,4} with one parity row: 1 and 2 arrive, the parity
+        // arrives with two members still absent, 3 is lost. Frame 4 arrives
+        // after the delivery cadence, so the reorder releases past 3; frame 4
+        // then completes the block and 3 is emitted late, exactly once.
+        let members: [&[u8]; 4] = [b"aaaa", b"bb", b"cccccc", b"dddd"];
+        inject_voice_inbound(&svc, 11, fec_data_frame(1, members[0]));
+        inject_voice_inbound(&svc, 11, fec_data_frame(2, members[1]));
+        wait_for_fec_sink(&sink, 2).await;
+        let parity = fec_rs_parity(&members, 0);
+        inject_voice_inbound(
+            &svc,
+            11,
+            fec_parity_frame(0xABC, 42, vec![1, 2, 3, 4], &parity, 0, 0),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        inject_voice_inbound(&svc, 11, fec_data_frame(4, members[3]));
+
+        let frames = wait_for_fec_sink(&sink, 4).await;
+        let order: Vec<u64> = frames.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(order, vec![1, 2, 4, 3]);
+        assert_eq!(frames[3].1.as_ref(), members[2]);
+        // A second copy of the parity cannot emit 3 again.
+        inject_voice_inbound(
+            &svc,
+            11,
+            fec_parity_frame(0xABC, 42, vec![1, 2, 3, 4], &parity, 0, 0),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(sink.snapshot().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn fec_parity_is_exempt_from_the_ingress_byte_budget() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = VoiceService::new_with_transport(
+            transport,
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        let sink = Arc::new(FecProbeSink::default());
+        svc.set_audio_sink(sink.clone());
+        inject_voice_inbound(&svc, 11, fec_data_frame(1, b"aaaa"));
+        wait_for_fec_sink(&sink, 1).await;
+        // Exhaust the proactive ingress lane parity used to draw from.
+        let mut held = Vec::new();
+        while let Some(permit) = svc.voice_budget.try_reserve_proactive(64 * 1024) {
+            held.push(permit);
+        }
+        while let Some(permit) = svc.voice_budget.try_reserve_proactive(1) {
+            held.push(permit);
+        }
+        let parity = fec_rs_parity(&[b"aaaa", b"bbbb"], 0);
+        inject_voice_inbound(
+            &svc,
+            11,
+            fec_parity_frame(0xABC, 42, vec![1, 2], &parity, 0, 0),
+        );
+        let frames = wait_for_fec_sink(&sink, 2).await;
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].1.as_ref(), b"bbbb");
+        drop(held);
     }
 
     #[tokio::test]
@@ -7956,20 +8300,31 @@ mod tests {
         inject_voice_inbound(&svc, 11, fec_data_frame(2, b"bbbb"));
         wait_for_fec_sink(&sink, 2).await;
 
-        // Both parity frames for block {1,2,3,4}: index 0 (XOR) and index 1
-        // (GF-weighted) together recover the two missing members.
+        // Any two Reed-Solomon rows of block {1,2,3,4} recover both.
         let members: [&[u8]; 4] = [b"aaaa", b"bbbb", b"cccc", b"dddd"];
-        let xor_parity = fec_xor(&members);
-        let gf_parity = fec_gf_parity(&members);
         inject_voice_inbound(
             &svc,
             11,
-            fec_parity_frame(0xABC, 42, vec![1, 2, 3, 4], &xor_parity, 0, 0),
+            fec_parity_frame(
+                0xABC,
+                42,
+                vec![1, 2, 3, 4],
+                &fec_rs_parity(&members, 0),
+                0,
+                0,
+            ),
         );
         inject_voice_inbound(
             &svc,
             11,
-            fec_parity_frame(0xABC, 42, vec![1, 2, 3, 4], &gf_parity, 1, 0),
+            fec_parity_frame(
+                0xABC,
+                42,
+                vec![1, 2, 3, 4],
+                &fec_rs_parity(&members, 2),
+                2,
+                0,
+            ),
         );
 
         let frames = wait_for_fec_sink(&sink, 4).await;

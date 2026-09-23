@@ -103,7 +103,9 @@ pub use identity::{
     OriginAuthenticationError, OriginSignature, OriginSignatureMetadata, node_id_from_cert_file,
 };
 pub use manager::PeerAddressSnapshot;
-pub use manager::{AdaptiveInboundReceiver, ConnectionManager, Inbound, InboundMessage};
+pub use manager::{
+    AdaptiveInboundReceiver, ConnectionManager, DatagramLaneCongestion, Inbound, InboundMessage,
+};
 pub use metrics::{
     DatagramPathHealthReason, DatagramPathHealthSnapshot, DatagramPathHealthState,
     DeliveryPathSelectionSnapshot, ExpiredOutboundDropSnapshot, ExpiredOutboundDropStage,

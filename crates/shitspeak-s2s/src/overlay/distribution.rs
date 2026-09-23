@@ -27,6 +27,14 @@ const UNKNOWN_TREE_FRAMES_TOTAL: usize = 256;
 const UNKNOWN_TREE_RECOVERY_RETRY: Duration = Duration::from_millis(10);
 const EDGE_FAILURE_REPORT_DEDUP: Duration = Duration::from_secs(1);
 const FAILED_EDGE_EXCLUSION: Duration = Duration::from_secs(10);
+/// Ceiling on the exclusion a first hop earns by aborting repeatedly: the
+/// exclusion doubles per consecutive abort, from [`FAILED_EDGE_EXCLUSION`].
+const FAILED_EDGE_EXCLUSION_MAX: Duration = Duration::from_secs(160);
+/// How long an exclusion streak is remembered without a further exclusion. A
+/// route that congests every time load moves onto it — or that load leaves
+/// because it congested, only to win the load back once it drains — keeps
+/// doubling its exclusion instead of flapping every ten seconds.
+const FAILED_EDGE_STREAK_MEMORY: Duration = Duration::from_secs(600);
 const METRIC_RESHAPE_HOLD: Duration = Duration::from_secs(5);
 const METRIC_RESHAPE_IMPROVEMENT_PERCENT: u64 = 10;
 const VOICE_OVERLAP_RATE_WINDOW: Duration = Duration::from_secs(1);
@@ -102,6 +110,14 @@ pub(crate) struct TreeEdgeCandidate {
     /// confirm the same way hard datagram loss does (C2c). Seeded alternates
     /// and test fixtures leave it false (unknown).
     sink_gap: bool,
+    /// Whether this first hop's datagram lane is congested without needing
+    /// any loss: frames shed at the send path, a standing send queue, or RTT
+    /// well above its empty-queue baseline
+    /// (`DatagramLaneCongestion::congested`). The congestion already raises
+    /// `pressure`; the flag additionally shortens the challenger confirm the
+    /// way hard loss does (C2d), since a congested incumbent only degrades
+    /// further while the confirm window runs.
+    congested: bool,
 }
 
 impl TreeEdgeCandidate {
@@ -119,6 +135,7 @@ impl TreeEdgeCandidate {
             lane_blocked: false,
             hard_loss: false,
             sink_gap: false,
+            congested: false,
         }
     }
 
@@ -131,6 +148,7 @@ impl TreeEdgeCandidate {
             lane_blocked: false,
             hard_loss: false,
             sink_gap: false,
+            congested: false,
         }
     }
 
@@ -148,6 +166,7 @@ impl TreeEdgeCandidate {
             lane_blocked: false,
             hard_loss: false,
             sink_gap: false,
+            congested: false,
         }
     }
 
@@ -185,6 +204,14 @@ impl TreeEdgeCandidate {
     /// test fixtures leave it false (unknown).
     pub(crate) fn with_sink_gap(mut self, sink_gap: bool) -> Self {
         self.sink_gap = sink_gap;
+        self
+    }
+
+    /// Attach whether this first hop's datagram lane is congested
+    /// (`ConnectionManager::conversational_path_assessment`). Seeded
+    /// alternates and test fixtures leave it false (unknown).
+    pub(crate) fn with_congestion(mut self, congested: bool) -> Self {
+        self.congested = congested;
         self
     }
 }
@@ -813,6 +840,28 @@ fn candidate_is_better(
     challenger_loaded * 100.0 <= incumbent_loaded * 90.0
 }
 
+/// A first hop's exclusion after split aborts on one tree edge.
+#[derive(Clone, Copy, Debug)]
+struct RouteCooldown {
+    excluded_until: Instant,
+    last_abort: Instant,
+    /// Consecutive aborts within [`FAILED_EDGE_STREAK_MEMORY`] of each other.
+    streak: u32,
+}
+
+fn prune_route_cooldowns(
+    cooldowns: &mut HashMap<(NodeIdentifier, NodeIdentifier, NodeIdentifier), RouteCooldown>,
+    now: Instant,
+) {
+    cooldowns.retain(|&(parent, child, first_hop), cooldown| {
+        let keep = now.saturating_duration_since(cooldown.last_abort) < FAILED_EDGE_STREAK_MEMORY;
+        if !keep {
+            distribution_metrics::update_tree_edge_route_exclusion(parent, child, first_hop, None);
+        }
+        keep
+    });
+}
+
 fn prune_voice_overlap_samples(link: &mut VoiceOverlapLink, now: Instant) {
     while link
         .accepted_originals
@@ -1428,13 +1477,14 @@ pub(crate) struct DistributionPlane {
     /// `shed voice transition copy` debug log in `send_tree_edge_split_copy`
     /// (see [`VoiceTransitionCopyDecision`]).
     shed_log_states: Mutex<HashMap<(NodeIdentifier, NodeIdentifier), VoiceTransitionCopyDecision>>,
-    /// First hops recently rolled back by a split abort, keyed per tree edge
-    /// `(parent, child, first_hop)`. A route that looked good while idle but
-    /// degraded under load must not be re-tried (and re-aborted) for
-    /// [`FAILED_EDGE_EXCLUSION`]: its metrics are idle-credit until it has had
-    /// a chance to prove otherwise.
+    /// First hops recently rolled back by a split abort or abandoned because
+    /// they congested, keyed per tree edge `(parent, child, first_hop)`. A
+    /// route that looked good while idle but degraded under load must not be
+    /// re-tried (and re-abandoned) while it is excluded: its metrics are
+    /// idle-credit until it has had a chance to prove otherwise. Consecutive
+    /// exclusions double the exclusion.
     voice_route_cooldowns:
-        Mutex<HashMap<(NodeIdentifier, NodeIdentifier, NodeIdentifier), Instant>>,
+        Mutex<HashMap<(NodeIdentifier, NodeIdentifier, NodeIdentifier), RouteCooldown>>,
     #[cfg(test)]
     control_publishes: Mutex<u64>,
 }
@@ -1478,25 +1528,50 @@ impl DistributionPlane {
         now: Instant,
     ) -> bool {
         let mut cooldowns = self.voice_route_cooldowns.lock();
-        cooldowns.retain(|_, at| now.saturating_duration_since(*at) < FAILED_EDGE_EXCLUSION);
+        prune_route_cooldowns(&mut cooldowns, now);
         cooldowns
             .get(&(parent, child, first_hop))
-            .is_some_and(|at| now.saturating_duration_since(*at) < FAILED_EDGE_EXCLUSION)
+            .is_some_and(|cooldown| now < cooldown.excluded_until)
     }
 
-    /// Mark a split-abort's failed first hop so it stays out of contention for
-    /// [`FAILED_EDGE_EXCLUSION`]. Called from both abort paths (the controller's
-    /// rollback and the sender's fallback abort).
-    fn record_tree_edge_split_abort(
+    /// Keep a first hop out of contention on this tree edge, for
+    /// [`FAILED_EDGE_EXCLUSION`] doubled per consecutive exclusion within
+    /// [`FAILED_EDGE_STREAK_MEMORY`], up to [`FAILED_EDGE_EXCLUSION_MAX`].
+    /// `reason` is `split_abort` (both abort paths: the controller's rollback
+    /// and the sender's fallback abort) or `congested_exit` (the edge left the
+    /// first hop because its lane congested). Returns the exclusion applied.
+    fn exclude_tree_edge_first_hop(
         &self,
         parent: NodeIdentifier,
         child: NodeIdentifier,
         failed_first_hop: NodeIdentifier,
+        reason: &'static str,
         now: Instant,
-    ) {
+    ) -> Duration {
         let mut cooldowns = self.voice_route_cooldowns.lock();
-        cooldowns.retain(|_, at| now.saturating_duration_since(*at) < FAILED_EDGE_EXCLUSION);
-        cooldowns.insert((parent, child, failed_first_hop), now);
+        prune_route_cooldowns(&mut cooldowns, now);
+        let streak = cooldowns
+            .get(&(parent, child, failed_first_hop))
+            .map_or(1, |cooldown| cooldown.streak.saturating_add(1));
+        let exclusion = FAILED_EDGE_EXCLUSION
+            .saturating_mul(1u32 << streak.saturating_sub(1).min(16))
+            .min(FAILED_EDGE_EXCLUSION_MAX);
+        cooldowns.insert(
+            (parent, child, failed_first_hop),
+            RouteCooldown {
+                excluded_until: now + exclusion,
+                last_abort: now,
+                streak,
+            },
+        );
+        distribution_metrics::update_tree_edge_route_exclusion(
+            parent,
+            child,
+            failed_first_hop,
+            Some(exclusion),
+        );
+        distribution_metrics::record_tree_edge_route_exclusion(parent, child, reason);
+        exclusion
     }
 
     /// Debounced gate for the `shed voice transition copy` debug log. Returns
@@ -1630,7 +1705,7 @@ impl DistributionPlane {
         binding.entered_at = now;
         // The adopted first hop failed to send; the sender fell back to the old
         // route. Keep the failed first hop out of contention while it cools.
-        self.record_tree_edge_split_abort(parent, child, to.first_hop(child), now);
+        self.exclude_tree_edge_first_hop(parent, child, to.first_hop(child), "split_abort", now);
         distribution_metrics::record_split_abort(parent, child, "primary_failed");
         distribution_metrics::record_tree_edge_binding_event(
             parent,
@@ -1766,7 +1841,13 @@ impl DistributionPlane {
                     // The challenger's first hop looked good while idle but
                     // degraded under load: keep it out of contention until its
                     // loaded metrics could be re-established.
-                    self.record_tree_edge_split_abort(parent, child, to.first_hop(child), now);
+                    self.exclude_tree_edge_first_hop(
+                        parent,
+                        child,
+                        to.first_hop(child),
+                        "split_abort",
+                        now,
+                    );
                     distribution_metrics::record_split_abort(parent, child, reason);
                     distribution_metrics::update_tree_edge_split_share(parent, child, None);
                     distribution_metrics::record_tree_edge_binding_event(
@@ -1834,6 +1915,15 @@ impl DistributionPlane {
                 candidate.path != binding.path && candidate.pressure < 3 && !candidate.lane_blocked
             });
             if let Some(replacement) = replacement {
+                if incumbent.is_some_and(|candidate| candidate.congested) {
+                    self.exclude_tree_edge_first_hop(
+                        parent,
+                        child,
+                        binding.path.first_hop(child),
+                        "congested_exit",
+                        now,
+                    );
+                }
                 begin_tree_edge_transition(binding, replacement.path, reason, now);
             } else {
                 clear_tree_edge_challenger(binding);
@@ -1878,16 +1968,20 @@ impl DistributionPlane {
 
         if let Some(challenger) = challenger {
             observe_tree_edge_challenger(binding, challenger.path, now);
-            // C2b + C2c: when the incumbent is losing at/above the full-dup
-            // threshold (>= 3%, not the suspect floor that saturates) OR the
-            // destination (sink) reports degraded reorder quality on the voice
-            // sent it, a cost-better challenger qualifies on a single
-            // observation and skips the confirm wait — the lane is losing hard,
-            // or the receiver is hearing gaps the sender cannot, so the extra
-            // confirmation window only prolongs the damage. min_hold still
-            // guards the fresh-binding flap case.
-            let incumbent_hard_signal =
-                incumbent.is_some_and(|candidate| candidate.hard_loss || candidate.sink_gap);
+            // C2b + C2c + C2d: when the incumbent is losing at/above the
+            // full-dup threshold (>= 3%, not the suspect floor that
+            // saturates), the destination (sink) reports degraded reorder
+            // quality on the voice sent it, OR the incumbent's lane is
+            // congested (sheds, a standing send queue, or inflated RTT), a
+            // cost-better challenger qualifies on a single observation and
+            // skips the confirm wait — the lane is losing hard, the receiver
+            // is hearing gaps the sender cannot, or a queue is building that
+            // loss will follow, so the extra confirmation window only
+            // prolongs the damage. min_hold still guards the fresh-binding
+            // flap case.
+            let incumbent_hard_signal = incumbent.is_some_and(|candidate| {
+                candidate.hard_loss || candidate.sink_gap || candidate.congested
+            });
             let confirm_window_met = incumbent_hard_signal
                 || binding.challenger_since.is_some_and(|since| {
                     now.saturating_duration_since(since) >= policy.challenger_confirm
@@ -1896,6 +1990,17 @@ impl DistributionPlane {
                 && binding.challenger_observations >= if incumbent_hard_signal { 1 } else { 2 }
                 && confirm_window_met
             {
+                if incumbent.is_some_and(|candidate| candidate.congested) {
+                    // Leaving because the lane congested under this load: the
+                    // drained route must not win the load straight back.
+                    self.exclude_tree_edge_first_hop(
+                        parent,
+                        child,
+                        binding.path.first_hop(child),
+                        "congested_exit",
+                        now,
+                    );
+                }
                 begin_tree_edge_transition(binding, challenger.path, "confirmed_challenger", now);
             }
         } else {
@@ -4542,6 +4647,92 @@ mod tests {
             at(1_350),
         );
         assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn c2d_congested_incumbent_confirms_cost_better_challenger_on_first_observation() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(113, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        // The incumbent loses nothing and its sink hears no gaps, but its
+        // lane is congested (a standing send queue or inflated RTT): the
+        // congestion raises its pressure to 2, and a cost-better challenger
+        // confirms on one observation — loss would only follow the queue.
+        let attempt = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct_with_cost(2, 40)
+                    .with_datagram_lane(false, false)
+                    .with_congestion(true),
+                TreeEdgeCandidate::legacy(4097, 0, 30).with_datagram_lane(false, false),
+            ],
+            fast_sticky_policy(),
+            at(800),
+        );
+        assert_eq!(attempt.reason, "confirmed_challenger");
+        assert_eq!(attempt.path(), TreeEdgePath::LegacyVia(4097));
+        // The congested direct route is excluded, so once it drains it cannot
+        // win the load straight back.
+        assert!(plane.voice_route_first_hop_cooling_down(1, 2, 2, at(800)));
+        assert!(!plane.voice_route_first_hop_cooling_down(1, 2, 4097, at(800)));
+
+        // Without the congestion flag the same pressure waits out the
+        // confirm window.
+        let plane = DistributionPlane::default();
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        let attempt = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct_with_cost(2, 40).with_datagram_lane(false, false),
+                TreeEdgeCandidate::legacy(4097, 0, 30).with_datagram_lane(false, false),
+            ],
+            fast_sticky_policy(),
+            at(800),
+        );
+        assert_eq!(attempt.path(), TreeEdgePath::DirectChild);
+    }
+
+    #[test]
+    fn repeated_exclusions_double_a_first_hops_exclusion() {
+        let plane = DistributionPlane::default();
+        let start = Instant::now();
+        let secs = |n: u64| start + Duration::from_secs(n);
+        let excluded = |now| plane.voice_route_first_hop_cooling_down(1, 2, 4097, now);
+        let exclude = |reason, now| plane.exclude_tree_edge_first_hop(1, 2, 4097, reason, now);
+
+        assert_eq!(exclude("split_abort", start), FAILED_EDGE_EXCLUSION);
+        assert!(excluded(secs(9)));
+        assert!(!excluded(secs(10)));
+        // It is excluded again after returning — by another abort or by a
+        // congested exit: twice the exclusion, then four times, up to the
+        // ceiling.
+        assert_eq!(
+            exclude("congested_exit", secs(11)),
+            FAILED_EDGE_EXCLUSION * 2
+        );
+        assert!(excluded(secs(30)));
+        assert!(!excluded(secs(31)));
+        assert_eq!(exclude("split_abort", secs(32)), FAILED_EDGE_EXCLUSION * 4);
+        let mut now = secs(32);
+        for _ in 0..8 {
+            now += FAILED_EDGE_EXCLUSION_MAX;
+            assert!(exclude("split_abort", now) <= FAILED_EDGE_EXCLUSION_MAX);
+        }
+        assert_eq!(exclude("split_abort", now), FAILED_EDGE_EXCLUSION_MAX);
+        // Other edges and first hops are unaffected.
+        assert!(!plane.voice_route_first_hop_cooling_down(1, 3, 4097, now));
+        assert!(!plane.voice_route_first_hop_cooling_down(1, 2, 4096, now));
+
+        // A quiet streak memory forgives the streak.
+        let later = now + FAILED_EDGE_STREAK_MEMORY;
+        assert!(!excluded(later));
+        assert_eq!(exclude("split_abort", later), FAILED_EDGE_EXCLUSION);
     }
 
     #[test]

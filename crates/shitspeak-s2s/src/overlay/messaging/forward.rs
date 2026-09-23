@@ -2619,11 +2619,12 @@ fn sink_gap_signal(transport: &ConnectionManager, first_hop: NodeIdentifier) -> 
     transport.best_effort_sink_feedback(first_hop).suspect
 }
 
-/// Expose a frame's datagram-lane and receiver-gap C2 signals to the telemetry
-/// layer so the dashboards can see, per edge, how often each signal is actually
-/// present (`shitspeak_s2s_voice_datagram_lane_signal_total`). `lane_blocked`
-/// feeds the C2a immediate-escape path, `hard_loss` the C2b shortened confirm,
-/// `sink_gap` the C2c receiver-gap shortened confirm.
+/// Expose a frame's datagram-lane, receiver-gap, and congestion C2 signals to
+/// the telemetry layer so the dashboards can see, per edge, how often each
+/// signal is actually present (`shitspeak_s2s_voice_datagram_lane_signal_total`).
+/// `lane_blocked` feeds the C2a immediate-escape path, `hard_loss` the C2b
+/// shortened confirm, `sink_gap` the C2c receiver-gap shortened confirm, and
+/// `congested` the C2d congestion shortened confirm.
 fn record_datagram_lane_signals(
     source: NodeIdentifier,
     peer: NodeIdentifier,
@@ -2631,14 +2632,18 @@ fn record_datagram_lane_signals(
     lane_blocked: bool,
     hard_loss: bool,
     sink_gap: bool,
+    congested: bool,
 ) {
     crate::overlay::distribution_metrics::record_datagram_lane_observation(
         source,
         peer,
         frame_bytes,
-        lane_blocked,
-        hard_loss,
-        sink_gap,
+        crate::overlay::distribution_metrics::DatagramLaneSignals {
+            lane_blocked,
+            hard_loss,
+            sink_gap,
+            congested,
+        },
     );
 }
 
@@ -2666,9 +2671,9 @@ fn tree_edge_candidates(
     let mut candidates = Vec::new();
     let tables = routing.load();
     let visited = path_trace_set(path_trace);
-    let direct_pressure =
-        transport.best_conversational_path_pressure(child, level, metric, transport_class, options);
-    if let Some(pressure) = direct_pressure {
+    let direct_assessment =
+        transport.conversational_path_assessment(child, level, metric, transport_class, options);
+    if let Some((pressure, congestion)) = direct_assessment {
         // The direct candidate's route cost must be comparable to a relay's:
         // both are the aggregate conversational cost of reaching *every*
         // recipient through the chosen first hop. Previously this was just the
@@ -2698,11 +2703,13 @@ fn tree_edge_candidates(
             lane_blocked,
             hard_loss,
             sink_gap,
+            congestion.congested(),
         );
         candidates.push(
             TreeEdgeCandidate::direct_with_cost(pressure, route_cost)
                 .with_datagram_lane(lane_blocked, hard_loss)
-                .with_sink_gap(sink_gap),
+                .with_sink_gap(sink_gap)
+                .with_congestion(congestion.congested()),
         );
     }
 
@@ -2715,7 +2722,7 @@ fn tree_edge_candidates(
         if first_hop == child || visited.contains(&first_hop) {
             continue;
         }
-        if let Some(pressure) = transport.best_conversational_path_pressure(
+        if let Some((pressure, congestion)) = transport.conversational_path_assessment(
             first_hop,
             level,
             metric,
@@ -2731,11 +2738,13 @@ fn tree_edge_candidates(
                 lane_blocked,
                 hard_loss,
                 sink_gap,
+                congestion.congested(),
             );
             candidates.push(
                 TreeEdgeCandidate::legacy(first_hop, pressure, route_cost)
                     .with_datagram_lane(lane_blocked, hard_loss)
-                    .with_sink_gap(sink_gap),
+                    .with_sink_gap(sink_gap)
+                    .with_congestion(congestion.congested()),
             );
         }
     }

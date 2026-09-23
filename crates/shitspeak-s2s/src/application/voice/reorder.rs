@@ -18,7 +18,7 @@
 //! same-epoch originals are discarded so they cannot rewind delivery.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -40,6 +40,15 @@ const ADAPTIVE_JITTER_IN_ORDER_DECAY_RUN: u32 = 16;
 const DEFAULT_MAX_USERS: u64 = 5_000;
 const MIN_TRACKED_SPEAKERS: usize = 1_024;
 const MAX_TRACKED_SPEAKERS: usize = 16_384;
+/// How long after the reorder released past a missing sequence a FEC
+/// reconstruction of it may still be emitted out of order. Listeners
+/// re-sequence voice by the Mumble packet sequence in their jitter buffer and
+/// discard what arrives past their playout point, so a late fill costs no
+/// audio stall; beyond this age no listener buffer still holds the slot.
+const FEC_LATE_EMIT_WINDOW: Duration = Duration::from_millis(200);
+/// Released holes remembered per speaker, bounding a flush across a large
+/// sequence jump.
+const MAX_RELEASED_HOLES: usize = 64;
 
 /// One emit decision: forward the bundled `(from_immediate, frame)` to
 /// the audio sink.
@@ -302,6 +311,10 @@ struct SenderState {
     last_activity: Instant,
     /// Delivery cadence survives an empty buffer until the speaker is pruned.
     next_flush_at: Option<Instant>,
+    /// Sequences a deadline flush released past without ever emitting, with
+    /// the release time. A FEC reconstruction of one may still emit late,
+    /// once, within [`FEC_LATE_EMIT_WINDOW`].
+    released_holes: VecDeque<(u64, Instant)>,
 }
 
 impl Reorderer {
@@ -740,6 +753,7 @@ impl Reorderer {
                     in_order_run: 0,
                     last_activity: now,
                     next_flush_at: None,
+                    released_holes: VecDeque::new(),
                 },
             );
             self.enqueue_idle_deadline(&mut state, session, now);
@@ -775,6 +789,7 @@ impl Reorderer {
             entry.adaptive_delay_ms = initial_adaptive_delay_ms;
             entry.in_order_run = 0;
             entry.next_flush_at = None;
+            entry.released_holes.clear();
         }
         entry.last_activity = now;
 
@@ -788,13 +803,27 @@ impl Reorderer {
 
         // Once a stream has advanced, every lower same-epoch sequence is a
         // duplicate or late arrival. Rewinding here re-emits audio and breaks
-        // the receiver's monotonic stream contract.
+        // the receiver's monotonic stream contract. The one exception is a FEC
+        // reconstruction of a hole a flush released past without emitting:
+        // it has never been played, so it emits once, out of order, and
+        // leaves the delivery cadence untouched.
         if frame_seq < entry.next_seq {
-            report.results.push(ReorderResultCount::new(
-                VoiceReceiveResult::DuplicateOrLate,
-                1,
-            ));
-            return self.finish_push(&mut state, session, entry, report, now);
+            let late_fill = copy_kind == VoiceCopyKind::Fec
+                && !frame.is_terminator
+                && Self::take_released_hole(&mut entry, frame_seq, now);
+            let result = if late_fill {
+                VoiceReceiveResult::FecLate
+            } else {
+                VoiceReceiveResult::DuplicateOrLate
+            };
+            report.results.push(ReorderResultCount::new(result, 1));
+            let mut report = self.finish_push(&mut state, session, entry, report, now);
+            if late_fill {
+                report
+                    .emissions
+                    .push(ReorderEmission::new(from, frame, copy_kind));
+            }
+            return report;
         }
 
         // In-order frames emit immediately and drain a contiguous buffered
@@ -1052,6 +1081,19 @@ impl Reorderer {
         entry.deadline = None;
         entry.hold_started_at = None;
         entry.gap_expires_at = None;
+        if let Some((&last_seq, _)) = pending.last_key_value() {
+            let first_hole = entry
+                .next_seq
+                .max(last_seq.saturating_sub(MAX_RELEASED_HOLES as u64));
+            for seq in first_hole..last_seq {
+                if !pending.contains_key(&seq) {
+                    entry.released_holes.push_back((seq, now));
+                }
+            }
+            while entry.released_holes.len() > MAX_RELEASED_HOLES {
+                entry.released_holes.pop_front();
+            }
+        }
         if let Some((seq, last)) = pending.last_key_value() {
             entry.next_seq = seq.saturating_add(1);
             entry.next_flush_at = Some(now + Self::delivery_interval(last.frame()));
@@ -1229,33 +1271,59 @@ impl Reorderer {
         })
     }
 
-    /// The currently live missing seq range `(first, last)` for a sender, if
-    /// a gap is actually open (something is buffered past `next_seq`). FEC
-    /// reconstruction uses this to restrict recovered frames to the range the
-    /// reorder is actually waiting on; `None` means "recover anything".
-    pub(crate) fn live_missing_range(
-        &self,
-        sender_session: u32,
-        sender_epoch: u64,
-    ) -> Option<(u64, u64)> {
+    /// Whether a FEC reconstruction of `seq` would still be delivered: the
+    /// sequence is not yet emitted or buffered, or it is a hole a flush
+    /// released past within [`FEC_LATE_EMIT_WINDOW`]. An unknown speaker
+    /// wants anything, since a reconstruction may bootstrap it.
+    pub(crate) fn fec_wants(&self, sender_session: u32, sender_epoch: u64, seq: u64) -> bool {
         if self.cfg.reorder_disabled {
-            return None;
+            return true;
         }
         let state = self.state.lock();
-        let entry = state.per_sender.get(&sender_session)?;
+        let Some(entry) = state.per_sender.get(&sender_session) else {
+            return true;
+        };
         if entry.sender_epoch != sender_epoch {
-            return None;
+            // A reconstruction never resets a stream to a new epoch.
+            return false;
         }
-        let first_pending = entry.pending.keys().next().copied()?;
-        if entry.next_seq >= first_pending {
-            return None;
+        if seq >= entry.next_seq {
+            return !entry.pending.contains_key(&seq);
         }
-        Some((entry.next_seq, first_pending.saturating_sub(1)))
+        let now = Instant::now();
+        entry.released_holes.iter().any(|(hole, released_at)| {
+            *hole == seq && now.saturating_duration_since(*released_at) < FEC_LATE_EMIT_WINDOW
+        })
+    }
+
+    /// Remove `seq` from the released holes if it is still inside the late
+    /// window, expiring older holes on the way.
+    fn take_released_hole(entry: &mut SenderState, seq: u64, now: Instant) -> bool {
+        entry.released_holes.retain(|(_, released_at)| {
+            now.saturating_duration_since(*released_at) < FEC_LATE_EMIT_WINDOW
+        });
+        let Some(index) = entry
+            .released_holes
+            .iter()
+            .position(|(hole, _)| *hole == seq)
+        else {
+            return false;
+        };
+        entry.released_holes.remove(index);
+        true
     }
 
     #[cfg(test)]
     pub fn pending_total(&self) -> usize {
         self.state.lock().total_pending
+    }
+
+    /// A report that emits nothing but carries the current pending total, for
+    /// dispatch steps that do not push (so the pending gauge stays truthful).
+    pub(crate) fn idle_report(&self) -> ReorderReport {
+        let mut report = ReorderReport::empty();
+        report.pending_total = self.state.lock().total_pending;
+        report
     }
 
     #[cfg(test)]
@@ -1697,6 +1765,48 @@ mod tests {
         let seqs: Vec<u64> = emits.iter().map(|(_, f)| f.s2s_seq).collect();
         assert_eq!(seqs, vec![1, 2]);
         assert_eq!(r.pending_total(), 0);
+    }
+
+    #[test]
+    fn fec_reconstruction_late_fills_a_released_hole_once_within_the_window() {
+        let r = Reorderer::new(cfg());
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let seqs = |report: ReorderReport| -> Vec<u64> {
+            report
+                .into_emissions()
+                .iter()
+                .map(|(_, f)| f.s2s_seq)
+                .collect()
+        };
+        let push = |seq: u64, terminator: bool, kind: VoiceCopyKind, ms: u64| {
+            r.push_at(11, frame(0xABC, 1, seq, terminator), None, kind, at(ms))
+        };
+        assert_eq!(seqs(push(0, false, VoiceCopyKind::Original, 0)), vec![0]);
+        // Frame 2 arrives past the 108 ms cadence: the reorder releases past 1.
+        assert_eq!(seqs(push(2, false, VoiceCopyKind::Original, 200)), vec![2]);
+        assert!(r.fec_wants(0xABC, 1, 1));
+        assert!(!r.fec_wants(0xABC, 2, 1), "never for another epoch");
+
+        // Only a FEC reconstruction may fill the released hole.
+        assert!(seqs(push(1, false, VoiceCopyKind::Proactive, 210)).is_empty());
+        let late = push(1, false, VoiceCopyKind::Fec, 220);
+        assert!(
+            late.result_counts()
+                .iter()
+                .any(|r| r.result() == VoiceReceiveResult::FecLate)
+        );
+        assert_eq!(seqs(late), vec![1]);
+        assert!(!r.fec_wants(0xABC, 1, 1));
+        assert!(seqs(push(1, false, VoiceCopyKind::Fec, 230)).is_empty());
+        // The late fill did not move the stream: 3 is next and emits in order.
+        assert_eq!(seqs(push(3, false, VoiceCopyKind::Original, 240)), vec![3]);
+
+        // Holes 4 and 5 release at 600 ms. A terminator is never late-filled,
+        // and a reconstruction past the window is discarded.
+        assert_eq!(seqs(push(6, false, VoiceCopyKind::Original, 600)), vec![6]);
+        assert!(seqs(push(4, true, VoiceCopyKind::Fec, 610)).is_empty());
+        assert!(seqs(push(5, false, VoiceCopyKind::Fec, 801)).is_empty());
     }
 
     #[test]

@@ -743,6 +743,15 @@ repair_max_extra_copies_per_frame = 1
 # deadline-aware, byte-fair reactive scheduler; these are not separate mints.
 repair_reactive_reserve_pct = 30
 repair_reactive_hard_reserve_pct = 10
+# Interleaved Reed-Solomon FEC on unreliable voice links. Consecutive frames
+# are dealt across voice_fec_interleave_depth blocks; each block of
+# voice_fec_block_size frames gets voice_fec_parity_blocks parity frames, and
+# any voice_fec_block_size frames of a block recover all of it.
+voice_fec_enabled = true
+voice_fec_block_size = 3
+voice_fec_parity_blocks = 3
+voice_fec_interleave_depth = 2
+voice_fec_receiver_window = 32
 
 [s2s.overlay]
 hello_interval_ms = 1000
@@ -995,6 +1004,49 @@ the deadline, the receiver immediately releases it past missing sequences.
 Proactive and FEC copies also receive this deadline without needing a later
 original. The speaker state resets after `reorder_idle_reset_ms` of inactivity
 (2000 ms by default) or a newer sender epoch. In-order audio emits immediately.
+
+FEC protects voice on unreliable (datagram) links with a systematic
+Reed-Solomon code over GF(2^8). The sender deals consecutive frames of a
+speaker stream across `voice_fec_interleave_depth` blocks (2 by default). Each
+block of `voice_fec_block_size` frames (3) gets `voice_fec_parity_blocks`
+parity frames (3), and any `voice_fec_block_size` frames of a block recover
+all of its frames, whatever their lengths. An utterance terminator flushes
+partial blocks. With the defaults the parity overhead is 100% of voice
+frames.
+
+Two kinds of diversity protect against bursty loss. A block's parity rows are
+paced one per following data frame instead of leaving back-to-back, so a
+congestion drop that takes everything sent in one instant cannot take every
+row. Rows still owed when an utterance ends follow at 20 ms intervals. Parity
+also rides the route's loop-free alternate first hop when that path's measured
+metrics can carry it: live transport metrics, a datagram lane that is not
+shedding, loss no more than 1.5 times the primary's plus 2%, and no more than
+100 ms of extra latency. A burst on the data path then cannot take the parity
+too. In a model with 20% loss in bursts that average four frame slots, the
+share of frames still lost falls from about 11% with parity on the data path to
+about 4% with an equally lossy alternate, and to about 0.5% with a clean one.
+A block's first frame can wait up to `(block_size - 1) × depth + parity - 1`
+frames (six with the defaults) before its last parity row arrives. The
+receiver matches data and parity per speaker regardless of which peer
+delivered them. It mirrors at least `voice_fec_receiver_window` recent frames
+per speaker, raised to two interleave spans when that is larger.
+`shitspeak_s2s_voice_fec_sends_total{path}` separates `primary` from
+`alternate` parity, and `shitspeak_s2s_voice_reorder_gaps_opened_total{missing_frames}`
+shows the loss-run lengths receivers see.
+
+Parity is not charged to any byte budget, either the per-first-hop voice
+overlap headroom on send or the proactive ingress queue on receive. The only
+thing that skips parity is a first hop whose datagram lane is shedding frames
+at the send path; parity bound for the alternate is unaffected by the
+primary's shedding. The cadence deadline above still applies to recovery. If a
+frame is reconstructed after the receiver has already released past its
+sequence, it is delivered once, out of order, for up to 200 ms. Listener
+jitter buffers re-sequence it by the Mumble packet sequence or discard it.
+`shitspeak_s2s_voice_fec_recovered_frames_total{outcome}` counts
+reconstructions that arrived `in_time`, `late`, or were `discarded`. Parity
+wire indices start at 2. Peers built before this scheme use indices 0 and 1
+and ignore these frames, and this build ignores theirs, so mixed versions
+fall back to no FEC between them and never mis-decode each other's parity.
 
 Reactive repair responses and terminal retries compete for credit on the primary and
 alternate first hops when an alternate is available. An unfunded alternate

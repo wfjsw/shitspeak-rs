@@ -259,6 +259,15 @@ struct DistributionMetrics {
     /// (0..=1000) — the `shitspeak_s2s_voice_split_share` gauge. An interior hold
     /// shows up as a stable value in (0, 1000) instead of a corner.
     voice_split_shares: HashMap<(NodeIdentifier, NodeIdentifier), u64>,
+    /// Last exclusion earned by a first hop per (source, peer, first_hop), in
+    /// seconds — the `shitspeak_s2s_voice_tree_edge_route_exclusion_seconds`
+    /// gauge. Doubles per consecutive exclusion; cleared when the streak is
+    /// forgotten.
+    route_exclusions: HashMap<(NodeIdentifier, NodeIdentifier, NodeIdentifier), f64>,
+    /// First-hop exclusions per (source, peer, reason) —
+    /// `shitspeak_s2s_voice_tree_edge_route_exclusions_total`. Reasons are
+    /// `split_abort` and `congested_exit`.
+    route_exclusion_events: HashMap<(NodeIdentifier, NodeIdentifier, &'static str), u64>,
     /// Entries into each split state-machine phase per (source, peer) —
     /// `shitspeak_s2s_voice_split_phase_total`. Phase labels are the `&'static`
     /// `SplitPhase` variant names, so the label set is bounded.
@@ -639,6 +648,43 @@ pub(crate) fn update_tree_edge_transition(
     }
 }
 
+/// Count one first-hop exclusion on a tree edge (counter
+/// `shitspeak_s2s_voice_tree_edge_route_exclusions_total`).
+pub(crate) fn record_tree_edge_route_exclusion(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    reason: &'static str,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics
+        .route_exclusion_events
+        .entry((source, peer, reason))
+        .or_default() += 1;
+}
+
+/// Track the exclusion a first hop last earned on a tree edge (gauge
+/// `shitspeak_s2s_voice_tree_edge_route_exclusion_seconds`), until its streak
+/// is forgotten. `None` clears it.
+pub(crate) fn update_tree_edge_route_exclusion(
+    source: NodeIdentifier,
+    peer: NodeIdentifier,
+    first_hop: NodeIdentifier,
+    exclusion: Option<Duration>,
+) {
+    let mut metrics = METRICS.lock().unwrap();
+    let key = (source, peer, first_hop);
+    match exclusion {
+        Some(exclusion) => {
+            metrics
+                .route_exclusions
+                .insert(key, exclusion.as_secs_f64());
+        }
+        None => {
+            metrics.route_exclusions.remove(&key);
+        }
+    }
+}
+
 /// Track the current split weight on the adopted path for a tree edge
 /// (gauge `shitspeak_s2s_voice_split_share`). `None` clears the edge when the
 /// split commits or aborts.
@@ -720,7 +766,9 @@ pub(crate) fn record_tree_edge_decision(
 /// C2a immediate-escape trigger), `hard_loss` (active-lane effective loss
 /// at/above the full-dup threshold, the C2b shortened-confirm trigger), or
 /// `sink_gap` (the destination reporting degraded reorder quality, the C2c
-/// receiver-gap shortened-confirm trigger). One record per signal per send, so
+/// receiver-gap shortened-confirm trigger), or `congested` (sheds, a standing
+/// send queue, or inflated RTT on the lane, the C2d congestion
+/// shortened-confirm trigger). One record per signal per send, so
 /// the per-edge rate is the exposure denominator against which the
 /// `shitspeak_s2s_voice_tree_edge_decision_total` escape and
 /// `confirmed_challenger` rates are judged.
@@ -737,6 +785,15 @@ pub(crate) fn record_datagram_lane_signal(
         .or_default() += 1;
 }
 
+/// The C2 decision signals observed on one first hop for one frame.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DatagramLaneSignals {
+    pub(crate) lane_blocked: bool,
+    pub(crate) hard_loss: bool,
+    pub(crate) sink_gap: bool,
+    pub(crate) congested: bool,
+}
+
 /// Record one candidate-edge observation and maintain event-oriented C2
 /// telemetry. The observed frame/byte counters are the denominators for the
 /// affected counters. State transitions and active duration avoid interpreting
@@ -745,28 +802,16 @@ pub(crate) fn record_datagram_lane_observation(
     source: NodeIdentifier,
     peer: NodeIdentifier,
     frame_bytes: usize,
-    lane_blocked: bool,
-    hard_loss: bool,
-    sink_gap: bool,
+    signals: DatagramLaneSignals,
 ) {
-    record_datagram_lane_observation_at(
-        source,
-        peer,
-        frame_bytes,
-        lane_blocked,
-        hard_loss,
-        sink_gap,
-        Instant::now(),
-    );
+    record_datagram_lane_observation_at(source, peer, frame_bytes, signals, Instant::now());
 }
 
 fn record_datagram_lane_observation_at(
     source: NodeIdentifier,
     peer: NodeIdentifier,
     frame_bytes: usize,
-    lane_blocked: bool,
-    hard_loss: bool,
-    sink_gap: bool,
+    signals: DatagramLaneSignals,
     now: Instant,
 ) {
     let mut metrics = METRICS.lock().unwrap();
@@ -781,9 +826,10 @@ fn record_datagram_lane_observation_at(
         .or_default() += frame_bytes as u64;
 
     for (signal, active) in [
-        ("lane_blocked", lane_blocked),
-        ("hard_loss", hard_loss),
-        ("sink_gap", sink_gap),
+        ("lane_blocked", signals.lane_blocked),
+        ("hard_loss", signals.hard_loss),
+        ("sink_gap", signals.sink_gap),
+        ("congested", signals.congested),
     ] {
         let key = (source, peer, signal);
         if active {
@@ -950,6 +996,28 @@ pub(crate) fn prometheus_samples(local_node: NodeIdentifier) -> Vec<PrometheusSa
                 ("peer".to_owned(), peer.to_string()),
             ],
             *count as f64,
+        ));
+    }
+    for ((source, peer, reason), count) in &metrics.route_exclusion_events {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_tree_edge_route_exclusions_total",
+            vec![
+                ("source".to_owned(), source.to_string()),
+                ("peer".to_owned(), peer.to_string()),
+                ("reason".to_owned(), (*reason).to_owned()),
+            ],
+            *count as f64,
+        ));
+    }
+    for ((source, peer, first_hop), seconds) in &metrics.route_exclusions {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_tree_edge_route_exclusion_seconds",
+            vec![
+                ("source".to_owned(), source.to_string()),
+                ("peer".to_owned(), peer.to_string()),
+                ("first_hop".to_owned(), first_hop.to_string()),
+            ],
+            *seconds,
         ));
     }
     for ((source, peer), share) in &metrics.voice_split_shares {
@@ -1496,23 +1564,17 @@ mod tests {
     #[test]
     fn datagram_lane_signal_state_metrics_separate_transitions_duration_and_exposure() {
         let started = Instant::now();
-        record_datagram_lane_observation_at(91, 92, 120, true, false, false, started);
-        record_datagram_lane_observation_at(
-            91,
-            92,
-            180,
-            true,
-            false,
-            false,
-            started + Duration::from_secs(2),
-        );
+        let blocked = DatagramLaneSignals {
+            lane_blocked: true,
+            ..DatagramLaneSignals::default()
+        };
+        record_datagram_lane_observation_at(91, 92, 120, blocked, started);
+        record_datagram_lane_observation_at(91, 92, 180, blocked, started + Duration::from_secs(2));
         record_datagram_lane_observation_at(
             91,
             92,
             240,
-            false,
-            false,
-            false,
+            DatagramLaneSignals::default(),
             started + Duration::from_secs(5),
         );
 

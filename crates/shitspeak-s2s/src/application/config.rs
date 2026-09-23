@@ -103,23 +103,26 @@ pub struct VoiceConfig {
     /// Enable block FEC for unreliable voice transports. Defaults to true.
     pub voice_fec_enabled: bool,
 
-    /// Number of consecutive equal-length payloads covered by one parity
-    /// frame. Enabled FEC protects unreliable voice transports, within
-    /// the per-first-hop congestion and headroom limits.
-    /// A block whose members are not all the same length is dropped
-    /// (no redundancy) rather than sent with length ambiguity.
+    /// Data frames per Reed-Solomon block (2 through 32). Members may differ
+    /// in length. Larger blocks cost less parity per frame but delay the
+    /// recovery of a block's early members until the block completes.
     pub voice_fec_block_size: usize,
 
-    /// How many parity frames each completed block emits. 1 = plain XOR sum
-    /// (recovers one missing member per block). 2 = adds a GF(2^8) weighted
-    /// sum that, together with the plain sum, recovers two missing members.
-    /// Clamped to at most `voice_fec_block_size - 1` (never more parity than
-    /// data), and never above 2.
+    /// Reed-Solomon parity frames per block (1 through 16). Any
+    /// `voice_fec_block_size` of a block's data and parity frames recover
+    /// every member, so a block survives this many lost frames.
     pub voice_fec_parity_blocks: usize,
 
-    /// How many recent payloads per `(sender_session, sender_epoch, from)`
-    /// the receiver caches to XOR against a parity block, and how many
-    /// received parity blocks it retains.
+    /// Number of blocks consecutive frames are dealt across (1 through 8).
+    /// A burst of up to `voice_fec_parity_blocks × voice_fec_interleave_depth`
+    /// consecutive frames stays recoverable; the recovery delay of a block's
+    /// first member grows to `(block_size - 1) × depth` frames.
+    pub voice_fec_interleave_depth: usize,
+
+    /// Minimum number of recent data frames per `(sender_session,
+    /// sender_epoch, from)` the receiver mirrors to solve parity blocks, and
+    /// of parity blocks it retains. Raised automatically to two interleave
+    /// spans (`2 × block_size × interleave_depth`).
     pub voice_fec_receiver_window: usize,
 }
 
@@ -153,6 +156,7 @@ impl Default for VoiceConfig {
             voice_fec_enabled: default_voice_fec_enabled(),
             voice_fec_block_size: default_voice_fec_block_size(),
             voice_fec_parity_blocks: default_voice_fec_parity_blocks(),
+            voice_fec_interleave_depth: default_voice_fec_interleave_depth(),
             voice_fec_receiver_window: default_voice_fec_receiver_window(),
         }
     }
@@ -228,6 +232,8 @@ struct VoiceConfigWire {
     voice_fec_block_size: usize,
     #[serde(default = "default_voice_fec_parity_blocks")]
     voice_fec_parity_blocks: usize,
+    #[serde(default = "default_voice_fec_interleave_depth")]
+    voice_fec_interleave_depth: usize,
     #[serde(default = "default_voice_fec_receiver_window")]
     voice_fec_receiver_window: usize,
     // Accepted for compatibility; enabled FEC no longer waits for loss.
@@ -261,9 +267,14 @@ impl<'de> Deserialize<'de> for VoiceConfig {
                 "voice_fec_block_size must be between 2 and 32",
             ));
         }
-        if raw.voice_fec_parity_blocks < 1 || raw.voice_fec_parity_blocks > 2 {
+        if raw.voice_fec_parity_blocks < 1 || raw.voice_fec_parity_blocks > 16 {
             return Err(D::Error::custom(
-                "voice_fec_parity_blocks must be between 1 and 2",
+                "voice_fec_parity_blocks must be between 1 and 16",
+            ));
+        }
+        if raw.voice_fec_interleave_depth < 1 || raw.voice_fec_interleave_depth > 8 {
+            return Err(D::Error::custom(
+                "voice_fec_interleave_depth must be between 1 and 8",
             ));
         }
         let _ = (
@@ -305,6 +316,7 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             voice_fec_enabled: raw.voice_fec_enabled,
             voice_fec_block_size: raw.voice_fec_block_size,
             voice_fec_parity_blocks: raw.voice_fec_parity_blocks,
+            voice_fec_interleave_depth: raw.voice_fec_interleave_depth,
             voice_fec_receiver_window: raw.voice_fec_receiver_window,
         })
     }
@@ -410,13 +422,16 @@ fn default_voice_fec_enabled() -> bool {
     true
 }
 fn default_voice_fec_block_size() -> usize {
-    4
+    3
 }
 fn default_voice_fec_parity_blocks() -> usize {
-    1
+    3
+}
+fn default_voice_fec_interleave_depth() -> usize {
+    2
 }
 fn default_voice_fec_receiver_window() -> usize {
-    8
+    32
 }
 
 #[cfg(test)]
@@ -433,6 +448,37 @@ mod tests {
         )
         .unwrap();
         assert!(!disabled.voice_fec_enabled);
+    }
+
+    #[test]
+    fn voice_fec_defaults_to_interleaved_reed_solomon_and_bounds_its_shape() {
+        let cfg = VoiceConfig::default();
+        assert_eq!(
+            (
+                cfg.voice_fec_block_size,
+                cfg.voice_fec_parity_blocks,
+                cfg.voice_fec_interleave_depth,
+                cfg.voice_fec_receiver_window,
+            ),
+            (3, 3, 2, 32)
+        );
+        let custom: VoiceConfig = serde_json::from_str(
+            r#"{"voice_fec_block_size":8,"voice_fec_parity_blocks":16,"voice_fec_interleave_depth":8}"#,
+        )
+        .unwrap();
+        assert_eq!(custom.voice_fec_parity_blocks, 16);
+        assert_eq!(custom.voice_fec_interleave_depth, 8);
+        for invalid in [
+            r#"{"voice_fec_parity_blocks":0}"#,
+            r#"{"voice_fec_parity_blocks":17}"#,
+            r#"{"voice_fec_interleave_depth":0}"#,
+            r#"{"voice_fec_interleave_depth":9}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<VoiceConfig>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
