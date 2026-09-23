@@ -974,6 +974,7 @@ impl Server {
         {
             tls_fingerprints.ja4t = Some(metadata.ja4t().to_owned());
             tls_fingerprints.ja4l = metadata.ja4l().map(ToOwned::to_owned);
+            tls_fingerprints.ip_ttl = Some(metadata.ip_ttl());
         }
         tls_fingerprints.ja4x = tls_stream
             .get_ref()

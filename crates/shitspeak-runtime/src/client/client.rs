@@ -1419,6 +1419,10 @@ impl Client {
         self.tls_fingerprints.ja4l.as_deref()
     }
 
+    pub fn ip_ttl(&self) -> Option<u8> {
+        self.tls_fingerprints.ip_ttl
+    }
+
     pub fn tls_sni(&self) -> Option<&str> {
         self.tls_fingerprints.sni.as_deref()
     }

@@ -179,12 +179,14 @@ authenticate_external(ptr: i32, len: i32) -> i64
   "auxiliary_data": {
     "certificate_hash_base64": null,
     "session_id": 1,
+    "client_instance_id": 123456789,
     "ip_address": "127.0.0.1",
     "tls_ja3": "771,4865-4866,10-11,23,0",
     "tls_ja4": "t13x0306h2_8daaf6152771_02713d6af862",
     "tls_ja4t": null,
     "tls_ja4x": null,
     "tls_ja4l": null,
+    "ip_ttl": null,
     "tls_sni": "voice.example.test",
     "proxy_server_address": "192.0.2.5:443",
     "packet_capture_backends": ["ebpf", "af_packet"],
@@ -198,7 +200,10 @@ authenticate_external(ptr: i32, len: i32) -> i64
 }
 ```
 
-`tls_ja3` and `tls_ja4` describe the TLS ClientHello; `tls_ja4x` describes the
+`client_instance_id` identifies the connection instance and is stable for the
+connection lifetime. It is `null` for web authentication that occurs before a
+runtime client instance is allocated. `tls_ja3` and `tls_ja4` describe the TLS
+ClientHello; `tls_ja4x` describes the
 presented client certificate. `tls_sni` is the client-provided server name.
 `tls_ja3` is the canonical ordered JA3 field string, deliberately un-hashed so
 authenticators do not need legacy MD5 to compare or inspect it.
@@ -209,11 +214,12 @@ process: `ebpf` requires `CAP_BPF`, `CAP_PERFMON`, `CAP_NET_ADMIN`, and
 `CAP_NET_RAW`; the `af_packet` fallback requires `CAP_NET_RAW`.
 `packet_capture_backend` is the backend actually started, and is `null` if
 capture setup failed.
-`tls_ja4t` and `tls_ja4l` are `null` unless the listener has a TCP packet
-metadata source that can observe the initial SYN packet; a regular accepted TCP
+`tls_ja4t`, `tls_ja4l`, and `ip_ttl` are `null` unless the listener has a TCP
+packet metadata source that can observe the initial SYN packet; a regular accepted TCP
 socket does not expose the required window, option-order, TTL, or SYN timing
-data. They are also `null` for PROXY-protocol clients because the observed TCP
-peer is the proxy, not the logical client.
+data. `ip_ttl` is the initial IPv4 TTL or IPv6 hop limit observed on that SYN.
+They are also `null` for PROXY-protocol clients because the observed TCP peer is
+the proxy, not the logical client.
 
 ### HTTPS Fetch Import
 

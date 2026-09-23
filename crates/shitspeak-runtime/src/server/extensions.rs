@@ -26,6 +26,7 @@ pub struct AlpnConnectionInfo {
     tls_ja4t: Option<String>,
     tls_ja4x: Option<String>,
     tls_ja4l: Option<String>,
+    ip_ttl: Option<u8>,
     tls_sni: Option<String>,
     uses_proxy_protocol: bool,
 }
@@ -49,6 +50,7 @@ impl AlpnConnectionInfo {
             tls_ja4t: tls_fingerprints.ja4t,
             tls_ja4x: tls_fingerprints.ja4x,
             tls_ja4l: tls_fingerprints.ja4l,
+            ip_ttl: tls_fingerprints.ip_ttl,
             tls_sni: tls_fingerprints.sni,
             uses_proxy_protocol,
         }
@@ -88,6 +90,10 @@ impl AlpnConnectionInfo {
 
     pub fn tls_ja4l(&self) -> Option<&str> {
         self.tls_ja4l.as_deref()
+    }
+
+    pub fn ip_ttl(&self) -> Option<u8> {
+        self.ip_ttl
     }
 
     pub fn tls_sni(&self) -> Option<&str> {

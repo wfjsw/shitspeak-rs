@@ -76,6 +76,7 @@ pub(crate) struct TlsFingerprints {
     pub(crate) ja4t: Option<String>,
     pub(crate) ja4x: Option<String>,
     pub(crate) ja4l: Option<String>,
+    pub(crate) ip_ttl: Option<u8>,
     pub(crate) sni: Option<String>,
 }
 
@@ -189,6 +190,7 @@ where
                     ja4t: None,
                     ja4x: None,
                     ja4l: None,
+                    ip_ttl: None,
                     sni: client_hello.sni.map(str::to_ascii_lowercase),
                 };
                 let tls_stream = tokio_rustls::server::StartHandshake::from_parts(accepted, stream)

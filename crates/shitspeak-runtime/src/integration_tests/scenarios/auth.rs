@@ -557,6 +557,11 @@ async fn authenticator_receives_tls_fingerprints_sni_and_proxy_protocol_flag() {
     assert_eq!(auxiliary.tls_sni(), Some("localhost"));
     assert_eq!(auxiliary.tls_ja4t(), None);
     assert_eq!(auxiliary.tls_ja4l(), None);
+    assert_eq!(auxiliary.ip_ttl(), None);
+    assert!(
+        auxiliary.client_instance_id().is_some(),
+        "native authentication should expose the client instance ID"
+    );
     assert!(
         !auxiliary.uses_proxy_protocol(),
         "direct test connection should not use PROXY protocol"

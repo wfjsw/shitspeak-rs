@@ -29,6 +29,7 @@ pub struct WebTlsMetadata {
     ja4t: Option<String>,
     ja4x: Option<String>,
     ja4l: Option<String>,
+    ip_ttl: Option<u8>,
     sni: Option<String>,
 }
 
@@ -39,6 +40,7 @@ impl WebTlsMetadata {
         ja4t: Option<String>,
         ja4x: Option<String>,
         ja4l: Option<String>,
+        ip_ttl: Option<u8>,
         sni: Option<String>,
     ) -> Self {
         Self {
@@ -47,6 +49,7 @@ impl WebTlsMetadata {
             ja4t,
             ja4x,
             ja4l,
+            ip_ttl,
             sni,
         }
     }
@@ -65,6 +68,9 @@ impl WebTlsMetadata {
     }
     pub(crate) fn ja4l(&self) -> Option<&str> {
         self.ja4l.as_deref()
+    }
+    pub(crate) fn ip_ttl(&self) -> Option<u8> {
+        self.ip_ttl
     }
     pub(crate) fn sni(&self) -> Option<&str> {
         self.sni.as_deref()
@@ -135,12 +141,14 @@ impl WebSessionContext {
             auth_session_id: None,
             certificate_hash: None,
             session_id,
+            client_instance_id: None,
             ip_address: canonical_authenticator_ip(self.real_ip),
             tls_ja3: self.tls_metadata.ja3.clone(),
             tls_ja4: self.tls_metadata.ja4.clone(),
             tls_ja4t: self.tls_metadata.ja4t.clone(),
             tls_ja4x: self.tls_metadata.ja4x.clone(),
             tls_ja4l: self.tls_metadata.ja4l.clone(),
+            ip_ttl: self.tls_metadata.ip_ttl,
             tls_sni: self.tls_metadata.sni.clone(),
             proxy_server_address: None,
             packet_capture_backends: Vec::new(),
@@ -320,6 +328,7 @@ mod tls_metadata_tests {
                 Some("ja4t".to_owned()),
                 Some("ja4x".to_owned()),
                 Some("ja4l".to_owned()),
+                Some(57),
                 Some("voice.example.test".to_owned()),
             ),
             false,
@@ -331,6 +340,7 @@ mod tls_metadata_tests {
         assert_eq!(auxiliary.tls_ja4t.as_deref(), Some("ja4t"));
         assert_eq!(auxiliary.tls_ja4x.as_deref(), Some("ja4x"));
         assert_eq!(auxiliary.tls_ja4l.as_deref(), Some("ja4l"));
+        assert_eq!(auxiliary.ip_ttl, Some(57));
         assert_eq!(auxiliary.tls_sni.as_deref(), Some("voice.example.test"));
     }
 }

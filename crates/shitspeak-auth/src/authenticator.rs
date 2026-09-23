@@ -122,6 +122,8 @@ pub enum AuthenticationExpiryAction {
 pub struct AuthenticateAuxiliaryData {
     pub certificate_hash: Option<Bytes>,
     pub session_id: u32,
+    /// Stable identifier for the client connection instance, when available.
+    pub client_instance_id: Option<u64>,
     pub ip_address: IpAddr,
     pub tls_ja3: Option<String>,
     pub tls_ja4: Option<String>,
@@ -132,6 +134,9 @@ pub struct AuthenticateAuxiliaryData {
     pub tls_ja4x: Option<String>,
     /// TCP distance/location fingerprint. This requires TCP packet metadata.
     pub tls_ja4l: Option<String>,
+    /// Initial client IP TTL or IPv6 hop limit observed in the TCP SYN.
+    /// This is unavailable when the listener cannot observe the SYN packet.
+    pub ip_ttl: Option<u8>,
     /// The SNI name presented by the TLS client, when present.
     pub tls_sni: Option<String>,
     /// Transport address of the trusted PROXY-protocol peer. Present only

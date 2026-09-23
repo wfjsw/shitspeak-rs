@@ -116,12 +116,14 @@ impl ExecAuthenticatorJsonRequest {
 pub(crate) struct AuthenticatorJsonAuxiliaryData {
     certificate_hash_base64: Option<String>,
     session_id: u32,
+    client_instance_id: Option<u64>,
     ip_address: IpAddr,
     tls_ja3: Option<String>,
     tls_ja4: Option<String>,
     tls_ja4t: Option<String>,
     tls_ja4x: Option<String>,
     tls_ja4l: Option<String>,
+    ip_ttl: Option<u8>,
     tls_sni: Option<String>,
     proxy_server_address: Option<SocketAddr>,
     packet_capture_backends: Vec<String>,
@@ -143,12 +145,14 @@ impl From<&AuthenticateAuxiliaryData> for AuthenticatorJsonAuxiliaryData {
                 .as_ref()
                 .map(|hash| BASE64_STANDARD.encode(hash)),
             session_id: value.session_id,
+            client_instance_id: value.client_instance_id,
             ip_address: canonical_authenticator_ip(value.ip_address),
             tls_ja3: value.tls_ja3.clone(),
             tls_ja4: value.tls_ja4.clone(),
             tls_ja4t: value.tls_ja4t.clone(),
             tls_ja4x: value.tls_ja4x.clone(),
             tls_ja4l: value.tls_ja4l.clone(),
+            ip_ttl: value.ip_ttl,
             tls_sni: value.tls_sni.clone(),
             proxy_server_address: value.proxy_server_address,
             packet_capture_backends: value.packet_capture_backends.clone(),
@@ -379,12 +383,14 @@ mod tests {
         let mut auxiliary = AuthenticateAuxiliaryData {
             certificate_hash: None,
             session_id: 7,
+            client_instance_id: Some(123),
             ip_address: "127.0.0.1".parse().unwrap(),
             tls_ja3: None,
             tls_ja4: None,
             tls_ja4t: None,
             tls_ja4x: None,
             tls_ja4l: None,
+            ip_ttl: Some(57),
             tls_sni: None,
             proxy_server_address: None,
             packet_capture_backends: Vec::new(),
@@ -399,6 +405,8 @@ mod tests {
 
         let json = serde_json::to_value(AuthenticatorJsonAuxiliaryData::from(&auxiliary)).unwrap();
         assert_eq!(json["auth_session_id"], "auth-session-7");
+        assert_eq!(json["client_instance_id"], 123);
+        assert_eq!(json["ip_ttl"], 57);
 
         auxiliary.auth_session_id = None;
         let json = serde_json::to_value(AuthenticatorJsonAuxiliaryData::from(&auxiliary)).unwrap();

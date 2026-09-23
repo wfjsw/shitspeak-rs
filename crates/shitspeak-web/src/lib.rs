@@ -90,6 +90,7 @@ impl ServerExtension for WebServerExtension {
                         info.tls_ja4t().map(ToOwned::to_owned),
                         info.tls_ja4x().map(ToOwned::to_owned),
                         info.tls_ja4l().map(ToOwned::to_owned),
+                        info.ip_ttl(),
                         info.tls_sni().map(ToOwned::to_owned),
                     ),
                     info.uses_proxy_protocol(),

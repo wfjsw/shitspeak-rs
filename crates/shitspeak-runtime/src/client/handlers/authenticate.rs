@@ -130,6 +130,7 @@ pub async fn handle_authenticate(
     let auth_auxiliary = AuthenticateAuxiliaryData {
         certificate_hash,
         session_id: session_id.into(),
+        client_instance_id: Some(sender.client_instance_id()),
         auth_session_id: None,
         ip_address,
         tls_ja3: sender.tls_ja3().map(ToOwned::to_owned),
@@ -137,6 +138,7 @@ pub async fn handle_authenticate(
         tls_ja4t: sender.tls_ja4t().map(ToOwned::to_owned),
         tls_ja4x: sender.tls_ja4x().map(ToOwned::to_owned),
         tls_ja4l: sender.tls_ja4l().map(ToOwned::to_owned),
+        ip_ttl: sender.ip_ttl(),
         tls_sni: sender.tls_sni().map(ToOwned::to_owned),
         proxy_server_address: sender.proxy_server_address(),
         packet_capture_backends: server.packet_capture_backends().to_vec(),

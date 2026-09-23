@@ -19,6 +19,7 @@ fn new_flow_cache() -> FlowCache {
 pub(crate) struct TcpPacketMetadata {
     ja4t: String,
     ja4l: Option<String>,
+    ip_ttl: u8,
 }
 
 impl TcpPacketMetadata {
@@ -28,6 +29,10 @@ impl TcpPacketMetadata {
 
     pub(crate) fn ja4l(&self) -> Option<&str> {
         self.ja4l.as_deref()
+    }
+
+    pub(crate) fn ip_ttl(&self) -> u8 {
+        self.ip_ttl
     }
 }
 
@@ -140,7 +145,11 @@ impl TcpPacketCollector {
                     )
                 })
         });
-        Some(TcpPacketMetadata { ja4t, ja4l })
+        Some(TcpPacketMetadata {
+            ja4t,
+            ja4l,
+            ip_ttl: metadata.observed_ttl,
+        })
     }
 
     /// Wait for the packet receiver to publish the flow observed by the
@@ -1685,6 +1694,7 @@ mod linux {
                 .expect("flow must remain cached");
             assert_eq!(metadata.ja4t(), "64240_2-1-3-4_1460_8");
             assert_eq!(metadata.ja4l(), Some("125_57_150"));
+            assert_eq!(metadata.ip_ttl(), 57);
         }
 
         #[test]
@@ -1890,6 +1900,7 @@ mod linux {
                 .expect("published flow metadata");
             assert_eq!(metadata.ja4t(), "64240_2-1-3-4_1460_8");
             assert_eq!(metadata.ja4l(), Some("125_57_150"));
+            assert_eq!(metadata.ip_ttl(), 57);
         }
 
         #[tokio::test]
