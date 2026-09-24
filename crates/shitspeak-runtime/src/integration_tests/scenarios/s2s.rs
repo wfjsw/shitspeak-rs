@@ -2341,6 +2341,64 @@ async fn s2s_cross_node_text_message_routes_to_remote_recipient() {
     );
 }
 
+/// Checks that an authenticator-invisible sender's text crosses nodes as a
+/// server message: the remote recipient receives it without an actor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_cross_node_invisible_sender_text_is_delivered_as_server_message() {
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    a.authenticator
+        .register_invisible_user("ghost", None, Some(1), vec![]);
+    b.authenticator.register_user("bob", None, Some(2), vec![]);
+
+    let ghost = TestClient::connect_and_authenticate(&a, "ghost", None)
+        .await
+        .expect("ghost");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+    wait_for_server_to_track_client(&a, bob.server_session.into()).await;
+    wait_for_server_to_track_client(&b, ghost.server_session.into()).await;
+
+    for (target, text) in [
+        (
+            TextMessage {
+                session: vec![bob.session_id],
+                ..TextMessage::default()
+            },
+            "invisible direct text across nodes",
+        ),
+        (
+            TextMessage {
+                channel_id: vec![0],
+                ..TextMessage::default()
+            },
+            "invisible channel text across nodes",
+        ),
+    ] {
+        ghost
+            .send(
+                TextMessage {
+                    message: text.to_owned(),
+                    ..target
+                }
+                .into(),
+            )
+            .await;
+        let received = bob
+            .recv_until(
+                |m| matches!(m, Message::TextMessage(t) if t.message == text),
+                CLIENT_DEADLINE,
+            )
+            .await;
+        let Some(Message::TextMessage(received)) = received else {
+            panic!("Bob should receive {text:?}");
+        };
+        assert_eq!(received.actor, None, "{text:?} must not reveal the sender");
+    }
+}
+
 /// Checks cross-node moderation routing to the target user's owning server.
 /// Expected: Alice's mute request on server A is applied by server B and Bob
 /// receives `UserState { mute: true }`. The moderation semantics come from

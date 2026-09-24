@@ -647,7 +647,10 @@ fn available_memory_bytes() -> Option<u64> {
 
 #[cfg(not(windows))]
 fn available_memory_bytes() -> Option<u64> {
-    select_available_memory(parse_cgroup_memory_available(), parse_mem_available_from_proc())
+    select_available_memory(
+        parse_cgroup_memory_available(),
+        parse_mem_available_from_proc(),
+    )
 }
 
 #[cfg(not(windows))]
@@ -3089,6 +3092,8 @@ async fn deliver_text_message_to_local_recipients(
     server: &Arc<Box<Server>>,
     envelope: TextMessageEnvelope,
 ) {
+    use crate::client::visibility::TextSenderAttribution;
+
     if envelope.receiver_sessions.is_empty() {
         return;
     }
@@ -3106,6 +3111,20 @@ async fn deliver_text_message_to_local_recipients(
     if server.get_hide_users_without_traverse() && sender.is_none() {
         return;
     }
+    let sender_message = shitspeak_messages::messages::encoder::TextMessage {
+        actor: Some(envelope.sender_session),
+        session: envelope.session,
+        channel_id: envelope.channel_id,
+        tree_id: envelope.tree_id,
+        message: envelope.message,
+    };
+    let server_message: shitspeak_messages::messages::Message =
+        shitspeak_messages::messages::encoder::TextMessage {
+            actor: None,
+            ..sender_message.clone()
+        }
+        .into();
+    let sender_message: shitspeak_messages::messages::Message = sender_message.into();
     for receiver in envelope.receiver_sessions {
         let id = ClientSessionIdentifier::from(receiver);
         if id.get_node_id() != server.get_clients().local_node_id() {
@@ -3121,26 +3140,28 @@ async fn deliver_text_message_to_local_recipients(
         if !target.is_authenticated() {
             continue;
         }
-        if let Some(sender) = sender.as_ref() {
-            if !crate::client::visibility::can_view_user(server, sender, &target).await {
-                continue;
+        let attribution = match sender.as_ref() {
+            Some(sender) => {
+                if !crate::client::visibility::can_view_user(server, sender, &target).await {
+                    continue;
+                }
+                let Some(attribution) =
+                    crate::client::visibility::text_sender_attribution(server, &target, sender)
+                        .await
+                else {
+                    continue;
+                };
+                attribution
             }
-            if !crate::client::visibility::can_view_user(server, &target, sender).await {
-                continue;
-            }
-        }
-        let message: shitspeak_messages::messages::Message =
-            shitspeak_messages::messages::encoder::TextMessage {
-                actor: Some(envelope.sender_session),
-                session: envelope.session.clone(),
-                channel_id: envelope.channel_id.clone(),
-                tree_id: envelope.tree_id.clone(),
-                message: envelope.message.clone(),
-            }
-            .into();
+            None => TextSenderAttribution::Sender,
+        };
+        let message = match attribution {
+            TextSenderAttribution::Sender => &sender_message,
+            TextSenderAttribution::Server => &server_message,
+        };
         server
             .get_clients()
-            .send_to_in_server(&server_id, id, &message)
+            .send_to_in_server(&server_id, id, message)
             .await;
     }
 }

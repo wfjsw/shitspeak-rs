@@ -12,7 +12,7 @@ use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _};
 use shitspeak_client_crypto::CryptState;
 use shitspeak_messages::messages::encoder::{
-    Authenticate, ClientType, ContextActionModify, CryptSetup, Ping, RejectType,
+    Authenticate, ClientType, ContextActionModify, CryptSetup, Ping, RejectType, TextMessage,
 };
 use shitspeak_messages::messages::{Message, ReadMessageExt, WriteMessageExt};
 use shitspeak_state::{ACL, ACLPermissions};
@@ -847,6 +847,133 @@ async fn authenticator_invisible_user_is_hidden_from_regular_and_superusers_and_
             .authenticated_client_count_in_server(crate::types::DEFAULT_SERVER_ID),
         2
     );
+}
+
+async fn expect_text(client: &TestClient, text: &str, actor: Option<u32>, context: &str) {
+    let received = client
+        .recv_until(
+            |message| matches!(message, Message::TextMessage(tm) if tm.message == text),
+            Duration::from_secs(2),
+        )
+        .await;
+    let Some(Message::TextMessage(tm)) = received else {
+        panic!("{context}: expected TextMessage {text:?}");
+    };
+    assert_eq!(tm.actor, actor, "{context}: unexpected actor");
+}
+
+#[tokio::test]
+async fn authenticator_invisible_user_text_is_delivered_as_server_message() {
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_invisible_user("ghost", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(3), vec!["admin".into()]);
+
+    let ghost = TestClient::connect_and_authenticate(&server, "ghost", None)
+        .await
+        .expect("ghost");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    bob.drain_now().await;
+    alice.drain_now().await;
+
+    ghost
+        .send(
+            TextMessage {
+                channel_id: vec![0],
+                message: "ghost channel text".to_owned(),
+                ..TextMessage::default()
+            }
+            .into(),
+        )
+        .await;
+    expect_text(&bob, "ghost channel text", None, "regular channel member").await;
+    expect_text(
+        &alice,
+        "ghost channel text",
+        None,
+        "superuser channel member",
+    )
+    .await;
+
+    ghost
+        .send(
+            TextMessage {
+                session: vec![bob.session_id],
+                message: "ghost direct text".to_owned(),
+                ..TextMessage::default()
+            }
+            .into(),
+        )
+        .await;
+    expect_text(&bob, "ghost direct text", None, "direct recipient").await;
+}
+
+#[tokio::test]
+async fn hidden_superuser_text_is_from_server_for_regular_users_only() {
+    use crate::toggle_superuser_visibility::ACTION_ID;
+
+    let server = spawn_test_server(TestServerOpts::default()).await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_superuser("carol", None, Some(2), vec!["admin".into()]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(3), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob");
+    bob.drain_now().await;
+
+    alice
+        .trigger_context_action_with_targets(ACTION_ID, Some(alice.session_id), Some(0))
+        .await;
+    bob.recv_until(
+        |message| matches!(message, Message::UserRemove(remove) if remove.session == alice.session_id),
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("regular user should lose the hidden superuser");
+    carol.drain_now().await;
+
+    alice
+        .send(
+            TextMessage {
+                channel_id: vec![0],
+                message: "hidden superuser text".to_owned(),
+                ..TextMessage::default()
+            }
+            .into(),
+        )
+        .await;
+    expect_text(&bob, "hidden superuser text", None, "regular user").await;
+    expect_text(
+        &carol,
+        "hidden superuser text",
+        Some(alice.session_id),
+        "superuser",
+    )
+    .await;
 }
 
 #[tokio::test]

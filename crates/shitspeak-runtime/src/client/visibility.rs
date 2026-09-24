@@ -909,6 +909,31 @@ fn superuser_hidden_from_viewer(viewer: &Arc<Box<Client>>, target: &Arc<Box<Clie
     target.is_superuser() && target.is_hidden_from_regular_users() && !viewer.is_superuser()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TextSenderAttribution {
+    Sender,
+    Server,
+}
+
+/// Decides how `recipient` sees a TextMessage from `sender`. A sender whose
+/// identity is concealed (authenticator invisibility or a hidden superuser) is
+/// relayed as a server message; a sender hidden only by channel ACLs is not
+/// delivered at all.
+pub(crate) async fn text_sender_attribution(
+    server: &Arc<Box<Server>>,
+    recipient: &Arc<Box<Client>>,
+    sender: &Arc<Box<Client>>,
+) -> Option<TextSenderAttribution> {
+    if recipient.get_session_id() != sender.get_session_id()
+        && (sender.is_invisible() || superuser_hidden_from_viewer(recipient, sender))
+    {
+        return Some(TextSenderAttribution::Server);
+    }
+    can_view_user(server, recipient, sender)
+        .await
+        .then_some(TextSenderAttribution::Sender)
+}
+
 pub(crate) fn user_filtering_enabled(server: &Arc<Box<Server>>, viewer: &Arc<Box<Client>>) -> bool {
     server.get_hide_users_without_traverse() || !viewer.is_superuser()
 }

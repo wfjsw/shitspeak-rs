@@ -5,6 +5,7 @@ use shitspeak_state::ACLPermissions;
 use crate::{
     client::Client,
     client::client_session_identifier::ClientSessionIdentifier,
+    client::visibility::{TextSenderAttribution, text_sender_attribution},
     errors::MessageHandlerError,
     messages::{Message, encoder::TextMessage},
     server::Server,
@@ -130,14 +131,23 @@ pub async fn handle_text_message(
         tree_roots.push(root_channel_id);
     }
 
-    let relay: Message = TextMessage {
+    let sender_relay = TextMessage {
         actor: Some(sender_session),
         session: direct_sessions.clone(),
         channel_id: channel_ids.clone(),
         tree_id: tree_roots,
         message,
+    };
+    let server_relay: Message = TextMessage {
+        actor: None,
+        ..sender_relay.clone()
     }
     .into();
+    let sender_relay: Message = sender_relay.into();
+    let relays = TextRelays {
+        sender: &sender_relay,
+        server: &server_relay,
+    };
 
     let local_node_id = server.get_clients().local_node_id();
     let mut remote_by_node = std::collections::BTreeMap::<u16, Vec<u32>>::new();
@@ -151,16 +161,16 @@ pub async fn handle_text_message(
         else {
             continue;
         };
-        if !crate::client::visibility::can_view_user(server, &target, sender).await {
+        let Some(attribution) = text_sender_attribution(server, &target, sender).await else {
             continue;
-        }
+        };
         if !delivered_sessions.insert(u32::from(session_id)) {
             continue;
         }
         if session_id.get_node_id() == local_node_id {
             server
                 .get_clients()
-                .send_to_in_server(&server_id, session_id, &relay)
+                .send_to_in_server(&server_id, session_id, relays.for_attribution(attribution))
                 .await;
         } else {
             remote_by_node
@@ -187,11 +197,12 @@ pub async fn handle_text_message(
             {
                 continue;
             }
-            if !crate::client::visibility::can_view_user(server, client, sender).await {
+            let Some(attribution) = text_sender_attribution(server, client, sender).await else {
                 continue;
-            }
+            };
             deliver_or_queue_text_recipient(
-                &relay,
+                relays,
+                attribution,
                 client,
                 local_node_id,
                 &mut delivered_sessions,
@@ -217,11 +228,12 @@ pub async fn handle_text_message(
             {
                 continue;
             }
-            if !crate::client::visibility::can_view_user(server, client, sender).await {
+            let Some(attribution) = text_sender_attribution(server, client, sender).await else {
                 continue;
-            }
+            };
             deliver_or_queue_text_recipient(
-                &relay,
+                relays,
+                attribution,
                 client,
                 local_node_id,
                 &mut delivered_sessions,
@@ -232,7 +244,7 @@ pub async fn handle_text_message(
     }
 
     if !remote_by_node.is_empty() {
-        let Message::TextMessage(relay) = &relay else {
+        let Message::TextMessage(relay) = &sender_relay else {
             return Ok(());
         };
         for (node_id, receiver_sessions) in remote_by_node {
@@ -261,8 +273,24 @@ pub async fn handle_text_message(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct TextRelays<'a> {
+    sender: &'a Message,
+    server: &'a Message,
+}
+
+impl<'a> TextRelays<'a> {
+    fn for_attribution(self, attribution: TextSenderAttribution) -> &'a Message {
+        match attribution {
+            TextSenderAttribution::Sender => self.sender,
+            TextSenderAttribution::Server => self.server,
+        }
+    }
+}
+
 async fn deliver_or_queue_text_recipient(
-    relay: &Message,
+    relays: TextRelays<'_>,
+    attribution: TextSenderAttribution,
     client: &Arc<Box<Client>>,
     local_node_id: u16,
     delivered_sessions: &mut std::collections::BTreeSet<u32>,
@@ -273,7 +301,9 @@ async fn deliver_or_queue_text_recipient(
         return;
     }
     if session_id.get_node_id() == local_node_id {
-        let _ = client.write_proto_message(relay).await;
+        let _ = client
+            .write_proto_message(relays.for_attribution(attribution))
+            .await;
     } else {
         remote_by_node
             .entry(session_id.get_node_id())

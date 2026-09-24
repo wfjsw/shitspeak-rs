@@ -1681,13 +1681,13 @@ async fn traverse_visibility_filters_channel_and_tree_text_from_hidden_sender() 
     .await;
     let hidden_channel_text = alice
         .recv_until(
-            |m| matches!(m, Message::TextMessage(tm) if tm.actor == Some(bob.session_id)),
+            |m| matches!(m, Message::TextMessage(tm) if tm.message == "hidden channel text"),
             Duration::from_millis(300),
         )
         .await;
     assert!(
         hidden_channel_text.is_none(),
-        "channel text from a hidden sender should be dropped"
+        "channel text from an ACL-hidden sender should be dropped, not relayed as a server message"
     );
 
     bob.send(
@@ -1701,13 +1701,13 @@ async fn traverse_visibility_filters_channel_and_tree_text_from_hidden_sender() 
     .await;
     let hidden_tree_text = alice
         .recv_until(
-            |m| matches!(m, Message::TextMessage(tm) if tm.actor == Some(bob.session_id)),
+            |m| matches!(m, Message::TextMessage(tm) if tm.message == "hidden tree text"),
             Duration::from_millis(300),
         )
         .await;
     assert!(
         hidden_tree_text.is_none(),
-        "tree text from a hidden sender should be dropped"
+        "tree text from an ACL-hidden sender should be dropped, not relayed as a server message"
     );
 }
 
