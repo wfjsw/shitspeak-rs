@@ -1271,10 +1271,15 @@ impl Reorderer {
         })
     }
 
-    /// Whether a FEC reconstruction of `seq` would still be delivered: the
-    /// sequence is not yet emitted or buffered, or it is a hole a flush
-    /// released past within [`FEC_LATE_EMIT_WINDOW`]. An unknown speaker
-    /// wants anything, since a reconstruction may bootstrap it.
+    /// Whether a FEC reconstruction of `seq` would fill a hole the reorder is
+    /// waiting on: the next sequence (emitting it early stays in order), a
+    /// sequence behind an already buffered later frame, or a hole a flush
+    /// released past within [`FEC_LATE_EMIT_WINDOW`]. A sequence past every
+    /// frame received so far is not wanted: its original may simply be in
+    /// flight, and a buffered reconstruction ahead of it would let the
+    /// cadence flush release past — and then discard — that original. An
+    /// unknown speaker wants anything, since a reconstruction may bootstrap
+    /// it.
     pub(crate) fn fec_wants(&self, sender_session: u32, sender_epoch: u64, seq: u64) -> bool {
         if self.cfg.reorder_disabled {
             return true;
@@ -1288,7 +1293,13 @@ impl Reorderer {
             return false;
         }
         if seq >= entry.next_seq {
-            return !entry.pending.contains_key(&seq);
+            return !entry.pending.contains_key(&seq)
+                && (seq == entry.next_seq
+                    || entry
+                        .pending
+                        .keys()
+                        .next_back()
+                        .is_some_and(|last| seq < *last));
         }
         let now = Instant::now();
         entry.released_holes.iter().any(|(hole, released_at)| {
@@ -1765,6 +1776,38 @@ mod tests {
         let seqs: Vec<u64> = emits.iter().map(|(_, f)| f.s2s_seq).collect();
         assert_eq!(seqs, vec![1, 2]);
         assert_eq!(r.pending_total(), 0);
+    }
+
+    #[test]
+    fn fec_wants_only_holes_the_reorder_is_waiting_on() {
+        let r = Reorderer::new(cfg());
+        let start = Instant::now();
+        r.push_at(
+            11,
+            frame(0xABC, 1, 0, false),
+            None,
+            VoiceCopyKind::Original,
+            start,
+        );
+        // Nothing past 0 has arrived: 1 may be in flight. Its early in-order
+        // emission is harmless; anything further ahead is not wanted.
+        assert!(r.fec_wants(0xABC, 1, 1));
+        assert!(!r.fec_wants(0xABC, 1, 2));
+        assert!(!r.fec_wants(0xABC, 1, 9));
+        // Frame 4 arrives: 1..3 are holes behind it, 4 itself is buffered.
+        r.push_at(
+            11,
+            frame(0xABC, 1, 4, false),
+            None,
+            VoiceCopyKind::Original,
+            start,
+        );
+        assert!((1..4).all(|seq| r.fec_wants(0xABC, 1, seq)));
+        assert!(!r.fec_wants(0xABC, 1, 4));
+        assert!(!r.fec_wants(0xABC, 1, 5));
+        // Already emitted, and unknown speakers.
+        assert!(!r.fec_wants(0xABC, 1, 0));
+        assert!(r.fec_wants(0xDEF, 1, 7));
     }
 
     #[test]

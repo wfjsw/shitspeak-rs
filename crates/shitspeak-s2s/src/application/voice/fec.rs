@@ -560,6 +560,10 @@ struct ReceiverFecWindow {
     window: usize,
     received: VecDeque<VoiceFrame>,
     blocks: VecDeque<FecBlock>,
+    /// Reconstructed members the reorder did not want yet — typically frames
+    /// whose originals were only in flight. Released once they become a hole
+    /// the reorder waits on, dropped when their original arrives.
+    stash: VecDeque<VoiceFrame>,
     last_used: Instant,
 }
 
@@ -569,6 +573,7 @@ impl ReceiverFecWindow {
             window: window.max(1),
             received: VecDeque::new(),
             blocks: VecDeque::new(),
+            stash: VecDeque::new(),
             last_used: now,
         }
     }
@@ -576,6 +581,12 @@ impl ReceiverFecWindow {
     /// Record an inbound data frame (any copy kind). Keeps the most recent
     /// copy of each seq so a replayed original cannot double-count a member.
     fn record_frame(&mut self, frame: VoiceFrame) {
+        let seq = frame.s2s_seq;
+        self.stash.retain(|stashed| stashed.s2s_seq != seq);
+        self.mirror_frame(frame);
+    }
+
+    fn mirror_frame(&mut self, frame: VoiceFrame) {
         let seq = frame.s2s_seq;
         self.received.retain(|member| member.s2s_seq != seq);
         self.received.push_back(frame);
@@ -634,8 +645,9 @@ impl ReceiverFecWindow {
 
     /// Solve every unresolved block that has at least as many parity frames
     /// as absent members, when the reorder still wants one of them. Recovered
-    /// members are recorded back into the mirror; those `wanted` accepts are
-    /// returned in seq order.
+    /// members are recorded back into the mirror. Those `wanted` accepts —
+    /// now or from an earlier solve — are returned in seq order; the rest wait
+    /// in the stash.
     fn try_reconstruct(&mut self, wanted: &dyn Fn(u64) -> bool) -> Vec<VoiceFrame> {
         let mut recovered: Vec<VoiceFrame> = Vec::new();
         if self.received.is_empty() {
@@ -662,9 +674,20 @@ impl ReceiverFecWindow {
             }
         }
         for frame in &recovered {
-            self.record_frame(frame.clone());
+            self.mirror_frame(frame.clone());
         }
-        recovered.retain(|frame| wanted(frame.s2s_seq));
+        self.stash.extend(recovered.drain(..));
+        self.stash.retain(|frame| {
+            if wanted(frame.s2s_seq) {
+                recovered.push(frame.clone());
+                false
+            } else {
+                true
+            }
+        });
+        while self.stash.len() > self.window {
+            self.stash.pop_front();
+        }
         recovered.sort_by_key(|frame| frame.s2s_seq);
         recovered.dedup_by_key(|frame| frame.s2s_seq);
         recovered
@@ -1253,6 +1276,36 @@ pub(crate) mod tests {
         assert_eq!(recovered[0].s2s_seq, 3);
         assert!(recovered[0].is_terminator);
         assert_eq!(recovered[0].payload.as_ref(), refs[2]);
+    }
+
+    #[test]
+    fn unwanted_reconstructions_wait_until_wanted_and_yield_to_their_original() {
+        let payloads: Vec<Vec<u8>> = (1..=3).map(payload_for).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let mut mirror = ReceiverFecWindow::new(8, Instant::now());
+        mirror.record_frame(frame(1, refs[0], false));
+        mirror.record_parity(vec![1, 2, 3], Bytes::from(rs_parity(&refs, 0)), 0, 0);
+        mirror.record_parity(vec![1, 2, 3], Bytes::from(rs_parity(&refs, 1)), 1, 0);
+        // Only 2 is wanted now; 3 is solved in the same block but held back.
+        let recovered = mirror.try_reconstruct(&|seq| seq == 2);
+        assert_eq!(
+            recovered.iter().map(|f| f.s2s_seq).collect::<Vec<_>>(),
+            vec![2]
+        );
+        // 3 becomes a hole: the stashed reconstruction is released.
+        let recovered = mirror.try_reconstruct(&|seq| seq == 3);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].payload.as_ref(), refs[2]);
+        assert!(mirror.try_reconstruct(&any).is_empty(), "released once");
+
+        // An original that lands first discards its stashed reconstruction.
+        let mut mirror = ReceiverFecWindow::new(8, Instant::now());
+        mirror.record_frame(frame(1, refs[0], false));
+        mirror.record_parity(vec![1, 2, 3], Bytes::from(rs_parity(&refs, 0)), 0, 0);
+        mirror.record_parity(vec![1, 2, 3], Bytes::from(rs_parity(&refs, 1)), 1, 0);
+        assert_eq!(mirror.try_reconstruct(&|seq| seq == 2).len(), 1);
+        mirror.record_frame(frame(3, refs[2], false));
+        assert!(mirror.try_reconstruct(&any).is_empty());
     }
 
     #[test]

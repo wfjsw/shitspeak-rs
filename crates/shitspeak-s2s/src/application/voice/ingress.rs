@@ -2552,18 +2552,27 @@ fn push_fec_recovered(
 ) -> Option<reorder::ReorderReport> {
     let wanted = |seq: u64| reorderer.fec_wants(sender_session, sender_epoch, seq);
     let mut report: Option<reorder::ReorderReport> = None;
-    for recovered in fec_state.try_reconstruct(sender_session, sender_epoch, &wanted) {
-        let pushed = reorderer.push_with_route_hint_report_with_copy_kind(
-            from,
-            recovered,
-            None,
-            VoiceCopyKind::Fec,
-        );
-        metrics::record_fec_recovery(pushed.result_counts());
-        report = Some(match report {
-            Some(report) => report.merge(pushed),
-            None => pushed,
-        });
+    // Each recovery can advance the cursor and make a stashed reconstruction
+    // the next wanted frame, so repeat until nothing more comes out. The stash
+    // is bounded, so this terminates.
+    loop {
+        let recovered = fec_state.try_reconstruct(sender_session, sender_epoch, &wanted);
+        if recovered.is_empty() {
+            break;
+        }
+        for recovered in recovered {
+            let pushed = reorderer.push_with_route_hint_report_with_copy_kind(
+                from,
+                recovered,
+                None,
+                VoiceCopyKind::Fec,
+            );
+            metrics::record_fec_recovery(pushed.result_counts());
+            report = Some(match report {
+                Some(report) => report.merge(pushed),
+                None => pushed,
+            });
+        }
     }
     report
 }
@@ -8250,6 +8259,63 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(sink.snapshot().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn fec_does_not_recover_ahead_of_a_merely_delayed_original() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = VoiceService::new_with_transport(
+            transport,
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        let sink = Arc::new(FecProbeSink::default());
+        svc.set_audio_sink(sink.clone());
+
+        // Interleaved block {2,4,6}: frame 2 and two parity rows arrive while
+        // frame 3 is still in flight. Nothing past 3 has arrived, so 3 is not
+        // lost; recovering 4 and 6 now would let the reorder release past 3
+        // and discard it when it lands.
+        let members: [&[u8]; 3] = [b"bbbb", b"dddd", b"ffff"];
+        inject_voice_inbound(&svc, 11, fec_data_frame(1, b"aaaa"));
+        inject_voice_inbound(&svc, 11, fec_data_frame(2, members[0]));
+        wait_for_fec_sink(&sink, 2).await;
+        for row in 0..2 {
+            inject_voice_inbound(
+                &svc,
+                12,
+                fec_parity_frame(
+                    0xABC,
+                    42,
+                    vec![2, 4, 6],
+                    &fec_rs_parity(&members, row as usize),
+                    row,
+                    0,
+                ),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        inject_voice_inbound(&svc, 11, fec_data_frame(3, b"cccc"));
+
+        let frames = wait_for_fec_sink(&sink, 3).await;
+        let order: Vec<u64> = frames.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(
+            &order[..3],
+            &[1, 2, 3],
+            "delayed original was skipped: {order:?}"
+        );
+        assert_eq!(frames[2].1.as_ref(), b"cccc");
+
+        // Once frame 5 arrives, 4 is a genuine hole behind it and the block's
+        // parity recovers it without waiting for another trigger; 6 then
+        // follows in order as the next frame.
+        inject_voice_inbound(&svc, 11, fec_data_frame(5, b"eeee"));
+        let frames = wait_for_fec_sink(&sink, 6).await;
+        let order: Vec<u64> = frames.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(order, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(frames[3].1.as_ref(), b"dddd");
+        assert_eq!(frames[5].1.as_ref(), b"ffff");
     }
 
     #[tokio::test]
