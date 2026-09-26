@@ -982,6 +982,21 @@ reliable incumbent immediately. Minimum hold and challenger confirmation
 continue to govern other path changes, and an unusable incumbent can still be
 escaped immediately.
 
+Receivers release past a missing voice frame within one packet period, so a
+frame overtaken by its successors on a faster route is lost. Tree edges
+therefore change which routes carry a speaker's voice between talk spurts (a
+new spurt starts after 250 ms without a frame on the edge). A challenger that
+is only cheaper waits for the next spurt, or at most 3 s after it is confirmed
+for a stream that never pauses. An incumbent with hard loss, congestion,
+receiver gaps, or no usable lane is still left mid-spurt. During a switch, the
+old route's redundant copy and, with `voice_path_split_mode`, the route of an
+interior split are drawn once per talk spurt rather than per frame. Receiver
+gap reports are not held against a route for 1 s after the edge changes routes,
+because they still describe the route it left. A tree edge idle for
+`voice_path_idle_reset_ms` is re-picked at its next spurt by the same loaded
+cost the challenger gate uses, skipping first hops excluded for failing that
+edge unless no other route is usable, so the pick is not overturned mid-spurt.
+
 S2S inbound and outbound transport queues are adaptive and byte-budgeted. The
 old `inbound_*_capacity` and `outbound_capacity` knobs are still accepted for
 compatibility, but they act as minimum budget hints rather than hard message
@@ -1102,7 +1117,13 @@ frame is reconstructed after the receiver has already released past its
 sequence, it is delivered once, out of order, for up to 200 ms. Listener
 jitter buffers re-sequence it by the Mumble packet sequence or discard it.
 `shitspeak_s2s_voice_fec_recovered_frames_total{outcome}` counts
-reconstructions that arrived `in_time`, `late`, or were `discarded`. Parity
+reconstructions that arrived `in_time`, `late`, or were `discarded`.
+`shitspeak_s2s_voice_late_arrival_after_release_bucket_total{copy,bucket}`
+counts every copy (`original`, `proactive`, `fec`, `repair`) that arrived for a
+sequence the receiver had already released past, bucketed by milliseconds
+after the release (`le_10` … `gt_640`). It shows how much of the loss a longer
+receiver wait or a deeper client jitter buffer could still have recovered. The
+receiver remembers the last 64 released sequences per speaker. Parity
 wire indices start at 2. Peers built before this scheme use indices 0 and 1
 and ignore these frames, and this build ignores theirs, so mixed versions
 fall back to no FEC between them and never mis-decode each other's parity.

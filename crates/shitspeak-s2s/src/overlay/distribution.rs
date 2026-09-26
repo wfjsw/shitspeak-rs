@@ -55,6 +55,20 @@ const TRANSITION_ABORT_OBSERVATIONS: u32 = 2;
 /// degrades hard (pressure >= 3) during the confirm is caught by the abort
 /// fast-path instead.
 const TRANSITION_CONFIRM: Duration = Duration::from_millis(150);
+/// Silence on an edge after which the next frame starts a new talk spurt.
+/// Longer than any Opus packet period, so continuous speech never reads as a
+/// pause, and long enough that frames still in flight on a route left during
+/// the silence have landed before the next spurt starts elsewhere. Receivers
+/// release past a missing frame within one packet period, so the set of routes
+/// carrying an edge's voice changes only between spurts unless it must.
+const TALK_SPURT_GAP: Duration = Duration::from_millis(250);
+/// How long a cost-only switch waits for the next talk spurt once confirmed,
+/// so a stream that never pauses (a music bot) still moves to the better route.
+const DEFERRED_SWITCH_MAX: Duration = Duration::from_secs(3);
+/// How long after a route change the sink's gap reports still describe the
+/// route just left: one 250 ms feedback window, its return trip, and the gaps
+/// the change itself caused.
+const SINK_GAP_SETTLE: Duration = Duration::from_secs(1);
 pub(crate) const DISTRIBUTION_CONTROL_SERVICE_TAG: u32 = 250;
 pub(crate) const VOICE_REALTIME_PROFILE_ID: u32 = 1;
 #[cfg(feature = "pre-release-workload")]
@@ -229,7 +243,7 @@ pub(crate) struct TreeEdgeStickinessPolicy {
     /// window ends and the split weight starts ramping.
     transition_fade: Duration,
     /// Interior split mode: once the controller settles at an interior weight
-    /// (`HoldsInterior`), each frame rides exactly one path by weight instead of
+    /// (`HoldsInterior`), each talk spurt rides exactly one path by weight instead of
     /// a redundant copy. OFF by default — the redundant fade is the staged first
     /// cut; enable once repair coverage is confirmed in Grafana.
     split_mode: bool,
@@ -312,6 +326,16 @@ struct TreeEdgeBinding {
     /// fades `from` (the old route) out under the challenger's *loaded*
     /// quality, aborting back to `from` if it degrades.
     transition: Option<TreeEdgeSplitState>,
+    /// When this edge last forwarded a frame, to detect talk-spurt boundaries.
+    last_frame_at: Instant,
+    /// Counts talk spurts on this edge; the sender's per-spurt draws key on it.
+    spurt: u64,
+    /// When a confirmed cost-only challenger started waiting for the next
+    /// talk spurt.
+    deferred_since: Option<Instant>,
+    /// When the routes carrying this edge's voice last changed (a switch began,
+    /// completed, or rolled back). `None` for a binding that never changed.
+    route_changed_at: Option<Instant>,
 }
 
 /// Snapshot of an in-flight voice split, handed to the sender each frame so it
@@ -323,8 +347,10 @@ pub(crate) struct TreeEdgeSplit {
     share: f64,
     /// True when the controller has converged on an interior split and is
     /// holding it as the steady state. The sender may then switch from
-    /// redundant-copy to one-path-per-frame by weight (split mode).
+    /// redundant-copy to one-path-per-spurt by weight (split mode).
     interior_hold: bool,
+    /// The edge's current talk spurt.
+    spurt: u64,
 }
 
 impl TreeEdgeSplit {
@@ -346,6 +372,14 @@ impl TreeEdgeSplit {
     /// path) rather than still moving toward a corner.
     pub(crate) fn interior_hold(self) -> bool {
         self.interior_hold
+    }
+
+    /// The edge's current talk spurt. Weighted route draws key on it rather
+    /// than on the frame, so every frame of a spurt rides the same routes: a
+    /// frame that alone lost its copy on a faster route would be overtaken by
+    /// its neighbours and released past at the receiver.
+    pub(crate) fn spurt(self) -> u64 {
+        self.spurt
     }
 }
 
@@ -754,6 +788,7 @@ fn observe_tree_edge_challenger(
         binding.challenger = Some(challenger);
         binding.challenger_since = Some(now);
         binding.challenger_observations = 1;
+        binding.deferred_since = None;
     }
 }
 
@@ -761,6 +796,7 @@ fn clear_tree_edge_challenger(binding: &mut TreeEdgeBinding) {
     binding.challenger = None;
     binding.challenger_since = None;
     binding.challenger_observations = 0;
+    binding.deferred_since = None;
 }
 
 fn begin_tree_edge_transition(
@@ -1676,6 +1712,7 @@ impl DistributionPlane {
                     to,
                     share,
                     interior_hold: matches!(phase, SplitPhase::HoldsInterior),
+                    spurt: binding.spurt,
                 }),
                 None => None,
             })
@@ -1729,6 +1766,7 @@ impl DistributionPlane {
         binding.transition = None;
         binding.path = from;
         binding.entered_at = now;
+        binding.route_changed_at = Some(now);
         // The adopted first hop failed to send; the sender fell back to the old
         // route. Keep the failed first hop out of contention while it cools.
         self.exclude_tree_edge_first_hop(parent, child, to.first_hop(child), "split_abort", now);
@@ -1801,16 +1839,46 @@ impl DistributionPlane {
             bound: false,
             no_alternate_reported: false,
             transition: None,
+            last_frame_at: now,
+            spurt: 0,
+            deferred_since: None,
+            route_changed_at: None,
         });
+        let spurt_start = now.saturating_duration_since(binding.last_frame_at) >= TALK_SPURT_GAP;
+        if spurt_start {
+            binding.spurt = binding.spurt.wrapping_add(1);
+        }
+        binding.last_frame_at = now;
 
         let incumbent = candidate_for(&candidates, binding.path);
 
         if !binding.bound && binding.pending == Some((TreeEdgePath::DirectChild, "initial")) {
-            if let Some(replacement) = candidates
-                .iter()
-                .copied()
-                .find(|candidate| candidate.pressure < 3 && !candidate.lane_blocked)
-            {
+            // Every talk spurt after an idle reset re-picks the edge, so the
+            // pick must agree with the challenger gate: rank by loaded cost
+            // (a raw-cheap relay already under load is not cheap) and keep out
+            // first hops excluded for failing this edge, unless nothing else
+            // is usable. Otherwise the gate moves the edge mid-spurt, every
+            // spurt. Ties keep the raw-cost order.
+            let pick = |allow_excluded: bool| {
+                candidates
+                    .iter()
+                    .copied()
+                    .filter(|candidate| candidate.pressure < 3 && !candidate.lane_blocked)
+                    .filter(|candidate| {
+                        allow_excluded
+                            || !self.voice_route_first_hop_cooling_down(
+                                parent,
+                                child,
+                                candidate.path.first_hop(child),
+                                now,
+                            )
+                    })
+                    .min_by(|left, right| {
+                        loaded_route_cost(Some(left.route_cost), left.pressure)
+                            .total_cmp(&loaded_route_cost(Some(right.route_cost), right.pressure))
+                    })
+            };
+            if let Some(replacement) = pick(false).or_else(|| pick(true)) {
                 binding.pending = Some((replacement.path, "initial"));
             }
         }
@@ -1849,6 +1917,7 @@ impl DistributionPlane {
             match transition.reduce(now, to_quality, from_quality, policy) {
                 TreeEdgeTransitionStep::Complete => {
                     binding.transition = None;
+                    binding.route_changed_at = Some(now);
                     distribution_metrics::update_tree_edge_split_share(parent, child, None);
                     distribution_metrics::record_tree_edge_binding_event(
                         parent,
@@ -1864,6 +1933,7 @@ impl DistributionPlane {
                     binding.transition = None;
                     binding.path = rollback;
                     binding.entered_at = now;
+                    binding.route_changed_at = Some(now);
                     // The challenger's first hop looked good while idle but
                     // degraded under load: keep it out of contention until its
                     // loaded metrics could be re-established.
@@ -2005,17 +2075,35 @@ impl DistributionPlane {
             // loss will follow, so the extra confirmation window only
             // prolongs the damage. min_hold still guards the fresh-binding
             // flap case.
+            //
+            // The sink's gap reports lag the route by a feedback window, so
+            // right after a route change they still describe the route just
+            // left (and the change itself): acting on them would move the edge
+            // again for gaps the current route never caused.
+            let sink_gap_settled = binding
+                .route_changed_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= SINK_GAP_SETTLE);
             let incumbent_hard_signal = incumbent.is_some_and(|candidate| {
-                candidate.hard_loss || candidate.sink_gap || candidate.congested
+                candidate.hard_loss
+                    || (candidate.sink_gap && sink_gap_settled)
+                    || candidate.congested
             });
             let confirm_window_met = incumbent_hard_signal
                 || binding.challenger_since.is_some_and(|since| {
                     now.saturating_duration_since(since) >= policy.challenger_confirm
                 });
-            if now.saturating_duration_since(binding.entered_at) >= policy.min_hold
+            let confirmed = now.saturating_duration_since(binding.entered_at) >= policy.min_hold
                 && binding.challenger_observations >= if incumbent_hard_signal { 1 } else { 2 }
-                && confirm_window_met
-            {
+                && confirm_window_met;
+            // A cost-only switch mid-spurt lets the new route overtake frames
+            // still in flight on the old one, and the receiver releases past
+            // them. Unless the incumbent is failing, wait for the next spurt
+            // (bounded, for streams that never pause).
+            let deferred = confirmed && !incumbent_hard_signal && !spurt_start && {
+                let since = *binding.deferred_since.get_or_insert(now);
+                now.saturating_duration_since(since) < DEFERRED_SWITCH_MAX
+            };
+            if confirmed && !deferred {
                 if incumbent.is_some_and(|candidate| candidate.congested) {
                     // Leaving because the lane congested under this load: the
                     // drained route must not win the load straight back.
@@ -2168,6 +2256,9 @@ impl DistributionPlane {
         let confirmation_for = binding.pending_confirmation;
         binding.path = attempt.path;
         binding.entered_at = changed.then_some(now).unwrap_or(binding.entered_at);
+        if previous.is_some() {
+            binding.route_changed_at = Some(now);
+        }
         binding.last_used_at = now;
         binding.bound = true;
         binding.no_alternate_reported = false;
@@ -2217,6 +2308,7 @@ impl DistributionPlane {
                 to: attempt.path,
                 share: 0.0,
                 interior_hold: false,
+                spurt: binding.spurt,
             })
         } else {
             None
@@ -4287,8 +4379,18 @@ mod tests {
             sticky_policy(),
             start + Duration::from_millis(750),
         );
-        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(3));
-        assert_eq!(confirmed.reason, "confirmed_challenger");
+        // Confirmed, but only cheaper: mid-spurt it waits for the next spurt.
+        assert_eq!(confirmed.path(), TreeEdgePath::DirectChild);
+        let next_spurt = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates(),
+            sticky_policy(),
+            start + Duration::from_millis(1_000),
+        );
+        assert_eq!(next_spurt.path(), TreeEdgePath::LegacyVia(3));
+        assert_eq!(next_spurt.reason, "confirmed_challenger");
     }
 
     #[test]
@@ -4352,7 +4454,20 @@ mod tests {
             sticky_policy(),
             at(1_750),
         );
-        assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4));
+        // Confirmed, but only cheaper: mid-spurt it waits for the next spurt.
+        assert_eq!(confirmed.path(), TreeEdgePath::DirectChild);
+        let next_spurt = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct_with_cost(2, 100),
+                TreeEdgeCandidate::legacy(4, 1, 1),
+            ],
+            sticky_policy(),
+            at(2_000),
+        );
+        assert_eq!(next_spurt.path(), TreeEdgePath::LegacyVia(4));
     }
 
     #[test]
@@ -4859,6 +4974,254 @@ mod tests {
             at(1_350),
         );
         assert_eq!(confirmed.path(), TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn initial_pick_weighs_load_like_the_challenger_gate() {
+        // After an idle reset every talk spurt re-picks the edge. A raw-cheaper
+        // relay already under load (pressure 2) used to win, only for the
+        // challenger gate — which compares loaded cost — to move the edge
+        // mid-spurt. The initial pick must agree with the gate.
+        let plane = DistributionPlane::default();
+        let tree_key = key(117, 1);
+        let start = Instant::now();
+        let candidates = vec![
+            TreeEdgeCandidate::legacy(4, 2, 30),
+            TreeEdgeCandidate::direct_with_cost(0, 40),
+        ];
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            candidates.clone(),
+            fast_sticky_policy(),
+            start,
+        );
+        assert_eq!(initial.path(), TreeEdgePath::DirectChild);
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+        // Nor does the pick then flip mid-spurt.
+        for ms in (20..2_000).step_by(20) {
+            let attempt = plane.choose_tree_edge(
+                tree_key,
+                1,
+                2,
+                candidates.clone(),
+                fast_sticky_policy(),
+                start + Duration::from_millis(ms),
+            );
+            assert_eq!(attempt.path(), TreeEdgePath::DirectChild, "at {ms} ms");
+        }
+    }
+
+    #[test]
+    fn initial_pick_honours_first_hop_exclusions() {
+        // A first hop excluded for congesting under this edge's load must not
+        // win it straight back when the edge is re-picked after an idle reset.
+        let plane = DistributionPlane::default();
+        let tree_key = key(118, 1);
+        let start = Instant::now();
+        plane.exclude_tree_edge_first_hop(1, 2, 4, "congested_exit", start);
+        let initial = plane.choose_tree_edge(
+            tree_key,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::legacy(4, 0, 30),
+                TreeEdgeCandidate::direct_with_cost(0, 40),
+            ],
+            fast_sticky_policy(),
+            start + Duration::from_millis(100),
+        );
+        assert_eq!(initial.path(), TreeEdgePath::DirectChild);
+        // With nothing else usable, an excluded route still beats no route.
+        let only = plane.choose_tree_edge(
+            key(119, 1),
+            1,
+            2,
+            vec![TreeEdgeCandidate::legacy(4, 0, 30)],
+            fast_sticky_policy(),
+            start + Duration::from_millis(100),
+        );
+        assert_eq!(only.path(), TreeEdgePath::LegacyVia(4));
+    }
+
+    /// Continuous speech on an edge: one `choose_tree_edge` per 20 ms frame
+    /// over `[from_ms, to_ms)`, returning the path each frame was sent on.
+    fn speak(
+        plane: &DistributionPlane,
+        tree_key: TreeKey,
+        candidates: &dyn Fn() -> Vec<TreeEdgeCandidate>,
+        at: &dyn Fn(u64) -> Instant,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Vec<(u64, TreeEdgePath)> {
+        (from_ms..to_ms)
+            .step_by(20)
+            .map(|ms| {
+                let attempt = plane.choose_tree_edge(
+                    tree_key,
+                    1,
+                    2,
+                    candidates(),
+                    fast_sticky_policy(),
+                    at(ms),
+                );
+                let _ = plane.complete_tree_edge_attempt(attempt, true, at(ms));
+                (ms, attempt.path())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_draw_stays_fixed_within_a_talk_spurt() {
+        // The receiver releases past a missing frame within one packet period,
+        // so any frame the old (faster) route stops carrying mid-stream is
+        // overtaken and lost. The sender must therefore decide which routes
+        // carry the voice once per talk spurt, not once per frame.
+        let plane = DistributionPlane::default();
+        let tree_key = key(113, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_congestion(true),
+                TreeEdgeCandidate::legacy(4097, 1, 3),
+            ]
+        };
+        let _ = speak(&plane, tree_key, &candidates, &at, 800, 1_000);
+        let split = plane
+            .active_tree_edge_split(tree_key, 1, 2)
+            .expect("the congested incumbent starts a split");
+        let spurt = split.spurt();
+        for (ms, _) in speak(&plane, tree_key, &candidates, &at, 1_000, 1_600) {
+            let split = plane
+                .active_tree_edge_split(tree_key, 1, 2)
+                .expect("split still active");
+            assert_eq!(split.spurt(), spurt, "same spurt at {ms} ms");
+        }
+        // A silence longer than a packet period starts the next spurt.
+        let _ = speak(&plane, tree_key, &candidates, &at, 1_900, 1_920);
+        let next = plane
+            .active_tree_edge_split(tree_key, 1, 2)
+            .expect("split still active");
+        assert_ne!(next.spurt(), spurt, "a new spurt after silence");
+    }
+
+    #[test]
+    fn cost_only_challenger_switches_at_the_next_talk_spurt() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(114, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        // A cheaper relay with no hard signal on the healthy incumbent.
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 1, 3),
+            ]
+        };
+        // It is confirmed well within this spurt, but switching mid-spurt would
+        // let the new route overtake frames still in flight on the old one.
+        let spurt = speak(&plane, tree_key, &candidates, &at, 800, 2_000);
+        assert!(
+            spurt
+                .iter()
+                .all(|(_, path)| *path == TreeEdgePath::DirectChild),
+            "no cost-only switch mid-spurt: {spurt:?}"
+        );
+        // The first frame after the silence moves to the confirmed challenger.
+        let next = speak(&plane, tree_key, &candidates, &at, 2_300, 2_320);
+        assert_eq!(next[0].1, TreeEdgePath::LegacyVia(4097));
+    }
+
+    #[test]
+    fn deferred_switch_is_bounded_on_a_stream_that_never_pauses() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(115, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40),
+                TreeEdgeCandidate::legacy(4097, 1, 3),
+            ]
+        };
+        // A music bot never pauses: the switch still happens, once the deferral
+        // cap after confirmation runs out.
+        let frames = speak(&plane, tree_key, &candidates, &at, 800, 6_000);
+        let switched_at = frames
+            .iter()
+            .find(|(_, path)| *path == TreeEdgePath::LegacyVia(4097))
+            .map(|(ms, _)| *ms)
+            .expect("switches without a pause");
+        assert!(
+            switched_at >= 1_300 + DEFERRED_SWITCH_MAX.as_millis() as u64,
+            "deferred for the full cap (switched at {switched_at})"
+        );
+    }
+
+    #[test]
+    fn receiver_gaps_from_before_a_route_change_do_not_trigger_another() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(116, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        let congested = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_congestion(true),
+                TreeEdgeCandidate::legacy(4097, 1, 3),
+            ]
+        };
+        let completed_at = (800..4_000u64)
+            .step_by(20)
+            .find(|ms| {
+                let _ = speak(&plane, tree_key, &congested, &at, *ms, *ms + 1);
+                *ms > 800
+                    && plane.active_tree_edge_split(tree_key, 1, 2).is_none()
+                    && plane.current_tree_edge_path(tree_key, 1, 2)
+                        == Some(TreeEdgePath::LegacyVia(4097))
+            })
+            .expect("the switch to the relay completes");
+        // The sink still reports the gaps it heard during the switch. They
+        // describe the route just left, not the relay, so a slightly cheaper
+        // second relay must not win on them.
+        let after = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_congestion(true),
+                TreeEdgeCandidate::legacy(4097, 1, 3).with_sink_gap(true),
+                TreeEdgeCandidate::legacy(4096, 1, 2),
+            ]
+        };
+        let settle = SINK_GAP_SETTLE.as_millis() as u64;
+        let frames = speak(
+            &plane,
+            tree_key,
+            &after,
+            &at,
+            completed_at + 20,
+            completed_at + settle,
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|(_, path)| *path == TreeEdgePath::LegacyVia(4097)),
+            "stale receiver gaps must not move the edge again: {frames:?}"
+        );
+        // Gaps the sink keeps reporting once the new route has settled are the
+        // new route's own, and still shorten the confirm.
+        let settled = speak(
+            &plane,
+            tree_key,
+            &after,
+            &at,
+            completed_at + settle + 20,
+            completed_at + settle + 40,
+        );
+        assert_eq!(settled[0].1, TreeEdgePath::LegacyVia(4096));
     }
 
     #[test]

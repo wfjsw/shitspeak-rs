@@ -2921,11 +2921,13 @@ async fn send_tree_edge_attempt(
     }
 }
 
-/// Per-frame draw for the redundant-copy decision. Deterministic per
-/// (first hop, origin message id) so the sender sheds copies in a stable,
-/// reproducible pattern and tests can reason about a fixed draw.
-fn split_frame_draw(first_hop: NodeIdentifier, origin_message_id: u64) -> f64 {
-    let mut x = (u64::from(u32::from(first_hop)) << 32) ^ origin_message_id;
+/// Per-spurt draw for the weighted route decisions of a split. Deterministic
+/// per (first hop, talk spurt): every frame of a spurt draws the same value, so
+/// a spurt keeps the routes it started on until the weight crosses its draw,
+/// instead of each frame independently gaining or losing a faster copy and
+/// being overtaken by its neighbours at a receiver that does not wait.
+fn split_spurt_draw(first_hop: NodeIdentifier, spurt: u64) -> f64 {
+    let mut x = (u64::from(u32::from(first_hop)) << 32) ^ spurt;
     x ^= x >> 33;
     x = x.wrapping_mul(0xff51afd7ed558ccd);
     x ^= x >> 33;
@@ -2935,7 +2937,7 @@ fn split_frame_draw(first_hop: NodeIdentifier, origin_message_id: u64) -> f64 {
 }
 
 /// Pure copy decision for the faded old route during a split: send the copy
-/// with probability `copy_weight` (i.e. when the per-frame draw falls below
+/// with probability `copy_weight` (i.e. when the per-spurt draw falls below
 /// it). `copy_weight = 1 - share`, so a probe at `share = 0` duplicates every
 /// frame and a completed fade at `share = 1` sends none.
 fn decide_send_old_route_copy(copy_weight: f64, draw: f64) -> bool {
@@ -2985,7 +2987,7 @@ async fn send_tree_edge_split_copy(
     // the shed counter (`shitspeak_s2s_voice_transition_copy_shed_total`) and
     // the debug log always agree on what shed the copy.
     let copy_weight = 1.0 - split.share();
-    let draw = split_frame_draw(first_hop, data.origin_message_id);
+    let draw = split_spurt_draw(first_hop, split.spurt());
     let shed_reason = if pressure.is_none_or(|pressure| pressure >= 2) {
         Some("pressure")
     } else if !primary_fallback && !decide_send_old_route_copy(copy_weight, draw) {
@@ -3082,7 +3084,7 @@ async fn send_sticky_tree_edge(
         Instant::now(),
     );
     // Split mode (interior steady state): once the controller holds an interior
-    // split, each frame rides exactly one path by weight instead of duplicating
+    // split, each talk spurt rides exactly one path by weight instead of duplicating
     // — the "portion to each" load distribution. `split_primary` is `None`
     // except when split mode is active and the draw picked the old route; then
     // the frame is sent down `from` as the primary (no redundant copy).
@@ -3090,9 +3092,9 @@ async fn send_sticky_tree_edge(
         .active_tree_edge_split(tree_key, self_id, child)
         .filter(|split| split.interior_hold() && policy.split_mode())
         .map(|split| {
-            let draw = split_frame_draw(
+            let draw = split_spurt_draw(
                 u16::from(split.to().first_hop(child)) ^ u16::from(split.from().first_hop(child)),
-                data.origin_message_id,
+                split.spurt(),
             );
             if decide_split_mode_takes_to(split.share(), draw) {
                 split.to()
@@ -3978,28 +3980,28 @@ mod tests {
     }
 
     #[test]
-    fn split_frame_draw_is_deterministic_per_link_and_frame() {
-        let a0 = split_frame_draw(1, 100);
-        let a0_again = split_frame_draw(1, 100);
-        let a1 = split_frame_draw(1, 101);
-        let b0 = split_frame_draw(2, 100);
-        assert_eq!(a0, a0_again, "same link and frame draws the same weight");
-        assert_ne!(a0, a1, "different frames vary the draw");
+    fn split_spurt_draw_is_deterministic_per_link_and_spurt() {
+        let a0 = split_spurt_draw(1, 100);
+        let a0_again = split_spurt_draw(1, 100);
+        let a1 = split_spurt_draw(1, 101);
+        let b0 = split_spurt_draw(2, 100);
+        assert_eq!(a0, a0_again, "same link and spurt draws the same weight");
+        assert_ne!(a0, a1, "different spurts vary the draw");
         assert_ne!(a0, b0, "different first hops decorrelate the draw");
         for id in 0..128u64 {
-            let draw = split_frame_draw(7, id);
+            let draw = split_spurt_draw(7, id);
             assert!((0.0..1.0).contains(&draw), "draw in [0,1): {draw}");
         }
     }
 
     #[test]
-    fn split_mode_allocates_each_frame_to_exactly_one_path_by_weight() {
-        // Interior share 0.6: the draw sits above 0.6 for most frames, so a
-        // majority ride the old route — each frame is single-path, never a copy.
+    fn split_mode_allocates_each_spurt_to_exactly_one_path_by_weight() {
+        // Interior share 0.4: the draw sits above 0.4 for most spurts, so a
+        // majority ride the old route — each spurt is single-path, never a copy.
         let share = 0.4;
         let mut to_allocated = 0u32;
         for id in 0..10_000u64 {
-            let draw = split_frame_draw(0x1701, id);
+            let draw = split_spurt_draw(0x1701, id);
             if decide_split_mode_takes_to(share, draw) {
                 to_allocated += 1;
             }
@@ -4013,11 +4015,11 @@ mod tests {
         // the adopted path is abandoned — the two corners still never duplicate.
         assert!(decide_split_mode_takes_to(1.0, 0.999_999));
         assert!(!decide_split_mode_takes_to(0.0, 0.0));
-        // Same link pair and frame deterministically pick the same path.
-        let draw = split_frame_draw(0x1701, 4242);
+        // Same link pair and spurt deterministically pick the same path.
+        let draw = split_spurt_draw(0x1701, 4242);
         assert_eq!(
             decide_split_mode_takes_to(share, draw),
-            decide_split_mode_takes_to(share, split_frame_draw(0x1701, 4242)),
+            decide_split_mode_takes_to(share, split_spurt_draw(0x1701, 4242)),
         );
     }
 

@@ -164,6 +164,25 @@ pub(crate) struct FlushByPeer {
     pub max_held_delay_us: u64,
 }
 
+/// A copy of a sequence that arrived after the reorder had released past it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LateArrival {
+    copy_kind: VoiceCopyKind,
+    after_release: Duration,
+}
+
+impl LateArrival {
+    pub(crate) fn copy_kind(self) -> VoiceCopyKind {
+        self.copy_kind
+    }
+
+    /// How long after the release the copy arrived: the extra wait that would
+    /// have delivered it in order.
+    pub(crate) fn after_release(self) -> Duration {
+        self.after_release
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ReorderReport {
     emissions: Vec<ReorderEmission>,
@@ -171,6 +190,7 @@ pub(crate) struct ReorderReport {
     pending_total: usize,
     opened_gap: Option<GapReport>,
     flushes_by_peer: Vec<FlushByPeer>,
+    late_arrivals: Vec<LateArrival>,
 }
 
 impl ReorderReport {
@@ -186,6 +206,7 @@ impl ReorderReport {
             pending_total,
             opened_gap,
             flushes_by_peer: Vec::new(),
+            late_arrivals: Vec::new(),
         }
     }
 
@@ -197,6 +218,11 @@ impl ReorderReport {
 
     pub(crate) fn result_counts(&self) -> &[ReorderResultCount] {
         &self.results
+    }
+
+    /// Copies that arrived for sequences already released past.
+    pub(crate) fn late_arrivals(&self) -> &[LateArrival] {
+        &self.late_arrivals
     }
 
     pub(crate) fn pending_total(&self) -> usize {
@@ -229,6 +255,7 @@ impl ReorderReport {
             pending_total: 0,
             opened_gap: None,
             flushes_by_peer: Vec::new(),
+            late_arrivals: Vec::new(),
         }
     }
 
@@ -244,6 +271,7 @@ impl ReorderReport {
             self.opened_gap = other.opened_gap;
         }
         self.flushes_by_peer.extend(other.flushes_by_peer);
+        self.late_arrivals.extend(other.late_arrivals);
         self
     }
 }
@@ -323,6 +351,14 @@ impl SenderState {
         while self.delivered.len() > DELIVERY_HISTORY {
             self.delivered.pop_front();
         }
+    }
+
+    /// When a flush released past `seq` without emitting it, if it did.
+    fn released_at(&self, seq: u64) -> Option<Instant> {
+        self.released_holes
+            .iter()
+            .find(|(hole, _)| *hole == seq)
+            .map(|(_, released_at)| *released_at)
     }
 
     /// Why a sequence below the delivery cursor is being rejected.
@@ -824,14 +860,24 @@ impl Reorderer {
         // it has never been played, so it emits once, out of order, and
         // leaves the delivery cadence untouched.
         if frame_seq < entry.next_seq {
+            let released_at = entry.released_at(frame_seq);
+            if let Some(released_at) = released_at {
+                report.late_arrivals.push(LateArrival {
+                    copy_kind,
+                    after_release: now.saturating_duration_since(released_at),
+                });
+            }
             let late_fill = copy_kind == VoiceCopyKind::Fec
                 && !frame.is_terminator
-                && Self::take_released_hole(&mut entry, frame_seq, now);
+                && released_at.is_some_and(|released_at| {
+                    now.saturating_duration_since(released_at) < FEC_LATE_EMIT_WINDOW
+                });
             if !late_fill {
                 let reason = entry.below_cursor_reason(frame_seq);
                 report.results.push(rejected(reason, copy_kind));
                 return self.finish_push(&mut state, session, entry, report, now);
             }
+            entry.released_holes.retain(|(hole, _)| *hole != frame_seq);
             report
                 .results
                 .push(ReorderResultCount::new(VoiceReceiveResult::FecLate, 1));
@@ -1258,23 +1304,6 @@ impl Reorderer {
         entry.released_holes.iter().any(|(hole, released_at)| {
             *hole == seq && now.saturating_duration_since(*released_at) < FEC_LATE_EMIT_WINDOW
         })
-    }
-
-    /// Remove `seq` from the released holes if it is still inside the late
-    /// window, expiring older holes on the way.
-    fn take_released_hole(entry: &mut SenderState, seq: u64, now: Instant) -> bool {
-        entry.released_holes.retain(|(_, released_at)| {
-            now.saturating_duration_since(*released_at) < FEC_LATE_EMIT_WINDOW
-        });
-        let Some(index) = entry
-            .released_holes
-            .iter()
-            .position(|(hole, _)| *hole == seq)
-        else {
-            return false;
-        };
-        entry.released_holes.remove(index);
-        true
     }
 
     #[cfg(test)]
@@ -1882,6 +1911,45 @@ mod tests {
         assert_eq!(seqs(push(6, false, VoiceCopyKind::Original, 600)), vec![6]);
         assert!(seqs(push(4, true, VoiceCopyKind::Fec, 610)).is_empty());
         assert!(seqs(push(5, false, VoiceCopyKind::Fec, 801)).is_empty());
+    }
+
+    #[test]
+    fn copies_of_a_released_hole_report_how_late_they_came() {
+        use VoiceCopyKind::{Fec, Original, Proactive};
+        let r = Reorderer::new(cfg());
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let push = |seq: u64, kind: VoiceCopyKind, ms: u64| {
+            r.push_at(11, frame(0xABC, 1, seq, false), None, kind, at(ms))
+        };
+        let late = |report: &ReorderReport| -> Vec<(VoiceCopyKind, u64)> {
+            report
+                .late_arrivals()
+                .iter()
+                .map(|late| (late.copy_kind(), late.after_release().as_millis() as u64))
+                .collect()
+        };
+        assert!(late(&push(0, Original, 0)).is_empty());
+        // Frame 2 arrives past the cadence: the reorder releases past 1 at 200.
+        assert!(late(&push(2, Original, 200)).is_empty());
+        assert_eq!(late(&push(1, Proactive, 230)), vec![(Proactive, 30)]);
+        assert_eq!(late(&push(1, Fec, 260)), vec![(Fec, 60)]);
+        // In-order and already-delivered frames are not late arrivals.
+        assert!(late(&push(3, Original, 270)).is_empty());
+        assert!(late(&push(1, Original, 280)).is_empty());
+
+        // Holes 4 and 5 release at 700. A reconstruction of 5 too late to fill
+        // it is measured, and must not forget hole 4: its original, well past
+        // the FEC window, is still measured too.
+        assert!(late(&push(6, Original, 700)).is_empty());
+        assert_eq!(late(&push(5, Fec, 950)), vec![(Fec, 250)]);
+        let very_late = push(4, Original, 1_300);
+        assert_eq!(late(&very_late), vec![(Original, 600)]);
+        assert!(very_late.result_counts().iter().any(|count| count.result()
+            == VoiceReceiveResult::DuplicateOrLate {
+                reason: DuplicateReason::LateAfterRelease,
+                copy: Original,
+            }));
     }
 
     #[test]

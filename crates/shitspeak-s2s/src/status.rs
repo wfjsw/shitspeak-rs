@@ -1510,6 +1510,11 @@ impl<'a> PrometheusWriter<'a> {
             "counter",
         );
         self.header(
+            "shitspeak_s2s_voice_late_arrival_after_release_bucket_total",
+            "S2S voice copies that arrived after the reorder released past their sequence, by copy kind and milliseconds after the release.",
+            "counter",
+        );
+        self.header(
             "shitspeak_s2s_voice_ingress_admission_drops_total",
             "S2S voice ingress work rejected by byte-budget lane.",
             "counter",

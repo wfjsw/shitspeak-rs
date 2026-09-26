@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 use shitspeak_core::NodeIdentifier;
 
@@ -26,6 +27,21 @@ const BYTE_BUCKETS: [(&str, u64); 8] = [
     ("le_16384", 16_384),
     ("le_65536", 65_536),
     ("gt_65536", u64::MAX),
+];
+
+/// How long after the reorder released past a sequence a copy of it arrived,
+/// in milliseconds. A listener's jitter buffer is at most a few packet periods
+/// deep, so the low buckets say what a longer server wait (or forwarding the
+/// late copy) could still have saved.
+const LATE_ARRIVAL_MS_BUCKETS: [(&str, u64); 8] = [
+    ("le_10", 10),
+    ("le_20", 20),
+    ("le_40", 40),
+    ("le_80", 80),
+    ("le_160", 160),
+    ("le_320", 320),
+    ("le_640", 640),
+    ("gt_640", u64::MAX),
 ];
 
 static METRICS: LazyLock<Mutex<VoiceAppMetrics>> =
@@ -412,6 +428,7 @@ struct VoiceAppMetrics {
     fec_send_bytes: HashMap<(NodeIdentifier, FecSendOutcome, FecParityPath), u64>,
     fec_recoveries: HashMap<FecRecoveryOutcome, u64>,
     gaps_opened: HashMap<&'static str, u64>,
+    late_arrivals: HashMap<(VoiceCopyKind, &'static str), u64>,
     proactive_budget: ProactiveBudget,
     proactive_outcomes: HashMap<(VoiceProactiveKind, VoiceProactiveResult), u64>,
     repair_credit_quarters: HashMap<RepairCreditStage, u64>,
@@ -507,6 +524,17 @@ pub(crate) fn record_gap_opened(missing_frames: u64) {
     *metrics
         .gaps_opened
         .entry(bucket(&COUNT_BUCKETS, missing_frames))
+        .or_default() += 1;
+}
+
+/// Record a copy of a sequence arriving `after_release` after the reorder had
+/// already released past it.
+pub(crate) fn record_late_arrival(copy: VoiceCopyKind, after_release: Duration) {
+    let millis = u64::try_from(after_release.as_millis()).unwrap_or(u64::MAX);
+    let mut metrics = METRICS.lock().unwrap();
+    *metrics
+        .late_arrivals
+        .entry((copy, bucket(&LATE_ARRIVAL_MS_BUCKETS, millis)))
         .or_default() += 1;
 }
 
@@ -753,6 +781,16 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         out.push(PrometheusSample::new(
             "shitspeak_s2s_voice_deadline_wakes_total",
             vec![("result".to_owned(), result.label().to_owned())],
+            *count as f64,
+        ));
+    }
+    for ((copy, bucket), count) in &metrics.late_arrivals {
+        out.push(PrometheusSample::new(
+            "shitspeak_s2s_voice_late_arrival_after_release_bucket_total",
+            vec![
+                ("copy".to_owned(), copy.label().to_owned()),
+                ("bucket".to_owned(), (*bucket).to_owned()),
+            ],
             *count as f64,
         ));
     }
@@ -1191,6 +1229,32 @@ mod tests {
                 .iter()
                 .all(|(key, _)| key != "reason" && key != "copy")
         );
+    }
+
+    #[test]
+    fn late_arrivals_are_bucketed_by_copy_and_delay_after_release() {
+        let count = |copy: &str, bucket: &str| {
+            find_sample(
+                "shitspeak_s2s_voice_late_arrival_after_release_bucket_total",
+                &[("copy", copy), ("bucket", bucket)],
+            )
+            .map_or(0.0, |sample| sample.value())
+        };
+        let before_10 = count("original", "le_10");
+        let before_80 = count("fec", "le_80");
+        let before_gt = count("proactive", "gt_640");
+        record_late_arrival(VoiceCopyKind::Original, Duration::from_millis(10));
+        record_late_arrival(VoiceCopyKind::Fec, Duration::from_millis(41));
+        record_late_arrival(VoiceCopyKind::Proactive, Duration::from_millis(641));
+        assert!(count("original", "le_10") >= before_10 + 1.0);
+        assert!(count("fec", "le_80") >= before_80 + 1.0);
+        assert!(count("proactive", "gt_640") >= before_gt + 1.0);
+        let sample = find_sample(
+            "shitspeak_s2s_voice_late_arrival_after_release_bucket_total",
+            &[("copy", "original"), ("bucket", "le_10")],
+        )
+        .expect("late arrival sample");
+        assert_no_unbounded_voice_labels(&sample);
     }
 
     #[test]

@@ -1983,6 +1983,9 @@ fn spawn_dispatch_task(
                 }
             };
             metrics::set_reorder_pending(source, report.pending_total());
+            for late in report.late_arrivals() {
+                metrics::record_late_arrival(late.copy_kind(), late.after_release());
+            }
             metrics::set_reorder_speaker_state(
                 reorderer.tracked_speaker_count(),
                 reorderer.tracked_speaker_capacity(),
