@@ -2019,17 +2019,23 @@ impl PeerState {
             .collect()
     }
 
-    pub(crate) fn max_consecutive_failures_for_transports(
+    /// Whether `transports` look unreachable: at least one address of them is
+    /// known and every one has failed `threshold` dials in a row. A single
+    /// failing address says nothing while another works — once one address
+    /// carries the session the others are not re-dialled, so their failure
+    /// counts go stale (and persist across restarts) rather than clear.
+    pub(crate) fn transports_unreachable(
         &self,
         transports: &[TransportKind],
-    ) -> u32 {
-        self.address_backoffs
-            .lock()
+        threshold: u32,
+    ) -> bool {
+        let backoffs = self.address_backoffs.lock();
+        let mut failures = backoffs
             .iter()
             .filter(|(addr, _)| transports.contains(&addr.transport()))
             .map(|(_, backoff)| backoff.consecutive_failures)
-            .max()
-            .unwrap_or(0)
+            .peekable();
+        failures.peek().is_some() && failures.all(|count| count >= threshold)
     }
 
     fn stream_entries(
@@ -4212,6 +4218,42 @@ mod tests {
             backoffs.get(&second).unwrap().next_delay,
             Duration::from_millis(500)
         );
+    }
+
+    #[test]
+    fn a_stale_failing_spare_address_does_not_make_the_transport_unreachable() {
+        let peer = peer_for_address_tests();
+        let v4 = PeerAddress::new("45.76.239.56:64801".parse().unwrap(), TransportKind::Udp);
+        let v6 = PeerAddress::new(
+            "[2001:19f0:6400:2b08::1]:64801".parse().unwrap(),
+            TransportKind::Udp,
+        );
+        let quic = PeerAddress::new("45.76.239.56:64801".parse().unwrap(), TransportKind::Quic);
+        let retry_cap = Duration::from_secs(30);
+        for addr in [v4, v6, quic] {
+            peer.add_address(addr);
+        }
+        // Both UDP addresses failed while the peer restarted; IPv4 then
+        // reconnected, and IPv6 was never needed (so never retried) again.
+        for _ in 0..4 {
+            peer.record_address_failure(v4, retry_cap);
+            peer.record_address_failure(v6, retry_cap);
+        }
+        peer.record_address_success(v4);
+        assert!(
+            !peer.transports_unreachable(&[TransportKind::Udp], 4),
+            "a working UDP address makes UDP reachable"
+        );
+        // Every UDP address failing is unreachable, and it takes every
+        // address of every listed transport: QUIC is untouched.
+        peer.record_address_failure(v4, retry_cap);
+        for _ in 0..3 {
+            peer.record_address_failure(v4, retry_cap);
+        }
+        assert!(peer.transports_unreachable(&[TransportKind::Udp], 4));
+        assert!(!peer.transports_unreachable(&[TransportKind::Udp, TransportKind::Quic], 4));
+        // No known address says nothing.
+        assert!(!peer.transports_unreachable(&[TransportKind::Kcp], 4));
     }
 
     #[test]

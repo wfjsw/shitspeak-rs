@@ -2289,9 +2289,22 @@ fn spawn_dispatch_task(
                     } else if is_parity {
                         reorderer.idle_report()
                     } else {
-                        if fec_enabled {
+                        // An overdue next frame is recovered before this data
+                        // frame is pushed: an arrival past the delivery
+                        // deadline releases past missing sequences, which
+                        // would turn an in-order recovery into a late fill.
+                        let before = if fec_enabled {
                             fec_state.record_frame(delivery.frame.clone());
-                        }
+                            push_fec_recovered(
+                                &reorderer,
+                                &fec_state,
+                                from,
+                                sender_session,
+                                sender_epoch,
+                            )
+                        } else {
+                            None
+                        };
                         let route_hint = reorderer
                             .may_arm_gap(&delivery.frame, delivery.copy_kind)
                             .then(|| {
@@ -2306,6 +2319,10 @@ fn spawn_dispatch_task(
                             route_hint,
                             delivery.copy_kind,
                         );
+                        let report = match before {
+                            Some(before) => before.merge(report),
+                            None => report,
+                        };
                         // A data frame can complete the `k` symbols a parity
                         // block needs, or open a gap a mirrored block covers.
                         let recovered = fec_enabled
@@ -8111,6 +8128,7 @@ mod tests {
         inject_voice_inbound(&svc, 11, fec_data_frame(1, b"aaaa"));
         inject_voice_inbound(&svc, 11, fec_data_frame(2, b"bbbb"));
         wait_for_fec_sink(&sink, 2).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let parity = fec_rs_parity(&[b"aaaa", b"bbbb", b"cc"], 0);
         inject_voice_inbound(
             &svc,
@@ -8139,7 +8157,8 @@ mod tests {
         wait_for_fec_sink(&sink, 3).await;
 
         // One parity row of block {1,2,3,4} recovers the single loss, whose
-        // length differs from its siblings'.
+        // length differs from its siblings', once 4 is overdue.
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let parity = fec_rs_parity(&[b"aaaa", b"bbbb", b"cccc", b"ddd"], 0);
         inject_voice_inbound(
             &svc,
@@ -8230,22 +8249,23 @@ mod tests {
         let sink = Arc::new(FecProbeSink::default());
         svc.set_audio_sink(sink.clone());
 
-        // Block {1,2,3,4} with one parity row: 1 and 2 arrive, the parity
-        // arrives with two members still absent, 3 is lost. Frame 4 arrives
-        // after the delivery cadence, so the reorder releases past 3; frame 4
-        // then completes the block and 3 is emitted late, exactly once.
+        // Block {1,2,3,4} with one parity row: 1 and 2 arrive and 3 is lost.
+        // Frame 4 arrives after the delivery cadence, so the reorder releases
+        // past 3 before the block can be solved; the parity then arrives and
+        // 3 is emitted late, exactly once.
         let members: [&[u8]; 4] = [b"aaaa", b"bb", b"cccccc", b"dddd"];
         inject_voice_inbound(&svc, 11, fec_data_frame(1, members[0]));
         inject_voice_inbound(&svc, 11, fec_data_frame(2, members[1]));
         wait_for_fec_sink(&sink, 2).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        inject_voice_inbound(&svc, 11, fec_data_frame(4, members[3]));
+        wait_for_fec_sink(&sink, 3).await;
         let parity = fec_rs_parity(&members, 0);
         inject_voice_inbound(
             &svc,
             11,
             fec_parity_frame(0xABC, 42, vec![1, 2, 3, 4], &parity, 0, 0),
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        inject_voice_inbound(&svc, 11, fec_data_frame(4, members[3]));
 
         let frames = wait_for_fec_sink(&sink, 4).await;
         let order: Vec<u64> = frames.iter().map(|(seq, _)| *seq).collect();
@@ -8259,6 +8279,50 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(sink.snapshot().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn fec_does_not_race_an_in_flight_original_on_a_faster_path() {
+        let transport = FakeVoiceTransport::new(7, vec![1, 2, 3]);
+        let svc = VoiceService::new_with_transport(
+            transport,
+            VoiceConfig::default(),
+            CancellationToken::new(),
+            42,
+        );
+        let sink = Arc::new(FecProbeSink::default());
+        svc.set_audio_sink(sink.clone());
+
+        // Data rides a slower relay; the block's parity arrives first over a
+        // faster path while frame 3 is still in flight and nothing past it
+        // has arrived. Emitting 3 from parity now would deliver frames at two
+        // latencies — jitter the listener hears — so it waits for a later
+        // frame to prove 3 is actually missing.
+        // Two 60 ms SILK frames per packet: frame 3 is due 108 ms after
+        // frame 2 is delivered.
+        const PACKET: &[u8] = &[0, 0x2a, 1, 0x19];
+        let members: [&[u8]; 3] = [PACKET; 3];
+        inject_voice_inbound(&svc, 11, fec_data_frame(1, PACKET));
+        inject_voice_inbound(&svc, 11, fec_data_frame(2, PACKET));
+        wait_for_fec_sink(&sink, 2).await;
+        inject_voice_inbound(
+            &svc,
+            12,
+            fec_parity_frame(0xABC, 42, vec![1, 2, 3], &fec_rs_parity(&members, 0), 0, 0),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            sink.snapshot().len(),
+            2,
+            "frame 3 emitted from parity early"
+        );
+
+        // Frame 3 is lost after all: frame 4 proves it and parity fills it.
+        inject_voice_inbound(&svc, 11, fec_data_frame(4, PACKET));
+        let frames = wait_for_fec_sink(&sink, 4).await;
+        let order: Vec<u64> = frames.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(order, vec![1, 2, 3, 4]);
+        assert_eq!(frames[2].1.as_ref(), PACKET);
     }
 
     #[tokio::test]
@@ -8308,13 +8372,19 @@ mod tests {
         assert_eq!(frames[2].1.as_ref(), b"cccc");
 
         // Once frame 5 arrives, 4 is a genuine hole behind it and the block's
-        // parity recovers it without waiting for another trigger; 6 then
-        // follows in order as the next frame.
+        // parity recovers it without waiting for another trigger. 6 is solved
+        // too, but waits until it is overdue; frame 7 arriving late recovers
+        // it in order ahead of 7.
         inject_voice_inbound(&svc, 11, fec_data_frame(5, b"eeee"));
-        let frames = wait_for_fec_sink(&sink, 6).await;
+        let frames = wait_for_fec_sink(&sink, 5).await;
         let order: Vec<u64> = frames.iter().map(|(seq, _)| *seq).collect();
-        assert_eq!(order, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(order, vec![1, 2, 3, 4, 5]);
         assert_eq!(frames[3].1.as_ref(), b"dddd");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        inject_voice_inbound(&svc, 11, fec_data_frame(7, b"gggg"));
+        let frames = wait_for_fec_sink(&sink, 7).await;
+        let order: Vec<u64> = frames.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(order, vec![1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(frames[5].1.as_ref(), b"ffff");
     }
 
@@ -8339,6 +8409,7 @@ mod tests {
         while let Some(permit) = svc.voice_budget.try_reserve_proactive(1) {
             held.push(permit);
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let parity = fec_rs_parity(&[b"aaaa", b"bbbb"], 0);
         inject_voice_inbound(
             &svc,
@@ -8366,7 +8437,9 @@ mod tests {
         inject_voice_inbound(&svc, 11, fec_data_frame(2, b"bbbb"));
         wait_for_fec_sink(&sink, 2).await;
 
-        // Any two Reed-Solomon rows of block {1,2,3,4} recover both.
+        // Any two Reed-Solomon rows of block {1,2,3,4} recover both; 3 is
+        // overdue when they arrive.
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let members: [&[u8]; 4] = [b"aaaa", b"bbbb", b"cccc", b"dddd"];
         inject_voice_inbound(
             &svc,
@@ -8393,11 +8466,17 @@ mod tests {
             ),
         );
 
-        let frames = wait_for_fec_sink(&sink, 4).await;
+        wait_for_fec_sink(&sink, 3).await;
+        // 4 is solved with 3 but waits for its own due time; frame 5 arriving
+        // late recovers it in order ahead of 5.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        inject_voice_inbound(&svc, 11, fec_data_frame(5, b"eeee"));
+        let frames = wait_for_fec_sink(&sink, 5).await;
         assert_eq!(frames[2].0, 3);
         assert_eq!(frames[2].1.as_ref(), b"cccc");
         assert_eq!(frames[3].0, 4);
         assert_eq!(frames[3].1.as_ref(), b"dddd");
+        assert_eq!(frames[4].0, 5);
     }
 
     #[tokio::test]

@@ -1272,15 +1272,21 @@ impl Reorderer {
     }
 
     /// Whether a FEC reconstruction of `seq` would fill a hole the reorder is
-    /// waiting on: the next sequence (emitting it early stays in order), a
-    /// sequence behind an already buffered later frame, or a hole a flush
-    /// released past within [`FEC_LATE_EMIT_WINDOW`]. A sequence past every
-    /// frame received so far is not wanted: its original may simply be in
-    /// flight, and a buffered reconstruction ahead of it would let the
-    /// cadence flush release past — and then discard — that original. An
-    /// unknown speaker wants anything, since a reconstruction may bootstrap
-    /// it.
+    /// waiting on: a sequence behind an already buffered later frame, the next
+    /// sequence once its delivery is overdue, or a hole a flush released past
+    /// within [`FEC_LATE_EMIT_WINDOW`]. The next sequence is not wanted before
+    /// it is due: its original may be in flight on a slower path than the
+    /// parity took, and emitting reconstructions early mixes two path
+    /// latencies into one stream — jitter the listener hears. A sequence past
+    /// every frame received so far is never wanted: a buffered reconstruction
+    /// ahead of an in-flight original would let the cadence flush release past
+    /// — and then discard — that original. An unknown speaker wants anything,
+    /// since a reconstruction may bootstrap it.
     pub(crate) fn fec_wants(&self, sender_session: u32, sender_epoch: u64, seq: u64) -> bool {
+        self.fec_wants_at(sender_session, sender_epoch, seq, Instant::now())
+    }
+
+    fn fec_wants_at(&self, sender_session: u32, sender_epoch: u64, seq: u64, now: Instant) -> bool {
         if self.cfg.reorder_disabled {
             return true;
         }
@@ -1293,15 +1299,18 @@ impl Reorderer {
             return false;
         }
         if seq >= entry.next_seq {
-            return !entry.pending.contains_key(&seq)
-                && (seq == entry.next_seq
-                    || entry
-                        .pending
-                        .keys()
-                        .next_back()
-                        .is_some_and(|last| seq < *last));
+            if entry.pending.contains_key(&seq) {
+                return false;
+            }
+            let behind_buffered = entry
+                .pending
+                .keys()
+                .next_back()
+                .is_some_and(|last| seq < *last);
+            let overdue =
+                seq == entry.next_seq && entry.next_flush_at.is_some_and(|due| due <= now);
+            return behind_buffered || overdue;
         }
-        let now = Instant::now();
         entry.released_holes.iter().any(|(hole, released_at)| {
             *hole == seq && now.saturating_duration_since(*released_at) < FEC_LATE_EMIT_WINDOW
         })
@@ -1782,32 +1791,32 @@ mod tests {
     fn fec_wants_only_holes_the_reorder_is_waiting_on() {
         let r = Reorderer::new(cfg());
         let start = Instant::now();
-        r.push_at(
-            11,
-            frame(0xABC, 1, 0, false),
-            None,
-            VoiceCopyKind::Original,
-            start,
-        );
-        // Nothing past 0 has arrived: 1 may be in flight. Its early in-order
-        // emission is harmless; anything further ahead is not wanted.
-        assert!(r.fec_wants(0xABC, 1, 1));
-        assert!(!r.fec_wants(0xABC, 1, 2));
-        assert!(!r.fec_wants(0xABC, 1, 9));
+        let at = |ms| start + Duration::from_millis(ms);
+        let push = |seq, ms| {
+            r.push_at(
+                11,
+                frame(0xABC, 1, seq, false),
+                None,
+                VoiceCopyKind::Original,
+                at(ms),
+            )
+        };
+        push(0, 0);
+        // Nothing past 0 has arrived: 1 may be in flight on a slower path, so
+        // it is wanted only once overdue (the test packets last 120 ms, so 1
+        // is due 108 ms after 0 emitted). Anything further ahead never is.
+        assert!(!r.fec_wants_at(0xABC, 1, 1, at(100)));
+        assert!(r.fec_wants_at(0xABC, 1, 1, at(108)));
+        assert!(!r.fec_wants_at(0xABC, 1, 2, at(500)));
+        assert!(!r.fec_wants_at(0xABC, 1, 9, at(500)));
         // Frame 4 arrives: 1..3 are holes behind it, 4 itself is buffered.
-        r.push_at(
-            11,
-            frame(0xABC, 1, 4, false),
-            None,
-            VoiceCopyKind::Original,
-            start,
-        );
-        assert!((1..4).all(|seq| r.fec_wants(0xABC, 1, seq)));
-        assert!(!r.fec_wants(0xABC, 1, 4));
-        assert!(!r.fec_wants(0xABC, 1, 5));
+        push(4, 10);
+        assert!((1..4).all(|seq| r.fec_wants_at(0xABC, 1, seq, at(10))));
+        assert!(!r.fec_wants_at(0xABC, 1, 4, at(10)));
+        assert!(!r.fec_wants_at(0xABC, 1, 5, at(10)));
         // Already emitted, and unknown speakers.
-        assert!(!r.fec_wants(0xABC, 1, 0));
-        assert!(r.fec_wants(0xDEF, 1, 7));
+        assert!(!r.fec_wants_at(0xABC, 1, 0, at(10)));
+        assert!(r.fec_wants_at(0xDEF, 1, 7, at(10)));
     }
 
     #[test]
