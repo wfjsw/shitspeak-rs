@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
     net::{IpAddr, Shutdown, SocketAddr},
@@ -9,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use parking_lot::{
@@ -331,9 +333,14 @@ fn try_send_owned_message_batch(
     sender.try_send(outbound)
 }
 
+fn carries_channel_name(message: &Message) -> bool {
+    matches!(message, Message::ChannelState(state) if state.name.is_some())
+}
+
 fn try_send_owned_gateway_batch(
     sender: &mpsc::Sender<Message>,
     batch: OwnedMessageBatch,
+    localize: impl Fn(Message) -> Message,
 ) -> Result<(), mpsc::error::TrySendError<ClientOutboundMessage>> {
     if batch.is_empty() {
         return Ok(());
@@ -348,7 +355,7 @@ fn try_send_owned_gateway_batch(
     match sender.try_reserve_many(messages.len()) {
         Ok(permits) => {
             for (permit, message) in permits.zip(messages) {
-                permit.send(message);
+                permit.send(localize(message));
             }
             Ok(())
         }
@@ -525,6 +532,8 @@ pub struct Client {
 
     local_state: ParkingRwLock<Option<ClientLocalState>>,
     global_state: ParkingRwLock<ClientGlobalState>,
+    /// Language and translation catalogs for text sent to this client.
+    locale: ArcSwap<crate::localization::ClientLocale>,
     /// Effective permissions owned by this client instance. The map grows to
     /// the channels this connection actually touches and is dropped with the
     /// client, so reconnect churn cannot leave stale global cache entries.
@@ -757,6 +766,7 @@ impl Client {
             protocol_version: AtomicU64::new(0),
             client_state_cursors: ParkingMutex::new(ClientProjectionCursorState::default()),
             last_channel_version: ParkingMutex::new(0),
+            locale: ArcSwap::from_pointee(crate::localization::ClientLocale::default()),
         })
     }
 
@@ -925,6 +935,7 @@ impl Client {
             protocol_version: AtomicU64::new(0),
             client_state_cursors: ParkingMutex::new(ClientProjectionCursorState::default()),
             last_channel_version: ParkingMutex::new(0),
+            locale: ArcSwap::from_pointee(crate::localization::ClientLocale::default()),
         })
     }
 
@@ -1010,6 +1021,7 @@ impl Client {
             protocol_version: AtomicU64::new(0),
             client_state_cursors: ParkingMutex::new(ClientProjectionCursorState::default()),
             last_channel_version: ParkingMutex::new(0),
+            locale: ArcSwap::from_pointee(crate::localization::ClientLocale::default()),
         })
     }
 
@@ -1604,13 +1616,15 @@ impl Client {
                 self.outbound_message_tx
                     .as_ref()
                     .ok_or_else(transport_closed_error)?
-                    .send(ClientOutboundMessage::Single(message.clone()))
+                    .send(ClientOutboundMessage::Single(
+                        self.localize_outbound_message(message.clone()),
+                    ))
                     .await
                     .map_err(|_| transport_closed_error())?;
             }
             ClientTransport::WebGateway { outbound_tx, .. } => {
                 outbound_tx
-                    .send(message.clone())
+                    .send(self.localize_outbound_message(message.clone()))
                     .await
                     .map_err(|_| transport_closed_error())?;
                 self.record_tcp_packets(1, 6 + message.encoded_len()).await;
@@ -1641,14 +1655,16 @@ impl Client {
                 self.outbound_message_tx
                     .as_ref()
                     .ok_or_else(transport_closed_error)?
-                    .send(ClientOutboundMessage::Batch(messages.to_vec()))
+                    .send(ClientOutboundMessage::Batch(
+                        self.localize_outbound(messages).into_owned(),
+                    ))
                     .await
                     .map_err(|_| transport_closed_error())?;
             }
             ClientTransport::WebGateway { outbound_tx, .. } => {
                 for message in messages {
                     outbound_tx
-                        .send(message.clone())
+                        .send(self.localize_outbound_message(message.clone()))
                         .await
                         .map_err(|_| transport_closed_error())?;
                 }
@@ -1676,11 +1692,14 @@ impl Client {
         batch: OwnedMessageBatch,
     ) -> Result<(), mpsc::error::TrySendError<ClientOutboundMessage>> {
         match &self.transport {
-            ClientTransport::NativeTls { .. } => {
-                try_send_owned_message_batch(self.outbound_message_tx.as_ref(), batch)
-            }
+            ClientTransport::NativeTls { .. } => try_send_owned_message_batch(
+                self.outbound_message_tx.as_ref(),
+                OwnedMessageBatch::new(self.localize_outbound_owned(batch.into_messages())),
+            ),
             ClientTransport::WebGateway { outbound_tx, .. } => {
-                try_send_owned_gateway_batch(outbound_tx, batch)
+                try_send_owned_gateway_batch(outbound_tx, batch, |message| {
+                    self.localize_outbound_message(message)
+                })
             }
             ClientTransport::Remote => try_send_owned_message_batch(None, batch),
         }
@@ -1707,13 +1726,15 @@ impl Client {
                 self.outbound_message_tx
                     .as_ref()
                     .ok_or_else(transport_closed_error)?
-                    .send(ClientOutboundMessage::Single(message.clone()))
+                    .send(ClientOutboundMessage::Single(
+                        self.localize_outbound_message(message.clone()),
+                    ))
                     .await
                     .map_err(|_| transport_closed_error())?;
             }
             ClientTransport::WebGateway { outbound_tx, .. } => {
                 outbound_tx
-                    .send(message.clone())
+                    .send(self.localize_outbound_message(message.clone()))
                     .await
                     .map_err(|_| transport_closed_error())?;
                 self.record_tcp_packets(1, 6 + message.encoded_len()).await;
@@ -1738,12 +1759,13 @@ impl Client {
         let bytes = 6 + message.encoded_len();
         match &self.transport {
             ClientTransport::NativeTls { tx, .. } => {
+                let message = self.localize_outbound(std::slice::from_ref(message));
                 let mut guard = tx.lock().await;
-                guard.write_proto_message(message).await?;
+                guard.write_proto_message(&message[0]).await?;
             }
             ClientTransport::WebGateway { outbound_tx, .. } => {
                 outbound_tx
-                    .send(message.clone())
+                    .send(self.localize_outbound_message(message.clone()))
                     .await
                     .map_err(|_| transport_closed_error())?;
             }
@@ -1774,14 +1796,16 @@ impl Client {
                 self.outbound_message_tx
                     .as_ref()
                     .ok_or_else(transport_closed_error)?
-                    .send(ClientOutboundMessage::Batch(messages.to_vec()))
+                    .send(ClientOutboundMessage::Batch(
+                        self.localize_outbound(messages).into_owned(),
+                    ))
                     .await
                     .map_err(|_| transport_closed_error())?;
             }
             ClientTransport::WebGateway { outbound_tx, .. } => {
                 for message in messages {
                     outbound_tx
-                        .send(message.clone())
+                        .send(self.localize_outbound_message(message.clone()))
                         .await
                         .map_err(|_| transport_closed_error())?;
                 }
@@ -1820,7 +1844,7 @@ impl Client {
                 self.outbound_message_tx
                     .as_ref()
                     .ok_or_else(transport_closed_error)?
-                    .send(ClientOutboundMessage::Batch(messages))
+                    .send(ClientOutboundMessage::Batch(self.localize_outbound_owned(messages)))
                     .await
                     .map_err(|_| transport_closed_error())?;
             }
@@ -1832,7 +1856,7 @@ impl Client {
                     .sum();
                 for message in messages {
                     outbound_tx
-                        .send(message)
+                        .send(self.localize_outbound_message(message))
                         .await
                         .map_err(|_| transport_closed_error())?;
                 }
@@ -1852,6 +1876,24 @@ impl Client {
     }
 
     async fn write_proto_message_batch_direct_inner(
+        &self,
+        messages: &[Message],
+    ) -> Result<(), WriteProtoMessageError> {
+        let messages = self.localize_outbound(messages);
+        self.write_prepared_batch_direct_inner(&messages).await
+    }
+
+    /// Write messages whose channel names were already translated when they
+    /// were queued. Used by the native writer task to drain its queue.
+    pub(crate) async fn write_prepared_batch_direct(
+        &self,
+        messages: &[Message],
+    ) -> Result<(), WriteProtoMessageError> {
+        self.in_tracing_span(self.write_prepared_batch_direct_inner(messages))
+            .await
+    }
+
+    async fn write_prepared_batch_direct_inner(
         &self,
         messages: &[Message],
     ) -> Result<(), WriteProtoMessageError> {
@@ -1887,6 +1929,46 @@ impl Client {
             ClientTransport::Remote => return Err(transport_not_writable_error().into()),
         }
         self.record_tcp_packets(messages.len(), bytes).await;
+        Ok(())
+    }
+
+    /// Queue `messages` exactly as given, in order and as one unit: channel
+    /// names are *not* translated. Callers translate the messages that should
+    /// be translated with [`Self::localize_outbound_message`]. Nothing else
+    /// queued for this client can interleave with the batch.
+    pub(crate) async fn write_prepared_message_batch(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<(), WriteProtoMessageError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        match &self.transport {
+            ClientTransport::NativeTls { .. } => {
+                self.outbound_message_tx
+                    .as_ref()
+                    .ok_or_else(transport_closed_error)?
+                    .send(ClientOutboundMessage::Batch(messages))
+                    .await
+                    .map_err(|_| transport_closed_error())?;
+            }
+            ClientTransport::WebGateway { outbound_tx, .. } => {
+                let message_count = messages.len();
+                let bytes = messages
+                    .iter()
+                    .map(|message| 6 + message.encoded_len())
+                    .sum();
+                let permits = outbound_tx
+                    .reserve_many(message_count)
+                    .await
+                    .map_err(|_| transport_closed_error())?;
+                for (permit, message) in permits.zip(messages) {
+                    permit.send(message);
+                }
+                self.record_tcp_packets(message_count, bytes).await;
+            }
+            ClientTransport::Remote => return Err(transport_not_writable_error().into()),
+        }
         Ok(())
     }
 
@@ -2423,17 +2505,85 @@ impl Client {
     }
 
     pub fn language(&self) -> crate::localization::Language {
-        self.local_state
-            .read()
-            .as_ref()
-            .map(|state| state.language())
-            .unwrap_or_default()
+        self.locale.load().language().clone()
     }
 
+    /// Change only the language, keeping the catalogs the client is bound
+    /// to. Servers use [`Server::apply_client_language`] instead, which also
+    /// binds the server's live catalogs.
+    ///
+    /// [`Server::apply_client_language`]: crate::server::Server::apply_client_language
     pub fn set_language(&self, language: crate::localization::Language) {
-        if let Some(ref mut state) = *self.local_state.write() {
-            state.set_language(language);
+        let locale = self.locale.load().with_language(language);
+        self.locale.store(Arc::new(locale));
+    }
+
+    pub fn set_locale(&self, locale: crate::localization::ClientLocale) {
+        self.locale.store(Arc::new(locale));
+    }
+
+    pub fn locale(&self) -> Arc<crate::localization::ClientLocale> {
+        self.locale.load_full()
+    }
+
+    /// Catalog text in this client's language.
+    pub fn text(&self, key: crate::localization::TextKey) -> Cow<'static, str> {
+        self.locale.load().text(key)
+    }
+
+    /// Catalog text in this client's language with `{name}` placeholders
+    /// substituted.
+    pub fn format_text(
+        &self,
+        key: crate::localization::TextKey,
+        arguments: &[(&str, &str)],
+    ) -> Cow<'static, str> {
+        self.locale.load().format(key, arguments)
+    }
+
+    /// Channel-name translations for this client's language, if any exist.
+    fn channel_name_map(&self) -> Option<Arc<crate::localization::channel_names::ChannelNameMap>> {
+        let locale = self.locale.load();
+        locale.channel_names().for_language(locale.language())
+    }
+
+    /// `messages` with channel names translated for this client. Borrows the
+    /// input unchanged when nothing needs translating, which is the common
+    /// case: only `ChannelState`s carrying a translated name are rewritten.
+    fn localize_outbound<'a>(&self, messages: &'a [Message]) -> Cow<'a, [Message]> {
+        if !messages.iter().any(carries_channel_name) {
+            return Cow::Borrowed(messages);
         }
+        match self
+            .channel_name_map()
+            .and_then(|names| crate::localization::channel_names::localize_channel_names(&names, messages))
+        {
+            Some(localized) => Cow::Owned(localized),
+            None => Cow::Borrowed(messages),
+        }
+    }
+
+    /// Owned variant of [`Self::localize_outbound`].
+    fn localize_outbound_owned(&self, mut messages: Vec<Message>) -> Vec<Message> {
+        if !messages.iter().any(carries_channel_name) {
+            return messages;
+        }
+        if let Some(names) = self.channel_name_map() {
+            for message in &mut messages {
+                crate::localization::channel_names::localize_channel_name(&names, message);
+            }
+        }
+        messages
+    }
+
+    /// Owned variant of [`Self::localize_outbound`] for one message.
+    pub(crate) fn localize_outbound_message(&self, mut message: Message) -> Message {
+        if carries_channel_name(&message)
+            && let Some(names) = self.channel_name_map()
+        {
+            crate::localization::channel_names::localize_channel_name(&names, &mut message);
+        }
+        message
     }
 
     pub fn max_bandwidth(&self, fallback: u32) -> u32 {
@@ -3161,7 +3311,7 @@ mod tests {
             .expect("first queue slot should be free");
 
         let full =
-            try_send_owned_gateway_batch(&tx, OwnedMessageBatch::new(vec![ping(2), ping(3)]))
+            try_send_owned_gateway_batch(&tx, OwnedMessageBatch::new(vec![ping(2), ping(3)]), std::convert::identity)
                 .expect_err("the complete batch does not fit");
         assert!(matches!(full, mpsc::error::TrySendError::Full(_)));
         assert_eq!(outbound_batch_len(full.into_inner()), 2);
@@ -3175,7 +3325,7 @@ mod tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
 
-        try_send_owned_gateway_batch(&tx, OwnedMessageBatch::new(vec![ping(4), ping(5)]))
+        try_send_owned_gateway_batch(&tx, OwnedMessageBatch::new(vec![ping(4), ping(5)]), std::convert::identity)
             .expect("the complete batch should fit once capacity is available");
         assert!(matches!(
             rx.try_recv(),
@@ -3186,10 +3336,7 @@ mod tests {
             Ok(Message::Ping(ping)) if ping.timestamp == Some(5)
         ));
 
-        let oversized = try_send_owned_gateway_batch(
-            &tx,
-            OwnedMessageBatch::new(vec![ping(6), ping(7), ping(8)]),
-        )
+        let oversized = try_send_owned_gateway_batch(&tx, OwnedMessageBatch::new(vec![ping(6), ping(7), ping(8)]), std::convert::identity)
         .expect_err("a batch larger than maximum capacity must not panic");
         assert!(matches!(oversized, mpsc::error::TrySendError::Full(_)));
         assert_eq!(outbound_batch_len(oversized.into_inner()), 3);

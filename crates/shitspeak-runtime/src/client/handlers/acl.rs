@@ -3,7 +3,7 @@ use shitspeak_state::{ACL, ACLPermissions, ChannelOp};
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    localization::{TextKey, text},
+    localization::TextKey,
     messages::{
         Message,
         encoder::{Acl as EncoderAcl, ChanAcl},
@@ -52,7 +52,7 @@ pub async fn handle_acl(
                 r#type: shitspeak_messages::messages::encoder::DenyType::Permission,
                 session: u32::from(sender.get_session_id()),
                 channel_id: Some(channel_id),
-                reason: Some(text(sender.language(), TextKey::WriteAclRequired)),
+                reason: Some(sender.text(TextKey::WriteAclRequired)),
                 name: None,
                 permission: Some(ACLPermissions::Write.bits()),
             }
@@ -113,9 +113,19 @@ pub async fn handle_acl(
             acls: flattened_acls,
             query: None,
         };
-        sender
-            .write_proto_message(&Message::ACL(acl_msg.into()))
-            .await?;
+        // The reply opens the client's channel editor; wrap it so the editor
+        // shows the raw channel name rather than a translation.
+        super::channel_editor::send_channel_editor_reply(
+            &LiveEditorReply {
+                server,
+                sender,
+                server_id: &server_id,
+                channel_id,
+            },
+            channel_id,
+            Message::ACL(acl_msg.into()),
+        )
+        .await?;
     } else {
         // ── Update mode: apply new ACLs ──────────────────────────────────
 
@@ -125,7 +135,7 @@ pub async fn handle_acl(
                     r#type: shitspeak_messages::messages::encoder::DenyType::Permission,
                     session: u32::from(sender.get_session_id()),
                     channel_id: Some(channel_id),
-                    reason: Some("ACL group updates are not supported".into()),
+                    reason: Some(sender.text(TextKey::AclGroupUpdatesUnsupported)),
                     name: None,
                     permission: Some(ACLPermissions::Write.bits()),
                 }
@@ -255,7 +265,7 @@ pub async fn handle_acl(
         } else {
             let Some(mut proposal) = proposed_s2s.into_started() else {
                 return Err(super::channel_op_propose_failed(
-                    u32::from(sender.get_session_id()),
+                    sender,
                     Some(channel_id),
                     None,
                 ));
@@ -263,7 +273,7 @@ pub async fn handle_acl(
             let accepted = proposal.accepted().await;
             if !accepted.is_proposed() {
                 return Err(super::channel_op_propose_failed(
-                    u32::from(sender.get_session_id()),
+                    sender,
                     Some(channel_id),
                     accepted.failure_reason(),
                 ));
@@ -274,7 +284,7 @@ pub async fn handle_acl(
                 super::channel_state::AcceptedChannelOpCommit::Completed(result) => {
                     if !result.is_proposed() {
                         return Err(super::channel_op_propose_failed(
-                            u32::from(sender.get_session_id()),
+                    sender,
                             Some(channel_id),
                             result.failure_reason(),
                         ));
@@ -296,4 +306,37 @@ pub async fn handle_acl(
     }
 
     Ok(())
+}
+
+/// The editor reply for a connected client: names come from the channel
+/// repository and the client's current locale.
+struct LiveEditorReply<'a> {
+    server: &'a Arc<Box<Server>>,
+    sender: &'a Arc<Box<Client>>,
+    server_id: &'a str,
+    channel_id: u32,
+}
+
+#[async_trait::async_trait]
+impl super::channel_editor::EditorReplyTarget for LiveEditorReply<'_> {
+    async fn raw_name(&self) -> Option<String> {
+        self.server
+            .get_channels()
+            .get_channel_in_server(self.server_id, self.channel_id)
+            .await
+            .map(|channel| channel.name.clone())
+    }
+
+    fn displayed(&self, raw: &str) -> String {
+        let locale = self.sender.locale();
+        locale
+            .channel_names()
+            .translate(locale.language(), raw)
+            .unwrap_or_else(|| raw.to_owned())
+    }
+
+    async fn queue(&self, batch: Vec<Message>) -> Result<(), MessageHandlerError> {
+        self.sender.write_prepared_message_batch(batch).await?;
+        Ok(())
+    }
 }

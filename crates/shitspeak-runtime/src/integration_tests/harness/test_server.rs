@@ -46,6 +46,8 @@ pub struct TestServerOpts {
     pub welcome_text: Option<String>,
     pub default_language: Language,
     pub force_language: Option<Language>,
+    pub translation_sync: Option<shitspeak_runtime_config::TranslationSyncConfig>,
+    pub channel_name_translation: Option<shitspeak_runtime_config::ChannelNameTranslationConfig>,
     pub udp_voice_enabled: bool,
     pub udp_ping_enabled: bool,
     pub default_channel: u32,
@@ -78,6 +80,8 @@ impl Default for TestServerOpts {
             welcome_text: Some("test-welcome".into()),
             default_language: Language::default(),
             force_language: None,
+            translation_sync: None,
+            channel_name_translation: None,
             udp_voice_enabled: true,
             udp_ping_enabled: true,
             default_channel: 0,
@@ -535,6 +539,8 @@ async fn spawn_test_server_with_pki(
         cert_required: opts.cert_required,
         default_language: opts.default_language,
         force_language: opts.force_language,
+        translation_sync: opts.translation_sync,
+        channel_name_translation: opts.channel_name_translation,
         blob_storage_dir: blob_storage_dir
             .as_ref()
             .map(|directory| directory.path().to_path_buf()),

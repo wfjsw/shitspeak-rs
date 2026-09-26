@@ -256,9 +256,9 @@ impl AuthenticatorJsonAuthenticateResponse {
             invisible: self.invisible,
             virtual_server_id: self.virtual_server_id,
             // An absent `language` leaves the selection to the server's
-            // `default_language`; a present one is negotiated leniently so an
-            // unknown tag degrades to English rather than failing the login.
-            language: self.language.as_deref().map(Language::from_code),
+            // `default_language`. Text that is not a language tag is treated
+            // the same way rather than failing the login.
+            language: self.language.as_deref().and_then(Language::parse),
             max_bandwidth: self.max_bandwidth,
             texture_url: self.texture_url,
             comment_url: self.comment_url,

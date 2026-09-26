@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 
-use crate::localization::Language;
 use shitspeak_auth::AuthenticationExpiryAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,7 +12,6 @@ pub(crate) enum ExpiredAuthenticationAction {
 pub struct ClientLocalState {
     authenticated: bool,
     supports_opus: bool,
-    language: Language,
     max_bandwidth: Option<u32>,
 
     auth_session_id: Option<String>,
@@ -31,7 +29,6 @@ impl ClientLocalState {
         ClientLocalState {
             authenticated: false,
             supports_opus: false,
-            language: Language::default(),
             max_bandwidth: None,
 
             auth_session_id: None,
@@ -59,14 +56,6 @@ impl ClientLocalState {
 
     pub fn set_supports_opus(&mut self, value: bool) {
         self.supports_opus = value;
-    }
-
-    pub fn language(&self) -> Language {
-        self.language
-    }
-
-    pub fn set_language(&mut self, language: Language) {
-        self.language = language;
     }
 
     pub fn max_bandwidth(&self) -> Option<u32> {

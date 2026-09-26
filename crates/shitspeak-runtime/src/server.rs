@@ -305,6 +305,13 @@ pub struct Server {
     visibility_reload_tx: broadcast::Sender<()>,
     visibility_generation: AtomicU64,
     client_projection_pool: std::sync::OnceLock<client_projection_pool::ClientProjectionPool>,
+
+    /// Server-generated text, including live translations from Weblate.
+    localizer: Arc<crate::localization::Localizer>,
+    /// Live channel-name translations applied to outgoing `ChannelState`s.
+    channel_name_translations: Arc<crate::localization::channel_names::ChannelNameTranslations>,
+    channel_names_tx:
+        broadcast::Sender<Arc<crate::localization::channel_names::ChannelNameRefresh>>,
 }
 
 impl Server {
@@ -449,6 +456,7 @@ impl Server {
         let config = ArcSwap::from_pointee(config);
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(());
         let (visibility_reload_tx, _visibility_reload_rx) = broadcast::channel(64);
+        let (channel_names_tx, _channel_names_rx) = broadcast::channel(16);
 
         let server = Arc::new(Box::new(Server {
             node_identifier: node_id,
@@ -530,6 +538,11 @@ impl Server {
             visibility_reload_tx,
             visibility_generation: AtomicU64::new(0),
             client_projection_pool: std::sync::OnceLock::new(),
+            localizer: Arc::new(crate::localization::Localizer::bundled()),
+            channel_name_translations: Arc::new(
+                crate::localization::channel_names::ChannelNameTranslations::new(),
+            ),
+            channel_names_tx,
         }));
 
         let projection_pool = client_projection_pool::ClientProjectionPool::spawn(
@@ -537,6 +550,7 @@ impl Server {
             server.clients.subscribe(),
             server.channels.subscribe(),
             server.subscribe_visibility_reload(),
+            server.channel_names_tx.subscribe(),
             server.clients.recommended_projection_event_capacity(),
         )?;
         server
@@ -553,6 +567,11 @@ impl Server {
             .set_observer(Arc::new(ClientRepositoryChannelObserver {
                 server: Arc::downgrade(&server),
             }));
+
+        // Serve the last downloaded translations until the first poll of
+        // Weblate completes.
+        crate::localization::sync::load_translation_cache(&server);
+        crate::localization::channel_names::load_channel_name_cache(&server).await;
 
         Ok(server)
     }
@@ -604,6 +623,60 @@ impl Server {
     /// either hide flag changes during a config reload.
     pub fn subscribe_visibility_reload(&self) -> broadcast::Receiver<()> {
         self.visibility_reload_tx.subscribe()
+    }
+
+    /// Server-generated text in any language.
+    pub fn localizer(&self) -> &Arc<crate::localization::Localizer> {
+        &self.localizer
+    }
+
+    pub fn channel_name_translations(
+        &self,
+    ) -> &Arc<crate::localization::channel_names::ChannelNameTranslations> {
+        &self.channel_name_translations
+    }
+
+    pub(crate) fn publish_channel_name_refresh(
+        &self,
+        refresh: crate::localization::channel_names::ChannelNameRefresh,
+    ) {
+        let _ = self.channel_names_tx.send(Arc::new(refresh));
+    }
+
+    /// Set a client's language from the authenticator's choice (`None` when
+    /// it made none, or before authentication) and the server's
+    /// `default_language` / `force_language`, and bind the client to the
+    /// server's live message catalogs and channel-name translations.
+    ///
+    /// Returns whether the language changed. Text generated from now on uses
+    /// the new language; for text the client already holds, see
+    /// [`Self::refresh_client_language`].
+    pub fn apply_client_language(
+        &self,
+        client: &Client,
+        requested: Option<crate::localization::Language>,
+    ) -> bool {
+        let language = self.read_config().resolve_language(requested);
+        let changed = client.language() != language;
+        client.set_locale(crate::localization::ClientLocale::new(
+            language,
+            Arc::clone(&self.localizer),
+            Arc::clone(&self.channel_name_translations),
+        ));
+        changed
+    }
+
+    /// Re-send the localized state an authenticated client already holds
+    /// after its language changed: every visible channel name (through its
+    /// projection, so ordering with channel updates is kept) and the server
+    /// context menu labels.
+    pub(crate) async fn refresh_client_language(self: &Arc<Box<Self>>, client: &Arc<Box<Client>>) {
+        self.publish_channel_name_refresh(
+            crate::localization::channel_names::ChannelNameRefresh::ClientLanguage(
+                client.client_instance_id(),
+            ),
+        );
+        crate::toggle_superuser_visibility::refresh_context_menu(self, client).await;
     }
 
     pub(crate) fn visibility_generation(&self) -> u64 {
@@ -804,6 +877,15 @@ impl Server {
         // it must never terminate the main server loop.
         let register_task =
             crate::register::spawn_register_task(Arc::clone(self), internal_rx.clone());
+        let translation_sync_task = crate::localization::sync::spawn_translation_sync(
+            Arc::downgrade(self),
+            internal_rx.clone(),
+        );
+        let channel_name_sync_task =
+            crate::localization::channel_names::spawn_channel_name_sync(
+                Arc::downgrade(self),
+                internal_rx.clone(),
+            );
 
         // Wait for any task to finish (error) or for the caller to request
         // shutdown by sending on the shared watch channel.
@@ -833,6 +915,8 @@ impl Server {
             let _ = task.await;
         }
         let _ = register_task.await;
+        let _ = translation_sync_task.await;
+        let _ = channel_name_sync_task.await;
 
         Ok(())
     }
@@ -1871,7 +1955,7 @@ impl Server {
             return;
         }
 
-        client.set_language(self.read_config().resolve_language(language));
+        let language_changed = self.apply_client_language(&client, language);
         client.set_max_bandwidth(max_bandwidth);
         client.set_voice_bandwidth_limit(max_bandwidth.unwrap_or(self.get_max_bandwidth()));
         let root_permissions = crate::client::acl::compute_permissions_for_client_with_identity(
@@ -1974,7 +2058,11 @@ impl Server {
             state
                 .set_suppress(!target_permissions.contains(shitspeak_state::ACLPermissions::Speak));
         }
-        if was_superuser != client.is_superuser() {
+        if language_changed {
+            // The authenticator chose a different language: re-send what the
+            // client already holds in the old one.
+            self.refresh_client_language(&client).await;
+        } else if was_superuser != client.is_superuser() {
             crate::toggle_superuser_visibility::refresh_context_menu(self, &client).await;
         }
 

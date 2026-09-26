@@ -5,7 +5,7 @@ use shitspeak_state::{ACLPermissions, ChannelOp};
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    localization::{TextKey, text},
+    localization::TextKey,
     messages::encoder::{ChannelRemove, DenyType, PermissionDenied},
     server::Server,
 };
@@ -33,7 +33,7 @@ pub async fn handle_channel_remove(
             r#type: DenyType::Permission,
             session: u32::from(sender.get_session_id()),
             channel_id: Some(0),
-            reason: Some(text(sender.language(), TextKey::CannotDeleteRootChannel)),
+            reason: Some(sender.text(TextKey::CannotDeleteRootChannel)),
             name: None,
             permission: None,
         }));
@@ -77,7 +77,7 @@ pub async fn handle_channel_remove(
         }
     } else if !result.is_proposed() {
         return Err(super::channel_op_propose_failed(
-            u32::from(sender.get_session_id()),
+                    sender,
             Some(channel_id),
             result.failure_reason(),
         ));

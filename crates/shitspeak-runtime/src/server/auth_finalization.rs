@@ -6,8 +6,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::client::Client;
-use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::errors::MessageHandlerError;
+use crate::localization::TextKey;
 use shitspeak_auth::{Authenticator, ReloadableAuthenticator};
 use shitspeak_messages::messages::Message;
 use shitspeak_messages::messages::encoder::TextMessage;
@@ -311,7 +311,7 @@ impl AuthFinalizationQueue {
         if let Some(position) = self.position(ticket)
             && should_send_auth_finalization_queue_notice(last_announced_position, position)
         {
-            let message = auth_finalization_queue_message(client.get_session_id(), position);
+            let message = auth_finalization_queue_message(&client, position);
             client.write_proto_message(&message).await?;
         }
         Ok(())
@@ -413,21 +413,21 @@ impl AuthFinalizationPermit {
     }
 }
 
-fn auth_finalization_queue_message(
-    session_id: ClientSessionIdentifier,
-    position: usize,
-) -> Message {
+fn auth_finalization_queue_message(client: &Client, position: usize) -> Message {
     let users_ahead = position.saturating_sub(1);
 
     Message::TextMessage(
         TextMessage {
             actor: None,
-            session: vec![u32::from(session_id)],
+            session: vec![u32::from(client.get_session_id())],
             channel_id: Vec::new(),
             tree_id: Vec::new(),
-            message: format!(
-                "You're in the login queue. There are {users_ahead} users ahead of you."
-            ),
+            message: client
+                .format_text(
+                    TextKey::LoginQueuePosition,
+                    &[("users_ahead", &users_ahead.to_string())],
+                )
+                .into_owned(),
         }
         .into(),
     )

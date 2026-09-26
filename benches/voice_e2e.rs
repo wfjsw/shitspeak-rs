@@ -300,6 +300,8 @@ fn bench_config(pki: &BenchPki, server_protocol_version: ProtocolVersion) -> Con
         cert_required: false,
         default_language: Default::default(),
         force_language: None,
+        translation_sync: None,
+        channel_name_translation: None,
         blob_storage_dir: None,
         user_channel_cache_record_remote_sessions: false,
         channel_log_max_entries: 10_000,

@@ -677,11 +677,17 @@ impl MoqSessionRuntime {
                             text: message.to_owned(),
                         },
                         ServerEvent::Error {
-                            message: authentication_rejection_reason(rejection),
+                            message: crate::session::authentication_rejection_reason(
+                                preallocated.as_ref().map(|(server, _)| &***server),
+                                &rejection,
+                            ),
                         },
                     ]);
                 }
-                return Err(authentication_rejection_reason(rejection));
+                return Err(crate::session::authentication_rejection_reason(
+                    preallocated.as_ref().map(|(server, _)| &***server),
+                    &rejection,
+                ));
             }
         };
         let Some((server, client)) = preallocated else {
@@ -702,7 +708,7 @@ impl MoqSessionRuntime {
                 )
                 .await;
             return Ok(vec![ServerEvent::AuthenticationRejected {
-                reason: error.reason().to_string(),
+                reason: error.reason(&client),
             }]);
         }
         let session = u32::from(client.get_session_id());
@@ -1865,19 +1871,6 @@ struct MoqActiveSpeaker {
     channel_id: u32,
 }
 
-fn authentication_rejection_reason(rejection: AuthenticationRejection) -> String {
-    if let Some(reason) = rejection.reason() {
-        return reason.to_owned();
-    }
-    match rejection.kind() {
-        shitspeak_auth::AuthenticationRejectionKind::WrongPassword => "wrong password",
-        shitspeak_auth::AuthenticationRejectionKind::NoSuchUser => "no such user",
-        shitspeak_auth::AuthenticationRejectionKind::RetryLater => {
-            "authenticator temporarily unavailable"
-        }
-    }
-    .to_string()
-}
 
 fn voice_target_kind(target: VoiceTarget) -> VoiceTargetKind {
     match target {
@@ -2709,6 +2702,8 @@ mod tests {
             cert_required: false,
             default_language: Default::default(),
             force_language: None,
+            translation_sync: None,
+            channel_name_translation: None,
             blob_storage_dir: None,
             session_blob_cache_budget_bytes: 256 * 1024 * 1024,
             user_channel_cache_record_remote_sessions: false,

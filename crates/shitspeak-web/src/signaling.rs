@@ -1242,7 +1242,10 @@ async fn handle_signaling_authenticate(
                 send_server_event(
                     stream,
                     &ServerEvent::AuthenticationRejected {
-                        reason: "password authentication is disabled".to_string(),
+                        reason: crate::session::unauthenticated_text(
+                            context.server.as_deref().map(|server| &**server),
+                            shitspeak_runtime::localization::TextKey::PasswordAuthenticationDisabled,
+                        ),
                     },
                 )
                 .await?;
@@ -1269,6 +1272,7 @@ async fn handle_signaling_authenticate(
                     );
                     send_authentication_rejection(
                         stream,
+                        context.server.as_deref().map(|server| &**server),
                         AuthenticationRejection::new(
                             shitspeak_auth::AuthenticationRejectionKind::RetryLater,
                         ),
@@ -1330,6 +1334,7 @@ async fn handle_signaling_authenticate(
                     }
                     send_authentication_rejection(
                         stream,
+                        context.server.as_deref().map(|server| &**server),
                         AuthenticationRejection::new(
                             shitspeak_auth::AuthenticationRejectionKind::RetryLater,
                         ),
@@ -1349,7 +1354,12 @@ async fn handle_signaling_authenticate(
                             .await;
                         session.session_id = DEFAULT_WEB_SESSION_ID;
                     }
-                    send_authentication_rejection(stream, rejection).await
+                    send_authentication_rejection(
+                        stream,
+                        context.server.as_deref().map(|server| &**server),
+                        rejection,
+                    )
+                    .await
                 }
             }
         }
@@ -1503,7 +1513,7 @@ async fn handle_successful_password_auth(
             return send_server_event(
                 stream,
                 &ServerEvent::AuthenticationRejected {
-                    reason: error.reason().to_string(),
+                    reason: error.reason(&client),
                 },
             )
             .await;
@@ -1542,7 +1552,7 @@ async fn handle_successful_password_auth(
             return send_server_event(
                 stream,
                 &ServerEvent::AuthenticationRejected {
-                    reason: error.reason().to_string(),
+                    reason: error.reason(&client),
                 },
             )
             .await;
@@ -2390,6 +2400,7 @@ async fn send_authentication_success(
 
 async fn send_authentication_rejection(
     stream: &mut (impl AsyncWrite + Unpin),
+    server: Option<&Server>,
     rejection: AuthenticationRejection,
 ) -> io::Result<()> {
     if let Some(message) = rejection.message() {
@@ -2405,17 +2416,10 @@ async fn send_authentication_rejection(
         )
         .await?;
     }
-    let reason = match rejection.kind() {
-        shitspeak_auth::AuthenticationRejectionKind::WrongPassword => "wrong password",
-        shitspeak_auth::AuthenticationRejectionKind::NoSuchUser => "no such user",
-        shitspeak_auth::AuthenticationRejectionKind::RetryLater => {
-            "authenticator temporarily unavailable"
-        }
-    };
     send_server_event(
         stream,
         &ServerEvent::AuthenticationRejected {
-            reason: rejection.reason().unwrap_or(reason).to_owned(),
+            reason: crate::session::authentication_rejection_reason(server, &rejection),
         },
     )
     .await
@@ -2734,6 +2738,7 @@ mod tests {
             let (mut client, mut server) = tokio::io::duplex(4096);
             send_authentication_rejection(
                 &mut server,
+                None,
                 AuthenticationRejection::new(kind)
                     .with_reason("Access denied.")
                     .with_message("Contact support."),
@@ -3035,7 +3040,7 @@ mod tests {
         };
         assert_eq!(
             text,
-            r#"{"type":"authentication_rejected","reason":"wrong password"}"#
+            r#"{"type":"authentication_rejected","reason":"Incorrect username or password"}"#
         );
 
         client.write_all(&masked_close_frame()).await.unwrap();
@@ -3464,6 +3469,8 @@ mod tests {
             cert_required: false,
             default_language: Default::default(),
             force_language: None,
+            translation_sync: None,
+            channel_name_translation: None,
             blob_storage_dir: None,
             session_blob_cache_budget_bytes: 256 * 1024 * 1024,
             user_channel_cache_record_remote_sessions: false,

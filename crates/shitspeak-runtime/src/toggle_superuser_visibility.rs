@@ -4,13 +4,22 @@ use crate::context_action::{Context, Operation, context};
 use shitspeak_messages::messages::encoder::{ContextAction, ContextActionModify};
 
 pub(crate) const ACTION_ID: &str = "shitspeak.toggle_superuser_visibility";
+/// English labels, as seen by clients using the default language.
+#[cfg(test)]
 pub(crate) const HIDE_LABEL: &str = "Hide me";
+#[cfg(test)]
 pub(crate) const SHOW_LABEL: &str = "Show me";
 
-pub(crate) fn action(hidden: bool) -> ContextActionModify {
+/// The toggle entry for `client`, labelled in the client's language.
+pub(crate) fn action(client: &crate::client::Client) -> ContextActionModify {
+    let label = if client.is_hidden_from_regular_users() {
+        crate::localization::TextKey::ShowMe
+    } else {
+        crate::localization::TextKey::HideMe
+    };
     ContextActionModify {
         action: ACTION_ID.to_owned(),
-        text: Some(if hidden { SHOW_LABEL } else { HIDE_LABEL }.to_owned()),
+        text: Some(client.text(label).into_owned()),
         context: Some(context::SERVER),
         operation: Some(Operation::Add as i32),
     }
@@ -75,7 +84,7 @@ pub(crate) async fn refresh_context_menu(
 
     let tail_action = client
         .is_superuser()
-        .then(|| action(client.is_hidden_from_regular_users()));
+        .then(|| action(client));
     let modifications = server
         .context_actions()
         .rebuild_context_with_tail(Context::SERVER, ACTION_ID, tail_action)

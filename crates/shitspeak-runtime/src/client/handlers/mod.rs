@@ -1,6 +1,7 @@
 mod acl;
 mod authenticate;
 mod ban_list;
+mod channel_editor;
 mod channel_remove;
 mod channel_state;
 mod context_action;
@@ -48,19 +49,18 @@ use voice_target::handle_voice_target;
 use crate::{
     client::Client,
     errors::{MessageHandlerError, MessageTypeNotForIncoming},
+    localization::{ClientLocale, TextKey},
     messages::{Message, encoder::TextMessage, errors::MessageProtocolError},
     server::Server,
 };
 
-pub(super) const BAN_REPOSITORY_REQUEST_SUBMITTED: &str =
-    "Ban list update submitted. Waiting for repository admission.";
-pub(super) const BAN_REPOSITORY_REQUEST_ADMITTED: &str = "Ban list update fully admitted.";
-pub(super) const BAN_REPOSITORY_REQUEST_REJECTED: &str =
-    "Ban list update was not admitted by strict replication.";
+pub(super) const BAN_REPOSITORY_REQUEST_SUBMITTED: TextKey = TextKey::BanListUpdateSubmitted;
+pub(super) const BAN_REPOSITORY_REQUEST_ADMITTED: TextKey = TextKey::BanListUpdateAdmitted;
+pub(super) const BAN_REPOSITORY_REQUEST_REJECTED: TextKey = TextKey::BanListUpdateRejected;
 
 pub(super) async fn send_ban_repository_notice(
     sender: &Arc<Box<Client>>,
-    message: &'static str,
+    notice: TextKey,
 ) -> Result<(), MessageHandlerError> {
     let notice = Message::TextMessage(
         TextMessage {
@@ -68,7 +68,7 @@ pub(super) async fn send_ban_repository_notice(
             session: vec![u32::from(sender.get_session_id())],
             channel_id: Vec::new(),
             tree_id: Vec::new(),
-            message: message.to_owned(),
+            message: sender.text(notice).into_owned(),
         }
         .into(),
     );
@@ -77,24 +77,35 @@ pub(super) async fn send_ban_repository_notice(
 }
 
 fn channel_op_propose_failed(
-    session: u32,
+    sender: &Client,
     channel_id: Option<u32>,
     reason: Option<&str>,
 ) -> MessageHandlerError {
-    let reason = reason
-        .map(|reason| {
-            if reason.contains("timed out") || reason.contains("timeout") {
-                format!(
-                    "Channel operation timed out before its result was known and may still apply. Refresh the channel before retrying. Details: {reason}"
-                )
-            } else {
-                format!("S2S channel operation failed: {reason}")
-            }
-        })
-        .unwrap_or_else(|| {
-            "Channel operation failed because the S2S commit could not complete; please try again"
-                .to_owned()
-        });
+    channel_op_failure(
+        u32::from(sender.get_session_id()),
+        &sender.locale(),
+        channel_id,
+        reason,
+    )
+}
+
+/// The S2S failure `reason` is internal (node ids, topics, durations) and
+/// English-only, so it is logged rather than sent; the client gets a
+/// localized explanation of what it means for them.
+fn channel_op_failure(
+    session: u32,
+    locale: &ClientLocale,
+    channel_id: Option<u32>,
+    reason: Option<&str>,
+) -> MessageHandlerError {
+    tracing::warn!(session, ?channel_id, reason, "channel operation failed");
+    let timed_out =
+        reason.is_some_and(|reason| reason.contains("timed out") || reason.contains("timeout"));
+    let reason = if timed_out {
+        locale.text(TextKey::ChannelOperationTimedOut)
+    } else {
+        locale.text(TextKey::ChannelOperationFailed)
+    };
     MessageHandlerError::PermissionDenied(shitspeak_messages::messages::encoder::PermissionDenied {
         // This is an operational failure, not an ACL decision. Mumble clients
         // commonly render Permission denials as a generic "Permission denied"
@@ -102,7 +113,7 @@ fn channel_op_propose_failed(
         r#type: shitspeak_messages::messages::encoder::DenyType::Text,
         session,
         channel_id,
-        reason: Some(reason.into()),
+        reason: Some(reason),
         name: None,
         permission: None,
     })
@@ -113,26 +124,45 @@ mod tests {
     use super::*;
     use shitspeak_messages::messages::encoder::DenyType;
 
-    #[test]
-    fn channel_op_failure_is_reported_as_text_with_s2s_reason() {
-        let error = channel_op_propose_failed(
-            8,
-            Some(42),
-            Some("consensus timed out waiting for delivery"),
-        );
-
+    fn denied_reason(error: MessageHandlerError) -> String {
         let MessageHandlerError::PermissionDenied(denied) = error else {
             panic!("channel operation failures must produce a client response");
         };
         assert_eq!(denied.r#type, DenyType::Text);
         assert_eq!(denied.channel_id, Some(42));
-        assert_eq!(
-            denied.reason.as_deref(),
-            Some(
-                "Channel operation timed out before its result was known and may still apply. Refresh the channel before retrying. Details: consensus timed out waiting for delivery"
-            )
-        );
         assert_eq!(denied.permission, None);
+        denied.reason.expect("reason").into_owned()
+    }
+
+    #[test]
+    fn channel_op_timeout_is_reported_as_a_localized_text_denial() {
+        let reason = denied_reason(channel_op_failure(
+            8,
+            &ClientLocale::default(),
+            Some(42),
+            Some("consensus timed out waiting for delivery"),
+        ));
+        assert_eq!(
+            reason,
+            "The channel operation timed out before its result was known and may still apply. Refresh the channel before retrying."
+        );
+    }
+
+    #[test]
+    fn channel_op_failure_does_not_leak_internal_s2s_details() {
+        let spanish =
+            ClientLocale::default().with_language(crate::localization::Language::parse("es").unwrap());
+        let reason = denied_reason(channel_op_failure(
+            8,
+            &spanish,
+            Some(42),
+            Some("non-owner attempted to propose on owner-mode topic owned by 7"),
+        ));
+        assert!(!reason.contains("owner"), "internal detail leaked: {reason}");
+        assert_eq!(
+            reason,
+            "No se pudo completar la operación del canal; inténtalo de nuevo"
+        );
     }
 }
 
@@ -504,19 +534,23 @@ async fn handle_message_inner(
     match result {
         Err(MessageHandlerError::ProtocolViolation(reason)) => {
             tracing::warn!(session, reason = %reason, "Protocol violation");
-            let reject = crate::errors::AuthRejection::new_with_language(
+            let reject = crate::errors::AuthRejection::new(
                 shitspeak_messages::messages::encoder::RejectType::None,
-                client.language(),
             );
-            let reject_msg: shitspeak_messages::messages::encoder::Reject = reject.clone().into();
-            let msg = shitspeak_messages::messages::Message::Reject(reject_msg.into());
+            let msg = shitspeak_messages::messages::Message::Reject(
+                reject
+                    .to_reject(client.locale().localizer(), client.locale().language())
+                    .into(),
+            );
             client.write_proto_message_direct(&msg).await?;
             Err(MessageHandlerError::AuthRejection(reject))
         }
         Err(MessageHandlerError::AuthRejection(reject)) => {
-            let reject_msg: shitspeak_messages::messages::encoder::Reject =
-                reject.clone().localized(client.language()).into();
-            let msg = shitspeak_messages::messages::Message::Reject(reject_msg.into());
+            let msg = shitspeak_messages::messages::Message::Reject(
+                reject
+                    .to_reject(client.locale().localizer(), client.locale().language())
+                    .into(),
+            );
             client.write_proto_message_direct(&msg).await?;
             Err(MessageHandlerError::AuthRejection(reject))
         }
@@ -526,10 +560,12 @@ async fn handle_message_inner(
         }
         Err(MessageHandlerError::PermissionDenied(mut deny)) => {
             if deny.reason.is_none() {
-                deny.reason = Some(crate::localization::permission_denied_reason(
-                    client.language(),
-                    deny.r#type,
-                ));
+                let locale = client.locale();
+                deny.reason = Some(
+                    locale
+                        .localizer()
+                        .permission_denied_reason(locale.language(), deny.r#type),
+                );
             }
             tracing::warn!(
                 session,

@@ -9,7 +9,7 @@ use crate::{
     },
     client::{Client, DeferredSessionBlobResolution, OwnedMessageBatch, user_info::Credential},
     errors::{AuthRejection, MessageHandlerError},
-    localization::{TextKey, text},
+    localization::TextKey,
     messages::{
         Message,
         encoder::{Authenticate, CodecVersion, RejectType, ServerConfig, ServerSync, TextMessage},
@@ -83,7 +83,7 @@ pub async fn handle_authenticate(
     // Apply the configured language before anything can be rejected, so
     // pre-authentication rejection text honors `default_language` and
     // `force_language` instead of defaulting to English.
-    sender.set_language(auth_config.resolve_language(None));
+    server.apply_client_language(sender, None);
 
     // ── Username required ─────────────────────────────────────────────────
     let username = msg.username.ok_or(RejectType::InvalidUsername)?;
@@ -108,10 +108,7 @@ pub async fn handle_authenticate(
             username = %username,
             "authentication rate limit exceeded"
         );
-        return Err(AuthRejection::new_with_language(
-            RejectType::AuthenticatorFail,
-            sender.language(),
-        )
+        return Err(AuthRejection::new(RejectType::AuthenticatorFail)
         .into());
     }
 
@@ -157,7 +154,7 @@ pub async fn handle_authenticate(
     // ── Certificate required ──────────────────────────────────────────────
     if auth_config.cert_required && !sender.has_certificate() {
         return Err(
-            AuthRejection::new_with_language(RejectType::NoCertificate, sender.language()).into(),
+            AuthRejection::new(RejectType::NoCertificate).into(),
         );
     }
 
@@ -202,7 +199,7 @@ pub async fn handle_authenticate(
                     RejectType::AuthenticatorFail
                 }
             };
-            let mut reject = AuthRejection::new_with_language(reject_type, sender.language());
+            let mut reject = AuthRejection::new(reject_type);
             if let Some(reason) = rejection.reason() {
                 reject = reject.because(reason.to_owned());
             }
@@ -210,10 +207,7 @@ pub async fn handle_authenticate(
         }
     };
     if result.user_id == Some(u32::MAX) {
-        return Err(AuthRejection::new_with_language(
-            RejectType::AuthenticatorFail,
-            sender.language(),
-        )
+        return Err(AuthRejection::new(RejectType::AuthenticatorFail)
         .into());
     }
 
@@ -222,17 +216,14 @@ pub async fn handle_authenticate(
     let auth_session_id = result.auth_session_id.clone();
     let authenticated_until = result.authenticated_until;
     let authentication_expiry_action = result.authentication_expiry_action;
-    sender.set_language(auth_config.resolve_language(result.language));
+    server.apply_client_language(sender, result.language.clone());
     if let Some(auth_server_id) = result.virtual_server_id.clone() {
         if auth_server_id != provisional_server_id {
             let Some(new_session) = repo
                 .move_local_client_to_server(&provisional_server_id, session, &auth_server_id)
                 .await
             else {
-                return Err(AuthRejection::new_with_language(
-                    RejectType::ServerFull,
-                    sender.language(),
-                )
+                return Err(AuthRejection::new(RejectType::ServerFull)
                 .into());
             };
             session = new_session;
@@ -267,7 +258,7 @@ pub async fn handle_authenticate(
         && repo.local_authenticated_client_count_in_server(&server_id) >= auth_config.max_users
     {
         return Err(
-            AuthRejection::new_with_language(RejectType::ServerFull, sender.language()).into(),
+            AuthRejection::new(RejectType::ServerFull).into(),
         );
     }
 
@@ -284,7 +275,7 @@ pub async fn handle_authenticate(
                     "Authenticate built outbound Reject payload"
                 );
                 return Err(AuthRejection::new(RejectType::None)
-                    .because(text(sender.language(), TextKey::MissingRequiredGroup))
+                    .because_text(TextKey::MissingRequiredGroup)
                     .into());
             }
         }
@@ -326,7 +317,7 @@ pub async fn handle_authenticate(
             .await
     {
         return Err(
-            AuthRejection::new_with_language(RejectType::ServerFull, sender.language()).into(),
+            AuthRejection::new(RejectType::ServerFull).into(),
         );
     }
 
@@ -346,7 +337,7 @@ pub async fn handle_authenticate(
                 "Authenticate built outbound Reject payload"
             );
             return Err(AuthRejection::new(RejectType::None)
-                .because(text(sender.language(), TextKey::NoRootTraverse))
+                .because_text(TextKey::NoRootTraverse)
                 .into());
         }
     }
@@ -370,7 +361,7 @@ pub async fn handle_authenticate(
         )
         .await;
         return Err(AuthRejection::new(RejectType::None)
-            .because(text(sender.language(), TextKey::CryptSetupFailed))
+            .because_text(TextKey::CryptSetupFailed)
             .into());
     }
     let crypt_setup_msg: Message = {
@@ -615,7 +606,7 @@ pub async fn handle_authenticate(
     }
     if sender.is_superuser() {
         push_burst(
-            crate::toggle_superuser_visibility::action(sender.is_hidden_from_regular_users())
+            crate::toggle_superuser_visibility::action(sender)
                 .into(),
         );
     }

@@ -32,9 +32,9 @@ default_channel = 1
 cert_required = false
 
 # Language used for server-generated text when the authenticator does not
-# return one, and before a client authenticates. Accepts any BCP-47 tag that
-# negotiates onto a bundled translation ("en", "es", "fr", "de", "zh"); for
-# example "es-MX" resolves to Spanish and "zh-CN" to Simplified Chinese.
+# return one, and before a client authenticates. Accepts any BCP-47 tag; it is
+# matched against the available translations, so "es-MX" is served by Spanish
+# and "zh-CN" by Simplified Chinese. See docs/localization.md.
 default_language = "en"
 # Uncomment to force one language for every client, overriding both
 # default_language and any language an authenticator returns.
@@ -145,6 +145,31 @@ backend = "demo"
 # gid = 1001
 # timeout_ms = 30000
 # max_response_bytes = 16777216
+
+# Live updates of the server's own text from the Weblate component that
+# translates translations/server/ (see docs/localization.md). Translations are
+# applied without a restart; strings Weblate does not provide keep the text
+# bundled in the binary.
+# [translation_sync]
+# url = "https://weblate.example.org"
+# project = "shitspeak"
+# component = "server"
+# # token = "wlu_..."      # only needed for private projects
+# poll_interval_secs = 300
+# cache_path = "data/localization/server.json"
+
+# Channel-name translation through a (possibly separate) Weblate component
+# whose source strings are the raw channel names, in a custom source language.
+# New names are pushed as source strings; translations are shown to each client
+# in its language and updated live (see docs/localization.md).
+# [channel_name_translation]
+# url = "https://weblate.example.org"
+# project = "shitspeak"
+# component = "channel-names"
+# token = "wlu_..."          # must be allowed to add strings when push_names = true
+# poll_interval_secs = 60
+# push_names = true
+# cache_path = "data/localization/channel_names.json"
 
 # ACL behavior toggles
 [acl]

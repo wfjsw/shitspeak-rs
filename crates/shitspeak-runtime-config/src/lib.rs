@@ -1170,6 +1170,177 @@ impl PrivacyConfig {
     }
 }
 
+/// Location of one Weblate translation component and the credentials used to
+/// reach it.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WeblateComponentConfig {
+    /// Base URL of the Weblate instance, e.g. `https://hosted.weblate.org`.
+    url: String,
+    /// Project slug.
+    project: String,
+    /// Component slug.
+    component: String,
+    /// API token (`wlu_…` user token or project token). Optional for reading
+    /// a public project; required for anything that writes.
+    #[serde(default)]
+    token: Option<String>,
+}
+
+impl WeblateComponentConfig {
+    pub fn new(
+        url: impl Into<String>,
+        project: impl Into<String>,
+        component: impl Into<String>,
+        token: Option<String>,
+    ) -> Self {
+        Self {
+            url: url.into(),
+            project: project.into(),
+            component: component.into(),
+            token,
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+
+    pub fn component(&self) -> &str {
+        &self.component
+    }
+
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref().filter(|token| !token.is_empty())
+    }
+}
+
+/// `[translation_sync]`: poll the Weblate component that translates the
+/// server's message catalog and apply translations without a restart.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TranslationSyncConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(flatten)]
+    weblate: WeblateComponentConfig,
+    #[serde(default = "default_translation_sync_poll_interval_secs")]
+    poll_interval_secs: u64,
+    /// File that keeps the last downloaded translations so a restart does not
+    /// fall back to the bundled catalogs while Weblate is unreachable.
+    #[serde(default)]
+    cache_path: Option<PathBuf>,
+}
+
+impl TranslationSyncConfig {
+    pub fn new(weblate: WeblateComponentConfig) -> Self {
+        Self {
+            enabled: true,
+            weblate,
+            poll_interval_secs: default_translation_sync_poll_interval_secs(),
+            cache_path: None,
+        }
+    }
+
+    pub fn with_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        self.poll_interval_secs = interval.as_secs().max(1);
+        self
+    }
+
+    pub fn with_cache_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cache_path = Some(path.into());
+        self
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn weblate(&self) -> &WeblateComponentConfig {
+        &self.weblate
+    }
+
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.poll_interval_secs.max(1))
+    }
+
+    pub fn cache_path(&self) -> Option<&std::path::Path> {
+        self.cache_path.as_deref()
+    }
+}
+
+/// `[channel_name_translation]`: translate channel names through a Weblate
+/// component whose source strings are the raw channel names.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ChannelNameTranslationConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(flatten)]
+    weblate: WeblateComponentConfig,
+    #[serde(default = "default_channel_name_translation_poll_interval_secs")]
+    poll_interval_secs: u64,
+    /// Add channel names that Weblate does not know yet as new source strings.
+    /// Requires a token allowed to add strings. Default: `true`.
+    #[serde(default = "default_true")]
+    push_names: bool,
+    /// File that keeps the last downloaded channel-name translations so they
+    /// are available immediately after a restart.
+    #[serde(default)]
+    cache_path: Option<PathBuf>,
+}
+
+impl ChannelNameTranslationConfig {
+    pub fn new(weblate: WeblateComponentConfig) -> Self {
+        Self {
+            enabled: true,
+            weblate,
+            poll_interval_secs: default_channel_name_translation_poll_interval_secs(),
+            push_names: true,
+            cache_path: None,
+        }
+    }
+
+    pub fn with_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        self.poll_interval_secs = interval.as_secs().max(1);
+        self
+    }
+
+    pub fn with_cache_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cache_path = Some(path.into());
+        self
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn weblate(&self) -> &WeblateComponentConfig {
+        &self.weblate
+    }
+
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.poll_interval_secs.max(1))
+    }
+
+    pub fn push_names(&self) -> bool {
+        self.push_names
+    }
+
+    pub fn cache_path(&self) -> Option<&std::path::Path> {
+        self.cache_path.as_deref()
+    }
+}
+
+fn default_translation_sync_poll_interval_secs() -> u64 {
+    300
+}
+
+fn default_channel_name_translation_poll_interval_secs() -> u64 {
+    60
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub listen: String,
@@ -1246,6 +1417,16 @@ pub struct Config {
     /// including a language returned by the authenticator. Default: unset.
     #[serde(default)]
     pub force_language: Option<Language>,
+    /// Live updates of the server's own message catalog from the Weblate
+    /// component that translates `translations/server`. Unset: only the
+    /// catalogs compiled into the binary are used.
+    #[serde(default)]
+    pub translation_sync: Option<TranslationSyncConfig>,
+    /// Channel-name translation through a Weblate component whose source
+    /// strings are the raw channel names. Unset: channel names are shown as
+    /// entered.
+    #[serde(default)]
+    pub channel_name_translation: Option<ChannelNameTranslationConfig>,
 
     // ── Blob / persistence ─────────────────────────────────────────────────
     /// Directory used for WAL, snapshot, and blob storage.
@@ -1861,8 +2042,9 @@ impl Config {
     /// `default_language`.
     pub fn resolve_language(&self, requested: Option<Language>) -> Language {
         self.force_language
+            .clone()
             .or(requested)
-            .unwrap_or(self.default_language)
+            .unwrap_or_else(|| self.default_language.clone())
     }
 
     pub fn load_from(path: impl AsRef<std::path::Path>) -> Self {
@@ -1943,57 +2125,138 @@ mod tests {
         max_users = 100
     "#;
 
+    fn language(tag: &str) -> Language {
+        Language::parse(tag).expect("valid language tag")
+    }
+
     #[test]
     fn language_config_defaults_to_english_without_a_forced_language() {
         let config = parse_config(MINIMAL_CONFIG).expect("minimal config parses");
 
-        assert_eq!(config.default_language, Language::English);
+        assert_eq!(config.default_language, Language::ENGLISH);
         assert_eq!(config.force_language, None);
-        assert_eq!(config.resolve_language(None), Language::English);
+        assert_eq!(config.resolve_language(None), Language::ENGLISH);
         assert_eq!(
-            config.resolve_language(Some(Language::French)),
-            Language::French
+            config.resolve_language(Some(language("fr"))),
+            language("fr")
         );
     }
 
     #[test]
     fn default_language_only_fills_in_an_absent_request() {
-        let raw = format!("{MINIMAL_CONFIG}\ndefault_language = \"es\"\n");
+        let raw = format!("{MINIMAL_CONFIG}
+default_language = \"es\"
+");
         let config = parse_config(&raw).expect("config parses");
 
-        assert_eq!(config.resolve_language(None), Language::Spanish);
+        assert_eq!(config.resolve_language(None), language("es"));
         assert_eq!(
-            config.resolve_language(Some(Language::German)),
-            Language::German
+            config.resolve_language(Some(language("de"))),
+            language("de")
         );
     }
 
     #[test]
     fn force_language_overrides_default_and_requested_languages() {
         let raw =
-            format!("{MINIMAL_CONFIG}\ndefault_language = \"es\"\nforce_language = \"zh-CN\"\n");
+            format!("{MINIMAL_CONFIG}
+default_language = \"es\"
+force_language = \"zh-CN\"
+");
         let config = parse_config(&raw).expect("config parses");
 
-        assert_eq!(config.default_language, Language::Spanish);
+        assert_eq!(config.default_language, language("es"));
         assert_eq!(
             config.resolve_language(None),
-            Language::ChineseSimplified,
+            language("zh-CN"),
             "forced language replaces the default"
         );
         assert_eq!(
-            config.resolve_language(Some(Language::German)),
-            Language::ChineseSimplified,
+            config.resolve_language(Some(language("de"))),
+            language("zh-CN"),
             "forced language replaces an authenticator-provided language"
         );
     }
 
     #[test]
-    fn unsupported_language_tags_are_rejected_at_load() {
-        let raw = format!("{MINIMAL_CONFIG}\ndefault_language = \"kl\"\n");
+    fn language_tags_without_a_bundled_catalog_still_load() {
+        // Catalogs can arrive at runtime from Weblate, so only the tag's
+        // syntax is validated at load time.
+        let raw = format!("{MINIMAL_CONFIG}
+default_language = \"kl\"
+");
+        let config = parse_config(&raw).expect("well-formed tag loads");
+        assert_eq!(config.default_language, language("kl"));
+    }
 
-        let error = parse_config(&raw).expect_err("unsupported language must not load");
+    #[test]
+    fn weblate_sections_are_optional_and_parse_with_defaults() {
+        let config = parse_config(MINIMAL_CONFIG).expect("minimal config parses");
+        assert_eq!(config.translation_sync, None);
+        assert_eq!(config.channel_name_translation, None);
+
+        let raw = format!(
+            r#"{MINIMAL_CONFIG}
+            [translation_sync]
+            url = "https://weblate.example"
+            project = "shitspeak"
+            component = "server"
+
+            [channel_name_translation]
+            url = "https://names.example"
+            project = "channels"
+            component = "names"
+            token = "wlu_secret"
+            poll_interval_secs = 15
+            push_names = false
+            cache_path = "data/channel_names.json"
+            "#
+        );
+        let config = parse_config(&raw).expect("config parses");
+
+        let sync = config.translation_sync.expect("translation sync configured");
+        assert!(sync.enabled());
+        assert_eq!(sync.weblate().url(), "https://weblate.example");
+        assert_eq!(sync.weblate().project(), "shitspeak");
+        assert_eq!(sync.weblate().component(), "server");
+        assert_eq!(sync.weblate().token(), None);
+        assert_eq!(sync.poll_interval(), std::time::Duration::from_secs(300));
+        assert_eq!(sync.cache_path(), None);
+
+        let names = config
+            .channel_name_translation
+            .expect("channel name translation configured");
+        assert!(names.enabled());
+        assert_eq!(names.weblate().url(), "https://names.example");
+        assert_eq!(names.weblate().token(), Some("wlu_secret"));
+        assert_eq!(names.poll_interval(), std::time::Duration::from_secs(15));
+        assert!(!names.push_names());
+        assert_eq!(
+            names.cache_path(),
+            Some(std::path::Path::new("data/channel_names.json"))
+        );
+    }
+
+    #[test]
+    fn weblate_sections_require_the_component_location() {
+        let raw = format!(
+            r#"{MINIMAL_CONFIG}
+            [channel_name_translation]
+            url = "https://names.example"
+            "#
+        );
+        assert!(parse_config(&raw).is_err());
+    }
+
+    #[test]
+    fn malformed_language_tags_are_rejected_at_load() {
+        let raw = format!("{MINIMAL_CONFIG}
+default_language = \"not a tag!\"
+");
+
+        let error = parse_config(&raw).expect_err("malformed language must not load");
         assert!(
-            error.to_string().contains("unsupported language tag"),
+            error.to_string().contains("invalid language tag"),
             "unexpected error: {error}"
         );
     }

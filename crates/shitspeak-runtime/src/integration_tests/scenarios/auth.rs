@@ -23,6 +23,14 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
+fn spanish() -> Language {
+    Language::parse("es").expect("valid language tag")
+}
+
+fn german() -> Language {
+    Language::parse("de").expect("valid language tag")
+}
+
 #[derive(Debug)]
 struct AcceptAnyServerCert;
 
@@ -193,7 +201,7 @@ async fn auth_queue_notice_is_pre_sync_and_ping_stays_responsive() {
     assert_eq!(text.session.len(), 1);
     assert!(
         text.message
-            .contains("You're in the login queue. There are 0 users ahead of you."),
+            .contains("You're in the login queue. Users ahead of you: 0"),
         "unexpected queue notice text: {}",
         text.message
     );
@@ -1609,7 +1617,7 @@ async fn auth_wrong_password_uses_default_unauthenticated_language() {
         Some("hunter2"),
         Some(1),
         vec![],
-        Language::Spanish,
+        spanish(),
     );
 
     match TestClient::connect_and_authenticate(&server, "alice", Some("nope")).await {
@@ -1710,7 +1718,7 @@ async fn permission_denied_uses_authenticated_language() {
         None,
         Some(1),
         vec![],
-        Language::Spanish,
+        spanish(),
     );
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
@@ -1754,7 +1762,7 @@ async fn permission_denied_reason_for_missing_channel(server: &TestServer, user:
 #[tokio::test]
 async fn default_language_applies_when_authenticator_returns_no_language() {
     let server = spawn_test_server(TestServerOpts {
-        default_language: Language::Spanish,
+        default_language: spanish(),
         ..TestServerOpts::default()
     })
     .await;
@@ -1771,7 +1779,7 @@ async fn default_language_applies_when_authenticator_returns_no_language() {
 #[tokio::test]
 async fn authenticator_language_wins_over_default_language() {
     let server = spawn_test_server(TestServerOpts {
-        default_language: Language::Spanish,
+        default_language: spanish(),
         ..TestServerOpts::default()
     })
     .await;
@@ -1780,7 +1788,7 @@ async fn authenticator_language_wins_over_default_language() {
         None,
         Some(1),
         vec![],
-        Language::German,
+        german(),
     );
 
     assert_eq!(
@@ -1792,8 +1800,8 @@ async fn authenticator_language_wins_over_default_language() {
 #[tokio::test]
 async fn force_language_overrides_the_authenticator_language() {
     let server = spawn_test_server(TestServerOpts {
-        default_language: Language::English,
-        force_language: Some(Language::German),
+        default_language: Language::ENGLISH,
+        force_language: Some(german()),
         ..TestServerOpts::default()
     })
     .await;
@@ -1802,7 +1810,7 @@ async fn force_language_overrides_the_authenticator_language() {
         None,
         Some(1),
         vec![],
-        Language::Spanish,
+        spanish(),
     );
 
     assert_eq!(
@@ -1814,7 +1822,7 @@ async fn force_language_overrides_the_authenticator_language() {
 #[tokio::test]
 async fn default_language_applies_to_pre_authentication_rejections() {
     let server = spawn_test_server(TestServerOpts {
-        default_language: Language::Spanish,
+        default_language: spanish(),
         ..TestServerOpts::default()
     })
     .await;
@@ -1838,8 +1846,8 @@ async fn default_language_applies_to_pre_authentication_rejections() {
 #[tokio::test]
 async fn force_language_overrides_pre_authentication_rejections() {
     let server = spawn_test_server(TestServerOpts {
-        default_language: Language::Spanish,
-        force_language: Some(Language::German),
+        default_language: spanish(),
+        force_language: Some(german()),
         ..TestServerOpts::default()
     })
     .await;
@@ -1848,7 +1856,7 @@ async fn force_language_overrides_pre_authentication_rejections() {
         Some("hunter2"),
         Some(1),
         vec![],
-        Language::Spanish,
+        spanish(),
     );
 
     match TestClient::connect_and_authenticate(&server, "alice", Some("nope")).await {

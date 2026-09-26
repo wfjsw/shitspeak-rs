@@ -17,7 +17,8 @@ use shitspeak_runtime::client::user_info::Credential;
 use shitspeak_runtime::client::visibility::UserVisibilityState;
 use shitspeak_runtime::client::{AsyncMessageHandlerExt, Client};
 use shitspeak_runtime::messages::Message;
-use shitspeak_runtime::messages::encoder::{CodecVersion, ServerConfig, ServerSync};
+use shitspeak_runtime::localization::{ClientLocale, TextKey};
+use shitspeak_runtime::messages::encoder::{CodecVersion, RejectType, ServerConfig, ServerSync};
 use shitspeak_runtime::server::Server;
 use shitspeak_runtime::types::DEFAULT_SERVER_ID;
 use shitspeak_runtime_config::{WebAuthMode, WebConfig};
@@ -358,10 +359,60 @@ pub enum ConfigureAuthenticatedClientError {
 }
 
 impl ConfigureAuthenticatedClientError {
-    pub fn reason(self) -> &'static str {
+    /// The reason in `client`'s language.
+    pub fn reason(self, client: &Client) -> String {
         match self {
-            Self::MissingRequiredGroup => "missing required group",
-            Self::ServerFull => "server full",
+            Self::MissingRequiredGroup => client.text(TextKey::MissingRequiredGroup).into_owned(),
+            Self::ServerFull => {
+                let locale = client.locale();
+                locale
+                    .localizer()
+                    .reject_reason(locale.language(), RejectType::ServerFull)
+                    .into_owned()
+            }
+        }
+    }
+}
+
+/// Text in the language used before authentication: the server's
+/// `force_language` or `default_language`. Without a server (gateway tests),
+/// the bundled English catalog is used.
+pub fn unauthenticated_text(server: Option<&Server>, key: TextKey) -> String {
+    match server {
+        Some(server) => server
+            .localizer()
+            .text(&server.read_config().resolve_language(None), key)
+            .into_owned(),
+        None => ClientLocale::default().text(key).into_owned(),
+    }
+}
+
+/// Reason sent for an authenticator rejection. An authenticator-provided
+/// reason is sent as-is; otherwise the reason matches the native `Reject`
+/// text for the same outcome, in the pre-authentication language.
+pub fn authentication_rejection_reason(
+    server: Option<&Server>,
+    rejection: &AuthenticationRejection,
+) -> String {
+    if let Some(reason) = rejection.reason() {
+        return reason.to_owned();
+    }
+    let reject_type = match rejection.kind() {
+        shitspeak_auth::AuthenticationRejectionKind::WrongPassword => RejectType::WrongUserPw,
+        shitspeak_auth::AuthenticationRejectionKind::NoSuchUser => RejectType::InvalidUsername,
+        shitspeak_auth::AuthenticationRejectionKind::RetryLater => RejectType::AuthenticatorFail,
+    };
+    match server {
+        Some(server) => server
+            .localizer()
+            .reject_reason(&server.read_config().resolve_language(None), reject_type)
+            .into_owned(),
+        None => {
+            let locale = ClientLocale::default();
+            locale
+                .localizer()
+                .reject_reason(locale.language(), reject_type)
+                .into_owned()
         }
     }
 }
@@ -385,6 +436,8 @@ async fn configure_authenticated_client_inner(
     mut result: AuthenticateResult,
     credential: Option<Credential>,
 ) -> Result<(), ConfigureAuthenticatedClientError> {
+    // Resolve the language first so rejections below are localized too.
+    server.apply_client_language(client, result.language.clone());
     let cache_username = credential
         .as_ref()
         .map(|credential| credential.username.clone());
@@ -465,7 +518,6 @@ async fn configure_authenticated_client_inner(
     {
         return Err(ConfigureAuthenticatedClientError::ServerFull);
     }
-    client.set_language(server.read_config().resolve_language(result.language));
     client.set_max_bandwidth(result.max_bandwidth);
     client.set_voice_bandwidth_limit(result.max_bandwidth.unwrap_or(server.get_max_bandwidth()));
     client.set_protocol_version(Some(

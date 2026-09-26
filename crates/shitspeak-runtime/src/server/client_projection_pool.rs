@@ -4,6 +4,7 @@ use futures_util::FutureExt as _;
 use tokio::sync::{broadcast, watch};
 
 use crate::client::state_log::ClientStateBroadcastPayload;
+use crate::localization::channel_names::ChannelNameRefresh;
 use shitspeak_state::ChannelOperation;
 
 use super::Server;
@@ -26,6 +27,7 @@ impl ClientProjectionPool {
         client_rx: broadcast::Receiver<Arc<ClientStateBroadcastPayload>>,
         channel_rx: broadcast::Receiver<Arc<ChannelOperation>>,
         visibility_reload_rx: broadcast::Receiver<()>,
+        channel_names_rx: broadcast::Receiver<Arc<ChannelNameRefresh>>,
         event_capacity: usize,
     ) -> Result<Self, PoolBuildError> {
         let (event_tx, _) = broadcast::channel(event_capacity.max(1));
@@ -40,6 +42,7 @@ impl ClientProjectionPool {
                 client_rx,
                 channel_rx,
                 visibility_reload_rx,
+                channel_names_rx,
             ))
             .catch_unwind()
             .await;
@@ -139,7 +142,9 @@ async fn run_projection_router(
     mut client_rx: broadcast::Receiver<Arc<ClientStateBroadcastPayload>>,
     mut channel_rx: broadcast::Receiver<Arc<ChannelOperation>>,
     mut visibility_reload_rx: broadcast::Receiver<()>,
+    mut channel_names_rx: broadcast::Receiver<Arc<ChannelNameRefresh>>,
 ) {
+    let mut channel_names_open = true;
     loop {
         tokio::select! {
             result = channel_rx.recv() => {
@@ -183,6 +188,21 @@ async fn run_projection_router(
                         let _ = event_tx.send(ClientProjectionEvent::VisibilityReload);
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            result = channel_names_rx.recv(), if channel_names_open => {
+                match result {
+                    Ok(change) => {
+                        let _ = event_tx.send(ClientProjectionEvent::ChannelNames(change));
+                    }
+                    // Translation updates are idempotent re-sends of names;
+                    // a missed one is repaired by the next change or by the
+                    // next connection sync, so lag is only logged.
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "client projection router lagged on channel-name updates");
+                    }
+                    // Not essential to projection; keep routing everything else.
+                    Err(broadcast::error::RecvError::Closed) => channel_names_open = false,
                 }
             }
         }
@@ -273,11 +293,13 @@ mod tests {
         let (client_tx, client_rx) = broadcast::channel(8);
         let (_channel_tx, channel_rx) = broadcast::channel(8);
         let (_visibility_tx, visibility_rx) = broadcast::channel(8);
+        let (_channel_names_tx, channel_names_rx) = broadcast::channel(8);
         let pool = ClientProjectionPool::spawn(
             Weak::<Box<Server>>::new(),
             client_rx,
             channel_rx,
             visibility_rx,
+            channel_names_rx,
             8,
         )
         .expect("pool starts");

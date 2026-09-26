@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
-use shitspeak_state::{ACL, ACLPermissions, Channel, ChannelOp, ChannelPatch};
+use std::borrow::Cow;
+
+use shitspeak_state::{ACL, ACLPermissions, Channel, ChannelOp, ChannelPatch, ChannelRepoError};
 
 use crate::{
     client::Client,
     errors::MessageHandlerError,
-    localization::{TextKey, text},
+    localization::TextKey,
     messages::{
         Message,
         encoder::{ChannelState, DenyType, PermissionDenied, TextMessage},
@@ -16,11 +18,64 @@ use crate::{
 
 const CHANNEL_SETTINGS_PENDING_NOTICE_GRACE: std::time::Duration =
     std::time::Duration::from_millis(25);
-const CHANNEL_REPOSITORY_REQUEST_SUBMITTED: &str =
-    "Channel settings update submitted. Waiting for repository admission.";
-const CHANNEL_REPOSITORY_REQUEST_COMMITTED: &str = "Channel settings update committed.";
-const CHANNEL_REPOSITORY_REQUEST_UNABLE_TO_COMMIT: &str =
-    "Channel settings update was unable to commit.";
+const CHANNEL_REPOSITORY_REQUEST_SUBMITTED: TextKey = TextKey::ChannelSettingsUpdateSubmitted;
+const CHANNEL_REPOSITORY_REQUEST_COMMITTED: TextKey = TextKey::ChannelSettingsUpdateCommitted;
+const CHANNEL_REPOSITORY_REQUEST_UNABLE_TO_COMMIT: TextKey =
+    TextKey::ChannelSettingsUpdateUnableToCommit;
+
+/// Whether an edit of an existing channel changes nothing.
+fn channel_edit_is_empty(msg: &ChannelState) -> bool {
+    msg.name.is_none()
+        && msg.parent.is_none()
+        && msg.description.is_none()
+        && msg.position.is_none()
+        && msg.max_users.is_none()
+        && msg.links_add.is_empty()
+        && msg.links_remove.is_empty()
+}
+
+fn channel_name_too_long(sender: &Client) -> Cow<'static, str> {
+    sender.format_text(
+        TextKey::ChannelNameTooLong,
+        &[(
+            "max_bytes",
+            &crate::rate_limits::MAX_CHANNEL_NAME_BYTES.to_string(),
+        )],
+    )
+}
+
+/// Client-facing reason for a failed channel creation. Internal details (I/O
+/// errors, WAL state) are logged by the caller, never sent.
+fn channel_create_failure(sender: &Client, error: &ChannelRepoError) -> Cow<'static, str> {
+    match error {
+        ChannelRepoError::NameConflict(_) => sender.text(TextKey::ChannelNameConflict),
+        ChannelRepoError::NotFound(channel_id) | ChannelRepoError::ParentNotFound(channel_id) => {
+            sender.format_text(
+                TextKey::ChannelDoesNotExist,
+                &[("channel_id", &channel_id.to_string())],
+            )
+        }
+        ChannelRepoError::TemporaryChannelCannotHaveChildren(_) => {
+            sender.text(TextKey::TemporaryChannelCannotHaveChildren)
+        }
+        _ => sender.text(TextKey::ChannelCreateFailed),
+    }
+}
+
+/// Client-facing reason for a description that could not be stored.
+fn description_store_failure(sender: &Client, error: &std::io::Error) -> Cow<'static, str> {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        sender.format_text(
+            TextKey::ChannelDescriptionTooLong,
+            &[(
+                "max_bytes",
+                &crate::rate_limits::MAX_CHANNEL_DESCRIPTION_BYTES.to_string(),
+            )],
+        )
+    } else {
+        sender.text(TextKey::ChannelCreateFailed)
+    }
+}
 
 pub async fn handle_channel_state(
     server: &Arc<Box<Server>>,
@@ -55,13 +110,7 @@ pub async fn handle_channel_state(
                             r#type: DenyType::TextTooLong,
                             session: u32::from(sender.get_session_id()),
                             channel_id: None,
-                            reason: Some(
-                                format!(
-                                    "channel name exceeds {} bytes",
-                                    crate::rate_limits::MAX_CHANNEL_NAME_BYTES
-                                )
-                                .into(),
-                            ),
+                            reason: Some(channel_name_too_long(sender)),
                             name: None,
                             permission: None,
                         }));
@@ -73,7 +122,7 @@ pub async fn handle_channel_state(
                         r#type: DenyType::ChannelName,
                         session: u32::from(sender.get_session_id()),
                         channel_id: None,
-                        reason: Some(text(sender.language(), TextKey::ChannelNameRequired)),
+                        reason: Some(sender.text(TextKey::ChannelNameRequired)),
                         name: None,
                         permission: None,
                     }));
@@ -112,7 +161,7 @@ pub async fn handle_channel_state(
                         r#type: DenyType::TemporaryChannel,
                         session: session_id,
                         channel_id: Some(parent_id),
-                        reason: Some("temporary channel creation rate limit exceeded".into()),
+                        reason: Some(sender.text(TextKey::TemporaryChannelRateLimited)),
                         name: None,
                         permission: None,
                     }));
@@ -143,7 +192,7 @@ pub async fn handle_channel_state(
                         r#type: DenyType::Text,
                         session: u32::from(sender.get_session_id()),
                         channel_id: None,
-                        reason: Some(format!("Failed to create channel: {e}").into()),
+                        reason: Some(description_store_failure(sender, &e)),
                         name: None,
                         permission: None,
                     }));
@@ -171,7 +220,7 @@ pub async fn handle_channel_state(
                     r#type: DenyType::Text,
                     session: u32::from(sender.get_session_id()),
                     channel_id: None,
-                    reason: Some(format!("Failed to create channel: {:?}", e).into()),
+                    reason: Some(channel_create_failure(sender, &e)),
                     name: None,
                     permission: None,
                 }));
@@ -189,7 +238,7 @@ pub async fn handle_channel_state(
                             r#type: DenyType::Text,
                             session: u32::from(sender.get_session_id()),
                             channel_id: None,
-                            reason: Some(format!("Failed to create channel: {:?}", e).into()),
+                            reason: Some(channel_create_failure(sender, &e)),
                             name: None,
                             permission: None,
                         }));
@@ -206,7 +255,7 @@ pub async fn handle_channel_state(
             } else {
                 let Some(mut proposal) = proposed_s2s.into_started() else {
                     return Err(super::channel_op_propose_failed(
-                        u32::from(session),
+                        sender,
                         Some(parent_id),
                         None,
                     ));
@@ -214,7 +263,7 @@ pub async fn handle_channel_state(
                 let accepted = proposal.accepted().await;
                 if !accepted.is_proposed() {
                     return Err(super::channel_op_propose_failed(
-                        u32::from(session),
+                        sender,
                         Some(parent_id),
                         accepted.failure_reason(),
                     ));
@@ -223,7 +272,7 @@ pub async fn handle_channel_state(
                     AcceptedChannelOpCommit::Completed(result) => {
                         if !result.is_proposed() {
                             return Err(super::channel_op_propose_failed(
-                                u32::from(session),
+                                sender,
                                 Some(parent_id),
                                 result.failure_reason(),
                             ));
@@ -270,6 +319,19 @@ pub async fn handle_channel_state(
                 }
             };
 
+            // A client that displays a translated channel name gets the raw
+            // name in its editor (see `channel_editor`), so saving the editor
+            // without renaming sends the current raw name back. That is not a
+            // rename: drop it before any rename check, which would otherwise
+            // reject it for the root channel or replicate a no-op change.
+            let mut msg = msg;
+            if msg.name.as_deref() == Some(channel.name.as_str()) {
+                msg.name = None;
+                if channel_edit_is_empty(&msg) {
+                    return Ok(());
+                }
+            }
+
             let perms =
                 crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
                     .await;
@@ -281,7 +343,7 @@ pub async fn handle_channel_state(
                         r#type: DenyType::Permission,
                         session: u32::from(session),
                         channel_id: Some(0),
-                        reason: Some(text(sender.language(), TextKey::CannotRenameRootChannel)),
+                        reason: Some(sender.text(TextKey::CannotRenameRootChannel)),
                         name: None,
                         permission: None,
                     }));
@@ -292,13 +354,7 @@ pub async fn handle_channel_state(
                             r#type: DenyType::TextTooLong,
                             session: u32::from(session),
                             channel_id: Some(channel_id),
-                            reason: Some(
-                                format!(
-                                    "channel name exceeds {} bytes",
-                                    crate::rate_limits::MAX_CHANNEL_NAME_BYTES
-                                )
-                                .into(),
-                            ),
+                            reason: Some(channel_name_too_long(sender)),
                             name: None,
                             permission: None,
                         }));
@@ -456,7 +512,7 @@ pub async fn handle_channel_state(
             } else {
                 let Some(mut proposal) = proposed_s2s.into_started() else {
                     return Err(super::channel_op_propose_failed(
-                        u32::from(session),
+                        sender,
                         Some(channel_id),
                         None,
                     ));
@@ -464,7 +520,7 @@ pub async fn handle_channel_state(
                 let accepted = proposal.accepted().await;
                 if !accepted.is_proposed() {
                     return Err(super::channel_op_propose_failed(
-                        u32::from(session),
+                        sender,
                         Some(channel_id),
                         accepted.failure_reason(),
                     ));
@@ -473,7 +529,7 @@ pub async fn handle_channel_state(
                     AcceptedChannelOpCommit::Completed(result) => {
                         if !result.is_proposed() {
                             return Err(super::channel_op_propose_failed(
-                                u32::from(session),
+                                sender,
                                 Some(channel_id),
                                 result.failure_reason(),
                             ));
@@ -613,7 +669,7 @@ async fn move_temp_channel_creator_after_commit(
 
 async fn send_channel_repository_notice(
     sender: &Arc<Box<Client>>,
-    notice: &'static str,
+    notice: TextKey,
 ) -> Result<(), MessageHandlerError> {
     let message = Message::TextMessage(
         TextMessage {
@@ -621,7 +677,7 @@ async fn send_channel_repository_notice(
             session: vec![u32::from(sender.get_session_id())],
             channel_id: Vec::new(),
             tree_id: Vec::new(),
-            message: notice.to_owned(),
+            message: sender.text(notice).into_owned(),
         }
         .into(),
     );
@@ -629,7 +685,7 @@ async fn send_channel_repository_notice(
     Ok(())
 }
 
-fn channel_repository_completion_notice(result: &ChannelOpProposeResult) -> &'static str {
+fn channel_repository_completion_notice(result: &ChannelOpProposeResult) -> TextKey {
     if result.is_proposed() {
         CHANNEL_REPOSITORY_REQUEST_COMMITTED
     } else {
@@ -758,10 +814,12 @@ mod tests {
     };
     use crate::s2s::ChannelOpProposeResult;
 
+    use crate::localization::source_text;
+
     #[test]
     fn pending_channel_update_uses_repository_admission_notice() {
         assert_eq!(
-            CHANNEL_REPOSITORY_REQUEST_SUBMITTED,
+            source_text(CHANNEL_REPOSITORY_REQUEST_SUBMITTED.key()),
             "Channel settings update submitted. Waiting for repository admission."
         );
     }
@@ -769,11 +827,11 @@ mod tests {
     #[test]
     fn completed_channel_update_uses_terminal_repository_notices() {
         assert_eq!(
-            CHANNEL_REPOSITORY_REQUEST_COMMITTED,
+            source_text(CHANNEL_REPOSITORY_REQUEST_COMMITTED.key()),
             "Channel settings update committed."
         );
         assert_eq!(
-            CHANNEL_REPOSITORY_REQUEST_UNABLE_TO_COMMIT,
+            source_text(CHANNEL_REPOSITORY_REQUEST_UNABLE_TO_COMMIT.key()),
             "Channel settings update was unable to commit."
         );
         assert_eq!(

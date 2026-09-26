@@ -6,8 +6,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
-
 const NON_RELEASE_COMMIT_HASH: &str = "unknown";
 const NON_RELEASE_COMMIT_DATE: &str = "unknown";
 const NON_RELEASE_BUILD_DATE: &str = "1970-01-01T00:00:00+00:00";
@@ -619,220 +617,71 @@ fn read_be_u64(bytes: &[u8], offset: usize, path: &Path) -> Result<u64, String> 
     ))
 }
 
-#[derive(Deserialize)]
-struct LocalizationCatalog {
-    languages: BTreeMap<String, TranslationSet>,
-}
-
-#[derive(Deserialize)]
-struct TranslationSet {
-    text: BTreeMap<String, String>,
-    reject: BTreeMap<String, String>,
-    deny: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Copy)]
-enum CatalogSection {
-    Text,
-    Reject,
-    Deny,
-}
-
-struct CatalogKey {
-    json_key: &'static str,
-    rust_variant: &'static str,
-}
-
-const LANGUAGES: &[(&str, &str)] = &[
-    ("en", "English"),
-    ("es", "Spanish"),
-    ("fr", "French"),
-    ("de", "German"),
-    ("zh", "ChineseSimplified"),
-];
-
-const TEXT_KEYS: &[CatalogKey] = &[
-    CatalogKey {
-        json_key: "MissingRequiredGroup",
-        rust_variant: "MissingRequiredGroup",
-    },
-    CatalogKey {
-        json_key: "NoRootTraverse",
-        rust_variant: "NoRootTraverse",
-    },
-    CatalogKey {
-        json_key: "CryptSetupFailed",
-        rust_variant: "CryptSetupFailed",
-    },
-    CatalogKey {
-        json_key: "WriteAclRequired",
-        rust_variant: "WriteAclRequired",
-    },
-    CatalogKey {
-        json_key: "CannotDeleteRootChannel",
-        rust_variant: "CannotDeleteRootChannel",
-    },
-    CatalogKey {
-        json_key: "ChannelNameRequired",
-        rust_variant: "ChannelNameRequired",
-    },
-    CatalogKey {
-        json_key: "CannotRenameRootChannel",
-        rust_variant: "CannotRenameRootChannel",
-    },
-    CatalogKey {
-        json_key: "ChannelDoesNotExist",
-        rust_variant: "ChannelDoesNotExist",
-    },
-];
-
-const REJECT_KEYS: &[CatalogKey] = &[
-    CatalogKey {
-        json_key: "None",
-        rust_variant: "None",
-    },
-    CatalogKey {
-        json_key: "WrongVersion",
-        rust_variant: "WrongVersion",
-    },
-    CatalogKey {
-        json_key: "InvalidUsername",
-        rust_variant: "InvalidUsername",
-    },
-    CatalogKey {
-        json_key: "WrongUserPw",
-        rust_variant: "WrongUserPw",
-    },
-    CatalogKey {
-        json_key: "WrongServerPw",
-        rust_variant: "WrongServerPw",
-    },
-    CatalogKey {
-        json_key: "UsernameInUse",
-        rust_variant: "UsernameInUse",
-    },
-    CatalogKey {
-        json_key: "ServerFull",
-        rust_variant: "ServerFull",
-    },
-    CatalogKey {
-        json_key: "NoCertificate",
-        rust_variant: "NoCertificate",
-    },
-    CatalogKey {
-        json_key: "AuthenticatorFail",
-        rust_variant: "AuthenticatorFail",
-    },
-    CatalogKey {
-        json_key: "NoNewConnections",
-        rust_variant: "NoNewConnections",
-    },
-];
-
-const DENY_KEYS: &[CatalogKey] = &[
-    CatalogKey {
-        json_key: "Text",
-        rust_variant: "Text",
-    },
-    CatalogKey {
-        json_key: "Permission",
-        rust_variant: "Permission",
-    },
-    CatalogKey {
-        json_key: "SuperUser",
-        rust_variant: "SuperUser",
-    },
-    CatalogKey {
-        json_key: "ChannelName",
-        rust_variant: "ChannelName",
-    },
-    CatalogKey {
-        json_key: "TextTooLong",
-        rust_variant: "TextTooLong",
-    },
-    CatalogKey {
-        json_key: "H9k",
-        rust_variant: "H9k",
-    },
-    CatalogKey {
-        json_key: "TemporaryChannel",
-        rust_variant: "TemporaryChannel",
-    },
-    CatalogKey {
-        json_key: "MissingCertificate",
-        rust_variant: "MissingCertificate",
-    },
-    CatalogKey {
-        json_key: "UserName",
-        rust_variant: "UserName",
-    },
-    CatalogKey {
-        json_key: "ChannelFull",
-        rust_variant: "ChannelFull",
-    },
-    CatalogKey {
-        json_key: "NestingLimit",
-        rust_variant: "NestingLimit",
-    },
-    CatalogKey {
-        json_key: "ChannelCountLimit",
-        rust_variant: "ChannelCountLimit",
-    },
-    CatalogKey {
-        json_key: "ChannelListenerLimit",
-        rust_variant: "ChannelListenerLimit",
-    },
-    CatalogKey {
-        json_key: "UserListenerLimit",
-        rust_variant: "UserListenerLimit",
-    },
-];
-
+/// Embed every catalog under `translations/server` into the binary.
+///
+/// The files are the ones Weblate commits to: one monolingual JSON file per
+/// language, named with Weblate's language code (`en.json`, `pt_BR.json`,
+/// `zh_Hans.json`). New languages added by translators are picked up without
+/// touching code. Only structural problems fail the build; key coverage and
+/// placeholder checks happen when the catalogs are loaded, where the Rust key
+/// definitions are available.
 fn generate_localization_catalog() -> Result<(), Box<dyn Error>> {
-    let catalog_path = workspace_dir()
-        .join("translations")
-        .join("client_text.json");
-    println!("cargo:rerun-if-changed={}", catalog_path.display());
+    let catalog_dir = workspace_dir().join("translations").join("server");
+    println!("cargo:rerun-if-changed={}", catalog_dir.display());
 
-    let catalog_json = fs::read_to_string(&catalog_path)?;
-    let catalog: LocalizationCatalog = serde_json::from_str(&catalog_json)?;
-    validate_catalog(&catalog)?;
+    let mut catalogs = BTreeMap::new();
+    for entry in fs::read_dir(&catalog_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(language_code) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        println!("cargo:rerun-if-changed={}", path.display());
+        let contents = fs::read_to_string(&path)?;
+        let parsed: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not valid JSON: {error}", path.display()),
+            )
+        })?;
+        if !parsed.is_object() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} must contain a JSON object", path.display()),
+            )
+            .into());
+        }
+        catalogs.insert(language_code.to_owned(), path);
+    }
+
+    if !catalogs.contains_key(SOURCE_CATALOG) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "missing source catalog {}",
+                catalog_dir.join(format!("{SOURCE_CATALOG}.json")).display()
+            ),
+        )
+        .into());
+    }
 
     let mut generated = String::from(
-        "pub(crate) fn generated_text(language: Language, key: TextKey) -> &'static str {\n    match (language, key) {\n",
+        "/// `(Weblate language code, catalog JSON)` for every bundled catalog.
+         pub(crate) const BUNDLED_CATALOGS: &[(&str, &str)] = &[
+",
     );
-    write_match_arms(
-        &mut generated,
-        &catalog,
-        CatalogSection::Text,
-        TEXT_KEYS,
-        "TextKey",
-    )?;
-    generated.push_str("    }\n}\n\n");
-
-    generated.push_str(
-        "pub(crate) fn generated_reject_reason(language: Language, reject_type: RejectType) -> &'static str {\n    match (language, reject_type) {\n",
-    );
-    write_match_arms(
-        &mut generated,
-        &catalog,
-        CatalogSection::Reject,
-        REJECT_KEYS,
-        "RejectType",
-    )?;
-    generated.push_str("    }\n}\n\n");
-
-    generated.push_str(
-        "pub(crate) fn generated_permission_denied_reason(language: Language, deny_type: DenyType) -> &'static str {\n    match (language, deny_type) {\n",
-    );
-    write_match_arms(
-        &mut generated,
-        &catalog,
-        CatalogSection::Deny,
-        DENY_KEYS,
-        "DenyType",
-    )?;
-    generated.push_str("    }\n}\n");
+    for (language_code, path) in &catalogs {
+        generated.push_str(&format!(
+            "    ({}, include_str!({})),
+",
+            serde_json::to_string(language_code)?,
+            serde_json::to_string(&path.display().to_string())?,
+        ));
+    }
+    generated.push_str("];
+");
 
     let out_dir = env::var_os("OUT_DIR").ok_or_else(|| {
         io::Error::new(
@@ -848,97 +697,8 @@ fn generate_localization_catalog() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn validate_catalog(catalog: &LocalizationCatalog) -> Result<(), Box<dyn Error>> {
-    for (language_code, _) in LANGUAGES {
-        let translations = catalog.languages.get(*language_code).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("missing localization language '{language_code}'"),
-            )
-        })?;
-
-        validate_section(language_code, "text", &translations.text, TEXT_KEYS)?;
-        validate_section(language_code, "reject", &translations.reject, REJECT_KEYS)?;
-        validate_section(language_code, "deny", &translations.deny, DENY_KEYS)?;
-    }
-
-    Ok(())
-}
-
-fn validate_section(
-    language_code: &str,
-    section_name: &str,
-    translations: &BTreeMap<String, String>,
-    keys: &[CatalogKey],
-) -> Result<(), Box<dyn Error>> {
-    for key in keys {
-        if !translations.contains_key(key.json_key) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "missing localization key '{section_name}.{}' for language '{language_code}'",
-                    key.json_key
-                ),
-            )
-            .into());
-        }
-    }
-
-    Ok(())
-}
-
-fn write_match_arms(
-    generated: &mut String,
-    catalog: &LocalizationCatalog,
-    section: CatalogSection,
-    keys: &[CatalogKey],
-    key_type: &str,
-) -> Result<(), Box<dyn Error>> {
-    for (language_code, language_variant) in LANGUAGES {
-        let translations = catalog.languages.get(*language_code).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("missing localization language '{language_code}'"),
-            )
-        })?;
-
-        let section_translations = match section {
-            CatalogSection::Text => &translations.text,
-            CatalogSection::Reject => &translations.reject,
-            CatalogSection::Deny => &translations.deny,
-        };
-
-        for key in keys {
-            let value = section_translations.get(key.json_key).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "missing localization key '{}.{}' for language '{language_code}'",
-                        section.name(),
-                        key.json_key
-                    ),
-                )
-            })?;
-            let value = serde_json::to_string(value)?;
-            generated.push_str(&format!(
-                "        (Language::{language_variant}, {key_type}::{}) => {value},\n",
-                key.rust_variant
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-impl CatalogSection {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Reject => "reject",
-            Self::Deny => "deny",
-        }
-    }
-}
+/// Weblate language code of the catalog every other catalog translates.
+const SOURCE_CATALOG: &str = "en";
 
 #[cfg(test)]
 mod tests {

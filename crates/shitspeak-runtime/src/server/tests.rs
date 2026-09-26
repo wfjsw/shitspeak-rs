@@ -148,6 +148,8 @@ fn test_config(entrypoints: Vec<ServerEntrypointConfig>) -> Config {
         cert_required: false,
         default_language: Language::default(),
         force_language: None,
+        translation_sync: None,
+        channel_name_translation: None,
         blob_storage_dir: None,
         session_blob_cache_budget_bytes: 256 * 1024 * 1024,
         user_channel_cache_record_remote_sessions: false,
@@ -1531,6 +1533,92 @@ async fn reauthentication_sends_new_authenticator_bandwidth_to_client() {
             assert_eq!(sync.max_users, None);
         }
         other => panic!("expected reauthentication ServerConfig bandwidth update, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn reauthentication_with_a_new_language_refreshes_localized_client_state() {
+    let (authenticator, mut calls, responses) = controlled_authenticator();
+    let server = Server::new(test_config(Vec::new()), authenticator)
+        .await
+        .expect("server");
+    let mut refreshes = server.channel_names_tx.subscribe();
+    let (client, _outbound) = authentication_expiry_test_client_with_outbound(&server).await;
+    assert_eq!(client.language(), Language::ENGLISH);
+    let deadline = chrono::Utc::now();
+    set_expiring_authentication(&client, deadline, AuthenticationExpiryAction::Reauth);
+
+    authentication_expiry_reaper(&server, deadline).await;
+    tokio::time::timeout(Duration::from_secs(1), calls.recv())
+        .await
+        .expect("reauthentication started")
+        .expect("reauthentication call");
+    responses
+        .send(Ok(AuthenticateResult {
+            auth_session_id: Some("previous-auth-session".to_owned()),
+            authenticated_until: Some(deadline + chrono::Duration::hours(1)),
+            authentication_expiry_action: AuthenticationExpiryAction::Kick,
+            user_id: Some(7),
+            fqdn: None,
+            display_name: Some("Original Name".to_owned()),
+            groups: vec!["original-group".to_owned()],
+            is_superuser: false,
+            invisible: false,
+            virtual_server_id: None,
+            language: Language::parse("es"),
+            max_bandwidth: None,
+            texture_url: None,
+            comment_url: None,
+        }))
+        .expect("send successful reauthentication");
+
+    let refresh = tokio::time::timeout(Duration::from_secs(1), refreshes.recv())
+        .await
+        .expect("language refresh published")
+        .expect("refresh channel open");
+    assert!(matches!(
+        refresh.as_ref(),
+        crate::localization::channel_names::ChannelNameRefresh::ClientLanguage(instance)
+            if *instance == client.client_instance_id()
+    ));
+    assert_eq!(client.language(), Language::parse("es").unwrap());
+    assert_eq!(
+        client.text(crate::localization::TextKey::ChannelNameRequired),
+        server
+            .localizer()
+            .text(&Language::parse("es").unwrap(), crate::localization::TextKey::ChannelNameRequired),
+        "text generated after reauthentication uses the new language"
+    );
+}
+
+#[tokio::test]
+async fn gateway_egress_translates_channel_names_for_the_client_language() {
+    let server = Server::new(test_config(Vec::new()), TestAuthenticator)
+        .await
+        .expect("server");
+    let (client, mut outbound) = authentication_expiry_test_client_with_outbound(&server).await;
+    server.channel_name_translations().replace(std::collections::HashMap::from([(
+        Language::parse("es").unwrap(),
+        std::collections::HashMap::from([("Lobby".to_owned(), "Vestíbulo".to_owned())]),
+    )]));
+    let lobby: Message = shitspeak_messages::messages::encoder::ChannelState {
+        channel_id: Some(4),
+        name: Some("Lobby".to_owned()),
+        ..Default::default()
+    }
+    .into();
+
+    for (requested, expected) in [(None, "Lobby"), (Language::parse("es-MX"), "Vestíbulo")] {
+        server.apply_client_language(&client, requested);
+        client.write_proto_message(&lobby).await.expect("write");
+        let Some(Message::ChannelState(state)) =
+            tokio::time::timeout(Duration::from_secs(1), outbound.recv())
+                .await
+                .expect("outbound message")
+        else {
+            panic!("expected ChannelState");
+        };
+        assert_eq!(state.name.as_deref(), Some(expected));
     }
 }
 
@@ -2951,7 +3039,7 @@ async fn auth_finalization_queue_admits_waiters_fifo() {
     let mut second_task = tokio::spawn(async move { second_queue.acquire(&second_client).await });
     let second_notice = recv_auth_queue_notice(&mut second_rx).await;
     assert!(
-        second_notice.contains("You're in the login queue. There are 0 users ahead of you."),
+        second_notice.contains("You're in the login queue. Users ahead of you: 0"),
         "unexpected second notice text: {second_notice}"
     );
 
@@ -2960,7 +3048,7 @@ async fn auth_finalization_queue_admits_waiters_fifo() {
     let mut third_task = tokio::spawn(async move { third_queue.acquire(&third_client).await });
     let third_notice = recv_auth_queue_notice(&mut third_rx).await;
     assert!(
-        third_notice.contains("You're in the login queue. There are 1 users ahead of you."),
+        third_notice.contains("You're in the login queue. Users ahead of you: 1"),
         "unexpected third notice text: {third_notice}"
     );
 
@@ -3068,8 +3156,10 @@ async fn authentication_rejections_preserve_reason_and_private_message() {
                     panic!("expected Reject");
                 };
                 assert_eq!(reject.r#type, Some(reject_type as i32));
-                let default_reason =
-                    crate::localization::reject_reason(client.language(), reject_type);
+                let default_reason = client
+                    .locale()
+                    .localizer()
+                    .reject_reason(&client.language(), reject_type);
                 assert_eq!(
                     reject.reason.as_deref(),
                     Some(reason.unwrap_or(&default_reason))

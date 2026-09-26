@@ -1,97 +1,97 @@
+use std::fmt;
+
 use fluent_langneg::{NegotiationStrategy, negotiate_languages};
 use icu_locid::{LanguageIdentifier, langid};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize, Serializer};
 
-/// Language selection for server-generated text.
+/// A user's language preference, as a canonical BCP-47 language tag.
 ///
-/// Each variant corresponds to one translation catalog. Incoming language
-/// requests are arbitrary BCP-47 tags (`es-MX`, `zh-Hans-CN`, `en-GB`, …); they
-/// are matched against the catalogs by language negotiation rather than by a
-/// hand-maintained table of accepted spellings, so adding a catalog only means
-/// adding a variant and its tag in [`Language::TAGGED`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Language {
-    #[default]
-    English,
-    Spanish,
-    French,
-    German,
-    ChineseSimplified,
-}
+/// The value records what was *requested* (`es-MX`, `zh-Hans-CN`, `en-GB`, …),
+/// not which catalog serves it. Translation catalogs are data that can appear
+/// at runtime (bundled files, a live Weblate project, channel-name
+/// translations), so each consumer matches the preference against the
+/// languages it currently has with [`Language::negotiate`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Language(LanguageIdentifier);
 
 impl Language {
-    /// Every supported catalog paired with the BCP-47 tag it is written in.
-    /// This is the single place a new translation catalog is registered.
-    const TAGGED: &'static [(Language, LanguageIdentifier)] = &[
-        (Language::English, langid!("en")),
-        (Language::Spanish, langid!("es")),
-        (Language::French, langid!("fr")),
-        (Language::German, langid!("de")),
-        (Language::ChineseSimplified, langid!("zh-Hans")),
-    ];
+    /// The source language of the bundled server catalog.
+    pub const ENGLISH: Language = Language(langid!("en"));
 
-    pub fn all() -> impl Iterator<Item = Language> {
-        Self::TAGGED.iter().map(|(language, _)| *language)
+    /// Parse a language tag. Both BCP-47 (`pt-BR`) and the underscore form
+    /// used by Weblate and gettext file names (`pt_BR`, `zh_Hans`) are
+    /// accepted. Returns `None` for text that is not a language tag.
+    pub fn parse(tag: &str) -> Option<Self> {
+        let tag = tag.trim().replace('_', "-");
+        if tag.is_empty() {
+            return None;
+        }
+        let identifier: LanguageIdentifier = tag.parse().ok()?;
+        // `und` parses successfully but expresses no preference at all.
+        (!identifier.language.is_empty()).then_some(Self(identifier))
     }
 
-    /// Resolve a requested language tag to the best matching catalog, falling
-    /// back to [`Language::English`] when the tag is unparsable or matches no
-    /// catalog. Use [`Self::negotiate`] when an unmatched tag must be an error.
-    pub fn from_code(code: &str) -> Self {
-        Self::negotiate(code).unwrap_or_default()
+    pub fn identifier(&self) -> &LanguageIdentifier {
+        &self.0
     }
 
-    /// Resolve a requested language tag to the best matching catalog, or `None`
-    /// when the tag is not a valid language tag or matches no catalog.
-    pub fn negotiate(code: &str) -> Option<Self> {
-        let requested: LanguageIdentifier = code.trim().parse().ok()?;
-        let available: Vec<&LanguageIdentifier> = Self::TAGGED.iter().map(|(_, tag)| tag).collect();
+    /// Canonical BCP-47 spelling of this language tag.
+    pub fn tag(&self) -> String {
+        self.0.to_string()
+    }
+
+    /// Pick the best entry of `available` for this preference, or `None` when
+    /// nothing is close enough. Regional and script variants resolve onto the
+    /// base language (`es-MX` → `es`, `zh-CN` → `zh-Hans`) and vice versa.
+    pub fn negotiate<'a>(&self, available: &'a [Language]) -> Option<&'a Language> {
+        if available.is_empty() {
+            return None;
+        }
+        let identifiers: Vec<&LanguageIdentifier> =
+            available.iter().map(Language::identifier).collect();
         let matched = negotiate_languages(
-            std::slice::from_ref(&requested),
-            &available,
+            std::slice::from_ref(&self.0),
+            &identifiers,
             None,
             NegotiationStrategy::Filtering,
         )
         .first()
         .copied()?;
-        Self::TAGGED
+        available
             .iter()
-            .find_map(|(language, tag)| (tag == *matched).then_some(*language))
+            .find(|language| language.identifier() == *matched)
     }
+}
 
-    /// Short canonical code for this language, as used on the wire and in
-    /// configuration files.
-    pub fn code(self) -> &'static str {
-        match self {
-            Self::English => "en",
-            Self::Spanish => "es",
-            Self::French => "fr",
-            Self::German => "de",
-            Self::ChineseSimplified => "zh",
-        }
+impl Default for Language {
+    fn default() -> Self {
+        Self::ENGLISH
+    }
+}
+
+impl fmt::Display for Language {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
     }
 }
 
 impl Serialize for Language {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.code())
+        serializer.serialize_str(&self.tag())
     }
 }
 
-/// Deserialization negotiates the tag like [`Language::negotiate`], but reports
-/// an error instead of falling back to English: a misspelled configuration
-/// value must surface rather than silently change the server's language.
+/// Deserialization rejects text that is not a language tag instead of falling
+/// back to English: a misspelled configuration value must surface rather than
+/// silently change the server's language. Whether a catalog exists for the tag
+/// is deliberately not checked here, because catalogs can arrive at runtime.
 impl<'de> Deserialize<'de> for Language {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let code = String::deserialize(deserializer)?;
-        Language::negotiate(&code).ok_or_else(|| {
-            let supported = Language::all()
-                .map(|language| language.code())
-                .collect::<Vec<_>>()
-                .join(", ");
+        let tag = String::deserialize(deserializer)?;
+        Language::parse(&tag).ok_or_else(|| {
             de::Error::custom(format!(
-                "unsupported language tag {code:?}; supported languages: {supported}"
+                "invalid language tag {tag:?}; expected a BCP-47 tag such as \"en\", \"es-MX\" or \"zh-Hans\""
             ))
         })
     }
@@ -101,65 +101,72 @@ impl<'de> Deserialize<'de> for Language {
 mod tests {
     use super::Language;
 
+    fn languages(tags: &[&str]) -> Vec<Language> {
+        tags.iter().map(|tag| Language::parse(tag).unwrap()).collect()
+    }
+
     #[test]
-    fn negotiates_regional_and_script_variants_onto_catalogs() {
-        for (code, expected) in [
-            ("en", Language::English),
-            ("en-US", Language::English),
-            ("en-GB", Language::English),
-            ("es", Language::Spanish),
-            ("es-MX", Language::Spanish),
-            ("es-419", Language::Spanish),
-            ("fr-CA", Language::French),
-            ("de-DE", Language::German),
-            ("zh", Language::ChineseSimplified),
-            ("zh-Hans", Language::ChineseSimplified),
-            ("zh-CN", Language::ChineseSimplified),
+    fn negotiates_regional_and_script_variants_onto_available_languages() {
+        let available = languages(&["en", "es", "fr", "de", "zh-Hans"]);
+        for (requested, expected) in [
+            ("en", "en"),
+            ("en-US", "en"),
+            ("en-GB", "en"),
+            ("es", "es"),
+            ("es-MX", "es"),
+            ("es-419", "es"),
+            ("fr-CA", "fr"),
+            ("de-DE", "de"),
+            ("zh", "zh-Hans"),
+            ("zh-Hans", "zh-Hans"),
+            ("zh-CN", "zh-Hans"),
         ] {
-            assert_eq!(Language::negotiate(code), Some(expected), "tag {code}");
-        }
-    }
-
-    #[test]
-    fn negotiation_is_whitespace_and_case_insensitive() {
-        assert_eq!(Language::negotiate("  ES-mx  "), Some(Language::Spanish));
-    }
-
-    #[test]
-    fn from_code_falls_back_to_english_but_negotiate_reports_no_match() {
-        // `from_code` stays lenient for authenticator payloads.
-        assert_eq!(Language::from_code("kl"), Language::English);
-        assert_eq!(Language::from_code("not a tag!"), Language::English);
-        assert_eq!(Language::negotiate("kl"), None);
-        assert_eq!(Language::negotiate("not a tag!"), None);
-    }
-
-    #[test]
-    fn serde_round_trips_through_the_canonical_code() {
-        for language in Language::all() {
-            let encoded = serde_json::to_string(&language).unwrap();
-            assert_eq!(encoded, format!("\"{}\"", language.code()));
+            let requested = Language::parse(requested).unwrap();
             assert_eq!(
-                serde_json::from_str::<Language>(&encoded).unwrap(),
-                language
+                requested.negotiate(&available).map(Language::tag).as_deref(),
+                Some(expected),
+                "tag {requested}"
             );
         }
     }
 
     #[test]
-    fn deserialization_rejects_unsupported_tags() {
-        let error = serde_json::from_str::<Language>("\"kl\"").unwrap_err();
-        assert!(
-            error.to_string().contains("unsupported language tag"),
-            "unexpected error: {error}"
-        );
+    fn negotiation_reports_no_match_for_unavailable_languages() {
+        let available = languages(&["en", "es"]);
+        assert_eq!(Language::parse("kl").unwrap().negotiate(&available), None);
+        assert_eq!(Language::ENGLISH.negotiate(&[]), None);
     }
 
     #[test]
-    fn every_registered_catalog_negotiates_back_to_itself() {
-        assert_eq!(Language::all().count(), 5);
-        for language in Language::all() {
-            assert_eq!(Language::negotiate(language.code()), Some(language));
+    fn parsing_accepts_weblate_underscore_codes_and_normalizes_case() {
+        assert_eq!(Language::parse("pt_BR").unwrap().tag(), "pt-BR");
+        assert_eq!(Language::parse("zh_Hans").unwrap().tag(), "zh-Hans");
+        assert_eq!(Language::parse("  ES-mx  ").unwrap().tag(), "es-MX");
+    }
+
+    #[test]
+    fn parsing_rejects_text_that_is_not_a_language_tag() {
+        assert_eq!(Language::parse("not a tag!"), None);
+        assert_eq!(Language::parse(""), None);
+        assert_eq!(Language::parse("und"), None);
+    }
+
+    #[test]
+    fn serde_round_trips_through_the_canonical_tag() {
+        for tag in ["en", "es-MX", "zh-Hans", "kl"] {
+            let language = Language::parse(tag).unwrap();
+            let encoded = serde_json::to_string(&language).unwrap();
+            assert_eq!(encoded, format!("\"{tag}\""));
+            assert_eq!(serde_json::from_str::<Language>(&encoded).unwrap(), language);
         }
+    }
+
+    #[test]
+    fn deserialization_rejects_invalid_tags() {
+        let error = serde_json::from_str::<Language>("\"not a tag!\"").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid language tag"),
+            "unexpected error: {error}"
+        );
     }
 }

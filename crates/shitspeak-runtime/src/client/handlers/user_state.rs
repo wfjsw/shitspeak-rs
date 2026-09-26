@@ -6,7 +6,7 @@ use shitspeak_state::ACLPermissions;
 use crate::{
     client::{Client, client_global_state::ClientGlobalState},
     errors::MessageHandlerError,
-    localization::channel_does_not_exist,
+    localization::TextKey,
     messages::encoder::{DenyType, PermissionDenied, UserState},
     server::Server,
 };
@@ -143,7 +143,10 @@ pub async fn handle_user_state(
                 r#type: DenyType::ChannelName,
                 session: u32::from(sender_id),
                 channel_id: Some(new_channel_id),
-                reason: Some(channel_does_not_exist(sender.language(), new_channel_id)),
+                reason: Some(sender.format_text(
+                    TextKey::ChannelDoesNotExist,
+                    &[("channel_id", &new_channel_id.to_string())],
+                )),
                 name: None,
                 permission: None,
             }));
@@ -404,7 +407,7 @@ pub async fn handle_user_state(
                         r#type: DenyType::Text,
                         session: u32::from(sender_id),
                         channel_id: None,
-                        reason: Some(format!("Failed to store comment blob: {e}").into()),
+                        reason: Some(sender.text(TextKey::CommentStoreFailed)),
                         name: None,
                         permission: None,
                     })
@@ -472,7 +475,7 @@ pub async fn handle_user_state(
                         r#type: DenyType::Text,
                         session: u32::from(sender_id),
                         channel_id: None,
-                        reason: Some(format!("Failed to store texture blob: {e}").into()),
+                        reason: Some(sender.text(TextKey::TextureStoreFailed)),
                         name: None,
                         permission: None,
                     })

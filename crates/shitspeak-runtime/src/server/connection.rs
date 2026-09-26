@@ -94,7 +94,7 @@ fn map_handler_result(
         Err(MessageHandlerError::AuthRejection(rejection)) => {
             tracing::info!(
                 session = u32::from(session_id),
-                reason = rejection.reason(),
+                %rejection,
                 "closing connection after auth rejection",
             );
             Err(HandleIncomingConnectionError::AuthRejected(rejection))
@@ -641,7 +641,9 @@ async fn drain_outbound_message_queue(
         }
     }
 
-    client.write_proto_message_batch_direct(&messages).await
+    // Channel names were translated when the messages were queued; some
+    // batches (the channel editor reply) deliberately carry raw names.
+    client.write_prepared_batch_direct(&messages).await
 }
 
 async fn drain_voice_tcp_queue(

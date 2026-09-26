@@ -7,6 +7,7 @@ This directory is the main documentation set for ShitSpeak. The top-level [READM
 - [Getting started](getting-started.md): build, generate local certificates, run the server, and connect with a Mumble client.
 - [Configuration](configuration.md): config loading, environment overrides, hot reload behavior, and common settings.
 - [Authentication](authentication.md): demo, exec, and WebAssembly authenticators.
+- [Localization](localization.md): translation files, Weblate setup, live translation updates, and channel-name translation.
 - [Persistence](persistence.md): what is stored under `blob_storage_dir`, backup guidance, and tuning knobs.
 
 ## Operators

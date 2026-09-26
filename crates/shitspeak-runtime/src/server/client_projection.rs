@@ -38,6 +38,8 @@ pub(crate) enum ClientProjectionEvent {
     Channel(Arc<ChannelOperation>),
     Client(Arc<ClientStateBroadcastPayload>),
     VisibilityReload,
+    /// Channel-name translations changed; re-send the affected names.
+    ChannelNames(Arc<crate::localization::channel_names::ChannelNameRefresh>),
     ClientLagged(u64),
     ChannelLagged(u64),
 }
@@ -154,6 +156,63 @@ impl ClientProjectionState {
             self.append_client_gap(&server, outbound, reason).await?;
         }
         Ok(())
+    }
+
+    /// Re-send the raw name of every channel this client can see whose
+    /// translation changed. The connection writer translates names on the
+    /// way out, so the client ends up with the current translation.
+    fn append_channel_name_refresh(
+        &self,
+        server: &Arc<Box<Server>>,
+        change: &crate::localization::channel_names::ChannelNamesChanged,
+        outbound: &mut Vec<Message>,
+    ) {
+        if !server
+            .channel_name_translations()
+            .affects(change.diff(), &self.client.language())
+        {
+            return;
+        }
+        let server_id = self.client.server_id();
+        outbound.extend(
+            change
+                .channels_in_server(&server_id)
+                .iter()
+                .filter(|(channel_id, _)| self.channel_tree_shadow.contains(channel_id))
+                .map(|(channel_id, raw_name)| {
+                    Message::from(shitspeak_messages::messages::encoder::ChannelState {
+                        channel_id: Some(*channel_id),
+                        name: Some(raw_name.clone()),
+                        ..Default::default()
+                    })
+                }),
+        );
+    }
+
+    /// Re-send the raw name of every channel this client can see, after its
+    /// language changed. Names without a translation are included so a name
+    /// translated in the old language reverts.
+    async fn append_all_channel_names(
+        &self,
+        server: &Arc<Box<Server>>,
+        outbound: &mut Vec<Message>,
+    ) {
+        let server_id = self.client.server_id();
+        outbound.extend(
+            server
+                .channels
+                .get_all_in_server(&server_id)
+                .await
+                .into_iter()
+                .filter(|channel| self.channel_tree_shadow.contains(&channel.id))
+                .map(|channel| {
+                    Message::from(shitspeak_messages::messages::encoder::ChannelState {
+                        channel_id: Some(channel.id),
+                        name: Some(channel.name.clone()),
+                        ..Default::default()
+                    })
+                }),
+        );
     }
 
     async fn append_current_root_channel(
@@ -830,6 +889,17 @@ impl ShardedSubscriber<ClientProjectionEvent> for ClientProjectionState {
                         ),
                     );
                 }
+                ClientProjectionEvent::ChannelNames(refresh) => match refresh.as_ref() {
+                    crate::localization::channel_names::ChannelNameRefresh::Translations(
+                        change,
+                    ) => self.append_channel_name_refresh(&server, change, &mut outbound),
+                    crate::localization::channel_names::ChannelNameRefresh::ClientLanguage(
+                        instance,
+                    ) if *instance == self.client.client_instance_id() => {
+                        self.append_all_channel_names(&server, &mut outbound).await;
+                    }
+                    crate::localization::channel_names::ChannelNameRefresh::ClientLanguage(_) => {}
+                },
                 ClientProjectionEvent::ClientLagged(_)
                 | ClientProjectionEvent::ChannelLagged(_) => {}
             }
