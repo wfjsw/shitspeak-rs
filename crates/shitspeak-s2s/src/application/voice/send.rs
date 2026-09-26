@@ -13,8 +13,7 @@ use std::time::Duration;
 use crate::application::config::VoiceConfig;
 use crate::application::error::ApplicationError;
 use crate::application::proto::{
-    self, VOICE_PATH_FEEDBACK_SERVICE_TAG, VOICE_REPAIR_SERVICE_TAG, VOICE_SERVICE_TAG,
-    VoiceIntent, VoicePathFeedback,
+    self, VOICE_PATH_FEEDBACK_SERVICE_TAG, VOICE_SERVICE_TAG, VoiceIntent, VoicePathFeedback,
 };
 use crate::application::voice::fec::{FecParityPath, FecSendOutcome};
 use crate::application::voice::{fec::FecSenderState, metrics};
@@ -164,13 +163,6 @@ pub trait VoiceTransport: Send + Sync + 'static {
 
     async fn send_broadcast(&self, body: Bytes, ttl: Duration) -> Result<(), ApplicationError>;
 
-    async fn send_repair_request(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-        ttl: Duration,
-    ) -> Result<(), ApplicationError>;
-
     async fn send_path_feedback(
         &self,
         _dst: NodeIdentifier,
@@ -180,14 +172,6 @@ pub trait VoiceTransport: Send + Sync + 'static {
     }
 
     fn record_path_feedback(&self, _from: NodeIdentifier, _feedback: VoicePathFeedback) {}
-
-    async fn send_repair_frame(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-        avoid_first_hop: Option<NodeIdentifier>,
-        ttl: Duration,
-    ) -> Result<(), ApplicationError>;
 
     /// Send an already-marked proactive alternate copy. The caller is
     /// responsible for deriving it from the original envelope once and may
@@ -280,8 +264,7 @@ pub trait VoiceTransport: Send + Sync + 'static {
     }
 }
 
-/// Protect successfully sent repair and proactive copies at their shared
-/// transport boundary. Originals are grouped by the foreground voice sender.
+/// Protect successfully sent proactive copies at the transport boundary. Originals are grouped by the foreground voice sender.
 pub(crate) struct FecVoiceTransport {
     inner: Arc<dyn VoiceTransport>,
     sender: Option<FecSenderState>,
@@ -315,7 +298,6 @@ impl FecVoiceTransport {
         body: Bytes,
         avoid_first_hop: Option<NodeIdentifier>,
         ttl: Duration,
-        reactive: bool,
     ) -> Result<(), ApplicationError> {
         let started = std::time::Instant::now();
         let avoid = avoid_first_hop.ok_or(ApplicationError::Unavailable)?;
@@ -339,15 +321,9 @@ impl FecVoiceTransport {
             .filter(|_| fec_route.is_some_and(|(_, reliable)| !reliable))
             .and_then(|_| proto::decode_voice(&body).ok())
             .filter(|frame| !frame.fec_parity);
-        if reactive {
-            self.inner
-                .send_repair_frame(dst, body, Some(avoid), ttl)
-                .await?;
-        } else {
-            self.inner
-                .send_proactive_repair_frame(dst, body, Some(avoid), ttl)
-                .await?;
-        }
+        self.inner
+            .send_proactive_repair_frame(dst, body, Some(avoid), ttl)
+            .await?;
         if let (Some(sender), Some(frame), Some((first_hop, _))) = (&self.sender, frame, fec_route)
         {
             let emissions = sender.push(
@@ -461,15 +437,6 @@ impl VoiceTransport for FecVoiceTransport {
         self.inner.send_broadcast(body, ttl).await
     }
 
-    async fn send_repair_request(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-        ttl: Duration,
-    ) -> Result<(), ApplicationError> {
-        self.inner.send_repair_request(dst, body, ttl).await
-    }
-
     async fn send_path_feedback(
         &self,
         dst: NodeIdentifier,
@@ -482,16 +449,6 @@ impl VoiceTransport for FecVoiceTransport {
         self.inner.record_path_feedback(from, feedback);
     }
 
-    async fn send_repair_frame(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-        avoid_first_hop: Option<NodeIdentifier>,
-        ttl: Duration,
-    ) -> Result<(), ApplicationError> {
-        self.send_copy(dst, body, avoid_first_hop, ttl, true).await
-    }
-
     async fn send_proactive_repair_frame(
         &self,
         dst: NodeIdentifier,
@@ -499,7 +456,7 @@ impl VoiceTransport for FecVoiceTransport {
         avoid_first_hop: Option<NodeIdentifier>,
         ttl: Duration,
     ) -> Result<(), ApplicationError> {
-        self.send_copy(dst, body, avoid_first_hop, ttl, false).await
+        self.send_copy(dst, body, avoid_first_hop, ttl).await
     }
 
     async fn send_fec_frame(
@@ -650,27 +607,6 @@ impl VoiceTransport for OverlayVoiceTransport {
         Ok(())
     }
 
-    async fn send_repair_request(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-        ttl: Duration,
-    ) -> Result<(), ApplicationError> {
-        let options = OverlaySendOptions::default().expire_after(ttl);
-        self.overlay
-            .send_unicast_unordered_with_routing_metric_and_options(
-                dst,
-                VOICE_REPAIR_SERVICE_TAG,
-                VOICE_REPAIR_LEVEL,
-                VOICE_REPAIR_ROUTING_METRIC,
-                VOICE_REPAIR_CLASS,
-                body,
-                options,
-            )
-            .await?;
-        Ok(())
-    }
-
     async fn send_path_feedback(
         &self,
         dst: NodeIdentifier,
@@ -693,32 +629,6 @@ impl VoiceTransport for OverlayVoiceTransport {
 
     fn record_path_feedback(&self, from: NodeIdentifier, feedback: VoicePathFeedback) {
         self.overlay.record_voice_path_feedback(from, feedback);
-    }
-
-    async fn send_repair_frame(
-        &self,
-        dst: NodeIdentifier,
-        body: Bytes,
-        avoid_first_hop: Option<NodeIdentifier>,
-        ttl: Duration,
-    ) -> Result<(), ApplicationError> {
-        let mut options = OverlaySendOptions::default()
-            .expire_after(ttl)
-            .as_distribution_repair();
-        let first_hop = avoid_first_hop.ok_or(ApplicationError::Unavailable)?;
-        options = options.avoid_first_hop(first_hop);
-        self.overlay
-            .send_unicast_unordered_with_routing_metric_and_options(
-                dst,
-                VOICE_SERVICE_TAG,
-                VOICE_LEVEL,
-                VOICE_ROUTING_METRIC,
-                VOICE_REPAIR_CLASS,
-                body,
-                options,
-            )
-            .await?;
-        Ok(())
     }
 
     async fn send_proactive_repair_frame(
@@ -993,17 +903,11 @@ pub(crate) mod testing {
             body: Bytes,
             ttl: Duration,
         },
-        RepairRequest {
-            dst: NodeIdentifier,
-            body: Bytes,
-            ttl: Duration,
-        },
         RepairFrame {
             dst: NodeIdentifier,
             body: Bytes,
             avoid_first_hop: Option<NodeIdentifier>,
             ttl: Duration,
-            is_repair: bool,
         },
     }
 
@@ -1104,36 +1008,6 @@ pub(crate) mod testing {
             Ok(())
         }
 
-        async fn send_repair_request(
-            &self,
-            dst: NodeIdentifier,
-            body: Bytes,
-            ttl: Duration,
-        ) -> Result<(), ApplicationError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(FakeCall::RepairRequest { dst, body, ttl });
-            Ok(())
-        }
-
-        async fn send_repair_frame(
-            &self,
-            dst: NodeIdentifier,
-            body: Bytes,
-            avoid_first_hop: Option<NodeIdentifier>,
-            ttl: Duration,
-        ) -> Result<(), ApplicationError> {
-            self.calls.lock().unwrap().push(FakeCall::RepairFrame {
-                dst,
-                body,
-                avoid_first_hop,
-                ttl,
-                is_repair: true,
-            });
-            Ok(())
-        }
-
         async fn send_proactive_repair_frame(
             &self,
             dst: NodeIdentifier,
@@ -1146,7 +1020,6 @@ pub(crate) mod testing {
                 body,
                 avoid_first_hop,
                 ttl,
-                is_repair: false,
             });
             Ok(())
         }
@@ -1238,25 +1111,6 @@ mod tests {
         async fn send_broadcast(
             &self,
             _body: Bytes,
-            _ttl: Duration,
-        ) -> Result<(), ApplicationError> {
-            Ok(())
-        }
-
-        async fn send_repair_request(
-            &self,
-            _dst: NodeIdentifier,
-            _body: Bytes,
-            _ttl: Duration,
-        ) -> Result<(), ApplicationError> {
-            Ok(())
-        }
-
-        async fn send_repair_frame(
-            &self,
-            _dst: NodeIdentifier,
-            _body: Bytes,
-            _avoid_first_hop: Option<NodeIdentifier>,
             _ttl: Duration,
         ) -> Result<(), ApplicationError> {
             Ok(())
@@ -1456,7 +1310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proactive_send_keeps_the_marked_copy_while_nack_replay_keeps_the_cached_original() {
+    async fn proactive_send_keeps_the_marked_copy() {
         let transport = testing::FakeVoiceTransport::new(1, vec![1, 2]);
         let original = build_envelope(
             7,
@@ -1479,15 +1333,10 @@ mod tests {
             .send_proactive_repair_frame(2, marked.clone(), None, Duration::from_millis(40))
             .await
             .unwrap();
-        transport
-            .send_repair_frame(2, original.clone(), None, Duration::from_millis(40))
-            .await
-            .unwrap();
 
         let calls = transport.calls();
         let testing::FakeCall::RepairFrame {
             body: sent_proactive,
-            is_repair: false,
             ..
         } = &calls[0]
         else {
@@ -1495,17 +1344,7 @@ mod tests {
         };
         assert_eq!(sent_proactive, &marked);
         assert!(proto::decode_voice(sent_proactive).unwrap().proactive_copy);
-
-        let testing::FakeCall::RepairFrame {
-            body: reactive,
-            is_repair: true,
-            ..
-        } = &calls[1]
-        else {
-            panic!("expected unmodified NACK replay");
-        };
-        assert_eq!(reactive, &original);
-        assert!(!proto::decode_voice(reactive).unwrap().proactive_copy);
+        assert!(!proto::decode_voice(&original).unwrap().proactive_copy);
     }
 
     #[test]

@@ -1546,6 +1546,10 @@ pub(crate) struct PeerState {
     /// the datagram lane, so redundancy sent over it is shed too — the FEC gate
     /// keys on this to skip parity while the lane is evicting.
     datagram_lane_sheds: Mutex<VecDeque<Instant>>,
+    /// When the peer was last seen to come up or restart. Dial failures from
+    /// attempts started before this describe an incarnation that was not
+    /// listening yet, not the addresses themselves.
+    address_failures_forgotten_at: Mutex<Option<Instant>>,
     transport_health_exclusions:
         Mutex<HashMap<(TransportKind, TransportHealthExclusionReason), u64>>,
     datagram_path_health: Mutex<HashMap<DeliveryPath, DatagramPathHealthObservation>>,
@@ -1607,6 +1611,7 @@ impl PeerState {
             udp_datagram_mtu_last_probe: Mutex::new(None),
             expired_outbound_drops: ExpiredOutboundDropCounters::default(),
             datagram_lane_sheds: Mutex::new(VecDeque::new()),
+            address_failures_forgotten_at: Mutex::new(None),
             transport_health_exclusions: Mutex::new(HashMap::new()),
             datagram_path_health: Mutex::new(HashMap::new()),
             conversational_transport_loss_suspect: Mutex::new(HashMap::new()),
@@ -1868,6 +1873,27 @@ impl PeerState {
         backoff.snapshot()
     }
 
+    /// The peer just came up or restarted: forget every address's dial
+    /// failures (they were recorded while it was down) so each address is
+    /// retried promptly on the normal schedule.
+    pub(crate) fn forget_address_failures(&self, now: Instant) {
+        {
+            let mut backoffs = self.address_backoffs.lock();
+            for backoff in backoffs.values_mut() {
+                backoff.record_success();
+            }
+        }
+        *self.address_failures_forgotten_at.lock() = Some(now);
+    }
+
+    /// Whether a dial started at `started` predates the last
+    /// [`Self::forget_address_failures`], so its failure must not count.
+    pub(crate) fn dial_outcome_is_stale(&self, started: Instant) -> bool {
+        self.address_failures_forgotten_at
+            .lock()
+            .is_some_and(|forgotten_at| started < forgotten_at)
+    }
+
     pub fn record_address_success(&self, addr: PeerAddress) {
         self.address_backoffs
             .lock()
@@ -2057,40 +2083,67 @@ impl PeerState {
 
     pub fn install_stream(&self, stream: ActiveStream) {
         let key = stream.key();
-        let mut g = self.stream_entries_for_install();
-        if self.retired.is_cancelled() {
-            stream.cancel();
-            return;
+        let (transport, remote_addr) = (stream.transport(), stream.remote_addr);
+        {
+            let mut g = self.stream_entries_for_install();
+            if self.retired.is_cancelled() {
+                stream.cancel();
+                return;
+            }
+            prune_dead_streams(&mut g);
+            if stream.transport() == TransportKind::Udp {
+                drop_udp_streams(&mut g);
+            }
+            if let Some(prev) = g.insert(key, stream) {
+                prev.closed.cancel();
+            }
         }
-        prune_dead_streams(&mut g);
-        if stream.transport() == TransportKind::Udp {
-            drop_udp_streams(&mut g);
-        }
-        if let Some(prev) = g.insert(key, stream) {
-            prev.closed.cancel();
-        }
+        self.record_stream_address_success(transport, remote_addr);
         self.notify_outbound_dispatch();
         self.note_seen_now();
+    }
+
+    /// A stream whose remote end is exactly one of the peer's addresses
+    /// proves that address works, whichever side dialled. Datagram
+    /// transports talk from their listening socket, so this covers the case
+    /// where the peer's dial wins and ours is never retried; a connection
+    /// from an ephemeral port matches nothing.
+    fn record_stream_address_success(
+        &self,
+        transport: TransportKind,
+        remote_addr: Option<SocketAddr>,
+    ) {
+        let Some(remote_addr) = remote_addr else {
+            return;
+        };
+        let addr = PeerAddress::new(remote_addr, transport);
+        if let Some(backoff) = self.address_backoffs.lock().get_mut(&addr) {
+            backoff.record_success();
+        }
     }
 
     /// Install a stream unless the exact same connection key is already live.
     pub fn try_install_stream(&self, new_stream: ActiveStream) -> Result<(), ActiveStream> {
         let key = new_stream.key();
-        let mut g = self.stream_entries_for_install();
-        if self.retired.is_cancelled() {
-            new_stream.cancel();
-            return Err(new_stream);
+        let (transport, remote_addr) = (new_stream.transport(), new_stream.remote_addr);
+        {
+            let mut g = self.stream_entries_for_install();
+            if self.retired.is_cancelled() {
+                new_stream.cancel();
+                return Err(new_stream);
+            }
+            prune_dead_streams(&mut g);
+            if new_stream.transport() == TransportKind::Udp {
+                drop_udp_streams(&mut g);
+            }
+            if g.get(&key).is_some_and(ActiveStream::is_alive) {
+                return Err(new_stream);
+            }
+            if let Some(prev) = g.insert(key, new_stream) {
+                prev.closed.cancel();
+            }
         }
-        prune_dead_streams(&mut g);
-        if new_stream.transport() == TransportKind::Udp {
-            drop_udp_streams(&mut g);
-        }
-        if g.get(&key).is_some_and(ActiveStream::is_alive) {
-            return Err(new_stream);
-        }
-        if let Some(prev) = g.insert(key, new_stream) {
-            prev.closed.cancel();
-        }
+        self.record_stream_address_success(transport, remote_addr);
         self.notify_outbound_dispatch();
         self.note_seen_now();
         Ok(())
@@ -4218,6 +4271,59 @@ mod tests {
             backoffs.get(&second).unwrap().next_delay,
             Duration::from_millis(500)
         );
+    }
+
+    #[test]
+    fn an_inbound_stream_from_an_address_clears_its_dial_failures() {
+        let peer = peer_for_address_tests();
+        let udp = PeerAddress::new("47.77.196.120:64801".parse().unwrap(), TransportKind::Udp);
+        let tcp = PeerAddress::new("47.77.196.120:64801".parse().unwrap(), TransportKind::Tcp);
+        peer.add_address(udp);
+        peer.add_address(tcp);
+        for _ in 0..5 {
+            peer.record_address_failure(udp, Duration::from_secs(30));
+            peer.record_address_failure(tcp, Duration::from_secs(30));
+        }
+        // The peer dialled us from its advertised UDP socket: that address
+        // demonstrably works, and with a UDP stream live it is never redialled.
+        let (inbound_udp, _udp_rx) = active_stream_for_test(TransportKind::Udp, udp.addr(), false);
+        peer.install_stream(inbound_udp);
+        assert!(!peer.transports_unreachable(&[TransportKind::Udp], 4));
+        // An inbound TCP connection comes from an ephemeral port and says
+        // nothing about the peer's listener.
+        let (inbound_tcp, _tcp_rx) = active_stream_for_test(
+            TransportKind::Tcp,
+            "47.77.196.120:51234".parse().unwrap(),
+            false,
+        );
+        peer.install_stream(inbound_tcp);
+        assert!(peer.transports_unreachable(&[TransportKind::Tcp], 4));
+    }
+
+    #[test]
+    fn a_peer_coming_up_forgets_failures_from_before_it_was_listening() {
+        let peer = peer_for_address_tests();
+        let udp = PeerAddress::new("47.77.196.120:64801".parse().unwrap(), TransportKind::Udp);
+        let retry_cap = Duration::from_secs(30 * 60);
+        peer.add_address(udp);
+        // Dials raced the peer's restart and all timed out; unconfirmed while
+        // the peer is reachable otherwise, the address backs off for minutes.
+        let dial_started = Instant::now();
+        for _ in 0..5 {
+            peer.record_address_failure_with_floor(udp, Duration::from_secs(300), retry_cap);
+        }
+        assert!(peer.transports_unreachable(&[TransportKind::Udp], 4));
+        assert!(!peer.address_retry_ready(udp, Instant::now(), retry_cap));
+
+        // The peer's Hello shows it is up: the address is retried promptly.
+        let seen_up = Instant::now();
+        peer.forget_address_failures(seen_up);
+        assert!(!peer.transports_unreachable(&[TransportKind::Udp], 4));
+        assert!(peer.address_retry_ready(udp, seen_up + Duration::from_secs(1), retry_cap));
+        // A dial still in flight from before it came up cannot re-poison it;
+        // a dial started afterwards counts as usual.
+        assert!(peer.dial_outcome_is_stale(dial_started));
+        assert!(!peer.dial_outcome_is_stale(seen_up + Duration::from_millis(1)));
     }
 
     #[test]

@@ -11,9 +11,9 @@ use shitspeak_proto::s2s_application_proto as pb;
 pub use pb::{
     ModerationEnvelope, PluginDataEnvelope, TextMessageEnvelope, UserRemovePatch, UserStatePatch,
     UserStatsEnvelope, UserStatsReply, UserStatsRequest, VoiceFrame, VoiceIntent,
-    VoiceIntentNormal, VoiceIntentTarget, VoicePathFeedback, VoiceRepairRequest,
-    VoiceTargetChannel, moderation_envelope::Command as ModerationCommand,
-    user_stats_envelope::Kind as UserStatsKind, voice_intent::Kind as VoiceIntentKind,
+    VoiceIntentNormal, VoiceIntentTarget, VoicePathFeedback, VoiceTargetChannel,
+    moderation_envelope::Command as ModerationCommand, user_stats_envelope::Kind as UserStatsKind,
+    voice_intent::Kind as VoiceIntentKind,
 };
 
 /// Reserved overlay service tag for moderation envelopes.
@@ -53,18 +53,6 @@ pub fn encode_voice(frame: &VoiceFrame) -> Result<Bytes, prost::EncodeError> {
 
 pub fn decode_voice(src: &[u8]) -> Result<VoiceFrame, prost::DecodeError> {
     VoiceFrame::decode(src)
-}
-
-pub fn encode_voice_repair_request(
-    request: &VoiceRepairRequest,
-) -> Result<Bytes, prost::EncodeError> {
-    let mut buf = BytesMut::with_capacity(request.encoded_len());
-    request.encode(&mut buf)?;
-    Ok(buf.freeze())
-}
-
-pub fn decode_voice_repair_request(src: &[u8]) -> Result<VoiceRepairRequest, prost::DecodeError> {
-    VoiceRepairRequest::decode(src)
 }
 
 pub fn encode_voice_path_feedback(
@@ -179,21 +167,6 @@ mod tests {
         let bytes = encode_voice(&frame).unwrap();
         let decoded = decode_voice(&bytes).unwrap();
         assert_eq!(decoded, frame);
-    }
-
-    #[test]
-    fn voice_tail_ack_roundtrip() {
-        let request = VoiceRepairRequest {
-            sender_session: 0xABC,
-            sender_epoch: 42,
-            first_seq: 17,
-            last_seq: 17,
-            request_sent_unix_ms: 0,
-            request_ttl_ms: 750,
-            tail_ack: true,
-        };
-        let bytes = encode_voice_repair_request(&request).unwrap();
-        assert_eq!(decode_voice_repair_request(&bytes).unwrap(), request);
     }
 
     #[test]

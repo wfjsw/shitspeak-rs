@@ -604,6 +604,99 @@ async fn restart_detection_via_hello() {
     transport_b2.shutdown().await;
 }
 
+/// Checks that a peer restart clears dial failures recorded while it was
+/// down. Expected: failures A recorded against B's addresses during B's
+/// downtime (backed off for minutes, as unconfirmed addresses of a reachable
+/// peer are) are forgotten as soon as B's Hello shows the new incarnation, so
+/// A retries B's addresses promptly instead of waiting out the backoff.
+#[tokio::test]
+async fn peer_restart_forgets_dial_failures_from_its_downtime() {
+    let _guard = s2s_network_test_guard().await;
+    install_provider_once();
+    let pki = mint_pki(&[1, 2]);
+    let port_a = pick_free_port().await;
+    let port_b = pick_free_port().await;
+    let seed_a = SeedPeer::new(
+        1,
+        vec![PeerAddress::new(loopback(port_a), TransportKind::Tcp)],
+    );
+    // An address of B that A holds but B never confirms: while B is
+    // otherwise reachable its failures back off for minutes and it is not
+    // redialled, so only B coming back can clear what A recorded meanwhile.
+    let spare_b = PeerAddress::new(
+        std::net::SocketAddr::from(([127, 0, 0, 2], port_b)),
+        TransportKind::Tcp,
+    );
+    let (transport_a, inbound_a) =
+        ConnectionManager::start(transport_cfg(&pki, 0, loopback(port_a)))
+            .await
+            .unwrap();
+    let overlay_a = OverlayNetwork::start(transport_a.clone(), inbound_a, overlay_cfg(vec![]))
+        .await
+        .unwrap();
+    let spare_failures = |transport: &ConnectionManager| -> Option<u32> {
+        transport
+            .peer_address_snapshot()
+            .into_iter()
+            .filter(|snapshot| snapshot.node_id() == 2)
+            .find_map(|snapshot| {
+                snapshot
+                    .address_backoffs()
+                    .get(&spare_b)
+                    .map(|backoff| backoff.consecutive_failures())
+            })
+    };
+
+    {
+        let (transport_b1, inbound_b1) =
+            ConnectionManager::start(transport_cfg(&pki, 1, loopback(port_b)))
+                .await
+                .unwrap();
+        let _overlay_b1 = OverlayNetwork::start(
+            transport_b1.clone(),
+            inbound_b1,
+            overlay_cfg(vec![seed_a.clone()]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(8), || overlay_a
+                .alive_members()
+                .contains(&2))
+            .await,
+            "A never saw B alive (initial)"
+        );
+        transport_a.add_address(2, spare_b).await;
+        transport_b1.shutdown().await;
+    }
+    // A dials B while B is down; every attempt fails and backs off.
+    transport_a.test_record_address_failures(2, 5);
+    assert_eq!(spare_failures(&transport_a), Some(5));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (transport_b2, inbound_b2) =
+        ConnectionManager::start(transport_cfg(&pki, 1, loopback(port_b)))
+            .await
+            .unwrap();
+    let overlay_b2 =
+        OverlayNetwork::start(transport_b2.clone(), inbound_b2, overlay_cfg(vec![seed_a]))
+            .await
+            .unwrap();
+    // Forgotten on B's Hello; a prompt redial of the dead spare may fail once.
+    assert!(
+        wait_until(Duration::from_secs(8), || spare_failures(&transport_a)
+            .is_some_and(|failures| failures <= 1))
+        .await,
+        "A kept B's downtime dial failures after B came back: {:?}",
+        spare_failures(&transport_a)
+    );
+
+    overlay_a.shutdown().await;
+    overlay_b2.shutdown().await;
+    transport_a.shutdown().await;
+    transport_b2.shutdown().await;
+}
+
 /// Checks LSDB synchronization after a network partition heals.
 /// Expected: after {1,2} and {3,4} age each other out, healing the partition
 /// repopulates node 1's view with nodes 3 and 4. This is this crate's S2S

@@ -807,6 +807,16 @@ async fn try_dial_peer(
                 debug!(peer=%peer.node_id(), transport=?transport, "dial succeeded");
                 any_success = true;
             }
+            Err(e) if peer.dial_outcome_is_stale(now) => {
+                // Started before the peer was seen up: it failed against an
+                // incarnation that was not listening yet.
+                debug!(
+                    peer=%peer.node_id(),
+                    ?addr,
+                    error=%e,
+                    "ignoring dial failure that predates the peer coming up"
+                );
+            }
             Err(e) => {
                 let removed = should_remove_failed_address(&e) && peer.remove_address(addr);
                 if removed {

@@ -348,10 +348,7 @@ tree_delivery_enabled = true
 transport_ttl_ms = 1500
 repair_enabled = true
 repair_transport_ttl_ms = 1500
-# Transport TTL for the NACK itself. Its payload separately carries the
-# requester's remaining actionable gap time as a relative response deadline;
-# that duration is not a synchronized or guaranteed receiver-arrival deadline.
-repair_request_ttl_ms = 1500
+# Upper bound on the route-aware wait the reorder gives a gap.
 repair_cache_ms = 3000
 # Only an observed S2S sequence gap is held. The delay adapts per speaker
 # within this narrow range; ordinary contiguous frames are never paced.
@@ -376,13 +373,6 @@ repair_jitter_start_ms = 40
 # demand; conserved-credit overflow is ranked by marginal on-time utility and
 # destination fairness.
 # repair_max_extra_copies_per_frame = 1
-# Reactive/tail repair owns 30% of the single 25% repair mint. Proactive work
-# may borrow unused reactive credit above the hard 10% reserve. NACK and tail
-# frames share deadline-aware, destination-byte-fair permit scheduling. Both
-# percentages are measured against the dynamic repair-credit cap; hard reserve
-# must not exceed the reactive reserve.
-repair_reactive_reserve_pct = 30
-repair_reactive_hard_reserve_pct = 10
 
 # ── L2 overlay tunables ───────────────────────────────────────────────
 [s2s.overlay]

@@ -257,27 +257,6 @@ pub struct GapReport {
     pub last_seq: u64,
 }
 
-/// The currently actionable missing range for an already-open gap.
-///
-/// Unlike [`GapReport`], which records the range that originally opened the
-/// gap, this range follows repair progress while retaining the original
-/// playout deadline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ActionableGap {
-    gap: GapReport,
-    deadline: Instant,
-}
-
-impl ActionableGap {
-    pub(crate) fn gap(self) -> GapReport {
-        self.gap
-    }
-
-    pub(crate) fn deadline(self) -> Instant {
-        self.deadline
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoiceRouteHint {
     path_latency_us: u64,
@@ -301,7 +280,6 @@ pub struct Reorderer {
     max_users: Arc<AtomicU64>,
     state: Mutex<ReorderInner>,
     deadline_notify: Arc<Notify>,
-    repair_notify: Arc<Notify>,
     deadline_wake_pending: AtomicBool,
     deadline_wake_ack: Notify,
 }
@@ -386,7 +364,6 @@ impl Reorderer {
                 total_pending: 0,
             }),
             deadline_notify: Arc::new(Notify::new()),
-            repair_notify: Arc::new(Notify::new()),
             deadline_wake_pending: AtomicBool::new(false),
             deadline_wake_ack: Notify::new(),
         })
@@ -394,10 +371,6 @@ impl Reorderer {
 
     pub fn deadline_notify(&self) -> Arc<Notify> {
         self.deadline_notify.clone()
-    }
-
-    pub(crate) fn repair_notify(&self) -> Arc<Notify> {
-        self.repair_notify.clone()
     }
 
     pub fn config(&self) -> &VoiceConfig {
@@ -755,10 +728,6 @@ impl Reorderer {
         let frame_seq = frame.s2s_seq;
         let sender_epoch = frame.sender_epoch;
         let now = clock();
-        // Wake the repair coordinator for every inbound frame. It will
-        // cheaply ignore healthy streams, while an open gap can be re-read
-        // immediately instead of waiting for a polling tick.
-        self.repair_notify.notify_one();
         self.prune_idle(&mut state, now);
 
         // A reactive repair cannot create a speaker stream. An original or
@@ -1244,78 +1213,6 @@ impl Reorderer {
         if self.deadline_wake_pending.swap(false, Ordering::AcqRel) {
             self.deadline_wake_ack.notify_one();
         }
-    }
-
-    pub fn gap_for_frame(&self, from: NodeIdentifier, frame: &VoiceFrame) -> Option<GapReport> {
-        if self.cfg.reorder_disabled || frame.s2s_seq == 0 {
-            return None;
-        }
-        let state = self.state.lock();
-        let entry = state.per_sender.get(&frame.sender_session)?;
-        if entry.sender_epoch != frame.sender_epoch
-            || entry.next_seq >= frame.s2s_seq
-            || !entry.pending.contains_key(&frame.s2s_seq)
-        {
-            return None;
-        }
-        Some(GapReport {
-            from,
-            sender_session: frame.sender_session,
-            sender_epoch: frame.sender_epoch,
-            first_seq: entry.next_seq,
-            last_seq: frame.s2s_seq.saturating_sub(1),
-        })
-    }
-
-    pub fn gap_still_missing(&self, gap: GapReport) -> bool {
-        let state = self.state.lock();
-        let Some(entry) = state.per_sender.get(&gap.sender_session) else {
-            return false;
-        };
-        entry.sender_epoch == gap.sender_epoch
-            && entry.next_seq <= gap.last_seq
-            && self.gap_is_live(entry, Instant::now())
-    }
-
-    /// Return the live missing range for an existing repair coordinator.
-    ///
-    /// The caller supplies the immediate peer captured when the gap opened;
-    /// sender state deliberately contains no routing information. The query
-    /// is fenced by epoch and by the original reorder deadline, and never
-    /// rearms or extends that deadline.
-    pub(crate) fn current_actionable_gap(
-        &self,
-        from: NodeIdentifier,
-        sender_session: u32,
-        sender_epoch: u64,
-    ) -> Option<ActionableGap> {
-        if self.cfg.reorder_disabled {
-            return None;
-        }
-
-        let state = self.state.lock();
-        let entry = state.per_sender.get(&sender_session)?;
-        // The repair coordinator should keep repairing until the chunk-hold
-        // deadline, not just the in-order skew tolerance.
-        let deadline = entry.gap_expires_at?;
-        if entry.sender_epoch != sender_epoch || deadline <= Instant::now() {
-            return None;
-        }
-        let first_pending = entry.pending.keys().next().copied()?;
-        if entry.next_seq >= first_pending {
-            return None;
-        }
-
-        Some(ActionableGap {
-            gap: GapReport {
-                from,
-                sender_session,
-                sender_epoch,
-                first_seq: entry.next_seq,
-                last_seq: first_pending.saturating_sub(1),
-            },
-            deadline,
-        })
     }
 
     /// Whether a FEC reconstruction of `seq` would fill a hole the reorder is
@@ -2202,17 +2099,16 @@ mod tests {
     }
 
     #[test]
-    fn gap_remains_missing_after_partial_fill() {
+    fn gap_remains_open_after_partial_fill() {
         let r = Reorderer::new(cfg());
         assert_eq!(r.push(11, frame(0xABC, 1, 0, false)).len(), 1);
-        let out_of_order = frame(0xABC, 1, 3, false);
-        assert!(r.push(11, out_of_order.clone()).is_empty());
-        let gap = r.gap_for_frame(11, &out_of_order).unwrap();
-        assert_eq!(gap.first_seq, 1);
-        assert_eq!(gap.last_seq, 2);
+        let opened = r.push_with_route_hint_report(11, frame(0xABC, 1, 3, false), None);
+        let gap = opened.opened_gap().expect("out-of-order frame opens a gap");
+        assert_eq!((gap.first_seq, gap.last_seq), (1, 2));
+        assert!(opened.into_emissions().is_empty());
 
         assert_eq!(r.push(11, frame(0xABC, 1, 1, false)).len(), 1);
-        assert!(r.gap_still_missing(gap));
+        assert_eq!(r.pending_total(), 1, "the buffered suffix waits for seq 2");
 
         let seqs: Vec<u64> = r
             .push(11, frame(0xABC, 1, 2, false))
@@ -2220,83 +2116,7 @@ mod tests {
             .map(|(_, frame)| frame.s2s_seq)
             .collect();
         assert_eq!(seqs, vec![2, 3]);
-        assert!(!r.gap_still_missing(gap));
-    }
-
-    #[test]
-    fn current_actionable_gap_tracks_successive_holes_without_extending_deadline() {
-        let mut c = cfg();
-        c.reorder_max_delay_ms = 500;
-        c.adaptive_jitter_min_delay_ms = 500;
-        c.adaptive_jitter_max_delay_ms = 500;
-        let r = Reorderer::new(c);
-        let session = 0xABC;
-
-        r.push(11, frame(session, 7, 0, false));
-        r.push(11, frame(session, 7, 3, false));
-        r.push(11, frame(session, 7, 5, false));
-
-        let initial = r
-            .current_actionable_gap(11, session, 7)
-            .expect("the first hole is actionable");
-        assert_eq!((initial.gap().first_seq, initial.gap().last_seq), (1, 2));
-        let original_deadline = initial.deadline();
-
-        assert_eq!(r.push(11, frame(session, 7, 1, false)).len(), 1);
-        let partial = r
-            .current_actionable_gap(11, session, 7)
-            .expect("the remainder of the first hole is actionable");
-        assert_eq!((partial.gap().first_seq, partial.gap().last_seq), (2, 2));
-        assert_eq!(partial.deadline(), original_deadline);
-
-        assert_eq!(
-            r.push(11, frame(session, 7, 2, false))
-                .iter()
-                .map(|(_, frame)| frame.s2s_seq)
-                .collect::<Vec<_>>(),
-            vec![2, 3]
-        );
-        let later = r
-            .current_actionable_gap(11, session, 7)
-            .expect("the later hole under the same deadline is actionable");
-        assert_eq!((later.gap().first_seq, later.gap().last_seq), (4, 4));
-        assert_eq!(later.deadline(), original_deadline);
-    }
-
-    #[test]
-    fn current_actionable_gap_rejects_closed_expired_and_old_epoch_state() {
-        let session = 0xABC;
-
-        let r = Reorderer::new(cfg());
-        r.push(11, frame(session, 1, 0, false));
-        r.push(11, frame(session, 1, 2, false));
-        assert!(r.current_actionable_gap(11, session, 1).is_some());
-        r.push(11, frame(session, 1, 1, false));
-        assert!(r.current_actionable_gap(11, session, 1).is_none());
-
-        r.push(11, frame(session, 1, 4, false));
-        assert!(r.current_actionable_gap(11, session, 1).is_some());
-        r.push(11, frame(session, 2, 0, false));
-        assert!(r.current_actionable_gap(11, session, 1).is_none());
-
-        let mut c = cfg();
-        c.reorder_max_delay_ms = 5;
-        c.adaptive_jitter_min_delay_ms = 5;
-        c.adaptive_jitter_max_delay_ms = 5;
-        // Tiny hold budget: by the time the sleep elapses both the skew
-        // tolerance and the chunk-hold window have passed, so the gap is
-        // permanently missed.
-        c.chunk_hold_budget_ms = 2;
-        let expired = Reorderer::new(c);
-        expired.push(11, frame(session, 3, 0, false));
-        let out_of_order = frame(session, 3, 2, false);
-        expired.push(11, out_of_order.clone());
-        let opened = expired
-            .gap_for_frame(11, &out_of_order)
-            .expect("gap exists before its deadline");
-        std::thread::sleep(Duration::from_millis(10));
-        assert!(expired.current_actionable_gap(11, session, 3).is_none());
-        assert!(!expired.gap_still_missing(opened));
+        assert_eq!(r.pending_total(), 0);
     }
 
     #[test]
@@ -2768,10 +2588,6 @@ mod tests {
             .into_emissions()
             .is_empty()
         );
-        let gap = r
-            .current_actionable_gap(11, 0xABC, 1)
-            .expect("the repair worker sees the bounded deadline");
-        assert_eq!(gap.deadline(), start + Duration::from_millis(108));
         assert!(
             r.drain_expired_at(start + Duration::from_millis(107))
                 .into_emissions()
@@ -2826,10 +2642,6 @@ mod tests {
             vec![1, 2]
         );
         let expiry = start + Duration::from_millis(108);
-        assert_eq!(
-            r.current_actionable_gap(11, 0xABC, 1).unwrap().deadline(),
-            expiry
-        );
         // An expired repair triggers delivery of the remaining suffix, but
         // the missing packet itself can no longer join the stream.
         let emitted = r

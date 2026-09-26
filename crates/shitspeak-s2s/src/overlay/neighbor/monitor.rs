@@ -665,6 +665,9 @@ impl NeighborMonitor {
             }
             (!was_up, restarted)
         };
+        if became_up || restarted {
+            self.transport.forget_address_failures(from);
+        }
         if became_up {
             debug!(peer=%from, "direct link up");
             self.on_change.notify_one();
@@ -747,6 +750,9 @@ impl NeighborMonitor {
             self.transport.record_peer_rtt(from, kind, rtt);
         }
         let became_up = !was_up;
+        if became_up || restarted {
+            self.transport.forget_address_failures(from);
+        }
         if became_up {
             debug!(peer=%from, ?rtt, "direct link up");
             self.on_change.notify_one();

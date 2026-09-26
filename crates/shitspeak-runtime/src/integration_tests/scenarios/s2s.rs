@@ -3486,10 +3486,10 @@ async fn s2s_root_children_shout_uses_tree_delivery_budget() {
 async fn run_s2s_root_children_shout_traffic(tree_delivery_enabled: bool) {
     // This scenario measures traffic amplification across a six-node tree.
     // Its receive assertions are not a low-latency playout contract, so give
-    // reactive repair enough room to absorb host scheduler contention during a
+    // late frames enough room to absorb host scheduler contention during a
     // full runtime run without relaxing the delivered-frame budget. The
-    // enlarged test-only reorder buffer holds the 20 ms stream while a valid
-    // repair completes instead of dropping its suffix, while leaving room
+    // enlarged test-only reorder buffer holds the 20 ms stream while a late
+    // frame arrives instead of dropping its suffix, while leaving room
     // before the receive timeout for a deadline flush.
     let cluster = spawn_s2s_convergence_cluster_with_voice_options(
         tree_delivery_enabled,

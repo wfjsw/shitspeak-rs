@@ -274,10 +274,8 @@ When `s2s.persistence_dir` is configured, the latest learned adaptive compressio
 
 Voice repair uses one conserved global currency: each encoded original byte
 mints one quarter-byte of repair credit only after the aggregate primary send is
-accepted. A failed primary send mints nothing. Proactive copies, NACK responses,
-tail attempts, and their retries all pay their encoded payload size from that
-ledger. The proactive/reactive entitlements, protected reactive reserve, and
-borrowing rules partition this credit; none of them creates a second mint.
+accepted. A failed primary send mints nothing. Proactive copies pay their
+encoded payload size from that ledger. FEC parity is not charged to it.
 
 Proactive first copies receive a small deterministic destination-fair phase.
 Shared overflow then ranks candidates by marginal utility per byte, combining
@@ -294,31 +292,10 @@ on-time arrival remain estimates: a different first hop does not prove
 downstream independence, and no repair delivery ACK is available to this
 allocator.
 
-Reactive permits are scheduled per encoded frame. Each destination is ordered
-by earliest deadline, while deterministic byte-deficit round robin shares
-service across destinations and a per-destination epoch cap defers excess retry
-traffic. Temporary credit exhaustion parks rather than sheds live work, and
-only a delivered permit advances fairness/retry accounting. NACKs carry the
-requester's remaining actionable-gap time as a relative duration; the responder
-bounds it locally and applies it to permit waiting and send attempts. This
-requires no synchronized clock, but it also cannot subtract request-path transit
-time and therefore does not guarantee receiver-side on-time delivery.
-Aggregate scheduler metrics expose queued items/bytes, active destinations,
-oldest wait, maximum starvation rounds, and bounded grant/wait/defer/expiry/
-cancellation/shutdown events without per-request label cardinality.
-
-NACK ranges and tail suffixes advance one frame at a time. The current frame
-from every ready key enters the shared allocator before transport concurrency
-is applied, then a successful frame requeues the next sequence behind other
-ready work. Deferred retries and temporarily unaffordable large frames are
-skipped while eligible fresh or smaller same-destination work is considered.
-Actual transport sends remain bounded and same-destination repair sends remain
-serialized.
-
-Tail repair uses protected reactive credit, primary sender admission, and a
-separate sender pressure lane. It remains proactive-marked at the receiver,
-because no later frame exists to open a reorder gap for a lost terminator. Tail
-is consequently not yet a fully isolated reactive receiver path.
+Reactive (NACK-driven) repair and terminal-tail retransmission were removed:
+a request/response round trip never lands before the listener needs the
+audio. Nodes still accept and discard repair requests and tail acknowledgements
+from older peers during a rolling upgrade.
 
 ## Status Page And Metrics
 

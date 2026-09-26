@@ -3246,7 +3246,6 @@ mod tests {
         assert_eq!(kcp.no_progress_close(), Duration::from_millis(789));
         assert_eq!(cfg.application.voice.transport_ttl_ms(), 180);
         assert_eq!(cfg.application.voice.repair_transport_ttl_ms, 300);
-        assert_eq!(cfg.application.voice.repair_request_ttl_ms, 300);
         assert_eq!(
             transport.compression_dictionary_len(),
             Some(dictionary.len())

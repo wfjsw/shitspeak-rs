@@ -726,10 +726,6 @@ adaptive_jitter_decay_step_ms = 10
 repair_enabled = true
 transport_ttl_ms = 1500
 repair_transport_ttl_ms = 1500
-# Transport TTL for the NACK itself; defaults to repair_transport_ttl_ms. The
-# payload separately carries the requester's remaining actionable gap time as
-# a relative response deadline.
-repair_request_ttl_ms = 1500
 repair_cache_ms = 3000
 repair_loss_start_ppm = 10000
 repair_full_dup_loss_ppm = 30000
@@ -738,11 +734,6 @@ repair_jitter_start_ms = 40
 # This caps demand; conserved-credit overflow is ranked separately by marginal
 # on-time utility and destination fairness.
 repair_max_extra_copies_per_frame = 1
-# Percentages of the repair-credit cap. Unused reactive entitlement above the
-# hard reserve is borrowable by proactive work. NACK and tail frames share a
-# deadline-aware, byte-fair reactive scheduler; these are not separate mints.
-repair_reactive_reserve_pct = 30
-repair_reactive_hard_reserve_pct = 10
 # Interleaved Reed-Solomon FEC on unreliable voice links. Consecutive frames
 # are dealt across voice_fec_interleave_depth blocks; each block of
 # voice_fec_block_size frames gets voice_fec_parity_blocks parity frames, and
@@ -955,21 +946,24 @@ that, clamped to `32 KiB..512 KiB`; tracked reorder speakers are
 2.5 MiB primary lane, 320 KiB proactive lane, 10,000 tracked speakers, and an
 80 KiB proactive burst. A capacity decrease blocks only future admission.
 
-Originals and reactive repairs use the primary lane. Proactive copies use the
-lower-priority lane and are shed before primary traffic when capacity is
-exhausted. An original mints one conserved repair byte for every four encoded
-original bytes only after the aggregate primary transport accepts the send. A
-failed primary send mints no credit and queues no proactive or tail repair.
-Proactive and reactive payloads both pay their encoded byte size from the same
-25% mint, which remains capped by the dynamic burst.
+Originals and repair copies from the overlay's tree repair use the primary
+lane. Proactive copies use the lower-priority lane and are shed before primary
+traffic when capacity is exhausted. An original mints one conserved repair byte
+for every four encoded original bytes only after the aggregate primary
+transport accepts the send. A failed primary send mints no credit and queues no
+proactive copy. Proactive copies pay their encoded byte size from that mint,
+which remains capped by the dynamic burst. Configure
+`repair_max_extra_copies_per_frame` only in the supported `0..2` range.
 
-`repair_reactive_reserve_pct` (30 by default) is the reactive/tail entitlement
-as a percentage of the total repair mint; the remainder is proactive
-entitlement. Proactive work may borrow unused reactive entitlement, except for
-`repair_reactive_hard_reserve_pct` (10 by default), and stops borrowing when
-reactive demand appears. The hard reserve must not exceed the reactive reserve,
-and neither may exceed 100. Configure `repair_max_extra_copies_per_frame` only
-in the supported `0..2` range.
+Reactive (NACK-driven) voice repair and terminal-tail retransmission were
+removed: a request/response round trip cannot arrive before the listener needs
+the audio, so FEC and proactive copies carry loss recovery instead.
+`repair_request_ttl_ms`, `repair_reactive_reserve_pct`, and
+`repair_reactive_hard_reserve_pct` are accepted as ignored no-ops for one
+release and should be removed from deployment configuration. Nodes still
+accept and discard repair requests and tail acknowledgements from older peers
+during a rolling upgrade; an older sender's tail retries stop after their
+bounded attempt limit because newer receivers never acknowledge them.
 
 `strict_bootstrap_retry_interval_ms` gates strict startup and partition-heal
 history-election retries. `strict_steady_state_catchup_interval_ms` is the
@@ -983,18 +977,18 @@ loss. Observed gaps and stalls are additional repair signals.
 compatibility; owner replication frames are retained on an end-to-end
 acknowledged overlay lane between repair events.
 
-`transport_ttl_ms`, `repair_transport_ttl_ms`, and `repair_request_ttl_ms` are
-the remote S2S voice delivery budget. They are not a local listener playout
-delay. Set all three explicitly when the deployment includes long-haul links;
-the tracked long-haul profile uses `1500` ms. `repair_cache_ms` must cover that
-delivery window and the time needed to request a repair; it is `3000` ms in the
-deployment configuration. Receiver waiting is capped separately by
+`transport_ttl_ms` and `repair_transport_ttl_ms` are the remote S2S voice
+delivery budget. They are not a local listener playout delay. Set both
+explicitly when the deployment includes long-haul links; the tracked long-haul
+profile uses `1500` ms. `repair_cache_ms` bounds the route-aware wait the
+reorder gives a gap; it is `3000` ms in the deployment configuration. Receiver
+waiting is capped separately by
 `adaptive_jitter_max_delay_ms` (120 ms by default), including route-quality
 extensions and `chunk_hold_budget_ms`. This cap applies even with adaptation
 disabled and is raised to `adaptive_jitter_min_delay_ms` if configured lower.
 The optional extra hold defaults to zero. Older configurations with a 600 ms
 extra hold are also subject to the total cap. Increasing transport TTLs or
-repair-cache retention does not extend receiver waiting.
+`repair_cache_ms` does not extend receiver waiting.
 
 Once a speaker starts delivering, the next buffer drain is due within 90% of
 the last emitted Opus packet's duration (18 ms for a 20 ms packet), leaving
@@ -1062,15 +1056,6 @@ wire indices start at 2. Peers built before this scheme use indices 0 and 1
 and ignore these frames, and this build ignores theirs, so mixed versions
 fall back to no FEC between them and never mis-decode each other's parity.
 
-Reactive repair responses and terminal retries compete for credit on the primary and
-alternate first hops when an alternate is available. An unfunded alternate
-does not block a funded primary until the response expires. Only the selected
-route sends a copy; unused reservations are refunded. Relayed terminal retries
-charge the selected first hop's bucket. The
-`shitspeak_s2s_voice_repair_events_total` results `primary_credit_selected` and
-`alternate_credit_selected` expose this choice. `frame_served` records send
-acceptance; receiver `reactive` gap resolutions confirm useful recovery.
-
 Remote voice is released immediately after S2S sequence ordering. The server
 buffers only an observed sequence gap for its short per-speaker repair window;
 clients own media pacing and jitter buffering. Legacy
@@ -1100,8 +1085,7 @@ directed edge without adding group or tree-version label cardinality.
 Adaptive voice protection observability uses bounded labels.
 `shitspeak_s2s_voice_ingress_admission_drops_total` retains the bounded `class`
 label, while `shitspeak_s2s_voice_proactive_events_total` uses bounded `kind`
-and `result` labels to distinguish ordinary copies from terminal-tail work and
-credit exhaustion from queue pressure. Grafana shows proactive queue and credit
+and `result` labels to distinguish credit exhaustion from queue pressure. Grafana shows proactive queue and credit
 utilization per node because those limits are enforced locally.
 `shitspeak_s2s_voice_receive_events_total{result="speaker_state_drop"}` reports
 a dynamic speaker-cap admission refusal.
@@ -1118,8 +1102,9 @@ the kind of copy that arrived: `original`, `proactive`, `fec`, or `repair`.
 - `late_after_release`: the frame arrived after a deadline flush released past
   its sequence, so listeners never heard it.
 - `already_buffered`: an equal or better copy was already waiting.
-- `repair_without_gap`, `repair_without_stream`: a reactive repair arrived with
-  no open gap, or for a speaker with no stream.
+- `repair_without_gap`, `repair_without_stream`: a repair copy (overlay tree
+  repair, or an older peer's reactive repair) arrived with no open gap, or for
+  a speaker with no stream.
 - `stale_epoch`: the frame is from an older sender epoch, or is a non-original
   copy of a newer one.
 - `untracked`: the sequence is below the cursor and older than the last 128
@@ -1128,29 +1113,18 @@ the kind of copy that arrived: `original`, `proactive`, `fec`, or `repair`.
 Only `late_after_release` is audio the listener missed. The other reasons are
 redundancy or protocol noise.
 
-The hierarchical allocator exports conserved credit lifecycle bytes through
-`shitspeak_s2s_voice_repair_credit_bytes_total{stage}`, and proactive versus
-reactive allocation through
-`shitspeak_s2s_voice_repair_allocator_class_bytes_total{class,stage}`. Fair
-allocation is visible through
+The allocator exports conserved credit lifecycle bytes through
+`shitspeak_s2s_voice_repair_credit_bytes_total{stage}`, and proactive
+allocation through
+`shitspeak_s2s_voice_repair_allocator_class_bytes_total{class="proactive",stage}`.
+Fair allocation is visible through
 `shitspeak_s2s_voice_repair_allocator_destination_bytes_total{peer,stage}`.
 `peer` is the bounded `u16` cluster node identity; session, user, address, and
-channel identifiers are never labels. Current balances, reserve, directional
-debt to each repair class, and active destination count are exported as
-allocator gauges. Borrowing and repayment totals remain class-stage counters.
-Lifecycle counters preserve the ledger's quarter-byte precision, so their
+channel identifiers are never labels. The available balance
+(`shitspeak_s2s_voice_repair_allocator_state_bytes{state="proactive_balance"}`)
+and active destination count are exported as allocator gauges. Lifecycle
+counters preserve the ledger's quarter-byte precision, so their
 Prometheus values may have `.25`, `.5`, or `.75` fractional byte components.
-
-Reactive scheduler observability uses the bounded counter
-`shitspeak_s2s_voice_reactive_scheduler_events_total{event}`, where `event` is
-one of `granted`, `credit_wait`, `retry_deferred`, `deadline_expired`,
-`cancelled`, or `shutdown`. Unlabeled gauges report aggregate
-`shitspeak_s2s_voice_reactive_scheduler_queued_items`,
-`shitspeak_s2s_voice_reactive_scheduler_queued_encoded_bytes`,
-`shitspeak_s2s_voice_reactive_scheduler_active_destinations`,
-`shitspeak_s2s_voice_reactive_scheduler_oldest_wait_microseconds`, and
-`shitspeak_s2s_voice_reactive_scheduler_max_starvation_rounds`. They expose
-bounded allocator health without adding session, request, or destination labels.
 
 The exact ledger invariant, evaluated in quarter-byte units, is
 `minted = available + tentatively_reserved + committed + cap_discarded`.
@@ -1186,51 +1160,6 @@ and the route-quality snapshot cannot observe the receiver's actual arrival
 time. The alternate's measured latency, loss, and jitter estimate on-time
 benefit; they are not delivery acknowledgements. A second copy can therefore
 still traverse correlated underlay even though its marginal utility is lower.
-
-Reactive NACK responses and tail attempts pay exact full-byte credit and enter
-one per-frame scheduler before receiving a tentative permit. Frames are EDF
-within each destination. Across destinations, byte-deficit round robin uses a
-1200-byte quantum and orders peers by least-recent actual grant, then node ID,
-so a stream of small frames cannot monopolize service merely by producing more
-requests. Retry traffic is bounded per destination in each 100 ms epoch to half
-of that destination's active share of reactive capacity, with a one-quantum
-minimum. Over-cap retries defer rather than being shed. Temporary credit
-exhaustion parks work until mint, refund, a new request, the next retry epoch,
-or its absolute local deadline. Only an actual permit advances service and
-retry accounting. Expired work receives no permit; transport timeout,
-rejection, or cancellation refunds tentative credit, and every retry must
-obtain a new permit. This is destination-fair EDF, not global EDF across all
-peers.
-
-NACK ranges and tail suffixes advance one frame at a time. The current frame
-from every ready key reaches the shared permit scheduler before transport
-concurrency is applied; a successful frame then requeues the next sequence
-behind other ready work. Retry-cap deferral and an unaffordable large request
-do not hide eligible fresh or smaller work for the same destination. Actual
-transport attempts remain bounded, with at most one repair send per destination
-in flight.
-
-A repair requester writes its remaining local actionable-gap window into the
-NACK as a relative duration. On receipt, the responder creates a local deadline
-bounded by its configured repair transport/cache lifetime, merges overlapping
-requests using the earliest such deadline, and applies the deadline to each
-frame and transport attempt. This avoids shared-clock assumptions, but time
-spent carrying the request over the network is not subtracted from the encoded
-duration. The deadline is therefore a bounded scheduling hint, not proof that a
-repair will reach the receiver before playout.
-
-Tail repair has protected reactive credit, primary sender admission, separate
-sender pressure state, and bounded concurrent dispatch. It intentionally stays
-proactive-marked on the wire: a healthy reorder stream rejects ordinary
-reactive repair when no gap has been observed, while a tail terminator has no
-later packet that could reveal its loss. Consequently tail repair is not yet a
-fully isolated reactive receiver lane even though its sender-side scheduling
-and accounting are reactive.
-
-There is deliberately no unminted startup seed. During cold start, the first
-full-frame NACK may therefore be credit-shed until accepted originals have
-accumulated enough repair credit. This preserves the exact 25% payload ceiling
-instead of hiding startup repair bytes outside the ledger.
 
 See [Clustering](clustering.md) for certificate generation, local demos, and S2S operational notes.
 

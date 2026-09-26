@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::sync::{LazyLock, Mutex};
 
 use shitspeak_core::NodeIdentifier;
 
@@ -31,45 +30,6 @@ const BYTE_BUCKETS: [(&str, u64); 8] = [
 
 static METRICS: LazyLock<Mutex<VoiceAppMetrics>> =
     LazyLock::new(|| Mutex::new(VoiceAppMetrics::default()));
-static REPAIR_CACHE_SOURCES: LazyLock<Mutex<Vec<Weak<dyn RepairCacheTelemetrySource>>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
-
-pub(crate) trait RepairCacheTelemetrySource: Send + Sync {
-    fn snapshot(&self, now: Instant) -> (usize, usize);
-}
-
-pub(crate) fn register_repair_cache_telemetry_source(source: Arc<dyn RepairCacheTelemetrySource>) {
-    REPAIR_CACHE_SOURCES
-        .lock()
-        .unwrap()
-        .push(Arc::downgrade(&source));
-}
-
-fn repair_cache_telemetry_snapshot() -> (usize, usize) {
-    let sources = {
-        let mut registry = REPAIR_CACHE_SOURCES.lock().unwrap();
-        let mut sources = Vec::with_capacity(registry.len());
-        registry.retain(|source| {
-            let Some(source) = source.upgrade() else {
-                return false;
-            };
-            sources.push(source);
-            true
-        });
-        sources
-    };
-    let now = Instant::now();
-    sources.into_iter().map(|source| source.snapshot(now)).fold(
-        (0_usize, 0_usize),
-        |(occupancy, capacity), next| {
-            (
-                occupancy.saturating_add(next.0),
-                capacity.saturating_add(next.1),
-            )
-        },
-    )
-}
-
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum VoiceSendMode {
     Broadcast,
@@ -153,9 +113,10 @@ pub(crate) enum DuplicateReason {
     /// From an older sender epoch, or a non-original copy of a newer one
     /// (only an original may restart a stream).
     StaleEpoch,
-    /// A reactive repair for a speaker with no stream state.
+    /// A repair copy (overlay tree repair, or an older peer's reactive
+    /// repair) for a speaker with no stream state.
     RepairWithoutStream,
-    /// A reactive repair while no gap was open.
+    /// A repair copy while no gap was open.
     RepairWithoutGap,
     /// An equal or better copy of the same sequence was already buffered.
     AlreadyBuffered,
@@ -271,14 +232,12 @@ impl VoiceDeadlineWakeResult {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum VoiceProactiveKind {
     Ordinary,
-    Tail,
 }
 
 impl VoiceProactiveKind {
     fn label(self) -> &'static str {
         match self {
             Self::Ordinary => "ordinary",
-            Self::Tail => "tail",
         }
     }
 }
@@ -315,25 +274,8 @@ impl RepairCreditStage {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub(crate) enum RepairBudgetClass {
-    Proactive,
-    Reactive,
-}
-
-impl RepairBudgetClass {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Proactive => "proactive",
-            Self::Reactive => "reactive",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum RepairClassStage {
     Granted,
-    Borrowed,
-    Repaid,
     Attempted,
     Sent,
     Shed,
@@ -343,8 +285,6 @@ impl RepairClassStage {
     fn label(self) -> &'static str {
         match self {
             Self::Granted => "granted",
-            Self::Borrowed => "borrowed",
-            Self::Repaid => "repaid",
             Self::Attempted => "attempted",
             Self::Sent => "sent",
             Self::Shed => "shed",
@@ -360,33 +300,6 @@ pub(crate) enum RepairDestinationStage {
     Attempted,
     Sent,
     Shed,
-}
-
-/// Bounded outcomes emitted by the reactive repair scheduler.
-///
-/// Keep this label set independent of peers, requests, and retry numbers so
-/// scheduler pressure remains safe to export from large clusters.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub(crate) enum ReactiveSchedulerEvent {
-    Granted,
-    CreditWait,
-    RetryDeferred,
-    DeadlineExpired,
-    Cancelled,
-    Shutdown,
-}
-
-impl ReactiveSchedulerEvent {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Granted => "granted",
-            Self::CreditWait => "credit_wait",
-            Self::RetryDeferred => "retry_deferred",
-            Self::DeadlineExpired => "deadline_expired",
-            Self::Cancelled => "cancelled",
-            Self::Shutdown => "shutdown",
-        }
-    }
 }
 
 impl RepairDestinationStage {
@@ -417,37 +330,13 @@ impl VoiceProactiveResult {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum VoiceRepairResult {
-    GapDetected,
-    RequestScheduled,
-    RequestSent,
-    RequestFailed,
-    RequestSuppressed,
-    FrameServed,
-    FrameSendFailed,
-    FrameMissed,
-    AlternateCreditSelected,
     ProactiveCopySent,
-    TailAckSent,
-    TailAckReceived,
-    TailRetrySent,
 }
 
 impl VoiceRepairResult {
     fn label(self) -> &'static str {
         match self {
-            Self::GapDetected => "gap_detected",
-            Self::RequestScheduled => "request_scheduled",
-            Self::RequestSent => "request_sent",
-            Self::RequestFailed => "request_failed",
-            Self::RequestSuppressed => "request_suppressed",
-            Self::FrameServed => "frame_served",
-            Self::FrameSendFailed => "frame_send_failed",
-            Self::FrameMissed => "frame_missed",
-            Self::AlternateCreditSelected => "alternate_credit_selected",
             Self::ProactiveCopySent => "proactive_copy_sent",
-            Self::TailAckSent => "tail_ack_sent",
-            Self::TailAckReceived => "tail_ack_received",
-            Self::TailRetrySent => "tail_retry_sent",
         }
     }
 }
@@ -499,27 +388,9 @@ struct ProactiveBudget {
 }
 
 #[derive(Debug, Default)]
-struct RepairCacheTelemetry {
-    evictions: u64,
-}
-
-#[derive(Debug, Default)]
 struct RepairAllocatorState {
     proactive_balance_bytes: u64,
-    reactive_balance_bytes: u64,
-    hard_reserve_bytes: u64,
-    debt_to_reactive_bytes: u64,
-    debt_to_proactive_bytes: u64,
     active_destinations: u64,
-}
-
-#[derive(Debug, Default)]
-struct ReactiveSchedulerState {
-    queued_items: u64,
-    queued_encoded_bytes: u64,
-    active_destinations: u64,
-    oldest_wait_microseconds: u64,
-    max_starvation_rounds: u64,
 }
 
 #[derive(Debug, Default)]
@@ -543,13 +414,10 @@ struct VoiceAppMetrics {
     gaps_opened: HashMap<&'static str, u64>,
     proactive_budget: ProactiveBudget,
     proactive_outcomes: HashMap<(VoiceProactiveKind, VoiceProactiveResult), u64>,
-    repair_cache: RepairCacheTelemetry,
     repair_credit_quarters: HashMap<RepairCreditStage, u64>,
-    repair_class_bytes: HashMap<(RepairBudgetClass, RepairClassStage), u64>,
+    repair_class_bytes: HashMap<RepairClassStage, u64>,
     repair_destination_bytes: HashMap<(NodeIdentifier, RepairDestinationStage), u64>,
     repair_allocator_state: RepairAllocatorState,
-    reactive_scheduler_events: HashMap<ReactiveSchedulerEvent, u64>,
-    reactive_scheduler_state: ReactiveSchedulerState,
 }
 
 pub(crate) fn record_send(
@@ -728,14 +596,6 @@ pub(crate) fn record_proactive_outcome(kind: VoiceProactiveKind, result: VoicePr
         .or_default() += 1;
 }
 
-pub(crate) fn record_repair_cache_evictions(count: u64) {
-    if count == 0 {
-        return;
-    }
-    let mut metrics = METRICS.lock().unwrap();
-    metrics.repair_cache.evictions = metrics.repair_cache.evictions.saturating_add(count);
-}
-
 pub(crate) fn record_repair_credit_quarters(stage: RepairCreditStage, quarters: usize) {
     if quarters == 0 {
         return;
@@ -745,19 +605,12 @@ pub(crate) fn record_repair_credit_quarters(stage: RepairCreditStage, quarters: 
     *total = total.saturating_add(quarters as u64);
 }
 
-pub(crate) fn record_repair_class_bytes(
-    class: RepairBudgetClass,
-    stage: RepairClassStage,
-    bytes: usize,
-) {
+pub(crate) fn record_repair_class_bytes(stage: RepairClassStage, bytes: usize) {
     if bytes == 0 {
         return;
     }
     let mut metrics = METRICS.lock().unwrap();
-    let total = metrics
-        .repair_class_bytes
-        .entry((class, stage))
-        .or_default();
+    let total = metrics.repair_class_bytes.entry(stage).or_default();
     *total = total.saturating_add(bytes as u64);
 }
 
@@ -779,56 +632,18 @@ pub(crate) fn record_repair_destination_bytes(
     *total = total.saturating_add(bytes as u64);
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn set_repair_allocator_state(
     proactive_balance_bytes: usize,
-    reactive_balance_bytes: usize,
-    hard_reserve_bytes: usize,
-    debt_to_reactive_bytes: usize,
-    debt_to_proactive_bytes: usize,
     active_destinations: usize,
 ) {
     let mut metrics = METRICS.lock().unwrap();
     metrics.repair_allocator_state = RepairAllocatorState {
         proactive_balance_bytes: proactive_balance_bytes as u64,
-        reactive_balance_bytes: reactive_balance_bytes as u64,
-        hard_reserve_bytes: hard_reserve_bytes as u64,
-        debt_to_reactive_bytes: debt_to_reactive_bytes as u64,
-        debt_to_proactive_bytes: debt_to_proactive_bytes as u64,
         active_destinations: active_destinations as u64,
-    };
-}
-
-pub(crate) fn record_reactive_scheduler_event(event: ReactiveSchedulerEvent) {
-    let mut metrics = METRICS.lock().unwrap();
-    let total = metrics.reactive_scheduler_events.entry(event).or_default();
-    *total = total.saturating_add(1);
-}
-
-/// Replaces the aggregate reactive scheduler gauges with one consistent
-/// snapshot. An empty queue should pass `None` for `oldest_wait`.
-pub(crate) fn set_reactive_scheduler_state(
-    queued_items: usize,
-    queued_encoded_bytes: usize,
-    active_destinations: usize,
-    oldest_wait: Option<Duration>,
-    max_starvation_rounds: usize,
-) {
-    let oldest_wait_microseconds = oldest_wait
-        .map(|wait| u64::try_from(wait.as_micros()).unwrap_or(u64::MAX))
-        .unwrap_or_default();
-    let mut metrics = METRICS.lock().unwrap();
-    metrics.reactive_scheduler_state = ReactiveSchedulerState {
-        queued_items: queued_items as u64,
-        queued_encoded_bytes: queued_encoded_bytes as u64,
-        active_destinations: active_destinations as u64,
-        oldest_wait_microseconds,
-        max_starvation_rounds: max_starvation_rounds as u64,
     };
 }
 
 pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
-    let (repair_cache_occupancy, repair_cache_capacity) = repair_cache_telemetry_snapshot();
     let metrics = METRICS.lock().unwrap();
     let mut out = Vec::new();
 
@@ -1027,21 +842,6 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             *count as f64,
         ));
     }
-    out.push(PrometheusSample::new(
-        "shitspeak_s2s_voice_repair_cache_occupancy",
-        Vec::new(),
-        repair_cache_occupancy as f64,
-    ));
-    out.push(PrometheusSample::new(
-        "shitspeak_s2s_voice_repair_cache_capacity",
-        Vec::new(),
-        repair_cache_capacity as f64,
-    ));
-    out.push(PrometheusSample::new(
-        "shitspeak_s2s_voice_repair_cache_evictions_total",
-        Vec::new(),
-        metrics.repair_cache.evictions as f64,
-    ));
     for (stage, quarters) in &metrics.repair_credit_quarters {
         out.push(PrometheusSample::new(
             "shitspeak_s2s_voice_repair_credit_bytes_total",
@@ -1049,11 +849,11 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
             *quarters as f64 / 4.0,
         ));
     }
-    for ((class, stage), bytes) in &metrics.repair_class_bytes {
+    for (stage, bytes) in &metrics.repair_class_bytes {
         out.push(PrometheusSample::new(
             "shitspeak_s2s_voice_repair_allocator_class_bytes_total",
             vec![
-                ("class".to_owned(), class.label().to_owned()),
+                ("class".to_owned(), "proactive".to_owned()),
                 ("stage".to_owned(), stage.label().to_owned()),
             ],
             *bytes as f64,
@@ -1070,56 +870,16 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         ));
     }
     let allocator = &metrics.repair_allocator_state;
-    for (state, bytes) in [
-        ("proactive_balance", allocator.proactive_balance_bytes),
-        ("reactive_balance", allocator.reactive_balance_bytes),
-        ("hard_reserve", allocator.hard_reserve_bytes),
-        ("debt_to_reactive", allocator.debt_to_reactive_bytes),
-        ("debt_to_proactive", allocator.debt_to_proactive_bytes),
-    ] {
-        out.push(PrometheusSample::new(
-            "shitspeak_s2s_voice_repair_allocator_state_bytes",
-            vec![("state".to_owned(), state.to_owned())],
-            bytes as f64,
-        ));
-    }
+    out.push(PrometheusSample::new(
+        "shitspeak_s2s_voice_repair_allocator_state_bytes",
+        vec![("state".to_owned(), "proactive_balance".to_owned())],
+        allocator.proactive_balance_bytes as f64,
+    ));
     out.push(PrometheusSample::new(
         "shitspeak_s2s_voice_repair_allocator_active_destinations",
         Vec::new(),
         allocator.active_destinations as f64,
     ));
-    for (event, count) in &metrics.reactive_scheduler_events {
-        out.push(PrometheusSample::new(
-            "shitspeak_s2s_voice_reactive_scheduler_events_total",
-            vec![("event".to_owned(), event.label().to_owned())],
-            *count as f64,
-        ));
-    }
-    let reactive = &metrics.reactive_scheduler_state;
-    for (name, value) in [
-        (
-            "shitspeak_s2s_voice_reactive_scheduler_queued_items",
-            reactive.queued_items,
-        ),
-        (
-            "shitspeak_s2s_voice_reactive_scheduler_queued_encoded_bytes",
-            reactive.queued_encoded_bytes,
-        ),
-        (
-            "shitspeak_s2s_voice_reactive_scheduler_active_destinations",
-            reactive.active_destinations,
-        ),
-        (
-            "shitspeak_s2s_voice_reactive_scheduler_oldest_wait_microseconds",
-            reactive.oldest_wait_microseconds,
-        ),
-        (
-            "shitspeak_s2s_voice_reactive_scheduler_max_starvation_rounds",
-            reactive.max_starvation_rounds,
-        ),
-    ] {
-        out.push(PrometheusSample::new(name, Vec::new(), value as f64));
-    }
 
     out
 }
@@ -1187,9 +947,7 @@ mod tests {
     #[test]
     fn receive_repair_and_pending_metrics_use_bounded_labels() {
         record_receive(4094, 4093, 4092, VoiceReceiveResult::GapBuffered, 3);
-        record_repair(4094, 4092, VoiceRepairResult::RequestSuppressed, 2);
-        record_repair(4094, 4092, VoiceRepairResult::RequestFailed, 1);
-        record_repair(4094, 4092, VoiceRepairResult::FrameSendFailed, 1);
+        record_repair(4094, 4092, VoiceRepairResult::ProactiveCopySent, 2);
         set_reorder_pending(4094, 9);
 
         let receive = find_sample(
@@ -1210,22 +968,12 @@ mod tests {
             &[
                 ("source", "4094"),
                 ("peer", "4092"),
-                ("result", "request_suppressed"),
+                ("result", "proactive_copy_sent"),
             ],
         )
         .expect("repair sample");
         assert!(repair.value() >= 2.0);
         assert_no_unbounded_voice_labels(&repair);
-
-        for result in ["request_failed", "frame_send_failed"] {
-            let failure = find_sample(
-                "shitspeak_s2s_voice_repair_events_total",
-                &[("source", "4094"), ("peer", "4092"), ("result", result)],
-            )
-            .expect("explicit repair failure sample");
-            assert!(failure.value() >= 1.0);
-            assert_no_unbounded_voice_labels(&failure);
-        }
 
         let pending = find_sample("shitspeak_s2s_voice_reorder_pending", &[("source", "4094")])
             .expect("pending gauge");
@@ -1286,7 +1034,6 @@ mod tests {
         record_deadline_wake(VoiceDeadlineWakeResult::Coalesced);
         set_proactive_queue_budget(320_000, 65_536);
         set_proactive_credit(32_768, 80_000);
-        record_repair_cache_evictions(3);
         record_proactive_outcome(VoiceProactiveKind::Ordinary, VoiceProactiveResult::Queued);
         record_proactive_outcome(VoiceProactiveKind::Ordinary, VoiceProactiveResult::Sent);
         record_proactive_outcome(
@@ -1305,7 +1052,6 @@ mod tests {
             VoiceProactiveKind::Ordinary,
             VoiceProactiveResult::SendFailed,
         );
-        record_proactive_outcome(VoiceProactiveKind::Tail, VoiceProactiveResult::Sent);
 
         let primary_drop = find_sample(
             "shitspeak_s2s_voice_ingress_admission_drops_total",
@@ -1377,25 +1123,6 @@ mod tests {
             .expect("distinct proactive budget outcome");
             assert!(shed.value() >= 1.0);
         }
-        let tail_sent = find_sample(
-            "shitspeak_s2s_voice_proactive_events_total",
-            &[("kind", "tail"), ("result", "sent")],
-        )
-        .expect("tail proactive outcome");
-        assert!(tail_sent.value() >= 1.0);
-
-        let repair_cache_occupancy = find_sample("shitspeak_s2s_voice_repair_cache_occupancy", &[])
-            .expect("repair cache occupancy");
-        assert!(repair_cache_occupancy.value() >= 0.0);
-        assert!(repair_cache_occupancy.labels().is_empty());
-        let repair_cache_capacity = find_sample("shitspeak_s2s_voice_repair_cache_capacity", &[])
-            .expect("repair cache capacity");
-        assert!(repair_cache_capacity.value() >= 0.0);
-        let repair_cache_evictions =
-            find_sample("shitspeak_s2s_voice_repair_cache_evictions_total", &[])
-                .expect("repair cache evictions");
-        assert!(repair_cache_evictions.value() >= 0.0);
-
         for sample in prometheus_samples().into_iter().filter(|sample| {
             sample.name().starts_with("shitspeak_s2s_voice_ingress_")
                 || sample.name().starts_with("shitspeak_s2s_voice_proactive_")
@@ -1489,12 +1216,12 @@ mod tests {
         record_repair_credit_quarters(RepairCreditStage::Committed, 2_400);
         record_repair_credit_quarters(RepairCreditStage::Refunded, 400);
         record_repair_credit_quarters(RepairCreditStage::CapDiscarded, 800);
-        record_repair_class_bytes(RepairBudgetClass::Proactive, RepairClassStage::Borrowed, 50);
-        record_repair_class_bytes(RepairBudgetClass::Reactive, RepairClassStage::Attempted, 75);
+        record_repair_class_bytes(RepairClassStage::Granted, 50);
+        record_repair_class_bytes(RepairClassStage::Attempted, 75);
         record_repair_destination_bytes(3, RepairDestinationStage::Requested, 100);
         record_repair_destination_bytes(4, RepairDestinationStage::PrivateGrant, 75);
         record_repair_destination_bytes(15, RepairDestinationStage::OverflowGrant, 50);
-        set_repair_allocator_state(700, 300, 100, 50, 25, 64);
+        set_repair_allocator_state(700, 64);
 
         let minted = find_sample(
             "shitspeak_s2s_voice_repair_credit_bytes_total",
@@ -1504,12 +1231,12 @@ mod tests {
         assert!(minted.value() >= 1_000.25);
         assert_no_unbounded_voice_labels(&minted);
 
-        let proactive_borrow = find_sample(
+        let granted = find_sample(
             "shitspeak_s2s_voice_repair_allocator_class_bytes_total",
-            &[("class", "proactive"), ("stage", "borrowed")],
+            &[("class", "proactive"), ("stage", "granted")],
         )
-        .expect("proactive borrowing");
-        assert!(proactive_borrow.value() >= 50.0);
+        .expect("proactive grant");
+        assert!(granted.value() >= 50.0);
 
         let requested = find_sample(
             "shitspeak_s2s_voice_repair_allocator_destination_bytes_total",
@@ -1519,77 +1246,20 @@ mod tests {
         assert!(requested.value() >= 100.0);
         assert_no_unbounded_voice_labels(&requested);
 
-        let hard_reserve = find_sample(
+        let balance = find_sample(
             "shitspeak_s2s_voice_repair_allocator_state_bytes",
-            &[("state", "hard_reserve")],
+            &[("state", "proactive_balance")],
         )
-        .expect("hard reserve state");
+        .expect("proactive balance state");
         // Allocator gauges are process-global and asynchronous voice tests
         // may refresh them concurrently. This test verifies stable bounded
         // dimensions; exact state transitions are covered by budget tests.
-        assert!(hard_reserve.value() >= 0.0);
-        let debt_to_reactive = find_sample(
-            "shitspeak_s2s_voice_repair_allocator_state_bytes",
-            &[("state", "debt_to_reactive")],
-        )
-        .expect("debt owed to reactive class");
-        assert!(debt_to_reactive.value() >= 0.0);
-        let debt_to_proactive = find_sample(
-            "shitspeak_s2s_voice_repair_allocator_state_bytes",
-            &[("state", "debt_to_proactive")],
-        )
-        .expect("debt owed to proactive class");
-        assert!(debt_to_proactive.value() >= 0.0);
+        assert!(balance.value() >= 0.0);
         let destinations = find_sample(
             "shitspeak_s2s_voice_repair_allocator_active_destinations",
             &[],
         )
         .expect("active allocator destinations");
         assert!(destinations.value() >= 0.0);
-    }
-
-    #[test]
-    fn reactive_scheduler_metrics_use_fixed_event_labels_and_aggregate_gauges() {
-        for event in [
-            ReactiveSchedulerEvent::Granted,
-            ReactiveSchedulerEvent::CreditWait,
-            ReactiveSchedulerEvent::RetryDeferred,
-            ReactiveSchedulerEvent::DeadlineExpired,
-            ReactiveSchedulerEvent::Cancelled,
-            ReactiveSchedulerEvent::Shutdown,
-        ] {
-            record_reactive_scheduler_event(event);
-        }
-        set_reactive_scheduler_state(7, 4_096, 3, Some(Duration::from_micros(2_500)), 4);
-
-        for event in [
-            "granted",
-            "credit_wait",
-            "retry_deferred",
-            "deadline_expired",
-            "cancelled",
-            "shutdown",
-        ] {
-            let sample = find_sample(
-                "shitspeak_s2s_voice_reactive_scheduler_events_total",
-                &[("event", event)],
-            )
-            .expect("reactive scheduler event");
-            assert!(sample.value() >= 1.0);
-            assert_eq!(sample.labels(), &[("event".to_owned(), event.to_owned())]);
-            assert_no_unbounded_voice_labels(&sample);
-        }
-
-        for name in [
-            "shitspeak_s2s_voice_reactive_scheduler_queued_items",
-            "shitspeak_s2s_voice_reactive_scheduler_queued_encoded_bytes",
-            "shitspeak_s2s_voice_reactive_scheduler_active_destinations",
-            "shitspeak_s2s_voice_reactive_scheduler_oldest_wait_microseconds",
-            "shitspeak_s2s_voice_reactive_scheduler_max_starvation_rounds",
-        ] {
-            let sample = find_sample(name, &[]).expect("reactive scheduler gauge");
-            assert!(sample.value() >= 0.0);
-            assert!(sample.labels().is_empty());
-        }
     }
 }

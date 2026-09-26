@@ -1500,21 +1500,6 @@ impl<'a> PrometheusWriter<'a> {
             "counter",
         );
         self.header(
-            "shitspeak_s2s_voice_repair_cache_occupancy",
-            "Current number of original S2S voice frames retained for repair.",
-            "gauge",
-        );
-        self.header(
-            "shitspeak_s2s_voice_repair_cache_capacity",
-            "Maximum number of original S2S voice frames retained for repair.",
-            "gauge",
-        );
-        self.header(
-            "shitspeak_s2s_voice_repair_cache_evictions_total",
-            "Original S2S voice frames evicted because the repair cache reached capacity.",
-            "counter",
-        );
-        self.header(
             "shitspeak_s2s_voice_reorder_pending",
             "Current S2S voice reorder pending frame count by local node.",
             "gauge",
@@ -1586,7 +1571,7 @@ impl<'a> PrometheusWriter<'a> {
         );
         self.header(
             "shitspeak_s2s_voice_repair_allocator_class_bytes_total",
-            "S2S voice repair allocation bytes by bounded proactive or reactive class and stage.",
+            "S2S voice proactive repair allocation bytes by bounded stage.",
             "counter",
         );
         self.header(
@@ -1602,36 +1587,6 @@ impl<'a> PrometheusWriter<'a> {
         self.header(
             "shitspeak_s2s_voice_repair_allocator_active_destinations",
             "Current destinations participating in S2S voice fair repair allocation.",
-            "gauge",
-        );
-        self.header(
-            "shitspeak_s2s_voice_reactive_scheduler_events_total",
-            "S2S voice reactive repair scheduler outcomes by bounded event.",
-            "counter",
-        );
-        self.header(
-            "shitspeak_s2s_voice_reactive_scheduler_queued_items",
-            "Current S2S voice reactive repair items waiting for scheduling.",
-            "gauge",
-        );
-        self.header(
-            "shitspeak_s2s_voice_reactive_scheduler_queued_encoded_bytes",
-            "Current encoded bytes in S2S voice reactive repair items waiting for scheduling.",
-            "gauge",
-        );
-        self.header(
-            "shitspeak_s2s_voice_reactive_scheduler_active_destinations",
-            "Current destinations represented in the S2S voice reactive repair queue.",
-            "gauge",
-        );
-        self.header(
-            "shitspeak_s2s_voice_reactive_scheduler_oldest_wait_microseconds",
-            "Age in microseconds of the oldest queued S2S voice reactive repair item.",
-            "gauge",
-        );
-        self.header(
-            "shitspeak_s2s_voice_reactive_scheduler_max_starvation_rounds",
-            "Current maximum scheduler starvation rounds across queued S2S voice reactive destinations.",
             "gauge",
         );
         self.header(
@@ -3881,11 +3836,6 @@ mod tests {
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_send_events_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_receive_events_total counter\n"));
         assert!(rendered.contains("# TYPE shitspeak_s2s_voice_repair_events_total counter\n"));
-        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_repair_cache_occupancy gauge\n"));
-        assert!(rendered.contains("# TYPE shitspeak_s2s_voice_repair_cache_capacity gauge\n"));
-        assert!(
-            rendered.contains("# TYPE shitspeak_s2s_voice_repair_cache_evictions_total counter\n")
-        );
         assert!(
             rendered.contains("# TYPE shitspeak_s2s_voice_repair_credit_bytes_total counter\n")
         );
@@ -3900,27 +3850,6 @@ mod tests {
         assert!(
             rendered.contains("# TYPE shitspeak_s2s_voice_repair_allocator_state_bytes gauge\n")
         );
-        assert!(
-            rendered
-                .contains("# TYPE shitspeak_s2s_voice_reactive_scheduler_events_total counter\n")
-        );
-        assert!(
-            rendered.contains("# TYPE shitspeak_s2s_voice_reactive_scheduler_queued_items gauge\n")
-        );
-        assert!(rendered.contains(
-            "# TYPE shitspeak_s2s_voice_reactive_scheduler_queued_encoded_bytes gauge\n"
-        ));
-        assert!(
-            rendered.contains(
-                "# TYPE shitspeak_s2s_voice_reactive_scheduler_active_destinations gauge\n"
-            )
-        );
-        assert!(rendered.contains(
-            "# TYPE shitspeak_s2s_voice_reactive_scheduler_oldest_wait_microseconds gauge\n"
-        ));
-        assert!(rendered.contains(
-            "# TYPE shitspeak_s2s_voice_reactive_scheduler_max_starvation_rounds gauge\n"
-        ));
         assert!(
             rendered.contains("# TYPE shitspeak_s2s_voice_ingress_admission_drops_total counter\n")
         );

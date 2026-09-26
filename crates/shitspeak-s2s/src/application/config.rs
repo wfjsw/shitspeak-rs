@@ -68,18 +68,15 @@ pub struct VoiceConfig {
     /// Enable bounded best-effort repair for S2S voice gaps.
     pub repair_enabled: bool,
 
-    /// How long the origin keeps encoded voice frames available for replay.
+    /// Upper bound on the route-aware wait the reorder gives a gap for a
+    /// repair copy to arrive.
     pub repair_cache_ms: u64,
 
     /// Short transport TTL for normal outbound voice frames.
     transport_ttl_ms: u64,
 
-    /// Short transport TTL for replayed/alternate voice repair frames.
+    /// Short transport TTL for alternate voice repair frames.
     pub repair_transport_ttl_ms: u64,
-
-    /// Short transport TTL for repair requests. Defaults to
-    /// `repair_transport_ttl_ms` when omitted.
-    pub repair_request_ttl_ms: u64,
 
     /// Start sending proactive alternate copies when UDP loss reaches this.
     pub repair_loss_start_ppm: u32,
@@ -93,12 +90,6 @@ pub struct VoiceConfig {
     /// Extra proactive copies allowed per voice frame (0 through 2).
     /// Each copy needs a distinct alternate link; current routing exposes one.
     pub repair_max_extra_copies_per_frame: usize,
-
-    /// Percentage of the repair mint reserved for reactive/tail repair.
-    pub repair_reactive_reserve_pct: u8,
-
-    /// Percentage of the repair mint that proactive work may never borrow.
-    pub repair_reactive_hard_reserve_pct: u8,
 
     /// Enable block FEC for unreliable voice transports. Defaults to true.
     pub voice_fec_enabled: bool,
@@ -146,13 +137,10 @@ impl Default for VoiceConfig {
             repair_cache_ms: default_repair_cache_ms(),
             transport_ttl_ms: default_transport_ttl_ms(),
             repair_transport_ttl_ms: default_repair_transport_ttl_ms(),
-            repair_request_ttl_ms: default_repair_transport_ttl_ms(),
             repair_loss_start_ppm: default_repair_loss_start_ppm(),
             repair_full_dup_loss_ppm: default_repair_full_dup_loss_ppm(),
             repair_jitter_start_ms: default_repair_jitter_start_ms(),
             repair_max_extra_copies_per_frame: default_repair_max_extra_copies_per_frame(),
-            repair_reactive_reserve_pct: default_repair_reactive_reserve_pct(),
-            repair_reactive_hard_reserve_pct: default_repair_reactive_hard_reserve_pct(),
             voice_fec_enabled: default_voice_fec_enabled(),
             voice_fec_block_size: default_voice_fec_block_size(),
             voice_fec_parity_blocks: default_voice_fec_parity_blocks(),
@@ -187,7 +175,7 @@ struct VoiceConfigWire {
     #[serde(default = "default_adaptive_jitter_max_delay_ms")]
     adaptive_jitter_max_delay_ms: u64,
     // Compatibility-only for one release. Reorder is now the sole remote
-    // buffer, and a gap opens a repair request immediately.
+    // buffer.
     #[serde(default)]
     remote_playout_min_ms: Option<IgnoredAny>,
     #[serde(default)]
@@ -212,8 +200,9 @@ struct VoiceConfigWire {
     transport_ttl_ms: u64,
     #[serde(default = "default_repair_transport_ttl_ms")]
     repair_transport_ttl_ms: u64,
+    // Reactive (NACK) repair was removed; its keys are accepted and ignored.
     #[serde(default)]
-    repair_request_ttl_ms: Option<u64>,
+    repair_request_ttl_ms: Option<IgnoredAny>,
     #[serde(default = "default_repair_loss_start_ppm")]
     repair_loss_start_ppm: u32,
     #[serde(default = "default_repair_full_dup_loss_ppm")]
@@ -222,10 +211,10 @@ struct VoiceConfigWire {
     repair_jitter_start_ms: u64,
     #[serde(default = "default_repair_max_extra_copies_per_frame")]
     repair_max_extra_copies_per_frame: usize,
-    #[serde(default = "default_repair_reactive_reserve_pct")]
-    repair_reactive_reserve_pct: u8,
-    #[serde(default = "default_repair_reactive_hard_reserve_pct")]
-    repair_reactive_hard_reserve_pct: u8,
+    #[serde(default)]
+    repair_reactive_reserve_pct: Option<IgnoredAny>,
+    #[serde(default)]
+    repair_reactive_hard_reserve_pct: Option<IgnoredAny>,
     #[serde(default = "default_voice_fec_enabled")]
     voice_fec_enabled: bool,
     #[serde(default = "default_voice_fec_block_size")]
@@ -252,16 +241,6 @@ impl<'de> Deserialize<'de> for VoiceConfig {
                 "repair_max_extra_copies_per_frame must be between 0 and 2",
             ));
         }
-        if raw.repair_reactive_reserve_pct > 100 {
-            return Err(D::Error::custom(
-                "repair_reactive_reserve_pct must be between 0 and 100",
-            ));
-        }
-        if raw.repair_reactive_hard_reserve_pct > raw.repair_reactive_reserve_pct {
-            return Err(D::Error::custom(
-                "repair_reactive_hard_reserve_pct must not exceed repair_reactive_reserve_pct",
-            ));
-        }
         if raw.voice_fec_block_size < 2 || raw.voice_fec_block_size > 32 {
             return Err(D::Error::custom(
                 "voice_fec_block_size must be between 2 and 32",
@@ -284,6 +263,9 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             raw.remote_playout_idle_reset_ms.as_ref(),
             raw.reorder_max_drop_lag_frames.as_ref(),
             raw.repair_nack_delay_ms.as_ref(),
+            raw.repair_request_ttl_ms.as_ref(),
+            raw.repair_reactive_reserve_pct.as_ref(),
+            raw.repair_reactive_hard_reserve_pct.as_ref(),
             raw.voice_fec_loss_gate_ppm.as_ref(),
         );
         Ok(Self {
@@ -304,15 +286,10 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             repair_cache_ms: raw.repair_cache_ms,
             transport_ttl_ms: raw.transport_ttl_ms,
             repair_transport_ttl_ms: raw.repair_transport_ttl_ms,
-            repair_request_ttl_ms: raw
-                .repair_request_ttl_ms
-                .unwrap_or(raw.repair_transport_ttl_ms),
             repair_loss_start_ppm: raw.repair_loss_start_ppm,
             repair_full_dup_loss_ppm: raw.repair_full_dup_loss_ppm,
             repair_jitter_start_ms: raw.repair_jitter_start_ms,
             repair_max_extra_copies_per_frame: raw.repair_max_extra_copies_per_frame,
-            repair_reactive_reserve_pct: raw.repair_reactive_reserve_pct,
-            repair_reactive_hard_reserve_pct: raw.repair_reactive_hard_reserve_pct,
             voice_fec_enabled: raw.voice_fec_enabled,
             voice_fec_block_size: raw.voice_fec_block_size,
             voice_fec_parity_blocks: raw.voice_fec_parity_blocks,
@@ -412,12 +389,6 @@ fn default_repair_jitter_start_ms() -> u64 {
 fn default_repair_max_extra_copies_per_frame() -> usize {
     1
 }
-fn default_repair_reactive_reserve_pct() -> u8 {
-    30
-}
-fn default_repair_reactive_hard_reserve_pct() -> u8 {
-    10
-}
 fn default_voice_fec_enabled() -> bool {
     true
 }
@@ -437,6 +408,15 @@ fn default_voice_fec_receiver_window() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_reactive_repair_keys_are_accepted_and_ignored() {
+        let cfg: VoiceConfig = serde_json::from_str(
+            r#"{"repair_request_ttl_ms":300,"repair_reactive_reserve_pct":150,"repair_reactive_hard_reserve_pct":90,"repair_transport_ttl_ms":400}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.repair_transport_ttl_ms, 400);
+    }
 
     #[test]
     fn voice_fec_defaults_on_and_can_be_disabled() {
@@ -489,7 +469,6 @@ mod tests {
         assert_eq!(cfg.voice.repair_cache_ms, 1_600);
         assert_eq!(cfg.voice.transport_ttl_ms(), 750);
         assert_eq!(cfg.voice.repair_transport_ttl_ms, 750);
-        assert_eq!(cfg.voice.repair_request_ttl_ms, 750);
         assert_eq!(cfg.voice.reorder_max_delay_ms, 40);
         assert_eq!(cfg.voice.reorder_max_buffered_frames, 48);
         assert_eq!(cfg.voice.reorder_max_total_buffer, 4_096);
@@ -503,8 +482,6 @@ mod tests {
         assert_eq!(cfg.voice.repair_full_dup_loss_ppm, 30_000);
         assert_eq!(cfg.voice.repair_jitter_start_ms, 40);
         assert_eq!(cfg.voice.repair_max_extra_copies_per_frame, 1);
-        assert_eq!(cfg.voice.repair_reactive_reserve_pct, 30);
-        assert_eq!(cfg.voice.repair_reactive_hard_reserve_pct, 10);
     }
 
     #[test]
@@ -520,24 +497,6 @@ mod tests {
         let cfg: ApplicationConfig =
             serde_json::from_str(r#"{"voice":{"tree_delivery_enabled":false}}"#).unwrap();
         assert!(!cfg.voice.tree_delivery_enabled);
-    }
-
-    #[test]
-    fn voice_repair_request_ttl_defaults_to_transport_ttl() {
-        let cfg: ApplicationConfig =
-            serde_json::from_str(r#"{"voice":{"repair_transport_ttl_ms":300}}"#).unwrap();
-        assert_eq!(cfg.voice.repair_transport_ttl_ms, 300);
-        assert_eq!(cfg.voice.repair_request_ttl_ms, 300);
-    }
-
-    #[test]
-    fn voice_repair_request_ttl_can_be_overridden() {
-        let cfg: ApplicationConfig = serde_json::from_str(
-            r#"{"voice":{"repair_transport_ttl_ms":300,"repair_request_ttl_ms":90}}"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.voice.repair_transport_ttl_ms, 300);
-        assert_eq!(cfg.voice.repair_request_ttl_ms, 90);
     }
 
     #[test]
@@ -575,33 +534,5 @@ mod tests {
                     .contains("repair_max_extra_copies_per_frame must be between 0 and 2")
             );
         }
-    }
-
-    #[test]
-    fn voice_repair_reserve_percentages_are_validated() {
-        let cfg: ApplicationConfig = serde_json::from_str(
-            r#"{"voice":{"repair_reactive_reserve_pct":40,"repair_reactive_hard_reserve_pct":15}}"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.voice.repair_reactive_reserve_pct, 40);
-        assert_eq!(cfg.voice.repair_reactive_hard_reserve_pct, 15);
-
-        let error = serde_json::from_str::<ApplicationConfig>(
-            r#"{"voice":{"repair_reactive_reserve_pct":25,"repair_reactive_hard_reserve_pct":26}}"#,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains(
-            "repair_reactive_hard_reserve_pct must not exceed repair_reactive_reserve_pct"
-        ));
-
-        let error = serde_json::from_str::<ApplicationConfig>(
-            r#"{"voice":{"repair_reactive_reserve_pct":101}}"#,
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("repair_reactive_reserve_pct must be between 0 and 100")
-        );
     }
 }

@@ -901,6 +901,26 @@ impl ConnectionManager {
         )
     }
 
+    /// Record `failures` consecutive dial failures against every address of
+    /// `node`, backed off the way an unconfirmed address of an otherwise
+    /// reachable peer is (minutes), for tests of failure recovery.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_record_address_failures(&self, node: NodeIdentifier, failures: u32) {
+        let Some(peer) = self.inner.get_peer(node) else {
+            return;
+        };
+        for addr in peer.snapshot_addresses() {
+            for _ in 0..failures {
+                peer.record_address_attempt(addr);
+                peer.record_address_failure_with_floor(
+                    addr,
+                    Duration::from_secs(5 * 60),
+                    Duration::from_secs(30 * 60),
+                );
+            }
+        }
+    }
+
     /// Force a transport kind down for a peer in fault-injection tests.
     /// Reconnection remains owned by the normal transport supervisor.
     #[cfg(any(test, feature = "test-support"))]
@@ -1889,6 +1909,15 @@ impl ConnectionManager {
             .filter_map(|kind| snapshot.get(&kind))
             .map(|link| link.effective_packet_loss_ppm())
             .max()
+    }
+
+    /// `node` was just seen to come up or restart: forget the dial failures
+    /// recorded against its addresses while it was down, so they are retried
+    /// promptly instead of on the unconfirmed-address backoff (minutes).
+    pub fn forget_address_failures(&self, node: NodeIdentifier) {
+        if let Some(peer) = self.inner.get_peer(node) {
+            peer.forget_address_failures(Instant::now());
+        }
     }
 
     /// Whether the datagram lane to `node` is currently evicting: at least
