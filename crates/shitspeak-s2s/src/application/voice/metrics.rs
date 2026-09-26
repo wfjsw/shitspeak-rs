@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use shitspeak_core::NodeIdentifier;
 
 use crate::application::voice::fec::{FecParityPath, FecSendOutcome};
-use crate::application::voice::reorder::ReorderResultCount;
+use crate::application::voice::reorder::{ReorderResultCount, VoiceCopyKind};
 use crate::status::PrometheusSample;
 
 const COUNT_BUCKETS: [(&str, u64); 8] = [
@@ -115,7 +115,13 @@ pub(crate) enum VoiceReceiveResult {
     InOrder,
     GapBuffered,
     GapFilled,
-    DuplicateOrLate,
+    /// A frame the reorder rejected without delivering it, with why and which
+    /// kind of copy arrived. Exported as `result="duplicate_or_late"` plus
+    /// `reason` and `copy` labels.
+    DuplicateOrLate {
+        reason: DuplicateReason,
+        copy: VoiceCopyKind,
+    },
     DeadlineFlush,
     BufferDrop,
     NoSinkDrop,
@@ -131,12 +137,50 @@ impl VoiceReceiveResult {
             Self::InOrder => "in_order",
             Self::GapBuffered => "gap_buffered",
             Self::GapFilled => "gap_filled",
-            Self::DuplicateOrLate => "duplicate_or_late",
+            Self::DuplicateOrLate { .. } => "duplicate_or_late",
             Self::DeadlineFlush => "deadline_flush",
             Self::BufferDrop => "buffer_drop",
             Self::NoSinkDrop => "no_sink_drop",
             Self::SpeakerStateDrop => "speaker_state_drop",
             Self::FecLate => "fec_late",
+        }
+    }
+}
+
+/// Why the reorder rejected a frame without delivering it.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum DuplicateReason {
+    /// From an older sender epoch, or a non-original copy of a newer one
+    /// (only an original may restart a stream).
+    StaleEpoch,
+    /// A reactive repair for a speaker with no stream state.
+    RepairWithoutStream,
+    /// A reactive repair while no gap was open.
+    RepairWithoutGap,
+    /// An equal or better copy of the same sequence was already buffered.
+    AlreadyBuffered,
+    /// Arrived after a deadline flush released past its sequence without it:
+    /// genuinely late, the listener never received it.
+    LateAfterRelease,
+    /// The sequence was already delivered, by a copy of this kind.
+    AlreadyDelivered(VoiceCopyKind),
+    /// Below the delivery cursor but older than the delivery history.
+    Untracked,
+}
+
+impl DuplicateReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::StaleEpoch => "stale_epoch",
+            Self::RepairWithoutStream => "repair_without_stream",
+            Self::RepairWithoutGap => "repair_without_gap",
+            Self::AlreadyBuffered => "already_buffered",
+            Self::LateAfterRelease => "late_after_release",
+            Self::AlreadyDelivered(VoiceCopyKind::Original) => "delivered_original",
+            Self::AlreadyDelivered(VoiceCopyKind::Proactive) => "delivered_proactive",
+            Self::AlreadyDelivered(VoiceCopyKind::Fec) => "delivered_fec",
+            Self::AlreadyDelivered(VoiceCopyKind::ReactiveRepair) => "delivered_repair",
+            Self::Untracked => "untracked",
         }
     }
 }
@@ -803,14 +847,19 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
     }
 
     for (key, count) in &metrics.receives {
+        let mut labels = vec![
+            ("source".to_owned(), key.source.to_string()),
+            ("origin_node".to_owned(), key.origin_node.to_string()),
+            ("from_immediate".to_owned(), key.from_immediate.to_string()),
+            ("result".to_owned(), key.result.label().to_owned()),
+        ];
+        if let VoiceReceiveResult::DuplicateOrLate { reason, copy } = key.result {
+            labels.push(("reason".to_owned(), reason.label().to_owned()));
+            labels.push(("copy".to_owned(), copy.label().to_owned()));
+        }
         out.push(PrometheusSample::new(
             "shitspeak_s2s_voice_receive_events_total",
-            vec![
-                ("source".to_owned(), key.source.to_string()),
-                ("origin_node".to_owned(), key.origin_node.to_string()),
-                ("from_immediate".to_owned(), key.from_immediate.to_string()),
-                ("result".to_owned(), key.result.label().to_owned()),
-            ],
+            labels,
             *count as f64,
         ));
     }
@@ -1357,6 +1406,64 @@ mod tests {
         }) {
             assert_no_unbounded_voice_labels(&sample);
         }
+    }
+
+    #[test]
+    fn duplicate_or_late_is_exported_with_reason_and_copy_labels() {
+        for (reason, copy, reason_label, copy_label) in [
+            (
+                DuplicateReason::AlreadyDelivered(VoiceCopyKind::Fec),
+                VoiceCopyKind::Original,
+                "delivered_fec",
+                "original",
+            ),
+            (
+                DuplicateReason::LateAfterRelease,
+                VoiceCopyKind::ReactiveRepair,
+                "late_after_release",
+                "repair",
+            ),
+        ] {
+            record_receive(
+                4094,
+                4093,
+                4092,
+                VoiceReceiveResult::DuplicateOrLate { reason, copy },
+                2,
+            );
+            let sample = find_sample(
+                "shitspeak_s2s_voice_receive_events_total",
+                &[
+                    ("source", "4094"),
+                    ("origin_node", "4093"),
+                    ("from_immediate", "4092"),
+                    ("result", "duplicate_or_late"),
+                    ("reason", reason_label),
+                    ("copy", copy_label),
+                ],
+            )
+            .expect("duplicate sample with reason and copy");
+            assert!(sample.value() >= 2.0);
+            assert_no_unbounded_voice_labels(&sample);
+        }
+        // Other results carry neither label.
+        record_receive(4094, 4093, 4092, VoiceReceiveResult::InOrder, 1);
+        let in_order = find_sample(
+            "shitspeak_s2s_voice_receive_events_total",
+            &[
+                ("source", "4094"),
+                ("origin_node", "4093"),
+                ("from_immediate", "4092"),
+                ("result", "in_order"),
+            ],
+        )
+        .expect("in-order sample");
+        assert!(
+            in_order
+                .labels()
+                .iter()
+                .all(|(key, _)| key != "reason" && key != "copy")
+        );
     }
 
     #[test]

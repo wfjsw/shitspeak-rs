@@ -1014,11 +1014,25 @@ all of its frames, whatever their lengths. An utterance terminator flushes
 partial blocks. With the defaults the parity overhead is 100% of voice
 frames.
 
+Parity follows the data's own route, so listeners receive data and parity at
+the same latency. With `tree_delivery_enabled`, parity is sent into the same
+distribution tree, group, and recipients as the voice, and every tree edge
+carries it along that edge's current binding (direct, a relay, or a split
+between them). Each row is also sent a second time, to every recipient on an
+unreliable route that a route can reach through a first hop other than the
+one(s) its data currently leaves on (the source edge's bound route, and the old
+route during a split). A burst on the data path then cannot take all the
+parity too. Recipients without such an independent first hop get only the tree
+copy. This roughly doubles parity bytes for recipients that have a detour.
+Routed voice (tree delivery off, or unicast) sends parity via the data's
+routed first hop.
+
 Two kinds of diversity protect against bursty loss. A block's parity rows are
 paced one per following data frame instead of leaving back-to-back, so a
 congestion drop that takes everything sent in one instant cannot take every
-row. Rows still owed when an utterance ends follow at 20 ms intervals. Parity
-also rides the route's loop-free alternate first hop when that path's measured
+row. Rows still owed when an utterance ends follow at 20 ms intervals. For
+routed voice, parity also rides the route's loop-free alternate first hop when
+that path's measured
 metrics can carry it: live transport metrics, a datagram lane that is not
 shedding, loss no more than 1.5 times the primary's plus 2%, and no more than
 100 ms of extra latency. A burst on the data path then cannot take the parity
@@ -1030,7 +1044,7 @@ frames (six with the defaults) before its last parity row arrives. The
 receiver matches data and parity per speaker regardless of which peer
 delivered them. It mirrors at least `voice_fec_receiver_window` recent frames
 per speaker, raised to two interleave spans when that is larger.
-`shitspeak_s2s_voice_fec_sends_total{path}` separates `primary` from
+`shitspeak_s2s_voice_fec_sends_total{path}` separates `tree`, `primary`, and
 `alternate` parity, and `shitspeak_s2s_voice_reorder_gaps_opened_total{missing_frames}`
 shows the loss-run lengths receivers see.
 
@@ -1091,6 +1105,28 @@ credit exhaustion from queue pressure. Grafana shows proactive queue and credit
 utilization per node because those limits are enforced locally.
 `shitspeak_s2s_voice_receive_events_total{result="speaker_state_drop"}` reports
 a dynamic speaker-cap admission refusal.
+
+Frames the receiver rejects without delivering keep
+`result="duplicate_or_late"` and add a `reason` and a `copy` label. `copy` is
+the kind of copy that arrived: `original`, `proactive`, `fec`, or `repair`.
+`reason` is one of the following:
+
+- `delivered_original`, `delivered_proactive`, `delivered_fec`,
+  `delivered_repair`: the sequence was already delivered, by that kind of copy.
+  For example, an original with `reason="delivered_fec"` lost the race to a FEC
+  reconstruction.
+- `late_after_release`: the frame arrived after a deadline flush released past
+  its sequence, so listeners never heard it.
+- `already_buffered`: an equal or better copy was already waiting.
+- `repair_without_gap`, `repair_without_stream`: a reactive repair arrived with
+  no open gap, or for a speaker with no stream.
+- `stale_epoch`: the frame is from an older sender epoch, or is a non-original
+  copy of a newer one.
+- `untracked`: the sequence is below the cursor and older than the last 128
+  deliveries.
+
+Only `late_after_release` is audio the listener missed. The other reasons are
+redundancy or protocol noise.
 
 The hierarchical allocator exports conserved credit lifecycle bytes through
 `shitspeak_s2s_voice_repair_credit_bytes_total{stage}`, and proactive versus

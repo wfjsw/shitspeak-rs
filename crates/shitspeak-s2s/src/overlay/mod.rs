@@ -2381,6 +2381,84 @@ impl OverlayNetwork {
             .collect()
     }
 
+    /// Recipients of this node's voice tree for `group` that a route can reach
+    /// through a first hop independent of the one(s) their data currently
+    /// leaves on, grouped by the data first hop such a copy avoids. The data
+    /// first hops come from the source tree edge whose branch holds the
+    /// recipient (its bound route, and the old route during a split). The
+    /// predicted detour matches what sending with `avoid_first_hop` does: the
+    /// primary route unless it starts at the avoided hop, else the best route
+    /// avoiding it. Recipients outside the active tree, or whose detour would
+    /// still start on a data first hop, are omitted.
+    pub fn voice_tree_parity_detours(
+        &self,
+        group: u64,
+        group_version: u64,
+        dsts: &[NodeIdentifier],
+    ) -> Vec<(NodeIdentifier, Vec<NodeIdentifier>)> {
+        if dsts.is_empty() {
+            return Vec::new();
+        }
+        let self_id = self.inner.self_id;
+        let scope = distribution::TreeKey {
+            source: self_id,
+            profile: distribution::VOICE_REALTIME_PROFILE_ID,
+            group,
+            group_version,
+            topology_epoch: self.inner.lsdb.distribution_epoch(),
+            version: 0,
+        };
+        let Some(tree) = self.inner.distribution.active_tree(scope) else {
+            return Vec::new();
+        };
+        let state = tree.state();
+        let branches: Vec<(NodeIdentifier, Vec<NodeIdentifier>)> = state
+            .children(self_id)
+            .iter()
+            .map(|child| (*child, state.descendant_members(*child)))
+            .collect();
+        let routing = self.inner.routing.load();
+        let level = ServiceLevel::BestEffort;
+        let metric = RoutingMetric::ConversationalQuality;
+        let mut grouped: Vec<(NodeIdentifier, Vec<NodeIdentifier>)> = Vec::new();
+        for &dst in dsts {
+            let Some((child, _)) = branches
+                .iter()
+                .find(|(child, members)| *child == dst || members.contains(&dst))
+            else {
+                continue;
+            };
+            let data_hops =
+                self.inner
+                    .distribution
+                    .tree_edge_data_first_hops(tree.key(), self_id, *child);
+            let Some(&avoid) = data_hops.first() else {
+                continue;
+            };
+            let detour = routing
+                .lookup_with_metric(dst, level, metric)
+                .filter(|route| route.next_hop != avoid)
+                .or_else(|| {
+                    routing.lookup_avoiding_first_hop_with_metric(
+                        self_id,
+                        dst,
+                        level,
+                        metric,
+                        &HashSet::new(),
+                        avoid,
+                    )
+                });
+            if detour.is_none_or(|route| data_hops.contains(&route.next_hop)) {
+                continue;
+            }
+            match grouped.iter_mut().find(|(hop, _)| *hop == avoid) {
+                Some((_, members)) => members.push(dst),
+                None => grouped.push((avoid, vec![dst])),
+            }
+        }
+        grouped
+    }
+
     /// Effective packet loss of the datagram lane to `next_hop` (worst among
     /// live UDP/KCP transports), or `None` when no datagram transport is
     /// live. This diagnostic is independent of the selected voice transport.

@@ -92,6 +92,8 @@ pub enum FecParityPath {
     Primary,
     /// The route's loop-free alternate first hop.
     Alternate,
+    /// The data's distribution tree, edge by edge along each binding.
+    Tree,
 }
 
 impl FecParityPath {
@@ -99,6 +101,7 @@ impl FecParityPath {
         match self {
             Self::Primary => "primary",
             Self::Alternate => "alternate",
+            Self::Tree => "tree",
         }
     }
 }
@@ -1453,7 +1456,7 @@ pub(crate) mod tests {
         let clean_alternate = burst_states(0xC1E, slots, 0.02, 4.0);
         let run = |diverse: bool, alternate: &[bool]| {
             let (raw, residual) = simulate(3, 3, 2, frames, diverse, 10, |path, slot| match path {
-                FecParityPath::Primary => primary[slot as usize],
+                FecParityPath::Primary | FecParityPath::Tree => primary[slot as usize],
                 FecParityPath::Alternate => alternate[slot as usize],
             });
             (raw as f64 / frames as f64, residual as f64 / frames as f64)

@@ -922,6 +922,9 @@ impl VoiceService {
             is_terminator,
             &dsts,
             repair_context.as_ref(),
+            self.cfg
+                .tree_delivery_enabled
+                .then(DistributionGroup::broadcast),
         )
         .await;
         self.admit_original_repair_credit(
@@ -1042,6 +1045,7 @@ impl VoiceService {
             is_terminator,
             dsts,
             repair_context.as_ref(),
+            self.cfg.tree_delivery_enabled.then_some(group),
         )
         .await;
         self.admit_original_repair_credit(
@@ -1396,6 +1400,7 @@ impl VoiceService {
             is_terminator,
             &[dst],
             repair_context.as_ref(),
+            None,
         )
         .await;
         self.admit_original_repair_credit(
@@ -1450,14 +1455,19 @@ impl VoiceService {
     }
 
     /// Feed the just-sent frame into the sender FEC streams and emit the
-    /// parity it made due, per first hop using an unreliable voice transport.
-    /// Parity for a destination rides the route's alternate first hop when
-    /// that path's metrics can carry it (a burst on the data path cannot then
-    /// take the parity too), otherwise the data's own first hop. Measured loss
-    /// does not gate protection and parity is not charged to a byte budget;
-    /// only a first hop whose datagram lane is shedding at the send path skips
-    /// the parity it would carry. Rows owed after a terminator are paced out
-    /// by a background task.
+    /// parity it made due. Parity follows the data's route so the listener
+    /// receives both at the same latency: tree voice (`tree_group`) sends it
+    /// into the same distribution tree, group and recipients as the data, so
+    /// every edge carries it along its own binding (direct, relay, or split).
+    /// Routed voice groups destinations by the data's first hop and sends
+    /// parity there, or over the route's alternate first hop when that path's
+    /// metrics can carry it (a burst on the data path cannot then take the
+    /// parity too). Only destinations over an unreliable voice transport get
+    /// parity. Measured loss does not gate protection and parity is not
+    /// charged to a byte budget; only a routed first hop whose datagram lane
+    /// is shedding at the send path skips the parity it would carry. Rows
+    /// owed after a terminator are paced out by a background task.
+    #[allow(clippy::too_many_arguments)]
     async fn emit_fec_if_due(
         &self,
         sender_session: u32,
@@ -1466,24 +1476,66 @@ impl VoiceService {
         is_terminator: bool,
         dsts: &[NodeIdentifier],
         repair_context: Option<&RepairFrameContext>,
+        tree_group: Option<DistributionGroup>,
     ) {
         if !self.cfg.voice_fec_enabled {
+            return;
+        }
+        let qualities = repair_context
+            .map(|context| context.route_qualities.as_slice())
+            .unwrap_or(&[]);
+        let unreliable = |index: usize| {
+            qualities
+                .get(index)
+                .copied()
+                .flatten()
+                .filter(|quality| !quality.reliable())
+        };
+        if let Some(group) = tree_group {
+            if !(0..dsts.len()).any(|index| unreliable(index).is_some()) {
+                return;
+            }
+            // One stream for the whole tree: the tree carries every row to
+            // every recipient, whatever route each edge is bound to.
+            let local = self.transport.local_node_id();
+            let emissions = self.fec_sender.push(
+                local,
+                dsts,
+                sender_session,
+                self.sender_epoch,
+                seq,
+                payload.clone(),
+                is_terminator,
+            );
+            // A second copy of every row detours around the first hop(s) the
+            // data leaves on, where such a route exists, so one burst on the
+            // data path cannot take both the data and all its parity.
+            let unreliable_dsts: Vec<_> = dsts
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| unreliable(*index).is_some())
+                .map(|(_, dst)| *dst)
+                .collect();
+            let detours = self
+                .transport
+                .voice_tree_parity_detours(group, &unreliable_dsts);
+            let route = FecParityRoute::Tree {
+                source: local,
+                dsts: dsts.to_vec(),
+                group,
+                detours,
+            };
+            self.emit_parity(route, emissions, sender_session).await;
             return;
         }
         // Group destinations by the data's first hop: a block holds only
         // frames that took one link to one recipient set.
         let mut hops: HashMap<NodeIdentifier, FecHopGroup> = HashMap::new();
         let mut alternate_shedding: HashMap<NodeIdentifier, bool> = HashMap::new();
-        let qualities = repair_context
-            .map(|context| context.route_qualities.as_slice())
-            .unwrap_or(&[]);
         for (index, &dst) in dsts.iter().enumerate() {
-            let Some(quality) = qualities.get(index).copied().flatten() else {
+            let Some(quality) = unreliable(index) else {
                 continue;
             };
-            if quality.reliable() {
-                continue;
-            }
             let diverse = quality.alternate_next_hop().is_some_and(|alternate| {
                 let shedding = *alternate_shedding
                     .entry(alternate)
@@ -1499,8 +1551,7 @@ impl VoiceService {
                 group.primary_dsts.push(dst);
             }
         }
-        let ttl = self.cfg.transport_ttl();
-        for (&first_hop, group) in &hops {
+        for (first_hop, group) in hops {
             let emissions = self.fec_sender.push(
                 first_hop,
                 &group.dsts,
@@ -1510,9 +1561,6 @@ impl VoiceService {
                 payload.clone(),
                 is_terminator,
             );
-            if emissions.is_empty() {
-                continue;
-            }
             // Send-path pressure gate: while the first-hop datagram lane is
             // evicting (frames shed before the wire), parity sent over it would
             // be shed too — emitting it only adds offered load to the lane
@@ -1520,57 +1568,69 @@ impl VoiceService {
             let primary_dsts = if group.primary_shedding {
                 Vec::new()
             } else {
-                group.primary_dsts.clone()
+                group.primary_dsts
             };
-            let targets = FecParityTargets {
+            let route = FecParityRoute::Hop(FecParityTargets {
                 first_hop,
                 primary_dsts,
-                alternate_dsts: group.alternate_dsts.clone(),
-            };
-            let (now, tail): (Vec<_>, Vec<_>) = emissions
-                .into_iter()
-                .partition(|emission| emission.tail_step == 0);
-            for emission in now {
+                alternate_dsts: group.alternate_dsts,
+            });
+            self.emit_parity(route, emissions, sender_session).await;
+        }
+    }
+
+    /// Send the parity rows due now, then pace any rows owed after a
+    /// terminator from a background task.
+    async fn emit_parity(
+        &self,
+        route: FecParityRoute,
+        emissions: Vec<fec::ParityEmission>,
+        sender_session: u32,
+    ) {
+        let ttl = self.cfg.transport_ttl();
+        let (now, tail): (Vec<_>, Vec<_>) = emissions
+            .into_iter()
+            .partition(|emission| emission.tail_step == 0);
+        for emission in now {
+            send_parity_emission(
+                self.transport.as_ref(),
+                &route,
+                &emission,
+                sender_session,
+                self.sender_epoch,
+                ttl,
+            )
+            .await;
+        }
+        if tail.is_empty() {
+            return;
+        }
+        let transport = self.transport.clone();
+        let shutdown = self.shutdown.clone();
+        let sender_epoch = self.sender_epoch;
+        tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            for emission in tail {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep_until(started + emission.delay()) => {}
+                }
+                let remaining = ttl.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return;
+                }
                 send_parity_emission(
-                    self.transport.as_ref(),
-                    &targets,
+                    transport.as_ref(),
+                    &route,
                     &emission,
                     sender_session,
-                    self.sender_epoch,
-                    ttl,
+                    sender_epoch,
+                    remaining,
                 )
                 .await;
             }
-            if tail.is_empty() {
-                continue;
-            }
-            let transport = self.transport.clone();
-            let shutdown = self.shutdown.clone();
-            let sender_epoch = self.sender_epoch;
-            tokio::spawn(async move {
-                let started = tokio::time::Instant::now();
-                for emission in tail {
-                    tokio::select! {
-                        biased;
-                        _ = shutdown.cancelled() => return,
-                        _ = tokio::time::sleep_until(started + emission.delay()) => {}
-                    }
-                    let remaining = ttl.saturating_sub(started.elapsed());
-                    if remaining.is_zero() {
-                        return;
-                    }
-                    send_parity_emission(
-                        transport.as_ref(),
-                        &targets,
-                        &emission,
-                        sender_session,
-                        sender_epoch,
-                        remaining,
-                    )
-                    .await;
-                }
-            });
-        }
+        });
     }
 
     fn remote_voice_members(&self) -> Vec<NodeIdentifier> {
@@ -2521,9 +2581,23 @@ struct FecParityTargets {
     alternate_dsts: Vec<NodeIdentifier>,
 }
 
+/// The route a FEC stream's parity takes: the data's distribution tree (plus
+/// detours independent of the data's first hops), or the routed first hop
+/// (and its alternate) of routed voice.
+enum FecParityRoute {
+    Tree {
+        source: NodeIdentifier,
+        dsts: Vec<NodeIdentifier>,
+        group: DistributionGroup,
+        /// `(data first hop to avoid, recipients)` for the second copy.
+        detours: Vec<(NodeIdentifier, Vec<NodeIdentifier>)>,
+    },
+    Hop(FecParityTargets),
+}
+
 async fn send_parity_emission(
     transport: &dyn VoiceTransport,
-    targets: &FecParityTargets,
+    route: &FecParityRoute,
     emission: &fec::ParityEmission,
     sender_session: u32,
     sender_epoch: u64,
@@ -2531,6 +2605,43 @@ async fn send_parity_emission(
 ) {
     let Some(body) = emission.encode(sender_session, sender_epoch) else {
         return;
+    };
+    let targets = match route {
+        FecParityRoute::Tree {
+            source,
+            dsts,
+            group,
+            detours,
+        } => {
+            let outcome = match transport
+                .send_tree_multicast(dsts, *group, body.clone(), ttl)
+                .await
+            {
+                Ok(()) => fec::FecSendOutcome::Sent,
+                Err(_) => fec::FecSendOutcome::Shed,
+            };
+            metrics::record_fec_send(
+                transport.local_node_id(),
+                *source,
+                body.len(),
+                outcome,
+                fec::FecParityPath::Tree,
+            );
+            for (avoid, detour_dsts) in detours {
+                let outcome = transport
+                    .send_fec_frame(detour_dsts, Some(*avoid), Some(*avoid), body.clone(), ttl)
+                    .await;
+                metrics::record_fec_send(
+                    transport.local_node_id(),
+                    *avoid,
+                    body.len(),
+                    outcome,
+                    fec::FecParityPath::Alternate,
+                );
+            }
+            return;
+        }
+        FecParityRoute::Hop(targets) => targets,
     };
     for (dsts, avoid, path) in [
         (&targets.primary_dsts, None, fec::FecParityPath::Primary),
@@ -7644,8 +7755,12 @@ mod tests {
                     .calls()
                     .iter()
                     .filter_map(|call| {
-                        let FakeCall::Multicast { body, .. } = call else {
-                            return None;
+                        // Parity rides the data's own route: the tree when
+                        // tree delivery is on, the routed multicast otherwise.
+                        let body = match call {
+                            FakeCall::TreeMulticast { body, .. } if tree_delivery_enabled => body,
+                            FakeCall::Multicast { body, .. } if !tree_delivery_enabled => body,
+                            _ => return None,
                         };
                         let frame = proto::decode_voice(body).unwrap();
                         frame.fec_parity.then(|| {
@@ -8111,6 +8226,125 @@ mod tests {
                 "alternate_loss={alternate_loss}, primary_shedding={primary_shedding}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tree_voice_parity_follows_the_data_tree() {
+        // Tree delivery binds each edge to its own route (direct, a relay, or
+        // a split) that only the tree knows. Parity routed any other way —
+        // the routing table's first hop or its alternate — reaches the
+        // listener at a different latency than the data it protects. It must
+        // ride the same tree, group and recipients as the data.
+        let transport = FakeVoiceTransport::new(7, vec![1, 2]);
+        for dst in [1u16, 2] {
+            transport.set_voice_route_quality(
+                dst,
+                VoiceRouteQuality::new(dst, TransportKind::Udp, 1_000, 0, 0)
+                    .with_alternate_route_quality(5, 2_000, TransportKind::Udp, 0, 0),
+            );
+        }
+        let mut cfg = VoiceConfig::default();
+        cfg.repair_enabled = false;
+        cfg.tree_delivery_enabled = true;
+        cfg.voice_fec_block_size = 2;
+        cfg.voice_fec_parity_blocks = 1;
+        cfg.voice_fec_interleave_depth = 1;
+        let svc =
+            VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
+        for _ in 0..2 {
+            svc.send_broadcast(
+                0xABC,
+                default_server_id(),
+                0,
+                false,
+                Bytes::from_static(b"abcd"),
+                normal_intent(5),
+            )
+            .await
+            .unwrap();
+        }
+        let calls = transport.calls();
+        let mut parity_calls = 0;
+        for call in &calls {
+            let (body, via_tree) = match call {
+                FakeCall::TreeMulticast {
+                    body, dsts, group, ..
+                } => {
+                    assert_eq!(*group, DistributionGroup::broadcast());
+                    let mut dsts = dsts.clone();
+                    dsts.sort_unstable();
+                    assert_eq!(dsts, vec![1, 2]);
+                    (body, true)
+                }
+                FakeCall::Multicast { body, .. } | FakeCall::RepairFrame { body, .. } => {
+                    (body, false)
+                }
+                other => panic!("unexpected call {other:?}"),
+            };
+            if proto::decode_voice(body).unwrap().fec_parity {
+                assert!(via_tree, "parity left the data tree: {call:?}");
+                parity_calls += 1;
+            }
+        }
+        assert_eq!(parity_calls, 1, "one block, one parity row");
+    }
+
+    #[tokio::test]
+    async fn tree_voice_parity_also_rides_an_independent_first_hop() {
+        // Recipient 1's data leaves on first hop 1 and a route avoiding it
+        // exists; recipient 2 has no such route. Every parity row goes into
+        // the data tree for both, and a second copy detours around first hop 1
+        // for recipient 1 only, so a burst on 1's data path cannot take both.
+        let transport = FakeVoiceTransport::new(7, vec![1, 2]);
+        for dst in [1u16, 2] {
+            transport.set_voice_route_quality(
+                dst,
+                VoiceRouteQuality::new(dst, TransportKind::Udp, 1_000, 0, 0),
+            );
+        }
+        transport.set_tree_parity_detour(1, 1);
+        let mut cfg = VoiceConfig::default();
+        cfg.repair_enabled = false;
+        cfg.tree_delivery_enabled = true;
+        cfg.voice_fec_block_size = 2;
+        cfg.voice_fec_parity_blocks = 1;
+        cfg.voice_fec_interleave_depth = 1;
+        let svc =
+            VoiceService::new_with_transport(transport.clone(), cfg, CancellationToken::new(), 42);
+        for _ in 0..2 {
+            svc.send_broadcast(
+                0xABC,
+                default_server_id(),
+                0,
+                false,
+                Bytes::from_static(b"abcd"),
+                normal_intent(5),
+            )
+            .await
+            .unwrap();
+        }
+        let mut tree_parity = 0;
+        let mut detour_parity = Vec::new();
+        for call in transport.calls() {
+            match call {
+                FakeCall::TreeMulticast { body, .. }
+                    if proto::decode_voice(&body).unwrap().fec_parity =>
+                {
+                    tree_parity += 1;
+                }
+                FakeCall::RepairFrame {
+                    dst,
+                    body,
+                    avoid_first_hop,
+                    ..
+                } if proto::decode_voice(&body).unwrap().fec_parity => {
+                    detour_parity.push((dst, avoid_first_hop));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(tree_parity, 1);
+        assert_eq!(detour_parity, vec![(1, Some(1))]);
     }
 
     #[tokio::test]

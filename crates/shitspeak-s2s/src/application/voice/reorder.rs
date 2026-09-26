@@ -31,7 +31,7 @@ use tracing::trace;
 use crate::application::config::VoiceConfig;
 use crate::application::proto::VoiceFrame;
 use crate::application::voice::metrics::{
-    self, GapResolution, VoiceDeadlineWakeResult, VoiceReceiveResult,
+    self, DuplicateReason, GapResolution, VoiceDeadlineWakeResult, VoiceReceiveResult,
 };
 use shitspeak_core::NodeIdentifier;
 use shitspeak_voice::codec::{Audio, AudioPayload};
@@ -49,6 +49,9 @@ const FEC_LATE_EMIT_WINDOW: Duration = Duration::from_millis(200);
 /// Released holes remembered per speaker, bounding a flush across a large
 /// sequence jump.
 const MAX_RELEASED_HOLES: usize = 64;
+/// Recently delivered sequences remembered per speaker, to tell a duplicate
+/// (and which copy won) from a late arrival.
+const DELIVERY_HISTORY: usize = 128;
 
 /// One emit decision: forward the bundled `(from_immediate, frame)` to
 /// the audio sink.
@@ -60,7 +63,7 @@ pub type Emission = (NodeIdentifier, VoiceFrame);
 /// with the original, but it must never rewind an established sender cursor.
 /// Reactive repairs are still more constrained: they only fill an already
 /// open gap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum VoiceCopyKind {
     ReactiveRepair,
     Proactive,
@@ -75,6 +78,19 @@ impl VoiceCopyKind {
     fn is_reactive_repair(self) -> bool {
         matches!(self, Self::ReactiveRepair)
     }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ReactiveRepair => "repair",
+            Self::Proactive => "proactive",
+            Self::Fec => "fec",
+            Self::Original => "original",
+        }
+    }
+}
+
+fn rejected(reason: DuplicateReason, copy: VoiceCopyKind) -> ReorderResultCount {
+    ReorderResultCount::new(VoiceReceiveResult::DuplicateOrLate { reason, copy }, 1)
 }
 
 /// Internal form of an emitted frame that preserves whether this exact copy
@@ -315,6 +331,37 @@ struct SenderState {
     /// the release time. A FEC reconstruction of one may still emit late,
     /// once, within [`FEC_LATE_EMIT_WINDOW`].
     released_holes: VecDeque<(u64, Instant)>,
+    /// The last [`DELIVERY_HISTORY`] delivered sequences and which kind of
+    /// copy delivered each.
+    delivered: VecDeque<(u64, VoiceCopyKind)>,
+}
+
+impl SenderState {
+    fn record_delivered(&mut self, emissions: &[ReorderEmission]) {
+        for emission in emissions {
+            self.delivered
+                .push_back((emission.frame.s2s_seq, emission.copy_kind));
+        }
+        while self.delivered.len() > DELIVERY_HISTORY {
+            self.delivered.pop_front();
+        }
+    }
+
+    /// Why a sequence below the delivery cursor is being rejected.
+    fn below_cursor_reason(&self, seq: u64) -> DuplicateReason {
+        if let Some((_, copy)) = self
+            .delivered
+            .iter()
+            .rev()
+            .find(|(delivered, _)| *delivered == seq)
+        {
+            return DuplicateReason::AlreadyDelivered(*copy);
+        }
+        if self.released_holes.iter().any(|(hole, _)| *hole == seq) {
+            return DuplicateReason::LateAfterRelease;
+        }
+        DuplicateReason::Untracked
+    }
 }
 
 impl Reorderer {
@@ -717,10 +764,9 @@ impl Reorderer {
         // A reactive repair cannot create a speaker stream. An original or
         // proactive copy may bootstrap when it wins the race to the receiver.
         if !state.per_sender.contains_key(&session) && copy_kind.is_reactive_repair() {
-            report.results.push(ReorderResultCount::new(
-                VoiceReceiveResult::DuplicateOrLate,
-                1,
-            ));
+            report
+                .results
+                .push(rejected(DuplicateReason::RepairWithoutStream, copy_kind));
             report.pending_total = state.total_pending;
             return report;
         }
@@ -754,6 +800,7 @@ impl Reorderer {
                     last_activity: now,
                     next_flush_at: None,
                     released_holes: VecDeque::new(),
+                    delivered: VecDeque::new(),
                 },
             );
             self.enqueue_idle_deadline(&mut state, session, now);
@@ -772,10 +819,9 @@ impl Reorderer {
         // and a delayed frame from an older epoch cannot be useful anymore.
         if sender_epoch != entry.sender_epoch {
             if sender_epoch < entry.sender_epoch || copy_kind != VoiceCopyKind::Original {
-                report.results.push(ReorderResultCount::new(
-                    VoiceReceiveResult::DuplicateOrLate,
-                    1,
-                ));
+                report
+                    .results
+                    .push(rejected(DuplicateReason::StaleEpoch, copy_kind));
                 return self.finish_push(&mut state, session, entry, report, now);
             }
 
@@ -790,6 +836,7 @@ impl Reorderer {
             entry.in_order_run = 0;
             entry.next_flush_at = None;
             entry.released_holes.clear();
+            entry.delivered.clear();
         }
         entry.last_activity = now;
 
@@ -811,18 +858,18 @@ impl Reorderer {
             let late_fill = copy_kind == VoiceCopyKind::Fec
                 && !frame.is_terminator
                 && Self::take_released_hole(&mut entry, frame_seq, now);
-            let result = if late_fill {
-                VoiceReceiveResult::FecLate
-            } else {
-                VoiceReceiveResult::DuplicateOrLate
-            };
-            report.results.push(ReorderResultCount::new(result, 1));
-            let mut report = self.finish_push(&mut state, session, entry, report, now);
-            if late_fill {
-                report
-                    .emissions
-                    .push(ReorderEmission::new(from, frame, copy_kind));
+            if !late_fill {
+                let reason = entry.below_cursor_reason(frame_seq);
+                report.results.push(rejected(reason, copy_kind));
+                return self.finish_push(&mut state, session, entry, report, now);
             }
+            report
+                .results
+                .push(ReorderResultCount::new(VoiceReceiveResult::FecLate, 1));
+            let emission = ReorderEmission::new(from, frame, copy_kind);
+            entry.record_delivered(std::slice::from_ref(&emission));
+            let mut report = self.finish_push(&mut state, session, entry, report, now);
+            report.emissions.push(emission);
             return report;
         }
 
@@ -833,10 +880,9 @@ impl Reorderer {
             // cannot advance a healthy stream by itself.
             let gap_open = self.gap_is_live(&entry, now);
             if copy_kind.is_reactive_repair() && !gap_open {
-                report.results.push(ReorderResultCount::new(
-                    VoiceReceiveResult::DuplicateOrLate,
-                    1,
-                ));
+                report
+                    .results
+                    .push(rejected(DuplicateReason::RepairWithoutGap, copy_kind));
                 return self.finish_push(&mut state, session, entry, report, now);
             }
             report
@@ -892,10 +938,9 @@ impl Reorderer {
             // existing suffix opened by an original or proactive copy.
             let gap_open = self.gap_is_live(&entry, now);
             if copy_kind.is_reactive_repair() && !gap_open {
-                report.results.push(ReorderResultCount::new(
-                    VoiceReceiveResult::DuplicateOrLate,
-                    1,
-                ));
+                report
+                    .results
+                    .push(rejected(DuplicateReason::RepairWithoutGap, copy_kind));
                 return self.finish_push(&mut state, session, entry, report, now);
             }
 
@@ -928,10 +973,9 @@ impl Reorderer {
                     report.opened_gap = gap;
                     return self.finish_push(&mut state, session, entry, report, now);
                 } else {
-                    report.results.push(ReorderResultCount::new(
-                        VoiceReceiveResult::DuplicateOrLate,
-                        1,
-                    ));
+                    report
+                        .results
+                        .push(rejected(DuplicateReason::AlreadyBuffered, copy_kind));
                 }
                 return self.finish_push(&mut state, session, entry, report, now);
             }
@@ -1061,6 +1105,7 @@ impl Reorderer {
                 report.opened_gap = None;
             }
         }
+        entry.record_delivered(&report.emissions);
         report.pending_total = state.total_pending;
         state.per_sender.insert(session, entry);
         report
@@ -1181,7 +1226,9 @@ impl Reorderer {
                 }
 
                 let entry = state.per_sender.get_mut(&session).unwrap();
+                let emitted_before = report.emissions.len();
                 let drained = self.flush_pending(entry, now, &mut report);
+                entry.record_delivered(&report.emissions[emitted_before..]);
                 state.total_pending = state.total_pending.saturating_sub(drained);
             }
             self.prune_idle(&mut state, now);
@@ -1817,6 +1864,85 @@ mod tests {
         // Already emitted, and unknown speakers.
         assert!(!r.fec_wants_at(0xABC, 1, 0, at(10)));
         assert!(r.fec_wants_at(0xDEF, 1, 7, at(10)));
+    }
+
+    #[test]
+    fn rejected_frames_report_why_and_which_copy_arrived() {
+        use VoiceCopyKind::{Fec, Original, Proactive, ReactiveRepair};
+        let r = Reorderer::new(cfg());
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let push = |epoch: u64, seq: u64, copy: VoiceCopyKind, ms: u64| {
+            r.push_at(11, frame(0xABC, epoch, seq, false), None, copy, at(ms))
+                .result_counts()
+                .to_vec()
+        };
+        let rejected_as =
+            |counts: Vec<ReorderResultCount>| -> Vec<(DuplicateReason, VoiceCopyKind)> {
+                counts
+                    .iter()
+                    .filter_map(|count| match count.result() {
+                        VoiceReceiveResult::DuplicateOrLate { reason, copy } => {
+                            Some((reason, copy))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+
+        assert_eq!(
+            rejected_as(push(1, 0, ReactiveRepair, 0)),
+            vec![(DuplicateReason::RepairWithoutStream, ReactiveRepair)]
+        );
+        assert!(rejected_as(push(1, 0, Original, 0)).is_empty());
+        assert_eq!(
+            rejected_as(push(1, 0, Original, 1)),
+            vec![(DuplicateReason::AlreadyDelivered(Original), Original)]
+        );
+        assert_eq!(
+            rejected_as(push(0, 1, Original, 2)),
+            vec![(DuplicateReason::StaleEpoch, Original)]
+        );
+        assert_eq!(
+            rejected_as(push(2, 1, Proactive, 3)),
+            vec![(DuplicateReason::StaleEpoch, Proactive)]
+        );
+        assert_eq!(
+            rejected_as(push(1, 1, ReactiveRepair, 4)),
+            vec![(DuplicateReason::RepairWithoutGap, ReactiveRepair)]
+        );
+        // 3 opens a gap over 1..2; a second copy of 3 is already buffered.
+        assert!(rejected_as(push(1, 3, Original, 5)).is_empty());
+        assert_eq!(
+            rejected_as(push(1, 3, Proactive, 6)),
+            vec![(DuplicateReason::AlreadyBuffered, Proactive)]
+        );
+        // 4 arrives past the 108 ms cadence: the reorder releases past 1 and
+        // 2. An original of 1 is then genuinely late.
+        assert!(rejected_as(push(1, 4, Original, 200)).is_empty());
+        assert_eq!(
+            rejected_as(push(1, 1, Original, 210)),
+            vec![(DuplicateReason::LateAfterRelease, Original)]
+        );
+        // FEC late-fills 2; its original arriving afterwards lost the race
+        // to FEC — the case that used to hide in one `duplicate_or_late`.
+        let late = push(1, 2, Fec, 220);
+        assert!(
+            late.iter()
+                .any(|c| c.result() == VoiceReceiveResult::FecLate)
+        );
+        assert_eq!(
+            rejected_as(push(1, 2, Original, 230)),
+            vec![(DuplicateReason::AlreadyDelivered(Fec), Original)]
+        );
+        // Far beyond the delivery history nothing is known.
+        for seq in 5..(5 + DELIVERY_HISTORY as u64) {
+            push(1, seq, Original, 240);
+        }
+        assert_eq!(
+            rejected_as(push(1, 3, Original, 250)),
+            vec![(DuplicateReason::Untracked, Original)]
+        );
     }
 
     #[test]

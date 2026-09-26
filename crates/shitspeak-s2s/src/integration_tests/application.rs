@@ -1047,6 +1047,51 @@ async fn s2s_tree_voice_long_haul_repair_is_delivered_without_server_pacing() {
     cluster.shutdown_all().await;
 }
 
+/// On a full mesh the source's tree reaches each recipient directly, and a
+/// route through the other node avoids that data first hop: parity for both
+/// recipients gets an independent detour, each avoiding exactly its own data
+/// first hop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s2s_tree_voice_parity_detours_avoid_each_recipients_data_first_hop() {
+    let ids = [1u16, 2, 3];
+    let cluster = Cluster::build(&ids, full_mesh_seeds).await;
+    assert!(
+        wait_for_full_alive_mesh(&cluster, Duration::from_secs(8)).await,
+        "mesh failed to converge"
+    );
+    assert!(
+        wait_for_full_routing(&cluster, Duration::from_secs(8)).await,
+        "mesh failed to learn routes"
+    );
+    let apps: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            ApplicationLayer::new(
+                cluster.node(*id).overlay.clone(),
+                ApplicationConfig::default(),
+            )
+        })
+        .collect();
+    wait_for_tree_voice_forwarding(apps[0].as_ref(), 1, 2).await;
+    wait_for_tree_voice_forwarding(apps[0].as_ref(), 1, 3).await;
+
+    let source = &cluster.node(1).overlay;
+    let mut detours = source.voice_tree_parity_detours(0, 0, &[2, 3]);
+    detours.sort_unstable();
+    assert_eq!(
+        detours,
+        vec![(2, vec![2]), (3, vec![3])],
+        "each recipient's parity detours around its own direct data hop"
+    );
+    // Outside the active tree there is nothing to detour around.
+    assert!(source.voice_tree_parity_detours(99, 99, &[2, 3]).is_empty());
+
+    for app in apps {
+        app.shutdown().await;
+    }
+    cluster.shutdown_all().await;
+}
+
 /// A healthy nearby tree path must release a complete buffered suffix as soon
 /// as a marked S2S repair fills its sole missing sequence within the
 /// current packet's playback window.

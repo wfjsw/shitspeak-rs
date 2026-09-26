@@ -264,6 +264,20 @@ pub trait VoiceTransport: Send + Sync + 'static {
         let _ = first_hop;
         false
     }
+
+    /// Independent parity paths for tree voice: recipients among `dsts`
+    /// that a loop-free route reaches through a first hop other than every
+    /// first hop their data currently leaves this node on (the tree edge's
+    /// bound route, and the old route during a split). Grouped by the data
+    /// first hop such a copy is sent avoiding. Test transports have none.
+    fn voice_tree_parity_detours(
+        &self,
+        group: DistributionGroup,
+        dsts: &[NodeIdentifier],
+    ) -> Vec<(NodeIdentifier, Vec<NodeIdentifier>)> {
+        let _ = (group, dsts);
+        Vec::new()
+    }
 }
 
 /// Protect successfully sent repair and proactive copies at their shared
@@ -521,6 +535,13 @@ impl VoiceTransport for FecVoiceTransport {
     }
     fn datagram_lane_shedding(&self, first_hop: NodeIdentifier) -> bool {
         self.inner.datagram_lane_shedding(first_hop)
+    }
+    fn voice_tree_parity_detours(
+        &self,
+        group: DistributionGroup,
+        dsts: &[NodeIdentifier],
+    ) -> Vec<(NodeIdentifier, Vec<NodeIdentifier>)> {
+        self.inner.voice_tree_parity_detours(group, dsts)
     }
 }
 
@@ -793,6 +814,15 @@ impl VoiceTransport for OverlayVoiceTransport {
     fn datagram_lane_shedding(&self, first_hop: NodeIdentifier) -> bool {
         self.overlay.datagram_lane_shedding(first_hop)
     }
+
+    fn voice_tree_parity_detours(
+        &self,
+        group: DistributionGroup,
+        dsts: &[NodeIdentifier],
+    ) -> Vec<(NodeIdentifier, Vec<NodeIdentifier>)> {
+        self.overlay
+            .voice_tree_parity_detours(group.id(), group.version(), dsts)
+    }
 }
 
 /// A voice envelope prepared for ordinary delivery and, if admitted, one
@@ -938,6 +968,7 @@ pub(crate) mod testing {
         route_qualities: Mutex<HashMap<NodeIdentifier, VoiceRouteQuality>>,
         route_quality_scalar_calls: AtomicU64,
         route_quality_batches: Mutex<Vec<Vec<NodeIdentifier>>>,
+        tree_parity_detours: Mutex<HashMap<NodeIdentifier, NodeIdentifier>>,
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -986,7 +1017,17 @@ pub(crate) mod testing {
                 route_qualities: Mutex::new(HashMap::new()),
                 route_quality_scalar_calls: AtomicU64::new(0),
                 route_quality_batches: Mutex::new(Vec::new()),
+                tree_parity_detours: Mutex::new(HashMap::new()),
             })
+        }
+
+        /// Declare that tree parity for `dst` has an independent route that
+        /// avoids `data_first_hop`.
+        pub fn set_tree_parity_detour(&self, dst: NodeIdentifier, data_first_hop: NodeIdentifier) {
+            self.tree_parity_detours
+                .lock()
+                .unwrap()
+                .insert(dst, data_first_hop);
         }
 
         pub fn calls(&self) -> Vec<FakeCall> {
@@ -1139,6 +1180,25 @@ pub(crate) mod testing {
                 .push(dsts.to_vec());
             let qualities = self.route_qualities.lock().unwrap();
             dsts.iter().map(|dst| qualities.get(dst).copied()).collect()
+        }
+
+        fn voice_tree_parity_detours(
+            &self,
+            _group: DistributionGroup,
+            dsts: &[NodeIdentifier],
+        ) -> Vec<(NodeIdentifier, Vec<NodeIdentifier>)> {
+            let detours = self.tree_parity_detours.lock().unwrap();
+            let mut grouped: Vec<(NodeIdentifier, Vec<NodeIdentifier>)> = Vec::new();
+            for dst in dsts {
+                let Some(&avoid) = detours.get(dst) else {
+                    continue;
+                };
+                match grouped.iter_mut().find(|(hop, _)| *hop == avoid) {
+                    Some((_, members)) => members.push(*dst),
+                    None => grouped.push((avoid, vec![*dst])),
+                }
+            }
+            grouped
         }
     }
 }

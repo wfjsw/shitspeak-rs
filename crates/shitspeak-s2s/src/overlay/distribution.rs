@@ -1681,6 +1681,32 @@ impl DistributionPlane {
             })
     }
 
+    /// First hops the edge `parent -> child` currently sends this tree's data
+    /// on: the bound route (or the pending decision about to be used) and,
+    /// during a weighted split, the old route still carrying a share. An edge
+    /// with no binding yet sends directly to `child`.
+    pub(crate) fn tree_edge_data_first_hops(
+        &self,
+        tree_key: TreeKey,
+        parent: NodeIdentifier,
+        child: NodeIdentifier,
+    ) -> Vec<NodeIdentifier> {
+        let bindings = self.tree_edge_bindings.lock();
+        let Some(binding) = bindings.get(&TreeEdgeBindingKey::new(tree_key, parent, child)) else {
+            return vec![child];
+        };
+        let mut hops = vec![binding.path.first_hop(child)];
+        if let Some((pending, _)) = binding.pending {
+            hops.push(pending.first_hop(child));
+        }
+        if let Some(TreeEdgeSplitState::Splitting { from, .. }) = binding.transition {
+            hops.push(from.first_hop(child));
+        }
+        hops.sort_unstable();
+        hops.dedup();
+        hops
+    }
+
     /// Roll an in-flight split back to the old route. Called by the sender when
     /// the primary (adopted) path failed to send and the old route successfully
     /// carried the frame as a fallback: the failed new path must not be treated
@@ -4733,6 +4759,40 @@ mod tests {
         let later = now + FAILED_EDGE_STREAK_MEMORY;
         assert!(!excluded(later));
         assert_eq!(exclude("split_abort", later), FAILED_EDGE_EXCLUSION);
+    }
+
+    #[test]
+    fn tree_edge_data_first_hops_track_binding_and_split() {
+        let plane = DistributionPlane::default();
+        let tree_key = key(114, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        // No binding yet: data goes straight to the child.
+        assert_eq!(plane.tree_edge_data_first_hops(tree_key, 1, 2), vec![2]);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        assert_eq!(plane.tree_edge_data_first_hops(tree_key, 1, 2), vec![2]);
+        // A relay challenger is confirmed: while the move is pending and
+        // while the split fades between them, both first hops carry data.
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(2, 40)
+                    .with_datagram_lane(false, false)
+                    .with_congestion(true),
+                TreeEdgeCandidate::legacy(4097, 0, 30).with_datagram_lane(false, false),
+            ]
+        };
+        let attempt =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(800));
+        assert_eq!(attempt.path(), TreeEdgePath::LegacyVia(4097));
+        assert_eq!(
+            plane.tree_edge_data_first_hops(tree_key, 1, 2),
+            vec![2, 4097]
+        );
+        let _ = plane.complete_tree_edge_attempt(attempt, true, at(800));
+        let hops = plane.tree_edge_data_first_hops(tree_key, 1, 2);
+        assert!(hops.contains(&4097), "adopted relay carries data: {hops:?}");
+        // Other edges are unaffected.
+        assert_eq!(plane.tree_edge_data_first_hops(tree_key, 1, 3), vec![3]);
     }
 
     #[test]
