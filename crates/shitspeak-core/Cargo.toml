@@ -5,8 +5,13 @@ edition.workspace = true
 
 [dependencies]
 enumflags2 = { workspace = true }
+fluent-langneg = { workspace = true }
+icu_locid = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }

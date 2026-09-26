@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::constants::APP_PROTO_VER;
 use crate::integration_tests::harness::{AuthenticatorAdapter, TestAuthenticator};
+use crate::localization::Language;
 use crate::protocol_version::ProtocolVersion;
 use crate::server::Server;
 use shitspeak_runtime_config::{
@@ -43,6 +44,8 @@ pub struct TestServerOpts {
     pub max_users: u64,
     pub cert_required: bool,
     pub welcome_text: Option<String>,
+    pub default_language: Language,
+    pub force_language: Option<Language>,
     pub udp_voice_enabled: bool,
     pub udp_ping_enabled: bool,
     pub default_channel: u32,
@@ -73,6 +76,8 @@ impl Default for TestServerOpts {
             max_users: 100,
             cert_required: false,
             welcome_text: Some("test-welcome".into()),
+            default_language: Language::default(),
+            force_language: None,
             udp_voice_enabled: true,
             udp_ping_enabled: true,
             default_channel: 0,
@@ -528,6 +533,8 @@ async fn spawn_test_server_with_pki(
         root_channel_name: "Root".into(),
         default_channel: opts.default_channel,
         cert_required: opts.cert_required,
+        default_language: opts.default_language,
+        force_language: opts.force_language,
         blob_storage_dir: blob_storage_dir
             .as_ref()
             .map(|directory| directory.path().to_path_buf()),

@@ -6,7 +6,9 @@ use std::{
 
 use config::{Config as ConfigCrate, Environment, File};
 use serde::{Deserialize, Deserializer};
-use shitspeak_core::{NodeGeo, NodeIdentifier, ProtocolVersion, constants::APP_PROTO_VER};
+use shitspeak_core::{
+    Language, NodeGeo, NodeIdentifier, ProtocolVersion, constants::APP_PROTO_VER,
+};
 use shitspeak_s2s::application::ApplicationConfig;
 use shitspeak_s2s::overlay::OverlayTuning;
 use shitspeak_s2s::replications::ReplicationTuning;
@@ -1235,6 +1237,16 @@ pub struct Config {
     #[serde(default)]
     pub cert_required: bool,
 
+    // ── Localization ───────────────────────────────────────────────────────
+    /// Language used for server-generated messages when the authenticator does
+    /// not return one, and before a client has authenticated. Default: `en`.
+    #[serde(default)]
+    pub default_language: Language,
+    /// When set, this language overrides every other language selection,
+    /// including a language returned by the authenticator. Default: unset.
+    #[serde(default)]
+    pub force_language: Option<Language>,
+
     // ── Blob / persistence ─────────────────────────────────────────────────
     /// Directory used for WAL, snapshot, and blob storage.
     /// `None` = in-memory only (no persistence).
@@ -1841,6 +1853,18 @@ impl Config {
         Self::load_from("config.toml")
     }
 
+    /// Resolve the language for server-generated text.
+    ///
+    /// `requested` is the language an authenticator asked for, or `None` when
+    /// it did not choose one (or when no authentication has happened yet).
+    /// `force_language` wins over everything, then the requested language, then
+    /// `default_language`.
+    pub fn resolve_language(&self, requested: Option<Language>) -> Language {
+        self.force_language
+            .or(requested)
+            .unwrap_or(self.default_language)
+    }
+
     pub fn load_from(path: impl AsRef<std::path::Path>) -> Self {
         Self::build_config(path)
             .try_deserialize()
@@ -1904,6 +1928,74 @@ mod tests {
             .add_source(::config::File::from_str(raw, ::config::FileFormat::Toml))
             .build()?
             .try_deserialize()
+    }
+
+    const MINIMAL_CONFIG: &str = r#"
+        listen = "127.0.0.1:64738"
+        register_name = "test"
+        cert_path = "cert.pem"
+        key_path = "key.pem"
+        send_version = true
+        send_build_info = true
+        send_os_info = true
+        allowed_proxies = []
+        min_client_version = 0
+        max_users = 100
+    "#;
+
+    #[test]
+    fn language_config_defaults_to_english_without_a_forced_language() {
+        let config = parse_config(MINIMAL_CONFIG).expect("minimal config parses");
+
+        assert_eq!(config.default_language, Language::English);
+        assert_eq!(config.force_language, None);
+        assert_eq!(config.resolve_language(None), Language::English);
+        assert_eq!(
+            config.resolve_language(Some(Language::French)),
+            Language::French
+        );
+    }
+
+    #[test]
+    fn default_language_only_fills_in_an_absent_request() {
+        let raw = format!("{MINIMAL_CONFIG}\ndefault_language = \"es\"\n");
+        let config = parse_config(&raw).expect("config parses");
+
+        assert_eq!(config.resolve_language(None), Language::Spanish);
+        assert_eq!(
+            config.resolve_language(Some(Language::German)),
+            Language::German
+        );
+    }
+
+    #[test]
+    fn force_language_overrides_default_and_requested_languages() {
+        let raw =
+            format!("{MINIMAL_CONFIG}\ndefault_language = \"es\"\nforce_language = \"zh-CN\"\n");
+        let config = parse_config(&raw).expect("config parses");
+
+        assert_eq!(config.default_language, Language::Spanish);
+        assert_eq!(
+            config.resolve_language(None),
+            Language::ChineseSimplified,
+            "forced language replaces the default"
+        );
+        assert_eq!(
+            config.resolve_language(Some(Language::German)),
+            Language::ChineseSimplified,
+            "forced language replaces an authenticator-provided language"
+        );
+    }
+
+    #[test]
+    fn unsupported_language_tags_are_rejected_at_load() {
+        let raw = format!("{MINIMAL_CONFIG}\ndefault_language = \"kl\"\n");
+
+        let error = parse_config(&raw).expect_err("unsupported language must not load");
+        assert!(
+            error.to_string().contains("unsupported language tag"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

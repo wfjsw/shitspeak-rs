@@ -38,6 +38,10 @@ cidr = "0"
 config = { version = "0", default-features = false, features = ["toml"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 enumflags2 = { version = "0", features = ["serde"] }
+fluent-langneg = { version = "0.14", features = ["cldr"] }
+# Language-tag type shared with fluent-langneg; keep the major version aligned
+# with the one fluent-langneg re-exports or negotiation stops type-checking.
+icu_locid = "1.5"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 hang = "0.16"
 hex = "0"

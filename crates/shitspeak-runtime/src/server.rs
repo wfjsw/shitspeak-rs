@@ -1871,7 +1871,7 @@ impl Server {
             return;
         }
 
-        client.set_language(language);
+        client.set_language(self.read_config().resolve_language(language));
         client.set_max_bandwidth(max_bandwidth);
         client.set_voice_bandwidth_limit(max_bandwidth.unwrap_or(self.get_max_bandwidth()));
         let root_permissions = crate::client::acl::compute_permissions_for_client_with_identity(

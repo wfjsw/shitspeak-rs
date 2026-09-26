@@ -255,11 +255,10 @@ impl AuthenticatorJsonAuthenticateResponse {
             is_superuser: self.is_superuser,
             invisible: self.invisible,
             virtual_server_id: self.virtual_server_id,
-            language: self
-                .language
-                .as_deref()
-                .map(Language::from_code)
-                .unwrap_or_default(),
+            // An absent `language` leaves the selection to the server's
+            // `default_language`; a present one is negotiated leniently so an
+            // unknown tag degrades to English rather than failing the login.
+            language: self.language.as_deref().map(Language::from_code),
             max_bandwidth: self.max_bandwidth,
             texture_url: self.texture_url,
             comment_url: self.comment_url,
@@ -284,7 +283,7 @@ pub(crate) fn authenticate_result_from_external_claims(
         is_superuser: false,
         invisible: false,
         virtual_server_id: None,
-        language: Language::default(),
+        language: None,
         max_bandwidth: None,
         texture_url: None,
         comment_url: None,

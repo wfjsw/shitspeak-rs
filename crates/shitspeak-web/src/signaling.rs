@@ -2621,7 +2621,6 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use shitspeak_auth::{AuthenticateResult, AuthenticationExpiryAction, AuthenticationRejection};
-    use shitspeak_runtime::localization::Language;
 
     #[test]
     fn web_event_conversion_preserves_move_messages_and_omits_permission_queries() {
@@ -3412,7 +3411,7 @@ mod tests {
                 is_superuser: false,
                 invisible: false,
                 virtual_server_id: None,
-                language: Language::default(),
+                language: None,
                 max_bandwidth: None,
                 texture_url: None,
                 comment_url: None,
@@ -3463,6 +3462,8 @@ mod tests {
             root_channel_name: "Root".into(),
             default_channel: 0,
             cert_required: false,
+            default_language: Default::default(),
+            force_language: None,
             blob_storage_dir: None,
             session_blob_cache_budget_bytes: 256 * 1024 * 1024,
             user_channel_cache_record_remote_sessions: false,

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use shitspeak_auth::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationExpiryAction,
-    AuthenticationRejection, Authenticator, Language, ReloadableAuthenticator,
+    AuthenticationRejection, Authenticator, ReloadableAuthenticator,
 };
 use tokio::sync::Barrier;
 
@@ -151,7 +151,7 @@ fn result(label: &str) -> AuthenticateResult {
         is_superuser: false,
         invisible: false,
         virtual_server_id: None,
-        language: Language::default(),
+        language: None,
         max_bandwidth: None,
         texture_url: None,
         comment_url: None,

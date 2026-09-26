@@ -91,7 +91,8 @@ pub struct AuthenticateResult {
     /// virtual-server entrypoints do not constrain this value.
     pub virtual_server_id: Option<String>,
     /// Preferred language for server-generated messages sent to this client.
-    pub language: Language,
+    /// `None` leaves the choice to the server's `default_language` config.
+    pub language: Option<Language>,
     /// Optional per-client maximum bandwidth advertised to the authenticated
     /// client. `None` uses the server-wide `max_bandwidth` config value.
     pub max_bandwidth: Option<u32>,
@@ -197,7 +198,7 @@ pub trait Authenticator: Send + Sync + 'static {
             is_superuser: false,
             invisible: false,
             virtual_server_id: None,
-            language: Language::default(),
+            language: None,
             max_bandwidth: None,
             texture_url: None,
             comment_url: None,

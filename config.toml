@@ -30,6 +30,16 @@ max_image_message_length = 131072
 root_channel_name = "Root"
 default_channel = 1
 cert_required = false
+
+# Language used for server-generated text when the authenticator does not
+# return one, and before a client authenticates. Accepts any BCP-47 tag that
+# negotiates onto a bundled translation ("en", "es", "fr", "de", "zh"); for
+# example "es-MX" resolves to Spanish and "zh-CN" to Simplified Chinese.
+default_language = "en"
+# Uncomment to force one language for every client, overriding both
+# default_language and any language an authenticator returns.
+# force_language = "en"
+
 # When enabled, ChannelState messages include per-client permission hints
 # (`is_enter_restricted` and `can_enter`), and ACL/enter changes send
 # PermissionQuery refreshes.

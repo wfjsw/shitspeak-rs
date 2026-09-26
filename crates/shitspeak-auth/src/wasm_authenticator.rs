@@ -25,7 +25,6 @@ use wasmtime::{
 
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
 
-use crate::Language;
 use crate::config::{AuthenticatorBackend, AuthenticatorConfigSource, ExecAuthenticatorMode};
 use crate::http_client;
 
@@ -122,7 +121,7 @@ impl Authenticator for DemoAuthenticator {
             is_superuser: username == "admin",
             invisible: false,
             virtual_server_id: None,
-            language: Language::default(),
+            language: None,
             max_bandwidth: None,
             texture_url: None,
             comment_url: None,

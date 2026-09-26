@@ -80,6 +80,11 @@ pub async fn handle_authenticate(
         return Ok(());
     }
 
+    // Apply the configured language before anything can be rejected, so
+    // pre-authentication rejection text honors `default_language` and
+    // `force_language` instead of defaulting to English.
+    sender.set_language(auth_config.resolve_language(None));
+
     // ── Username required ─────────────────────────────────────────────────
     let username = msg.username.ok_or(RejectType::InvalidUsername)?;
     let password = msg.password;
@@ -217,7 +222,7 @@ pub async fn handle_authenticate(
     let auth_session_id = result.auth_session_id.clone();
     let authenticated_until = result.authenticated_until;
     let authentication_expiry_action = result.authentication_expiry_action;
-    sender.set_language(result.language);
+    sender.set_language(auth_config.resolve_language(result.language));
     if let Some(auth_server_id) = result.virtual_server_id.clone() {
         if auth_server_id != provisional_server_id {
             let Some(new_session) = repo

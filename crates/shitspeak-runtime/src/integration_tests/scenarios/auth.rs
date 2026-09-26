@@ -2,7 +2,7 @@
 //! and `cert_required` rejection.
 
 use crate::integration_tests::harness::{
-    ManualNativeClient, TestClient, TestServerOpts, spawn_test_server,
+    ManualNativeClient, TestClient, TestServer, TestServerOpts, spawn_test_server,
 };
 use crate::localization::Language;
 use crate::voice::codec::IncomingUdpPacket;
@@ -1335,7 +1335,7 @@ async fn auth_selected_server_id_absent_from_config_scopes_client() {
         None,
         Some(1),
         vec![],
-        Language::default(),
+        None,
         Some("tenant-auth"),
     );
 
@@ -1378,7 +1378,7 @@ async fn blank_auth_selected_server_id_keeps_incoming_default_server() {
         None,
         Some(1),
         vec![],
-        Language::default(),
+        None,
         Some(""),
     );
 
@@ -1413,7 +1413,7 @@ async fn whitespace_auth_selected_server_id_keeps_incoming_default_server() {
         None,
         Some(1),
         vec![],
-        Language::default(),
+        None,
         Some(" \t\n "),
     );
 
@@ -1730,4 +1730,136 @@ async fn permission_denied_uses_authenticated_language() {
         panic!("Alice should receive PermissionDenied");
     };
     assert_eq!(pd.reason.as_deref(), Some("El canal 99 no existe"));
+}
+
+/// The reason text of the first `PermissionDenied` Alice gets for moving into a
+/// nonexistent channel, which is localized with her resolved language.
+async fn permission_denied_reason_for_missing_channel(server: &TestServer, user: &str) -> String {
+    let client = TestClient::connect_and_authenticate(server, user, None)
+        .await
+        .expect("auth");
+    client.move_to_channel(99).await;
+    let denied = client
+        .recv_until(
+            |m| matches!(m, Message::PermissionDenied(pd) if pd.channel_id == Some(99)),
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+    let Some(Message::PermissionDenied(pd)) = denied else {
+        panic!("{user} should receive PermissionDenied");
+    };
+    pd.reason.expect("PermissionDenied carries a reason")
+}
+
+#[tokio::test]
+async fn default_language_applies_when_authenticator_returns_no_language() {
+    let server = spawn_test_server(TestServerOpts {
+        default_language: Language::Spanish,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user_without_language("alice", None, Some(1), vec![]);
+
+    assert_eq!(
+        permission_denied_reason_for_missing_channel(&server, "alice").await,
+        "El canal 99 no existe"
+    );
+}
+
+#[tokio::test]
+async fn authenticator_language_wins_over_default_language() {
+    let server = spawn_test_server(TestServerOpts {
+        default_language: Language::Spanish,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server.authenticator.register_user_with_language(
+        "alice",
+        None,
+        Some(1),
+        vec![],
+        Language::German,
+    );
+
+    assert_eq!(
+        permission_denied_reason_for_missing_channel(&server, "alice").await,
+        "Kanal 99 existiert nicht"
+    );
+}
+
+#[tokio::test]
+async fn force_language_overrides_the_authenticator_language() {
+    let server = spawn_test_server(TestServerOpts {
+        default_language: Language::English,
+        force_language: Some(Language::German),
+        ..TestServerOpts::default()
+    })
+    .await;
+    server.authenticator.register_user_with_language(
+        "alice",
+        None,
+        Some(1),
+        vec![],
+        Language::Spanish,
+    );
+
+    assert_eq!(
+        permission_denied_reason_for_missing_channel(&server, "alice").await,
+        "Kanal 99 existiert nicht"
+    );
+}
+
+#[tokio::test]
+async fn default_language_applies_to_pre_authentication_rejections() {
+    let server = spawn_test_server(TestServerOpts {
+        default_language: Language::Spanish,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user_without_language("alice", Some("hunter2"), Some(1), vec![]);
+
+    match TestClient::connect_and_authenticate(&server, "alice", Some("nope")).await {
+        Err(crate::integration_tests::harness::test_client::ConnectError::Rejected(r)) => {
+            assert_eq!(r.r#type, Some(RejectType::WrongUserPw as i32));
+            assert_eq!(
+                r.reason.as_deref(),
+                Some("Usuario o contraseña incorrectos")
+            );
+        }
+        Err(other) => panic!("expected Rejected, got {other:?}"),
+        Ok(_) => panic!("auth should have failed"),
+    }
+}
+
+#[tokio::test]
+async fn force_language_overrides_pre_authentication_rejections() {
+    let server = spawn_test_server(TestServerOpts {
+        default_language: Language::Spanish,
+        force_language: Some(Language::German),
+        ..TestServerOpts::default()
+    })
+    .await;
+    server.authenticator.register_user_with_language(
+        "alice",
+        Some("hunter2"),
+        Some(1),
+        vec![],
+        Language::Spanish,
+    );
+
+    match TestClient::connect_and_authenticate(&server, "alice", Some("nope")).await {
+        Err(crate::integration_tests::harness::test_client::ConnectError::Rejected(r)) => {
+            assert_eq!(r.r#type, Some(RejectType::WrongUserPw as i32));
+            assert_eq!(
+                r.reason.as_deref(),
+                Some("Benutzername oder Passwort ist falsch")
+            );
+        }
+        Err(other) => panic!("expected Rejected, got {other:?}"),
+        Ok(_) => panic!("auth should have failed"),
+    }
 }

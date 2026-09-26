@@ -23,7 +23,9 @@ struct ScriptedUser {
     groups: Vec<String>,
     is_superuser: bool,
     invisible: bool,
-    language: Language,
+    /// `None` models an authenticator that returns no language, leaving the
+    /// choice to the server's `default_language`.
+    language: Option<Language>,
     virtual_server_id: Option<String>,
     max_bandwidth: Option<u32>,
 }
@@ -138,7 +140,7 @@ impl TestAuthenticator {
         user_id: Option<u32>,
         groups: Vec<String>,
     ) {
-        self.register_user_with_language(name, password, user_id, groups, Language::default());
+        self.register_user_without_language(name, password, user_id, groups);
     }
 
     pub fn register_superuser(
@@ -154,7 +156,7 @@ impl TestAuthenticator {
             user_id,
             groups,
             true,
-            Language::default(),
+            None,
             None,
             None,
         );
@@ -175,7 +177,7 @@ impl TestAuthenticator {
                 groups,
                 is_superuser: false,
                 invisible: true,
-                language: Language::default(),
+                language: None,
                 virtual_server_id: None,
                 max_bandwidth: None,
             },
@@ -197,7 +199,7 @@ impl TestAuthenticator {
                 groups,
                 is_superuser: true,
                 invisible: true,
-                language: Language::default(),
+                language: None,
                 virtual_server_id: None,
                 max_bandwidth: None,
             },
@@ -218,7 +220,7 @@ impl TestAuthenticator {
             user_id,
             groups,
             false,
-            Language::default(),
+            None,
             None,
             max_bandwidth,
         );
@@ -232,7 +234,19 @@ impl TestAuthenticator {
         groups: Vec<String>,
         language: Language,
     ) {
-        self.register_user_in_server(name, password, user_id, groups, language, None);
+        self.register_user_in_server(name, password, user_id, groups, Some(language), None);
+    }
+
+    /// Register a user whose authentication result carries no language, so the
+    /// server falls back to its `default_language`.
+    pub fn register_user_without_language(
+        &self,
+        name: &str,
+        password: Option<&str>,
+        user_id: Option<u32>,
+        groups: Vec<String>,
+    ) {
+        self.register_user_in_server(name, password, user_id, groups, None, None);
     }
 
     pub fn register_user_in_server(
@@ -241,7 +255,7 @@ impl TestAuthenticator {
         password: Option<&str>,
         user_id: Option<u32>,
         groups: Vec<String>,
-        language: Language,
+        language: Option<Language>,
         virtual_server_id: Option<&str>,
     ) {
         self.register_user_with_options(
@@ -263,7 +277,7 @@ impl TestAuthenticator {
         user_id: Option<u32>,
         groups: Vec<String>,
         is_superuser: bool,
-        language: Language,
+        language: Option<Language>,
         virtual_server_id: Option<&str>,
         max_bandwidth: Option<u32>,
     ) {

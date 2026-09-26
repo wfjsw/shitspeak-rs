@@ -119,6 +119,8 @@ Successful authentication can provide identity, display name, groups, virtual se
 
 `max_bandwidth`, when present, overrides the configured `max_bandwidth` value advertised to that authenticated client.
 
+`language` selects the language of server-generated text for this client. Omit it (or send `null`) to leave the choice to the server's `default_language`. Any BCP-47 tag that negotiates onto a bundled translation is accepted, so `es-MX` resolves to Spanish and `zh-CN` to Simplified Chinese; a tag matching no translation falls back to English rather than failing the login. The server's `force_language` setting, when configured, overrides this field. See [Configuration](configuration.md#localization).
+
 `fqdn` is an optional authenticator-assigned, globally unique user identifier. It is replicated between cluster nodes but is not sent in Mumble `UserState` messages.
 
 `auth_session_id` is an optional opaque identifier supplied by the authenticator. The server retains it for the connection and includes it as `auxiliary_data.auth_session_id` in later authentication requests for that connection, including expiry-triggered reauthentication.

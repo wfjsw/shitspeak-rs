@@ -198,6 +198,31 @@ default_channel = 0
 certificate. It checks certificate presence, not whether the certificate chains
 to a trusted client CA.
 
+### Localization
+
+```toml
+default_language = "en"
+# force_language = "de"
+```
+
+Server-generated text (login rejections, permission denials, and other server
+messages) is localized per client. The language is resolved in this order:
+
+1. `force_language`, when set.
+2. The `language` returned by the authenticator for that user.
+3. `default_language`.
+
+`default_language` therefore covers both users whose authenticator returns no
+`language` and text sent before authentication completes, such as a rejected
+login. `force_language` overrides every other source, including the
+authenticator, which is useful for a single-locale deployment.
+
+Both values accept any BCP-47 language tag that negotiates onto a bundled
+translation (`en`, `es`, `fr`, `de`, `zh`), so `es-MX` resolves to Spanish and
+`zh-CN` to Simplified Chinese. A tag that matches no bundled translation is a
+configuration error and fails the load, rather than silently falling back to
+English.
+
 ## PROXY Protocol
 
 Configure trusted upstream proxies with `allowed_proxies`:
@@ -1290,6 +1315,9 @@ Reloaded successfully at runtime:
 - `show_node_id_for_superusers`
 - `[acl]` behavior toggles
 - `[privacy]` certificate hash protection and secret
+- `default_language` and `force_language`, for clients that authenticate or
+  reauthenticate after the reload; already-connected clients keep the language
+  resolved at their last authentication
 - additions to `server_entrypoints`
 
 Restart-sensitive settings include base listener changes, most existing listener remaps, S2S identity and most S2S transport/listen settings, storage paths, `client_log_max_entries`, `auth_finalization_concurrency`, feature-gated web startup, metrics server startup, Loki startup, and public registration startup.
