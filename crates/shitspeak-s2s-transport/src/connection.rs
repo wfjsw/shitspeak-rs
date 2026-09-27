@@ -1261,6 +1261,12 @@ impl SessionSender {
     }
 }
 
+/// How soon after a session on an address was established we may have to dial
+/// it again before that session counts as too short-lived to prove the address
+/// works. A healthy address holds its session for hours; a link that cannot
+/// carry one re-dials every couple of minutes.
+const ADDRESS_FLAP_WINDOW: Duration = Duration::from_secs(300);
+
 #[derive(Debug)]
 pub(crate) struct BackoffState {
     initial: Duration,
@@ -1268,6 +1274,10 @@ pub(crate) struct BackoffState {
     retry_delay: Duration,
     last_attempt: Option<Instant>,
     consecutive_failures: u32,
+    /// When a session on this address last came up, so a success that lands
+    /// inside [`ADDRESS_FLAP_WINDOW`] of the previous one can be recognised as
+    /// a connect/die loop rather than a recovery.
+    last_success_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1339,6 +1349,7 @@ impl BackoffState {
             retry_delay: initial,
             last_attempt: None,
             consecutive_failures: 0,
+            last_success_at: None,
         }
     }
 
@@ -1369,6 +1380,8 @@ impl BackoffState {
             retry_delay,
             last_attempt,
             consecutive_failures: snapshot.consecutive_failures(),
+            // Not persisted: a restored address gets a clean first success.
+            last_success_at: None,
         }
     }
 
@@ -1405,10 +1418,39 @@ impl BackoffState {
         self.last_attempt = Some(Instant::now());
     }
 
-    pub fn record_success(&mut self) {
+    /// A session on this address came up.
+    ///
+    /// Establishing a session only proves the address works if the session then
+    /// holds. When we have to dial the same address again within
+    /// [`ADDRESS_FLAP_WINDOW`], the previous one collapsed, and crediting that
+    /// as a success clears the failures the re-dial accumulated — so the
+    /// address never looks unreachable, the lane never gets marked blocked, and
+    /// voice keeps being steered onto a link that cannot hold a session. Keep
+    /// the accumulated failures in that case and let the backoff stand.
+    pub fn record_success(&mut self, now: Instant) {
+        let flapping = self
+            .last_success_at
+            .is_some_and(|at| now.saturating_duration_since(at) < ADDRESS_FLAP_WINDOW);
+        if !flapping {
+            self.clear_failures();
+        }
+        self.last_success_at = Some(now);
+    }
+
+    /// Forget the address's accumulated dial failures, keeping the record of
+    /// when a session on it last came up.
+    pub fn clear_failures(&mut self) {
         self.consecutive_failures = 0;
         self.next_delay = self.initial;
         self.retry_delay = self.initial;
+    }
+
+    /// Forget the failures *and* the flap history: the peer restarted, so
+    /// everything we recorded describes listeners that no longer exist, and the
+    /// next session that comes up must be judged fresh rather than as a flap.
+    pub fn forget_dial_history(&mut self) {
+        self.clear_failures();
+        self.last_success_at = None;
     }
 
     fn snapshot(&self) -> BackoffSnapshot {
@@ -1880,7 +1922,7 @@ impl PeerState {
         {
             let mut backoffs = self.address_backoffs.lock();
             for backoff in backoffs.values_mut() {
-                backoff.record_success();
+                backoff.forget_dial_history();
             }
         }
         *self.address_failures_forgotten_at.lock() = Some(now);
@@ -1899,7 +1941,7 @@ impl PeerState {
             .lock()
             .entry(addr)
             .or_insert_with(|| BackoffState::new(self.backoff_initial))
-            .record_success();
+            .record_success(Instant::now());
     }
 
     pub fn note_observed_remote_addr(&self, transport: TransportKind, addr: std::net::SocketAddr) {
@@ -2118,7 +2160,7 @@ impl PeerState {
         };
         let addr = PeerAddress::new(remote_addr, transport);
         if let Some(backoff) = self.address_backoffs.lock().get_mut(&addr) {
-            backoff.record_success();
+            backoff.record_success(Instant::now());
         }
     }
 
@@ -3323,6 +3365,61 @@ impl PeerState {
         })
     }
 
+    /// Whether a stream on `transport` is live, whichever side dialled it.
+    ///
+    /// A live stream proves the transport reaches the peer right now, even when
+    /// no address in the book can be credited for it: the peer may sit behind
+    /// NAT so its packets arrive from a translated address, or advertise a name
+    /// that resolves somewhere other than the address we hold. Reachability
+    /// verdicts derived from dial failures alone must defer to this.
+    pub fn has_live_stream_on(&self, transport: TransportKind) -> bool {
+        let mut streams = self.stream_entries();
+        prune_dead_streams(&mut streams);
+        streams
+            .values()
+            .any(|stream| stream.is_alive() && stream.transport() == transport)
+    }
+
+    /// Forget dial failures recorded against a transport that has been holding a
+    /// session for longer than [`ADDRESS_FLAP_WINDOW`].
+    ///
+    /// `install_stream` credits one address, and only the one a stream's remote
+    /// end matches exactly. A datagram peer commonly dials us from an ephemeral
+    /// port, so the session it opens matches no address in our book and credits
+    /// nothing — while `has_live_outgoing_to` treats any live UDP stream as
+    /// covering every UDP address, which stops us re-dialling the advertised one.
+    /// Failures recorded before that session came up therefore freeze: nothing
+    /// clears them and nothing retries them, and the transport reads as
+    /// unreachable for as long as it keeps working.
+    ///
+    /// A session that has held past the flap window is proof enough that the
+    /// transport reaches the peer, whichever address or port carried it. Below
+    /// that window it proves nothing yet — that is the connect/die loop
+    /// [`BackoffState::record_success`] guards against.
+    pub fn clear_failures_for_durable_transports(&self, now: Instant) {
+        let durable: Vec<TransportKind> = {
+            let mut streams = self.stream_entries();
+            prune_dead_streams(&mut streams);
+            streams
+                .values()
+                .filter(|stream| {
+                    stream.is_alive()
+                        && now.saturating_duration_since(stream.installed_at) >= ADDRESS_FLAP_WINDOW
+                })
+                .map(ActiveStream::transport)
+                .collect()
+        };
+        if durable.is_empty() {
+            return;
+        }
+        let mut backoffs = self.address_backoffs.lock();
+        for (addr, backoff) in backoffs.iter_mut() {
+            if durable.contains(&addr.transport()) {
+                backoff.clear_failures();
+            }
+        }
+    }
+
     pub fn outgoing_live_count(&self) -> usize {
         let mut g = self.stream_entries();
         prune_dead_streams(&mut g);
@@ -3627,8 +3724,71 @@ mod tests {
         assert_eq!(b.next_delay, Duration::from_secs(2));
         b.record_failure(Duration::from_secs(2));
         assert_eq!(b.next_delay, Duration::from_secs(2));
-        b.record_success();
+        b.record_success(Instant::now());
         assert_eq!(b.next_delay, Duration::from_millis(250));
+        assert_eq!(b.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn a_session_that_dies_inside_the_flap_window_keeps_its_failures() {
+        // A link that connects and then collapses re-dials every couple of
+        // minutes. Crediting each handshake as a success wiped the failures the
+        // re-dials accumulated, so the address never reached the unreachable
+        // threshold, its datagram lane was never marked blocked, and voice kept
+        // being steered onto a lane that could not hold a session.
+        let cap = Duration::from_secs(30);
+        let start = Instant::now();
+        let mut b = BackoffState::new(Duration::from_millis(250));
+
+        // First time up: nothing to be suspicious of, the backoff resets.
+        for _ in 0..4 {
+            b.record_failure(cap);
+        }
+        b.record_success(start);
+        assert_eq!(b.consecutive_failures, 0);
+        assert_eq!(b.next_delay, Duration::from_millis(250));
+
+        // It dies, we dial again, and it comes up 100s later — inside the flap
+        // window. The failures in between must stand.
+        for _ in 0..4 {
+            b.record_failure(cap);
+        }
+        b.record_success(start + Duration::from_secs(100));
+        assert_eq!(
+            b.consecutive_failures, 4,
+            "a session that only lasted 100s does not prove the address works"
+        );
+        assert_eq!(b.next_delay, Duration::from_secs(4));
+
+        // A session that holds past the window does prove it, and clears.
+        for _ in 0..2 {
+            b.record_failure(cap);
+        }
+        b.record_success(start + Duration::from_secs(100) + ADDRESS_FLAP_WINDOW);
+        assert_eq!(b.consecutive_failures, 0);
+        assert_eq!(b.next_delay, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn a_restart_clears_failures_even_mid_flap() {
+        // `forget_address_failures` speaks for a peer that restarted: the
+        // failures were recorded against listeners that no longer exist, so they
+        // go regardless of how recently a session was up.
+        let cap = Duration::from_secs(30);
+        let start = Instant::now();
+        let mut b = BackoffState::new(Duration::from_millis(250));
+        b.record_success(start);
+        for _ in 0..4 {
+            b.record_failure(cap);
+        }
+        b.forget_dial_history();
+        assert_eq!(b.consecutive_failures, 0);
+        assert_eq!(b.next_delay, Duration::from_millis(250));
+        // And the next success is judged fresh, not as a flap.
+        for _ in 0..3 {
+            b.record_failure(cap);
+        }
+        b.record_success(start + Duration::from_secs(1));
         assert_eq!(b.consecutive_failures, 0);
     }
 
@@ -4298,6 +4458,54 @@ mod tests {
         );
         peer.install_stream(inbound_tcp);
         assert!(peer.transports_unreachable(&[TransportKind::Tcp], 4));
+    }
+
+    #[test]
+    fn a_durable_session_thaws_a_frozen_failure_count() {
+        let peer = peer_for_address_tests();
+        let udp = PeerAddress::new("47.77.196.120:64801".parse().unwrap(), TransportKind::Udp);
+        peer.add_address(udp);
+        for _ in 0..5 {
+            peer.record_address_failure(udp, Duration::from_secs(30));
+        }
+        assert!(peer.transports_unreachable(&[TransportKind::Udp], 4));
+
+        // The peer then dials us from an ephemeral port, as datagram peers do.
+        // That session matches no address in our book, so it credits nothing —
+        // and because any live UDP stream stops us re-dialling the advertised
+        // address, the failures above can never be retried either.
+        let (inbound, _rx) = active_stream_for_test(
+            TransportKind::Udp,
+            "47.77.196.120:42675".parse().unwrap(),
+            false,
+        );
+        peer.install_stream(inbound);
+        let installed = Instant::now();
+        assert!(
+            peer.transports_unreachable(&[TransportKind::Udp], 4),
+            "an ephemeral remote credits no address, so the count is frozen"
+        );
+
+        // Inside the flap window the session proves nothing yet.
+        peer.clear_failures_for_durable_transports(installed + ADDRESS_FLAP_WINDOW / 2);
+        assert!(peer.transports_unreachable(&[TransportKind::Udp], 4));
+
+        // Once it has held past the window, the transport is demonstrably
+        // reaching the peer and the stale failures go.
+        peer.clear_failures_for_durable_transports(installed + ADDRESS_FLAP_WINDOW);
+        assert!(
+            !peer.transports_unreachable(&[TransportKind::Udp], 4),
+            "a session held past the flap window thaws the count"
+        );
+
+        // A transport with no session of its own keeps its failures.
+        let quic = PeerAddress::new("47.77.196.120:64801".parse().unwrap(), TransportKind::Quic);
+        peer.add_address(quic);
+        for _ in 0..5 {
+            peer.record_address_failure(quic, Duration::from_secs(30));
+        }
+        peer.clear_failures_for_durable_transports(installed + ADDRESS_FLAP_WINDOW);
+        assert!(peer.transports_unreachable(&[TransportKind::Quic], 4));
     }
 
     #[test]

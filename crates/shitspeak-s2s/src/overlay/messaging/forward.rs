@@ -2709,7 +2709,7 @@ fn tree_edge_candidates(
             TreeEdgeCandidate::direct_with_cost(pressure, route_cost)
                 .with_datagram_lane(lane_blocked, hard_loss)
                 .with_sink_gap(sink_gap)
-                .with_congestion(congestion.congested()),
+                .with_congestion(congestion.congested(), congestion.losing_frames()),
         );
     }
 
@@ -2744,7 +2744,7 @@ fn tree_edge_candidates(
                 TreeEdgeCandidate::legacy(first_hop, pressure, route_cost)
                     .with_datagram_lane(lane_blocked, hard_loss)
                     .with_sink_gap(sink_gap)
-                    .with_congestion(congestion.congested()),
+                    .with_congestion(congestion.congested(), congestion.losing_frames()),
             );
         }
     }

@@ -127,11 +127,16 @@ pub(crate) struct TreeEdgeCandidate {
     /// Whether this first hop's datagram lane is congested without needing
     /// any loss: frames shed at the send path, a standing send queue, or RTT
     /// well above its empty-queue baseline
-    /// (`DatagramLaneCongestion::congested`). The congestion already raises
-    /// `pressure`; the flag additionally shortens the challenger confirm the
-    /// way hard loss does (C2d), since a congested incumbent only degrades
-    /// further while the confirm window runs.
+    /// (`DatagramLaneCongestion::congested`). Raises `pressure`, and so the
+    /// loaded route cost, but on its own is not urgent — see `losing_frames`.
     congested: bool,
+    /// Whether that congestion is the lane *losing or stranding* frames
+    /// (sheds, a standing send queue) rather than delivering them late
+    /// (`DatagramLaneCongestion::losing_frames`). Only this shortens the
+    /// challenger confirm the way hard loss does (C2d): a lane that is merely
+    /// queueing above baseline can sit there for hours, and treating that as
+    /// urgent re-decides the route on every frame of a talk spurt.
+    losing_frames: bool,
 }
 
 impl TreeEdgeCandidate {
@@ -150,6 +155,7 @@ impl TreeEdgeCandidate {
             hard_loss: false,
             sink_gap: false,
             congested: false,
+            losing_frames: false,
         }
     }
 
@@ -163,6 +169,7 @@ impl TreeEdgeCandidate {
             hard_loss: false,
             sink_gap: false,
             congested: false,
+            losing_frames: false,
         }
     }
 
@@ -181,6 +188,7 @@ impl TreeEdgeCandidate {
             hard_loss: false,
             sink_gap: false,
             congested: false,
+            losing_frames: false,
         }
     }
 
@@ -221,11 +229,13 @@ impl TreeEdgeCandidate {
         self
     }
 
-    /// Attach whether this first hop's datagram lane is congested
+    /// Attach whether this first hop's datagram lane is congested, and whether
+    /// that congestion is the lane losing frames rather than delaying them
     /// (`ConnectionManager::conversational_path_assessment`). Seeded
-    /// alternates and test fixtures leave it false (unknown).
-    pub(crate) fn with_congestion(mut self, congested: bool) -> Self {
+    /// alternates and test fixtures leave both false (unknown).
+    pub(crate) fn with_congestion(mut self, congested: bool, losing_frames: bool) -> Self {
         self.congested = congested;
+        self.losing_frames = losing_frames;
         self
     }
 }
@@ -2086,7 +2096,7 @@ impl DistributionPlane {
             let incumbent_hard_signal = incumbent.is_some_and(|candidate| {
                 candidate.hard_loss
                     || (candidate.sink_gap && sink_gap_settled)
-                    || candidate.congested
+                    || candidate.losing_frames
             });
             let confirm_window_met = incumbent_hard_signal
                 || binding.challenger_since.is_some_and(|since| {
@@ -4808,7 +4818,7 @@ mod tests {
             vec![
                 TreeEdgeCandidate::direct_with_cost(2, 40)
                     .with_datagram_lane(false, false)
-                    .with_congestion(true),
+                    .with_congestion(true, true),
                 TreeEdgeCandidate::legacy(4097, 0, 30).with_datagram_lane(false, false),
             ],
             fast_sticky_policy(),
@@ -4837,6 +4847,51 @@ mod tests {
             at(800),
         );
         assert_eq!(attempt.path(), TreeEdgePath::DirectChild);
+    }
+
+    #[test]
+    fn a_lane_that_only_queues_above_baseline_is_not_a_hard_signal() {
+        // A QUIC DATAGRAM lane sharing its connection's congestion window with
+        // bulk streams sits above its RTT baseline for hours. That is congestion
+        // (it raises pressure, and so loaded route cost) but it is not urgent:
+        // the frames still go out. Treating it as a hard signal made every frame
+        // of a talk spurt re-decide the route on a link that was always
+        // "congested", and each mid-spurt switch cost the audio it meant to save.
+        let plane = DistributionPlane::default();
+        let tree_key = key(131, 1);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let _ = committed_direct_binding(&plane, tree_key, start);
+        let candidates = || {
+            vec![
+                TreeEdgeCandidate::direct_with_cost(2, 40)
+                    .with_datagram_lane(false, false)
+                    .with_congestion(true, false),
+                TreeEdgeCandidate::legacy(4097, 0, 30).with_datagram_lane(false, false),
+            ]
+        };
+
+        // One observation no longer confirms, and the incumbent keeps the edge.
+        let attempt =
+            plane.choose_tree_edge(tree_key, 1, 2, candidates(), fast_sticky_policy(), at(800));
+        assert_ne!(attempt.reason, "confirmed_challenger");
+        assert_eq!(attempt.path(), TreeEdgePath::DirectChild);
+        // It is not excluded either, so it can still win the load on cost.
+        assert!(!plane.voice_route_first_hop_cooling_down(1, 2, 2, at(800)));
+
+        // The challenger still wins, through the normal confirm window and at a
+        // talk-spurt boundary rather than mid-spurt.
+        let switched_at = (820..6_000u64)
+            .step_by(20)
+            .find(|ms| {
+                let _ = speak(&plane, tree_key, &candidates, &at, *ms, *ms + 1);
+                plane.current_tree_edge_path(tree_key, 1, 2) == Some(TreeEdgePath::LegacyVia(4097))
+            })
+            .expect("a cost-better challenger still takes a merely-queueing edge");
+        assert!(
+            switched_at >= 820 + fast_sticky_policy().challenger_confirm.as_millis() as u64,
+            "switched at {switched_at}ms, before the confirm window elapsed"
+        );
     }
 
     #[test]
@@ -4892,7 +4947,7 @@ mod tests {
             vec![
                 TreeEdgeCandidate::direct_with_cost(2, 40)
                     .with_datagram_lane(false, false)
-                    .with_congestion(true),
+                    .with_congestion(true, true),
                 TreeEdgeCandidate::legacy(4097, 0, 30).with_datagram_lane(false, false),
             ]
         };
@@ -5085,7 +5140,7 @@ mod tests {
         let _ = committed_direct_binding(&plane, tree_key, start);
         let candidates = || {
             vec![
-                TreeEdgeCandidate::direct_with_cost(1, 40).with_congestion(true),
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_congestion(true, true),
                 TreeEdgeCandidate::legacy(4097, 1, 3),
             ]
         };
@@ -5172,7 +5227,7 @@ mod tests {
         let _ = committed_direct_binding(&plane, tree_key, start);
         let congested = || {
             vec![
-                TreeEdgeCandidate::direct_with_cost(1, 40).with_congestion(true),
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_congestion(true, true),
                 TreeEdgeCandidate::legacy(4097, 1, 3),
             ]
         };
@@ -5191,7 +5246,7 @@ mod tests {
         // second relay must not win on them.
         let after = || {
             vec![
-                TreeEdgeCandidate::direct_with_cost(1, 40).with_congestion(true),
+                TreeEdgeCandidate::direct_with_cost(1, 40).with_congestion(true, true),
                 TreeEdgeCandidate::legacy(4097, 1, 3).with_sink_gap(true),
                 TreeEdgeCandidate::legacy(4096, 1, 2),
             ]

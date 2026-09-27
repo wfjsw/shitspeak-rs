@@ -303,6 +303,7 @@ pub(crate) async fn run_supervisor(inner: Arc<ManagerInner>) {
         let mut candidates: Vec<_> = inner
             .iter_peers()
             .into_iter()
+            .inspect(|(_, peer)| peer.clear_failures_for_durable_transports(now))
             .filter(|(_, peer)| needs_dial(peer, inner.cfg(), now, wall_now, local_ip_capability))
             .collect();
         let mandatory_targets = mandatory_backbone_targets(&inner);
@@ -1105,7 +1106,7 @@ pub(crate) async fn probe_seed_address(
     let result = dial_seed_address(inner, &addr).await;
     match &result {
         Ok(_) => {
-            backoff.lock().record_success();
+            backoff.lock().record_success(Instant::now());
         }
         Err(error) if is_self_loop_error(error) || seed_error_resolved_only_to_local(error) => {
             let should_log = inner.quarantine_self_seed(addr.clone(), Instant::now());

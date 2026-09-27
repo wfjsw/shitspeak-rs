@@ -681,6 +681,14 @@ stale_probe_age_secs = 3600
 unconfirmed_address_retry_floor_secs = 300
 unconfirmed_address_retry_cap_secs = 1800
 unconfirmed_address_decay_failures = 5
+# A dial only clears an address's accumulated failures when the session it
+# opened then holds. If the same address has to be dialled again within 5
+# minutes of its last session coming up, the previous one collapsed, so the
+# failures the re-dials accumulated stand — otherwise a link that connects and
+# dies never reaches the unreachable threshold, its datagram lane is never
+# marked blocked, and voice keeps being steered onto it. A peer that restarts
+# still clears every address outright, since those failures were recorded
+# against listeners that no longer exist.
 dial_attempt_timeout_secs = 10
 self_seed_quarantine_secs = 3600
 unselected_link_probe_interval_secs = 30
@@ -692,6 +700,15 @@ udp_family_min_samples = 32
 udp_family_probe_loss_block_count = 3
 udp_family_block_loss_ppm = 250000
 udp_family_loss_excess_over_tcp_ppm = 50000
+# A live stream on a transport outranks our record of dial failures against the
+# peer's advertised address, and a session that has held for longer than 5
+# minutes clears those failures outright. A datagram peer commonly dials us from
+# an ephemeral port, so the session it opens matches no address in our book and
+# credits none of them, while any live UDP stream stops us re-dialling the
+# advertised address — so failures recorded before that session came up would
+# otherwise freeze, unclearable and unretried, and read as unreachable for as
+# long as the transport kept working. A transport with no session of its own
+# still keeps its failures.
 # Observe separate BestEffort datagram states. Raw UDP uses weighted effective
 # loss. QUIC DATAGRAM uses path-local enqueue rejection and writer-failure
 # evidence; suspect or blocked paths are removed from BestEffort candidates.
@@ -987,8 +1004,16 @@ frame overtaken by its successors on a faster route is lost. Tree edges
 therefore change which routes carry a speaker's voice between talk spurts (a
 new spurt starts after 250 ms without a frame on the edge). A challenger that
 is only cheaper waits for the next spurt, or at most 3 s after it is confirmed
-for a stream that never pauses. An incumbent with hard loss, congestion,
-receiver gaps, or no usable lane is still left mid-spurt. During a switch, the
+for a stream that never pauses. An incumbent with hard loss, receiver gaps, or
+no usable lane is still left mid-spurt, as is one whose datagram lane is
+*losing* frames (sheds at the send path, or a standing send queue). A lane that
+is congested only in the sense that its smoothed RTT sits above its empty-queue
+baseline is not treated as urgent: the frames still go out, and a QUIC DATAGRAM
+lane sharing its connection's congestion window with bulk streams can sit above
+baseline for hours, so treating it as urgent re-decides the route on every frame
+of a talk spurt. The queueing still raises the lane's pressure, and so its
+loaded route cost, and a cheaper challenger still takes the edge through the
+normal confirm window. During a switch, the
 old route's redundant copy and, with `voice_path_split_mode`, the route of an
 interior split are drawn once per talk spurt rather than per frame. Receiver
 gap reports are not held against a route for 1 s after the edge changes routes,

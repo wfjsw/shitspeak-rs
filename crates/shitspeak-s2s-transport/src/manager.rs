@@ -710,11 +710,10 @@ impl DatagramLaneCongestion {
         self.rtt_baseline
     }
 
-    /// Conversational pressure (0-3) the congestion alone warrants: 3 when
-    /// the lane drops voice outright (sustained heavy sheds or a stalled send
-    /// queue), 2 when it is congested, 1 when it is building a queue. RTT
-    /// inflation alone never reaches 3; the frames still arrive.
-    pub fn pressure(&self) -> u8 {
+    /// Pressure (0-3) from the lane failing to hand frames to the wire at all:
+    /// sustained sheds at the send path, or a send queue that is standing.
+    /// These destroy or strand voice rather than merely delaying it.
+    fn delivery_pressure(&self) -> u8 {
         let shed_pressure = if self.sheds >= DATAGRAM_LANE_SHED_HARD_THRESHOLD {
             3
         } else if self.sheds >= DATAGRAM_LANE_SHED_THRESHOLD {
@@ -731,7 +730,14 @@ impl DatagramLaneCongestion {
         } else {
             0
         };
-        let queueing_pressure = match (self.queueing_delay, self.rtt_baseline) {
+        shed_pressure.max(standing_pressure)
+    }
+
+    /// Pressure (0-2) from smoothed RTT sitting above its empty-queue baseline.
+    /// The frames still go out and still arrive; they arrive late. RTT
+    /// inflation alone never reaches 3.
+    fn queueing_pressure(&self) -> u8 {
+        match (self.queueing_delay, self.rtt_baseline) {
             (Some(queueing), Some(baseline)) => {
                 let congested = QUEUEING_DELAY_CONGESTED
                     .max(baseline / QUEUEING_DELAY_CONGESTED_BASELINE_DIVISOR);
@@ -746,13 +752,35 @@ impl DatagramLaneCongestion {
                 }
             }
             _ => 0,
-        };
-        shed_pressure.max(standing_pressure).max(queueing_pressure)
+        }
+    }
+
+    /// Conversational pressure (0-3) the congestion alone warrants: 3 when
+    /// the lane drops voice outright (sustained heavy sheds or a stalled send
+    /// queue), 2 when it is congested, 1 when it is building a queue.
+    pub fn pressure(&self) -> u8 {
+        self.delivery_pressure().max(self.queueing_pressure())
     }
 
     /// Congested enough that routing should treat the lane as degraded.
     pub fn congested(&self) -> bool {
         self.pressure() >= 2
+    }
+
+    /// Congested *because the lane is losing or stranding frames*, rather than
+    /// merely delivering them late.
+    ///
+    /// Only this warrants the shortened challenger confirm (C2d). Queueing
+    /// delay above baseline is a standing property of a long, busy path — a
+    /// QUIC DATAGRAM lane sharing its connection's congestion window with bulk
+    /// streams sits above baseline for hours at a time — so treating it as a
+    /// hard signal makes an unremarkable route permanently urgent: every frame
+    /// of a talk spurt re-decides the route, and each mid-spurt switch costs
+    /// the audio it was meant to save. The queueing still raises `pressure`,
+    /// so a congested lane loses on loaded route cost through the normal
+    /// confirm window instead.
+    pub fn losing_frames(&self) -> bool {
+        self.delivery_pressure() >= 2
     }
 }
 
@@ -3044,7 +3072,15 @@ fn udp_family_health(
     if eligible_udp.is_empty() {
         return UdpFamilyHealth::Blocked;
     }
-    if peer.transports_unreachable(&eligible_udp, policy.udp_family_probe_loss_block_count()) {
+    // Dial failures alone cannot condemn a transport that is demonstrably
+    // carrying a session: a peer behind NAT dials us from a translated address
+    // that matches nothing in our address book, so our own failures against its
+    // advertised address accumulate forever while the lane works.
+    if peer.transports_unreachable(&eligible_udp, policy.udp_family_probe_loss_block_count())
+        && !eligible_udp
+            .iter()
+            .any(|transport| peer.has_live_stream_on(*transport))
+    {
         return UdpFamilyHealth::Blocked;
     }
 
@@ -4003,8 +4039,11 @@ fn observe_best_effort_datagram_path_health(
     });
     let effective_loss_ppm = fresh_link.map(LinkMetrics::effective_packet_loss_ppm);
     let loss_samples = fresh_link.map(LinkMetrics::loss_sample_count).unwrap_or(0);
-    let address_failures_blocked =
-        peer.transports_unreachable(&[transport], policy.udp_family_probe_loss_block_count());
+    // A live stream on this transport outranks our record of dial failures
+    // against the peer's advertised address; see `udp_family_health`.
+    let address_failures_blocked = peer
+        .transports_unreachable(&[transport], policy.udp_family_probe_loss_block_count())
+        && !peer.has_live_stream_on(transport);
     let consecutive_probe_losses_blocked = fresh_link.is_some_and(|link| {
         link.consecutive_probe_losses() >= policy.udp_family_probe_loss_block_count()
     });
@@ -6565,6 +6604,74 @@ mod tests {
         );
 
         assert_eq!(ranked.first().copied(), Some(TransportKind::Tcp));
+    }
+
+    #[test]
+    fn a_live_stream_outranks_dial_failures_against_the_peers_address() {
+        // A peer behind 1:1 NAT dials us from a translated address, so nothing
+        // in our address book can be credited for the session it opened, and our
+        // own dials against its advertised address keep accumulating failures.
+        // Judging the lane from those failures alone declared a working UDP lane
+        // unreachable for 18 hours and pinned voice to QUIC DATAGRAM, which pays
+        // for loss in congestion-controlled delay the receiver cannot absorb.
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Udp]);
+        let policy = TransportRoutingPolicy::default();
+        let udp = PeerAddress::new("47.77.196.120:64801".parse().unwrap(), TransportKind::Udp);
+        peer.add_address(udp);
+        for _ in 0..policy.udp_family_probe_loss_block_count() {
+            peer.record_address_failure(udp, Duration::from_secs(30));
+        }
+        assert!(
+            peer.transports_unreachable(
+                &[TransportKind::Udp],
+                policy.udp_family_probe_loss_block_count()
+            ),
+            "every known UDP address has failed to dial"
+        );
+
+        // Yet a UDP stream is live, so the family is not blocked.
+        let snapshot = peer.metrics().snapshot_per_transport();
+        assert_ne!(
+            udp_family_health(&peer, &[TransportKind::Udp], &snapshot, policy),
+            UdpFamilyHealth::Blocked,
+        );
+        assert!(peer.has_live_stream_on(TransportKind::Udp));
+
+        // A transport with no live stream is still condemned by the same
+        // failures: the veto is evidence, not a blanket exemption.
+        assert!(!peer.has_live_stream_on(TransportKind::Quic));
+        let quic = PeerAddress::new("47.77.196.120:64801".parse().unwrap(), TransportKind::Quic);
+        peer.add_address(quic);
+        for _ in 0..policy.udp_family_probe_loss_block_count() {
+            peer.record_address_failure(quic, Duration::from_secs(30));
+        }
+        assert_eq!(
+            udp_family_health(&peer, &[TransportKind::Quic], &snapshot, policy),
+            UdpFamilyHealth::Blocked,
+        );
+    }
+
+    #[test]
+    fn a_live_udp_stream_keeps_its_datagram_path_out_of_blocked() {
+        let (peer, _receivers) =
+            peer_with_live_transports(&[TransportKind::Tcp, TransportKind::Udp]);
+        let policy = TransportRoutingPolicy::default();
+        let udp = PeerAddress::new("47.77.196.120:64801".parse().unwrap(), TransportKind::Udp);
+        peer.add_address(udp);
+        for _ in 0..policy.udp_family_probe_loss_block_count() {
+            peer.record_address_failure(udp, Duration::from_secs(30));
+        }
+
+        let snapshot = peer.metrics().snapshot_per_transport();
+        let state = observe_best_effort_datagram_path_health(
+            &peer,
+            DeliveryPath::UdpDatagram,
+            &snapshot,
+            policy,
+            Instant::now(),
+        );
+        assert_ne!(state, DatagramPathHealthState::Blocked);
     }
 
     #[test]

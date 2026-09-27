@@ -372,6 +372,9 @@ fn parse_cgroup_memory_available() -> Option<u64> {
 mod tests {
     use super::*;
 
+    // `select_available_memory` only exists off Windows, where the available
+    // memory comes from cgroup/meminfo rather than GlobalMemoryStatusEx.
+    #[cfg(not(windows))]
     #[test]
     fn cgroup_memory_limit_is_preferred_over_host_meminfo() {
         assert_eq!(
