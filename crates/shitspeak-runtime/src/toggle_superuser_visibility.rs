@@ -33,7 +33,7 @@ pub(crate) async fn handle(
     if message.action != ACTION_ID {
         return false;
     }
-    if !sender.is_superuser() {
+    if !sender.can_hide_self() {
         return true;
     }
 
@@ -82,9 +82,7 @@ pub(crate) async fn refresh_context_menu(
         return;
     }
 
-    let tail_action = client
-        .is_superuser()
-        .then(|| action(client));
+    let tail_action = client.can_hide_self().then(|| action(client));
     let modifications = server
         .context_actions()
         .rebuild_context_with_tail(Context::SERVER, ACTION_ID, tail_action)

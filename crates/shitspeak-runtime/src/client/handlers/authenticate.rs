@@ -254,7 +254,10 @@ pub async fn handle_authenticate(
 
     // Avoid identity/ACL finalization work when the selected server is
     // already full. The reservation CAS below remains the race-safe check.
-    if !result.invisible
+    let invisible = result
+        .privileges
+        .contains(shitspeak_core::Privilege::Invisible);
+    if !invisible
         && repo.local_authenticated_client_count_in_server(&server_id) >= auth_config.max_users
     {
         return Err(
@@ -293,7 +296,7 @@ pub async fn handle_authenticate(
         gs.set_fqdn(result.fqdn);
         gs.set_display_name(result.display_name);
         gs.set_superuser(result.is_superuser);
-        gs.set_invisible(result.invisible);
+        gs.set_privileges(result.privileges);
         gs.set_groups(result.groups.into_iter().collect());
         gs.set_texture_blob(initial_texture_url, None);
         gs.set_comment_blob(initial_comment_url, None);
@@ -307,7 +310,7 @@ pub async fn handle_authenticate(
 
     // Reserve local capacity before the root ACL check so concurrent
     // over-capacity attempts do not all perform the same permission computation.
-    if !result.invisible
+    if !invisible
         && !repo
             .try_reserve_authenticated_client_in_server(
                 &server_id,
@@ -604,7 +607,7 @@ pub async fn handle_authenticate(
     for action in server.context_actions().build_modify_list().await {
         push_burst(action.into());
     }
-    if sender.is_superuser() {
+    if sender.can_hide_self() {
         push_burst(
             crate::toggle_superuser_visibility::action(sender)
                 .into(),
@@ -619,7 +622,7 @@ pub async fn handle_authenticate(
                 session: Some(u32::from(session_id)),
                 max_bandwidth: Some(sender.max_bandwidth(auth_config.max_bandwidth)),
                 welcome_text: auth_config.welcome_text.clone(),
-                permissions: Some(root_perm),
+                permissions: Some(sender.advertised_permissions(root_perm)),
             }
             .into(),
         ));

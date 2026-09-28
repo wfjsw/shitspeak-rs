@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shitspeak_core::ProtocolVersion;
 
-use crate::Language;
+use crate::{Language, Privileges};
 
 pub fn canonical_authenticator_ip(ip_address: IpAddr) -> IpAddr {
     match ip_address {
@@ -85,8 +85,8 @@ pub struct AuthenticateResult {
     pub display_name: Option<String>,
     pub groups: Vec<String>,
     pub is_superuser: bool,
-    /// Hide this client from all other clients, including superusers.
-    pub invisible: bool,
+    /// Capabilities granted outside of the channel ACL model.
+    pub privileges: Privileges,
     /// Optional server-id scope selected by the authenticator.  Configured
     /// virtual-server entrypoints do not constrain this value.
     pub virtual_server_id: Option<String>,
@@ -196,7 +196,7 @@ pub trait Authenticator: Send + Sync + 'static {
                 .or_else(|| Some(claims.username.clone())),
             groups: claims.groups.clone(),
             is_superuser: false,
-            invisible: false,
+            privileges: Privileges::empty(),
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,

@@ -503,7 +503,7 @@ pub async fn can_view_channel(
     client: &Arc<Box<Client>>,
     channel_id: u32,
 ) -> bool {
-    if !server.get_hide_channels_without_traverse() {
+    if !crate::client::visibility::hides_channels_from(server, client) {
         return true;
     }
 
@@ -520,7 +520,7 @@ pub async fn can_view_channel_with_ancestors(
     client: &Arc<Box<Client>>,
     channel_id: u32,
 ) -> bool {
-    if !server.get_hide_channels_without_traverse() {
+    if !crate::client::visibility::hides_channels_from(server, client) {
         return true;
     }
 
@@ -548,7 +548,7 @@ pub(crate) async fn can_view_channel_with_ancestors_at_home(
     channel_id: u32,
     home_channel_id: u32,
 ) -> bool {
-    if !server.get_hide_channels_without_traverse() {
+    if !crate::client::visibility::hides_channels_from(server, client) {
         return true;
     }
 
@@ -1318,8 +1318,10 @@ async fn prepare_channel_visibility_refresh_inner(
         }
         context.precompute_background(server, acl_channel_ids).await;
     }
+    let sees_all = client.has_privilege(shitspeak_core::Privilege::SeeAll);
     for channel in &candidate_channels {
         let visible = match (home_move_impact, acl_context) {
+            _ if sees_all => true,
             (Some(impact), _) if server.get_hide_channels_without_traverse() => {
                 crate::client::acl::compute_permissions_for_client_with_home_channel(
                     server,
@@ -1418,7 +1420,9 @@ async fn prepare_channel_visibility_refresh_inner(
             additions.push(
                 shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                     channel.id,
-                    context.evaluate(channel.id).bits(),
+                    client
+                        .advertised_permissions(context.evaluate(channel.id))
+                        .bits(),
                 )
                 .into(),
             );
@@ -1569,7 +1573,7 @@ async fn client_log_permission_refresh_messages(
             messages.push(
                 shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                     channel.id,
-                    permissions.bits(),
+                    client.advertised_permissions(permissions).bits(),
                 )
                 .into(),
             );
@@ -3620,7 +3624,7 @@ async fn build_precise_acl_permission_refresh_messages_from_context(
             permission_queries.push(
                 shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                     channel_id,
-                    new_permissions.bits(),
+                    client.advertised_permissions(new_permissions).bits(),
                 )
                 .into(),
             );
@@ -3697,7 +3701,7 @@ async fn build_channel_permission_refresh_messages_for_channel_ids(
         permission_queries.push(
             shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                 channel.id,
-                permissions.bits(),
+                client.advertised_permissions(permissions).bits(),
             )
             .into(),
         );
@@ -3774,7 +3778,7 @@ pub async fn build_enter_permission_query_refresh_messages(
         messages.push(
             shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                 channel_id,
-                permissions.bits(),
+                client.advertised_permissions(permissions).bits(),
             )
             .into(),
         );
@@ -3870,7 +3874,7 @@ async fn build_scoped_permission_info_refresh_messages_for_channels(
         messages.push(
             shitspeak_messages::messages::encoder::PermissionQuery::refresh_channel_permissions(
                 channel.id,
-                perms.bits(),
+                client.advertised_permissions(perms).bits(),
             )
             .into(),
         );

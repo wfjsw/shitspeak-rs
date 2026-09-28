@@ -198,13 +198,13 @@ pub async fn handle_user_remove(
     // drive the UserRemove broadcast to all per-client subscribers.
     // No need to broadcast manually.
 
-    let actor = sender.get_session_id();
-    let actor_for_target =
-        if crate::client::visibility::can_view_user(server, &target, sender).await {
+    let actor = sender.moderation_actor();
+    let actor_for_target = match actor {
+        Some(actor) if crate::client::visibility::can_view_user(server, &target, sender).await => {
             Some(u32::from(actor))
-        } else {
-            None
-        };
+        }
+        _ => None,
+    };
     let remove_notice: Message = UserRemove {
         session: target_raw,
         actor: actor_for_target,
@@ -229,7 +229,7 @@ pub async fn handle_user_remove(
             &server_id,
             target_session,
             target.client_instance_id(),
-            Some(actor),
+            actor,
             msg.reason.clone(),
             is_ban,
         )

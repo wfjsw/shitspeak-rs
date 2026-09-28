@@ -3258,10 +3258,8 @@ async fn apply_user_state_patch(
     };
     let mut cache_listening_channel_ids = None;
     let hidden_before = target.is_hidden_from_regular_users();
-    let moderator_reveals_hidden_superuser = target.is_superuser()
-        && hidden_before
-        && (patch.suppress == Some(false)
-            || (patch.mute == Some(false) && target.read_global_state().is_suppressed()));
+    let moderator_reveals_hidden_superuser = hidden_before
+        && patch.suppress == Some(false);
     let post_move_destination_perms = if let Some(channel_id) = patch.channel_id {
         Some(
             crate::client::acl::compute_permissions_for_client_as_if_in_channel(
@@ -3274,7 +3272,11 @@ async fn apply_user_state_patch(
     };
     let can_receive_voice;
     {
-        let actor = (!moderator_reveals_hidden_superuser).then_some(actor);
+        let actor = if moderator_reveals_hidden_superuser {
+            None
+        } else {
+            actor_client.moderation_actor()
+        };
         let mut gs = target.write_global_state_as(server.get_clients(), actor, channel_version_dep);
 
         if let Some(mute) = patch.mute {
@@ -3283,10 +3285,6 @@ async fn apply_user_state_patch(
                 if !mute {
                     gs.set_deaf(false);
                 }
-            }
-            if gs.is_suppressed() && !mute {
-                gs.set_hidden_from_regular_users(false);
-                gs.set_suppress(false);
             }
         }
         if let Some(deaf) = patch.deaf {
@@ -3461,12 +3459,15 @@ async fn apply_user_remove_patch(
         }
     }
 
-    let actor_for_target =
-        if crate::client::visibility::can_view_user(server, &target, &actor_client).await {
-            Some(actor_session)
-        } else {
-            None
-        };
+    let recorded_actor = actor_client.moderation_actor();
+    let actor_for_target = match recorded_actor {
+        Some(actor)
+            if crate::client::visibility::can_view_user(server, &target, &actor_client).await =>
+        {
+            Some(u32::from(actor))
+        }
+        _ => None,
+    };
     let remove_notice: shitspeak_messages::messages::Message =
         shitspeak_messages::messages::encoder::UserRemove {
             session: u32::from(target_id),
@@ -3492,7 +3493,7 @@ async fn apply_user_remove_patch(
             server_id,
             target_id,
             target.client_instance_id(),
-            Some(actor),
+            recorded_actor,
             patch.reason.clone(),
             patch.ban,
         )

@@ -284,34 +284,22 @@ async fn moderator_unsuppress_disables_hidden_superuser_mode() {
     .await
     .expect("Alice should become hidden again");
 
+    // Mute and suppression are independent: unmuting leaves Alice hidden.
     carol.mute_other(alice.session_id, false).await;
-    bob.recv_until(
-        |message| {
-            matches!(message, Message::UserState(state)
-                    if state.session == Some(alice.session_id)
-                        && state.name.is_some()
-                        && state.channel_id.is_some()
-                        && state.actor.is_none())
-        },
-        Duration::from_secs(2),
-    )
-    .await
-    .expect("moderator mute=false should also reveal Alice");
-    alice
+    let revealed = bob
         .recv_until(
             |message| {
-                matches!(message, Message::ContextActionModify(modify)
-                    if modify.action == ACTION_ID
-                        && modify.text.as_deref() == Some(HIDE_LABEL))
+                matches!(message, Message::UserState(state)
+                    if state.session == Some(alice.session_id) && state.name.is_some())
             },
-            Duration::from_secs(2),
+            Duration::from_millis(300),
         )
-        .await
-        .expect("mute=false should reset Alice's action label");
+        .await;
+    assert!(revealed.is_none(), "mute=false must not reveal Alice");
 
     let state = live_alice.read_global_state();
-    assert!(!state.is_hidden_from_regular_users());
-    assert!(!state.is_suppressed());
+    assert!(state.is_hidden_from_regular_users());
+    assert!(state.is_suppressed());
 }
 
 /// Checks that a moderator kick removes the target from the server.

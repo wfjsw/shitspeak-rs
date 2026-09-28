@@ -36,6 +36,7 @@ pub async fn handle_text_message(
         message,
         ..
     } = msg;
+    let bypass_acl = sender.has_privilege(shitspeak_core::Privilege::TextMessage);
 
     let mut direct_sessions = Vec::new();
     let mut direct_recipients = Vec::new();
@@ -52,10 +53,11 @@ pub async fn handle_text_message(
             continue;
         }
         let target_channel = target.get_current_channel_id();
-        let perms =
-            crate::client::acl::compute_permissions_for_client(server, sender, target_channel)
-                .await;
-        if !perms.contains(ACLPermissions::TextMessage) {
+        if !bypass_acl
+            && !crate::client::acl::compute_permissions_for_client(server, sender, target_channel)
+                .await
+                .contains(ACLPermissions::TextMessage)
+        {
             return Err(MessageHandlerError::PermissionDenied(
                 shitspeak_messages::messages::encoder::PermissionDenied::for_permission(
                     sender_session,
@@ -88,10 +90,11 @@ pub async fn handle_text_message(
 
     let mut channel_ids = Vec::new();
     for target_channel in channel_id {
-        let perms =
-            crate::client::acl::compute_permissions_for_client(server, sender, target_channel)
-                .await;
-        if !perms.contains(ACLPermissions::TextMessage) {
+        if !bypass_acl
+            && !crate::client::acl::compute_permissions_for_client(server, sender, target_channel)
+                .await
+                .contains(ACLPermissions::TextMessage)
+        {
             return Err(MessageHandlerError::PermissionDenied(
                 shitspeak_messages::messages::encoder::PermissionDenied::for_permission(
                     sender_session,
@@ -106,10 +109,11 @@ pub async fn handle_text_message(
     let mut tree_roots = Vec::new();
     let mut tree_deliverable_channels = std::collections::HashSet::new();
     for root_channel_id in tree_id {
-        let root_perms =
-            crate::client::acl::compute_permissions_for_client(server, sender, root_channel_id)
-                .await;
-        if !root_perms.contains(ACLPermissions::TextMessage) {
+        if !bypass_acl
+            && !crate::client::acl::compute_permissions_for_client(server, sender, root_channel_id)
+                .await
+                .contains(ACLPermissions::TextMessage)
+        {
             return Err(MessageHandlerError::PermissionDenied(
                 shitspeak_messages::messages::encoder::PermissionDenied::for_permission(
                     sender_session,
@@ -121,10 +125,11 @@ pub async fn handle_text_message(
 
         let subtree = collect_subtree_ids(server, &server_id, root_channel_id).await;
         for channel_id in subtree {
-            let perms =
-                crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
-                    .await;
-            if perms.contains(ACLPermissions::TextMessage) {
+            if bypass_acl
+                || crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
+                    .await
+                    .contains(ACLPermissions::TextMessage)
+            {
                 tree_deliverable_channels.insert(channel_id);
             }
         }

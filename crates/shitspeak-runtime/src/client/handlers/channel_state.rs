@@ -99,6 +99,7 @@ pub async fn handle_channel_state(
 
     let channels = server.get_channels();
     let server_id = sender.server_id();
+    let bypass_acl = sender.has_privilege(shitspeak_core::Privilege::EditChannels);
 
     match msg.channel_id {
         None => {
@@ -167,9 +168,11 @@ pub async fn handle_channel_state(
                     }));
                 }
             }
-            let creator_parent_perms =
-                crate::client::acl::compute_permissions_for_client(server, sender, parent_id).await;
-            if !creator_parent_perms.contains(required_permission) {
+            if !bypass_acl
+                && !crate::client::acl::compute_permissions_for_client(server, sender, parent_id)
+                    .await
+                    .contains(required_permission)
+            {
                 return Err(MessageHandlerError::PermissionDenied(
                     PermissionDenied::for_permission(
                         u32::from(session),
@@ -332,9 +335,11 @@ pub async fn handle_channel_state(
                 }
             }
 
-            let perms =
-                crate::client::acl::compute_permissions_for_client(server, sender, channel_id)
-                    .await;
+            let perms = if bypass_acl {
+                ACLPermissions::Write | ACLPermissions::LinkChannel
+            } else {
+                crate::client::acl::compute_permissions_for_client(server, sender, channel_id).await
+            };
             let has_write = perms.contains(ACLPermissions::Write);
 
             if msg.name.is_some() {
@@ -417,11 +422,13 @@ pub async fn handle_channel_state(
                     } else {
                         ACLPermissions::MakeChannel
                     };
-                    let parent_perms = crate::client::acl::compute_permissions_for_client(
-                        server, sender, new_parent,
-                    )
-                    .await;
-                    if !parent_perms.contains(required_permission) {
+                    if !bypass_acl
+                        && !crate::client::acl::compute_permissions_for_client(
+                            server, sender, new_parent,
+                        )
+                        .await
+                        .contains(required_permission)
+                    {
                         return Err(MessageHandlerError::PermissionDenied(
                             PermissionDenied::for_permission(
                                 u32::from(session),
@@ -443,7 +450,7 @@ pub async fn handle_channel_state(
                         ),
                     ));
                 }
-                for link_add in &msg.links_add {
+                for link_add in msg.links_add.iter().filter(|_| !bypass_acl) {
                     let target_perms = crate::client::acl::compute_permissions_for_client(
                         server, sender, *link_add,
                     )

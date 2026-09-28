@@ -149,7 +149,7 @@ fn result(label: &str) -> AuthenticateResult {
         display_name: Some(label.to_owned()),
         groups: Vec::new(),
         is_superuser: false,
-        invisible: false,
+        privileges: Default::default(),
         virtual_server_id: None,
         language: None,
         max_bandwidth: None,

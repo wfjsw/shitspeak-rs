@@ -8,5 +8,5 @@ mod wasm_authenticator;
 pub use authenticator::*;
 pub use config::*;
 pub use exec_authenticator::*;
-pub use shitspeak_core::Language;
+pub use shitspeak_core::{Language, Privilege, Privileges};
 pub use wasm_authenticator::*;

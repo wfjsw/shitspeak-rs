@@ -1,6 +1,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use bytes::Bytes;
+use shitspeak_core::{Privilege, Privileges};
 
 use crate::client::state_log::ClientGlobalStateDelta;
 
@@ -36,7 +37,7 @@ pub struct ClientGlobalState {
     fqdn: Option<String>,
     groups: Arc<HashSet<String>>,
     is_superuser: bool,
-    invisible: bool,
+    privileges: Privileges,
     tokens: Arc<HashSet<String>>,
     display_name: Option<String>,
     /// Broad generation retained for voice-routing caches, which depend on
@@ -80,7 +81,7 @@ impl ClientGlobalState {
             fqdn: None,
             groups: Arc::default(),
             is_superuser: false,
-            invisible: false,
+            privileges: Privileges::empty(),
             tokens: Arc::default(),
             display_name: None,
             acl_generation: 0,
@@ -313,8 +314,13 @@ impl ClientGlobalState {
         self.hidden_from_regular_users
     }
 
+    /// Whether this client may use hidden mode (the Hide me toggle).
+    pub fn can_hide_self(&self) -> bool {
+        self.is_superuser || self.has_privilege(Privilege::HideSelf)
+    }
+
     pub fn set_hidden_from_regular_users(&mut self, hidden: bool) {
-        let hidden = hidden && self.is_superuser;
+        let hidden = hidden && self.can_hide_self();
         if self.hidden_from_regular_users == hidden {
             return;
         }
@@ -482,17 +488,28 @@ impl ClientGlobalState {
         self.is_superuser
     }
 
-    pub fn is_invisible(&self) -> bool {
-        self.invisible
+    pub fn privileges(&self) -> Privileges {
+        self.privileges
     }
 
-    pub fn set_invisible(&mut self, value: bool) {
-        if self.invisible == value {
+    pub fn has_privilege(&self, privilege: Privilege) -> bool {
+        self.privileges.contains(privilege)
+    }
+
+    pub fn is_invisible(&self) -> bool {
+        self.has_privilege(Privilege::Invisible)
+    }
+
+    pub fn set_privileges(&mut self, privileges: Privileges) {
+        if self.privileges == privileges {
             return;
         }
-        self.invisible = value;
+        self.privileges = privileges;
         if self.delta_recording {
-            self.pending_delta.invisible = Some(value);
+            self.pending_delta.privileges = Some(privileges.names());
+        }
+        if !self.can_hide_self() {
+            self.set_hidden_from_regular_users(false);
         }
     }
 
@@ -501,7 +518,7 @@ impl ClientGlobalState {
             return;
         }
         self.is_superuser = value;
-        if !value {
+        if !self.can_hide_self() {
             self.set_hidden_from_regular_users(false);
         }
         self.bump_acl_subject_generation();
@@ -621,6 +638,7 @@ impl Default for ClientGlobalState {
 #[cfg(test)]
 mod tests {
     use super::ClientGlobalState;
+    use shitspeak_core::{Privilege, Privileges};
     use std::{collections::HashSet, sync::Arc};
 
     #[test]
@@ -766,6 +784,44 @@ mod tests {
 
         state.set_superuser(false);
 
+        assert!(!state.is_hidden_from_regular_users());
+    }
+
+    #[test]
+    fn privileges_are_recorded_as_replicated_state() {
+        let mut state = ClientGlobalState::new();
+        state.begin_delta_recording();
+
+        state.set_privileges(Privileges::from(Privilege::Invisible));
+        let delta = state.finish_delta_recording();
+
+        assert!(state.is_invisible());
+        assert_eq!(delta.privileges, Some(state.privileges().names()));
+
+        state.begin_delta_recording();
+        state.set_privileges(Privileges::from(Privilege::Invisible));
+        assert!(state.finish_delta_recording().is_empty());
+    }
+
+    #[test]
+    fn hide_self_privilege_enables_hidden_mode_until_revoked() {
+        let mut state = ClientGlobalState::new();
+        state.set_hidden_from_regular_users(true);
+        assert!(!state.is_hidden_from_regular_users());
+
+        state.set_privileges(Privileges::from(Privilege::HideSelf));
+        state.set_hidden_from_regular_users(true);
+        assert!(state.is_hidden_from_regular_users());
+        assert!(state.is_suppressed());
+
+        state.set_superuser(true);
+        state.set_superuser(false);
+        assert!(
+            state.is_hidden_from_regular_users(),
+            "the privilege keeps hidden mode after superuser status is lost"
+        );
+
+        state.set_privileges(Privileges::empty());
         assert!(!state.is_hidden_from_regular_users());
     }
 

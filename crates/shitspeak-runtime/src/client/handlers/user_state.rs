@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use shitspeak_core::Privilege;
 use shitspeak_state::ACLPermissions;
 
 use crate::{
@@ -167,7 +168,7 @@ pub async fn handle_user_state(
                     ),
                 ));
             }
-        } else {
+        } else if !sender.has_privilege(Privilege::Move) {
             // Moving others: need Move on target's current channel.
             let src_perms = crate::client::acl::compute_permissions_for_client(
                 server,
@@ -242,7 +243,8 @@ pub async fn handle_user_state(
         None
     };
 
-    if msg.suppress == Some(true) {
+    let can_suppress = sender.has_privilege(Privilege::Suppress);
+    if msg.suppress == Some(true) && !can_suppress {
         return Err(MessageHandlerError::PermissionDenied(
             PermissionDenied::for_permission(
                 u32::from(sender_id),
@@ -253,11 +255,13 @@ pub async fn handle_user_state(
     }
 
     // ── ACL: Server mute/deaf/suppress/priority_speaker ──────
-    if msg.mute.is_some()
-        || msg.deaf.is_some()
-        || msg.suppress.is_some()
-        || msg.priority_speaker.is_some()
-    {
+    // Each privilege covers its own fields; any field it does not cover still
+    // requires MuteDeafen.
+    let requires_acl = ((msg.mute.is_some() || msg.deaf.is_some())
+        && !sender.has_privilege(Privilege::MuteDeafen))
+        || (msg.suppress.is_some() && !can_suppress)
+        || (msg.priority_speaker.is_some() && !sender.has_privilege(Privilege::PrioritySpeaker));
+    if requires_acl {
         let perms = match actor_source_perms {
             Some(perms) => perms,
             None => {
@@ -569,14 +573,17 @@ pub async fn handle_user_state(
     let mut cache_last_channel_id = None;
     let mut cache_listening_channel_ids = None;
     let hidden_before = target.is_hidden_from_regular_users();
-    let moderator_reveals_hidden_superuser = !is_self
-        && target.is_superuser()
-        && hidden_before
-        && (msg.suppress == Some(false)
-            || (msg.mute == Some(false) && target.read_global_state().is_suppressed()));
+    let moderator_reveals_hidden_superuser =
+        !is_self && hidden_before && msg.suppress == Some(false);
     let can_receive_voice;
     {
-        let actor = (!moderator_reveals_hidden_superuser).then_some(sender_id);
+        let actor = if moderator_reveals_hidden_superuser {
+            None
+        } else if is_self {
+            Some(sender_id)
+        } else {
+            sender.moderation_actor()
+        };
         let mut gs = target.write_global_state_as(repo, actor, channel_version_dep);
 
         // ── Self-mute / self-deaf (only target can set their own) ─────────────
@@ -593,11 +600,6 @@ pub async fn handle_user_state(
                     if !mute {
                         gs.set_deaf(false);
                     }
-                }
-
-                if gs.is_suppressed() && !mute {
-                    gs.set_hidden_from_regular_users(false);
-                    gs.set_suppress(false);
                 }
             }
             if let Some(deaf) = msg.deaf {

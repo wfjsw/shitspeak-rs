@@ -2399,6 +2399,76 @@ async fn s2s_cross_node_invisible_sender_text_is_delivered_as_server_message() {
     }
 }
 
+/// Checks that privileges authorize cross-node moderation without ACL
+/// permissions, that `server_moderation` hides the actor on the owner, and that
+/// an unmute keeps the remote target suppressed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2s_cross_node_privileged_moderation_is_server_attributed() {
+    let _guard = s2s_network_test_guard().await;
+    let (a, b) = spawn_s2s_pair().await;
+    wait_for_s2s_pair(&a, &b).await;
+    a.authenticator.register_privileged_user(
+        "carol",
+        None,
+        Some(1),
+        vec![],
+        [
+            shitspeak_auth::Privilege::MuteDeafen,
+            shitspeak_auth::Privilege::ServerModeration,
+        ],
+    );
+    b.authenticator.register_user("bob", None, Some(2), vec![]);
+
+    let carol = TestClient::connect_and_authenticate(&a, "carol", None)
+        .await
+        .expect("carol");
+    let bob = TestClient::connect_and_authenticate(&b, "bob", None)
+        .await
+        .expect("bob");
+    wait_for_server_to_track_client(&a, bob.server_session.into()).await;
+    wait_for_server_to_track_client(&b, carol.server_session.into()).await;
+
+    carol.mute_other(bob.session_id, true).await;
+    let muted = bob
+        .recv_until(
+            |m| {
+                matches!(m, Message::UserState(us)
+                    if us.session == Some(bob.session_id) && us.mute == Some(true))
+            },
+            CLIENT_DEADLINE,
+        )
+        .await;
+    let Some(Message::UserState(muted)) = muted else {
+        panic!("Bob should receive the privileged cross-node mute");
+    };
+    assert_eq!(muted.actor, None, "server_moderation must hide the actor");
+
+    let live_bob = b
+        .server
+        .get_clients()
+        .get_client_in_server(crate::types::DEFAULT_SERVER_ID, bob.server_session.into())
+        .await
+        .expect("live bob");
+    {
+        let mut state = live_bob.write_global_state(b.server.get_clients());
+        state.set_suppress(true);
+    }
+    carol.mute_other(bob.session_id, false).await;
+    bob.recv_until(
+        |m| {
+            matches!(m, Message::UserState(us)
+                if us.session == Some(bob.session_id) && us.mute == Some(false))
+        },
+        CLIENT_DEADLINE,
+    )
+    .await
+    .expect("Bob should receive the privileged cross-node unmute");
+    assert!(
+        live_bob.read_global_state().is_suppressed(),
+        "an unmute must not unsuppress the remote target"
+    );
+}
+
 /// Checks cross-node moderation routing to the target user's owning server.
 /// Expected: Alice's mute request on server A is applied by server B and Bob
 /// receives `UserState { mute: true }`. The moderation semantics come from

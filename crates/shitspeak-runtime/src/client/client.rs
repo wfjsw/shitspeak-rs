@@ -2383,8 +2383,37 @@ impl Client {
         self.global_state.read().is_invisible()
     }
 
+    pub fn privileges(&self) -> shitspeak_core::Privileges {
+        self.global_state.read().privileges()
+    }
+
+    pub fn has_privilege(&self, privilege: shitspeak_core::Privilege) -> bool {
+        self.global_state.read().has_privilege(privilege)
+    }
+
+    /// The actor recorded for a moderation action performed by this client.
+    /// `None` attributes the action to the server.
+    pub(crate) fn moderation_actor(&self) -> Option<ClientSessionIdentifier> {
+        (!self.has_privilege(shitspeak_core::Privilege::ServerModeration))
+            .then(|| self.get_session_id())
+    }
+
+    /// Permissions reported to this client: the ACL result widened by the
+    /// actions its privileges allow, so the client exposes those actions.
+    pub fn advertised_permissions(
+        &self,
+        permissions: enumflags2::BitFlags<shitspeak_state::ACLPermissions>,
+    ) -> enumflags2::BitFlags<shitspeak_state::ACLPermissions> {
+        permissions | self.privileges().advertised_permissions()
+    }
+
     pub(crate) fn is_hidden_from_regular_users(&self) -> bool {
         self.global_state.read().is_hidden_from_regular_users()
+    }
+
+    /// Whether this client may use hidden mode (the Hide me toggle).
+    pub(crate) fn can_hide_self(&self) -> bool {
+        self.global_state.read().can_hide_self()
     }
 
     pub fn set_authenticated(&self, value: bool) {

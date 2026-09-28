@@ -56,7 +56,8 @@ pub struct ClientGlobalStateDelta {
     // Append new replicated fields to preserve positional MessagePack compatibility.
     pub hidden_from_regular_users: Option<bool>,
     pub fqdn: Option<Option<String>>,
-    pub invisible: Option<bool>,
+    /// Canonical privilege names.
+    pub privileges: Option<HashSet<String>>,
 }
 
 impl ClientGlobalStateDelta {
@@ -87,8 +88,15 @@ impl ClientGlobalStateDelta {
             tokens: Some(state.get_tokens().clone()),
             display_name: Some(state.get_display_name_opt().map(ToOwned::to_owned)),
             fqdn: Some(state.get_fqdn().map(ToOwned::to_owned)),
-            invisible: Some(state.is_invisible()),
+            privileges: Some(state.privileges().names()),
         }
+    }
+
+    /// Parses the privileges carried by this delta.
+    pub fn resolve_privileges(&self) -> Option<shitspeak_core::Privileges> {
+        self.privileges
+            .as_ref()
+            .map(|names| shitspeak_core::Privileges::from_names(names.iter().map(String::as_str)))
     }
 
     /// Returns `true` if no fields are set (nothing changed).
@@ -116,7 +124,7 @@ impl ClientGlobalStateDelta {
             || self.tokens.is_some()
             || self.display_name.is_some()
             || self.fqdn.is_some()
-            || self.invisible.is_some())
+            || self.privileges.is_some())
     }
 
     pub fn affects_acl_generation(&self) -> bool {
@@ -125,6 +133,7 @@ impl ClientGlobalStateDelta {
             || self.groups.is_some()
             || self.is_superuser.is_some()
             || self.tokens.is_some()
+            || self.privileges.is_some()
     }
 
     pub fn affects_voice_routing(&self) -> bool {
@@ -138,7 +147,7 @@ impl ClientGlobalStateDelta {
             || self.groups.is_some()
             || self.is_superuser.is_some()
             || self.tokens.is_some()
-            || self.invisible.is_some()
+            || self.privileges.is_some()
     }
 
     pub fn to_initial_user_state(
@@ -986,6 +995,22 @@ mod tests {
         assert!(
             payload.canonical_message(&repo).await.is_none(),
             "a cached message for the prior instance must not escape after session reuse"
+        );
+    }
+
+    #[test]
+    fn privileges_round_trip_through_replicated_snapshot() {
+        use shitspeak_core::{Privilege, Privileges};
+
+        let mut state = crate::client::client_global_state::ClientGlobalState::new();
+        state.set_privileges(Privileges::from(Privilege::Invisible));
+        let snapshot = ClientGlobalStateDelta::from_global_state(&state);
+        let decoded: ClientGlobalStateDelta =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&snapshot).unwrap()).unwrap();
+
+        assert_eq!(
+            decoded.resolve_privileges(),
+            Some(Privileges::from(Privilege::Invisible))
         );
     }
 

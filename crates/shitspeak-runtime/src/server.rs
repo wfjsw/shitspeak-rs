@@ -1918,7 +1918,7 @@ impl Server {
             display_name,
             groups,
             is_superuser,
-            invisible,
+            privileges,
             virtual_server_id,
             language,
             max_bandwidth,
@@ -2006,6 +2006,7 @@ impl Server {
             return;
         }
         let was_invisible = client.is_invisible();
+        let invisible = privileges.contains(shitspeak_core::Privilege::Invisible);
         if was_invisible && !invisible {
             if !self
                 .clients
@@ -2045,7 +2046,7 @@ impl Server {
                 );
             }
         }
-        let was_superuser = client.is_superuser();
+        let could_hide_self = client.can_hide_self();
         {
             let mut state = client.write_global_state(&self.clients);
             state.set_user_id(user_id);
@@ -2053,7 +2054,7 @@ impl Server {
             state.set_display_name(display_name);
             state.set_groups(groups);
             state.set_superuser(is_superuser);
-            state.set_invisible(invisible);
+            state.set_privileges(privileges);
             state.set_current_channel_id(target_channel_id);
             state
                 .set_suppress(!target_permissions.contains(shitspeak_state::ACLPermissions::Speak));
@@ -2062,7 +2063,7 @@ impl Server {
             // The authenticator chose a different language: re-send what the
             // client already holds in the old one.
             self.refresh_client_language(&client).await;
-        } else if was_superuser != client.is_superuser() {
+        } else if could_hide_self != client.can_hide_self() {
             crate::toggle_superuser_visibility::refresh_context_menu(self, &client).await;
         }
 

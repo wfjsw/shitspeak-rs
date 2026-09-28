@@ -14,6 +14,7 @@ use crate::localization::Language;
 use crate::protocol_version::ProtocolVersion;
 use shitspeak_auth::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationRejection, Authenticator,
+    Privilege, Privileges,
 };
 
 #[derive(Debug, Clone)]
@@ -22,7 +23,7 @@ struct ScriptedUser {
     user_id: Option<u32>,
     groups: Vec<String>,
     is_superuser: bool,
-    invisible: bool,
+    privileges: Privileges,
     /// `None` models an authenticator that returns no language, leaving the
     /// choice to the server's `default_language`.
     language: Option<Language>,
@@ -176,7 +177,7 @@ impl TestAuthenticator {
                 user_id,
                 groups,
                 is_superuser: false,
-                invisible: true,
+                privileges: Privilege::Invisible.into(),
                 language: None,
                 virtual_server_id: None,
                 max_bandwidth: None,
@@ -198,12 +199,43 @@ impl TestAuthenticator {
                 user_id,
                 groups,
                 is_superuser: true,
-                invisible: true,
+                privileges: Privilege::Invisible.into(),
                 language: None,
                 virtual_server_id: None,
                 max_bandwidth: None,
             },
         );
+    }
+
+    /// Register (or overwrite) a regular user holding `privileges`.
+    pub fn register_privileged_user(
+        &self,
+        name: &str,
+        password: Option<&str>,
+        user_id: Option<u32>,
+        groups: Vec<String>,
+        privileges: impl IntoIterator<Item = Privilege>,
+    ) {
+        self.users.lock().unwrap().insert(
+            name.to_owned(),
+            ScriptedUser {
+                password: password.map(str::to_owned),
+                user_id,
+                groups,
+                is_superuser: false,
+                privileges: privileges.into_iter().collect(),
+                language: None,
+                virtual_server_id: None,
+                max_bandwidth: None,
+            },
+        );
+    }
+
+    /// Replace the privileges returned for an already registered user.
+    pub fn set_privileges(&self, name: &str, privileges: impl IntoIterator<Item = Privilege>) {
+        if let Some(user) = self.users.lock().unwrap().get_mut(name) {
+            user.privileges = privileges.into_iter().collect();
+        }
     }
 
     pub fn register_user_with_max_bandwidth(
@@ -288,7 +320,7 @@ impl TestAuthenticator {
                 user_id,
                 groups,
                 is_superuser,
-                invisible: false,
+                privileges: Privileges::empty(),
                 language,
                 virtual_server_id: virtual_server_id.map(str::to_owned),
                 max_bandwidth,
@@ -361,7 +393,7 @@ impl Authenticator for AuthenticatorAdapter {
             display_name: Some(username.to_owned()),
             groups: entry.groups,
             is_superuser: entry.is_superuser,
-            invisible: entry.invisible,
+            privileges: entry.privileges,
             virtual_server_id: entry.virtual_server_id,
             language: entry.language,
             max_bandwidth: entry.max_bandwidth,

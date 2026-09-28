@@ -8,6 +8,7 @@ use crate::client::client_session_identifier::ClientSessionIdentifier;
 use crate::client::state_log::{ClientGlobalStateDelta, ClientStateLogEntry, ClientStateOperation};
 use crate::server::Server;
 use parking_lot::RwLock as ParkingRwLock;
+use shitspeak_core::Privilege;
 use shitspeak_messages::messages::Message;
 use shitspeak_messages::messages::encoder::{ChannelState, UserRemove, UserState};
 use shitspeak_state::ACLPermissions;
@@ -850,7 +851,7 @@ async fn can_view_user_with_home(
     if superuser_hidden_from_viewer(viewer, target) {
         return false;
     }
-    if !server.get_hide_users_without_traverse() {
+    if !hides_users_from(server, viewer) {
         return true;
     }
     let perms = match effective_home_channel_id {
@@ -905,8 +906,22 @@ async fn viewer_can_temporarily_view_current_or_linked_channel(
         .is_some_and(|channel| channel.links.contains(&target_channel_id))
 }
 
+/// Whether `target` is in hidden mode (the Hide me toggle) as seen by
+/// `viewer`. Hidden mode is only ever set for clients allowed to use it.
 fn superuser_hidden_from_viewer(viewer: &Arc<Box<Client>>, target: &Arc<Box<Client>>) -> bool {
-    target.is_superuser() && target.is_hidden_from_regular_users() && !viewer.is_superuser()
+    target.is_hidden_from_regular_users()
+        && !viewer.is_superuser()
+        && !viewer.has_privilege(Privilege::SeeAll)
+}
+
+/// Whether `hide_users_without_traverse` applies to this viewer.
+pub(crate) fn hides_users_from(server: &Arc<Box<Server>>, viewer: &Arc<Box<Client>>) -> bool {
+    server.get_hide_users_without_traverse() && !viewer.has_privilege(Privilege::SeeAll)
+}
+
+/// Whether `hide_channels_without_traverse` applies to this viewer.
+pub(crate) fn hides_channels_from(server: &Arc<Box<Server>>, viewer: &Arc<Box<Client>>) -> bool {
+    server.get_hide_channels_without_traverse() && !viewer.has_privilege(Privilege::SeeAll)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -915,17 +930,18 @@ pub(crate) enum TextSenderAttribution {
     Server,
 }
 
-/// Decides how `recipient` sees a TextMessage from `sender`. A sender whose
-/// identity is concealed (authenticator invisibility or a hidden superuser) is
-/// relayed as a server message; a sender hidden only by channel ACLs is not
-/// delivered at all.
+/// Decides how `recipient` sees a TextMessage from `sender`. A sender with the
+/// `server_text` privilege or a hidden superuser sender is relayed as a
+/// server message; a sender hidden only by channel ACLs is not delivered at
+/// all.
 pub(crate) async fn text_sender_attribution(
     server: &Arc<Box<Server>>,
     recipient: &Arc<Box<Client>>,
     sender: &Arc<Box<Client>>,
 ) -> Option<TextSenderAttribution> {
     if recipient.get_session_id() != sender.get_session_id()
-        && (sender.is_invisible() || superuser_hidden_from_viewer(recipient, sender))
+        && (sender.has_privilege(Privilege::ServerText)
+            || superuser_hidden_from_viewer(recipient, sender))
     {
         return Some(TextSenderAttribution::Server);
     }
@@ -935,7 +951,8 @@ pub(crate) async fn text_sender_attribution(
 }
 
 pub(crate) fn user_filtering_enabled(server: &Arc<Box<Server>>, viewer: &Arc<Box<Client>>) -> bool {
-    server.get_hide_users_without_traverse() || !viewer.is_superuser()
+    !viewer.has_privilege(Privilege::SeeAll)
+        && (server.get_hide_users_without_traverse() || !viewer.is_superuser())
 }
 
 async fn can_project_user(
@@ -960,7 +977,7 @@ async fn can_project_user_with_home(
     if !can_view_user_with_home(server, viewer, target, effective_home_channel_id).await {
         return false;
     }
-    if !server.get_hide_channels_without_traverse() {
+    if !hides_channels_from(server, viewer) {
         return true;
     }
     let channel_is_visible = match effective_home_channel_id {
@@ -1023,13 +1040,13 @@ async fn visible_listener_channels_with_home(
     channels: HashSet<u32>,
     effective_home_channel_id: Option<u32>,
 ) -> HashSet<u32> {
-    if !server.get_hide_users_without_traverse() {
+    if !hides_users_from(server, viewer) {
         return channels;
     }
 
     let mut visible = HashSet::new();
     for channel_id in channels {
-        let traversable = if server.get_hide_channels_without_traverse() {
+        let traversable = if hides_channels_from(server, viewer) {
             match effective_home_channel_id {
                 Some(home_channel_id) => {
                     crate::channel_handler::can_view_channel_with_ancestors_at_home(
@@ -1079,7 +1096,7 @@ pub async fn build_visible_user_state(
     target: &Arc<Box<Client>>,
 ) -> UserState {
     let mut state = target.build_user_state_for_broadcast();
-    if server.get_hide_users_without_traverse() {
+    if hides_users_from(server, viewer) {
         let listener_channels =
             visible_listener_channels(server, viewer, target.get_listening_channel_ids()).await;
         state.listening_channel_add = sorted_channels(&listener_channels);
@@ -2238,6 +2255,7 @@ async fn visibility_refresh_scope_for_viewer_delta(
         || delta.groups.is_some()
         || delta.is_superuser.is_some()
         || delta.tokens.is_some()
+        || delta.privileges.is_some()
     {
         scope.include_all_channels();
         scope.include_known_users();
@@ -2389,8 +2407,8 @@ async fn refresh_target_visibility(
     } else if superuser_hidden_from_viewer(viewer, target) {
         false
     } else if let Some(context) = acl_context {
-        (!server.get_hide_users_without_traverse() || context.can_view_channel(target_channel_id))
-            && (!server.get_hide_channels_without_traverse()
+        (!hides_users_from(server, viewer) || context.can_view_channel(target_channel_id))
+            && (!hides_channels_from(server, viewer)
                 || context.can_view_channel_with_ancestors(target_channel_id))
             || viewer_can_temporarily_view_current_or_linked_channel(
                 server,
@@ -2415,7 +2433,7 @@ async fn refresh_target_visibility(
     let new_listeners = if let Some(context) = acl_context {
         context.visible_listener_channels(
             target.get_listening_channel_ids(),
-            server.get_hide_channels_without_traverse(),
+            hides_channels_from(server, viewer),
         )
     } else {
         visible_listener_channels_with_home(

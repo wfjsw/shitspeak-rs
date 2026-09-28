@@ -119,7 +119,7 @@ impl Authenticator for DemoAuthenticator {
             display_name: Some(username.to_owned()),
             groups,
             is_superuser: username == "admin",
-            invisible: false,
+            privileges: Default::default(),
             virtual_server_id: None,
             language: None,
             max_bandwidth: None,

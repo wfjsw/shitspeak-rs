@@ -2600,7 +2600,7 @@ mod tests {
                 display_name: Some("Alice".to_string()),
                 groups: vec!["web".to_string()],
                 is_superuser: false,
-                invisible: false,
+                privileges: Default::default(),
                 virtual_server_id: None,
                 language: None,
                 max_bandwidth: None,

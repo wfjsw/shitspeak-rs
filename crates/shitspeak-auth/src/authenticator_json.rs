@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shitspeak_core::ProtocolVersion;
 
-use crate::Language;
+use crate::{Language, Privilege, Privileges};
 
 use super::{
     AuthenticateAuxiliaryData, AuthenticateResult, AuthenticationExpiryAction,
@@ -207,6 +207,9 @@ pub(crate) struct AuthenticatorJsonAuthenticateResponse {
     #[serde(default)]
     is_superuser: bool,
     #[serde(default)]
+    privileges: Vec<String>,
+    /// Deprecated alias for the `invisible` privilege.
+    #[serde(default)]
     invisible: bool,
     #[serde(default)]
     virtual_server_id: Option<String>,
@@ -247,13 +250,25 @@ impl AuthenticatorJsonAuthenticateResponse {
             }
             return Err(rejection);
         }
+        let (mut privileges, unknown_privileges) =
+            Privileges::parse(self.privileges.iter().map(String::as_str));
+        if !unknown_privileges.is_empty() {
+            tracing::warn!(
+                user_id = ?self.user_id,
+                privileges = ?unknown_privileges,
+                "authenticator returned unknown privileges; ignoring them"
+            );
+        }
+        if self.invisible {
+            privileges.insert(Privilege::Invisible);
+        }
         Ok(AuthenticateResult {
             user_id: self.user_id,
             fqdn: self.fqdn,
             display_name: self.display_name,
             groups: self.groups,
             is_superuser: self.is_superuser,
-            invisible: self.invisible,
+            privileges,
             virtual_server_id: self.virtual_server_id,
             // An absent `language` leaves the selection to the server's
             // `default_language`. Text that is not a language tag is treated
@@ -281,7 +296,7 @@ pub(crate) fn authenticate_result_from_external_claims(
             .or_else(|| Some(claims.username.clone())),
         groups: claims.groups.clone(),
         is_superuser: false,
-        invisible: false,
+        privileges: Privileges::empty(),
         virtual_server_id: None,
         language: None,
         max_bandwidth: None,
@@ -351,6 +366,34 @@ mod tests {
 
         assert_eq!(result.user_id, Some(7));
         assert_eq!(result.fqdn.as_deref(), Some("alice@example.test"));
+    }
+
+    #[test]
+    fn authenticate_response_maps_privileges() {
+        let response: AuthenticatorJsonAuthenticateResponse =
+            serde_json::from_str(r#"{"accepted":true,"privileges":["see_all","Move","unknown"]}"#)
+                .unwrap();
+        let privileges = response.into_authenticate_result().unwrap().privileges;
+
+        assert!(privileges.contains(Privilege::SeeAll));
+        assert!(privileges.contains(Privilege::Move));
+        assert!(!privileges.contains(Privilege::Invisible));
+
+        let response: AuthenticatorJsonAuthenticateResponse =
+            serde_json::from_str(r#"{"accepted":true}"#).unwrap();
+        let privileges = response.into_authenticate_result().unwrap().privileges;
+        assert!(privileges.is_empty());
+    }
+
+    #[test]
+    fn legacy_invisible_flag_maps_to_invisible_privilege() {
+        let response: AuthenticatorJsonAuthenticateResponse =
+            serde_json::from_str(r#"{"accepted":true,"invisible":true}"#).unwrap();
+        let privileges = response.into_authenticate_result().unwrap().privileges;
+
+        assert!(privileges.contains(Privilege::Invisible));
+        assert!(privileges.contains(Privilege::ServerModeration));
+        assert!(privileges.contains(Privilege::ServerText));
     }
 
     #[test]

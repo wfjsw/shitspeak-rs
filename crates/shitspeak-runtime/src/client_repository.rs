@@ -3267,7 +3267,7 @@ impl ClientRepository {
                     client.record_tracing_span_identity();
                     let channel_id = client.get_current_channel_id();
                     let listener_channels = client.get_listening_channel_ids();
-                    let counted = !initial_state.invisible.unwrap_or(false);
+                    let counted = !client.is_invisible();
                     let was_counted = register.counted_clients.contains(&scoped_id);
                     register.clients.insert(scoped_id.clone(), client);
                     if counted {
@@ -3359,18 +3359,17 @@ impl ClientRepository {
                             client.set_can_receive_voice(gs.can_receive_voice());
                         }
                         client.record_tracing_span_identity();
-                        if let Some(invisible) = delta.invisible {
-                            if invisible {
-                                register.counted_clients.remove(&scoped_id);
-                            } else {
-                                register.counted_clients.insert(scoped_id.clone());
-                            }
+                        let counted = !client.is_invisible();
+                        if counted {
+                            register.counted_clients.insert(scoped_id.clone());
+                        } else {
+                            register.counted_clients.remove(&scoped_id);
                         }
-                        match (was_counted, delta.invisible) {
-                            (false, Some(false)) => {
+                        match (was_counted, counted) {
+                            (false, true) => {
                                 Some(AuthenticatedClientCountChange::Added(server_id.clone()))
                             }
-                            (true, Some(true)) => {
+                            (true, false) => {
                                 Some(AuthenticatedClientCountChange::Removed(server_id.clone()))
                             }
                             _ => None,
@@ -6104,11 +6103,12 @@ pub(crate) fn apply_delta_to_global_state(
     if let Some(v) = delta.is_superuser {
         gs.set_superuser(v);
     }
+    // Privileges gate hidden mode, so apply them first.
+    if let Some(privileges) = delta.resolve_privileges() {
+        gs.set_privileges(privileges);
+    }
     if let Some(v) = delta.hidden_from_regular_users {
         gs.set_hidden_from_regular_users(v);
-    }
-    if let Some(v) = delta.invisible {
-        gs.set_invisible(v);
     }
     if let Some(v) = delta.suppress {
         gs.set_suppress(v);

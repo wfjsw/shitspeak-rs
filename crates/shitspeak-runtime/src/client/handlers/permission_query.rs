@@ -53,8 +53,11 @@ pub async fn handle_permission_query(
             "Computed permissions for PermissionQuery"
         );
 
-        let reply: Message =
-            PermissionQuery::for_channel_permissions(channel_id, perms.bits()).into();
+        let reply: Message = PermissionQuery::for_channel_permissions(
+            channel_id,
+            sender.advertised_permissions(perms).bits(),
+        )
+        .into();
 
         sender.write_proto_message(&reply).await?;
     }
