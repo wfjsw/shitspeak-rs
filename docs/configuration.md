@@ -789,7 +789,10 @@ reorder_disabled = false
 adaptive_jitter_enabled = true
 adaptive_jitter_min_delay_ms = 40
 adaptive_jitter_max_delay_ms = 120
-adaptive_jitter_growth_step_ms = 20
+adaptive_jitter_target_percentile = 95
+adaptive_jitter_histogram_forgetting_factor = 0.995
+adaptive_jitter_histogram_bucket_ms = 5
+adaptive_jitter_min_samples = 20
 adaptive_jitter_decay_step_ms = 10
 repair_enabled = true
 transport_ttl_ms = 1500
@@ -1081,6 +1084,24 @@ The optional extra hold defaults to zero. Older configurations with a 600 ms
 extra hold are also subject to the total cap. Increasing transport TTLs or
 `repair_cache_ms` does not extend receiver waiting.
 
+When `adaptive_jitter_enabled` is set, the per-speaker wait is derived from a
+NetEQ-style histogram of relative arrival delay rather than fixed grow/decay
+steps. Each arriving frame contributes a sample — its observed inter-arrival
+gap minus the gap its sequence delta implies — and every sample decays the
+whole histogram by `adaptive_jitter_histogram_forgetting_factor` before
+landing in its own `adaptive_jitter_histogram_bucket_ms` wide bucket. The
+target wait is the `adaptive_jitter_target_percentile`th percentile of that
+histogram, clamped to the min/max range above. A fatter jitter tail raises the
+target immediately; the target only steps back down by
+`adaptive_jitter_decay_step_ms` after 16 consecutive samples showing the tail
+has shrunk, which keeps the estimate from oscillating. The estimator stays on
+its bootstrap value (`reorder_max_delay_ms` within the min/max range) until
+`adaptive_jitter_min_samples` samples have arrived. Deadline-triggered gap
+flushes record a maximal-lateness sample so a loss is reflected in the very
+next estimate. Reactive repair arrivals are excluded from sampling — they are
+late by construction and would otherwise ratchet the delay up on a healthy
+link. `adaptive_jitter_growth_step_ms` is retired and ignored if present.
+
 Once a speaker starts delivering, the next buffer drain is due within 90% of
 the last emitted Opus packet's duration (18 ms for a 20 ms packet), leaving
 headroom for client processing. This deadline survives an empty buffer and
@@ -1159,7 +1180,9 @@ clients own media pacing and jitter buffering. Legacy
 `remote_playout_min_ms`, `remote_playout_max_ms`,
 `remote_playout_p99_margin_ms`, and `remote_playout_idle_reset_ms` keys are
 accepted as ignored no-ops for one release and should be removed from deployment
-configuration.
+configuration. `adaptive_jitter_growth_step_ms` is likewise accepted and
+ignored: the AIMD growth step was replaced by the percentile estimator
+described above.
 
 The tracked `config.toml` enables the documented long-haul profile explicitly.
 The S2S dashboard reports deadline translation, expiry, and clock-offset

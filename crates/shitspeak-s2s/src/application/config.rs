@@ -59,10 +59,27 @@ pub struct VoiceConfig {
     /// hold, even when adaptation is disabled. Raised to the minimum if lower.
     pub adaptive_jitter_max_delay_ms: u64,
 
-    /// Amount added after observed jitter/loss pressure.
-    pub adaptive_jitter_growth_step_ms: u64,
+    /// Target percentile (50 through 100) of the observed relative-arrival-delay
+    /// distribution used as the per-sender delay estimate (NetEQ-style histogram
+    /// estimator).
+    pub adaptive_jitter_target_percentile: u8,
 
-    /// Amount removed after sustained in-order delivery.
+    /// Exponential forgetting factor for the per-sender arrival-delay histogram.
+    /// Closer to 1.0 retains a longer memory of past jitter; closer to 0.0
+    /// reacts to only the most recent samples. Must be in (0.0, 1.0).
+    pub adaptive_jitter_histogram_forgetting_factor: f64,
+
+    /// Bucket width, in milliseconds, of the per-sender arrival-delay histogram.
+    pub adaptive_jitter_histogram_bucket_ms: u64,
+
+    /// Minimum arrival samples observed before the histogram estimate is
+    /// trusted. Below this, the cold-start `reorder_max_delay_ms`-derived delay
+    /// is used unchanged.
+    pub adaptive_jitter_min_samples: u32,
+
+    /// Maximum delay decrease, in ms, applied in one step once the percentile
+    /// target has stayed at or below the current delay for
+    /// `ADAPTIVE_JITTER_DECAY_HOLDOFF_SAMPLES` consecutive arrival samples.
     pub adaptive_jitter_decay_step_ms: u64,
 
     /// Enable bounded best-effort repair for S2S voice gaps.
@@ -131,7 +148,11 @@ impl Default for VoiceConfig {
             adaptive_jitter_enabled: default_adaptive_jitter_enabled(),
             adaptive_jitter_min_delay_ms: default_adaptive_jitter_min_delay_ms(),
             adaptive_jitter_max_delay_ms: default_adaptive_jitter_max_delay_ms(),
-            adaptive_jitter_growth_step_ms: default_adaptive_jitter_growth_step_ms(),
+            adaptive_jitter_target_percentile: default_adaptive_jitter_target_percentile(),
+            adaptive_jitter_histogram_forgetting_factor:
+                default_adaptive_jitter_histogram_forgetting_factor(),
+            adaptive_jitter_histogram_bucket_ms: default_adaptive_jitter_histogram_bucket_ms(),
+            adaptive_jitter_min_samples: default_adaptive_jitter_min_samples(),
             adaptive_jitter_decay_step_ms: default_adaptive_jitter_decay_step_ms(),
             repair_enabled: default_repair_enabled(),
             repair_cache_ms: default_repair_cache_ms(),
@@ -186,8 +207,19 @@ struct VoiceConfigWire {
     remote_playout_idle_reset_ms: Option<IgnoredAny>,
     #[serde(default)]
     reorder_max_drop_lag_frames: Option<IgnoredAny>,
-    #[serde(default = "default_adaptive_jitter_growth_step_ms")]
-    adaptive_jitter_growth_step_ms: u64,
+    // Compatibility-only. The AIMD growth step was replaced by a NetEQ-style
+    // percentile estimator that reacts immediately to a fatter observed tail;
+    // there is no longer a fixed growth-step-per-event to configure.
+    #[serde(default)]
+    adaptive_jitter_growth_step_ms: Option<IgnoredAny>,
+    #[serde(default = "default_adaptive_jitter_target_percentile")]
+    adaptive_jitter_target_percentile: u8,
+    #[serde(default = "default_adaptive_jitter_histogram_forgetting_factor")]
+    adaptive_jitter_histogram_forgetting_factor: f64,
+    #[serde(default = "default_adaptive_jitter_histogram_bucket_ms")]
+    adaptive_jitter_histogram_bucket_ms: u64,
+    #[serde(default = "default_adaptive_jitter_min_samples")]
+    adaptive_jitter_min_samples: u32,
     #[serde(default = "default_adaptive_jitter_decay_step_ms")]
     adaptive_jitter_decay_step_ms: u64,
     #[serde(default = "default_repair_enabled")]
@@ -256,12 +288,31 @@ impl<'de> Deserialize<'de> for VoiceConfig {
                 "voice_fec_interleave_depth must be between 1 and 8",
             ));
         }
+        if raw.adaptive_jitter_target_percentile < 50 || raw.adaptive_jitter_target_percentile > 100
+        {
+            return Err(D::Error::custom(
+                "adaptive_jitter_target_percentile must be between 50 and 100",
+            ));
+        }
+        if !(raw.adaptive_jitter_histogram_forgetting_factor > 0.0
+            && raw.adaptive_jitter_histogram_forgetting_factor < 1.0)
+        {
+            return Err(D::Error::custom(
+                "adaptive_jitter_histogram_forgetting_factor must be between 0.0 and 1.0 (exclusive)",
+            ));
+        }
+        if raw.adaptive_jitter_histogram_bucket_ms == 0 {
+            return Err(D::Error::custom(
+                "adaptive_jitter_histogram_bucket_ms must be at least 1",
+            ));
+        }
         let _ = (
             raw.remote_playout_min_ms.as_ref(),
             raw.remote_playout_max_ms.as_ref(),
             raw.remote_playout_p99_margin_ms.as_ref(),
             raw.remote_playout_idle_reset_ms.as_ref(),
             raw.reorder_max_drop_lag_frames.as_ref(),
+            raw.adaptive_jitter_growth_step_ms.as_ref(),
             raw.repair_nack_delay_ms.as_ref(),
             raw.repair_request_ttl_ms.as_ref(),
             raw.repair_reactive_reserve_pct.as_ref(),
@@ -280,7 +331,11 @@ impl<'de> Deserialize<'de> for VoiceConfig {
             adaptive_jitter_enabled: raw.adaptive_jitter_enabled,
             adaptive_jitter_min_delay_ms: raw.adaptive_jitter_min_delay_ms,
             adaptive_jitter_max_delay_ms: raw.adaptive_jitter_max_delay_ms,
-            adaptive_jitter_growth_step_ms: raw.adaptive_jitter_growth_step_ms,
+            adaptive_jitter_target_percentile: raw.adaptive_jitter_target_percentile,
+            adaptive_jitter_histogram_forgetting_factor: raw
+                .adaptive_jitter_histogram_forgetting_factor,
+            adaptive_jitter_histogram_bucket_ms: raw.adaptive_jitter_histogram_bucket_ms,
+            adaptive_jitter_min_samples: raw.adaptive_jitter_min_samples,
             adaptive_jitter_decay_step_ms: raw.adaptive_jitter_decay_step_ms,
             repair_enabled: raw.repair_enabled,
             repair_cache_ms: raw.repair_cache_ms,
@@ -359,7 +414,16 @@ fn default_adaptive_jitter_min_delay_ms() -> u64 {
 fn default_adaptive_jitter_max_delay_ms() -> u64 {
     120
 }
-fn default_adaptive_jitter_growth_step_ms() -> u64 {
+fn default_adaptive_jitter_target_percentile() -> u8 {
+    95
+}
+fn default_adaptive_jitter_histogram_forgetting_factor() -> f64 {
+    0.995
+}
+fn default_adaptive_jitter_histogram_bucket_ms() -> u64 {
+    5
+}
+fn default_adaptive_jitter_min_samples() -> u32 {
     20
 }
 fn default_adaptive_jitter_decay_step_ms() -> u64 {
@@ -476,7 +540,10 @@ mod tests {
         assert_eq!(cfg.voice.chunk_hold_budget_ms, 0);
         assert_eq!(cfg.voice.adaptive_jitter_min_delay_ms, 40);
         assert_eq!(cfg.voice.adaptive_jitter_max_delay_ms, 120);
-        assert_eq!(cfg.voice.adaptive_jitter_growth_step_ms, 20);
+        assert_eq!(cfg.voice.adaptive_jitter_target_percentile, 95);
+        assert_eq!(cfg.voice.adaptive_jitter_histogram_forgetting_factor, 0.995);
+        assert_eq!(cfg.voice.adaptive_jitter_histogram_bucket_ms, 5);
+        assert_eq!(cfg.voice.adaptive_jitter_min_samples, 20);
         assert_eq!(cfg.voice.adaptive_jitter_decay_step_ms, 10);
         assert_eq!(cfg.voice.repair_loss_start_ppm, 10_000);
         assert_eq!(cfg.voice.repair_full_dup_loss_ppm, 30_000);
@@ -532,6 +599,44 @@ mod tests {
                 error
                     .to_string()
                     .contains("repair_max_extra_copies_per_frame must be between 0 and 2")
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_jitter_growth_step_ms_key_is_accepted_and_ignored() {
+        let cfg: ApplicationConfig =
+            serde_json::from_str(r#"{"voice":{"adaptive_jitter_growth_step_ms":99}}"#).unwrap();
+        assert_eq!(cfg.voice.adaptive_jitter_decay_step_ms, 10);
+    }
+
+    #[test]
+    fn adaptive_jitter_target_percentile_rejects_out_of_range_values() {
+        for percentile in [0, 49, 101] {
+            let error = serde_json::from_str::<ApplicationConfig>(&format!(
+                r#"{{"voice":{{"adaptive_jitter_target_percentile":{percentile}}}}}"#
+            ))
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("adaptive_jitter_target_percentile must be between 50 and 100")
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_jitter_histogram_forgetting_factor_rejects_out_of_range_values() {
+        for factor in ["0.0", "1.0", "-0.5", "1.5"] {
+            let error = serde_json::from_str::<ApplicationConfig>(&format!(
+                r#"{{"voice":{{"adaptive_jitter_histogram_forgetting_factor":{factor}}}}}"#
+            ))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "adaptive_jitter_histogram_forgetting_factor must be between 0.0 and 1.0 (exclusive)"
+                ),
+                "{factor}"
             );
         }
     }

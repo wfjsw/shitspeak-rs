@@ -394,7 +394,19 @@ reorder_disabled = false
 adaptive_jitter_enabled = true
 adaptive_jitter_min_delay_ms = 40
 adaptive_jitter_max_delay_ms = 120
-adaptive_jitter_growth_step_ms = 20
+# Delay target is the given percentile of a decaying relative-arrival-delay
+# histogram. Higher percentiles tolerate a fatter jitter tail at the cost of
+# more latency.
+adaptive_jitter_target_percentile = 95
+# Per-sample exponential forgetting factor for the histogram, in (0, 1).
+# Closer to 1 keeps a longer jitter history; lower reacts faster.
+adaptive_jitter_histogram_forgetting_factor = 0.995
+# Histogram bucket width in milliseconds.
+adaptive_jitter_histogram_bucket_ms = 5
+# Samples required before the estimator leaves its bootstrap delay.
+adaptive_jitter_min_samples = 20
+# Step-down applied only after the percentile target stays below the current
+# delay for 16 consecutive samples.
 adaptive_jitter_decay_step_ms = 10
 reorder_idle_reset_ms = 2000
 reorder_max_buffered_frames = 48

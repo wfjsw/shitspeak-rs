@@ -5,7 +5,11 @@ use std::{
 
 use shitspeak_messages::messages::encoder::Ping;
 
-const BANDWIDTH_WINDOW: Duration = Duration::from_secs(1);
+/// How long a bandwidth sample stays eligible. Short enough that the rate
+/// returns to zero promptly once the client goes quiet, long enough that a
+/// client speaking about once a second does not report zero bandwidth just
+/// because its newest sample aged out before the query arrived.
+const BANDWIDTH_WINDOW: Duration = Duration::from_millis(1_250);
 const BANDWIDTH_MINIMUM_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
@@ -123,7 +127,17 @@ impl ClientStats {
             .iter()
             .map(|sample| sample.bytes)
             .sum();
-        let elapsed = now.duration_since(first.at).as_secs_f64();
+        // Rate over the span the samples actually cover. Idle time after the
+        // newest sample is deliberately left out: the window expiry is what
+        // brings the rate back to zero once the client goes quiet. The minimum
+        // interval floors the span so a burst that lands in a single instant is
+        // not divided by zero.
+        let span = self
+            .bandwidth_samples
+            .back()
+            .map(|last| last.at.duration_since(first.at))
+            .unwrap_or_default();
+        let elapsed = span.max(BANDWIDTH_MINIMUM_INTERVAL).as_secs_f64();
         ((bytes as f64 / elapsed).min(u32::MAX as f64)) as u32
     }
 
@@ -201,6 +215,41 @@ mod tests {
         );
         assert_eq!(
             stats.bandwidth_bytes_per_second(start + Duration::from_millis(250)),
+            4_000
+        );
+    }
+
+    /// A client that speaks about once a second must not report zero
+    /// bandwidth just because the newer of its two samples aged out of the
+    /// window before the query arrived.
+    #[test]
+    fn bandwidth_keeps_sparse_traffic_visible() {
+        let start = Instant::now();
+        let mut stats = ClientStats::default();
+        stats.record_tcp_packets_at(1, 1_200, start);
+        stats.record_tcp_packets_at(1, 1_200, start + Duration::from_millis(1_200));
+
+        assert_eq!(
+            stats.bandwidth_bytes_per_second(start + Duration::from_millis(1_200)),
+            2_000
+        );
+    }
+
+    /// The idle tail after the newest sample is not part of the measured
+    /// span: a lone burst keeps its rate until the window expires rather than
+    /// being diluted by time the client spent quiet.
+    #[test]
+    fn bandwidth_does_not_decay_with_idle_time_after_the_last_sample() {
+        let start = Instant::now();
+        let mut stats = ClientStats::default();
+        stats.record_udp_packet_at(1_000, start);
+
+        assert_eq!(
+            stats.bandwidth_bytes_per_second(start + Duration::from_millis(250)),
+            4_000
+        );
+        assert_eq!(
+            stats.bandwidth_bytes_per_second(start + Duration::from_millis(900)),
             4_000
         );
     }

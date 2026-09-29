@@ -36,7 +36,7 @@ use crate::application::voice::metrics::{
 use shitspeak_core::NodeIdentifier;
 use shitspeak_voice::codec::{Audio, AudioPayload};
 
-const ADAPTIVE_JITTER_IN_ORDER_DECAY_RUN: u32 = 16;
+const ADAPTIVE_JITTER_DECAY_HOLDOFF_SAMPLES: u32 = 16;
 const DEFAULT_MAX_USERS: u64 = 5_000;
 const MIN_TRACKED_SPEAKERS: usize = 1_024;
 const MAX_TRACKED_SPEAKERS: usize = 16_384;
@@ -302,6 +302,76 @@ impl VoiceRouteHint {
     }
 }
 
+const MIN_HISTOGRAM_BUCKETS: usize = 8;
+const MAX_HISTOGRAM_BUCKETS: usize = 128;
+
+/// Self-normalizing exponential histogram of relative arrival delay
+/// (lateness only — early arrivals are clamped to zero), in milliseconds.
+/// Every sample decays all buckets by `forgetting_factor` then adds
+/// `(1 - forgetting_factor)` mass to the sample's bucket, so the histogram is
+/// always implicitly normalized to (at most) 1.0 without a separate
+/// renormalization pass.
+struct DelayHistogram {
+    buckets: Vec<f32>,
+    sample_count: u32,
+}
+
+impl DelayHistogram {
+    fn new(bucket_count: usize) -> Self {
+        Self {
+            buckets: vec![0.0; bucket_count.max(1)],
+            sample_count: 0,
+        }
+    }
+
+    /// Zero-capacity variant used when adaptive jitter is disabled, so
+    /// disabled deployments pay no per-speaker memory/CPU cost.
+    fn disabled() -> Self {
+        Self {
+            buckets: Vec::new(),
+            sample_count: 0,
+        }
+    }
+
+    fn record(&mut self, relative_delay_ms: f64, bucket_ms: u64, forgetting_factor: f64) {
+        if self.buckets.is_empty() {
+            return;
+        }
+        let bucket_ms = bucket_ms.max(1) as f64;
+        let idx = (relative_delay_ms.max(0.0) / bucket_ms).floor() as usize;
+        let idx = idx.min(self.buckets.len() - 1);
+        let factor = forgetting_factor.clamp(0.0, 0.999_999) as f32;
+        for bucket in &mut self.buckets {
+            *bucket *= factor;
+        }
+        self.buckets[idx] += 1.0 - factor;
+        self.sample_count = self.sample_count.saturating_add(1);
+    }
+
+    /// The smallest bucket's upper edge whose cumulative mass — normalized by
+    /// the histogram's ACTUAL accumulated total, not an assumed 1.0 — is at or
+    /// past `percentile`. Returns `None` before `min_samples` samples have been
+    /// recorded (cold start).
+    fn percentile_ms(&self, percentile: f64, bucket_ms: u64, min_samples: u32) -> Option<u64> {
+        if self.buckets.is_empty() || self.sample_count < min_samples {
+            return None;
+        }
+        let total: f32 = self.buckets.iter().sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let threshold = total * (percentile / 100.0) as f32;
+        let mut cumulative = 0.0f32;
+        for (i, mass) in self.buckets.iter().enumerate() {
+            cumulative += mass;
+            if cumulative >= threshold {
+                return Some((i as u64 + 1) * bucket_ms.max(1));
+            }
+        }
+        Some(self.buckets.len() as u64 * bucket_ms.max(1))
+    }
+}
+
 /// Public reorder gate. Cheap to clone — internally `Arc`-wrapped.
 pub struct Reorderer {
     cfg: VoiceConfig,
@@ -310,6 +380,8 @@ pub struct Reorderer {
     deadline_notify: Arc<Notify>,
     deadline_wake_pending: AtomicBool,
     deadline_wake_ack: Notify,
+    histogram_bucket_ms: u64,
+    histogram_bucket_count: usize,
 }
 
 struct ReorderInner {
@@ -329,7 +401,7 @@ struct SenderState {
     /// Fixed when the gap opens; partial repairs cannot extend this expiry.
     gap_expires_at: Option<Instant>,
     adaptive_delay_ms: u64,
-    in_order_run: u32,
+    decay_holdoff_run: u32,
     last_activity: Instant,
     /// Delivery cadence survives an empty buffer until the speaker is pruned.
     next_flush_at: Option<Instant>,
@@ -340,6 +412,9 @@ struct SenderState {
     /// The last [`DELIVERY_HISTORY`] delivered sequences and which kind of
     /// copy delivered each.
     delivered: VecDeque<(u64, VoiceCopyKind)>,
+    delay_histogram: DelayHistogram,
+    last_arrival_seq: Option<u64>,
+    last_arrival_at: Option<Instant>,
 }
 
 impl SenderState {
@@ -390,6 +465,11 @@ impl Reorderer {
         cfg: VoiceConfig,
         max_users: Arc<AtomicU64>,
     ) -> Arc<Self> {
+        let histogram_bucket_ms = cfg.adaptive_jitter_histogram_bucket_ms.max(1);
+        let histogram_bucket_count = ((cfg.adaptive_jitter_max_delay_ms / histogram_bucket_ms)
+            as usize
+            + 1)
+            .clamp(MIN_HISTOGRAM_BUCKETS, MAX_HISTOGRAM_BUCKETS);
         Arc::new(Self {
             cfg,
             max_users,
@@ -402,6 +482,8 @@ impl Reorderer {
             deadline_notify: Arc::new(Notify::new()),
             deadline_wake_pending: AtomicBool::new(false),
             deadline_wake_ack: Notify::new(),
+            histogram_bucket_ms,
+            histogram_bucket_count,
         })
     }
 
@@ -587,32 +669,105 @@ impl Reorderer {
         started <= now && matches!(self.gap_hold_deadline(entry), Some(deadline) if deadline > now)
     }
 
-    fn grow_adaptive_delay(&self, entry: &mut SenderState) {
-        if !self.cfg.adaptive_jitter_enabled {
-            return;
+    fn new_delay_histogram(&self) -> DelayHistogram {
+        if self.cfg.adaptive_jitter_enabled {
+            DelayHistogram::new(self.histogram_bucket_count)
+        } else {
+            DelayHistogram::disabled()
         }
-        let (_, max) = self.adaptive_delay_bounds_ms();
-        entry.adaptive_delay_ms = entry
-            .adaptive_delay_ms
-            .saturating_add(self.cfg.adaptive_jitter_growth_step_ms)
-            .min(max);
-        entry.in_order_run = 0;
     }
 
-    fn record_clean_in_order(&self, entry: &mut SenderState) {
+    fn observe_arrival_and_update_delay(
+        &self,
+        entry: &mut SenderState,
+        seq: u64,
+        nominal_duration_ms: f64,
+        now: Instant,
+    ) {
+        let (Some(last_seq), Some(last_at)) = (entry.last_arrival_seq, entry.last_arrival_at)
+        else {
+            // First arrival ever observed for this stream/epoch: seed the
+            // watermark only. There is no prior point to measure a delta
+            // against yet.
+            entry.last_arrival_seq = Some(seq);
+            entry.last_arrival_at = Some(now);
+            return;
+        };
+        if seq <= last_seq {
+            // A duplicate, or a genuinely out-of-order arrival for a sequence
+            // at or below our watermark. We cannot recover a real send-time
+            // delta for it without a per-packet timestamp (which the wire
+            // format does not carry), so it neither contributes a sample nor
+            // advances the watermark.
+            return;
+        }
+        let seq_delta = seq.saturating_sub(last_seq) as f64;
+        let expected_ms = seq_delta * nominal_duration_ms.max(0.1);
+        let observed_ms = now.saturating_duration_since(last_at).as_secs_f64() * 1000.0;
+        let relative_delay_ms = (observed_ms - expected_ms).max(0.0);
+
+        entry.delay_histogram.record(
+            relative_delay_ms,
+            self.histogram_bucket_ms,
+            self.cfg.adaptive_jitter_histogram_forgetting_factor,
+        );
+        entry.last_arrival_seq = Some(seq);
+        entry.last_arrival_at = Some(now);
+        self.reconcile_adaptive_delay(entry);
+    }
+
+    fn reconcile_adaptive_delay(&self, entry: &mut SenderState) {
         if !self.cfg.adaptive_jitter_enabled {
             return;
         }
-        entry.in_order_run = entry.in_order_run.saturating_add(1);
-        if entry.in_order_run < ADAPTIVE_JITTER_IN_ORDER_DECAY_RUN {
+        let (min, max) = self.adaptive_delay_bounds_ms();
+        let Some(target) = entry.delay_histogram.percentile_ms(
+            f64::from(self.cfg.adaptive_jitter_target_percentile),
+            self.histogram_bucket_ms,
+            self.cfg.adaptive_jitter_min_samples,
+        ) else {
+            // Still cold — keep the bootstrap/reorder_max_delay_ms value.
+            return;
+        };
+        let target = target.clamp(min, max);
+
+        if target > entry.adaptive_delay_ms {
+            // Attack: react immediately to a fatter tail.
+            entry.adaptive_delay_ms = target;
+            entry.decay_holdoff_run = 0;
+        } else if target < entry.adaptive_delay_ms {
+            // Decay: only after sustained evidence the tail has genuinely
+            // shrunk, and then only by one bounded step, never straight to
+            // the new target — avoids oscillation/premature tightening.
+            entry.decay_holdoff_run = entry.decay_holdoff_run.saturating_add(1);
+            if entry.decay_holdoff_run >= ADAPTIVE_JITTER_DECAY_HOLDOFF_SAMPLES {
+                entry.adaptive_delay_ms = entry
+                    .adaptive_delay_ms
+                    .saturating_sub(self.cfg.adaptive_jitter_decay_step_ms)
+                    .max(target)
+                    .max(min);
+                entry.decay_holdoff_run = 0;
+            }
+        } else {
+            entry.decay_holdoff_run = 0;
+        }
+    }
+
+    fn record_flush_timeout_sample(&self, entry: &mut SenderState) {
+        if !self.cfg.adaptive_jitter_enabled {
             return;
         }
-        let (min, _) = self.adaptive_delay_bounds_ms();
-        entry.adaptive_delay_ms = entry
-            .adaptive_delay_ms
-            .saturating_sub(self.cfg.adaptive_jitter_decay_step_ms)
-            .max(min);
-        entry.in_order_run = 0;
+        // We don't know how late the missing frame truly was — only that the
+        // whole gap budget elapsed without it arriving. Treat this as a
+        // maximal-lateness sample so the histogram's tail, and therefore the
+        // percentile target, reflects the loss on the very next reconcile.
+        let (_, max) = self.adaptive_delay_bounds_ms();
+        entry.delay_histogram.record(
+            max as f64,
+            self.histogram_bucket_ms,
+            self.cfg.adaptive_jitter_histogram_forgetting_factor,
+        );
+        self.reconcile_adaptive_delay(entry);
     }
 
     fn idle_reset_duration(&self) -> Duration {
@@ -801,11 +956,14 @@ impl Reorderer {
                     hold_started_at: None,
                     gap_expires_at: None,
                     adaptive_delay_ms: initial_adaptive_delay_ms,
-                    in_order_run: 0,
+                    decay_holdoff_run: 0,
                     last_activity: now,
                     next_flush_at: None,
                     released_holes: VecDeque::new(),
                     delivered: VecDeque::new(),
+                    delay_histogram: self.new_delay_histogram(),
+                    last_arrival_seq: None,
+                    last_arrival_at: None,
                 },
             );
             self.enqueue_idle_deadline(&mut state, session, now);
@@ -838,10 +996,13 @@ impl Reorderer {
             entry.hold_started_at = None;
             entry.gap_expires_at = None;
             entry.adaptive_delay_ms = initial_adaptive_delay_ms;
-            entry.in_order_run = 0;
+            entry.decay_holdoff_run = 0;
             entry.next_flush_at = None;
             entry.released_holes.clear();
             entry.delivered.clear();
+            entry.delay_histogram = self.new_delay_histogram();
+            entry.last_arrival_seq = None;
+            entry.last_arrival_at = None;
         }
         entry.last_activity = now;
 
@@ -886,6 +1047,17 @@ impl Reorderer {
             let mut report = self.finish_push(&mut state, session, entry, report, now);
             report.emissions.push(emission);
             return report;
+        }
+
+        // A reactive repair is by construction late — it only ever arrives
+        // because this reorderer already decided a gap was open and requested
+        // it. Including it in the jitter histogram would create a feedback
+        // loop that ratchets the delay up even on a healthy link whenever a
+        // single repair fires. Original/Proactive/Fec copies are genuine,
+        // independently-timed network arrivals and are sampled.
+        if self.cfg.adaptive_jitter_enabled && copy_kind != VoiceCopyKind::ReactiveRepair {
+            let nominal_duration_ms = Self::packet_nominal_duration(&frame).as_secs_f64() * 1000.0;
+            self.observe_arrival_and_update_delay(&mut entry, frame_seq, nominal_duration_ms, now);
         }
 
         // In-order frames emit immediately and drain a contiguous buffered
@@ -943,9 +1115,7 @@ impl Reorderer {
                     VoiceReceiveResult::GapFilled,
                     drained_count,
                 ));
-                entry.in_order_run = 0;
-            } else if entry.pending.is_empty() {
-                self.record_clean_in_order(&mut entry);
+                entry.decay_holdoff_run = 0;
             }
             state.total_pending = state.total_pending.saturating_sub(drained_count);
         } else {
@@ -1038,7 +1208,7 @@ impl Reorderer {
             entry
                 .pending
                 .insert(frame_seq, ReorderEmission::new(from, frame, copy_kind));
-            entry.in_order_run = 0;
+            entry.decay_holdoff_run = 0;
             report
                 .results
                 .push(ReorderResultCount::new(VoiceReceiveResult::GapBuffered, 1));
@@ -1066,9 +1236,8 @@ impl Reorderer {
         self.finish_push(&mut state, session, entry, report, now)
     }
 
-    /// Keep enough headroom for client processing before its current packet ends.
-    fn delivery_interval(frame: &VoiceFrame) -> Duration {
-        let duration = Audio::decode(&frame.payload, Some(frame.sender_session.into()))
+    fn packet_nominal_duration(frame: &VoiceFrame) -> Duration {
+        Audio::decode(&frame.payload, Some(frame.sender_session.into()))
             .ok()
             .and_then(|audio| match audio.audio_payload {
                 AudioPayload::Opus(opus) => opus.packet_duration(),
@@ -1076,7 +1245,12 @@ impl Reorderer {
             })
             // An empty terminator or malformed payload provides no media clock.
             // Use the shortest Opus period so it cannot lengthen a voice stall.
-            .unwrap_or(Duration::from_micros(2_500));
+            .unwrap_or(Duration::from_micros(2_500))
+    }
+
+    /// Keep enough headroom for client processing before its current packet ends.
+    fn delivery_interval(frame: &VoiceFrame) -> Duration {
+        let duration = Self::packet_nominal_duration(frame);
         duration * 9 / 10
     }
 
@@ -1157,7 +1331,7 @@ impl Reorderer {
         if let Some((seq, last)) = pending.last_key_value() {
             entry.next_seq = seq.saturating_add(1);
             entry.next_flush_at = Some(now + Self::delivery_interval(last.frame()));
-            self.grow_adaptive_delay(entry);
+            self.record_flush_timeout_sample(entry);
             if confirmed {
                 metrics::record_gap_resolution(GapResolution::Timeout);
             }
@@ -2569,7 +2743,9 @@ mod tests {
         c.reorder_max_delay_ms = 5;
         c.adaptive_jitter_min_delay_ms = 5;
         c.adaptive_jitter_max_delay_ms = 25;
-        c.adaptive_jitter_growth_step_ms = 10;
+        // Warm the histogram on the very first sample so the deadline-flush
+        // sample is allowed to move the estimate.
+        c.adaptive_jitter_min_samples = 1;
         // The flush that triggers adaptive growth is the chunk-hold
         // exhaustion, so keep the hold window short.
         c.chunk_hold_budget_ms = 5;
@@ -2583,7 +2759,10 @@ mod tests {
         let drained = r.drain_expired();
         let seqs: Vec<u64> = drained.iter().map(|(_, f)| f.s2s_seq).collect();
         assert_eq!(seqs, vec![2]);
-        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(15));
+        // A deadline flush records a maximal-lateness sample, which pushes the
+        // percentile target to the top of the histogram and therefore straight
+        // to the configured ceiling.
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(25));
     }
 
     #[test]
@@ -2592,8 +2771,10 @@ mod tests {
         c.reorder_max_delay_ms = 25;
         c.adaptive_jitter_min_delay_ms = 5;
         c.adaptive_jitter_max_delay_ms = 25;
-        c.adaptive_jitter_growth_step_ms = 10;
         c.adaptive_jitter_decay_step_ms = 5;
+        // Warm the histogram immediately so the 16 clean in-order samples can
+        // qualify for a step-down within this short burst.
+        c.adaptive_jitter_min_samples = 1;
         let r = Reorderer::new(c);
 
         r.push(11, frame(0xABC, 1, 0, false));
@@ -2613,8 +2794,9 @@ mod tests {
         c.reorder_max_delay_ms = 10;
         c.adaptive_jitter_min_delay_ms = 10;
         c.adaptive_jitter_max_delay_ms = 20;
-        c.adaptive_jitter_growth_step_ms = 50;
         c.adaptive_jitter_decay_step_ms = 50;
+        // Warm the histogram so the percentile target is actually consulted.
+        c.adaptive_jitter_min_samples = 1;
         let r = Reorderer::new(c);
 
         r.push(11, frame(0xABC, 1, 0, false));
@@ -2625,6 +2807,285 @@ mod tests {
             r.push(11, frame(0xABC, 1, seq, false));
         }
         assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(10));
+    }
+
+    #[test]
+    fn adaptive_delay_cold_start_holds_until_min_samples() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_min_delay_ms = 5;
+        c.adaptive_jitter_max_delay_ms = 120;
+        c.adaptive_jitter_histogram_bucket_ms = 5;
+        c.adaptive_jitter_target_percentile = 95;
+        c.adaptive_jitter_min_samples = 5;
+        let r = Reorderer::new(c);
+        let start = Instant::now();
+
+        r.push_at(
+            11,
+            frame(0xABC, 1, 0, false),
+            None,
+            VoiceCopyKind::Original,
+            start,
+        );
+        // Each arrival is 50 ms late against its 120 ms nominal packet time.
+        for seq in 1..=5u64 {
+            r.push_at(
+                11,
+                frame(0xABC, 1, seq, false),
+                None,
+                VoiceCopyKind::Original,
+                start + Duration::from_millis(170 * seq),
+            );
+            let expected = if seq < 5 { Some(5) } else { Some(55) };
+            assert_eq!(r.adaptive_delay_ms_for(0xABC), expected, "after {seq}");
+        }
+    }
+
+    #[test]
+    fn adaptive_delay_attacks_immediately_once_warm() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_min_delay_ms = 5;
+        c.adaptive_jitter_max_delay_ms = 120;
+        c.adaptive_jitter_histogram_bucket_ms = 5;
+        c.adaptive_jitter_target_percentile = 95;
+        c.adaptive_jitter_min_samples = 2;
+        let r = Reorderer::new(c);
+        let start = Instant::now();
+
+        r.push_at(
+            11,
+            frame(0xABC, 1, 0, false),
+            None,
+            VoiceCopyKind::Original,
+            start,
+        );
+        for seq in 1..=2u64 {
+            r.push_at(
+                11,
+                frame(0xABC, 1, seq, false),
+                None,
+                VoiceCopyKind::Original,
+                start + Duration::from_millis(120 * seq),
+            );
+        }
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(5));
+
+        // A single late arrival is enough to raise the target; attack has no
+        // multi-sample lag.
+        r.push_at(
+            11,
+            frame(0xABC, 1, 3, false),
+            None,
+            VoiceCopyKind::Original,
+            start + Duration::from_millis(120 * 2 + 170),
+        );
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(55));
+    }
+
+    #[test]
+    fn adaptive_delay_decays_only_after_the_full_holdoff_run() {
+        let mut c = cfg();
+        // Bootstrap the estimate well above the on-time target so the decay
+        // path is the one under test.
+        c.reorder_max_delay_ms = 55;
+        c.adaptive_jitter_min_delay_ms = 5;
+        c.adaptive_jitter_max_delay_ms = 120;
+        c.adaptive_jitter_histogram_bucket_ms = 5;
+        c.adaptive_jitter_decay_step_ms = 5;
+        c.adaptive_jitter_min_samples = 1;
+        let r = Reorderer::new(c);
+        let start = Instant::now();
+
+        r.push_at(
+            11,
+            frame(0xABC, 1, 0, false),
+            None,
+            VoiceCopyKind::Original,
+            start,
+        );
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(55));
+
+        // Fifteen on-time arrivals count toward the holdoff but must not yet
+        // step the estimate down.
+        for seq in 1..=15u64 {
+            r.push_at(
+                11,
+                frame(0xABC, 1, seq, false),
+                None,
+                VoiceCopyKind::Original,
+                start + Duration::from_millis(120 * seq),
+            );
+        }
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(55));
+
+        // The sixteenth qualifying sample finally releases one decay step.
+        r.push_at(
+            11,
+            frame(0xABC, 1, 16, false),
+            None,
+            VoiceCopyKind::Original,
+            start + Duration::from_millis(120 * 16),
+        );
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(50));
+    }
+
+    #[test]
+    fn target_percentile_selects_from_a_bimodal_delay_mixture() {
+        // Nine on-time arrivals plus one 50 ms late arrival: the median stays
+        // in the 0-5 ms bucket while the 95th percentile must cross into the
+        // 50-55 ms bucket.
+        let build = |percentile: u8| {
+            let mut c = cfg();
+            c.reorder_max_delay_ms = 5;
+            c.adaptive_jitter_min_delay_ms = 5;
+            c.adaptive_jitter_max_delay_ms = 120;
+            c.adaptive_jitter_histogram_bucket_ms = 5;
+            c.adaptive_jitter_histogram_forgetting_factor = 0.99;
+            c.adaptive_jitter_target_percentile = percentile;
+            c.adaptive_jitter_min_samples = 1;
+            Reorderer::new(c)
+        };
+        let r_low = build(50);
+        let r_high = build(95);
+        let start = Instant::now();
+
+        for r in [&r_low, &r_high] {
+            r.push_at(
+                11,
+                frame(0xABC, 1, 0, false),
+                None,
+                VoiceCopyKind::Original,
+                start,
+            );
+            for seq in 1..=9u64 {
+                r.push_at(
+                    11,
+                    frame(0xABC, 1, seq, false),
+                    None,
+                    VoiceCopyKind::Original,
+                    start + Duration::from_millis(120 * seq),
+                );
+            }
+            assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(5));
+            r.push_at(
+                11,
+                frame(0xABC, 1, 10, false),
+                None,
+                VoiceCopyKind::Original,
+                start + Duration::from_millis(120 * 9 + 170),
+            );
+        }
+
+        assert_eq!(r_low.adaptive_delay_ms_for(0xABC), Some(5));
+        assert_eq!(r_high.adaptive_delay_ms_for(0xABC), Some(55));
+    }
+
+    #[test]
+    fn sender_epoch_change_resets_delay_histogram() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_min_delay_ms = 5;
+        c.adaptive_jitter_max_delay_ms = 120;
+        c.adaptive_jitter_histogram_bucket_ms = 5;
+        c.adaptive_jitter_min_samples = 1;
+        let r = Reorderer::new(c);
+        let start = Instant::now();
+
+        r.push_at(
+            11,
+            frame(0xABC, 1, 0, false),
+            None,
+            VoiceCopyKind::Original,
+            start,
+        );
+        r.push_at(
+            11,
+            frame(0xABC, 1, 1, false),
+            None,
+            VoiceCopyKind::Original,
+            start + Duration::from_millis(170),
+        );
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(55));
+
+        // A newer epoch resets the estimator and discards its histogram.
+        r.push_at(
+            11,
+            frame(0xABC, 2, 0, false),
+            None,
+            VoiceCopyKind::Original,
+            start + Duration::from_millis(300),
+        );
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(5));
+
+        // A clean arrival on the fresh histogram must not re-attack from the
+        // previous epoch's late sample.
+        r.push_at(
+            11,
+            frame(0xABC, 2, 1, false),
+            None,
+            VoiceCopyKind::Original,
+            start + Duration::from_millis(420),
+        );
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(5));
+    }
+
+    #[test]
+    fn reactive_repair_arrivals_never_feed_the_histogram() {
+        let mut c = cfg();
+        c.reorder_max_delay_ms = 5;
+        c.adaptive_jitter_min_delay_ms = 5;
+        c.adaptive_jitter_max_delay_ms = 200;
+        c.adaptive_jitter_histogram_bucket_ms = 5;
+        c.adaptive_jitter_min_samples = 1;
+        // Keep the gap live long enough for the repair to join the suffix
+        // instead of being rejected as a repair without a gap.
+        c.chunk_hold_budget_ms = 200;
+        let r = Reorderer::new(c);
+        let start = Instant::now();
+
+        r.push_at(
+            11,
+            frame(0xABC, 1, 0, false),
+            None,
+            VoiceCopyKind::Original,
+            start,
+        );
+        // Land the gap-forming suffix well inside the previous delivery's
+        // 108 ms deadline (90% of the 120 ms frame). An arrival past that
+        // deadline is itself a deadline flush, which records a
+        // maximal-lateness sample — intentional, and covered by
+        // `adaptive_delay_grows_after_gap_and_deadline_flush`, but not what
+        // this test is about.
+        r.push_at(
+            11,
+            frame(0xABC, 1, 2, false),
+            None,
+            VoiceCopyKind::Original,
+            start + Duration::from_millis(20),
+        );
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(5));
+        assert_eq!(r.pending_total(), 1);
+
+        // The repair joins the open suffix 60 ms after the last arrival,
+        // still inside the gap window the previous delivery's deadline leaves
+        // open. It carries a short 2.5 ms TOC so a wrongly recorded sample
+        // would be unambiguously late — 60 ms observed against a 2.5 ms
+        // nominal attacks the estimate straight to 60 — whereas a repair that
+        // never feeds the histogram leaves it at the bootstrap 5. A
+        // same-duration repair cannot discriminate here: the live gap window
+        // is always shorter than one nominal packet, so its own sample would
+        // be zero either way.
+        r.push_at(
+            11,
+            timed_frame(0xABC, 3, 0x80),
+            None,
+            VoiceCopyKind::ReactiveRepair,
+            start + Duration::from_millis(80),
+        );
+        assert_eq!(r.pending_total(), 2);
+        assert_eq!(r.adaptive_delay_ms_for(0xABC), Some(5));
     }
 
     #[test]
