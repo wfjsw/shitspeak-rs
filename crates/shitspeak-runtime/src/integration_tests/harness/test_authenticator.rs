@@ -21,6 +21,7 @@ use shitspeak_auth::{
 struct ScriptedUser {
     password: Option<String>,
     user_id: Option<u32>,
+    fqdn: Option<String>,
     groups: Vec<String>,
     is_superuser: bool,
     privileges: Privileges,
@@ -175,6 +176,7 @@ impl TestAuthenticator {
             ScriptedUser {
                 password: password.map(str::to_owned),
                 user_id,
+                fqdn: None,
                 groups,
                 is_superuser: false,
                 privileges: Privilege::Invisible.into(),
@@ -197,6 +199,7 @@ impl TestAuthenticator {
             ScriptedUser {
                 password: password.map(str::to_owned),
                 user_id,
+                fqdn: None,
                 groups,
                 is_superuser: true,
                 privileges: Privilege::Invisible.into(),
@@ -221,6 +224,7 @@ impl TestAuthenticator {
             ScriptedUser {
                 password: password.map(str::to_owned),
                 user_id,
+                fqdn: None,
                 groups,
                 is_superuser: false,
                 privileges: privileges.into_iter().collect(),
@@ -235,6 +239,14 @@ impl TestAuthenticator {
     pub fn set_privileges(&self, name: &str, privileges: impl IntoIterator<Item = Privilege>) {
         if let Some(user) = self.users.lock().unwrap().get_mut(name) {
             user.privileges = privileges.into_iter().collect();
+        }
+    }
+
+    /// Give an already registered user an FQDN, which the authentication
+    /// result reports alongside the user id.
+    pub fn set_fqdn(&self, name: &str, fqdn: Option<&str>) {
+        if let Some(user) = self.users.lock().unwrap().get_mut(name) {
+            user.fqdn = fqdn.map(str::to_owned);
         }
     }
 
@@ -318,6 +330,7 @@ impl TestAuthenticator {
             ScriptedUser {
                 password: password.map(str::to_owned),
                 user_id,
+                fqdn: None,
                 groups,
                 is_superuser,
                 privileges: Privileges::empty(),
@@ -389,7 +402,7 @@ impl Authenticator for AuthenticatorAdapter {
             authenticated_until: None,
             authentication_expiry_action: Default::default(),
             user_id: entry.user_id,
-            fqdn: None,
+            fqdn: entry.fqdn.clone(),
             display_name: Some(username.to_owned()),
             groups: entry.groups,
             is_superuser: entry.is_superuser,

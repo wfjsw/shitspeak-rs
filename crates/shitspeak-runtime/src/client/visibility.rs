@@ -1502,7 +1502,18 @@ async fn project_message_at_home(
                             target.get_current_channel_id(),
                             target.get_listening_channel_ids(),
                         );
-                        return vec![target.build_user_state_for_broadcast().into()];
+                        // First sighting of this user still has to go through the
+                        // per-viewer projection: a viewer with filtering disabled
+                        // (a superuser, or a `SeeAll` holder) must not receive the
+                        // raw certificate hash here.
+                        let mut state = target.build_user_state_for_broadcast();
+                        project_user_state_fields_for_viewer(
+                            server,
+                            viewer,
+                            Some(&***target),
+                            &mut state,
+                        );
+                        return vec![state.into()];
                     }
                     let old_listeners = visibility
                         .get(session)
@@ -2515,21 +2526,6 @@ fn protect_user_state_hash_for_viewer(
     target: Option<&Client>,
     state: &mut UserState,
 ) {
-    if viewer.is_superuser()
-        || state.session == Some(viewer.get_session_id())
-        || state.hash.is_none()
-    {
-        return;
-    }
-    let visibility_generation = server.visibility_generation();
-    if let Some(cached) = target
-        .and_then(|target| target.cached_protected_certificate_hash_hex(visibility_generation))
-    {
-        if let Some(protected) = cached {
-            state.hash = Some(protected);
-        }
-        return;
-    }
     let Some((protection, secret)) = server.get_certificate_hash_privacy() else {
         return;
     };
@@ -2545,22 +2541,44 @@ fn protect_user_state_hash_for_viewer(
     ) {
         return;
     }
-    if let Some(protected) = target.and_then(|target| {
-        target.protected_certificate_hash_hex(visibility_generation, protection, &secret)
+
+    // Salt components, in order: the referenced user's identity, the receiving
+    // side's certificate hash, and the receiving side's identity. When this
+    // node has no client for the referenced user (a remote or already-departed
+    // user) only the user id carried by the message is available.
+    let salt = match target {
+        Some(target) => target.certificate_hash_salt_for(viewer),
+        None => crate::privacy::CertificateHashSalt::new(
+            crate::privacy::PrivacyIdentity::new(None, state.user_id),
+            viewer.get_certificate_hash().unwrap_or_default(),
+            viewer.privacy_identity(),
+        ),
+    };
+
+    let visibility_generation = server.visibility_generation();
+    if let Some(cached) = target.and_then(|target| {
+        target.cached_protected_certificate_hash_hex(visibility_generation, &salt)
     }) {
-        state.hash = Some(protected);
-    } else {
-        crate::privacy::protect_user_state_certificate_hash(
-            state,
-            false,
-            viewer.get_session_id(),
-            protection,
-            Some(secret.as_str()),
-            server
-                .read_config()
-                .privacy
-                .protect_certificate_hashes_for_superusers(),
-        );
+        if let Some(protected) = cached {
+            state.hash = Some(protected);
+        }
+        return;
+    }
+
+    let projected = target
+        .and_then(|target| {
+            target.protected_certificate_hash_hex(visibility_generation, protection, &secret, &salt)
+        })
+        .or_else(|| {
+            crate::privacy::protected_certificate_hash_hex(
+                protection,
+                &secret,
+                state.hash.as_deref()?,
+                &salt,
+            )
+        });
+    if let Some(projected) = projected {
+        state.hash = Some(projected);
     }
 }
 

@@ -1147,6 +1147,13 @@ impl PrivacyConfig {
         }
     }
 
+    /// Extends this configuration with the superuser-protection flag, which
+    /// decides whether superuser viewers see remapped certificate hashes too.
+    pub fn with_superuser_protection(mut self, protect_certificate_hashes_for_superusers: bool) -> Self {
+        self.protect_certificate_hashes_for_superusers = protect_certificate_hashes_for_superusers;
+        self
+    }
+
     pub fn protect_certificate_hashes(&self) -> bool {
         self.protect_certificate_hashes.is_enabled()
     }

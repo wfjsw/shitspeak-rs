@@ -645,6 +645,57 @@ async fn native_client_must_authenticate_before_timeout() {
     );
 }
 
+/// Salt a certificate hash is projected under when `receiver` views the user
+/// described by `referenced_identity`.
+fn certificate_hash_salt(
+    referenced_identity: crate::privacy::PrivacyIdentity,
+    receiver: &TestClient,
+    receiver_identity: crate::privacy::PrivacyIdentity,
+) -> crate::privacy::CertificateHashSalt {
+    crate::privacy::CertificateHashSalt::new(
+        referenced_identity,
+        &receiver.cert_sha1(),
+        receiver_identity,
+    )
+}
+
+fn user_identity(user_id: u32) -> crate::privacy::PrivacyIdentity {
+    crate::privacy::PrivacyIdentity::new(None, Some(user_id))
+}
+
+fn fqdn_identity(fqdn: &str, user_id: u32) -> crate::privacy::PrivacyIdentity {
+    crate::privacy::PrivacyIdentity::new(Some(fqdn), Some(user_id))
+}
+
+/// Collects the projected `UserState` `client` holds for `session_id`, whether
+/// it arrived in the auth burst or as a later broadcast.
+async fn view_of_user(client: &TestClient, session_id: u32) -> Message {
+    client
+        .recv_until(
+            |message| {
+                matches!(message, Message::UserState(state) if state.session == Some(session_id))
+            },
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .or_else(|| {
+            client
+                .initial_user_states
+                .iter()
+                .find(|state| state.session == Some(session_id))
+                .cloned()
+                .map(Message::UserState)
+        })
+        .unwrap_or_else(|| panic!("client should see user {session_id}"))
+}
+
+fn user_state_hash(message: &Message) -> Option<&str> {
+    let Message::UserState(state) = message else {
+        panic!("expected UserState");
+    };
+    state.hash.as_deref()
+}
+
 #[tokio::test]
 async fn certificate_hash_privacy_remaps_other_users_only() {
     let privacy = shitspeak_runtime_config::PrivacyConfig::new(
@@ -678,33 +729,157 @@ async fn certificate_hash_privacy_remaps_other_users_only() {
         .expect("bob should receive his own UserState");
     assert_eq!(bob_self_state.hash.as_deref(), Some(bob_self_hash.as_str()));
 
-    let alice_bob_state = alice
-        .recv_until(
-            |message| matches!(message, Message::UserState(state) if state.session == Some(bob.session_id)),
-            std::time::Duration::from_secs(2),
-        )
-        .await
-        .or_else(|| {
-            alice
-                .initial_user_states
-                .iter()
-                .find(|state| state.session == Some(bob.session_id))
-                .cloned()
-                .map(Message::UserState)
-        })
-        .expect("alice should see bob");
-    let Message::UserState(alice_bob_state) = alice_bob_state else {
-        panic!("expected Bob UserState");
-    };
+    let alice_bob_state = view_of_user(&alice, bob.session_id).await;
     let expected = crate::privacy::remapped_certificate_hash_hex(
         "test-shared-certificate-hash-secret",
         &bob_self_hash,
+        &certificate_hash_salt(user_identity(2), &alice, user_identity(1)),
     )
     .expect("valid test hash");
-    assert_eq!(alice_bob_state.hash.as_deref(), Some(expected.as_str()));
+    assert_eq!(user_state_hash(&alice_bob_state), Some(expected.as_str()));
     assert_ne!(
-        alice_bob_state.hash.as_deref(),
+        user_state_hash(&alice_bob_state),
         Some(bob_self_hash.as_str())
+    );
+}
+
+/// The headline property: the same person yields a different projected hash
+/// for every receiving side, while their own self-view stays the source hash.
+#[tokio::test]
+async fn certificate_hash_privacy_differs_per_receiving_user() {
+    let privacy = shitspeak_runtime_config::PrivacyConfig::new(
+        true,
+        Some("test-shared-certificate-hash-secret".to_owned()),
+    );
+    let server = spawn_test_server(TestServerOpts {
+        privacy,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob auth");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol auth");
+
+    let bob_self_hash = hex::encode(bob.cert_sha1());
+    let bob_self_state = bob
+        .initial_user_states
+        .iter()
+        .find(|state| state.session == Some(bob.session_id))
+        .expect("bob should receive his own UserState");
+    assert_eq!(bob_self_state.hash.as_deref(), Some(bob_self_hash.as_str()));
+
+    let for_alice = crate::privacy::remapped_certificate_hash_hex(
+        "test-shared-certificate-hash-secret",
+        &bob_self_hash,
+        &certificate_hash_salt(user_identity(2), &alice, user_identity(1)),
+    )
+    .expect("valid test hash");
+    let for_carol = crate::privacy::remapped_certificate_hash_hex(
+        "test-shared-certificate-hash-secret",
+        &bob_self_hash,
+        &certificate_hash_salt(user_identity(2), &carol, user_identity(3)),
+    )
+    .expect("valid test hash");
+
+    let alice_view = view_of_user(&alice, bob.session_id).await;
+    let carol_view = view_of_user(&carol, bob.session_id).await;
+
+    assert_eq!(user_state_hash(&alice_view), Some(for_alice.as_str()));
+    assert_eq!(user_state_hash(&carol_view), Some(for_carol.as_str()));
+    assert_ne!(
+        for_alice, for_carol,
+        "alice and carol must not be able to correlate their views of bob"
+    );
+    assert_ne!(user_state_hash(&alice_view), Some(bob_self_hash.as_str()));
+    assert_ne!(user_state_hash(&carol_view), Some(bob_self_hash.as_str()));
+}
+
+/// FQDN identities take part in the salt, and the two identity slots must not
+/// be interchangeable: the referenced user's identity belongs on one side and
+/// the receiver's on the other.
+#[tokio::test]
+async fn certificate_hash_privacy_uses_fqdn_identity() {
+    let privacy = shitspeak_runtime_config::PrivacyConfig::new(
+        true,
+        Some("test-shared-certificate-hash-secret".to_owned()),
+    );
+    let server = spawn_test_server(TestServerOpts {
+        privacy,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_user("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+    server.authenticator.set_fqdn("alice", Some("alice.example"));
+    server.authenticator.set_fqdn("bob", Some("bob.example"));
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob auth");
+
+    let bob_self_hash = hex::encode(bob.cert_sha1());
+    let alice_view = view_of_user(&alice, bob.session_id).await;
+
+    let expected = crate::privacy::remapped_certificate_hash_hex(
+        "test-shared-certificate-hash-secret",
+        &bob_self_hash,
+        &certificate_hash_salt(
+            fqdn_identity("bob.example", 2),
+            &alice,
+            fqdn_identity("alice.example", 1),
+        ),
+    )
+    .expect("valid test hash");
+    let with_swapped_identities = crate::privacy::remapped_certificate_hash_hex(
+        "test-shared-certificate-hash-secret",
+        &bob_self_hash,
+        &certificate_hash_salt(
+            fqdn_identity("alice.example", 1),
+            &alice,
+            fqdn_identity("bob.example", 2),
+        ),
+    )
+    .expect("valid test hash");
+    let with_user_id_only = crate::privacy::remapped_certificate_hash_hex(
+        "test-shared-certificate-hash-secret",
+        &bob_self_hash,
+        &certificate_hash_salt(user_identity(2), &alice, user_identity(1)),
+    )
+    .expect("valid test hash");
+
+    assert_eq!(user_state_hash(&alice_view), Some(expected.as_str()));
+    assert_ne!(
+        user_state_hash(&alice_view),
+        Some(with_swapped_identities.as_str()),
+        "the referenced identity and the receiver identity occupy distinct slots"
+    );
+    assert_ne!(
+        user_state_hash(&alice_view),
+        Some(with_user_id_only.as_str()),
+        "an FQDN identity must not collapse to its user id"
     );
 }
 
@@ -725,6 +900,9 @@ async fn certificate_hash_privacy_reversible_remaps_other_users_only() {
     server
         .authenticator
         .register_user("bob", None, Some(2), vec![]);
+    server
+        .authenticator
+        .register_user("carol", None, Some(3), vec![]);
 
     let alice = TestClient::connect_and_authenticate(&server, "alice", None)
         .await
@@ -732,6 +910,9 @@ async fn certificate_hash_privacy_reversible_remaps_other_users_only() {
     let bob = TestClient::connect_and_authenticate(&server, "bob", None)
         .await
         .expect("bob auth");
+    let carol = TestClient::connect_and_authenticate(&server, "carol", None)
+        .await
+        .expect("carol auth");
 
     let bob_self_hash = hex::encode(bob.cert_sha1());
     let bob_self_state = bob
@@ -741,37 +922,121 @@ async fn certificate_hash_privacy_reversible_remaps_other_users_only() {
         .expect("bob should receive his own UserState");
     assert_eq!(bob_self_state.hash.as_deref(), Some(bob_self_hash.as_str()));
 
-    let alice_bob_state = alice
-        .recv_until(
-            |message| matches!(message, Message::UserState(state) if state.session == Some(bob.session_id)),
-            std::time::Duration::from_secs(2),
-        )
-        .await
-        .or_else(|| {
-            alice
-                .initial_user_states
-                .iter()
-                .find(|state| state.session == Some(bob.session_id))
-                .cloned()
-                .map(Message::UserState)
-        })
-        .expect("alice should see bob");
-    let Message::UserState(alice_bob_state) = alice_bob_state else {
-        panic!("expected Bob UserState");
-    };
+    let alice_salt = certificate_hash_salt(user_identity(2), &alice, user_identity(1));
+    let carol_salt = certificate_hash_salt(user_identity(2), &carol, user_identity(3));
     let expected = crate::privacy::protected_certificate_hash_hex(
         shitspeak_runtime_config::CertificateHashProtection::Reversible,
         "test-shared-certificate-hash-secret",
         &bob_self_hash,
+        &alice_salt,
     )
     .expect("valid test hash");
-    assert_eq!(alice_bob_state.hash.as_deref(), Some(expected.as_str()));
+
+    let alice_view = view_of_user(&alice, bob.session_id).await;
+    let carol_view = view_of_user(&carol, bob.session_id).await;
+
+    assert_eq!(user_state_hash(&alice_view), Some(expected.as_str()));
     assert_ne!(
-        alice_bob_state.hash.as_deref(),
+        user_state_hash(&alice_view),
         Some(bob_self_hash.as_str())
     );
+    // The reversible projection stays same-length decryptable, so it must not
+    // take the per-recipient salt: every viewer sees the same value, which the
+    // secret alone can invert back to the source hash.
+    assert_eq!(
+        user_state_hash(&carol_view),
+        Some(expected.as_str()),
+        "reversible mode must ignore the per-recipient salt"
+    );
+    let ignored_salt = crate::privacy::protected_certificate_hash_hex(
+        shitspeak_runtime_config::CertificateHashProtection::Reversible,
+        "test-shared-certificate-hash-secret",
+        &bob_self_hash,
+        &carol_salt,
+    )
+    .expect("valid test hash");
+    assert_eq!(ignored_salt, expected);
 }
 
+/// Without `protect_certificate_hashes_for_superusers` a superuser viewer is
+/// trusted with the real fingerprint. This pins the default so enabling the
+/// flag stays an explicit, observable change.
+#[tokio::test]
+async fn certificate_hash_privacy_superusers_see_raw_hash_by_default() {
+    let privacy = shitspeak_runtime_config::PrivacyConfig::new(
+        true,
+        Some("test-shared-certificate-hash-secret".to_owned()),
+    );
+    let server = spawn_test_server(TestServerOpts {
+        privacy,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob auth");
+
+    let bob_self_hash = hex::encode(bob.cert_sha1());
+    let alice_view = view_of_user(&alice, bob.session_id).await;
+    assert_eq!(user_state_hash(&alice_view), Some(bob_self_hash.as_str()));
+}
+
+/// Regression: `protect_certificate_hashes_for_superusers` used to be dead on
+/// the `UserState` projection path because the viewer-superuser check returned
+/// early, before the flag was ever consulted. Once the flag is set, a superuser
+/// must receive a remapped hash like anyone else.
+#[tokio::test]
+async fn certificate_hash_privacy_protects_superusers_when_configured() {
+    let privacy = shitspeak_runtime_config::PrivacyConfig::new(
+        true,
+        Some("test-shared-certificate-hash-secret".to_owned()),
+    )
+    .with_superuser_protection(true);
+    let server = spawn_test_server(TestServerOpts {
+        privacy,
+        ..TestServerOpts::default()
+    })
+    .await;
+    server
+        .authenticator
+        .register_superuser("alice", None, Some(1), vec![]);
+    server
+        .authenticator
+        .register_user("bob", None, Some(2), vec![]);
+
+    let alice = TestClient::connect_and_authenticate(&server, "alice", None)
+        .await
+        .expect("alice auth");
+    let bob = TestClient::connect_and_authenticate(&server, "bob", None)
+        .await
+        .expect("bob auth");
+
+    let bob_self_hash = hex::encode(bob.cert_sha1());
+    let expected = crate::privacy::remapped_certificate_hash_hex(
+        "test-shared-certificate-hash-secret",
+        &bob_self_hash,
+        &certificate_hash_salt(user_identity(2), &alice, user_identity(1)),
+    )
+    .expect("valid test hash");
+
+    let alice_view = view_of_user(&alice, bob.session_id).await;
+    assert_ne!(
+        user_state_hash(&alice_view),
+        Some(bob_self_hash.as_str()),
+        "a superuser viewer must not receive the raw hash when the flag is set"
+    );
+    assert_eq!(user_state_hash(&alice_view), Some(expected.as_str()));
+}
 /// Checks that two users authenticating at the same time converge on each
 /// other's presence even if one user's auth burst races the other's publish.
 #[tokio::test]

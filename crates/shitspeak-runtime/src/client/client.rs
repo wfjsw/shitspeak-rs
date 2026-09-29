@@ -121,10 +121,16 @@ impl ClientAclStateSnapshot {
     }
 }
 
+/// Upper bound on cached per-recipient certificate-hash projections kept for
+/// one client. Only repeated projections of this user to the same recipient
+/// benefit, so the map is dropped wholesale once it grows past the cap rather
+/// than accumulating one entry per viewer forever.
+const CERTIFICATE_HASH_PROJECTION_CACHE_LIMIT: usize = 32;
+
 #[derive(Default)]
 struct CertificateHashProjectionCache {
     visibility_generation: Option<u64>,
-    protected_hash_hex: Option<String>,
+    protected_hash_hex_by_salt: HashMap<crate::privacy::CertificateHashSalt, Option<String>>,
 }
 
 impl ClientCachedAclPermissions {
@@ -1208,29 +1214,67 @@ impl Client {
         self.certificate_hash.as_deref()
     }
 
+    /// Identity of this client as certificate-hash salt material: its FQDN
+    /// when one is set, otherwise its user id, otherwise nothing.
+    pub(crate) fn privacy_identity(&self) -> crate::privacy::PrivacyIdentity {
+        let global_state = self.global_state.read();
+        crate::privacy::PrivacyIdentity::new(global_state.get_fqdn(), global_state.get_user_id())
+    }
+
+    /// Salt this client's certificate hash is projected under when it is
+    /// delivered to `receiver`.
+    pub(crate) fn certificate_hash_salt_for(
+        &self,
+        receiver: &Client,
+    ) -> crate::privacy::CertificateHashSalt {
+        crate::privacy::CertificateHashSalt::new(
+            self.privacy_identity(),
+            receiver.get_certificate_hash().unwrap_or_default(),
+            receiver.privacy_identity(),
+        )
+    }
+
     pub(crate) fn protected_certificate_hash_hex(
         &self,
         visibility_generation: u64,
         protection: shitspeak_runtime_config::CertificateHashProtection,
         secret: &str,
+        salt: &crate::privacy::CertificateHashSalt,
     ) -> Option<String> {
         let source = self.certificate_hash_hex.as_deref()?;
         let mut cache = self.certificate_hash_projection_cache.lock();
         if cache.visibility_generation != Some(visibility_generation) {
-            cache.protected_hash_hex =
-                crate::privacy::protected_certificate_hash_hex(protection, secret, source);
+            cache.protected_hash_hex_by_salt.clear();
             cache.visibility_generation = Some(visibility_generation);
         }
-        cache.protected_hash_hex.clone()
+        if let Some(cached) = cache.protected_hash_hex_by_salt.get(salt) {
+            return cached.clone();
+        }
+        let projected =
+            crate::privacy::protected_certificate_hash_hex(protection, secret, source, salt);
+        if cache.protected_hash_hex_by_salt.len() >= CERTIFICATE_HASH_PROJECTION_CACHE_LIMIT {
+            cache.protected_hash_hex_by_salt.clear();
+        }
+        cache
+            .protected_hash_hex_by_salt
+            .insert(salt.clone(), projected.clone());
+        projected
     }
 
+    /// The cached projection of this client's certificate hash for `salt`, if
+    /// the cache is still live for `visibility_generation`. A `Some(None)`
+    /// entry means the projection was already attempted for this recipient and
+    /// produced nothing.
     pub(crate) fn cached_protected_certificate_hash_hex(
         &self,
         visibility_generation: u64,
+        salt: &crate::privacy::CertificateHashSalt,
     ) -> Option<Option<String>> {
         let cache = self.certificate_hash_projection_cache.lock();
-        (cache.visibility_generation == Some(visibility_generation))
-            .then(|| cache.protected_hash_hex.clone())
+        if cache.visibility_generation != Some(visibility_generation) {
+            return None;
+        }
+        cache.protected_hash_hex_by_salt.get(salt).cloned()
     }
 
     pub fn get_certificate_chain(&self) -> &[CertificateDer<'static>] {
@@ -3221,7 +3265,7 @@ mod tests {
     }
 
     #[test]
-    fn certificate_hash_projection_cache_reuses_one_value_per_generation() {
+    fn certificate_hash_projection_cache_reuses_one_value_per_recipient_per_generation() {
         let certificate_hash = Bytes::from_static(&[
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
             0xee, 0xff, 0x00, 0x11, 0x22, 0x33,
@@ -3244,17 +3288,55 @@ mod tests {
             Some("00112233445566778899aabbccddeeff00112233")
         );
 
+        let alice_salt = crate::privacy::CertificateHashSalt::new(
+            crate::privacy::PrivacyIdentity::new(None, Some(2)),
+            &[0xaa; 20],
+            crate::privacy::PrivacyIdentity::new(None, Some(1)),
+        );
+        let carol_salt = crate::privacy::CertificateHashSalt::new(
+            crate::privacy::PrivacyIdentity::new(None, Some(2)),
+            &[0xcc; 20],
+            crate::privacy::PrivacyIdentity::new(None, Some(3)),
+        );
+
         let generation_seven = client
-            .protected_certificate_hash_hex(7, protection, "first-secret")
+            .protected_certificate_hash_hex(7, protection, "first-secret", &alice_salt)
             .expect("valid certificate hash");
         let same_generation = client
-            .protected_certificate_hash_hex(7, protection, "unused-secret")
+            .protected_certificate_hash_hex(7, protection, "unused-secret", &alice_salt)
             .expect("cached certificate hash");
-        let generation_eight = client
-            .protected_certificate_hash_hex(8, protection, "second-secret")
-            .expect("recomputed certificate hash");
+        let other_recipient = client
+            .protected_certificate_hash_hex(7, protection, "unused-secret", &carol_salt)
+            .expect("per-recipient certificate hash");
 
         assert_eq!(same_generation, generation_seven);
+        assert_ne!(other_recipient, generation_seven);
+        assert_eq!(
+            other_recipient,
+            crate::privacy::protected_certificate_hash_hex(
+                protection,
+                "unused-secret",
+                "00112233445566778899aabbccddeeff00112233",
+                &carol_salt,
+            )
+            .unwrap()
+        );
+
+        // Both recipients are cached under generation seven, independently.
+        // Checked before the generation change, which drops the whole map.
+        assert_eq!(
+            client.cached_protected_certificate_hash_hex(7, &alice_salt),
+            Some(Some(generation_seven.clone()))
+        );
+        assert_eq!(
+            client.cached_protected_certificate_hash_hex(7, &carol_salt),
+            Some(Some(other_recipient.clone()))
+        );
+
+        let generation_eight = client
+            .protected_certificate_hash_hex(8, protection, "second-secret", &alice_salt)
+            .expect("recomputed certificate hash");
+
         assert_ne!(generation_eight, generation_seven);
         assert_eq!(
             generation_eight,
@@ -3262,14 +3344,22 @@ mod tests {
                 protection,
                 "second-secret",
                 "00112233445566778899aabbccddeeff00112233",
+                &alice_salt,
             )
             .unwrap()
         );
+        assert_eq!(client.cached_protected_certificate_hash_hex(8, &carol_salt), None);
+
         let cache = client.certificate_hash_projection_cache.lock();
         assert_eq!(cache.visibility_generation, Some(8));
         assert_eq!(
-            cache.protected_hash_hex.as_deref(),
-            Some(&*generation_eight)
+            cache.protected_hash_hex_by_salt.len(),
+            1,
+            "generation change must drop the previous recipients' entries"
+        );
+        assert_eq!(
+            cache.protected_hash_hex_by_salt.get(&alice_salt),
+            Some(&Some(generation_eight))
         );
     }
 
