@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use parking_lot::{
@@ -19,7 +19,7 @@ use parking_lot::{
     RwLockReadGuard as ParkingRwLockReadGuard, RwLockWriteGuard as ParkingRwLockWriteGuard,
 };
 use rustls::pki_types::CertificateDer;
-use shitspeak_client_crypto::{CryptError, CryptState};
+use shitspeak_client_crypto::{CryptDecryptor, CryptEncryptor, CryptError, CryptState};
 use socket2::Socket;
 use tokio::{
     io::{AsyncWriteExt as _, ReadHalf, WriteHalf},
@@ -544,7 +544,13 @@ pub struct Client {
     /// the channels this connection actually touches and is dropped with the
     /// client, so reconnect churn cannot leave stale global cache entries.
     acl_permission_cache: scc::HashMap<u32, ClientCachedAclPermissions>,
-    crypt_state: ParkingMutex<Option<CryptState>>,
+    /// Outbound half of the UDP crypto. Voice egress encrypts through it
+    /// lock-free, so sending to this client never waits for its UDP ingress.
+    /// Replaced only as a whole, together with the inbound half.
+    crypt_encryptor: ArcSwapOption<CryptEncryptor>,
+    /// Inbound half of the UDP crypto: nonce tracking, replay history and
+    /// packet statistics. Also serialises crypt-state replacement.
+    crypt_state: ParkingMutex<Option<CryptDecryptor>>,
     voice_targets: ParkingMutex<HashMap<u32, VoiceTarget>>,
     voice_ingress_limiter: VoiceIngressLimiter,
     voice_routing_tx: Option<mpsc::Sender<VoiceRoutingPayload>>,
@@ -752,6 +758,7 @@ impl Client {
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             acl_permission_cache: scc::HashMap::new(),
+            crypt_encryptor: ArcSwapOption::empty(),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
             voice_ingress_limiter: VoiceIngressLimiter::default(),
@@ -921,6 +928,7 @@ impl Client {
             local_state: ParkingRwLock::new(Some(ClientLocalState::new())),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             acl_permission_cache: scc::HashMap::new(),
+            crypt_encryptor: ArcSwapOption::empty(),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
             voice_ingress_limiter: VoiceIngressLimiter::default(),
@@ -1007,6 +1015,7 @@ impl Client {
             local_state: ParkingRwLock::new(None),
             global_state: ParkingRwLock::new(ClientGlobalState::new()),
             acl_permission_cache: scc::HashMap::new(),
+            crypt_encryptor: ArcSwapOption::empty(),
             crypt_state: ParkingMutex::new(None),
             voice_targets: ParkingMutex::new(HashMap::new()),
             voice_ingress_limiter: VoiceIngressLimiter::default(),
@@ -2118,19 +2127,26 @@ impl Client {
     //     }
     // }
 
-    pub fn crypt_state(&self) -> ParkingMutexGuard<'_, Option<CryptState>> {
+    /// The inbound half of the UDP crypto. Holding it also pins the outbound
+    /// half: both are only ever replaced together, under this lock.
+    pub fn crypt_state(&self) -> ParkingMutexGuard<'_, Option<CryptDecryptor>> {
         self.crypt_state.lock()
     }
 
-    pub fn try_crypt_state(&self) -> Option<ParkingMutexGuard<'_, Option<CryptState>>> {
-        self.crypt_state
-            .try_lock_until(std::time::Instant::now() + std::time::Duration::from_millis(10))
+    /// The outbound half of the UDP crypto, without taking any lock.
+    pub fn crypt_encryptor(&self) -> Option<Arc<CryptEncryptor>> {
+        self.crypt_encryptor.load_full()
     }
 
     pub fn create_crypt_state(&self, mode: &str) -> Result<(), CryptError> {
-        let mut state = self.crypt_state.lock();
         let rng = aws_lc_rs::rand::SystemRandom::new();
-        *state = Some(CryptState::generate(mode, &rng)?);
+        let (encryptor, decryptor) = CryptState::generate(mode, &rng)?.into_split();
+        // Install both halves under the inbound lock, so anyone reading the
+        // key and both nonces together (the CryptSetup sent to the client)
+        // sees one consistent state.
+        let mut state = self.crypt_state.lock();
+        *state = Some(decryptor);
+        self.crypt_encryptor.store(Some(Arc::new(encryptor)));
         Ok(())
     }
 

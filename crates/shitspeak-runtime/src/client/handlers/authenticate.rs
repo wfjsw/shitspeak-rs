@@ -368,12 +368,15 @@ pub async fn handle_authenticate(
             .into());
     }
     let crypt_setup_msg: Message = {
+        // The inbound lock pins the outbound half, so the key and both nonces
+        // come from the same crypt state.
         let crypt = sender.crypt_state();
         let state = crypt.as_ref().expect("crypt state just created");
+        let encryptor = sender.crypt_encryptor().expect("crypt state just created");
         shitspeak_messages::messages::encoder::CryptSetup::new(
             state.key().map(Bytes::copy_from_slice),
             Some(Bytes::copy_from_slice(state.decrypt_iv())),
-            Some(Bytes::copy_from_slice(state.encrypt_iv())),
+            Some(Bytes::copy_from_slice(&encryptor.encrypt_iv())),
         )
         .into()
     };

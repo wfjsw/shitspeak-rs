@@ -1600,7 +1600,7 @@ impl ChannelRepository {
             applied_operations,
             self.channels.read().clone(),
         );
-        self.write_strict_snapshot_candidate(&snapshot).await
+        self.write_strict_snapshot_candidate(snapshot).await
     }
 
     fn merge_strict_operation_ids_in_server_unpersisted(
@@ -3059,8 +3059,8 @@ impl ChannelRepository {
         }
     }
 
-    async fn write_snapshot_atomically(&self, snapshot: &Snapshot) -> Result<(), ChannelRepoError> {
-        let Some(dir) = self.storage_dir.as_ref() else {
+    async fn write_snapshot_atomically(&self, snapshot: Snapshot) -> Result<(), ChannelRepoError> {
+        let Some(dir) = self.storage_dir.clone() else {
             return Ok(());
         };
         #[cfg(test)]
@@ -3073,30 +3073,25 @@ impl ChannelRepository {
                 "forced channel snapshot write failure",
             )));
         }
-        let snapshot_path = dir.join("channels.snapshot.json");
-        let snapshot_tmp = dir.join("channels.snapshot.json.tmp");
-        let json = serde_json::to_vec(snapshot).map_err(|e| ChannelRepoError::WalCorrupt {
-            line: 0,
-            reason: format!("snapshot serialisation error: {e}"),
-        })?;
-
-        {
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&snapshot_tmp)
-                .await?;
-            file.write_all(&json).await?;
-            file.sync_data().await?;
-        }
-        #[cfg(windows)]
-        replace_file_atomically(&snapshot_tmp, &snapshot_path)?;
-        #[cfg(not(windows))]
-        tokio::fs::rename(&snapshot_tmp, &snapshot_path).await?;
-        if let Some(parent) = snapshot_path.parent() {
-            sync_parent_directory(parent)?;
-        }
+        // Serialising the whole tree and the fsyncs that make it durable run
+        // on the blocking pool: on a slow disk they would otherwise stall the
+        // runtime of whichever task committed the channel operation.
+        run_blocking(move || {
+            #[cfg(test)]
+            crate::test_blocking_io::pause(&dir);
+            let json = serde_json::to_vec(&snapshot).map_err(|e| ChannelRepoError::WalCorrupt {
+                line: 0,
+                reason: format!("snapshot serialisation error: {e}"),
+            })?;
+            write_file_durably(
+                &dir,
+                &dir.join("channels.snapshot.json.tmp"),
+                &dir.join("channels.snapshot.json"),
+                &json,
+            )?;
+            Ok(())
+        })
+        .await?;
         self.last_snapshot_at
             .store(chrono::Utc::now().timestamp(), Ordering::Release);
         Ok(())
@@ -3125,9 +3120,9 @@ impl ChannelRepository {
             strict_applied_ops,
             channels_by_server,
         );
-        self.write_snapshot_atomically(&snapshot).await?;
+        self.write_snapshot_atomically(snapshot).await?;
         if let Some(effective_acl_cache_snapshot) = effective_acl_cache_snapshot {
-            self.write_effective_acl_cache_atomically(&effective_acl_cache_snapshot)
+            self.write_effective_acl_cache_atomically(effective_acl_cache_snapshot)
                 .await?;
             self.effective_acl_cache_dirty
                 .store(false, Ordering::Release);
@@ -3182,10 +3177,15 @@ impl ChannelRepository {
                     tmp_file.sync_data().await?;
                 }
 
-                #[cfg(windows)]
-                replace_file_atomically(&wal_tmp, &wal_path)?;
-                #[cfg(not(windows))]
-                tokio::fs::rename(&wal_tmp, &wal_path).await?;
+                {
+                    let wal_tmp = wal_tmp.clone();
+                    let wal_path = wal_path.clone();
+                    run_blocking(move || {
+                        replace_file(&wal_tmp, &wal_path)?;
+                        Ok(())
+                    })
+                    .await?;
+                }
                 *wal = tokio::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -3200,35 +3200,25 @@ impl ChannelRepository {
 
     async fn write_effective_acl_cache_atomically(
         &self,
-        snapshot: &EffectiveAclCacheSnapshot,
+        snapshot: EffectiveAclCacheSnapshot,
     ) -> Result<(), ChannelRepoError> {
-        let Some(dir) = self.storage_dir.as_ref() else {
+        let Some(dir) = self.storage_dir.clone() else {
             return Ok(());
         };
-        let path = dir.join("channels.effective-acl-cache.json");
-        let tmp = dir.join("channels.effective-acl-cache.json.tmp");
-        let json = serde_json::to_vec(snapshot).map_err(|e| ChannelRepoError::WalCorrupt {
-            line: 0,
-            reason: format!("effective ACL cache serialisation error: {e}"),
-        })?;
-        {
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)
-                .await?;
-            file.write_all(&json).await?;
-            file.sync_data().await?;
-        }
-        #[cfg(windows)]
-        replace_file_atomically(&tmp, &path)?;
-        #[cfg(not(windows))]
-        tokio::fs::rename(&tmp, &path).await?;
-        if let Some(parent) = path.parent() {
-            sync_parent_directory(parent)?;
-        }
-        Ok(())
+        run_blocking(move || {
+            let json = serde_json::to_vec(&snapshot).map_err(|e| ChannelRepoError::WalCorrupt {
+                line: 0,
+                reason: format!("effective ACL cache serialisation error: {e}"),
+            })?;
+            write_file_durably(
+                &dir,
+                &dir.join("channels.effective-acl-cache.json.tmp"),
+                &dir.join("channels.effective-acl-cache.json"),
+                &json,
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     // ── S2S / replication stubs ───────────────────────────────────────────
@@ -3879,14 +3869,14 @@ impl ChannelRepository {
             applied_operations,
             channels_by_server,
         );
-        self.write_strict_snapshot_candidate(&snapshot).await
+        self.write_strict_snapshot_candidate(snapshot).await
     }
 
     /// Persist strict snapshot state before exposing it in memory. A failed
     /// write makes the durable operation-id ledger ambiguous until restart.
     async fn write_strict_snapshot_candidate(
         &self,
-        snapshot: &Snapshot,
+        snapshot: Snapshot,
     ) -> Result<(), ChannelRepoError> {
         let result = self.write_snapshot_atomically(snapshot).await;
         if result.is_err() {
@@ -4458,6 +4448,48 @@ fn replace_file_atomically(temporary_path: &Path, path: &Path) -> io::Result<()>
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+/// Run blocking snapshot I/O on the blocking pool.
+async fn run_blocking(
+    work: impl FnOnce() -> Result<(), ChannelRepoError> + Send + 'static,
+) -> Result<(), ChannelRepoError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|error| Err(ChannelRepoError::WalIo(io::Error::other(error))))
+}
+
+/// Write `bytes` to `temporary_path`, flush it to disk, move it over `path`,
+/// and make the directory entry durable.
+fn write_file_durably(
+    directory: &Path,
+    temporary_path: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> io::Result<()> {
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(temporary_path)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_data()?;
+    }
+    replace_file(temporary_path, path)?;
+    sync_parent_directory(directory)
+}
+
+/// Move `temporary_path` over `path`, durably where the platform needs it.
+fn replace_file(temporary_path: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        replace_file_atomically(temporary_path, path)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temporary_path, path)
     }
 }
 
@@ -5514,6 +5546,28 @@ mod tests {
             description_hash: None,
             parent_id: Some(Some(parent_id)),
         }
+    }
+
+    /// A snapshot serialises the whole tree and fsyncs it; on a slow disk
+    /// that stalls whichever runtime committed the channel operation.
+    #[tokio::test]
+    async fn snapshot_write_does_not_block_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = ChannelRepository::open(1, dir.path(), root_config(), tuning())
+            .await
+            .unwrap();
+        repo.create_channel_in_server(DEFAULT_SERVER_ID, Channel::new(1, "parent", 0, 0, Some(0)))
+            .await
+            .unwrap();
+        let _slow =
+            crate::test_blocking_io::slow_down(dir.path(), std::time::Duration::from_millis(300));
+        let (saved, ticks) = crate::test_blocking_io::ticks_during(repo.save_snapshot()).await;
+        saved.unwrap();
+        assert!(
+            ticks >= 8,
+            "snapshot write blocked the runtime: {ticks} ticks"
+        );
+        assert!(dir.path().join("channels.snapshot.json").exists());
     }
 
     #[tokio::test]

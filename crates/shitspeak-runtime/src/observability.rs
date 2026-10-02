@@ -839,11 +839,6 @@ const VOICE_METRIC_HEADERS: &[(&str, &str, &str)] = &[
         "counter",
     ),
     (
-        "shitspeak_voice_crypt_lock_contention_drops_total",
-        "Total outbound UDP recipient frames dropped because the recipient crypt lock was contended.",
-        "counter",
-    ),
-    (
         "shitspeak_voice_udp_send_events_total",
         "Total UDP batch send events by result.",
         "counter",

@@ -140,6 +140,9 @@ pub struct VoiceConfig {
     /// sender_epoch, from)` the receiver mirrors to solve parity blocks, and
     /// of parity blocks it retains. Raised automatically to two interleave
     /// spans (`2 × block_size × interleave_depth`) and two sliding windows.
+    /// 1 through 512, the largest interleave span the block code allows:
+    /// each inbound voice packet may solve over this many frames and
+    /// equations.
     pub voice_fec_receiver_window: usize,
 
     /// Members each sliding-window parity covers (0, or 2 through 16). Toward
@@ -309,6 +312,11 @@ impl<'de> Deserialize<'de> for VoiceConfig {
         if raw.voice_fec_interleave_depth < 1 || raw.voice_fec_interleave_depth > 8 {
             return Err(D::Error::custom(
                 "voice_fec_interleave_depth must be between 1 and 8",
+            ));
+        }
+        if raw.voice_fec_receiver_window < 1 || raw.voice_fec_receiver_window > 512 {
+            return Err(D::Error::custom(
+                "voice_fec_receiver_window must be between 1 and 512",
             ));
         }
         if raw.voice_fec_sliding_window == 1 || raw.voice_fec_sliding_window > 16 {
@@ -556,6 +564,9 @@ mod tests {
         assert_eq!(custom.voice_fec_parity_blocks, 16);
         assert_eq!(custom.voice_fec_interleave_depth, 8);
         assert_eq!(cfg.voice_fec_sliding_window, 4);
+        let widest: VoiceConfig =
+            serde_json::from_str(r#"{"voice_fec_receiver_window":512}"#).unwrap();
+        assert_eq!(widest.voice_fec_receiver_window, 512);
         for (raw, window) in [
             (r#"{"voice_fec_sliding_window":0}"#, 0),
             (r#"{"voice_fec_sliding_window":16}"#, 16),
@@ -568,6 +579,9 @@ mod tests {
             r#"{"voice_fec_parity_blocks":17}"#,
             r#"{"voice_fec_interleave_depth":0}"#,
             r#"{"voice_fec_interleave_depth":9}"#,
+            r#"{"voice_fec_receiver_window":0}"#,
+            r#"{"voice_fec_receiver_window":513}"#,
+            r#"{"voice_fec_receiver_window":100000}"#,
             r#"{"voice_fec_sliding_window":1}"#,
             r#"{"voice_fec_sliding_window":17}"#,
         ] {

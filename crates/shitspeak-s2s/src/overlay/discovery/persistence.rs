@@ -237,6 +237,8 @@ pub fn load(persistence_dir: &Path) -> Result<Vec<PersistedPeerRecord>, OverlayE
 /// Atomically write the peers file: serialize to a temp file then rename.
 pub fn save(persistence_dir: &Path, peers: &[PersistedPeerRecord]) -> Result<(), OverlayError> {
     let dir = persistence_dir.join(SUBDIR);
+    #[cfg(test)]
+    crate::test_blocking_io::pause(&dir);
     fs::create_dir_all(&dir).map_err(|source| OverlayError::Persistence {
         path: dir.clone(),
         source,
@@ -303,6 +305,23 @@ pub fn save(persistence_dir: &Path, peers: &[PersistedPeerRecord]) -> Result<(),
         source,
     })?;
     Ok(())
+}
+
+/// [`save`] on the blocking pool: it fsyncs the address book before
+/// renaming it into place.
+pub(crate) async fn save_off_runtime(
+    persistence_dir: PathBuf,
+    peers: Vec<PersistedPeerRecord>,
+) -> Result<(), OverlayError> {
+    let error_path = persistence_dir.join(SUBDIR).join(FILE_NAME);
+    tokio::task::spawn_blocking(move || save(&persistence_dir, &peers))
+        .await
+        .unwrap_or_else(|error| {
+            Err(OverlayError::Persistence {
+                path: error_path,
+                source: std::io::Error::other(error),
+            })
+        })
 }
 
 fn system_time_from_unix_ms(ms: u64) -> SystemTime {
@@ -628,5 +647,32 @@ mod tests {
         fs::write(path.join(FILE_NAME), bad).unwrap();
         let loaded = load(dir.path()).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    /// The debounced address-book write fsyncs a file; on a stalled disk it
+    /// would stall the overlay runtime that also drains peer traffic.
+    #[tokio::test]
+    async fn address_book_write_does_not_block_the_runtime() {
+        let dir = TempDir::new().unwrap();
+        let _slow = crate::test_blocking_io::slow_down(dir.path(), Duration::from_millis(300));
+        let peers = vec![PersistedPeerRecord::new(
+            7u16,
+            vec![PeerAddress::new(
+                "127.0.0.1:1234".parse().unwrap(),
+                TransportKind::Tcp,
+            )],
+            None,
+        )];
+        let (result, ticks) = crate::test_blocking_io::ticks_during(save_off_runtime(
+            dir.path().to_path_buf(),
+            peers,
+        ))
+        .await;
+        result.unwrap();
+        assert_eq!(load(dir.path()).unwrap().len(), 1);
+        assert!(
+            ticks >= 8,
+            "address book write blocked the runtime: {ticks} ticks"
+        );
     }
 }

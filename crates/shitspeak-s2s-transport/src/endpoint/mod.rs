@@ -79,6 +79,15 @@ pub(crate) async fn bind_tcp_listener(
     TcpListener::from_std(socket.into())
 }
 
+/// Kernel receive buffer requested for every S2S UDP socket. The kernel
+/// default (about 208 KiB on Linux) is charged per datagram, so it holds only
+/// about a hundred small voice datagrams — roughly a second of a busy node's
+/// inbound traffic. Any longer reader stall drops the whole excess as one
+/// burst, which listeners hear as a gap; a larger buffer turns the same stall
+/// into delay the reorder can still play. Linux caps the request at
+/// `net.core.rmem_max`.
+pub(crate) const UDP_RECEIVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
 pub(crate) async fn bind_udp_socket_with_ipv6_only(
     addr: SocketAddr,
     ipv6_only: bool,
@@ -89,9 +98,19 @@ pub(crate) async fn bind_udp_socket_with_ipv6_only(
         Some(socket2::Protocol::UDP),
     )?;
     set_socket_ipv6_only(&socket, addr, ipv6_only);
+    request_udp_receive_buffer(&socket, addr);
+    udp_batch::disable_udp_connection_reset_reports(&socket);
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     UdpSocket::from_std(socket.into())
+}
+
+/// Ask for [`UDP_RECEIVE_BUFFER_BYTES`]. A refusal is not fatal: the socket
+/// keeps the kernel default.
+fn request_udp_receive_buffer(socket: &socket2::Socket, addr: SocketAddr) {
+    if let Err(e) = socket.set_recv_buffer_size(UDP_RECEIVE_BUFFER_BYTES) {
+        debug!(%addr, error = %e, "unable to raise S2S UDP receive buffer");
+    }
 }
 
 fn set_socket_ipv6_only(socket: &socket2::Socket, addr: SocketAddr, ipv6_only: bool) {
@@ -117,7 +136,16 @@ pub(crate) async fn bind_ephemeral_udp_dial_socket(
     } else {
         SocketAddr::from(([0u16; 8], 0))
     };
-    UdpSocket::bind(bind_addr).await
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(bind_addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    request_udp_receive_buffer(&socket, bind_addr);
+    udp_batch::disable_udp_connection_reset_reports(&socket);
+    socket.set_nonblocking(true)?;
+    socket.bind(&bind_addr.into())?;
+    UdpSocket::from_std(socket.into())
 }
 
 /// Common shape for every wire transport. Implementations own their own
@@ -1488,6 +1516,47 @@ mod tests {
 
         install_live_stream_for(&peer, TransportKind::Tcp);
         assert!(address_dial_allowed(&peer, udp));
+    }
+
+    /// The receive buffer an S2S UDP socket should end up with: the request,
+    /// or the most the kernel allows (`net.core.rmem_max` on Linux, which the
+    /// kernel then doubles for its own accounting).
+    fn expected_udp_receive_buffer() -> usize {
+        std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .ok()
+            .and_then(|max| max.trim().parse::<usize>().ok())
+            .map_or(UDP_RECEIVE_BUFFER_BYTES, |max| {
+                UDP_RECEIVE_BUFFER_BYTES.min(max)
+            })
+    }
+
+    fn receive_buffer(socket: &UdpSocket) -> usize {
+        socket2::SockRef::from(socket)
+            .recv_buffer_size()
+            .expect("read SO_RCVBUF")
+    }
+
+    /// Both the shared S2S listener and the outbound dial sockets carry a
+    /// receive buffer large enough to ride out a reader stall. The kernel
+    /// default (about 208 KiB on Linux, 64 KiB on Windows) holds roughly a
+    /// hundred small datagrams — about a second of a busy node's inbound
+    /// voice — and dropped whole bursts on a node whose runtime stalled.
+    #[tokio::test]
+    async fn s2s_udp_sockets_request_a_large_receive_buffer() {
+        let expected = expected_udp_receive_buffer();
+        let listener = bind_udp_socket_with_ipv6_only(SocketAddr::from(([127, 0, 0, 1], 0)), false)
+            .await
+            .expect("bind listener");
+        let dial = bind_ephemeral_udp_dial_socket(SocketAddr::from(([127, 0, 0, 1], 9)))
+            .await
+            .expect("bind dial socket");
+        for (name, socket) in [("listener", &listener), ("dial", &dial)] {
+            let actual = receive_buffer(socket);
+            assert!(
+                actual >= expected,
+                "{name} receive buffer {actual} below {expected}"
+            );
+        }
     }
 
     /// A seed host name resolves off the runtime. A resolver that stalls

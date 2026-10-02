@@ -409,20 +409,7 @@ fn ipv6_prefix(address: std::net::Ipv6Addr, mask: u8) -> u128 {
 
 pub struct BanRepository {
     node_id: u16,
-    /// SQLite connection wrapped in a Mutex (rusqlite Connection is not Sync).
-    conn: Mutex<Connection>,
-    /// Authentication-time ban lookups. Updated only after the corresponding
-    /// SQLite mutation commits successfully.
-    lookup_index: RwLock<BanLookupIndex>,
-    version: AtomicU64,
-    history_freshness: AtomicI64,
-    /// Optional storage directory (for logging / future use).
-    #[allow(dead_code)]
-    storage_dir: Option<PathBuf>,
-    /// A failed strict SQLite transaction leaves its durable terminal state
-    /// uncertain. Keep v2 disabled until a fresh process reopens and verifies
-    /// the repository rather than treating the configured path as healthy.
-    strict_durability_poisoned: AtomicBool,
+    store: Arc<BanStore>,
     /// Broadcast channel for S2S subscribers.
     tx: broadcast::Sender<Arc<BanOperation>>,
 }
@@ -608,12 +595,14 @@ impl BanRepository {
 
         Self {
             node_id,
-            conn: Mutex::new(conn),
-            lookup_index: RwLock::new(lookup_index),
-            version: AtomicU64::new(max_version.max(snapshot_version)),
-            history_freshness: AtomicI64::new(snapshot_freshness),
-            storage_dir,
-            strict_durability_poisoned: AtomicBool::new(false),
+            store: Arc::new(BanStore {
+                conn: Mutex::new(conn),
+                lookup_index: RwLock::new(lookup_index),
+                version: AtomicU64::new(max_version.max(snapshot_version)),
+                history_freshness: AtomicI64::new(snapshot_freshness),
+                storage_dir,
+                strict_durability_poisoned: AtomicBool::new(false),
+            }),
             tx,
         }
     }
@@ -621,18 +610,18 @@ impl BanRepository {
     // ── Version ───────────────────────────────────────────────────────────
 
     pub fn current_version(&self) -> u64 {
-        self.version.load(Ordering::Acquire)
+        self.store.version.load(Ordering::Acquire)
     }
 
     pub fn latest_timestamp(&self) -> i64 {
-        let conn = self.conn.lock();
+        let conn = self.store.conn.lock();
         conn.query_row(
             "SELECT COALESCE(MAX(timestamp), 0) FROM ban_operations",
             [],
             |row| row.get(0),
         )
         .unwrap_or(0)
-        .max(self.history_freshness.load(Ordering::Acquire))
+        .max(self.store.history_freshness.load(Ordering::Acquire))
     }
 
     pub fn local_node_id(&self) -> u16 {
@@ -642,27 +631,26 @@ impl BanRepository {
     /// Whether the strict-operation ledger is backed by a persistent SQLite
     /// database and therefore survives a repository restart.
     pub fn durable_storage_enabled(&self) -> bool {
-        self.storage_dir.is_some() && !self.strict_durability_poisoned.load(Ordering::Acquire)
+        self.store.storage_dir.is_some()
+            && !self
+                .store
+                .strict_durability_poisoned
+                .load(Ordering::Acquire)
     }
 
     /// Whether this repository instance has observed a local strict-storage
     /// failure. Callers use this to distinguish a failed durable snapshot
     /// install from a semantically rejected peer snapshot.
     pub fn strict_durability_failure_observed(&self) -> bool {
-        self.strict_durability_poisoned.load(Ordering::Acquire)
-    }
-
-    fn mark_strict_durability_failed(&self) {
-        if self.storage_dir.is_some() {
-            self.strict_durability_poisoned
-                .store(true, Ordering::Release);
-        }
+        self.store
+            .strict_durability_poisoned
+            .load(Ordering::Acquire)
     }
 
     /// Return strict operation ids retained by the durable idempotency ledger.
     /// These ids are intended to accompany an S2S ban snapshot.
     pub fn strict_operation_ids(&self) -> Result<Vec<StrictOperationId>, io::Error> {
-        let conn = self.conn.lock();
+        let conn = self.store.conn.lock();
         let result = strict_operation_ids_from_connection(&conn);
         if result.is_err() {
             self.mark_strict_durability_failed();
@@ -678,7 +666,7 @@ impl BanRepository {
     /// like a duplicate before its mutation is represented by the snapshot.
     pub fn strict_snapshot(&self) -> Result<BanStrictSnapshot, io::Error> {
         let result = (|| {
-            let mut conn = self.conn.lock();
+            let mut conn = self.store.conn.lock();
             let tx = conn.transaction().map_err(sqlite_io_error)?;
             let version = durable_version_from_connection(&tx)?;
             let freshness = durable_freshness_from_connection(&tx)?;
@@ -706,7 +694,7 @@ impl BanRepository {
     /// receivers, but v5 applications no longer add entries to it.
     pub fn strict_snapshot_v5(&self) -> Result<BanStrictSnapshot, io::Error> {
         let result = (|| {
-            let mut conn = self.conn.lock();
+            let mut conn = self.store.conn.lock();
             let tx = conn.transaction().map_err(sqlite_io_error)?;
             let version = durable_version_from_connection(&tx)?;
             let freshness = durable_freshness_from_connection(&tx)?;
@@ -734,7 +722,7 @@ impl BanRepository {
         operation_ids: &[StrictOperationId],
     ) -> Result<(), io::Error> {
         let result = (|| {
-            let mut conn = self.conn.lock();
+            let mut conn = self.store.conn.lock();
             let tx = conn.transaction().map_err(sqlite_io_error)?;
             for operation_id in operation_ids {
                 tx.execute(
@@ -760,34 +748,7 @@ impl BanRepository {
 
     /// Return all non-expired ban entries.
     pub async fn get_active_bans(&self) -> Vec<BanEntry> {
-        let now = chrono::Utc::now().timestamp();
-        let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT address, mask, name, hash, ban_certificate, ban_ip, reason, start, duration
-                 FROM bans
-                 WHERE duration = 0 OR (start + duration) > ?1",
-            )
-            .expect("query should be valid");
-
-        let rows = stmt
-            .query_map(params![now], |row| {
-                let addr_str: String = row.get(0)?;
-                Ok(BanEntry {
-                    address: addr_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0])),
-                    mask: row.get(1)?,
-                    name: row.get(2)?,
-                    hash: row.get(3)?,
-                    ban_certificate: row.get::<_, i64>(4)? != 0,
-                    ban_ip: row.get::<_, i64>(5)? != 0,
-                    reason: row.get(6)?,
-                    start: row.get(7)?,
-                    duration: sql_u64_from_i64(row.get::<_, i64>(8)?),
-                })
-            })
-            .expect("query should succeed");
-
-        rows.filter_map(|r| r.ok()).collect()
+        self.on_store(|store| store.active_bans()).await
     }
 
     /// Check whether an IP address is banned.
@@ -800,7 +761,7 @@ impl BanRepository {
                 .map(IpAddr::V4)
                 .unwrap_or(IpAddr::V6(address)),
         };
-        self.lookup_index.read().is_ip_banned(addr, now)
+        self.store.lookup_index.read().is_ip_banned(addr, now)
     }
 
     /// Check certificate-hash and TLS JA4 ban criteria without scanning the
@@ -811,7 +772,7 @@ impl BanRepository {
         certificate_hash: Option<&str>,
         tls_ja4: Option<&str>,
     ) -> bool {
-        self.lookup_index.read().is_identity_banned(
+        self.store.lookup_index.read().is_identity_banned(
             certificate_hash,
             tls_ja4,
             chrono::Utc::now().timestamp(),
@@ -821,14 +782,16 @@ impl BanRepository {
     /// Whether an active certificate-ban hash represents an ASN criterion.
     /// Callers use this to avoid a GeoIP lookup unless one is required.
     pub fn has_active_asn_bans(&self) -> bool {
-        self.lookup_index
+        self.store
+            .lookup_index
             .read()
             .has_active_asn_bans(chrono::Utc::now().timestamp())
     }
 
     /// Check an ASN resolved by the runtime against ASN-style certificate bans.
     pub fn is_asn_banned(&self, asn: u32) -> bool {
-        self.lookup_index
+        self.store
+            .lookup_index
             .read()
             .is_asn_banned(asn, chrono::Utc::now().timestamp())
     }
@@ -858,6 +821,11 @@ impl BanRepository {
         self.tx.subscribe()
     }
 
+    pub async fn get_log_entries_since(&self, since_version: u64) -> Vec<BanLogEntry> {
+        self.on_store(move |store| store.log_entries_since(since_version))
+            .await
+    }
+
     /// Return all log entries with `version > since_version`.
     pub async fn get_log_since(&self, since_version: u64) -> Vec<Arc<BanOperation>> {
         self.get_log_entries_since(since_version)
@@ -867,7 +835,255 @@ impl BanRepository {
             .collect()
     }
 
-    pub async fn get_log_entries_since(&self, since_version: u64) -> Vec<BanLogEntry> {
+    /// Return strict-replication log entries after `since_version` when this
+    /// repository still has a complete history for that cursor.
+    ///
+    /// `None` means an installed snapshot established a newer history floor,
+    /// or durable log data cannot be read safely. Strict callers must request a
+    /// snapshot in that case instead of treating a partial operation list as a
+    /// complete history.
+    pub async fn strict_log_entries_since(&self, since_version: u64) -> Option<Vec<BanLogEntry>> {
+        self.on_store(move |store| store.strict_log_entries_since(since_version))
+            .await
+    }
+
+    /// Apply an operation that arrived from a remote node.
+    pub async fn apply_remote_operation(&self, op: Arc<BanOperation>) {
+        self.apply_remote_operation_with_metadata(op, None).await
+    }
+
+    pub async fn apply_remote_operation_with_metadata(
+        &self,
+        op: Arc<BanOperation>,
+        strict_metadata: Option<StrictReplicationMetadata>,
+    ) {
+        if let Some(strict_metadata) = strict_metadata {
+            if let Err(error) = self.apply_strict_operation_once(op, strict_metadata).await {
+                tracing::warn!(error = %error, "strict ban operation apply failed");
+            }
+            return;
+        }
+        self.on_store(move |store| store.apply_remote_operation(&op))
+            .await
+    }
+
+    /// Atomically apply a strict ban operation at most once. The op-id claim,
+    /// ban mutation, and operation-log append commit in one SQLite
+    /// transaction, so the result survives a repository restart.
+    pub async fn apply_strict_operation_once(
+        &self,
+        op: Arc<BanOperation>,
+        strict_metadata: StrictReplicationMetadata,
+    ) -> Result<StrictOperationApplyOutcome, io::Error> {
+        let result = self
+            .apply_strict_operation_inner(op, strict_metadata, true)
+            .await;
+        if result.is_err() {
+            self.mark_strict_durability_failed();
+        }
+        result
+    }
+
+    /// Apply a strict protocol v5 delivery with its WAL metadata.
+    ///
+    /// The S2S terminal journal owns idempotency in v5. This transaction still
+    /// persists the operation id and final timestamp with the WAL row for
+    /// history replay, but it neither claims nor grows `ban_strict_op_ids`.
+    pub async fn apply_strict_operation_v5(
+        &self,
+        op: Arc<BanOperation>,
+        strict_metadata: StrictReplicationMetadata,
+    ) -> Result<StrictOperationApplyOutcome, io::Error> {
+        let result = self
+            .apply_strict_operation_inner(op, strict_metadata, false)
+            .await;
+        if result.is_err() {
+            self.mark_strict_durability_failed();
+        }
+        result
+    }
+
+    async fn apply_strict_operation_inner(
+        &self,
+        op: Arc<BanOperation>,
+        strict_metadata: StrictReplicationMetadata,
+        claim_legacy_operation_id: bool,
+    ) -> Result<StrictOperationApplyOutcome, io::Error> {
+        self.on_store(move |store| {
+            store.apply_strict_operation(&op, strict_metadata, claim_legacy_operation_id)
+        })
+        .await
+    }
+
+    pub async fn install_s2s_snapshot(&self, version: u64, entries: Vec<BanEntry>, freshness: i64) {
+        if let Err(error) = self
+            .install_s2s_snapshot_with_strict_operation_ids(version, entries, freshness, Vec::new())
+            .await
+        {
+            tracing::warn!(error = %error, "ban snapshot install failed");
+        }
+    }
+
+    /// Install an S2S ban snapshot and atomically merge strict operation ids
+    /// represented by it into the durable SQLite ledger.
+    ///
+    /// A replacement must retain every local strict operation id. Otherwise a
+    /// merged ledger could suppress replay of an operation whose ban state was
+    /// erased by the replacement snapshot.
+    pub async fn install_s2s_snapshot_with_strict_operation_ids(
+        &self,
+        version: u64,
+        entries: Vec<BanEntry>,
+        freshness: i64,
+        strict_operation_ids: Vec<StrictOperationId>,
+    ) -> Result<(), io::Error> {
+        self.install_s2s_snapshot_inner(
+            version,
+            entries,
+            freshness,
+            Some(strict_operation_ids),
+            false,
+        )
+        .await
+    }
+
+    /// Install a strict protocol v5 snapshot without consulting or modifying
+    /// the legacy repository-owned applied-operation ledger.
+    pub async fn install_s2s_snapshot_v5(
+        &self,
+        version: u64,
+        entries: Vec<BanEntry>,
+        freshness: i64,
+    ) -> Result<(), io::Error> {
+        self.install_s2s_snapshot_inner(version, entries, freshness, None, false)
+            .await
+    }
+
+    /// Atomically replace the repository with an authenticated protocol-v8
+    /// recovery artifact. This is the sole snapshot path allowed to replace a
+    /// locally newer image: a durable recovery certificate has already
+    /// established the supplied image as authoritative.
+    pub async fn install_s2s_authoritative_recovery_snapshot_v8(
+        &self,
+        version: u64,
+        entries: Vec<BanEntry>,
+        freshness: i64,
+    ) -> Result<(), io::Error> {
+        self.install_s2s_snapshot_inner(version, entries, freshness, None, true)
+            .await
+    }
+
+    async fn install_s2s_snapshot_inner(
+        &self,
+        version: u64,
+        entries: Vec<BanEntry>,
+        freshness: i64,
+        strict_operation_ids: Option<Vec<StrictOperationId>>,
+        authoritative_recovery: bool,
+    ) -> Result<(), io::Error> {
+        self.on_store(move |store| {
+            store.install_snapshot(
+                version,
+                entries,
+                freshness,
+                strict_operation_ids,
+                authoritative_recovery,
+            )
+        })
+        .await
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────
+
+    /// Run SQLite work on the blocking pool. A panic inside it resumes on the
+    /// caller, as it would have when the work ran inline.
+    async fn on_store<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&BanStore) -> T + Send + 'static,
+    ) -> T {
+        let store = Arc::clone(&self.store);
+        match tokio::task::spawn_blocking(move || work(&store)).await {
+            Ok(output) => output,
+            Err(error) => std::panic::resume_unwind(error.into_panic()),
+        }
+    }
+
+    fn mark_strict_durability_failed(&self) {
+        self.store.mark_strict_durability_failed();
+    }
+
+    fn make_op(&self, op: BanOp) -> BanOperation {
+        BanOperation {
+            version: 0, // assigned by commit()
+            node_id: self.node_id,
+            timestamp: chrono::Utc::now().timestamp(),
+            op,
+        }
+    }
+
+    /// Commit an operation: assign version, insert into ban_operations, broadcast.
+    async fn commit(&self, op: BanOperation) -> Result<(), io::Error> {
+        let op = self.on_store(move |store| store.commit(op)).await?;
+        let _ = self.tx.send(op);
+        Ok(())
+    }
+}
+
+/// The state SQLite transactions read and write. It is shared with the
+/// blocking pool: a transaction, and the in-memory updates that must follow
+/// its commit in commit order, run there under the connection lock instead
+/// of blocking an async worker for the transaction and its fsync.
+struct BanStore {
+    /// SQLite connection wrapped in a Mutex (rusqlite Connection is not Sync).
+    conn: Mutex<Connection>,
+    /// Authentication-time ban lookups. Updated only after the corresponding
+    /// SQLite mutation commits successfully.
+    lookup_index: RwLock<BanLookupIndex>,
+    version: AtomicU64,
+    history_freshness: AtomicI64,
+    /// Storage directory of a persisted repository.
+    storage_dir: Option<PathBuf>,
+    /// A failed strict SQLite transaction leaves its durable terminal state
+    /// uncertain. Keep v2 disabled until a fresh process reopens and verifies
+    /// the repository rather than treating the configured path as healthy.
+    strict_durability_poisoned: AtomicBool,
+}
+
+impl BanStore {
+    fn active_bans(&self) -> Vec<BanEntry> {
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock();
+        #[cfg(test)]
+        self.pause_for_test();
+        let mut stmt = conn
+            .prepare(
+                "SELECT address, mask, name, hash, ban_certificate, ban_ip, reason, start, duration
+                 FROM bans
+                 WHERE duration = 0 OR (start + duration) > ?1",
+            )
+            .expect("query should be valid");
+
+        let rows = stmt
+            .query_map(params![now], |row| {
+                let addr_str: String = row.get(0)?;
+                Ok(BanEntry {
+                    address: addr_str.parse().unwrap_or(IpAddr::from([0, 0, 0, 0])),
+                    mask: row.get(1)?,
+                    name: row.get(2)?,
+                    hash: row.get(3)?,
+                    ban_certificate: row.get::<_, i64>(4)? != 0,
+                    ban_ip: row.get::<_, i64>(5)? != 0,
+                    reason: row.get(6)?,
+                    start: row.get(7)?,
+                    duration: sql_u64_from_i64(row.get::<_, i64>(8)?),
+                })
+            })
+            .expect("query should succeed");
+
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    fn log_entries_since(&self, since_version: u64) -> Vec<BanLogEntry> {
         let since_version = i64::try_from(since_version).unwrap_or(i64::MAX);
         let conn = self.conn.lock();
         let mut stmt = conn
@@ -942,14 +1158,7 @@ impl BanRepository {
             .collect()
     }
 
-    /// Return strict-replication log entries after `since_version` when this
-    /// repository still has a complete history for that cursor.
-    ///
-    /// `None` means an installed snapshot established a newer history floor,
-    /// or durable log data cannot be read safely. Strict callers must request a
-    /// snapshot in that case instead of treating a partial operation list as a
-    /// complete history.
-    pub async fn strict_log_entries_since(&self, since_version: u64) -> Option<Vec<BanLogEntry>> {
+    fn strict_log_entries_since(&self, since_version: u64) -> Option<Vec<BanLogEntry>> {
         let sql_since_version = i64::try_from(since_version).ok()?;
         let conn = self.conn.lock();
         let history_floor = match snapshot_version_from_connection(&conn) {
@@ -971,23 +1180,7 @@ impl BanRepository {
         }
     }
 
-    /// Apply an operation that arrived from a remote node.
-    pub async fn apply_remote_operation(&self, op: Arc<BanOperation>) {
-        self.apply_remote_operation_with_metadata(op, None).await
-    }
-
-    pub async fn apply_remote_operation_with_metadata(
-        &self,
-        op: Arc<BanOperation>,
-        strict_metadata: Option<StrictReplicationMetadata>,
-    ) {
-        if let Some(strict_metadata) = strict_metadata {
-            if let Err(error) = self.apply_strict_operation_once(op, strict_metadata).await {
-                tracing::warn!(error = %error, "strict ban operation apply failed");
-            }
-            return;
-        }
-
+    fn apply_remote_operation(&self, op: &BanOperation) {
         let Ok(sql_version) = sql_i64_from_u64(op.version) else {
             return;
         };
@@ -1043,45 +1236,9 @@ impl BanRepository {
         self.apply_lookup_index(&op.op);
     }
 
-    /// Atomically apply a strict ban operation at most once. The op-id claim,
-    /// ban mutation, and operation-log append commit in one SQLite
-    /// transaction, so the result survives a repository restart.
-    pub async fn apply_strict_operation_once(
+    fn apply_strict_operation(
         &self,
-        op: Arc<BanOperation>,
-        strict_metadata: StrictReplicationMetadata,
-    ) -> Result<StrictOperationApplyOutcome, io::Error> {
-        let result = self
-            .apply_strict_operation_inner(op, strict_metadata, true)
-            .await;
-        if result.is_err() {
-            self.mark_strict_durability_failed();
-        }
-        result
-    }
-
-    /// Apply a strict protocol v5 delivery with its WAL metadata.
-    ///
-    /// The S2S terminal journal owns idempotency in v5. This transaction still
-    /// persists the operation id and final timestamp with the WAL row for
-    /// history replay, but it neither claims nor grows `ban_strict_op_ids`.
-    pub async fn apply_strict_operation_v5(
-        &self,
-        op: Arc<BanOperation>,
-        strict_metadata: StrictReplicationMetadata,
-    ) -> Result<StrictOperationApplyOutcome, io::Error> {
-        let result = self
-            .apply_strict_operation_inner(op, strict_metadata, false)
-            .await;
-        if result.is_err() {
-            self.mark_strict_durability_failed();
-        }
-        result
-    }
-
-    async fn apply_strict_operation_inner(
-        &self,
-        op: Arc<BanOperation>,
+        op: &BanOperation,
         strict_metadata: StrictReplicationMetadata,
         claim_legacy_operation_id: bool,
     ) -> Result<StrictOperationApplyOutcome, io::Error> {
@@ -1145,65 +1302,7 @@ impl BanRepository {
         Ok(StrictOperationApplyOutcome::Applied)
     }
 
-    pub async fn install_s2s_snapshot(&self, version: u64, entries: Vec<BanEntry>, freshness: i64) {
-        if let Err(error) = self
-            .install_s2s_snapshot_with_strict_operation_ids(version, entries, freshness, Vec::new())
-            .await
-        {
-            tracing::warn!(error = %error, "ban snapshot install failed");
-        }
-    }
-
-    /// Install an S2S ban snapshot and atomically merge strict operation ids
-    /// represented by it into the durable SQLite ledger.
-    ///
-    /// A replacement must retain every local strict operation id. Otherwise a
-    /// merged ledger could suppress replay of an operation whose ban state was
-    /// erased by the replacement snapshot.
-    pub async fn install_s2s_snapshot_with_strict_operation_ids(
-        &self,
-        version: u64,
-        entries: Vec<BanEntry>,
-        freshness: i64,
-        strict_operation_ids: Vec<StrictOperationId>,
-    ) -> Result<(), io::Error> {
-        self.install_s2s_snapshot_inner(
-            version,
-            entries,
-            freshness,
-            Some(strict_operation_ids),
-            false,
-        )
-        .await
-    }
-
-    /// Install a strict protocol v5 snapshot without consulting or modifying
-    /// the legacy repository-owned applied-operation ledger.
-    pub async fn install_s2s_snapshot_v5(
-        &self,
-        version: u64,
-        entries: Vec<BanEntry>,
-        freshness: i64,
-    ) -> Result<(), io::Error> {
-        self.install_s2s_snapshot_inner(version, entries, freshness, None, false)
-            .await
-    }
-
-    /// Atomically replace the repository with an authenticated protocol-v8
-    /// recovery artifact. This is the sole snapshot path allowed to replace a
-    /// locally newer image: a durable recovery certificate has already
-    /// established the supplied image as authoritative.
-    pub async fn install_s2s_authoritative_recovery_snapshot_v8(
-        &self,
-        version: u64,
-        entries: Vec<BanEntry>,
-        freshness: i64,
-    ) -> Result<(), io::Error> {
-        self.install_s2s_snapshot_inner(version, entries, freshness, None, true)
-            .await
-    }
-
-    async fn install_s2s_snapshot_inner(
+    fn install_snapshot(
         &self,
         version: u64,
         entries: Vec<BanEntry>,
@@ -1312,38 +1411,18 @@ impl BanRepository {
         Ok(())
     }
 
-    // ── Internal helpers ──────────────────────────────────────────────────
-
-    fn apply_lookup_index(&self, op: &BanOp) {
-        self.lookup_index.write().apply_op(op);
-    }
-
-    fn make_op(&self, op: BanOp) -> BanOperation {
-        BanOperation {
-            version: 0, // assigned by commit()
-            node_id: self.node_id,
-            timestamp: chrono::Utc::now().timestamp(),
-            op,
-        }
-    }
-
-    /// Commit an operation: assign version, insert into ban_operations, broadcast.
-    /// Acquires the connection lock internally.
-    async fn commit(&self, op: BanOperation) -> Result<(), io::Error> {
+    /// Commit an operation: assign its version and append it to the log.
+    fn commit(&self, op: BanOperation) -> Result<Arc<BanOperation>, io::Error> {
         let result = {
             let mut conn = self.conn.lock();
+            #[cfg(test)]
+            self.pause_for_test();
             self.commit_locked(&mut conn, op)
         };
-        match result {
-            Ok(op) => {
-                let _ = self.tx.send(op);
-                Ok(())
-            }
-            Err(error) => {
-                self.mark_strict_durability_failed();
-                Err(error)
-            }
+        if result.is_err() {
+            self.mark_strict_durability_failed();
         }
+        result
     }
 
     /// Commit an operation synchronously. The caller must hold `conn` lock.
@@ -1410,6 +1489,24 @@ impl BanRepository {
             .fetch_max(op.timestamp, Ordering::AcqRel);
         self.apply_lookup_index(&op.op);
         Ok(op)
+    }
+
+    fn apply_lookup_index(&self, op: &BanOp) {
+        self.lookup_index.write().apply_op(op);
+    }
+
+    fn mark_strict_durability_failed(&self) {
+        if self.storage_dir.is_some() {
+            self.strict_durability_poisoned
+                .store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_for_test(&self) {
+        if let Some(storage_dir) = self.storage_dir.as_deref() {
+            crate::test_blocking_io::pause(storage_dir);
+        }
     }
 }
 
@@ -2034,6 +2131,7 @@ mod tests {
 
         let repo = BanRepository::open(8, temp.path()).await.unwrap();
         let has_entry_key = repo
+            .store
             .conn
             .lock()
             .prepare("PRAGMA table_info(bans)")
@@ -2248,7 +2346,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repo = BanRepository::open(1, temp.path()).await.unwrap();
         assert!(repo.durable_storage_enabled());
-        repo.conn
+        repo.store
+            .conn
             .lock()
             .execute_batch("PRAGMA query_only = ON;")
             .unwrap();
@@ -2279,7 +2378,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repo = BanRepository::open(1, temp.path()).await.unwrap();
         assert!(repo.durable_storage_enabled());
-        repo.conn
+        repo.store
+            .conn
             .lock()
             .execute_batch("PRAGMA query_only = ON;")
             .unwrap();
@@ -2568,7 +2668,7 @@ mod tests {
     fn strict_snapshot_rejects_a_malformed_operation_id_ledger() {
         let repo = BanRepository::new_in_memory(1);
         {
-            let conn = repo.conn.lock();
+            let conn = repo.store.conn.lock();
             conn.execute(
                 "INSERT INTO ban_strict_op_ids (op_id_hi, op_id_lo, ts_final)
                  VALUES (?1, ?2, ?3)",
@@ -2924,5 +3024,36 @@ mod tests {
             vec![test_ban("203.0.113.92", "certified")]
         );
         assert!(repo.strict_operation_ids().unwrap().is_empty());
+    }
+
+    /// Ban commits and reads are SQLite transactions with an fsync on
+    /// commit. Run on the caller's runtime they block it for the whole
+    /// transaction, and longer while replication holds the connection.
+    #[tokio::test]
+    async fn sqlite_work_does_not_block_the_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = BanRepository::open(1, temp.path()).await.unwrap();
+        let _slow =
+            crate::test_blocking_io::slow_down(temp.path(), std::time::Duration::from_millis(300));
+        let entry = BanEntry {
+            address: "198.51.100.0".parse().unwrap(),
+            mask: 24,
+            name: None,
+            hash: None,
+            ban_certificate: false,
+            ban_ip: true,
+            reason: None,
+            start: chrono::Utc::now().timestamp(),
+            duration: 0,
+        };
+
+        let (added, ticks) =
+            crate::test_blocking_io::ticks_during(repo.add_ban(entry.clone())).await;
+        added.unwrap();
+        assert!(ticks >= 8, "ban commit blocked the runtime: {ticks} ticks");
+
+        let (active, ticks) = crate::test_blocking_io::ticks_during(repo.get_active_bans()).await;
+        assert_eq!(active, vec![entry]);
+        assert!(ticks >= 8, "ban read blocked the runtime: {ticks} ticks");
     }
 }

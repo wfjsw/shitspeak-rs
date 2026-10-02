@@ -96,7 +96,7 @@ pub fn spawn_persister(
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    let _ = persist_now(&persistence_dir, &transport);
+                    let _ = persist_now(&persistence_dir, &transport).await;
                     return;
                 }
                 _ = lsdb.change_signal().notified() => {}
@@ -105,14 +105,16 @@ pub fn spawn_persister(
                 _ = shutdown.cancelled() => return,
                 _ = sleep(interval) => {}
             }
-            if let Err(e) = persist_now(&persistence_dir, &transport) {
+            if let Err(e) = persist_now(&persistence_dir, &transport).await {
                 warn!(error=%e, "overlay persistence write failed");
             }
         }
     });
 }
 
-fn persist_now(
+/// Snapshot the address book and write it. The write (including an fsync)
+/// runs off the runtime.
+async fn persist_now(
     persistence_dir: &std::path::Path,
     transport: &ConnectionManager,
 ) -> Result<(), super::error::OverlayError> {
@@ -121,7 +123,7 @@ fn persist_now(
         .into_iter()
         .map(peer_record_from_snapshot)
         .collect();
-    persistence::save(persistence_dir, &peers)
+    persistence::save_off_runtime(persistence_dir.to_path_buf(), peers).await
 }
 
 fn peer_record_from_snapshot(snapshot: PeerAddressSnapshot) -> persistence::PersistedPeerRecord {

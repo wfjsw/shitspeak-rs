@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use aws_lc_rs::rand::SecureRandom;
 use bytes::BytesMut;
 use chrono::{DateTime, Utc};
@@ -8,8 +11,36 @@ use crate::{CryptoMode, Ocb2, errors::CryptError};
 
 const DECRYPT_HISTORY_SIZE: usize = 0x100;
 
+/// A client's UDP crypto: an outbound [`CryptEncryptor`] and an inbound
+/// [`CryptDecryptor`] sharing one key schedule.
+///
+/// The halves touch disjoint state, so a server can [`split`](Self::into_split)
+/// them and let voice egress encrypt toward a client without contending with
+/// that client's UDP ingress, which decrypts and keeps packet statistics.
 pub struct CryptState {
-    encrypt_iv: [u8; Ocb2::NONCE_SIZE],
+    encryptor: CryptEncryptor,
+    decryptor: CryptDecryptor,
+}
+
+/// The outbound half: the key schedule and the packets sent so far.
+///
+/// Every operation takes `&self`. The nonce for each packet is reserved with
+/// one atomic add, and the AES-OCB work runs outside any lock, so concurrent
+/// senders never wait for each other and never reuse a nonce.
+pub struct CryptEncryptor {
+    mode: Arc<Ocb2>,
+    /// The nonce before the first packet, as a little-endian integer. Packet
+    /// `n` (1-based) is sent with `base_iv + n`: Mumble increments the nonce
+    /// byte 0 first, carrying into byte 1 and onward, which is exactly a
+    /// little-endian increment. The wire carries byte 0.
+    base_iv: u128,
+    /// Packets sent, i.e. nonces reserved.
+    sent: AtomicU64,
+}
+
+/// The inbound half: nonce tracking, replay history, and packet statistics.
+pub struct CryptDecryptor {
+    mode: Arc<Ocb2>,
     decrypt_iv: [u8; Ocb2::NONCE_SIZE],
 
     last_good_time: DateTime<Utc>,
@@ -25,7 +56,6 @@ pub struct CryptState {
     remote_resync: u32,
 
     decrypt_history: [u8; DECRYPT_HISTORY_SIZE],
-    mode: Ocb2,
 }
 
 impl CryptState {
@@ -44,23 +74,7 @@ impl CryptState {
         rng.fill(&mut encrypt_iv)?;
         rng.fill(&mut decrypt_iv)?;
 
-        let now = Utc::now();
-        Ok(CryptState {
-            encrypt_iv,
-            decrypt_iv,
-            last_good_time: now,
-            last_resync_request_time: now,
-            good: 0,
-            late: 0,
-            lost: 0,
-            resync: 0,
-            remote_good: 0,
-            remote_late: 0,
-            remote_lost: 0,
-            remote_resync: 0,
-            decrypt_history: [0u8; DECRYPT_HISTORY_SIZE],
-            mode,
-        })
+        Ok(Self::assemble(mode, encrypt_iv, decrypt_iv))
     }
 
     pub fn from_key(
@@ -83,32 +97,286 @@ impl CryptState {
             .try_into()
             .map_err(|_| CryptError::InvalidNonceSize)?;
 
-        let now = Utc::now();
-        Ok(CryptState {
-            encrypt_iv,
-            decrypt_iv,
-            last_good_time: now,
-            last_resync_request_time: now,
-            good: 0,
-            late: 0,
-            lost: 0,
-            resync: 0,
-            remote_good: 0,
-            remote_late: 0,
-            remote_lost: 0,
-            remote_resync: 0,
-            decrypt_history: [0u8; DECRYPT_HISTORY_SIZE],
-            mode,
-        })
+        Ok(Self::assemble(mode, encrypt_iv, decrypt_iv))
     }
 
+    fn assemble(
+        mode: Ocb2,
+        encrypt_iv: [u8; Ocb2::NONCE_SIZE],
+        decrypt_iv: [u8; Ocb2::NONCE_SIZE],
+    ) -> Self {
+        let mode = Arc::new(mode);
+        let now = Utc::now();
+        CryptState {
+            encryptor: CryptEncryptor {
+                mode: mode.clone(),
+                base_iv: u128::from_le_bytes(encrypt_iv),
+                sent: AtomicU64::new(0),
+            },
+            decryptor: CryptDecryptor {
+                mode,
+                decrypt_iv,
+                last_good_time: now,
+                last_resync_request_time: now,
+                good: 0,
+                late: 0,
+                lost: 0,
+                resync: 0,
+                remote_good: 0,
+                remote_late: 0,
+                remote_lost: 0,
+                remote_resync: 0,
+                decrypt_history: [0u8; DECRYPT_HISTORY_SIZE],
+            },
+        }
+    }
+
+    /// Separate the outbound and inbound halves so each can be guarded on
+    /// its own.
+    pub fn into_split(self) -> (CryptEncryptor, CryptDecryptor) {
+        (self.encryptor, self.decryptor)
+    }
+
+    pub fn encryptor(&self) -> &CryptEncryptor {
+        &self.encryptor
+    }
+
+    pub fn decryptor(&mut self) -> &mut CryptDecryptor {
+        &mut self.decryptor
+    }
+
+    pub fn overhead(&self) -> usize {
+        self.encryptor.overhead()
+    }
+
+    /// Return the encryption nonce (IV): the one the last packet used.
+    pub fn encrypt_iv(&self) -> [u8; Ocb2::NONCE_SIZE] {
+        self.encryptor.encrypt_iv()
+    }
+
+    /// Return the decryption nonce (IV).
+    pub fn decrypt_iv(&self) -> &[u8] {
+        self.decryptor.decrypt_iv()
+    }
+
+    /// Overwrite the decrypt IV (used for client-requested resync).
+    pub fn set_decrypt_iv(&mut self, iv: &[u8]) {
+        self.decryptor.set_decrypt_iv(iv);
+    }
+
+    /// Whether a nonce resync request is due: no good packet and no request
+    /// for at least `interval`. Does not record a request.
+    pub fn resync_request_due(&self, interval: std::time::Duration) -> bool {
+        self.decryptor.resync_request_due(interval)
+    }
+
+    /// Record that a nonce resync request was actually handed to the client's
+    /// transport. Call it only once the request is queued: a request that was
+    /// never sent must not hold off the next one.
+    pub fn record_resync_request(&mut self) {
+        self.decryptor.record_resync_request();
+    }
+
+    /// Return the key (if available from the crypto mode).
+    pub fn key(&self) -> Option<&[u8]> {
+        self.encryptor.key()
+    }
+
+    pub fn encrypt(&mut self, dest: &mut [u8], data: &[u8]) -> Result<(), CryptError> {
+        self.encryptor.encrypt(dest, data)
+    }
+
+    /// Precompute the plaintext-derived component of the OCB2 authentication
+    /// checksum, suitable for passing to `encrypt_with_precomputed_checksum`
+    /// across a fan-out broadcast that shares the same plaintext. See
+    /// `Ocb2::compute_plaintext_checksum` for layout details.
+    pub fn compute_plaintext_checksum(plaintext: &[u8]) -> [u8; 16] {
+        super::Ocb2::compute_plaintext_checksum(plaintext)
+    }
+
+    /// See [`CryptEncryptor::encrypt_with_precomputed_checksum`].
+    pub fn encrypt_with_precomputed_checksum(
+        &mut self,
+        dest: &mut [u8],
+        data: &[u8],
+        plaintext_checksum: &[u8; 16],
+    ) -> Result<(), CryptError> {
+        self.encryptor
+            .encrypt_with_precomputed_checksum(dest, data, plaintext_checksum)
+    }
+
+    /// See [`CryptEncryptor::encrypt_sequence_with_precomputed_checksums`].
+    pub fn encrypt_sequence_with_precomputed_checksums(
+        &mut self,
+        dests: &mut [&mut [u8]],
+        datas: &[&[u8]],
+        plaintext_checksums: &[[u8; 16]],
+    ) -> Result<(), CryptError> {
+        self.encryptor.encrypt_sequence_with_precomputed_checksums(
+            dests,
+            datas,
+            plaintext_checksums,
+        )
+    }
+
+    pub fn decrypt(&mut self, dest: &mut BytesMut, data: &[u8]) -> Result<(), CryptError> {
+        self.decryptor.decrypt(dest, data)
+    }
+
+    pub fn decrypt_into(&mut self, dest: &mut [u8], data: &[u8]) -> Result<usize, CryptError> {
+        self.decryptor.decrypt_into(dest, data)
+    }
+
+    pub fn update_from_ping_message(&mut self, ping_message: &Ping) {
+        self.decryptor.update_from_ping_message(ping_message);
+    }
+
+    pub fn local_packet_stats(&self) -> (u32, u32, u32, u32) {
+        self.decryptor.local_packet_stats()
+    }
+
+    pub fn remote_packet_stats(&self) -> (u32, u32, u32, u32) {
+        self.decryptor.remote_packet_stats()
+    }
+
+    pub fn create_ping_response(&self, ping_message: &Ping) -> Ping {
+        self.decryptor.create_ping_response(ping_message)
+    }
+}
+
+impl CryptEncryptor {
     pub fn overhead(&self) -> usize {
         1 + self.mode.overhead()
     }
 
-    /// Return the encryption nonce (IV).
-    pub fn encrypt_iv(&self) -> &[u8] {
-        &self.encrypt_iv
+    /// Return the key (if available from the crypto mode).
+    pub fn key(&self) -> Option<&[u8]> {
+        self.mode.key()
+    }
+
+    /// Return the encryption nonce (IV): the one the last packet used, or the
+    /// initial nonce before any packet was sent. A concurrent sender may
+    /// advance it right after; a receiver resynchronised to an older value
+    /// still accepts the later packets as a forward jump.
+    pub fn encrypt_iv(&self) -> [u8; Ocb2::NONCE_SIZE] {
+        self.nonce(self.sent.load(Ordering::Relaxed))
+    }
+
+    /// The nonce of packet `sent` (1-based; 0 is the initial nonce).
+    fn nonce(&self, sent: u64) -> [u8; Ocb2::NONCE_SIZE] {
+        self.base_iv.wrapping_add(u128::from(sent)).to_le_bytes()
+    }
+
+    /// Reserve `count` consecutive nonces and return the index of the first.
+    fn reserve(&self, count: u64) -> u64 {
+        self.sent.fetch_add(count, Ordering::Relaxed) + 1
+    }
+
+    pub fn encrypt(&self, dest: &mut [u8], data: &[u8]) -> Result<(), CryptError> {
+        // A nonce is consumed even when the destination is too small, as the
+        // reference increments before checking.
+        let nonce = self.nonce(self.reserve(1));
+
+        if dest.len() < data.len() + self.overhead() {
+            return Err(CryptError::DestinationBufferTooSmall);
+        }
+
+        // Wire layout: `[iv_byte (1), tag (3), ciphertext (N)]`. We hand the
+        // OCB2 layer `&mut dest[1..]` so it places its tag at `dest[1..4]` and
+        // its ciphertext at `dest[4..4+N]`, then we write the IV byte at
+        // position 0. The decrypt path mirrors this by passing `&data[1..]`
+        // to `mode.decrypt`, which reads the tag from positions 0..3 of that
+        // slice (= wire positions 1..4).
+        self.mode.encrypt(&mut dest[1..], data, &nonce)?;
+        dest[0] = nonce[0];
+
+        Ok(())
+    }
+
+    /// Variant of `encrypt` that takes a precomputed plaintext checksum.
+    /// Output is byte-identical to `encrypt`. Skips the per-block plaintext
+    /// XOR-fold inside the underlying mode (saves ~13% on a 256-recipient
+    /// fan-out at 175 B plaintext). Identical IV management, identical
+    /// destination layout — same correctness boundary.
+    pub fn encrypt_with_precomputed_checksum(
+        &self,
+        dest: &mut [u8],
+        data: &[u8],
+        plaintext_checksum: &[u8; 16],
+    ) -> Result<(), CryptError> {
+        let nonce = self.nonce(self.reserve(1));
+
+        if dest.len() < data.len() + self.overhead() {
+            return Err(CryptError::DestinationBufferTooSmall);
+        }
+
+        self.mode.encrypt_with_plaintext_checksum(
+            &mut dest[1..],
+            data,
+            &nonce,
+            plaintext_checksum,
+        )?;
+        dest[0] = nonce[0];
+
+        Ok(())
+    }
+
+    /// Encrypt a short ordered run of packets for the same recipient.
+    ///
+    /// This is intended for micro-batch experiments: the caller supplies each
+    /// packet's destination, plaintext, and precomputed plaintext checksum,
+    /// and this method advances the recipient IV exactly once per packet before
+    /// handing the sequence to the crypto mode. Packet order is preserved.
+    pub fn encrypt_sequence_with_precomputed_checksums(
+        &self,
+        dests: &mut [&mut [u8]],
+        datas: &[&[u8]],
+        plaintext_checksums: &[[u8; 16]],
+    ) -> Result<(), CryptError> {
+        if dests.len() != datas.len() || datas.len() != plaintext_checksums.len() {
+            return Err(CryptError::DestinationBufferTooSmall);
+        }
+        let mode_overhead = self.mode.overhead();
+        let wire_overhead = self.overhead();
+        if dests
+            .iter()
+            .zip(datas.iter())
+            .any(|(dest, data)| dest.len() < data.len() + wire_overhead)
+        {
+            return Err(CryptError::DestinationBufferTooSmall);
+        }
+        let first = self.reserve(datas.len() as u64);
+        let mut nonces = Vec::with_capacity(datas.len());
+
+        for (index, dest) in dests.iter_mut().enumerate() {
+            let nonce = self.nonce(first + index as u64);
+            dest[0] = nonce[0];
+            nonces.push(nonce);
+        }
+
+        let mut mode_dests = dests
+            .iter_mut()
+            .zip(datas.iter())
+            .map(|(dest, data)| &mut dest[1..data.len() + 1 + mode_overhead])
+            .collect::<Vec<_>>();
+
+        self.mode.encrypt_sequence_with_plaintext_checksums(
+            &mut mode_dests,
+            datas,
+            &nonces,
+            plaintext_checksums,
+        )
+    }
+}
+
+impl CryptDecryptor {
+    pub fn overhead(&self) -> usize {
+        1 + self.mode.overhead()
+    }
+
+    /// Return the key (if available from the crypto mode).
+    pub fn key(&self) -> Option<&[u8]> {
+        self.mode.key()
     }
 
     /// Return the decryption nonce (IV).
@@ -125,142 +393,22 @@ impl CryptState {
         self.resync = self.resync.wrapping_add(1);
     }
 
-    pub fn should_request_resync(&mut self, interval: std::time::Duration) -> bool {
+    /// Whether a nonce resync request is due: no good packet and no request
+    /// for at least `interval`. Does not record a request.
+    pub fn resync_request_due(&self, interval: std::time::Duration) -> bool {
         let now = Utc::now();
         let since_last_good = (now - self.last_good_time).to_std().unwrap_or_default();
         let since_last_request = (now - self.last_resync_request_time)
             .to_std()
             .unwrap_or_default();
-        if since_last_good < interval || since_last_request < interval {
-            return false;
-        }
-        self.last_resync_request_time = now;
-        true
+        since_last_good >= interval && since_last_request >= interval
     }
 
-    /// Return the key (if available from the crypto mode).
-    pub fn key(&self) -> Option<&[u8]> {
-        self.mode.key()
-    }
-
-    pub fn encrypt(&mut self, dest: &mut [u8], data: &[u8]) -> Result<(), CryptError> {
-        // Increment the IV left-to-right (byte 0 first, carry to byte 1, ...).
-        // This matches the Mumble C++ reference (`for i=0..15: if ++iv[i] break`)
-        // and — crucially — matches the wire format which puts `encrypt_iv[0]`
-        // in `dest[0]`. With a right-to-left increment, `dest[0]` would never
-        // change between packets and the receiver would reject every packet
-        // after the first as a duplicate IV.
-        for byte in self.encrypt_iv.iter_mut() {
-            *byte = byte.wrapping_add(1);
-            if *byte != 0 {
-                break;
-            }
-        }
-
-        if dest.len() < data.len() + self.overhead() {
-            return Err(CryptError::DestinationBufferTooSmall);
-        }
-
-        // Wire layout: `[iv_byte (1), tag (3), ciphertext (N)]`. We hand the
-        // OCB2 layer `&mut dest[1..]` so it places its tag at `dest[1..4]` and
-        // its ciphertext at `dest[4..4+N]`, then we write the IV byte at
-        // position 0. The decrypt path mirrors this by passing `&data[1..]`
-        // to `mode.decrypt`, which reads the tag from positions 0..3 of that
-        // slice (= wire positions 1..4).
-        self.mode.encrypt(&mut dest[1..], data, &self.encrypt_iv)?;
-        dest[0] = self.encrypt_iv[0];
-
-        Ok(())
-    }
-
-    /// Precompute the plaintext-derived component of the OCB2 authentication
-    /// checksum, suitable for passing to `encrypt_with_precomputed_checksum`
-    /// across a fan-out broadcast that shares the same plaintext. See
-    /// `Ocb2::compute_plaintext_checksum` for layout details.
-    pub fn compute_plaintext_checksum(plaintext: &[u8]) -> [u8; 16] {
-        super::Ocb2::compute_plaintext_checksum(plaintext)
-    }
-
-    /// Variant of `encrypt` that takes a precomputed plaintext checksum.
-    /// Output is byte-identical to `encrypt`. Skips the per-block plaintext
-    /// XOR-fold inside the underlying mode (saves ~13% on a 256-recipient
-    /// fan-out at 175 B plaintext). Identical IV management, identical
-    /// destination layout — same correctness boundary.
-    pub fn encrypt_with_precomputed_checksum(
-        &mut self,
-        dest: &mut [u8],
-        data: &[u8],
-        plaintext_checksum: &[u8; 16],
-    ) -> Result<(), CryptError> {
-        for byte in self.encrypt_iv.iter_mut() {
-            *byte = byte.wrapping_add(1);
-            if *byte != 0 {
-                break;
-            }
-        }
-
-        if dest.len() < data.len() + self.overhead() {
-            return Err(CryptError::DestinationBufferTooSmall);
-        }
-
-        self.mode.encrypt_with_plaintext_checksum(
-            &mut dest[1..],
-            data,
-            &self.encrypt_iv,
-            plaintext_checksum,
-        )?;
-        dest[0] = self.encrypt_iv[0];
-
-        Ok(())
-    }
-
-    /// Encrypt a short ordered run of packets for the same recipient.
-    ///
-    /// This is intended for micro-batch experiments: the caller supplies each
-    /// packet's destination, plaintext, and precomputed plaintext checksum,
-    /// and this method advances the recipient IV exactly once per packet before
-    /// handing the sequence to the crypto mode. Packet order is preserved.
-    pub fn encrypt_sequence_with_precomputed_checksums(
-        &mut self,
-        dests: &mut [&mut [u8]],
-        datas: &[&[u8]],
-        plaintext_checksums: &[[u8; 16]],
-    ) -> Result<(), CryptError> {
-        if dests.len() != datas.len() || datas.len() != plaintext_checksums.len() {
-            return Err(CryptError::DestinationBufferTooSmall);
-        }
-        let mode_overhead = self.mode.overhead();
-        let wire_overhead = self.overhead();
-        let mut nonces = Vec::with_capacity(datas.len());
-
-        for (dest, data) in dests.iter_mut().zip(datas.iter()) {
-            for byte in self.encrypt_iv.iter_mut() {
-                *byte = byte.wrapping_add(1);
-                if *byte != 0 {
-                    break;
-                }
-            }
-
-            if dest.len() < data.len() + wire_overhead {
-                return Err(CryptError::DestinationBufferTooSmall);
-            }
-            dest[0] = self.encrypt_iv[0];
-
-            nonces.push(self.encrypt_iv);
-        }
-
-        let mut mode_dests = dests
-            .iter_mut()
-            .zip(datas.iter())
-            .map(|(dest, data)| &mut dest[1..data.len() + 1 + mode_overhead])
-            .collect::<Vec<_>>();
-
-        self.mode.encrypt_sequence_with_plaintext_checksums(
-            &mut mode_dests,
-            datas,
-            &nonces,
-            plaintext_checksums,
-        )
+    /// Record that a nonce resync request was actually handed to the client's
+    /// transport. Call it only once the request is queued: a request that was
+    /// never sent must not hold off the next one.
+    pub fn record_resync_request(&mut self) {
+        self.last_resync_request_time = Utc::now();
     }
 
     pub fn decrypt(&mut self, dest: &mut BytesMut, data: &[u8]) -> Result<(), CryptError> {
@@ -497,5 +645,130 @@ mod tests {
                 .unwrap();
             assert_eq!(&decrypted[..len], plain.as_slice());
         }
+    }
+
+    /// The Mumble reference nonce step: increment byte 0, carrying into
+    /// byte 1 and onward.
+    fn reference_increment(iv: &mut [u8; 16]) {
+        for byte in iv.iter_mut() {
+            *byte = byte.wrapping_add(1);
+            if *byte != 0 {
+                break;
+            }
+        }
+    }
+
+    /// The reference wire packet: increment, OCB2-encrypt with the full
+    /// nonce, prefix nonce byte 0.
+    fn reference_packet(mode: &Ocb2, iv: &mut [u8; 16], data: &[u8]) -> Vec<u8> {
+        reference_increment(iv);
+        let mut out = vec![0u8; data.len() + 1 + mode.overhead()];
+        mode.encrypt(&mut out[1..], data, iv).unwrap();
+        out[0] = iv[0];
+        out
+    }
+
+    #[test]
+    fn encryptor_is_byte_identical_to_the_reference_across_nonce_carries() {
+        let mut low_wrap = [0u8; 16];
+        low_wrap[..8].copy_from_slice(&[0xFF; 8]);
+        low_wrap[0] = 0xF0;
+        let starts: [[u8; 16]; 4] = [
+            IV_E,
+            // Carries out of byte 0 into byte 1 and byte 2.
+            [0xF8, 0xFF, 0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            // Carries across the 64-bit boundary between byte 7 and byte 8.
+            low_wrap,
+            // Wraps the whole 128-bit nonce.
+            [
+                0xF0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                0xFF, 0xFF,
+            ],
+        ];
+        let reference_mode = Ocb2::from_key(KEY).unwrap();
+        for start in starts {
+            let state = CryptState::from_key("OCB2-AES128", &KEY, &start, &IV_D).unwrap();
+            let (encryptor, _) = state.into_split();
+            let mut iv = start;
+            for packet in 0..40u8 {
+                let data = vec![packet; 1 + packet as usize * 3];
+                let expected = reference_packet(&reference_mode, &mut iv, &data);
+                let mut actual = vec![0u8; data.len() + encryptor.overhead()];
+                if packet % 2 == 0 {
+                    encryptor.encrypt(&mut actual, &data).unwrap();
+                } else {
+                    let checksum = CryptState::compute_plaintext_checksum(&data);
+                    encryptor
+                        .encrypt_with_precomputed_checksum(&mut actual, &data, &checksum)
+                        .unwrap();
+                }
+                assert_eq!(actual, expected, "start {start:02x?}, packet {packet}");
+                assert_eq!(
+                    encryptor.encrypt_iv(),
+                    iv,
+                    "start {start:02x?}, packet {packet}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_halves_round_trip_and_report_the_last_used_nonce() {
+        let (encryptor, _) = sender().into_split();
+        assert_eq!(encryptor.encrypt_iv(), IV_E, "no packet sent yet");
+        let (_, mut decryptor) = receiver().into_split();
+        for len in [0usize, 1, 16, 33, 170] {
+            let data = vec![0x5Au8; len];
+            let mut wire = vec![0u8; len + encryptor.overhead()];
+            encryptor.encrypt(&mut wire, &data).unwrap();
+            let mut plain = BytesMut::new();
+            decryptor.decrypt(&mut plain, &wire).unwrap();
+            assert_eq!(plain.as_ref(), data.as_slice());
+        }
+        let mut expected = IV_E;
+        for _ in 0..5 {
+            reference_increment(&mut expected);
+        }
+        assert_eq!(encryptor.encrypt_iv(), expected);
+        assert_eq!(decryptor.local_packet_stats().0, 5);
+    }
+
+    /// Concurrent senders each reserve their own nonce: none is used twice
+    /// and none is skipped.
+    #[test]
+    fn concurrent_encrypts_use_every_nonce_exactly_once() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 500;
+        let (encryptor, _) = sender().into_split();
+        let mut nonce_bytes = std::thread::scope(|scope| {
+            let workers = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..PER_THREAD)
+                            .map(|_| {
+                                let mut wire = vec![0u8; 8 + encryptor.overhead()];
+                                encryptor.encrypt(&mut wire, &[7u8; 8]).unwrap();
+                                wire
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(nonce_bytes.len(), THREADS * PER_THREAD);
+        let reference_mode = Ocb2::from_key(KEY).unwrap();
+        let mut iv = IV_E;
+        let mut expected = Vec::with_capacity(THREADS * PER_THREAD);
+        for _ in 0..THREADS * PER_THREAD {
+            expected.push(reference_packet(&reference_mode, &mut iv, &[7u8; 8]));
+        }
+        nonce_bytes.sort();
+        expected.sort();
+        assert_eq!(nonce_bytes, expected, "a nonce was reused or skipped");
+        assert_eq!(encryptor.encrypt_iv(), iv);
     }
 }

@@ -294,12 +294,18 @@ impl TreeEdgeStickinessPolicy {
     }
 }
 
+/// A tree edge's route binding, keyed by the group but not its version. The
+/// version hashes the recipient set, which changes whenever any node gains or
+/// loses a listener; an edge still in the tree keeps its binding across that
+/// (edges that left the tree are pruned with it). Re-keying by version made
+/// every recipient change re-pick every edge's route from scratch mid-stream,
+/// bypassing the challenger confirm and the mid-spurt deferral, so the
+/// receiver released past frames still in flight on the old route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TreeEdgeBindingKey {
     source: NodeIdentifier,
     profile: u32,
     group: u64,
-    group_version: u64,
     parent: NodeIdentifier,
     child: NodeIdentifier,
 }
@@ -310,7 +316,6 @@ impl TreeEdgeBindingKey {
             source: key.source,
             profile: key.profile,
             group: key.group,
-            group_version: key.group_version,
             parent,
             child,
         }
@@ -753,7 +758,6 @@ impl TreeEdgeAttempt {
                 source: 0,
                 profile: 0,
                 group: 0,
-                group_version: 0,
                 parent: 0,
                 child: 0,
             },
@@ -953,46 +957,38 @@ fn record_no_tree_edge_alternate(key: TreeEdgeBindingKey, binding: &mut TreeEdge
 
 fn prune_tree_edge_bindings(
     bindings: &mut HashMap<TreeEdgeBindingKey, TreeEdgeBinding>,
-    current: TreeEdgeBindingKey,
     idle_reset: Duration,
     now: Instant,
 ) {
     let mut removed = Vec::new();
     bindings.retain(|key, binding| {
-        let superseded_group = key.source == current.source
-            && key.profile == current.profile
-            && key.group == current.group
-            && key.group_version != current.group_version;
         let idle = now.saturating_duration_since(binding.last_used_at) >= idle_reset;
-        let keep = !superseded_group && !idle;
-        if !keep && binding.bound {
-            removed.push((*key, binding.path, idle));
+        if idle && binding.bound {
+            removed.push((*key, binding.path));
         }
-        keep
+        !idle
     });
-    for (key, path, idle) in removed {
+    for (key, path) in removed {
         distribution_metrics::update_tree_edge_binding(
             key.parent,
             key.child,
             Some(path.mode_label()),
             None,
         );
-        if idle {
-            distribution_metrics::record_tree_edge_binding_event(
-                key.parent,
-                key.child,
-                path.mode_label(),
-                "none",
-                "idle_reset",
-            );
-            debug!(
-                source = %key.parent,
-                peer = %key.child,
-                from_mode = path.mode_label(),
-                reason = "idle_reset",
-                "voice tree edge binding reset after idle"
-            );
-        }
+        distribution_metrics::record_tree_edge_binding_event(
+            key.parent,
+            key.child,
+            path.mode_label(),
+            "none",
+            "idle_reset",
+        );
+        debug!(
+            source = %key.parent,
+            peer = %key.child,
+            from_mode = path.mode_label(),
+            reason = "idle_reset",
+            "voice tree edge binding reset after idle"
+        );
     }
 }
 
@@ -1834,7 +1830,7 @@ impl DistributionPlane {
         });
 
         let mut bindings = self.tree_edge_bindings.lock();
-        prune_tree_edge_bindings(&mut bindings, key, policy.idle_reset, now);
+        prune_tree_edge_bindings(&mut bindings, policy.idle_reset, now);
         let binding = bindings.entry(key).or_insert(TreeEdgeBinding {
             path: TreeEdgePath::DirectChild,
             entered_at: now,
@@ -2626,25 +2622,9 @@ impl DistributionPlane {
                 || key.group != current.group
                 || key.group_version == current.group_version
         });
-        let mut removed_bindings = Vec::new();
-        self.tree_edge_bindings.lock().retain(|key, binding| {
-            let stale = key.source == current.source
-                && key.profile == current.profile
-                && key.group == current.group
-                && key.group_version != current.group_version;
-            if stale && binding.bound {
-                removed_bindings.push((*key, binding.path));
-            }
-            !stale
-        });
-        for (key, path) in removed_bindings {
-            distribution_metrics::update_tree_edge_binding(
-                key.parent,
-                key.child,
-                Some(path.mode_label()),
-                None,
-            );
-        }
+        // Tree edge bindings deliberately survive a new group version: see
+        // `TreeEdgeBindingKey`. Edges that left the tree are pruned when the
+        // new tree is installed.
         let now = Instant::now();
         self.failure_reported_at.lock().retain(|_, reported_at| {
             now.saturating_duration_since(*reported_at) < EDGE_FAILURE_REPORT_DEDUP
@@ -2659,8 +2639,7 @@ impl DistributionPlane {
             .retain(|binding_key, binding| {
                 let in_scope = binding_key.source == key.source
                     && binding_key.profile == key.profile
-                    && binding_key.group == key.group
-                    && binding_key.group_version == key.group_version;
+                    && binding_key.group == key.group;
                 let keep = !in_scope || edges.contains(&(binding_key.parent, binding_key.child));
                 if !keep && binding.bound {
                     removed.push((*binding_key, binding.path));
@@ -3535,6 +3514,54 @@ mod tests {
             0.1,
             0.3,
         )
+    }
+
+    /// A group's version is a hash of its recipient set, so it changes
+    /// whenever any node gains or loses a listener. An edge whose child is
+    /// still in the tree must keep its binding across that change: a fresh
+    /// `initial` pick moves the edge mid-stream, bypassing the challenger
+    /// confirm and the mid-spurt deferral, and the receiver releases past the
+    /// frames still in flight on the old route.
+    #[test]
+    fn a_recipient_set_change_keeps_the_binding_of_a_surviving_edge() {
+        let plane = DistributionPlane::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut before = key(95, 1);
+        before.group_version = 1;
+        plane.prepare_routing_generation(before, 1);
+        let initial = plane.choose_tree_edge(
+            before,
+            1,
+            2,
+            vec![TreeEdgeCandidate::legacy(4097, 1, 3)],
+            sticky_policy(),
+            start,
+        );
+        let _ = plane.complete_tree_edge_attempt(initial, true, start);
+        assert_eq!(
+            plane.current_tree_edge_path(before, 1, 2),
+            Some(TreeEdgePath::LegacyVia(4097))
+        );
+
+        // Another node gains a listener: same group, new recipient-set
+        // version. A cheaper direct route is now on offer.
+        let mut after = before;
+        after.group_version = 2;
+        plane.prepare_routing_generation(after, 1);
+        let next = plane.choose_tree_edge(
+            after,
+            1,
+            2,
+            vec![
+                TreeEdgeCandidate::direct_with_cost(1, 2),
+                TreeEdgeCandidate::legacy(4097, 1, 3),
+            ],
+            sticky_policy(),
+            at(100),
+        );
+        assert_eq!(next.reason, "incumbent");
+        assert_eq!(next.path(), TreeEdgePath::LegacyVia(4097));
     }
 
     #[test]

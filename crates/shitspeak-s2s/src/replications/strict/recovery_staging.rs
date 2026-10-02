@@ -226,6 +226,8 @@ pub(crate) fn write_recovery_staging_artifact(
     }
 
     let parent = artifact_parent(path)?;
+    #[cfg(test)]
+    crate::test_blocking_io::pause(path);
     fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
     let write_result = (|| {
         let mut file = OpenOptions::new()
@@ -253,6 +255,8 @@ pub(crate) fn verify_recovery_staging_artifact(
     path: &Path,
     expected: RecoveryStagingManifest,
 ) -> Result<VerifiedRecoveryStagingArtifact, RecoveryStagingError> {
+    #[cfg(test)]
+    crate::test_blocking_io::pause(path);
     let mut file = File::open(path).map_err(|source| io_error(path, source))?;
     let file_len = file
         .metadata()
@@ -331,6 +335,8 @@ pub(crate) fn verify_recovery_staging_artifact(
 ///
 /// Cleanup is idempotent: a missing file is already removed.
 pub(crate) fn delete_recovery_staging_artifact(path: &Path) -> Result<(), RecoveryStagingError> {
+    #[cfg(test)]
+    crate::test_blocking_io::pause(path);
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -338,6 +344,50 @@ pub(crate) fn delete_recovery_staging_artifact(path: &Path) -> Result<(), Recove
     }
     let parent = artifact_parent(path)?;
     sync_parent_directory(parent).map_err(|source| io_error(parent, source))
+}
+
+/// [`write_recovery_staging_artifact`] on the blocking pool: hashing and
+/// writing an image of up to the snapshot transfer limit, then fsyncing it
+/// and its directory, must not stall the strict replication runtime.
+pub(crate) async fn write_recovery_staging_artifact_off_runtime(
+    path: PathBuf,
+    expectation: RecoveryStagingExpectation,
+    repository_image: Bytes,
+) -> Result<RecoveryStagingManifest, RecoveryStagingError> {
+    off_runtime(path, move |path| {
+        write_recovery_staging_artifact(path, expectation, &repository_image)
+    })
+    .await
+}
+
+/// [`verify_recovery_staging_artifact`] on the blocking pool: it reads and
+/// hashes the whole staged image.
+pub(crate) async fn verify_recovery_staging_artifact_off_runtime(
+    path: PathBuf,
+    expected: RecoveryStagingManifest,
+) -> Result<VerifiedRecoveryStagingArtifact, RecoveryStagingError> {
+    off_runtime(path, move |path| {
+        verify_recovery_staging_artifact(path, expected)
+    })
+    .await
+}
+
+/// [`delete_recovery_staging_artifact`] on the blocking pool: it fsyncs the
+/// directory after removing the file.
+pub(crate) async fn delete_recovery_staging_artifact_off_runtime(
+    path: PathBuf,
+) -> Result<(), RecoveryStagingError> {
+    off_runtime(path, |path| delete_recovery_staging_artifact(path)).await
+}
+
+async fn off_runtime<T: Send + 'static>(
+    path: PathBuf,
+    work: impl FnOnce(&Path) -> Result<T, RecoveryStagingError> + Send + 'static,
+) -> Result<T, RecoveryStagingError> {
+    let error_path = path.clone();
+    tokio::task::spawn_blocking(move || work(&path))
+        .await
+        .unwrap_or_else(|error| Err(io_error(&error_path, io::Error::other(error))))
 }
 
 fn artifact_parent(path: &Path) -> Result<&Path, RecoveryStagingError> {
@@ -381,6 +431,7 @@ fn sha256(image: &[u8]) -> [u8; DIGEST_LEN] {
 #[cfg(test)]
 mod tests {
     use std::io::{Seek, SeekFrom};
+    use std::time::Duration;
 
     use super::*;
 
@@ -514,5 +565,41 @@ mod tests {
         delete_recovery_staging_artifact(&path).unwrap();
         assert!(!path.exists());
         delete_recovery_staging_artifact(&path).unwrap();
+    }
+
+    /// Writing, verifying, and deleting a staged image (up to the 64 MiB
+    /// snapshot transfer limit, with fsyncs) stall the strict replication
+    /// runtime when done on it; the async entry points run them off it.
+    #[tokio::test]
+    async fn staging_file_work_does_not_block_the_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attempt.stage");
+        let _slow =
+            crate::test_blocking_io::slow_down(directory.path(), Duration::from_millis(300));
+
+        let (written, ticks) =
+            crate::test_blocking_io::ticks_during(write_recovery_staging_artifact_off_runtime(
+                path.clone(),
+                expectation(),
+                Bytes::from_static(b"snapshot"),
+            ))
+            .await;
+        let written = written.unwrap();
+        assert!(ticks >= 8, "write blocked the runtime: {ticks} ticks");
+
+        let (verified, ticks) = crate::test_blocking_io::ticks_during(
+            verify_recovery_staging_artifact_off_runtime(path.clone(), written),
+        )
+        .await;
+        assert_eq!(verified.unwrap().repository_image().as_ref(), b"snapshot");
+        assert!(ticks >= 8, "verify blocked the runtime: {ticks} ticks");
+
+        let (deleted, ticks) = crate::test_blocking_io::ticks_during(
+            delete_recovery_staging_artifact_off_runtime(path.clone()),
+        )
+        .await;
+        deleted.unwrap();
+        assert!(!path.exists());
+        assert!(ticks >= 8, "delete blocked the runtime: {ticks} ticks");
     }
 }

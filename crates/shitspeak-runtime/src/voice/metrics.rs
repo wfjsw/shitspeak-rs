@@ -611,7 +611,6 @@ static SCHEDULER_DELAY_BUCKETS: [[AtomicU64; SCHEDULER_DELAY_BUCKETS_US.len()];
     VOICE_SCHEDULER_STAGE_COUNT] =
     [const { [const { AtomicU64::new(0) }; SCHEDULER_DELAY_BUCKETS_US.len()] };
         VOICE_SCHEDULER_STAGE_COUNT];
-static CRYPT_LOCK_CONTENTION_DROPS: AtomicU64 = AtomicU64::new(0);
 static UDP_SEND_EVENTS: [AtomicU64; VOICE_UDP_SEND_RESULT_COUNT] =
     [const { AtomicU64::new(0) }; VOICE_UDP_SEND_RESULT_COUNT];
 static UDP_RECV_BATCHES: AtomicU64 = AtomicU64::new(0);
@@ -1123,10 +1122,6 @@ pub(crate) fn record_egress(
     increment(&EGRESS_BYTES[transport_index][result_index], bytes as u64);
 }
 
-pub(crate) fn record_crypt_lock_contention_drop(packets: usize) {
-    increment(&CRYPT_LOCK_CONTENTION_DROPS, packets as u64);
-}
-
 pub(crate) fn record_udp_send_result(result: VoiceUdpSendResult, events: u64) {
     if events == 0 {
         return;
@@ -1619,11 +1614,6 @@ pub(crate) fn prometheus_samples() -> Vec<PrometheusSample> {
         }
     }
 
-    samples.push(PrometheusSample::new(
-        "shitspeak_voice_crypt_lock_contention_drops_total",
-        Vec::new(),
-        CRYPT_LOCK_CONTENTION_DROPS.load(Ordering::Relaxed) as f64,
-    ));
     for result in [
         VoiceUdpSendResult::WouldBlock,
         VoiceUdpSendResult::Partial,

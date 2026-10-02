@@ -3303,3 +3303,46 @@ async fn authentication_rejections_preserve_reason_and_private_message() {
         }
     }
 }
+
+/// A crypt resync request is queued on the client's TCP outbound queue from
+/// the single UDP processing task. A client whose queue is full (a stalled TCP
+/// connection) must not stall that task — every client's UDP voice waits
+/// behind it — and a request dropped for a full queue must not count as sent,
+/// or the server would believe it had asked and stay silent for a whole
+/// resync interval.
+#[tokio::test]
+async fn crypt_resync_request_never_waits_on_a_full_client_queue() {
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+    let client = Client::new_web_gateway_in_server(
+        DEFAULT_SERVER_ID.to_owned(),
+        ClientSessionIdentifier::from(0x0002_0007),
+        Ipv4Addr::LOCALHOST.into(),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 64738)),
+        outbound_tx.clone(),
+    );
+    client
+        .create_crypt_state("OCB2-AES128")
+        .expect("crypt state");
+    outbound_tx
+        .try_send(shitspeak_messages::messages::Message::Ping(
+            Default::default(),
+        ))
+        .expect("fill the one-slot queue");
+
+    let interval = Duration::from_millis(50);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let started = std::time::Instant::now();
+    request_client_crypt_resync_after_failure(&client, interval);
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "a full client queue must not stall the UDP processing task"
+    );
+
+    // The request was dropped, so the next decrypt failure may ask again.
+    let still_due = client
+        .crypt_state()
+        .as_ref()
+        .is_some_and(|state| state.resync_request_due(interval));
+    assert!(still_due, "a dropped resync request was recorded as sent");
+}

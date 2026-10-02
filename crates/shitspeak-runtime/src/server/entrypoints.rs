@@ -257,6 +257,7 @@ fn bind_udp_socket(
     udp_runtime: &tokio::runtime::Handle,
 ) -> std::io::Result<Arc<tokio::net::UdpSocket>> {
     let socket = std::net::UdpSocket::bind(address)?;
+    super::udp_recv_batch::disable_udp_connection_reset_reports(&socket);
     socket.set_nonblocking(true)?;
     let _runtime_guard = udp_runtime.enter();
     tokio::net::UdpSocket::from_std(socket).map(Arc::new)

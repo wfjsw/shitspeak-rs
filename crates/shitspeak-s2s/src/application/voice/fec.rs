@@ -79,6 +79,11 @@ pub(crate) const RS_PARITY_INDEX_BASE: u32 = 2;
 pub(crate) const SLIDING_PARITY_INDEX_BASE: u32 = 64;
 /// Upper bound on members one sliding-window parity covers.
 pub(crate) const MAX_SLIDING_WINDOW: usize = 16;
+/// Largest member payload a block or sliding equation codes: the largest
+/// encoded voice packet Mumble carries (`MAX_UDP_PACKET_SIZE`, which the codec
+/// enforces on encode). A parity frame is one member symbol long, so no
+/// legitimate parity exceeds the length prefix plus this.
+pub(crate) const MAX_MEMBER_PAYLOAD_BYTES: usize = 1024;
 /// Spacing of parity rows still owed when an utterance ends, standing in for
 /// the data frames that would otherwise have paced them.
 pub(crate) const TAIL_PARITY_SPACING: Duration = Duration::from_millis(20);
@@ -549,7 +554,7 @@ impl SenderFecStream {
     ) -> Vec<ParityEmission> {
         let terminator = member.terminator;
         let protectable =
-            !member.payload.is_empty() && member.payload.len() <= usize::from(u16::MAX);
+            !member.payload.is_empty() && member.payload.len() <= MAX_MEMBER_PAYLOAD_BYTES;
         let duplicate = self
             .lanes
             .iter()
@@ -636,7 +641,7 @@ impl SenderSlidingStream {
     fn push(&mut self, window: usize, member: PendingMember) -> Vec<ParityEmission> {
         let terminator = member.terminator;
         let protectable =
-            !member.payload.is_empty() && member.payload.len() <= usize::from(u16::MAX);
+            !member.payload.is_empty() && member.payload.len() <= MAX_MEMBER_PAYLOAD_BYTES;
         if self.window.iter().any(|pending| pending.seq == member.seq) {
             return Vec::new();
         }
@@ -827,6 +832,38 @@ struct FecBlock {
     terminator_mask: u32,
     /// Every member is present or recovered; nothing left to solve.
     resolved: bool,
+    /// The inputs of the last solve that ran and recovered nothing: the
+    /// absent-member mask and the received-parity-row mask. Until either
+    /// changes the same solve cannot succeed, so it is not re-run.
+    failed_attempt: Option<(u32, u32)>,
+}
+
+impl FecBlock {
+    /// `(absent members, received parity rows)` as bit masks.
+    fn solve_inputs(&self, received: &VecDeque<VoiceFrame>) -> (u32, u32) {
+        let mut absent = 0u32;
+        for (index, seq) in self.member_seqs.iter().enumerate() {
+            if !received.iter().any(|frame| frame.s2s_seq == *seq) {
+                absent |= 1 << index;
+            }
+        }
+        let mut rows = 0u32;
+        for (row, parity) in self.parities.iter().enumerate() {
+            if parity.is_some() {
+                rows |= 1 << row;
+            }
+        }
+        (absent, rows)
+    }
+}
+
+/// The inputs of the last sliding elimination that ran: the absent members
+/// and the equations over them. The elimination pins every member these
+/// determine, so until either changes a re-run cannot pin anything new.
+#[derive(Debug, PartialEq, Eq)]
+struct SlidingInputs {
+    absent: Vec<u64>,
+    equations: Vec<u64>,
 }
 
 /// A received sliding-window parity equation.
@@ -847,11 +884,18 @@ struct ReceiverFecWindow {
     blocks: VecDeque<FecBlock>,
     /// Sliding-window equations that still cover an absent member.
     equations: VecDeque<SlidingEquation>,
+    /// Inputs of the last sliding elimination that ran.
+    last_sliding: Option<SlidingInputs>,
     /// Reconstructed members the reorder did not want yet — typically frames
     /// whose originals were only in flight. Released once they become a hole
     /// the reorder waits on, dropped when their original arrives.
     stash: VecDeque<VoiceFrame>,
     last_used: Instant,
+    /// Block solves and sliding eliminations actually run, for tests.
+    #[cfg(test)]
+    block_solves: usize,
+    #[cfg(test)]
+    sliding_solves: usize,
 }
 
 impl ReceiverFecWindow {
@@ -861,8 +905,13 @@ impl ReceiverFecWindow {
             received: VecDeque::new(),
             blocks: VecDeque::new(),
             equations: VecDeque::new(),
+            last_sliding: None,
             stash: VecDeque::new(),
             last_used: now,
+            #[cfg(test)]
+            block_solves: 0,
+            #[cfg(test)]
+            sliding_solves: 0,
         }
     }
 
@@ -894,6 +943,7 @@ impl ReceiverFecWindow {
             || member_seqs.len() > MAX_BLOCK_MEMBERS
             || row >= MAX_PARITY_FRAMES
             || parity.len() < LENGTH_PREFIX
+            || parity.len() > LENGTH_PREFIX + MAX_MEMBER_PAYLOAD_BYTES
         {
             return;
         }
@@ -925,6 +975,7 @@ impl ReceiverFecWindow {
             parities,
             terminator_mask,
             resolved: false,
+            failed_attempt: None,
         });
         while self.blocks.len() > self.window {
             self.blocks.pop_front();
@@ -941,7 +992,10 @@ impl ReceiverFecWindow {
         let Some(&newest) = member_seqs.iter().max() else {
             return;
         };
-        if member_seqs.len() > MAX_SLIDING_WINDOW || parity.len() < LENGTH_PREFIX {
+        if member_seqs.len() > MAX_SLIDING_WINDOW
+            || parity.len() < LENGTH_PREFIX
+            || parity.len() > LENGTH_PREFIX + MAX_MEMBER_PAYLOAD_BYTES
+        {
             return;
         }
         let parity_id = sliding_parity_id(newest, step);
@@ -979,7 +1033,29 @@ impl ReceiverFecWindow {
             if block.resolved {
                 continue;
             }
+            // Solves run on the voice dispatch task for every inbound packet.
+            // One that recovered nothing cannot succeed until a member or a
+            // parity row of the block arrives, so it is not re-run before.
+            // Only a solve that ran is remembered: one skipped because
+            // nothing absent was wanted yet must run once something is.
+            let inputs = block.solve_inputs(&self.received);
+            if block.failed_attempt == Some(inputs) {
+                continue;
+            }
+            let wants_absent = block
+                .member_seqs
+                .iter()
+                .enumerate()
+                .any(|(index, seq)| (inputs.0 >> index) & 1 == 1 && wanted(*seq));
+            if inputs.0 != 0 && !wants_absent {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                self.block_solves += 1;
+            }
             let Some(solution) = solve_block(block, &self.received, wanted) else {
+                self.blocks[block_index].failed_attempt = Some(inputs);
                 continue;
             };
             self.blocks[block_index].resolved = true;
@@ -1048,6 +1124,27 @@ impl ReceiverFecWindow {
         absent.dedup();
         if !absent.iter().any(|seq| wanted(*seq)) {
             return Vec::new();
+        }
+        // The elimination pins every member its inputs determine and the
+        // caller mirrors them, so with the same absent members and equations
+        // a re-run pins nothing new. Remembered only once it has run: a
+        // system skipped because nothing absent was wanted yet still runs
+        // once something is.
+        let inputs = SlidingInputs {
+            absent: absent.clone(),
+            equations: self
+                .equations
+                .iter()
+                .map(|equation| equation.parity_id)
+                .collect(),
+        };
+        if self.last_sliding.as_ref() == Some(&inputs) {
+            return Vec::new();
+        }
+        self.last_sliding = Some(inputs);
+        #[cfg(test)]
+        {
+            self.sliding_solves += 1;
         }
         let symbol_len = self
             .equations
@@ -2373,5 +2470,120 @@ pub(crate) mod tests {
             last.fec_terminator_mask,
         ));
         assert_eq!(recovered_seqs(&receiver), vec![2]);
+    }
+
+    /// `(block solves, sliding eliminations)` run so far for the test stream.
+    fn solve_counts(state: &ReceiverFecState) -> (usize, usize) {
+        let inner = state.inner.lock().unwrap();
+        let mirror = inner
+            .mirrors
+            .get(&MirrorKey {
+                sender_session: 7,
+                sender_epoch: 11,
+            })
+            .expect("test stream mirror");
+        (mirror.block_solves, mirror.sliding_solves)
+    }
+
+    /// An under-determined system is solved once; packets that change none of
+    /// its equations or unknowns must not re-run the elimination — it runs on
+    /// the voice dispatch task for every inbound packet.
+    #[test]
+    fn an_unsolvable_sliding_system_is_not_re_solved_until_its_inputs_change() {
+        let sent = sent_parity(&sliding_sender(4), 6, None, true);
+        let receiver = ReceiverFecState::new(32);
+        // 3 and 4 lost; only the equation sent with 5 survives: one equation,
+        // two unknowns.
+        deliver(
+            &receiver,
+            &sent,
+            None,
+            |seq| seq != 3 && seq != 4,
+            |seq| seq == 5,
+        );
+        assert!(recovered_seqs(&receiver).is_empty());
+        for seq in 10..20 {
+            receiver.record_frame(frame(seq, &payload_for(seq), false));
+            assert!(receiver.try_reconstruct(7, 11, &any).is_empty());
+        }
+        assert_eq!(solve_counts(&receiver).1, 1);
+        // A second equation over the same unknowns makes the system solvable.
+        for row in &sent[4] {
+            receiver.record_parity(
+                7,
+                11,
+                row.fec_member_seqs.clone(),
+                row.payload.clone(),
+                row.fec_parity_index,
+                row.fec_terminator_mask,
+            );
+        }
+        assert_eq!(recovered_seqs(&receiver), vec![3, 4]);
+        assert_eq!(solve_counts(&receiver).1, 2);
+    }
+
+    /// A block short of parity is tried once, and again only when a parity or
+    /// member for it arrives.
+    #[test]
+    fn an_unsolvable_block_is_not_re_solved_until_its_inputs_change() {
+        let payloads: Vec<Vec<u8>> = (1..=4).map(payload_for).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let receiver = ReceiverFecState::new(32);
+        for seq in [1, 4] {
+            receiver.record_frame(frame(seq, &payload_for(seq), false));
+        }
+        let parity = |row: usize| Bytes::from(rs_parity(&refs, row));
+        assert!(receiver.record_parity(
+            7,
+            11,
+            vec![1, 2, 3, 4],
+            parity(0),
+            RS_PARITY_INDEX_BASE,
+            0
+        ));
+        assert!(receiver.try_reconstruct(7, 11, &any).is_empty());
+        for seq in 10..20 {
+            receiver.record_frame(frame(seq, &payload_for(seq), false));
+            assert!(receiver.try_reconstruct(7, 11, &any).is_empty());
+        }
+        assert_eq!(solve_counts(&receiver).0, 1);
+        assert!(receiver.record_parity(
+            7,
+            11,
+            vec![1, 2, 3, 4],
+            parity(1),
+            RS_PARITY_INDEX_BASE + 1,
+            0
+        ));
+        assert_eq!(recovered_seqs(&receiver), vec![2, 3]);
+        assert_eq!(solve_counts(&receiver).0, 2);
+    }
+
+    /// Parity longer than any voice payload the codec can carry is not a voice
+    /// equation; recording it would let a peer size every elimination row.
+    #[test]
+    fn parity_longer_than_any_voice_payload_is_ignored() {
+        let receiver = ReceiverFecState::new(32);
+        receiver.record_frame(frame(1, &payload_for(1), false));
+        let oversized = Bytes::from(vec![1u8; LENGTH_PREFIX + MAX_MEMBER_PAYLOAD_BYTES + 1]);
+        receiver.record_parity(
+            7,
+            11,
+            vec![1, 2],
+            oversized.clone(),
+            RS_PARITY_INDEX_BASE,
+            0,
+        );
+        receiver.record_parity(7, 11, vec![1, 2], oversized, SLIDING_PARITY_INDEX_BASE, 0);
+        let inner = receiver.inner.lock().unwrap();
+        let mirror = inner
+            .mirrors
+            .get(&MirrorKey {
+                sender_session: 7,
+                sender_epoch: 11,
+            })
+            .expect("test stream mirror");
+        assert!(mirror.blocks.is_empty());
+        assert!(mirror.equations.is_empty());
     }
 }

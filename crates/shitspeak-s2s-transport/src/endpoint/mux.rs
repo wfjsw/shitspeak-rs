@@ -21,8 +21,8 @@ use tracing::{debug, warn};
 use super::{
     bind_ephemeral_udp_dial_socket, bind_udp_socket_with_ipv6_only,
     udp_batch::{
-        RecvDatagramBatch, UDP_RECV_BATCH_MAX_DATAGRAMS, UdpBatchDatagram, recv_udp_batch,
-        send_udp_batch,
+        RecvDatagramBatch, UDP_RECV_BATCH_MAX_DATAGRAMS, UdpBatchDatagram,
+        recv_from_skipping_transient_errors, recv_udp_batch, send_udp_batch,
     },
 };
 use crate::service_level::TransportKind;
@@ -629,7 +629,8 @@ impl PrefixedUdpSocket {
     pub(crate) async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let mut recv = vec![0u8; buf.len().saturating_add(DISCRIMINATOR_LEN)];
         loop {
-            let (n, peer_addr) = self.socket.recv_from(&mut recv).await?;
+            let (n, peer_addr) =
+                recv_from_skipping_transient_errors(&self.socket, &mut recv).await?;
             let Some(payload) = decode_prefixed(self.protocol, &recv[..n])? else {
                 continue;
             };

@@ -75,27 +75,54 @@ const UDP_PROCESSING_MIN_HARD_CAPACITY: usize =
     UDP_PROCESSING_MIN_BASELINE_CAPACITY * UDP_PROCESSING_BURST_MULTIPLIER;
 const UDP_PROCESSING_PACKETS_PER_USER_HARD_CAP: usize = 128;
 const CLIENT_CRYPT_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Per-packet UDP warnings log at most once per this interval per site; the
+/// drops are counted in metrics either way.
+const UDP_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// Consecutive receive errors after which the drain pauses briefly, so a
+/// persistent socket error is not a hot spin.
+const UDP_RECV_ERROR_BACKOFF_AFTER: u32 = 3;
+const UDP_RECV_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+static UDP_RECV_ERROR_LOG: crate::logging::LogRateLimiter =
+    crate::logging::LogRateLimiter::new(UDP_WARN_INTERVAL);
+static UDP_PING_ERROR_LOG: crate::logging::LogRateLimiter =
+    crate::logging::LogRateLimiter::new(UDP_WARN_INTERVAL);
+static UDP_PROCESSING_FULL_LOG: crate::logging::LogRateLimiter =
+    crate::logging::LogRateLimiter::new(UDP_WARN_INTERVAL);
 
-async fn request_client_crypt_resync_after_failure(client: &Client) {
-    let should_request = {
-        let mut crypt = client.crypt_state();
-        crypt
-            .as_mut()
-            .is_some_and(|state| state.should_request_resync(CLIENT_CRYPT_RESYNC_INTERVAL))
-    };
-    if !should_request {
+/// Ask a client whose UDP packets stopped decrypting to resend its nonce.
+///
+/// This runs on the single UDP processing task, so it never waits: a client
+/// whose outbound queue is full (a stalled TCP connection) gets no request
+/// this time instead of stalling every client's UDP voice behind it. The
+/// request rides the same queue as the client's other TCP messages, so their
+/// order is kept, and it is recorded only once queued, so the next decrypt
+/// failure asks again instead of waiting out a whole interval. A dropped
+/// request cannot desync the two sides: it changes no state on either until
+/// the client answers with its nonce through the ordinary CryptSetup handler.
+fn request_client_crypt_resync_after_failure(client: &Client, interval: std::time::Duration) {
+    let due = client
+        .crypt_state()
+        .as_ref()
+        .is_some_and(|state| state.resync_request_due(interval));
+    if !due {
         return;
     }
 
     let request = shitspeak_messages::messages::Message::CryptSetup(
         shitspeak_proto::mumble_proto::CryptSetup::default(),
     );
-    if let Err(error) = client.write_proto_message(&request).await {
-        tracing::debug!(
+    match client.try_write_owned_message_batch(crate::client::OwnedMessageBatch::new(vec![request]))
+    {
+        Ok(()) => {
+            if let Some(state) = client.crypt_state().as_mut() {
+                state.record_resync_request();
+            }
+        }
+        Err(error) => tracing::debug!(
             session = u32::from(client.get_session_id()),
             %error,
-            "failed to request client crypto nonce resync"
-        );
+            "client outbound queue unavailable; crypto nonce resync request deferred"
+        ),
     }
 }
 
@@ -446,7 +473,9 @@ impl Server {
         );
 
         let s2s_manager = Arc::new(S2SManager::initialize(&config));
-        let geoip_config = config.geoip.clone();
+        // Loaded on the blocking pool before the server takes traffic, so the
+        // first lookups already see the databases.
+        let geoip_resolver = GeoIpResolver::load(config.geoip.clone()).await;
         // Capture abuse-protection tunings before `config` is moved into the
         // reloadable ArcSwap below.
         let auth_ip_rate_per_second = config.auth_rate_limit_per_ip_per_second;
@@ -533,7 +562,7 @@ impl Server {
                 ]),
             ),
             s2s_manager,
-            geoip_resolver: ParkingRwLock::new(Arc::new(GeoIpResolver::new(geoip_config))),
+            geoip_resolver: ParkingRwLock::new(Arc::new(geoip_resolver)),
             shutdown_tx,
             visibility_reload_tx,
             visibility_generation: AtomicU64::new(0),
@@ -670,10 +699,7 @@ impl Server {
     /// projection, so ordering with channel updates is kept), after the way
     /// names are presented to it changed: its language, or its
     /// `no_channel_name_translation` entitlement.
-    pub(crate) fn refresh_client_channel_names(
-        self: &Arc<Box<Self>>,
-        client: &Arc<Box<Client>>,
-    ) {
+    pub(crate) fn refresh_client_channel_names(self: &Arc<Box<Self>>, client: &Arc<Box<Client>>) {
         self.publish_channel_name_refresh(
             crate::localization::channel_names::ChannelNameRefresh::ClientNames(
                 client.client_instance_id(),
@@ -892,11 +918,10 @@ impl Server {
             Arc::downgrade(self),
             internal_rx.clone(),
         );
-        let channel_name_sync_task =
-            crate::localization::channel_names::spawn_channel_name_sync(
-                Arc::downgrade(self),
-                internal_rx.clone(),
-            );
+        let channel_name_sync_task = crate::localization::channel_names::spawn_channel_name_sync(
+            Arc::downgrade(self),
+            internal_rx.clone(),
+        );
 
         // Wait for any task to finish (error) or for the caller to request
         // shutdown by sending on the shared watch channel.
@@ -951,12 +976,22 @@ impl Server {
                 .local_addr()
                 .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
             tracing::info!("UDP drain started, listening on {}", local_addr);
+            let mut consecutive_errors: u32 = 0;
             loop {
                 let received = tokio::select! {
                     result = recv_voice_udp_batch(&socket, &mut batch) => match result {
-                        Ok(n) => n,
+                        Ok(n) => {
+                            consecutive_errors = 0;
+                            n
+                        }
                         Err(e) => {
-                            tracing::warn!("UDP recv error: {e}");
+                            consecutive_errors = consecutive_errors.saturating_add(1);
+                            if let Some(suppressed) = UDP_RECV_ERROR_LOG.admit() {
+                                tracing::warn!(suppressed, "UDP recv error: {e}");
+                            }
+                            if consecutive_errors >= UDP_RECV_ERROR_BACKOFF_AFTER {
+                                tokio::time::sleep(UDP_RECV_ERROR_BACKOFF).await;
+                            }
                             continue;
                         }
                     },
@@ -1032,10 +1067,13 @@ impl Server {
                         match Self::build_ping_response(server, &ping, &status_server_id).await {
                             Ok(r) => r,
                             Err(e) => {
-                                tracing::warn!(
-                                    "Failed to build UDP ping response for {}: {e}",
-                                    src_addr
-                                );
+                                if let Some(suppressed) = UDP_PING_ERROR_LOG.admit() {
+                                    tracing::warn!(
+                                        suppressed,
+                                        "Failed to build UDP ping response for {}: {e}",
+                                        src_addr
+                                    );
+                                }
                                 return;
                             }
                         };
@@ -1043,7 +1081,15 @@ impl Server {
                         Ok(sent) => {
                             tracing::trace!("UDP ping reply sent to {}: {} bytes", src_addr, sent)
                         }
-                        Err(e) => tracing::warn!("UDP ping reply failed to {}: {e}", src_addr),
+                        Err(e) => {
+                            if let Some(suppressed) = UDP_PING_ERROR_LOG.admit() {
+                                tracing::warn!(
+                                    suppressed,
+                                    "UDP ping reply failed to {}: {e}",
+                                    src_addr
+                                );
+                            }
+                        }
                     }
                     return;
                 }
@@ -1094,10 +1140,13 @@ impl Server {
                     crate::voice::metrics::record_udp_drain_drop(
                         crate::voice::metrics::UdpDrainDropReason::ProcessingQueueFull,
                     );
-                    tracing::warn!(
-                        "UDP processing channel is full, dropping packet from {}",
-                        src_addr
-                    );
+                    if let Some(suppressed) = UDP_PROCESSING_FULL_LOG.admit() {
+                        tracing::warn!(
+                            suppressed,
+                            "UDP processing channel is full, dropping packet from {}",
+                            src_addr
+                        );
+                    }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     crate::voice::metrics::record_queue_enqueue(
@@ -1217,7 +1266,7 @@ impl Server {
                                 server
                                     .clients
                                     .unbind_client_udp_endpoint(local_addr, src_addr);
-                                request_client_crypt_resync_after_failure(&c).await;
+                                request_client_crypt_resync_after_failure(&c, CLIENT_CRYPT_RESYNC_INTERVAL);
                             }
                             None => {
                                 crate::voice::metrics::record_udp_decrypt(
@@ -1302,7 +1351,7 @@ impl Server {
                                 }
                             };
                             if decrypted.is_none() {
-                                request_client_crypt_resync_after_failure(c).await;
+                                request_client_crypt_resync_after_failure(c, CLIENT_CRYPT_RESYNC_INTERVAL);
                             }
                             if let Some(decrypted) = decrypted {
                                 matched = Some(c.clone());
@@ -1385,8 +1434,7 @@ impl Server {
                             }
                         };
                         let encrypted = {
-                            let mut crypt = client.crypt_state();
-                            let Some(state) = crypt.as_mut() else {
+                            let Some(state) = client.crypt_encryptor() else {
                                 tracing::warn!(
                                     "no crypt state available for authenticated UDP ping reply to {}",
                                     src_addr
@@ -1417,7 +1465,15 @@ impl Server {
                                 src_addr,
                                 sent
                             ),
-                            Err(e) => tracing::warn!("UDP ping reply failed to {}: {e}", src_addr),
+                            Err(e) => {
+                            if let Some(suppressed) = UDP_PING_ERROR_LOG.admit() {
+                                tracing::warn!(
+                                    suppressed,
+                                    "UDP ping reply failed to {}: {e}",
+                                    src_addr
+                                );
+                            }
+                        }
                         }
                         continue;
                     }
@@ -2440,8 +2496,10 @@ impl Server {
                     }
                     if current.geoip != new_config.geoip {
                         tracing::info!("config reload: geoip changed");
-                        *self.geoip_resolver.write() =
-                            Arc::new(GeoIpResolver::new(new_config.geoip.clone()));
+                        // Load first, so the replacement never serves lookups
+                        // without its databases.
+                        let resolver = GeoIpResolver::load(new_config.geoip.clone()).await;
+                        *self.geoip_resolver.write() = Arc::new(resolver);
                         invalidate_acl_cache = true;
                         visibility_reload = true;
                     }

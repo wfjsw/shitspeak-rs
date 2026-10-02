@@ -3,6 +3,8 @@ mod ban_repository;
 mod channel_repository;
 mod channels;
 mod group;
+#[cfg(test)]
+mod test_blocking_io;
 
 pub mod errors {
     pub use crate::channel_repo_error::ChannelRepoError;

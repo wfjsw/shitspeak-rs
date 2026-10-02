@@ -212,6 +212,8 @@ impl LokiConfig {
 
 pub struct LoggingGuard {
     flush_handle: Option<LokiFlushHandle>,
+    /// Flushes the console writer's pending lines when logging shuts down.
+    _console: tracing_appender::non_blocking::WorkerGuard,
 }
 
 impl LoggingGuard {
@@ -231,14 +233,87 @@ impl Drop for LoggingGuard {
     }
 }
 
+/// Console lines the background writer may hold before new ones are dropped.
+const CONSOLE_BUFFERED_LINES: usize = 16_384;
+
+/// The writer console log lines go through. Lines are handed to a background
+/// thread and dropped, not waited for, when it falls behind: a stalled stderr
+/// (journald or a container log driver not draining) must never block the
+/// thread that logs. Voice and transport threads warn on dropped packets, and
+/// a blocking write would turn a log stall into a voice stall exactly when
+/// packets are already being dropped. The guard flushes pending lines when
+/// logging shuts down.
+fn console_writer<W: Write + Send + 'static>(
+    sink: W,
+) -> (
+    tracing_subscriber::fmt::writer::BoxMakeWriter,
+    tracing_appender::non_blocking::WorkerGuard,
+) {
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(CONSOLE_BUFFERED_LINES)
+        .thread_name("console-log")
+        .finish(sink);
+    (
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(writer),
+        guard,
+    )
+}
+
+/// Caps a warning raised per packet to one line per interval for its call
+/// site, reporting how many were suppressed in between. The drops themselves
+/// are counted in metrics; the log only needs to say that it is happening.
+pub(crate) struct LogRateLimiter {
+    interval_ms: u64,
+    /// Milliseconds since [`LOG_RATE_EPOCH`] of the last emitted line, plus
+    /// one so that zero means never.
+    last_ms: std::sync::atomic::AtomicU64,
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+static LOG_RATE_EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+impl LogRateLimiter {
+    pub(crate) const fn new(interval: Duration) -> Self {
+        Self {
+            interval_ms: interval.as_millis() as u64,
+            last_ms: std::sync::atomic::AtomicU64::new(0),
+            suppressed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// `Some(suppressed)` when this occurrence should be logged, with the
+    /// number of occurrences suppressed since the last line; `None` to skip.
+    pub(crate) fn admit(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = u64::try_from(LOG_RATE_EPOCH.elapsed().as_millis())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1);
+        let last = self.last_ms.load(Relaxed);
+        let within_interval = last != 0 && now.saturating_sub(last) < self.interval_ms;
+        if within_interval
+            || self
+                .last_ms
+                .compare_exchange(last, now, Relaxed, Relaxed)
+                .is_err()
+        {
+            self.suppressed.fetch_add(1, Relaxed);
+            return None;
+        }
+        Some(self.suppressed.swap(0, Relaxed))
+    }
+}
+
 pub fn init(
     service_name: &'static str,
     config_path: impl AsRef<std::path::Path>,
 ) -> Result<LoggingGuard, Box<dyn Error>> {
     let cli_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let (console, console_guard) = console_writer(std::io::stderr());
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
+        .with_writer(console)
         .with_line_number(true)
         .fmt_fields(LokiFields::default())
         .event_format(ScopedSpanEventFormatter {
@@ -267,13 +342,17 @@ pub fn init(
         install_panic_hook();
         Ok(LoggingGuard {
             flush_handle: Some(flush_handle),
+            _console: console_guard,
         })
     } else {
         tracing_subscriber::registry()
             .with(SpanFieldsLayer::default())
             .with(fmt_layer.with_filter(cli_filter))
             .init();
-        Ok(LoggingGuard { flush_handle: None })
+        Ok(LoggingGuard {
+            flush_handle: None,
+            _console: console_guard,
+        })
     }
 }
 
@@ -1647,6 +1726,69 @@ fn panic_message(info: &panic::PanicHookInfo<'_>) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A console sink whose writes block until it is released, like a
+    /// stalled stderr pipe (journald or a container log driver not draining).
+    struct StalledSink {
+        release: std::sync::mpsc::Receiver<()>,
+        released: bool,
+    }
+
+    impl std::io::Write for StalledSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if !self.released {
+                let _ = self.release.recv();
+                self.released = true;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Logging must never block the thread that logs: voice threads warn on
+    /// dropped packets, and a stalled stderr would otherwise stall voice for
+    /// as long as the log consumer is stuck.
+    #[test]
+    fn a_stalled_console_does_not_block_the_logging_thread() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (writer, _guard) = super::console_writer(StalledSink {
+            release: release_rx,
+            released: false,
+        });
+        let subscriber = tracing_subscriber::fmt().with_writer(writer).finish();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let logger = std::thread::spawn(move || {
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::warn!("first line, stalls the console");
+                tracing::warn!("second line");
+            });
+            let _ = done_tx.send(());
+        });
+        let returned = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+        // Unstick the sink so the logging thread (and any background
+        // writer) can finish either way.
+        let _ = release_tx.send(());
+        let _ = logger.join();
+        assert!(
+            returned.is_ok(),
+            "logging blocked on a stalled console writer"
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_warning_logs_once_per_interval_and_counts_the_rest() {
+        let limiter = super::LogRateLimiter::new(std::time::Duration::from_millis(50));
+        assert_eq!(limiter.admit(), Some(0));
+        for _ in 0..999 {
+            assert_eq!(limiter.admit(), None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(limiter.admit(), Some(999));
+        assert_eq!(limiter.admit(), None);
+    }
+
     use super::*;
 
     #[test]

@@ -9,7 +9,7 @@ mod profile_test;
 mod xor_backend;
 
 pub use aes_backend::probe as probe_aes_backend;
-pub use crypt_state::CryptState;
+pub use crypt_state::{CryptDecryptor, CryptEncryptor, CryptState};
 pub use crypto_mode::CryptoMode;
 pub use errors::CryptError;
 pub use gf128::probe as probe_gf128_backend;

@@ -38,6 +38,11 @@ use shitspeak_s2s::application::proto::{
     VoiceTargetChannel as S2SVoiceTargetChannel,
 };
 
+/// UDP batch send errors log at most once per this interval; failed sends are
+/// counted in metrics either way.
+static UDP_BATCH_SEND_ERROR_LOG: crate::logging::LogRateLimiter =
+    crate::logging::LogRateLimiter::new(std::time::Duration::from_secs(10));
+
 const S2S_RECIPIENT_CACHE_INITIAL_CAPACITY: usize = 256;
 const S2S_RECIPIENT_CACHE_MAX_CAPACITY: usize = 65536;
 
@@ -2218,17 +2223,7 @@ fn encrypt_udp_recipients(
         else {
             continue;
         };
-        let Some(mut crypt) = client.try_crypt_state() else {
-            super::metrics::record_crypt_lock_contention_drop(1);
-            super::metrics::record_egress(
-                VoiceEgressTransport::Udp,
-                VoiceEgressResult::Dropped,
-                1,
-                entry.bytes.len(),
-            );
-            continue;
-        };
-        let Some(state) = crypt.as_mut() else {
+        let Some(state) = client.crypt_encryptor() else {
             continue;
         };
         let encrypted_len = entry.bytes.len() + state.overhead();
@@ -2305,17 +2300,7 @@ pub(crate) async fn flush_voice_batch(
             };
             record_pipeline_stage(path, VoicePipelineStage::RecipientLookup, lookup_started_at);
 
-            let Some(mut crypt) = client.try_crypt_state() else {
-                super::metrics::record_crypt_lock_contention_drop(1);
-                super::metrics::record_egress(
-                    VoiceEgressTransport::Udp,
-                    VoiceEgressResult::Dropped,
-                    1,
-                    entry.bytes.len(),
-                );
-                continue;
-            };
-            let Some(state) = crypt.as_mut() else {
+            let Some(state) = client.crypt_encryptor() else {
                 continue;
             };
             let encrypted_len = entry.bytes.len() + state.overhead();
@@ -2388,7 +2373,9 @@ pub(crate) async fn flush_voice_batch(
                         byte_count,
                         flush_duration,
                     );
-                    tracing::warn!("UDP batch send error: {e}");
+                    if let Some(suppressed) = UDP_BATCH_SEND_ERROR_LOG.admit() {
+                        tracing::warn!(suppressed, "UDP batch send error: {e}");
+                    }
                     super::metrics::record_egress(
                         VoiceEgressTransport::Udp,
                         VoiceEgressResult::Failed,
@@ -2595,7 +2582,9 @@ pub(crate) async fn flush_voice_batch(
             Err(e) => {
                 let flush_duration = flush_started_at.elapsed();
                 super::metrics::record_udp_egress_batch(packet_count, byte_count, flush_duration);
-                tracing::warn!("UDP batch send error: {e}");
+                if let Some(suppressed) = UDP_BATCH_SEND_ERROR_LOG.admit() {
+                    tracing::warn!(suppressed, "UDP batch send error: {e}");
+                }
                 super::metrics::record_egress(
                     VoiceEgressTransport::Udp,
                     VoiceEgressResult::Failed,
@@ -2818,6 +2807,120 @@ pub fn spawn_voice_tcp_task(client: Arc<Box<Client>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn crypt_test_client(session: u32) -> Arc<Box<Client>> {
+        let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 30_000 + session as u16));
+        let local = std::net::SocketAddr::from(([127, 0, 0, 1], 40_000 + session as u16));
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(8);
+        let client = Client::new_web_gateway_in_server(
+            shitspeak_core::default_server_id(),
+            crate::client::client_session_identifier::ClientSessionIdentifier::new(1, session)
+                .expect("test session id"),
+            peer.ip(),
+            peer,
+            local,
+            outbound_tx,
+        );
+        client
+            .create_crypt_state("OCB2-AES128")
+            .expect("test crypt state");
+        Arc::new(client)
+    }
+
+    /// What a Mumble client builds from the server's CryptSetup: the server's
+    /// outbound nonce is its inbound one, and vice versa.
+    fn client_side_from_crypt_setup(client: &Client) -> shitspeak_client_crypto::CryptState {
+        let crypt = client.crypt_state();
+        let state = crypt.as_ref().expect("crypt state exists");
+        let encryptor = client.crypt_encryptor().expect("crypt state exists");
+        shitspeak_client_crypto::CryptState::from_key(
+            "OCB2-AES128",
+            state.key().expect("OCB2 exposes its key"),
+            state.decrypt_iv(),
+            &encryptor.encrypt_iv(),
+        )
+        .expect("client crypt state")
+    }
+
+    /// A client that resynchronises to the server's crypt state, initially or
+    /// after the server regenerated it, decrypts every packet the server sends
+    /// afterwards: the reported nonce is the last one used, and the next
+    /// packet uses the one after it, with nothing reused or skipped.
+    #[test]
+    fn a_client_resynchronised_to_the_crypt_state_decrypts_every_later_packet() {
+        let server_side = crypt_test_client(8);
+        for generation in 0..2 {
+            if generation == 1 {
+                server_side
+                    .create_crypt_state("OCB2-AES128")
+                    .expect("regenerated crypt state");
+            }
+            let mut client_side = client_side_from_crypt_setup(&server_side);
+            let encryptor = server_side.crypt_encryptor().expect("crypt state exists");
+            for packet in 0..300u16 {
+                let plaintext = packet.to_le_bytes();
+                let mut wire = vec![0u8; plaintext.len() + encryptor.overhead()];
+                encryptor.encrypt(&mut wire, &plaintext).expect("encrypt");
+                let mut decrypted = BytesMut::new();
+                client_side
+                    .decrypt(&mut decrypted, &wire)
+                    .unwrap_or_else(|error| {
+                        panic!("generation {generation}, packet {packet}: {error:?}")
+                    });
+                assert_eq!(decrypted.as_ref(), plaintext);
+            }
+            // In order, with no loss and no late packet.
+            assert_eq!(client_side.local_packet_stats(), (300, 0, 0, 0));
+        }
+    }
+
+    /// Voice egress to a client must not wait on that client's UDP ingress:
+    /// decrypting its packets (and the resync/ping bookkeeping around it)
+    /// holds the inbound half of the crypt state, which encryption toward the
+    /// client never needs. While they shared one lock, a held decrypt made
+    /// every outbound packet to that client wait 10 ms and then drop.
+    #[test]
+    fn encrypting_to_a_client_does_not_wait_for_its_decrypt_side() {
+        let client = crypt_test_client(7);
+        let plaintext = Bytes::from_static(&[0xAB; 64]);
+        let plaintexts: Vec<VoicePlaintext> = vec![(
+            (PacketFormat::Protobuf, AudioContext::Normal),
+            Encoded {
+                checksum: shitspeak_client_crypto::CryptState::compute_plaintext_checksum(
+                    &plaintext,
+                ),
+                bytes: plaintext,
+            },
+        )];
+        let recipients: Vec<UdpVoiceRecipient> = vec![(
+            client.clone(),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 64738)),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50_007)),
+            PacketFormat::Protobuf,
+            AudioContext::Normal,
+        )];
+        let _decrypting = client.crypt_state();
+        let (batches, elapsed) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let started = Instant::now();
+                    let batches = encrypt_udp_recipients(
+                        &recipients,
+                        &plaintexts,
+                        VoicePipelinePath::LocalSequential,
+                    );
+                    (batches, started.elapsed())
+                })
+                .join()
+                .expect("encrypt thread")
+        });
+        let queued: usize = batches.values().map(DatagramBatch::len).sum();
+        assert_eq!(queued, 1, "the packet was dropped instead of encrypted");
+        assert!(
+            elapsed < std::time::Duration::from_millis(5),
+            "encryption waited {elapsed:?} on the decrypt side"
+        );
+    }
 
     #[test]
     fn rayon_dispatch_requires_enough_udp_recipients() {

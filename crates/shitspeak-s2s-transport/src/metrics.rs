@@ -3,10 +3,12 @@
 //! can score path quality among co-existing transports.
 
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 
 use crate::types::NodeIdentifier;
@@ -113,10 +115,79 @@ const TRANSPORT_IO_BATCH_SIZE_BUCKETS: [(&str, u64); 8] = [
 ];
 const DATAGRAM_PATH_EVIDENCE_WINDOW: Duration = Duration::from_secs(1);
 
-static TRANSPORT_IO: LazyLock<StdMutex<TransportIoMetrics>> =
-    LazyLock::new(|| StdMutex::new(TransportIoMetrics::default()));
-static QUIC_METRICS: LazyLock<StdMutex<QuicMetrics>> =
-    LazyLock::new(|| StdMutex::new(QuicMetrics::default()));
+// Packet-path counters. Every transport's readers and writers record into
+// these on each packet or batch, so recording must never wait on another
+// recorder or on a scrape: each key owns a cell of atomics, and the key map is
+// replaced copy-on-write when a new key first appears.
+static TRANSPORT_IO: LazyLock<CounterRegistry<TransportIoKey, TransportIoCell>> =
+    LazyLock::new(CounterRegistry::default);
+static TRANSPORT_IO_FRAMES: LazyLock<CounterRegistry<TransportIoFrameKey, AtomicU64>> =
+    LazyLock::new(CounterRegistry::default);
+// `None` is the overflow bucket after the fixed peer cardinality cap.
+static QUIC_LANES: LazyLock<CounterRegistry<Option<NodeIdentifier>, QuicLaneCells>> =
+    LazyLock::new(CounterRegistry::default);
+static QUIC_DATAGRAM_DROPS: [AtomicU64; QUIC_DATAGRAM_DROP_REASON_COUNT] =
+    [const { AtomicU64::new(0) }; QUIC_DATAGRAM_DROP_REASON_COUNT];
+static QUIC_PROTOCOL_EVENTS: [[[AtomicU64; QUIC_PROTOCOL_RESULT_COUNT];
+    QUIC_PROTOCOL_VERSION_COUNT]; QUIC_PROTOCOL_STAGE_COUNT] = [const {
+    [const { [const { AtomicU64::new(0) }; QUIC_PROTOCOL_RESULT_COUNT] };
+        QUIC_PROTOCOL_VERSION_COUNT]
+}; QUIC_PROTOCOL_STAGE_COUNT];
+static QUIC_PROTOCOL_ERRORS: [AtomicU64; QUIC_PROTOCOL_ERROR_REASON_COUNT] =
+    [const { AtomicU64::new(0) }; QUIC_PROTOCOL_ERROR_REASON_COUNT];
+
+/// Counter cells keyed by a bounded label set. Recording an existing key is
+/// lock-free: one atomic map load, a lookup, and atomic adds on the cell. A
+/// new key copies the map under `insert`, which only new keys contend on.
+/// Snapshots load the current map and read the atomics without blocking
+/// recorders. Nothing here can be poisoned.
+struct CounterRegistry<K, C> {
+    cells: ArcSwap<HashMap<K, Arc<C>>>,
+    insert: Mutex<()>,
+}
+
+impl<K, C> Default for CounterRegistry<K, C> {
+    fn default() -> Self {
+        Self {
+            cells: ArcSwap::from_pointee(HashMap::new()),
+            insert: Mutex::new(()),
+        }
+    }
+}
+
+impl<K: Copy + Eq + Hash, C: Default> CounterRegistry<K, C> {
+    fn record(&self, key: K, update: impl FnOnce(&C)) {
+        if let Some(cell) = self.cells.load().get(&key) {
+            update(cell);
+            return;
+        }
+        update(&self.insert_cell(key, |_| key));
+    }
+
+    /// Insert `key`'s cell, or the cell of the key `admit` maps it to given
+    /// the current map (used to fold keys past a cardinality cap into an
+    /// overflow key).
+    fn insert_cell(&self, key: K, admit: impl FnOnce(&HashMap<K, Arc<C>>) -> K) -> Arc<C> {
+        let _insert = self.insert.lock();
+        let current = self.cells.load_full();
+        if let Some(cell) = current.get(&key) {
+            return cell.clone();
+        }
+        let key = admit(&current);
+        if let Some(cell) = current.get(&key) {
+            return cell.clone();
+        }
+        let cell = Arc::new(C::default());
+        let mut next = HashMap::clone(&current);
+        next.insert(key, cell.clone());
+        self.cells.store(Arc::new(next));
+        cell
+    }
+
+    fn snapshot(&self) -> Arc<HashMap<K, Arc<C>>> {
+        self.cells.load_full()
+    }
+}
 
 static TRANSPORT_PIPELINE_STAGE_EVENTS: [[AtomicU64; TRANSPORT_PIPELINE_STAGE_COUNT];
     TRANSPORT_KIND_COUNT] =
@@ -613,25 +684,14 @@ impl QuicProtocolErrorReason {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct QuicLaneCounter {
-    frames: u64,
-    bytes: u64,
+#[derive(Debug, Default)]
+struct QuicLaneCell {
+    frames: AtomicU64,
+    bytes: AtomicU64,
 }
 
 #[derive(Debug, Default)]
-struct QuicMetrics {
-    // `None` is the overflow bucket after the fixed peer cardinality cap.
-    lanes: HashMap<
-        Option<NodeIdentifier>,
-        [[QuicLaneCounter; QUIC_DELIVERY_LANE_COUNT]; QUIC_DELIVERY_DIRECTION_COUNT],
-    >,
-    tracked_peers: usize,
-    datagram_drops: [u64; QUIC_DATAGRAM_DROP_REASON_COUNT],
-    protocol_events: [[[u64; QUIC_PROTOCOL_RESULT_COUNT]; QUIC_PROTOCOL_VERSION_COUNT];
-        QUIC_PROTOCOL_STAGE_COUNT],
-    protocol_errors: [u64; QUIC_PROTOCOL_ERROR_REASON_COUNT],
-}
+struct QuicLaneCells([[QuicLaneCell; QUIC_DELIVERY_LANE_COUNT]; QUIC_DELIVERY_DIRECTION_COUNT]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuicLaneSnapshot {
@@ -737,29 +797,24 @@ pub fn record_quic_lane_delivery(
     frames: u64,
     bytes: usize,
 ) {
-    let mut metrics = QUIC_METRICS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let key = if metrics.lanes.contains_key(&Some(peer)) {
-        Some(peer)
-    } else if metrics.tracked_peers < MAX_TRACKED_QUIC_METRIC_PEERS {
-        metrics.tracked_peers += 1;
-        Some(peer)
-    } else {
-        None
+    let update = |cells: &QuicLaneCells| {
+        let cell = &cells.0[quic_direction_index(direction)][quic_lane_index(lane)];
+        cell.frames.fetch_add(frames, Ordering::Relaxed);
+        cell.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
     };
-    let counter = &mut metrics.lanes.entry(key).or_default()[quic_direction_index(direction)]
-        [quic_lane_index(lane)];
-    counter.frames = counter.frames.saturating_add(frames);
-    counter.bytes = counter.bytes.saturating_add(bytes as u64);
+    if let Some(cells) = QUIC_LANES.cells.load().get(&Some(peer)) {
+        update(cells);
+        return;
+    }
+    let cells = QUIC_LANES.insert_cell(Some(peer), |current| {
+        let tracked_peers = current.keys().filter(|key| key.is_some()).count();
+        (tracked_peers < MAX_TRACKED_QUIC_METRIC_PEERS).then_some(peer)
+    });
+    update(&cells);
 }
 
 pub fn record_quic_datagram_drop(reason: QuicDatagramDropReason) {
-    let mut metrics = QUIC_METRICS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let counter = &mut metrics.datagram_drops[quic_datagram_drop_reason_index(reason)];
-    *counter = counter.saturating_add(1);
+    QUIC_DATAGRAM_DROPS[quic_datagram_drop_reason_index(reason)].fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn record_quic_protocol_event(
@@ -767,28 +822,19 @@ pub fn record_quic_protocol_event(
     version: QuicProtocolVersion,
     result: QuicProtocolResult,
 ) {
-    let mut metrics = QUIC_METRICS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let counter = &mut metrics.protocol_events[quic_protocol_stage_index(stage)]
-        [quic_protocol_version_index(version)][quic_protocol_result_index(result)];
-    *counter = counter.saturating_add(1);
+    QUIC_PROTOCOL_EVENTS[quic_protocol_stage_index(stage)][quic_protocol_version_index(version)]
+        [quic_protocol_result_index(result)]
+    .fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn record_quic_protocol_error(reason: QuicProtocolErrorReason) {
-    let mut metrics = QUIC_METRICS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let counter = &mut metrics.protocol_errors[quic_protocol_error_reason_index(reason)];
-    *counter = counter.saturating_add(1);
+    QUIC_PROTOCOL_ERRORS[quic_protocol_error_reason_index(reason)].fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn quic_lane_snapshots() -> Vec<QuicLaneSnapshot> {
-    let metrics = QUIC_METRICS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lanes = QUIC_LANES.snapshot();
     let mut snapshots = Vec::new();
-    for (&peer, counters) in &metrics.lanes {
+    for (&peer, cells) in lanes.iter() {
         for direction in [TransportIoDirection::Ingress, TransportIoDirection::Egress] {
             for lane in [
                 QuicDeliveryLane::Control,
@@ -796,14 +842,16 @@ pub fn quic_lane_snapshots() -> Vec<QuicLaneSnapshot> {
                 QuicDeliveryLane::Regular,
                 QuicDeliveryLane::Datagram,
             ] {
-                let counter = counters[quic_direction_index(direction)][quic_lane_index(lane)];
-                if counter.frames != 0 || counter.bytes != 0 {
+                let cell = &cells.0[quic_direction_index(direction)][quic_lane_index(lane)];
+                let frames = cell.frames.load(Ordering::Relaxed);
+                let bytes = cell.bytes.load(Ordering::Relaxed);
+                if frames != 0 || bytes != 0 {
                     snapshots.push(QuicLaneSnapshot {
                         peer,
                         direction,
                         lane,
-                        frames: counter.frames,
-                        bytes: counter.bytes,
+                        frames,
+                        bytes,
                     });
                 }
             }
@@ -820,23 +868,17 @@ pub fn quic_lane_snapshots() -> Vec<QuicLaneSnapshot> {
 }
 
 pub fn quic_datagram_drop_snapshots() -> Vec<QuicDatagramDropSnapshot> {
-    let metrics = QUIC_METRICS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     QUIC_DATAGRAM_DROP_REASONS
         .into_iter()
         .enumerate()
         .map(|(index, reason)| QuicDatagramDropSnapshot {
             reason,
-            drops: metrics.datagram_drops[index],
+            drops: QUIC_DATAGRAM_DROPS[index].load(Ordering::Relaxed),
         })
         .collect()
 }
 
 pub fn quic_protocol_event_snapshots() -> Vec<QuicProtocolEventSnapshot> {
-    let metrics = QUIC_METRICS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut snapshots = Vec::new();
     for stage in [QuicProtocolStage::Negotiation, QuicProtocolStage::Setup] {
         for version in [QuicProtocolVersion::S2s1, QuicProtocolVersion::S2s2] {
@@ -845,8 +887,9 @@ pub fn quic_protocol_event_snapshots() -> Vec<QuicProtocolEventSnapshot> {
                     stage,
                     version,
                     result,
-                    events: metrics.protocol_events[quic_protocol_stage_index(stage)]
-                        [quic_protocol_version_index(version)][quic_protocol_result_index(result)],
+                    events: QUIC_PROTOCOL_EVENTS[quic_protocol_stage_index(stage)]
+                        [quic_protocol_version_index(version)][quic_protocol_result_index(result)]
+                    .load(Ordering::Relaxed),
                 });
             }
         }
@@ -855,15 +898,12 @@ pub fn quic_protocol_event_snapshots() -> Vec<QuicProtocolEventSnapshot> {
 }
 
 pub fn quic_protocol_error_snapshots() -> Vec<QuicProtocolErrorSnapshot> {
-    let metrics = QUIC_METRICS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     QUIC_PROTOCOL_ERROR_REASONS
         .into_iter()
         .enumerate()
         .map(|(index, reason)| QuicProtocolErrorSnapshot {
             reason,
-            errors: metrics.protocol_errors[index],
+            errors: QUIC_PROTOCOL_ERRORS[index].load(Ordering::Relaxed),
         })
         .collect()
 }
@@ -1116,29 +1156,12 @@ struct TransportIoFrameKey {
     class: MessageClass,
 }
 
-#[derive(Debug, Clone)]
-struct TransportIoCounter {
-    batches: u64,
-    bytes: u64,
-    batch_size_buckets: [u64; TRANSPORT_IO_BATCH_SIZE_BUCKETS.len()],
-    pressure: [u64; TRANSPORT_IO_PRESSURE_RESULT_COUNT],
-}
-
-impl Default for TransportIoCounter {
-    fn default() -> Self {
-        Self {
-            batches: 0,
-            bytes: 0,
-            batch_size_buckets: [0; TRANSPORT_IO_BATCH_SIZE_BUCKETS.len()],
-            pressure: [0; TRANSPORT_IO_PRESSURE_RESULT_COUNT],
-        }
-    }
-}
-
 #[derive(Debug, Default)]
-struct TransportIoMetrics {
-    io: HashMap<TransportIoKey, TransportIoCounter>,
-    frames: HashMap<TransportIoFrameKey, u64>,
+struct TransportIoCell {
+    batches: AtomicU64,
+    bytes: AtomicU64,
+    batch_size_buckets: [AtomicU64; TRANSPORT_IO_BATCH_SIZE_BUCKETS.len()],
+    pressure: [AtomicU64; TRANSPORT_IO_PRESSURE_RESULT_COUNT],
 }
 
 const TRANSPORT_IO_PRESSURE_RESULT_COUNT: usize = 4;
@@ -1234,25 +1257,21 @@ pub fn record_transport_io_batch(
     if frames == 0 && bytes == 0 {
         return;
     }
-    let mut metrics = TRANSPORT_IO.lock().unwrap();
-    let entry = metrics
-        .io
-        .entry(TransportIoKey {
-            peer,
-            transport,
-            direction,
-        })
-        .or_default();
-    entry.batches = entry.batches.saturating_add(1);
-    entry.bytes = entry.bytes.saturating_add(bytes as u64);
-    if let Some((bucket_index, _)) = TRANSPORT_IO_BATCH_SIZE_BUCKETS
+    let bucket_index = TRANSPORT_IO_BATCH_SIZE_BUCKETS
         .iter()
-        .enumerate()
-        .find(|(_, (_, upper_bound))| frames as u64 <= *upper_bound)
-    {
-        entry.batch_size_buckets[bucket_index] =
-            entry.batch_size_buckets[bucket_index].saturating_add(1);
-    }
+        .position(|(_, upper_bound)| frames as u64 <= *upper_bound);
+    let key = TransportIoKey {
+        peer,
+        transport,
+        direction,
+    };
+    TRANSPORT_IO.record(key, |cell| {
+        cell.batches.fetch_add(1, Ordering::Relaxed);
+        cell.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        if let Some(bucket_index) = bucket_index {
+            cell.batch_size_buckets[bucket_index].fetch_add(1, Ordering::Relaxed);
+        }
+    });
 }
 
 pub fn record_transport_io_frames(
@@ -1265,17 +1284,15 @@ pub fn record_transport_io_frames(
     if frames == 0 {
         return;
     }
-    let mut metrics = TRANSPORT_IO.lock().unwrap();
-    let entry = metrics
-        .frames
-        .entry(TransportIoFrameKey {
-            peer,
-            transport,
-            direction,
-            class,
-        })
-        .or_default();
-    *entry = entry.saturating_add(frames as u64);
+    let key = TransportIoFrameKey {
+        peer,
+        transport,
+        direction,
+        class,
+    };
+    TRANSPORT_IO_FRAMES.record(key, |cell| {
+        cell.fetch_add(frames as u64, Ordering::Relaxed);
+    });
 }
 
 pub fn record_transport_io_pressure(
@@ -1288,32 +1305,38 @@ pub fn record_transport_io_pressure(
     if events == 0 {
         return;
     }
-    let mut metrics = TRANSPORT_IO.lock().unwrap();
-    let entry = metrics
-        .io
-        .entry(TransportIoKey {
-            peer,
-            transport,
-            direction,
-        })
-        .or_default();
-    entry.pressure[transport_io_pressure_result_index(result)] =
-        entry.pressure[transport_io_pressure_result_index(result)].saturating_add(events);
+    let key = TransportIoKey {
+        peer,
+        transport,
+        direction,
+    };
+    TRANSPORT_IO.record(key, |cell| {
+        cell.pressure[transport_io_pressure_result_index(result)]
+            .fetch_add(events, Ordering::Relaxed);
+    });
 }
 
 pub fn transport_io_snapshots() -> Vec<TransportIoSnapshot> {
-    let metrics = TRANSPORT_IO.lock().unwrap();
-    let mut out = metrics
-        .io
+    collect_transport_io_snapshots(|| {})
+}
+
+/// `during` runs while the snapshot is being collected — a seam for tests
+/// that check recorders are not blocked by a scrape.
+fn collect_transport_io_snapshots(during: impl FnOnce()) -> Vec<TransportIoSnapshot> {
+    let cells = TRANSPORT_IO.snapshot();
+    during();
+    let mut out = cells
         .iter()
-        .map(|(key, counter)| TransportIoSnapshot {
+        .map(|(key, cell)| TransportIoSnapshot {
             peer: key.peer,
             transport: key.transport,
             direction: key.direction,
-            batches: counter.batches,
-            bytes: counter.bytes,
-            batch_size_buckets: counter.batch_size_buckets,
-            pressure: counter.pressure,
+            batches: cell.batches.load(Ordering::Relaxed),
+            bytes: cell.bytes.load(Ordering::Relaxed),
+            batch_size_buckets: std::array::from_fn(|index| {
+                cell.batch_size_buckets[index].load(Ordering::Relaxed)
+            }),
+            pressure: std::array::from_fn(|index| cell.pressure[index].load(Ordering::Relaxed)),
         })
         .collect::<Vec<_>>();
     out.sort_by_key(|snapshot| {
@@ -1330,16 +1353,15 @@ pub fn transport_io_snapshots() -> Vec<TransportIoSnapshot> {
 }
 
 pub fn transport_io_frame_snapshots() -> Vec<TransportIoFrameSnapshot> {
-    let metrics = TRANSPORT_IO.lock().unwrap();
-    let mut out = metrics
-        .frames
+    let cells = TRANSPORT_IO_FRAMES.snapshot();
+    let mut out = cells
         .iter()
         .map(|(key, frames)| TransportIoFrameSnapshot {
             peer: key.peer,
             transport: key.transport,
             direction: key.direction,
             class: key.class,
-            frames: *frames,
+            frames: frames.load(Ordering::Relaxed),
         })
         .collect::<Vec<_>>();
     out.sort_by_key(|snapshot| {
@@ -4054,6 +4076,82 @@ mod tests {
         assert_eq!(second.snapshot_count(), 0);
         first.reset_snapshot_count();
         assert_eq!(first.snapshot_count(), 0);
+    }
+
+    /// A Prometheus scrape must not stall packet-path recorders: on a
+    /// single-worker runtime a recorder blocked behind a scrape stops that
+    /// transport's reader or writer.
+    #[test]
+    fn transport_io_recording_is_not_blocked_by_a_snapshot_in_progress() {
+        let peer = 4093;
+        record_transport_io_batch(
+            peer,
+            TransportKind::Udp,
+            TransportIoDirection::Ingress,
+            1,
+            10,
+        );
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let scrape = std::thread::spawn(move || {
+            collect_transport_io_snapshots(|| {
+                paused_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            })
+        });
+        paused_rx.recv().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let recorder = std::thread::spawn(move || {
+            record_transport_io_batch(
+                peer,
+                TransportKind::Udp,
+                TransportIoDirection::Ingress,
+                1,
+                10,
+            );
+            record_transport_io_frames(
+                peer,
+                TransportKind::Quic,
+                TransportIoDirection::Egress,
+                MessageClass::Regular,
+                1,
+            );
+            done_tx.send(()).unwrap();
+        });
+        let recorded = done_rx.recv_timeout(Duration::from_millis(500)).is_ok();
+        release_tx.send(()).unwrap();
+        scrape.join().unwrap();
+        recorder.join().unwrap();
+        assert!(
+            recorded,
+            "recorder blocked while a snapshot was in progress"
+        );
+    }
+
+    /// A panic anywhere while metrics are being touched must not turn every
+    /// later packet into a panic.
+    #[test]
+    fn a_panic_during_metrics_recording_does_not_break_later_recording() {
+        let peer = 4092;
+        let _ = std::thread::spawn(|| {
+            collect_transport_io_snapshots(|| panic!("scrape panicked"));
+        })
+        .join();
+        let recorded = std::panic::catch_unwind(|| {
+            record_transport_io_batch(peer, TransportKind::Tcp, TransportIoDirection::Egress, 1, 7);
+            record_transport_io_pressure(
+                peer,
+                TransportKind::Tcp,
+                TransportIoDirection::Egress,
+                TransportIoPressureResult::Partial,
+                1,
+            );
+            transport_io_snapshots()
+        });
+        let snapshots = recorded.expect("recording after a panicked scrape");
+        assert!(snapshots.iter().any(|snapshot| snapshot.peer() == peer
+            && snapshot.transport() == TransportKind::Tcp
+            && snapshot.bytes() >= 7));
     }
 
     #[test]

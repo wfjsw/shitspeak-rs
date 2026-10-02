@@ -26,10 +26,9 @@ pub async fn handle_crypt_setup(
         // An empty request asks for the server's current outbound nonce. Keep
         // the existing key and client nonce.
         let reply: Message = {
-            let crypt = sender.crypt_state();
-            let server_nonce = crypt
-                .as_ref()
-                .map(|state| Bytes::copy_from_slice(state.encrypt_iv()));
+            let server_nonce = sender
+                .crypt_encryptor()
+                .map(|encryptor| Bytes::copy_from_slice(&encryptor.encrypt_iv()));
             CryptSetup::new(None, None, server_nonce).into()
         };
 

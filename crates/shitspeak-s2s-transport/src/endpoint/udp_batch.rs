@@ -2,8 +2,12 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
+use tracing::debug;
 
 pub(crate) const UDP_RECV_BATCH_MAX_DATAGRAMS: usize = 32;
 
@@ -133,6 +137,133 @@ pub(crate) async fn recv_udp_batch(
     }
 }
 
+/// Whether a UDP receive error reports one earlier datagram rather than
+/// the socket. An ICMP unreachable for a datagram we sent surfaces on the
+/// socket's next receive: as WSAECONNRESET / WSAENETRESET on Windows, as
+/// ECONNREFUSED on Linux for connected sockets. The socket itself is fine
+/// and the next datagram is still deliverable, so a read loop that treats
+/// these as fatal stops all ingress on the socket because one peer went
+/// away.
+pub(crate) fn is_transient_udp_recv_error(error: &io::Error) -> bool {
+    /// WSAENETRESET: the TTL-expired counterpart of WSAECONNRESET.
+    #[cfg(windows)]
+    const NETWORK_RESET: i32 = 10052;
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(NETWORK_RESET) {
+        return true;
+    }
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::Interrupted
+    )
+}
+
+/// One receive attempt's outcome for a read loop: `None` to try again
+/// after a per-datagram error (see [`is_transient_udp_recv_error`]), else
+/// the result to act on.
+pub(crate) fn settle_udp_recv<T>(result: io::Result<T>) -> Option<io::Result<T>> {
+    match result {
+        Err(error) if is_transient_udp_recv_error(&error) => {
+            log_transient_udp_recv_error(&error);
+            None
+        }
+        result => Some(result),
+    }
+}
+
+/// `socket.recv_from`, retried past per-datagram errors.
+pub(crate) async fn recv_from_skipping_transient_errors(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr)> {
+    loop {
+        if let Some(result) = settle_udp_recv(socket.recv_from(buf).await) {
+            return result;
+        }
+    }
+}
+
+/// How often a skipped per-datagram receive error is logged; the rest are
+/// counted into the next log line.
+const TRANSIENT_RECV_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+pub(crate) fn log_transient_udp_recv_error(error: &io::Error) {
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    let now_ms = u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis())
+        .unwrap_or(u64::MAX - 1);
+    let last = LAST_LOG_MS.load(Ordering::Relaxed);
+    let due = last == u64::MAX
+        || now_ms.saturating_sub(last) >= TRANSIENT_RECV_ERROR_LOG_INTERVAL.as_millis() as u64;
+    if due
+        && LAST_LOG_MS
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let suppressed = SUPPRESSED.swap(0, Ordering::Relaxed);
+        debug!(
+            %error,
+            suppressed,
+            "skipped a per-datagram UDP receive error; the socket keeps reading"
+        );
+    } else {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Stop Windows from reporting ICMP port/network unreachable for datagrams
+/// this socket sent as WSAECONNRESET / WSAENETRESET on its next receive
+/// (`SIO_UDP_CONNRESET`, `SIO_UDP_NETRESET`). A server socket shared by
+/// many peers must not see one peer's departure as an error at all. A
+/// refusal is logged; [`is_transient_udp_recv_error`] still covers it.
+#[cfg(windows)]
+pub(crate) fn disable_udp_connection_reset_reports(
+    socket: &impl std::os::windows::io::AsRawSocket,
+) {
+    use windows_sys::Win32::Networking::WinSock::{
+        SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SOCKET, WSAIoctl,
+    };
+    for (name, code) in [
+        ("SIO_UDP_CONNRESET", SIO_UDP_CONNRESET),
+        ("SIO_UDP_NETRESET", SIO_UDP_NETRESET),
+    ] {
+        let enabled: i32 = 0;
+        let mut returned: u32 = 0;
+        // SAFETY: the socket handle is live for the borrow; the input
+        // buffer is a valid BOOL and no output, overlapped I/O or
+        // completion routine is used.
+        let rc = unsafe {
+            WSAIoctl(
+                socket.as_raw_socket() as SOCKET,
+                code,
+                (&enabled as *const i32).cast(),
+                std::mem::size_of::<i32>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if rc != 0 {
+            debug!(
+                ioctl = name,
+                error = %io::Error::last_os_error(),
+                "unable to disable UDP reset reports"
+            );
+        }
+    }
+}
+
+/// Only Windows reports a peer's ICMP unreachable on an unconnected socket.
+#[cfg(not(windows))]
+pub(crate) fn disable_udp_connection_reset_reports<S: ?Sized>(_socket: &S) {}
+
 pub(crate) async fn send_udp_batch(
     socket: &UdpSocket,
     datagrams: &[UdpBatchDatagram<'_>],
@@ -158,13 +289,19 @@ async fn recv_each_available(
     batch: &mut RecvDatagramBatch,
 ) -> io::Result<usize> {
     batch.clear();
-    let (len, peer_addr) = socket.recv_from(batch.first_buffer_mut()).await?;
+    let (len, peer_addr) =
+        recv_from_skipping_transient_errors(socket, batch.first_buffer_mut()).await?;
     batch.push_received(0, len, peer_addr);
 
     for index in 1..batch.capacity() {
         match socket.try_recv_from(batch.buffers[index].as_mut_slice()) {
             Ok((len, peer_addr)) => batch.push_received(index, len, peer_addr),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+            // Keep what this batch already holds; the next call reads on.
+            Err(err) if is_transient_udp_recv_error(&err) => {
+                log_transient_udp_recv_error(&err);
+                break;
+            }
             Err(err) => return Err(err),
         }
     }
@@ -183,7 +320,10 @@ async fn recvmmsg_linux(socket: &UdpSocket, batch: &mut RecvDatagramBatch) -> io
             Ok(0) => continue,
             Ok(n) => return Ok(n),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if is_transient_udp_recv_error(&err) => {
+                log_transient_udp_recv_error(&err);
+                continue;
+            }
             Err(err) => return Err(err),
         }
     }
@@ -415,6 +555,112 @@ mod tests {
             }
         });
         assert_eq!(allocations, 0);
+    }
+
+    /// A receive error that reports one earlier datagram (an ICMP
+    /// unreachable for something we sent) must not end a receive loop: the
+    /// next datagram is still delivered. A fatal error still surfaces.
+    #[tokio::test]
+    async fn per_datagram_receive_errors_are_skipped_and_fatal_ones_surface() {
+        // A read loop driven by injected receive results, as the socket
+        // read loops are.
+        let read = |results: Vec<io::Result<usize>>| {
+            let mut results = results.into_iter();
+            loop {
+                let next = results.next().expect("the loop stopped reading");
+                if let Some(result) = settle_udp_recv(next) {
+                    return result;
+                }
+            }
+        };
+        let received = read(vec![
+            Err(io::Error::from(io::ErrorKind::ConnectionReset)),
+            Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            Ok(7),
+        ])
+        .expect("per-datagram errors are skipped");
+        assert_eq!(received, 7);
+
+        let fatal = read(vec![Err(io::Error::from(io::ErrorKind::NotConnected))])
+            .expect_err("a fatal error ends the receive");
+        assert_eq!(fatal.kind(), io::ErrorKind::NotConnected);
+    }
+
+    /// Send a datagram from `socket` to a port nobody listens on and give
+    /// the ICMP port unreachable time to come back. On Windows this queues
+    /// a WSAECONNRESET for the socket's next receive.
+    #[cfg(windows)]
+    async fn provoke_port_unreachable(socket: &UdpSocket) {
+        let closed = {
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap()
+        };
+        socket.send_to(b"nobody", closed).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// Windows reports an ICMP port unreachable for a datagram we sent as
+    /// WSAECONNRESET on the socket's next receive. The batch receive must
+    /// skip it and deliver the datagram behind it, not fail the whole
+    /// socket's read loop.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn recv_batch_survives_a_port_unreachable_report() {
+        let receiver = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        provoke_port_unreachable(&receiver).await;
+        sender
+            .send_to(b"after", receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        let mut batch = RecvDatagramBatch::new(UDP_RECV_BATCH_MAX_DATAGRAMS, 64);
+        timeout(
+            Duration::from_secs(1),
+            recv_udp_batch(&receiver, &mut batch),
+        )
+        .await
+        .expect("receive completes")
+        .expect("the reset report is skipped");
+        assert_eq!(
+            batch
+                .iter()
+                .next()
+                .map(|datagram| datagram.payload().to_vec()),
+            Some(b"after".to_vec())
+        );
+    }
+
+    /// With connection-reset reporting disabled, even a plain receive never
+    /// sees the ICMP report.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn disabled_reset_reports_never_reach_a_plain_receive() {
+        let receiver = {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            disable_udp_connection_reset_reports(&socket);
+            socket.set_nonblocking(true).unwrap();
+            UdpSocket::from_std(socket).unwrap()
+        };
+        let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        provoke_port_unreachable(&receiver).await;
+        sender
+            .send_to(b"after", receiver.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, _) = timeout(Duration::from_secs(1), receiver.recv_from(&mut buf))
+            .await
+            .expect("receive completes")
+            .expect("no reset report is queued");
+        assert_eq!(&buf[..n], b"after");
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@
 use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use shitspeak_core::NodeIdentifier;
@@ -40,6 +40,8 @@ pub(crate) fn probe_participant_journal(
     self_id: NodeIdentifier,
 ) -> io::Result<()> {
     let journal_dir = persistence_dir.join(JOURNAL_DIRECTORY);
+    #[cfg(test)]
+    crate::test_blocking_io::pause(&journal_dir);
     create_directory_with_durable_entries(&journal_dir)?;
 
     let probe_id = NEXT_DURABILITY_PROBE_ID.fetch_add(1, Ordering::Relaxed);
@@ -75,6 +77,18 @@ pub(crate) fn probe_participant_journal(
     result
 }
 
+/// [`probe_participant_journal`] on the blocking pool: the probe fsyncs a
+/// file and its directory, which on a busy or stalled disk would stall every
+/// task on the runtime that runs the periodic monitor.
+async fn probe_participant_journal_off_runtime(
+    persistence_dir: PathBuf,
+    self_id: NodeIdentifier,
+) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || probe_participant_journal(&persistence_dir, self_id))
+        .await
+        .unwrap_or_else(|error| Err(io::Error::other(error)))
+}
+
 pub(crate) fn spawn_participant_durability_monitor(
     overlay: OverlayNetwork,
     capability: std::sync::Arc<StrictParticipantCapability>,
@@ -100,10 +114,12 @@ pub(crate) fn spawn_participant_durability_monitor(
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {
-                    let next_journal_ready = match probe_participant_journal(
-                        &persistence_dir,
+                    let next_journal_ready = match probe_participant_journal_off_runtime(
+                        persistence_dir.clone(),
                         self_id,
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(()) => true,
                         Err(error) => {
                             if journal_ready {
@@ -250,5 +266,20 @@ mod tests {
         let regular_file = root.path().join("not-a-directory");
         fs::write(&regular_file, b"x").unwrap();
         assert!(participant_journal_ready(Some(&regular_file), 7).is_err());
+    }
+
+    /// The periodic probe fsyncs a file and its directory twice; on a busy
+    /// or stalled disk that would stall every strict replication task.
+    #[tokio::test]
+    async fn periodic_probe_does_not_block_the_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let _slow =
+            crate::test_blocking_io::slow_down(root.path(), std::time::Duration::from_millis(300));
+        let (result, ticks) = crate::test_blocking_io::ticks_during(
+            probe_participant_journal_off_runtime(root.path().to_path_buf(), 7),
+        )
+        .await;
+        result.unwrap();
+        assert!(ticks >= 8, "probe blocked the runtime: {ticks} ticks");
     }
 }

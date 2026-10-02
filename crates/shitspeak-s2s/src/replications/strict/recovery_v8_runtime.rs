@@ -22,8 +22,8 @@ use super::super::proto::{
     StrictRecoveryTerminalPage, StrictRecoveryTerminalReq, StrictTerminalState,
 };
 use super::catchup::{
-    decode_s2s_snapshot_envelope, delivery_checkpoint_is_valid, encode_bound_s2s_snapshot_envelope,
-    staged_terminal_decision,
+    DecodedS2sSnapshotEnvelope, decode_s2s_snapshot_envelope, delivery_checkpoint_is_valid,
+    encode_bound_s2s_snapshot_envelope, staged_terminal_decision,
 };
 use super::recovery_reducer::{
     DonorFailure, LogicalTarget, ParticipantIncarnation, RECOVERY_RETRY_DELAY_MS,
@@ -33,7 +33,8 @@ use super::recovery_reducer::{
 };
 use super::recovery_staging::{
     RecoveryStagingExpectation, RecoveryStagingManifest, delete_recovery_staging_artifact,
-    verify_recovery_staging_artifact, write_recovery_staging_artifact,
+    delete_recovery_staging_artifact_off_runtime, verify_recovery_staging_artifact_off_runtime,
+    write_recovery_staging_artifact_off_runtime,
 };
 use super::runtime::{BulkPageIdentity, OpId};
 use super::runtime::{StrictRuntime, node_from_u32};
@@ -96,7 +97,20 @@ struct ClientTransfer {
     snapshot_total: Option<u64>,
     snapshot_digest: Option<[u8; 32]>,
     snapshot_bytes: Vec<u8>,
+    /// The received image, frozen once it reached its announced length so it
+    /// can be hashed and staged without holding the recovery locks. While set,
+    /// `snapshot_bytes` is empty.
+    snapshot_image: Option<Bytes>,
     staging: Option<(PathBuf, RecoveryStagingManifest)>,
+}
+
+impl ClientTransfer {
+    /// The snapshot bytes received so far.
+    fn received_snapshot(&self) -> &[u8] {
+        self.snapshot_image
+            .as_deref()
+            .unwrap_or(self.snapshot_bytes.as_slice())
+    }
 }
 
 struct ServerSnapshot {
@@ -272,22 +286,32 @@ impl RecoveryV8Runtime {
         self.next_wire_id.fetch_add(1, Ordering::Relaxed).max(1)
     }
 
-    fn cleanup(&self, attempt: RecoveryAttemptId, protected_staging_path: Option<&Path>) {
+    /// Forget an attempt. Returns its staging artifact, unless protected, for
+    /// the caller to delete off the runtime and outside the client lock.
+    #[must_use]
+    fn cleanup(
+        &self,
+        attempt: RecoveryAttemptId,
+        protected_staging_path: Option<&Path>,
+    ) -> Option<PathBuf> {
         self.probe_nonces
             .lock()
             .retain(|(candidate, _), _| *candidate != attempt);
-        if let Some(client) = self.clients.lock().remove(&attempt) {
-            if let Some((path, _)) = client.staging {
-                if protected_staging_path != Some(path.as_path()) {
-                    let _ = delete_recovery_staging_artifact(&path);
-                }
+        let staging_path = self
+            .clients
+            .lock()
+            .remove(&attempt)
+            .and_then(|client| client.staging)
+            .map(|(path, _)| path)
+            .filter(|path| protected_staging_path != Some(path.as_path()));
+        self.pending_transfer_retries.lock().remove(&attempt);
+        {
+            let mut active_audit = self.active_generation_zero_audit.lock();
+            if *active_audit == Some(attempt) {
+                *active_audit = None;
             }
         }
-        self.pending_transfer_retries.lock().remove(&attempt);
-        let mut active_audit = self.active_generation_zero_audit.lock();
-        if *active_audit == Some(attempt) {
-            *active_audit = None;
-        }
+        staging_path
     }
 
     fn schedule_transfer_retry(
@@ -1153,15 +1177,30 @@ fn stage_prefix(topic: &str) -> String {
     format!("strict-recovery-{:016x}-", hasher.finish())
 }
 
-fn cleanup_orphaned_staging_artifacts<R: StrictReplicable>(
+/// Delete this topic's staging artifacts other than `retained`. Each delete
+/// fsyncs the directory, so the scan runs on the blocking pool.
+async fn cleanup_orphaned_staging_artifacts<R: StrictReplicable>(
     rt: &StrictRuntime<R>,
-    retained: Option<&Path>,
+    retained: Option<PathBuf>,
 ) {
     let Some(directory) = rt.net.strict_protocol_state_dir() else {
         return;
     };
     let prefix = stage_prefix(&rt.topic);
-    let Ok(entries) = fs::read_dir(&directory) else {
+    let topic = rt.topic.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        delete_orphaned_staging_artifacts(&directory, &prefix, retained.as_deref(), &topic);
+    })
+    .await;
+}
+
+fn delete_orphaned_staging_artifacts(
+    directory: &Path,
+    prefix: &str,
+    retained: Option<&Path>,
+    topic: &str,
+) {
+    let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1172,13 +1211,40 @@ fn cleanup_orphaned_staging_artifacts<R: StrictReplicable>(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name.starts_with(&prefix)
+        if name.starts_with(prefix)
             && name.ends_with(".stage")
             && let Err(error) = delete_recovery_staging_artifact(&path)
         {
-            tracing::warn!(topic = %rt.topic, path = %path.display(), %error, "strict recovery orphan staging cleanup failed");
+            tracing::warn!(topic = %topic, path = %path.display(), %error, "strict recovery orphan staging cleanup failed");
         }
     }
+}
+
+/// Why a staged repository image could not be loaded.
+enum StagedSnapshotError {
+    /// The artifact is missing or fails its manifest or digest check.
+    Artifact,
+    /// The artifact verified but holds no valid snapshot envelope.
+    Envelope,
+}
+
+/// Verify a staging artifact and decode its snapshot envelope on the
+/// blocking pool. Both read or parse an image of up to the snapshot transfer
+/// limit, which must stall neither the strict replication runtime nor anyone
+/// waiting on the recovery locks.
+async fn load_staged_snapshot(
+    path: PathBuf,
+    manifest: RecoveryStagingManifest,
+) -> Result<DecodedS2sSnapshotEnvelope, StagedSnapshotError> {
+    let artifact = verify_recovery_staging_artifact_off_runtime(path, manifest)
+        .await
+        .map_err(|_| StagedSnapshotError::Artifact)?;
+    tokio::task::spawn_blocking(move || {
+        decode_s2s_snapshot_envelope(artifact.into_repository_image())
+            .map_err(|_| StagedSnapshotError::Envelope)
+    })
+    .await
+    .unwrap_or(Err(StagedSnapshotError::Envelope))
 }
 
 async fn send_terminal_request<R: StrictReplicable>(
@@ -1434,6 +1500,7 @@ async fn execute_effects_with_retry_clock<R: StrictReplicable>(
                                 snapshot_total: None,
                                 snapshot_digest: None,
                                 snapshot_bytes: Vec::new(),
+                                snapshot_image: None,
                                 staging: None,
                             },
                         );
@@ -1520,8 +1587,12 @@ async fn execute_effects_with_retry_clock<R: StrictReplicable>(
                     .ok()
                     .flatten()
                     .map(|intent| intent.staging_path().to_path_buf());
-                rt.recovery_v8
+                let staging_path = rt
+                    .recovery_v8
                     .cleanup(attempt, protected_staging_path.as_deref());
+                if let Some(path) = staging_path {
+                    let _ = delete_recovery_staging_artifact_off_runtime(path).await;
+                }
             }
             RecoveryEffect::ClearCompletedAttempt { attempt } => {
                 let attempt_id = durable_attempt_id(attempt);
@@ -1600,8 +1671,11 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
         if intent.is_some() || phase == RecoveryPhase::Healthy {
             cleanup_orphaned_staging_artifacts(
                 rt.as_ref(),
-                intent.as_ref().map(|intent| intent.staging_path()),
-            );
+                intent
+                    .as_ref()
+                    .map(|intent| intent.staging_path().to_path_buf()),
+            )
+            .await;
         }
         let Some(intent) = intent else {
             let _ = rt.request_pending_repository_install_recovery();
@@ -1656,22 +1730,25 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
             intent.content_length(),
             *intent.content_digest(),
         );
-        let Ok(artifact) = verify_recovery_staging_artifact(intent.staging_path(), manifest) else {
-            rt.require_repository_image_install(expected_metadata);
-            recertify_topic_after_local_recovery_failure(
-                rt.as_ref(),
-                "durable recovery staging artifact is missing or invalid",
-            );
-            return;
-        };
-        let Ok(decoded) = decode_s2s_snapshot_envelope(artifact.into_repository_image()) else {
-            rt.require_repository_image_install(expected_metadata);
-            recertify_topic_after_local_recovery_failure(
-                rt.as_ref(),
-                "durable recovery staging artifact has an invalid snapshot envelope",
-            );
-            return;
-        };
+        let decoded =
+            match load_staged_snapshot(intent.staging_path().to_path_buf(), manifest).await {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    rt.require_repository_image_install(expected_metadata);
+                    recertify_topic_after_local_recovery_failure(
+                        rt.as_ref(),
+                        match error {
+                            StagedSnapshotError::Artifact => {
+                                "durable recovery staging artifact is missing or invalid"
+                            }
+                            StagedSnapshotError::Envelope => {
+                                "durable recovery staging artifact has an invalid snapshot envelope"
+                            }
+                        },
+                    );
+                    return;
+                }
+            };
         if decoded.terminal_cut != Some(cut) {
             rt.require_repository_image_install(expected_metadata);
             recertify_topic_after_local_recovery_failure(
@@ -1786,7 +1863,9 @@ pub(super) fn spawn_startup_rollforward<R: StrictReplicable>(rt: std::sync::Arc<
                     reducer_cut(cut),
                 ),
             });
-            let _ = delete_recovery_staging_artifact(intent.staging_path());
+            let _ =
+                delete_recovery_staging_artifact_off_runtime(intent.staging_path().to_path_buf())
+                    .await;
             rt.finish_authoritative_recovery_install();
         } else {
             rt.finish_authoritative_recovery_install();
@@ -1815,6 +1894,30 @@ async fn prepare_install<R: StrictReplicable>(
     donor: ParticipantIncarnation,
     terminal_cut: ReducerCut,
 ) {
+    let (path, manifest) = {
+        let coordinator = rt.recovery_coordinator.lock();
+        if coordinator.attempt() != Some(attempt)
+            || coordinator.phase() != RecoveryPhase::FetchingRepositorySnapshot
+            || coordinator.donor() != Some(&donor)
+            || coordinator.representation_cut() != Some(&terminal_cut)
+        {
+            return;
+        }
+        let clients = rt.recovery_v8.clients.lock();
+        let Some(client) = clients.get(&attempt) else {
+            return;
+        };
+        if client.donor != donor {
+            return;
+        }
+        let Some(staging) = client.staging.clone() else {
+            return;
+        };
+        staging
+    };
+    // Read and decode the staged image without the recovery locks, then
+    // re-check that the attempt still stages exactly this artifact.
+    let decoded = load_staged_snapshot(path.clone(), manifest).await;
     let prepared = {
         let coordinator = rt.recovery_coordinator.lock();
         if coordinator.attempt() != Some(attempt)
@@ -1824,20 +1927,19 @@ async fn prepare_install<R: StrictReplicable>(
         {
             return;
         }
-        let mut clients = rt.recovery_v8.clients.lock();
-        let Some(client) = clients.get_mut(&attempt) else {
+        let clients = rt.recovery_v8.clients.lock();
+        let Some(client) = clients.get(&attempt) else {
             return;
         };
-        if client.donor != donor {
+        if client.donor != donor
+            || !client
+                .staging
+                .as_ref()
+                .is_some_and(|(staged_path, staged)| *staged_path == path && *staged == manifest)
+        {
             return;
         }
-        let Some((path, manifest)) = client.staging.clone() else {
-            return;
-        };
-        let Ok(verified) = verify_recovery_staging_artifact(&path, manifest) else {
-            return donor_failed(rt, attempt, donor, DonorFailure::RetryableFailure);
-        };
-        let Ok(decoded) = decode_s2s_snapshot_envelope(verified.into_repository_image()) else {
+        let Ok(decoded) = decoded else {
             return donor_failed(rt, attempt, donor, DonorFailure::RetryableFailure);
         };
         if decoded.terminal_cut != Some(client.cut) {
@@ -1943,7 +2045,7 @@ async fn install<R: StrictReplicable>(
     attempt: RecoveryAttemptId,
     donor: ParticipantIncarnation,
 ) {
-    let (path, manifest, target, cut, applied, retired) = {
+    let (path, manifest) = {
         let coordinator = rt.recovery_coordinator.lock();
         if coordinator.attempt() != Some(attempt)
             || coordinator.phase() != RecoveryPhase::Installing
@@ -1959,54 +2061,69 @@ async fn install<R: StrictReplicable>(
         if client.donor != donor {
             return;
         }
-        let Some((path, manifest)) = client.staging.clone() else {
+        let Some(staging) = client.staging.clone() else {
             schedule_local_install_retry(rt, attempt, donor);
             return;
         };
-        let Ok(verified) = verify_recovery_staging_artifact(&path, manifest) else {
+        staging
+    };
+    // Read and decode the staged image once, without the recovery locks.
+    let Ok(DecodedS2sSnapshotEnvelope {
+        repository_snapshot: staged_repository_snapshot,
+        applied_operations,
+        retired_operations,
+        terminal_cut: staged_cut,
+    }) = load_staged_snapshot(path.clone(), manifest).await
+    else {
+        schedule_local_install_retry(rt, attempt, donor);
+        return;
+    };
+    let (target, cut, applied, retired) = {
+        let coordinator = rt.recovery_coordinator.lock();
+        if coordinator.attempt() != Some(attempt)
+            || coordinator.phase() != RecoveryPhase::Installing
+            || coordinator.donor() != Some(&donor)
+        {
+            return;
+        }
+        let clients = rt.recovery_v8.clients.lock();
+        let Some(client) = clients.get(&attempt) else {
             schedule_local_install_retry(rt, attempt, donor);
             return;
         };
-        let Ok(decoded) = decode_s2s_snapshot_envelope(verified.into_repository_image()) else {
+        if client.donor != donor {
+            return;
+        }
+        if !client
+            .staging
+            .as_ref()
+            .is_some_and(|(staged_path, staged)| *staged_path == path && *staged == manifest)
+        {
             schedule_local_install_retry(rt, attempt, donor);
             return;
-        };
-        if decoded.terminal_cut != Some(client.cut) {
+        }
+        if staged_cut != Some(client.cut) {
             schedule_local_install_retry(rt, attempt, donor);
             return;
         }
         if !delivery_checkpoint_is_valid(
             client.target.repository_version(),
-            &decoded.applied_operations,
-            &decoded.retired_operations,
+            &applied_operations,
+            &retired_operations,
         ) {
             schedule_local_install_retry(rt, attempt, donor);
             return;
         }
         (
-            path,
-            manifest,
             client.target.clone(),
             client.cut,
-            decoded
-                .applied_operations
-                .into_iter()
-                .collect::<BTreeMap<_, _>>(),
-            decoded.retired_operations,
+            applied_operations.into_iter().collect::<BTreeMap<_, _>>(),
+            retired_operations,
         )
-    };
-    let Ok(verified) = verify_recovery_staging_artifact(&path, manifest) else {
-        schedule_local_install_retry(rt, attempt, donor);
-        return;
-    };
-    let Ok(decoded) = decode_s2s_snapshot_envelope(verified.into_repository_image()) else {
-        schedule_local_install_retry(rt, attempt, donor);
-        return;
     };
     if !rt.begin_authoritative_recovery_install(attempt, &donor) {
         return;
     }
-    let staged_repository_snapshot = decoded.repository_snapshot;
     if rt
         .install_authoritative_recovery_snapshot(
             target.repository_version(),
@@ -2097,13 +2214,7 @@ async fn finalize_install<R: StrictReplicable>(
         version: target.repository_version(),
         freshness: target.history_freshness(),
     };
-    let Ok(verified_artifact) = verify_recovery_staging_artifact(&path, manifest) else {
-        rt.finish_authoritative_recovery_install();
-        schedule_local_install_retry(rt, attempt, donor);
-        return;
-    };
-    let Ok(decoded) = decode_s2s_snapshot_envelope(verified_artifact.into_repository_image())
-    else {
+    let Ok(decoded) = load_staged_snapshot(path.clone(), manifest).await else {
         rt.finish_authoritative_recovery_install();
         schedule_local_install_retry(rt, attempt, donor);
         return;
@@ -2175,7 +2286,7 @@ async fn finalize_install<R: StrictReplicable>(
             donor,
             verification: Verification::new(target, reducer_cut(cut)),
         });
-        let _ = delete_recovery_staging_artifact(&path);
+        let _ = delete_recovery_staging_artifact_off_runtime(path).await;
         rt.recovery_v8.clients.lock().remove(&attempt);
         rt.finish_authoritative_recovery_install();
     } else {
@@ -3683,9 +3794,8 @@ pub(super) async fn recv_snapshot_page<R: StrictReplicable>(
         } else {
             let start = usize::try_from(page.cursor).unwrap_or(usize::MAX);
             let end = usize::try_from(page.next_cursor).unwrap_or(usize::MAX);
-            if end <= client.snapshot_bytes.len()
-                && start <= end
-                && client.snapshot_bytes[start..end] == page.snapshot_bytes
+            let received = client.received_snapshot();
+            if end <= received.len() && start <= end && received[start..end] == page.snapshot_bytes
             {
                 2
             } else {
@@ -3729,7 +3839,7 @@ pub(super) async fn recv_snapshot_page<R: StrictReplicable>(
         let _ = rt.net.send_redundant_unicast(from, &rt.topic, ack).await;
         return;
     }
-    let (complete, expectation, image) = {
+    let (expectation, digest, candidate) = {
         let coordinator = rt.recovery_coordinator.lock();
         if coordinator.attempt() != Some(attempt)
             || coordinator.phase() != RecoveryPhase::FetchingRepositorySnapshot
@@ -3763,14 +3873,23 @@ pub(super) async fn recv_snapshot_page<R: StrictReplicable>(
         client.snapshot_id = page.transfer_id;
         client.snapshot_total = Some(page.total_bytes);
         client.snapshot_digest = Some(digest);
+        if let Some(image) = client.snapshot_image.take() {
+            client.snapshot_bytes = image.to_vec();
+        }
         client
             .snapshot_bytes
             .extend_from_slice(&page.snapshot_bytes);
         client.snapshot_cursor = page.next_cursor;
-        let complete = !page.has_more
-            && client.snapshot_bytes.len() as u64 == page.total_bytes
-            && sha256(&client.snapshot_bytes) == digest;
-        if !complete {
+        // A full-length image is frozen and hashed outside the locks: the
+        // SHA-256 of an image up to the transfer limit takes hundreds of
+        // milliseconds.
+        let candidate = (!page.has_more && client.snapshot_bytes.len() as u64 == page.total_bytes)
+            .then(|| {
+                let image = Bytes::from(std::mem::take(&mut client.snapshot_bytes));
+                client.snapshot_image = Some(image.clone());
+                image
+            });
+        if candidate.is_none() {
             client.snapshot_nonce = rt.recovery_v8.wire_id();
         }
         let expectation = RecoveryStagingExpectation::new(
@@ -3782,12 +3901,44 @@ pub(super) async fn recv_snapshot_page<R: StrictReplicable>(
             },
             client.cut,
         );
-        (
-            complete,
-            expectation,
-            complete.then(|| client.snapshot_bytes.clone()),
-        )
+        (expectation, digest, candidate)
     };
+    let image = match candidate {
+        Some(image) => {
+            let (image, digest_matches) = tokio::task::spawn_blocking(move || {
+                let digest_matches = sha256(&image) == digest;
+                (image, digest_matches)
+            })
+            .await
+            .unwrap_or_else(|_| (Bytes::new(), false));
+            if digest_matches {
+                Some(image)
+            } else {
+                // Request the transfer again, as when the image fell short,
+                // unless the attempt moved on while the image was hashed.
+                let coordinator = rt.recovery_coordinator.lock();
+                if coordinator.attempt() == Some(attempt)
+                    && coordinator.phase() == RecoveryPhase::FetchingRepositorySnapshot
+                    && coordinator.donor() == Some(&donor)
+                    && coordinator.representation_cut().map(journal_cut) == Some(page_cut)
+                {
+                    let mut clients = rt.recovery_v8.clients.lock();
+                    if let Some(client) = clients.get_mut(&attempt)
+                        && client.donor == donor
+                        && client.cut == page_cut
+                        && client.snapshot_id == page.transfer_id
+                        && client.snapshot_nonce == page.request_nonce
+                        && client.snapshot_cursor == page.next_cursor
+                    {
+                        client.snapshot_nonce = rt.recovery_v8.wire_id();
+                    }
+                }
+                None
+            }
+        }
+        None => None,
+    };
+    let complete = image.is_some();
     let ack = StrictBody::RecoverySnapshotAck(StrictRecoverySnapshotAck {
         context: Some(wire_context(
             rt.self_id,
@@ -3815,8 +3966,10 @@ pub(super) async fn recv_snapshot_page<R: StrictReplicable>(
         let Some(image) = image else {
             return;
         };
-        let _ = delete_recovery_staging_artifact(&path);
-        let Ok(manifest) = write_recovery_staging_artifact(&path, expectation, &image) else {
+        let _ = delete_recovery_staging_artifact_off_runtime(path.clone()).await;
+        let Ok(manifest) =
+            write_recovery_staging_artifact_off_runtime(path.clone(), expectation, image).await
+        else {
             donor_failed(
                 rt,
                 attempt,
@@ -3826,7 +3979,7 @@ pub(super) async fn recv_snapshot_page<R: StrictReplicable>(
             return;
         };
         if !persist_attempt(rt).await {
-            let _ = delete_recovery_staging_artifact(&path);
+            let _ = delete_recovery_staging_artifact_off_runtime(path).await;
             return;
         }
         let attached = {
@@ -3854,7 +4007,7 @@ pub(super) async fn recv_snapshot_page<R: StrictReplicable>(
             }
         };
         if !attached {
-            let _ = delete_recovery_staging_artifact(&path);
+            let _ = delete_recovery_staging_artifact_off_runtime(path).await;
             return;
         }
     }

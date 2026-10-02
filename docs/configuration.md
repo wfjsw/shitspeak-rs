@@ -820,6 +820,7 @@ voice_fec_enabled = true
 voice_fec_block_size = 3
 voice_fec_parity_blocks = 3
 voice_fec_interleave_depth = 2
+# Frames and parity equations mirrored per speaker for recovery (1 through 512).
 voice_fec_receiver_window = 32
 # Toward recipients that all advertise it, every data frame is followed at once
 # by one sliding-window parity over the last this-many frames instead of block
@@ -1189,7 +1190,12 @@ A block's first frame can wait up to `(block_size - 1) × depth + parity - 1`
 frames (six with the defaults) before its last parity row arrives. The
 receiver matches data and parity per speaker regardless of which peer
 delivered them. It mirrors at least `voice_fec_receiver_window` recent frames
-per speaker, raised to two interleave spans when that is larger.
+per speaker (1 through 512), raised to two interleave spans or two sliding
+windows when that is larger. Recovery runs on the voice dispatch path, so the
+receiver bounds its cost: a parity frame longer than the largest encoded voice
+packet (1024 bytes plus its 2-byte length prefix) is ignored, and a block or
+sliding-window system that recovered nothing is not solved again until a
+member frame or parity for it arrives.
 `shitspeak_s2s_voice_fec_sends_total{path}` separates `tree`, `primary`, and
 `alternate` parity, and `shitspeak_s2s_voice_reorder_gaps_opened_total{missing_frames}`
 shows the loss-run lengths receivers see.
